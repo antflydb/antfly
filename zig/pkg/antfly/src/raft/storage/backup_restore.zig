@@ -315,7 +315,9 @@ fn portableEmbeddingSourceFieldsFromIndexesJson(
         };
         const type_value = cfg.get("type") orelse continue;
         if (type_value != .string) continue;
-        if (!std.mem.eql(u8, type_value.string, "embeddings") and !std.mem.eql(u8, type_value.string, "dense_vector")) continue;
+        if (!std.mem.eql(u8, type_value.string, "embeddings") and
+            !std.mem.eql(u8, type_value.string, "dense_vector") and
+            !std.mem.eql(u8, type_value.string, "sparse_vector")) continue;
         const field_value = cfg.get("field") orelse continue;
         if (field_value != .string or field_value.string.len == 0) continue;
         try fields.append(alloc, .{

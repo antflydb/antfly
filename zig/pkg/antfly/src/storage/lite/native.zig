@@ -1,0 +1,4233 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+//! Native single-file Antfly Lite format primitives.
+//!
+//! This module owns the v1-native `.aflite` on-disk header and checkpoint-slot
+//! layout plus the first native page stores used by the Lite backend.
+
+const std = @import("std");
+const fs_paths = @import("../../common/fs_paths.zig");
+
+const Allocator = std.mem.Allocator;
+
+pub const magic = "AFLITE\x02N";
+pub const format_version: u32 = 1;
+pub const default_page_size: u32 = 4096;
+pub const header_size: usize = 4096;
+pub const checkpoint_slot_count = 2;
+pub const checkpoint_slot_size: usize = 64;
+pub const page_magic = "AFLP";
+pub const page_header_size: usize = 16;
+
+const magic_offset: usize = 0;
+const version_offset: usize = 8;
+const page_size_offset: usize = 12;
+const header_size_offset: usize = 16;
+const active_checkpoint_offset: usize = 20;
+const checkpoint_slots_offset: usize = 64;
+const checkpoint_slots_end: usize = checkpoint_slots_offset + checkpoint_slot_count * checkpoint_slot_size;
+const checkpoint_slot_payload_size: usize = 48;
+const checkpoint_slot_checksum_offset: usize = checkpoint_slot_payload_size;
+const header_checksum_offset: usize = header_size - 4;
+const page_crc_offset: usize = 12;
+
+pub const PageKind = enum(u8) {
+    data = 1,
+    catalog = 2,
+    document = 3,
+    value = 4,
+    free_map = 5,
+};
+
+const catalog_key_len_mask: u32 = 0x00ff_ffff;
+const catalog_delete_flag: u32 = 1 << 31;
+const catalog_external_value_flag: u32 = 1 << 30;
+const document_delete_flag: u8 = 1 << 0;
+const document_external_value_flag: u8 = 1 << 1;
+const value_page_header_size: usize = 8;
+const free_map_format_version: u32 = 1;
+const free_map_header_size: usize = 16;
+
+const CatalogRoot = enum {
+    metadata,
+    index,
+};
+
+pub const CatalogEntry = struct {
+    previous_page: u64,
+    key: []const u8,
+    value: []const u8,
+    is_delete: bool = false,
+    external_value_root_page: u64 = 0,
+    external_value_len: usize = 0,
+};
+
+pub const DocumentEntry = struct {
+    previous_page: u64,
+    key: []const u8,
+    value: []const u8 = "",
+    is_delete: bool = false,
+    external_value_root_page: u64 = 0,
+    external_value_len: usize = 0,
+};
+
+const ValuePage = struct {
+    next_page: u64,
+    chunk: []const u8,
+};
+
+const EncodedCatalogEntry = struct {
+    previous_page: u64,
+    key: []const u8,
+    value: []const u8 = "",
+    is_delete: bool = false,
+    external_value_root_page: u64 = 0,
+    external_value_len: usize = 0,
+};
+
+const FreeMap = struct {
+    covered_page_count: u64,
+    free_pages: []u64,
+};
+
+const PageAllocator = struct {
+    file: *NativeFile,
+    free_pages: []u64,
+    next_free_index: usize = 0,
+    next_page_id: u64,
+    data_lock_file: ?std.Io.File = null,
+
+    fn deinit(self: *PageAllocator) void {
+        if (self.data_lock_file) |lock_file| {
+            lock_file.close(self.file.io_impl.io());
+        }
+        self.file.allocator.free(self.free_pages);
+    }
+
+    fn allocate(self: *PageAllocator) !u64 {
+        if (self.next_free_index < self.free_pages.len) {
+            const page_id = self.free_pages[self.next_free_index];
+            self.next_free_index += 1;
+            return page_id;
+        }
+
+        const page_id = self.next_page_id;
+        self.next_page_id = try std.math.add(u64, self.next_page_id, 1);
+        return page_id;
+    }
+};
+
+pub const DocumentMutation = struct {
+    key: []const u8,
+    value: []const u8 = "",
+    is_delete: bool = false,
+};
+
+pub const CatalogMutation = struct {
+    key: []const u8,
+    value: []const u8 = "",
+    is_delete: bool = false,
+};
+
+pub const OwnedDocument = struct {
+    key: []u8,
+    value: []u8,
+};
+
+pub const CheckpointSlot = struct {
+    commit_sequence: u64 = 0,
+    catalog_root_page: u64 = 0,
+    document_root_page: u64 = 0,
+    index_catalog_root_page: u64 = 0,
+    free_map_root_page: u64 = 0,
+    page_count: u64 = 1,
+};
+
+pub const LockMode = enum {
+    writer,
+    reader,
+};
+
+pub const OpenOptions = struct {
+    read_only: bool = false,
+    no_sync: bool = false,
+};
+
+pub const PathWriterLock = struct {
+    io_impl: std.Io.Threaded,
+    file: std.Io.File,
+
+    pub fn close(self: *PathWriterLock) void {
+        self.file.close(self.io_impl.io());
+        self.io_impl.deinit();
+        self.* = undefined;
+    }
+};
+
+pub const CreateOptions = struct {
+    exclusive: bool = false,
+    no_sync: bool = false,
+};
+
+pub const Header = struct {
+    page_size: u32 = default_page_size,
+    active_checkpoint: u8 = 0,
+    checkpoints: [checkpoint_slot_count]CheckpointSlot = .{ .{}, .{} },
+};
+
+pub const InspectReport = struct {
+    valid: bool,
+    format_version: u32,
+    page_size: u32,
+    active_checkpoint: u8,
+    commit_sequence: u64,
+    page_count: u64,
+    issue: ?[]const u8 = null,
+};
+
+pub const CheckReport = struct {
+    valid: bool,
+    file_size: u64,
+    valid_prefix_size: u64,
+    tail_bytes: u64,
+    record_count: u64,
+    live_file_count: u64,
+    live_bytes: u64,
+    compact_size: u64,
+    reclaimable_bytes: u64,
+    issue: ?[]const u8 = null,
+};
+
+pub const VacuumReport = struct {
+    before_size: u64,
+    after_size: u64,
+    reclaimed_bytes: u64,
+    live_file_count: u64,
+    live_bytes: u64,
+};
+
+pub const StableSnapshotReport = struct {
+    source_size: u64,
+    snapshot_size: u64,
+    checkpoint_sequence: u64,
+    page_count: u64,
+    tail_bytes: u64,
+};
+
+pub const OwnedCatalogRecord = struct {
+    key: []u8,
+    value: []u8,
+};
+
+pub const OwnedCatalogKey = struct {
+    key: []u8,
+};
+
+pub const NativeFile = struct {
+    allocator: Allocator,
+    io_impl: std.Io.Threaded,
+    path: []u8,
+    file: std.Io.File,
+    writer_lock_file: ?std.Io.File = null,
+    header: Header,
+    read_only: bool = false,
+    no_sync: bool = false,
+
+    pub fn open(allocator: Allocator, path: []const u8, read_only: bool) !NativeFile {
+        return try openWithOptions(allocator, path, .{ .read_only = read_only });
+    }
+
+    pub fn openWithOptions(allocator: Allocator, path: []const u8, opts: OpenOptions) !NativeFile {
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        errdefer io_impl.deinit();
+        const io = io_impl.io();
+
+        const owned_path = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned_path);
+
+        var writer_lock_file: ?std.Io.File = null;
+        if (!opts.read_only) {
+            writer_lock_file = try acquireWriterLock(allocator, io, path);
+        }
+        errdefer if (writer_lock_file) |lock_file| lock_file.close(io);
+
+        const file = try openDataFile(io, path, if (opts.read_only) .reader else .writer);
+        errdefer file.close(io);
+
+        var header_bytes: [header_size]u8 = undefined;
+        try readHeaderExactAt(file, io, &header_bytes);
+        var header = try decodeHeader(&header_bytes);
+        const file_size = (try file.stat(io)).size;
+        header.active_checkpoint = try selectCompleteCheckpointForFile(header, file_size);
+
+        return .{
+            .allocator = allocator,
+            .io_impl = io_impl,
+            .path = owned_path,
+            .file = file,
+            .writer_lock_file = writer_lock_file,
+            .header = header,
+            .read_only = opts.read_only,
+            .no_sync = opts.no_sync,
+        };
+    }
+
+    pub fn create(allocator: Allocator, path: []const u8) !NativeFile {
+        return try createWithMode(allocator, path, false, false);
+    }
+
+    pub fn createNew(allocator: Allocator, path: []const u8) !NativeFile {
+        return try createWithMode(allocator, path, true, false);
+    }
+
+    pub fn createWithOptions(allocator: Allocator, path: []const u8, opts: CreateOptions) !NativeFile {
+        return try createWithMode(allocator, path, opts.exclusive, opts.no_sync);
+    }
+
+    fn createWithMode(allocator: Allocator, path: []const u8, exclusive: bool, no_sync: bool) !NativeFile {
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        errdefer io_impl.deinit();
+        const io = io_impl.io();
+
+        const owned_path = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned_path);
+
+        var writer_lock_file = try acquireWriterLock(allocator, io, path);
+        errdefer writer_lock_file.close(io);
+
+        var encoded: [header_size]u8 = undefined;
+        encodeHeader(&encoded, .{});
+
+        const file = try createDataFile(io, path, .{
+            .truncate = true,
+            .exclusive = exclusive,
+        });
+        errdefer file.close(io);
+
+        try file.writePositionalAll(io, &encoded, 0);
+        if (!no_sync) try file.sync(io);
+
+        return .{
+            .allocator = allocator,
+            .io_impl = io_impl,
+            .path = owned_path,
+            .file = file,
+            .writer_lock_file = writer_lock_file,
+            .header = .{},
+            .read_only = false,
+            .no_sync = no_sync,
+        };
+    }
+
+    pub fn close(self: *NativeFile) void {
+        if (self.writer_lock_file) |lock_file| {
+            lock_file.close(self.io_impl.io());
+        }
+        self.file.close(self.io_impl.io());
+        self.allocator.free(self.path);
+        self.io_impl.deinit();
+        self.* = undefined;
+    }
+
+    pub fn activeCheckpoint(self: *const NativeFile) CheckpointSlot {
+        return self.header.checkpoints[self.header.active_checkpoint];
+    }
+
+    pub fn check(self: *NativeFile) !CheckReport {
+        const checkpoint = self.activeCheckpoint();
+        const expected_size = try checkpointPrefixSize(checkpoint, self.header.page_size);
+        const file_size = (try self.file.stat(self.io_impl.io())).size;
+
+        const report = CheckReport{
+            .valid = true,
+            .file_size = file_size,
+            .valid_prefix_size = @min(file_size, expected_size),
+            .tail_bytes = if (file_size > expected_size) file_size - expected_size else 0,
+            .record_count = if (checkpoint.page_count > 0) checkpoint.page_count - 1 else 0,
+            .live_file_count = 0,
+            .live_bytes = 0,
+            .compact_size = expected_size,
+            .reclaimable_bytes = 0,
+        };
+
+        if (checkpoint.page_count == 0) return invalidCheck(report, "invalid_page_count");
+        if (file_size < expected_size) return invalidCheck(report, "truncated_file");
+
+        var reachable_pages = std.AutoHashMapUnmanaged(u64, void){};
+        defer reachable_pages.deinit(self.allocator);
+
+        const catalog_records = self.countReachableChainPages(.catalog, checkpoint.catalog_root_page, &reachable_pages) catch |err| {
+            return invalidCheck(report, issueForPageCheckError(err));
+        };
+        const index_catalog_records = self.countReachableChainPages(.catalog, checkpoint.index_catalog_root_page, &reachable_pages) catch |err| {
+            return invalidCheck(report, issueForPageCheckError(err));
+        };
+        const document_records = self.countReachableChainPages(.document, checkpoint.document_root_page, &reachable_pages) catch |err| {
+            return invalidCheck(report, issueForPageCheckError(err));
+        };
+        self.validateReachableFreeMap(checkpoint, &reachable_pages) catch |err| {
+            return invalidCheck(report, issueForPageCheckError(err));
+        };
+        const live = self.liveStats() catch |err| {
+            return invalidCheck(report, issueForPageCheckError(err));
+        };
+
+        var valid = report;
+        valid.record_count = catalog_records + index_catalog_records + document_records;
+        valid.live_file_count = live.record_count;
+        valid.live_bytes = live.bytes;
+        valid.compact_size = live.compact_size;
+        valid.reclaimable_bytes = if (file_size > live.compact_size) file_size - live.compact_size else 0;
+        if (valid.tail_bytes != 0) return invalidCheck(valid, "tail_bytes");
+        return valid;
+    }
+
+    pub fn allocatePage(self: *NativeFile, contents: []const u8) !u64 {
+        if (self.read_only) return error.ReadOnly;
+        const previous = self.activeCheckpoint();
+        var page_allocator = try self.pageAllocatorFromFreeMap(previous);
+        defer page_allocator.deinit();
+
+        const page_id = try page_allocator.allocate();
+        try self.writePage(page_id, .data, contents);
+
+        var next = previous;
+        next.commit_sequence += 1;
+        next.free_map_root_page = try page_allocator.allocate();
+        next.page_count = page_allocator.next_page_id;
+
+        const free_pages = try self.computeFreePagesForPublishedCheckpoint(next, previous);
+        defer self.allocator.free(free_pages);
+        try self.writeFreeMapPage(next.free_map_root_page, next.page_count, free_pages);
+        try self.syncIfRequired();
+
+        try self.publishCheckpoint(next);
+        return page_id;
+    }
+
+    pub fn readPageAlloc(self: *NativeFile, allocator: Allocator, page_id: u64) ![]u8 {
+        return try self.readPageAllocForCheckpoint(allocator, page_id, self.activeCheckpoint());
+    }
+
+    fn readPageAllocForCheckpoint(self: *NativeFile, allocator: Allocator, page_id: u64, checkpoint: CheckpointSlot) ![]u8 {
+        if (page_id == 0 or page_id >= checkpoint.page_count) return error.InvalidPageId;
+
+        const page_size: usize = @intCast(self.header.page_size);
+        const page = try allocator.alloc(u8, page_size);
+        errdefer allocator.free(page);
+
+        try readExactAt(self.file, self.io_impl.io(), page, page_id * @as(u64, self.header.page_size));
+        return page;
+    }
+
+    pub fn readPagePayloadAlloc(self: *NativeFile, allocator: Allocator, page_id: u64) ![]u8 {
+        const page = try self.readPageAlloc(allocator, page_id);
+        defer allocator.free(page);
+        return try decodePagePayloadAlloc(allocator, page, .data);
+    }
+
+    pub fn putCatalogRecord(self: *NativeFile, key: []const u8, value: []const u8) !void {
+        try self.putCatalogBatch(&.{.{ .key = key, .value = value }});
+    }
+
+    pub fn deleteCatalogRecord(self: *NativeFile, key: []const u8) !void {
+        try self.putCatalogBatch(&.{.{ .key = key, .is_delete = true }});
+    }
+
+    pub fn putCatalogBatch(self: *NativeFile, mutations: []const CatalogMutation) !void {
+        return try self.putCatalogBatchForRoot(.metadata, mutations);
+    }
+
+    pub fn putIndexCatalogRecord(self: *NativeFile, key: []const u8, value: []const u8) !void {
+        try self.putIndexCatalogBatch(&.{.{ .key = key, .value = value }});
+    }
+
+    pub fn appendIndexCatalogRecord(self: *NativeFile, key: []const u8, suffix: []const u8) !void {
+        try self.appendCatalogRecordForRoot(.index, key, suffix);
+    }
+
+    pub fn deleteIndexCatalogRecord(self: *NativeFile, key: []const u8) !void {
+        try self.putIndexCatalogBatch(&.{.{ .key = key, .is_delete = true }});
+    }
+
+    pub fn renameIndexCatalogRecord(self: *NativeFile, old_key: []const u8, new_key: []const u8) !void {
+        try self.renameCatalogRecordForRoot(.index, old_key, new_key);
+    }
+
+    pub fn putIndexCatalogBatch(self: *NativeFile, mutations: []const CatalogMutation) !void {
+        return try self.putCatalogBatchForRoot(.index, mutations);
+    }
+
+    fn putCatalogBatchForRoot(self: *NativeFile, root: CatalogRoot, mutations: []const CatalogMutation) !void {
+        if (self.read_only) return error.ReadOnly;
+        if (mutations.len == 0) return;
+        for (mutations) |mutation| try self.validateCatalogMutation(mutation);
+
+        const previous = self.activeCheckpoint();
+        var next_root_page = catalogRootPage(previous, root);
+        var page_allocator = try self.pageAllocatorFromFreeMap(previous);
+        defer page_allocator.deinit();
+
+        for (mutations) |mutation| {
+            var external_value_root_page: u64 = 0;
+            if (!mutation.is_delete and !self.catalogEntryFitsInline(mutation.key, mutation.value)) {
+                external_value_root_page = try self.writeValuePagesAllocated(&page_allocator, mutation.value);
+            }
+
+            const page_id = try page_allocator.allocate();
+            var payload = std.ArrayListUnmanaged(u8).empty;
+            defer payload.deinit(self.allocator);
+            try encodeCatalogEntry(self.allocator, &payload, .{
+                .previous_page = next_root_page,
+                .key = mutation.key,
+                .value = mutation.value,
+                .is_delete = mutation.is_delete,
+                .external_value_root_page = external_value_root_page,
+            });
+            try self.writePage(page_id, .catalog, payload.items);
+            next_root_page = page_id;
+        }
+
+        var next = previous;
+        next.commit_sequence += 1;
+        setCatalogRootPage(&next, root, next_root_page);
+        next.free_map_root_page = try page_allocator.allocate();
+        next.page_count = page_allocator.next_page_id;
+
+        const free_pages = try self.computeFreePagesForPublishedCheckpoint(next, previous);
+        defer self.allocator.free(free_pages);
+        try self.writeFreeMapPage(next.free_map_root_page, next.page_count, free_pages);
+        try self.syncIfRequired();
+
+        try self.publishCheckpoint(next);
+    }
+
+    fn appendCatalogRecordForRoot(self: *NativeFile, root: CatalogRoot, key: []const u8, suffix: []const u8) !void {
+        if (self.read_only) return error.ReadOnly;
+
+        const previous = self.activeCheckpoint();
+        var found_entry: ?CatalogEntry = null;
+        var found_payload: ?[]u8 = null;
+
+        var page_id = catalogRootPage(previous, root);
+        while (page_id != 0) {
+            const payload = try self.readPagePayloadByKindAlloc(self.allocator, page_id, .catalog);
+            const entry = decodeCatalogEntry(payload) catch |err| {
+                self.allocator.free(payload);
+                return err;
+            };
+            if (std.mem.eql(u8, entry.key, key)) {
+                if (entry.is_delete) {
+                    self.allocator.free(payload);
+                    return try self.putCatalogBatchForRoot(root, &.{.{ .key = key, .value = suffix }});
+                }
+                found_entry = entry;
+                found_payload = payload;
+                break;
+            }
+            page_id = entry.previous_page;
+            self.allocator.free(payload);
+        }
+
+        const entry = found_entry orelse return try self.putCatalogBatchForRoot(root, &.{.{ .key = key, .value = suffix }});
+        defer if (found_payload) |payload| self.allocator.free(payload);
+
+        const old_len = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
+        const total_len = try std.math.add(usize, old_len, suffix.len);
+
+        var next_root_page = catalogRootPage(previous, root);
+        var page_allocator = try self.pageAllocatorFromFreeMap(previous);
+        defer page_allocator.deinit();
+
+        var external_value_root_page: u64 = 0;
+        var inline_value: []u8 = &.{};
+        defer if (inline_value.len > 0) self.allocator.free(inline_value);
+
+        const fixed_len = 16 + key.len;
+        const fits_inline = fixed_len <= self.maxPagePayloadBytes() and total_len <= self.maxPagePayloadBytes() - fixed_len;
+        if (fits_inline) {
+            inline_value = try self.allocator.alloc(u8, total_len);
+            if (entry.external_value_root_page != 0) {
+                const old_value = try self.readValuePagesAlloc(self.allocator, entry.external_value_root_page, entry.external_value_len);
+                defer self.allocator.free(old_value);
+                @memcpy(inline_value[0..old_value.len], old_value);
+            } else {
+                @memcpy(inline_value[0..entry.value.len], entry.value);
+            }
+            @memcpy(inline_value[old_len..], suffix);
+        } else {
+            external_value_root_page = try self.writeAppendedCatalogValuePagesAllocated(&page_allocator, entry, suffix, total_len);
+        }
+
+        const catalog_page_id = try page_allocator.allocate();
+        var payload = std.ArrayListUnmanaged(u8).empty;
+        defer payload.deinit(self.allocator);
+        try encodeCatalogEntryRaw(self.allocator, &payload, .{
+            .previous_page = next_root_page,
+            .key = key,
+            .value = inline_value,
+            .external_value_root_page = external_value_root_page,
+            .external_value_len = if (external_value_root_page != 0) total_len else 0,
+        });
+        try self.writePage(catalog_page_id, .catalog, payload.items);
+        next_root_page = catalog_page_id;
+
+        var next = previous;
+        next.commit_sequence += 1;
+        setCatalogRootPage(&next, root, next_root_page);
+        next.free_map_root_page = try page_allocator.allocate();
+        next.page_count = page_allocator.next_page_id;
+
+        const free_pages = try self.computeFreePagesForPublishedCheckpoint(next, previous);
+        defer self.allocator.free(free_pages);
+        try self.writeFreeMapPage(next.free_map_root_page, next.page_count, free_pages);
+        try self.syncIfRequired();
+
+        try self.publishCheckpoint(next);
+    }
+
+    fn renameCatalogRecordForRoot(self: *NativeFile, root: CatalogRoot, old_key: []const u8, new_key: []const u8) !void {
+        if (self.read_only) return error.ReadOnly;
+        if (std.mem.eql(u8, old_key, new_key)) return;
+
+        const previous = self.activeCheckpoint();
+        var found_entry: ?CatalogEntry = null;
+        var found_payload: ?[]u8 = null;
+
+        var page_id = catalogRootPage(previous, root);
+        while (page_id != 0) {
+            const payload = try self.readPagePayloadByKindAlloc(self.allocator, page_id, .catalog);
+            const entry = decodeCatalogEntry(payload) catch |err| {
+                self.allocator.free(payload);
+                return err;
+            };
+            if (std.mem.eql(u8, entry.key, old_key)) {
+                if (entry.is_delete) {
+                    self.allocator.free(payload);
+                    return;
+                }
+                found_entry = entry;
+                found_payload = payload;
+                break;
+            }
+            page_id = entry.previous_page;
+            self.allocator.free(payload);
+        }
+
+        const entry = found_entry orelse return;
+        defer if (found_payload) |payload| self.allocator.free(payload);
+
+        var next_root_page = catalogRootPage(previous, root);
+        var page_allocator = try self.pageAllocatorFromFreeMap(previous);
+        defer page_allocator.deinit();
+
+        var external_value_root_page: u64 = 0;
+        if (entry.external_value_root_page != 0) {
+            external_value_root_page = entry.external_value_root_page;
+        }
+
+        {
+            const new_page_id = try page_allocator.allocate();
+            var payload = std.ArrayListUnmanaged(u8).empty;
+            defer payload.deinit(self.allocator);
+            try encodeCatalogEntryRaw(self.allocator, &payload, .{
+                .previous_page = next_root_page,
+                .key = new_key,
+                .value = entry.value,
+                .external_value_root_page = external_value_root_page,
+                .external_value_len = entry.external_value_len,
+            });
+            try self.writePage(new_page_id, .catalog, payload.items);
+            next_root_page = new_page_id;
+        }
+
+        {
+            const tombstone_page_id = try page_allocator.allocate();
+            var payload = std.ArrayListUnmanaged(u8).empty;
+            defer payload.deinit(self.allocator);
+            try encodeCatalogEntryRaw(self.allocator, &payload, .{
+                .previous_page = next_root_page,
+                .key = old_key,
+                .is_delete = true,
+            });
+            try self.writePage(tombstone_page_id, .catalog, payload.items);
+            next_root_page = tombstone_page_id;
+        }
+
+        var next = previous;
+        next.commit_sequence += 1;
+        setCatalogRootPage(&next, root, next_root_page);
+        next.free_map_root_page = try page_allocator.allocate();
+        next.page_count = page_allocator.next_page_id;
+
+        const free_pages = try self.computeFreePagesForPublishedCheckpoint(next, previous);
+        defer self.allocator.free(free_pages);
+        try self.writeFreeMapPage(next.free_map_root_page, next.page_count, free_pages);
+        try self.syncIfRequired();
+
+        try self.publishCheckpoint(next);
+    }
+
+    pub fn getCatalogRecordAlloc(self: *NativeFile, allocator: Allocator, key: []const u8) !?[]u8 {
+        return try self.getCatalogRecordFromRootAlloc(allocator, .metadata, key);
+    }
+
+    pub fn getIndexCatalogRecordAlloc(self: *NativeFile, allocator: Allocator, key: []const u8) !?[]u8 {
+        return try self.getCatalogRecordFromRootAlloc(allocator, .index, key);
+    }
+
+    pub fn getIndexCatalogRecordSize(self: *NativeFile, key: []const u8) !?usize {
+        return try self.getCatalogRecordSizeFromRoot(.index, key);
+    }
+
+    pub fn getIndexCatalogRecordRangeAlloc(
+        self: *NativeFile,
+        allocator: Allocator,
+        key: []const u8,
+        offset: u64,
+        len: usize,
+    ) !?[]u8 {
+        return try self.getCatalogRecordRangeFromRootAlloc(allocator, .index, key, offset, len);
+    }
+
+    fn getCatalogRecordFromRootAlloc(
+        self: *NativeFile,
+        allocator: Allocator,
+        root: CatalogRoot,
+        key: []const u8,
+    ) !?[]u8 {
+        var page_id = catalogRootPage(self.activeCheckpoint(), root);
+        while (page_id != 0) {
+            const payload = try self.readPagePayloadByKindAlloc(allocator, page_id, .catalog);
+            defer allocator.free(payload);
+            const entry = try decodeCatalogEntry(payload);
+            if (std.mem.eql(u8, entry.key, key)) {
+                if (entry.is_delete) return null;
+                return try self.catalogEntryValueAlloc(allocator, entry);
+            }
+            page_id = entry.previous_page;
+        }
+        return null;
+    }
+
+    fn getCatalogRecordSizeFromRoot(
+        self: *NativeFile,
+        root: CatalogRoot,
+        key: []const u8,
+    ) !?usize {
+        var page_id = catalogRootPage(self.activeCheckpoint(), root);
+        while (page_id != 0) {
+            const payload = try self.readPagePayloadByKindAlloc(self.allocator, page_id, .catalog);
+            defer self.allocator.free(payload);
+            const entry = try decodeCatalogEntry(payload);
+            if (std.mem.eql(u8, entry.key, key)) {
+                if (entry.is_delete) return null;
+                return if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
+            }
+            page_id = entry.previous_page;
+        }
+        return null;
+    }
+
+    fn getCatalogRecordRangeFromRootAlloc(
+        self: *NativeFile,
+        allocator: Allocator,
+        root: CatalogRoot,
+        key: []const u8,
+        offset: u64,
+        len: usize,
+    ) !?[]u8 {
+        var page_id = catalogRootPage(self.activeCheckpoint(), root);
+        while (page_id != 0) {
+            const payload = try self.readPagePayloadByKindAlloc(self.allocator, page_id, .catalog);
+            defer self.allocator.free(payload);
+            const entry = try decodeCatalogEntry(payload);
+            if (std.mem.eql(u8, entry.key, key)) {
+                if (entry.is_delete) return null;
+                return try self.catalogEntryRangeAlloc(allocator, entry, offset, len);
+            }
+            page_id = entry.previous_page;
+        }
+        return null;
+    }
+
+    pub fn snapshotCatalogRecordsAlloc(self: *NativeFile, allocator: Allocator) ![]OwnedCatalogRecord {
+        return try self.snapshotCatalogRecordsFromRootAlloc(allocator, .metadata);
+    }
+
+    pub fn snapshotIndexCatalogRecordsAlloc(self: *NativeFile, allocator: Allocator) ![]OwnedCatalogRecord {
+        return try self.snapshotCatalogRecordsFromRootAlloc(allocator, .index);
+    }
+
+    pub fn snapshotIndexCatalogKeysAlloc(self: *NativeFile, allocator: Allocator) ![]OwnedCatalogKey {
+        return try self.snapshotCatalogKeysFromRootAlloc(allocator, .index);
+    }
+
+    fn snapshotCatalogRecordsFromRootAlloc(self: *NativeFile, allocator: Allocator, root: CatalogRoot) ![]OwnedCatalogRecord {
+        var map = std.StringHashMapUnmanaged(?[]u8).empty;
+        defer {
+            var it = map.iterator();
+            while (it.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                if (entry.value_ptr.*) |value| allocator.free(value);
+            }
+            map.deinit(allocator);
+        }
+
+        var page_id = catalogRootPage(self.activeCheckpoint(), root);
+        while (page_id != 0) {
+            const payload = try self.readPagePayloadByKindAlloc(allocator, page_id, .catalog);
+            defer allocator.free(payload);
+            const entry = try decodeCatalogEntry(payload);
+
+            if (!map.contains(entry.key)) {
+                const owned_key = try allocator.dupe(u8, entry.key);
+                errdefer allocator.free(owned_key);
+                const owned_value = if (entry.is_delete) null else try self.catalogEntryValueAlloc(allocator, entry);
+                errdefer if (owned_value) |value| allocator.free(value);
+                try map.put(allocator, owned_key, owned_value);
+            }
+            page_id = entry.previous_page;
+        }
+
+        var records = std.ArrayListUnmanaged(OwnedCatalogRecord).empty;
+        errdefer {
+            for (records.items) |record| {
+                allocator.free(record.key);
+                allocator.free(record.value);
+            }
+            records.deinit(allocator);
+        }
+        var it = map.iterator();
+        while (it.next()) |entry| {
+            const stored_value = entry.value_ptr.* orelse continue;
+            const key = try allocator.dupe(u8, entry.key_ptr.*);
+            errdefer allocator.free(key);
+            const value = try allocator.dupe(u8, stored_value);
+            errdefer allocator.free(value);
+            try records.append(allocator, .{ .key = key, .value = value });
+        }
+
+        std.mem.sort(OwnedCatalogRecord, records.items, {}, struct {
+            fn lessThan(_: void, lhs: OwnedCatalogRecord, rhs: OwnedCatalogRecord) bool {
+                return std.mem.order(u8, lhs.key, rhs.key) == .lt;
+            }
+        }.lessThan);
+
+        return try records.toOwnedSlice(allocator);
+    }
+
+    fn snapshotCatalogKeysFromRootAlloc(self: *NativeFile, allocator: Allocator, root: CatalogRoot) ![]OwnedCatalogKey {
+        var map = std.StringHashMapUnmanaged(bool).empty;
+        defer {
+            var it = map.iterator();
+            while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+            map.deinit(allocator);
+        }
+
+        var page_id = catalogRootPage(self.activeCheckpoint(), root);
+        while (page_id != 0) {
+            const payload = try self.readPagePayloadByKindAlloc(allocator, page_id, .catalog);
+            defer allocator.free(payload);
+            const entry = try decodeCatalogEntry(payload);
+
+            if (!map.contains(entry.key)) {
+                const owned_key = try allocator.dupe(u8, entry.key);
+                errdefer allocator.free(owned_key);
+                try map.put(allocator, owned_key, !entry.is_delete);
+            }
+            page_id = entry.previous_page;
+        }
+
+        var keys = std.ArrayListUnmanaged(OwnedCatalogKey).empty;
+        errdefer {
+            for (keys.items) |record| allocator.free(record.key);
+            keys.deinit(allocator);
+        }
+        var it = map.iterator();
+        while (it.next()) |entry| {
+            if (!entry.value_ptr.*) continue;
+            const key = try allocator.dupe(u8, entry.key_ptr.*);
+            errdefer allocator.free(key);
+            try keys.append(allocator, .{ .key = key });
+        }
+
+        std.mem.sort(OwnedCatalogKey, keys.items, {}, struct {
+            fn lessThan(_: void, lhs: OwnedCatalogKey, rhs: OwnedCatalogKey) bool {
+                return std.mem.order(u8, lhs.key, rhs.key) == .lt;
+            }
+        }.lessThan);
+
+        return try keys.toOwnedSlice(allocator);
+    }
+
+    pub fn freeSnapshotCatalogRecords(allocator: Allocator, records: []OwnedCatalogRecord) void {
+        for (records) |record| {
+            allocator.free(record.key);
+            allocator.free(record.value);
+        }
+        allocator.free(records);
+    }
+
+    pub fn freeSnapshotCatalogKeys(allocator: Allocator, records: []OwnedCatalogKey) void {
+        for (records) |record| allocator.free(record.key);
+        allocator.free(records);
+    }
+
+    pub fn putDocument(self: *NativeFile, key: []const u8, value: []const u8) !void {
+        try self.putDocumentBatch(&.{.{ .key = key, .value = value }});
+    }
+
+    pub fn deleteDocument(self: *NativeFile, key: []const u8) !void {
+        try self.putDocumentBatch(&.{.{ .key = key, .is_delete = true }});
+    }
+
+    pub fn putDocumentBatch(self: *NativeFile, mutations: []const DocumentMutation) !void {
+        if (self.read_only) return error.ReadOnly;
+        if (mutations.len == 0) return;
+        for (mutations) |mutation| try self.validateDocumentMutation(mutation);
+
+        const previous = self.activeCheckpoint();
+        var next_root_page = previous.document_root_page;
+        var page_allocator = try self.pageAllocatorFromFreeMap(previous);
+        defer page_allocator.deinit();
+
+        for (mutations) |mutation| {
+            var external_value_root_page: u64 = 0;
+            if (!mutation.is_delete and !self.documentEntryFitsInline(mutation.key, mutation.value)) {
+                external_value_root_page = try self.writeValuePagesAllocated(&page_allocator, mutation.value);
+            }
+
+            const page_id = try page_allocator.allocate();
+            var payload = std.ArrayListUnmanaged(u8).empty;
+            defer payload.deinit(self.allocator);
+            try encodeDocumentEntry(self.allocator, &payload, .{
+                .previous_page = next_root_page,
+                .key = mutation.key,
+                .value = mutation.value,
+                .is_delete = mutation.is_delete,
+                .external_value_root_page = external_value_root_page,
+            });
+            try self.writePage(page_id, .document, payload.items);
+            next_root_page = page_id;
+        }
+
+        var next = previous;
+        next.commit_sequence += 1;
+        next.document_root_page = next_root_page;
+        next.free_map_root_page = try page_allocator.allocate();
+        next.page_count = page_allocator.next_page_id;
+
+        const free_pages = try self.computeFreePagesForPublishedCheckpoint(next, previous);
+        defer self.allocator.free(free_pages);
+        try self.writeFreeMapPage(next.free_map_root_page, next.page_count, free_pages);
+        try self.syncIfRequired();
+
+        try self.publishCheckpoint(next);
+    }
+
+    pub fn getDocumentAlloc(self: *NativeFile, allocator: Allocator, key: []const u8) !?[]u8 {
+        var page_id = self.activeCheckpoint().document_root_page;
+        while (page_id != 0) {
+            const payload = try self.readPagePayloadByKindAlloc(allocator, page_id, .document);
+            defer allocator.free(payload);
+            const entry = try decodeDocumentEntry(payload);
+            if (std.mem.eql(u8, entry.key, key)) {
+                if (entry.is_delete) return null;
+                return try self.documentEntryValueAlloc(allocator, entry);
+            }
+            page_id = entry.previous_page;
+        }
+        return null;
+    }
+
+    pub fn snapshotDocumentsAlloc(self: *NativeFile, allocator: Allocator) ![]OwnedDocument {
+        var map = std.StringHashMapUnmanaged(?[]u8).empty;
+        defer {
+            var it = map.iterator();
+            while (it.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                if (entry.value_ptr.*) |value| allocator.free(value);
+            }
+            map.deinit(allocator);
+        }
+
+        var page_id = self.activeCheckpoint().document_root_page;
+        while (page_id != 0) {
+            const payload = try self.readPagePayloadByKindAlloc(allocator, page_id, .document);
+            defer allocator.free(payload);
+            const entry = try decodeDocumentEntry(payload);
+
+            if (!map.contains(entry.key)) {
+                const owned_key = try allocator.dupe(u8, entry.key);
+                errdefer allocator.free(owned_key);
+                const owned_value = if (entry.is_delete) null else try self.documentEntryValueAlloc(allocator, entry);
+                errdefer if (owned_value) |value| allocator.free(value);
+                try map.put(allocator, owned_key, owned_value);
+            }
+            page_id = entry.previous_page;
+        }
+
+        var docs = std.ArrayListUnmanaged(OwnedDocument).empty;
+        errdefer {
+            for (docs.items) |doc| {
+                allocator.free(doc.key);
+                allocator.free(doc.value);
+            }
+            docs.deinit(allocator);
+        }
+        var it = map.iterator();
+        while (it.next()) |entry| {
+            const value = entry.value_ptr.* orelse continue;
+            const key = try allocator.dupe(u8, entry.key_ptr.*);
+            errdefer allocator.free(key);
+            const value_copy = try allocator.dupe(u8, value);
+            errdefer allocator.free(value_copy);
+            try docs.append(allocator, .{ .key = key, .value = value_copy });
+        }
+
+        std.mem.sort(OwnedDocument, docs.items, {}, struct {
+            fn lessThan(_: void, lhs: OwnedDocument, rhs: OwnedDocument) bool {
+                return std.mem.order(u8, lhs.key, rhs.key) == .lt;
+            }
+        }.lessThan);
+
+        return try docs.toOwnedSlice(allocator);
+    }
+
+    pub fn freeSnapshotDocuments(allocator: Allocator, docs: []OwnedDocument) void {
+        for (docs) |doc| {
+            allocator.free(doc.key);
+            allocator.free(doc.value);
+        }
+        allocator.free(docs);
+    }
+
+    pub fn vacuum(self: *NativeFile) !VacuumReport {
+        if (self.read_only) return error.ReadOnly;
+
+        var data_lock_file = try acquireDataRewriteLock(self.io_impl.io(), self.path);
+        defer data_lock_file.close(self.io_impl.io());
+
+        const before_size = (try self.file.stat(self.io_impl.io())).size;
+        const previous = self.activeCheckpoint();
+
+        const catalog_records = try self.snapshotCatalogRecordsAlloc(self.allocator);
+        defer freeSnapshotCatalogRecords(self.allocator, catalog_records);
+
+        const index_catalog_records = try self.snapshotIndexCatalogRecordsAlloc(self.allocator);
+        defer freeSnapshotCatalogRecords(self.allocator, index_catalog_records);
+
+        const docs = try self.snapshotDocumentsAlloc(self.allocator);
+        defer freeSnapshotDocuments(self.allocator, docs);
+
+        var image = std.ArrayListUnmanaged(u8).empty;
+        defer image.deinit(self.allocator);
+
+        const page_size: usize = @intCast(self.header.page_size);
+        try image.resize(self.allocator, page_size);
+        @memset(image.items, 0);
+
+        var next_page_id: u64 = 1;
+        var catalog_root_page: u64 = 0;
+        var index_catalog_root_page: u64 = 0;
+        var document_root_page: u64 = 0;
+        var free_map_root_page: u64 = 0;
+        var live_bytes: u64 = 0;
+
+        for (catalog_records) |record| {
+            const external_value_root_page = if (record.value.len == 0 or self.catalogEntryFitsInline(record.key, record.value))
+                0
+            else
+                try appendValuePagesToImage(self.allocator, &image, page_size, self.maxValuePagePayloadBytes(), &next_page_id, record.value);
+
+            var payload = std.ArrayListUnmanaged(u8).empty;
+            defer payload.deinit(self.allocator);
+            try encodeCatalogEntry(self.allocator, &payload, .{
+                .previous_page = catalog_root_page,
+                .key = record.key,
+                .value = record.value,
+                .external_value_root_page = external_value_root_page,
+            });
+            catalog_root_page = try appendPageToImage(self.allocator, &image, page_size, &next_page_id, .catalog, payload.items);
+            live_bytes +|= record.key.len + record.value.len;
+        }
+
+        for (index_catalog_records) |record| {
+            const external_value_root_page = if (record.value.len == 0 or self.catalogEntryFitsInline(record.key, record.value))
+                0
+            else
+                try appendValuePagesToImage(self.allocator, &image, page_size, self.maxValuePagePayloadBytes(), &next_page_id, record.value);
+
+            var payload = std.ArrayListUnmanaged(u8).empty;
+            defer payload.deinit(self.allocator);
+            try encodeCatalogEntry(self.allocator, &payload, .{
+                .previous_page = index_catalog_root_page,
+                .key = record.key,
+                .value = record.value,
+                .external_value_root_page = external_value_root_page,
+            });
+            index_catalog_root_page = try appendPageToImage(self.allocator, &image, page_size, &next_page_id, .catalog, payload.items);
+            live_bytes +|= record.key.len + record.value.len;
+        }
+
+        for (docs) |doc| {
+            const external_value_root_page = if (self.documentEntryFitsInline(doc.key, doc.value))
+                0
+            else
+                try appendValuePagesToImage(self.allocator, &image, page_size, self.maxValuePagePayloadBytes(), &next_page_id, doc.value);
+
+            var payload = std.ArrayListUnmanaged(u8).empty;
+            defer payload.deinit(self.allocator);
+            try encodeDocumentEntry(self.allocator, &payload, .{
+                .previous_page = document_root_page,
+                .key = doc.key,
+                .value = doc.value,
+                .external_value_root_page = external_value_root_page,
+            });
+            document_root_page = try appendPageToImage(self.allocator, &image, page_size, &next_page_id, .document, payload.items);
+            live_bytes +|= doc.key.len + doc.value.len;
+        }
+
+        free_map_root_page = try appendFreeMapPageToImage(self.allocator, &image, page_size, &next_page_id, next_page_id + 1, &.{});
+
+        const checkpoint = CheckpointSlot{
+            .commit_sequence = previous.commit_sequence + 1,
+            .catalog_root_page = catalog_root_page,
+            .document_root_page = document_root_page,
+            .index_catalog_root_page = index_catalog_root_page,
+            .free_map_root_page = free_map_root_page,
+            .page_count = next_page_id,
+        };
+        const compact_header = Header{
+            .page_size = self.header.page_size,
+            .active_checkpoint = 0,
+            .checkpoints = .{ checkpoint, .{} },
+        };
+
+        var encoded_header: [header_size]u8 = undefined;
+        encodeHeader(&encoded_header, compact_header);
+        @memcpy(image.items[0..header_size], &encoded_header);
+
+        try self.replaceOpenFileWithImage(image.items);
+        self.header = compact_header;
+
+        const after_size: u64 = @intCast(image.items.len);
+        return .{
+            .before_size = before_size,
+            .after_size = after_size,
+            .reclaimed_bytes = if (before_size > after_size) before_size - after_size else 0,
+            .live_file_count = @intCast(catalog_records.len + index_catalog_records.len + docs.len),
+            .live_bytes = live_bytes,
+        };
+    }
+
+    pub fn copyStableSnapshotToPath(self: *NativeFile, dest_path: []const u8, replace: bool) !StableSnapshotReport {
+        if (std.mem.eql(u8, self.path, dest_path) or try pathsReferToSameExistingFile(self.allocator, self.io_impl.io(), self.path, dest_path)) {
+            return error.InvalidNativeSnapshotPath;
+        }
+        const dest_exists = pathExists(self.io_impl.io(), dest_path);
+        if (!replace and dest_exists) return error.PathAlreadyExists;
+
+        var dest_lock = try lockWriterPath(self.allocator, dest_path);
+        defer dest_lock.close();
+
+        if (!replace and !dest_exists and pathExists(self.io_impl.io(), dest_path)) return error.PathAlreadyExists;
+
+        const checkpoint = self.activeCheckpoint();
+        const snapshot_size = try checkpointPrefixSize(checkpoint, self.header.page_size);
+        const source_size = (try self.file.stat(self.io_impl.io())).size;
+        if (source_size < snapshot_size) return error.TruncatedNativeSnapshotSource;
+
+        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp-aflite-snapshot", .{dest_path});
+        defer self.allocator.free(tmp_path);
+        errdefer deleteFilePath(self.io_impl.io(), tmp_path) catch {};
+
+        {
+            var out_file = try createSnapshotFile(self.io_impl.io(), tmp_path);
+            defer out_file.close(self.io_impl.io());
+
+            const chunk_size: usize = 1024 * 1024;
+            const buffer_len: usize = @intCast(@min(@as(u64, chunk_size), snapshot_size));
+            const buffer = try self.allocator.alloc(u8, @max(buffer_len, 1));
+            defer self.allocator.free(buffer);
+
+            var offset: u64 = 0;
+            while (offset < snapshot_size) {
+                const len: usize = @intCast(@min(@as(u64, buffer.len), snapshot_size - offset));
+                try readExactAt(self.file, self.io_impl.io(), buffer[0..len], offset);
+                try out_file.writePositionalAll(self.io_impl.io(), buffer[0..len], offset);
+                offset += len;
+            }
+            var snapshot_header: [header_size]u8 = undefined;
+            encodeHeader(&snapshot_header, self.header);
+            try out_file.writePositionalAll(self.io_impl.io(), &snapshot_header, 0);
+            try out_file.setLength(self.io_impl.io(), snapshot_size);
+            try out_file.sync(self.io_impl.io());
+        }
+
+        renameFilePath(self.io_impl.io(), tmp_path, dest_path) catch |err| {
+            deleteFilePath(self.io_impl.io(), tmp_path) catch {};
+            return err;
+        };
+
+        return .{
+            .source_size = source_size,
+            .snapshot_size = snapshot_size,
+            .checkpoint_sequence = checkpoint.commit_sequence,
+            .page_count = checkpoint.page_count,
+            .tail_bytes = source_size - snapshot_size,
+        };
+    }
+
+    pub fn maxPagePayloadBytes(self: *const NativeFile) usize {
+        return @as(usize, @intCast(self.header.page_size)) - page_header_size;
+    }
+
+    pub fn maxValuePagePayloadBytes(self: *const NativeFile) usize {
+        return self.maxPagePayloadBytes() - value_page_header_size;
+    }
+
+    fn validateCatalogMutation(self: *const NativeFile, mutation: CatalogMutation) !void {
+        if (mutation.key.len > catalog_key_len_mask or mutation.value.len > std.math.maxInt(u32)) return error.RecordTooLarge;
+        const fixed_len = 16 + mutation.key.len;
+        if (fixed_len > self.maxPagePayloadBytes()) return error.PageTooLarge;
+        if (mutation.is_delete) return;
+        if (mutation.value.len <= self.maxPagePayloadBytes() - fixed_len) return;
+        if (value_page_header_size > self.maxPagePayloadBytes()) return error.InvalidNativePageLength;
+        if (fixed_len + 8 > self.maxPagePayloadBytes()) return error.PageTooLarge;
+    }
+
+    fn catalogEntryFitsInline(self: *const NativeFile, key: []const u8, value: []const u8) bool {
+        const fixed_len = 16 + key.len;
+        return fixed_len <= self.maxPagePayloadBytes() and value.len <= self.maxPagePayloadBytes() - fixed_len;
+    }
+
+    fn catalogEntryValueAlloc(self: *NativeFile, allocator: Allocator, entry: CatalogEntry) ![]u8 {
+        if (entry.external_value_root_page != 0) {
+            return try self.readValuePagesAlloc(allocator, entry.external_value_root_page, entry.external_value_len);
+        }
+        return try allocator.dupe(u8, entry.value);
+    }
+
+    fn catalogEntryRangeAlloc(self: *NativeFile, allocator: Allocator, entry: CatalogEntry, offset: u64, len: usize) ![]u8 {
+        const value_len = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
+        if (offset > std.math.maxInt(usize)) return error.EndOfStream;
+        const start: usize = @intCast(offset);
+        if (start > value_len or value_len - start < len) return error.EndOfStream;
+        if (entry.external_value_root_page != 0) {
+            return try self.readValuePagesRangeAlloc(allocator, entry.external_value_root_page, value_len, start, len);
+        }
+        return try allocator.dupe(u8, entry.value[start..][0..len]);
+    }
+
+    fn validateDocumentMutation(self: *const NativeFile, mutation: DocumentMutation) !void {
+        if (mutation.key.len > std.math.maxInt(u32) or mutation.value.len > std.math.maxInt(u32)) return error.RecordTooLarge;
+        const fixed_len = 20 + mutation.key.len;
+        if (fixed_len > self.maxPagePayloadBytes()) return error.PageTooLarge;
+        if (mutation.is_delete) return;
+        if (mutation.value.len <= self.maxPagePayloadBytes() - fixed_len) return;
+        if (value_page_header_size > self.maxPagePayloadBytes()) return error.InvalidNativePageLength;
+        if (fixed_len + 8 > self.maxPagePayloadBytes()) return error.PageTooLarge;
+    }
+
+    fn documentEntryFitsInline(self: *const NativeFile, key: []const u8, value: []const u8) bool {
+        const fixed_len = 20 + key.len;
+        return fixed_len <= self.maxPagePayloadBytes() and value.len <= self.maxPagePayloadBytes() - fixed_len;
+    }
+
+    fn documentEntryValueAlloc(self: *NativeFile, allocator: Allocator, entry: DocumentEntry) ![]u8 {
+        if (entry.external_value_root_page != 0) {
+            return try self.readValuePagesAlloc(allocator, entry.external_value_root_page, entry.external_value_len);
+        }
+        return try allocator.dupe(u8, entry.value);
+    }
+
+    fn readPagePayloadByKindAlloc(self: *NativeFile, allocator: Allocator, page_id: u64, kind: PageKind) ![]u8 {
+        return try self.readPagePayloadByKindAllocForCheckpoint(allocator, page_id, kind, self.activeCheckpoint());
+    }
+
+    fn readPagePayloadByKindAllocForCheckpoint(
+        self: *NativeFile,
+        allocator: Allocator,
+        page_id: u64,
+        kind: PageKind,
+        checkpoint: CheckpointSlot,
+    ) ![]u8 {
+        const page = try self.readPageAllocForCheckpoint(allocator, page_id, checkpoint);
+        defer allocator.free(page);
+        return try decodePagePayloadAlloc(allocator, page, kind);
+    }
+
+    const ReachablePageSet = std.AutoHashMapUnmanaged(u64, void);
+
+    fn markReachablePage(self: *NativeFile, reachable_pages: *ReachablePageSet, page_id: u64, page_count: u64) !void {
+        if (page_id == 0 or page_id >= page_count) return error.InvalidPageId;
+        const entry = try reachable_pages.getOrPut(self.allocator, page_id);
+        if (entry.found_existing) return error.InvalidNativePageChain;
+    }
+
+    fn countReachableChainPages(self: *NativeFile, kind: PageKind, root_page_id: u64, reachable_pages: *ReachablePageSet) !u64 {
+        return try self.countReachableChainPagesForCheckpoint(kind, root_page_id, self.activeCheckpoint(), reachable_pages);
+    }
+
+    fn countReachableChainPagesForCheckpoint(
+        self: *NativeFile,
+        kind: PageKind,
+        root_page_id: u64,
+        checkpoint: CheckpointSlot,
+        reachable_pages: *ReachablePageSet,
+    ) !u64 {
+        var seen_catalog_keys = std.StringHashMapUnmanaged(void).empty;
+        defer {
+            var it = seen_catalog_keys.iterator();
+            while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+            seen_catalog_keys.deinit(self.allocator);
+        }
+
+        var count: u64 = 0;
+        var page_id = root_page_id;
+        while (page_id != 0) {
+            try self.markReachablePage(reachable_pages, page_id, checkpoint.page_count);
+            const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, page_id, kind, checkpoint);
+            defer self.allocator.free(payload);
+            page_id = switch (kind) {
+                .catalog => blk: {
+                    const entry = try decodeCatalogEntry(payload);
+                    const seen = seen_catalog_keys.contains(entry.key);
+                    if (!seen) {
+                        const owned_key = try self.allocator.dupe(u8, entry.key);
+                        errdefer self.allocator.free(owned_key);
+                        try seen_catalog_keys.put(self.allocator, owned_key, {});
+                    }
+                    if (!seen and entry.external_value_root_page != 0) {
+                        try self.validateReachableValuePages(entry.external_value_root_page, entry.external_value_len, checkpoint, reachable_pages);
+                    }
+                    break :blk entry.previous_page;
+                },
+                .document => blk: {
+                    const entry = try decodeDocumentEntry(payload);
+                    if (entry.external_value_root_page != 0) {
+                        try self.validateReachableValuePages(entry.external_value_root_page, entry.external_value_len, checkpoint, reachable_pages);
+                    }
+                    break :blk entry.previous_page;
+                },
+                .data, .value, .free_map => return error.UnexpectedNativePageKind,
+            };
+            count += 1;
+            if (count > checkpoint.page_count) return error.InvalidNativePageChain;
+        }
+        return count;
+    }
+
+    fn writeValuePagesAllocated(self: *NativeFile, page_allocator: *PageAllocator, value: []const u8) !u64 {
+        if (value.len == 0) return error.InvalidNativeValueChain;
+        const chunk_size = self.maxValuePagePayloadBytes();
+        if (chunk_size == 0) return error.InvalidNativePageLength;
+        const page_count = std.math.divCeil(usize, value.len, chunk_size) catch unreachable;
+
+        const page_ids = try self.allocator.alloc(u64, page_count);
+        defer self.allocator.free(page_ids);
+        for (page_ids) |*page_id| page_id.* = try page_allocator.allocate();
+
+        var offset: usize = 0;
+        var page_index: usize = 0;
+        while (offset < value.len) : (page_index += 1) {
+            const len = @min(chunk_size, value.len - offset);
+            const page_id = page_ids[page_index];
+            const next_page = if (page_index + 1 < page_count) page_ids[page_index + 1] else 0;
+
+            const payload = try self.allocator.alloc(u8, value_page_header_size + len);
+            defer self.allocator.free(payload);
+            std.mem.writeInt(u64, payload[0..8], next_page, .little);
+            @memcpy(payload[value_page_header_size..][0..len], value[offset..][0..len]);
+
+            try self.writePage(page_id, .value, payload);
+            offset += len;
+        }
+
+        return page_ids[0];
+    }
+
+    fn copyValuePagesAllocated(self: *NativeFile, page_allocator: *PageAllocator, root_page_id: u64, value_len: usize) !u64 {
+        if (value_len == 0 or root_page_id == 0) return error.InvalidNativeValueChain;
+        const page_count = try self.countValuePages(root_page_id, value_len);
+
+        const page_ids = try self.allocator.alloc(u64, page_count);
+        defer self.allocator.free(page_ids);
+        for (page_ids) |*page_id| page_id.* = try page_allocator.allocate();
+
+        var remaining = value_len;
+        var source_page_id = root_page_id;
+        var page_index: usize = 0;
+        while (source_page_id != 0) : (page_index += 1) {
+            if (page_index >= page_ids.len) return error.InvalidNativeValueChain;
+            const payload = try self.readPagePayloadByKindAlloc(self.allocator, source_page_id, .value);
+            defer self.allocator.free(payload);
+            const page = try decodeValuePage(payload);
+            if (page.chunk.len == 0) return error.InvalidNativeValueChain;
+            if (page.chunk.len > remaining) return error.InvalidNativeValueChain;
+
+            const dest_page_id = page_ids[page_index];
+            const next_dest_page_id = if (page_index + 1 < page_ids.len) page_ids[page_index + 1] else 0;
+            const copied_payload = try self.allocator.alloc(u8, value_page_header_size + page.chunk.len);
+            defer self.allocator.free(copied_payload);
+            std.mem.writeInt(u64, copied_payload[0..8], next_dest_page_id, .little);
+            @memcpy(copied_payload[value_page_header_size..], page.chunk);
+            try self.writePage(dest_page_id, .value, copied_payload);
+
+            remaining -= page.chunk.len;
+            source_page_id = page.next_page;
+            if (remaining == 0 and source_page_id != 0) return error.InvalidNativeValueChain;
+        }
+
+        if (remaining != 0 or page_index != page_ids.len) return error.InvalidNativeValueChain;
+        return page_ids[0];
+    }
+
+    fn writeAppendedCatalogValuePagesAllocated(
+        self: *NativeFile,
+        page_allocator: *PageAllocator,
+        entry: CatalogEntry,
+        suffix: []const u8,
+        total_len: usize,
+    ) !u64 {
+        if (total_len == 0) return error.InvalidNativeValueChain;
+        const old_page_count: usize = if (entry.external_value_root_page != 0)
+            try self.countValuePages(entry.external_value_root_page, entry.external_value_len)
+        else if (entry.value.len > 0)
+            1
+        else
+            0;
+        const suffix_page_count: usize = if (suffix.len == 0)
+            0
+        else
+            std.math.divCeil(usize, suffix.len, self.maxValuePagePayloadBytes()) catch unreachable;
+        const page_count = try std.math.add(usize, old_page_count, suffix_page_count);
+        if (page_count == 0) return error.InvalidNativeValueChain;
+
+        const page_ids = try self.allocator.alloc(u64, page_count);
+        defer self.allocator.free(page_ids);
+        for (page_ids) |*page_id| page_id.* = try page_allocator.allocate();
+
+        var page_index: usize = 0;
+        if (entry.external_value_root_page != 0) {
+            var remaining = entry.external_value_len;
+            var source_page_id = entry.external_value_root_page;
+            while (source_page_id != 0) : (page_index += 1) {
+                if (page_index >= old_page_count) return error.InvalidNativeValueChain;
+                const payload = try self.readPagePayloadByKindAlloc(self.allocator, source_page_id, .value);
+                defer self.allocator.free(payload);
+                const page = try decodeValuePage(payload);
+                if (page.chunk.len == 0) return error.InvalidNativeValueChain;
+                if (page.chunk.len > remaining) return error.InvalidNativeValueChain;
+                try self.writeValuePageChunk(page_ids, page_index, page.chunk);
+                remaining -= page.chunk.len;
+                source_page_id = page.next_page;
+                if (remaining == 0 and source_page_id != 0) return error.InvalidNativeValueChain;
+            }
+            if (remaining != 0 or page_index != old_page_count) return error.InvalidNativeValueChain;
+        } else if (entry.value.len > 0) {
+            try self.writeValuePageChunk(page_ids, page_index, entry.value);
+            page_index += 1;
+        }
+
+        var suffix_offset: usize = 0;
+        while (suffix_offset < suffix.len) : (page_index += 1) {
+            if (page_index >= page_ids.len) return error.InvalidNativeValueChain;
+            const len = @min(self.maxValuePagePayloadBytes(), suffix.len - suffix_offset);
+            try self.writeValuePageChunk(page_ids, page_index, suffix[suffix_offset..][0..len]);
+            suffix_offset += len;
+        }
+
+        if (page_index != page_ids.len) return error.InvalidNativeValueChain;
+        return page_ids[0];
+    }
+
+    fn countValuePages(self: *NativeFile, root_page_id: u64, value_len: usize) !usize {
+        if (value_len == 0 or root_page_id == 0) return error.InvalidNativeValueChain;
+        var remaining = value_len;
+        var page_id = root_page_id;
+        var count: usize = 0;
+        while (page_id != 0) {
+            count += 1;
+            if (count > self.activeCheckpoint().page_count) return error.InvalidNativeValueChain;
+            const payload = try self.readPagePayloadByKindAlloc(self.allocator, page_id, .value);
+            defer self.allocator.free(payload);
+            const page = try decodeValuePage(payload);
+            if (page.chunk.len == 0) return error.InvalidNativeValueChain;
+            if (page.chunk.len > remaining) return error.InvalidNativeValueChain;
+            remaining -= page.chunk.len;
+            page_id = page.next_page;
+            if (remaining == 0 and page_id != 0) return error.InvalidNativeValueChain;
+        }
+        if (remaining != 0) return error.InvalidNativeValueChain;
+        return count;
+    }
+
+    fn writeValuePageChunk(self: *NativeFile, page_ids: []const u64, page_index: usize, chunk: []const u8) !void {
+        if (chunk.len == 0 or chunk.len > self.maxValuePagePayloadBytes()) return error.InvalidNativeValueChain;
+        const next_page_id = if (page_index + 1 < page_ids.len) page_ids[page_index + 1] else 0;
+        const payload = try self.allocator.alloc(u8, value_page_header_size + chunk.len);
+        defer self.allocator.free(payload);
+        std.mem.writeInt(u64, payload[0..8], next_page_id, .little);
+        @memcpy(payload[value_page_header_size..], chunk);
+        try self.writePage(page_ids[page_index], .value, payload);
+    }
+
+    fn pageAllocatorFromFreeMap(self: *NativeFile, checkpoint: CheckpointSlot) !PageAllocator {
+        var free_pages = try self.readFreePagesAlloc(checkpoint);
+        errdefer self.allocator.free(free_pages);
+        try self.validateFreePagesSafeForCheckpointSlots(free_pages);
+        var data_lock_file: ?std.Io.File = null;
+        if (free_pages.len > 0) {
+            data_lock_file = acquireDataRewriteLock(self.io_impl.io(), self.path) catch |err| switch (err) {
+                error.WouldBlock => blk: {
+                    self.allocator.free(free_pages);
+                    free_pages = try self.allocator.alloc(u64, 0);
+                    break :blk null;
+                },
+                else => return err,
+            };
+        }
+        return .{
+            .file = self,
+            .free_pages = free_pages,
+            .next_page_id = checkpoint.page_count,
+            .data_lock_file = data_lock_file,
+        };
+    }
+
+    fn readFreePagesAlloc(self: *NativeFile, checkpoint: CheckpointSlot) ![]u64 {
+        if (checkpoint.free_map_root_page == 0) return try self.allocator.alloc(u64, 0);
+
+        const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
+        defer self.allocator.free(payload);
+        const free_map = try decodeFreeMapAlloc(self.allocator, payload, checkpoint.page_count);
+        return free_map.free_pages;
+    }
+
+    fn writeFreeMapPage(self: *NativeFile, page_id: u64, covered_page_count: u64, free_pages: []const u64) !void {
+        const payload = try encodeFreeMapAlloc(self.allocator, self.header.page_size, covered_page_count, free_pages);
+        defer self.allocator.free(payload);
+        try self.writePage(page_id, .free_map, payload);
+    }
+
+    fn computeFreePagesForPublishedCheckpoint(self: *NativeFile, next: CheckpointSlot, previous: CheckpointSlot) ![]u64 {
+        var reachable_pages = std.AutoHashMapUnmanaged(u64, void){};
+        defer reachable_pages.deinit(self.allocator);
+
+        try self.collectCheckpointReachablePages(next, &reachable_pages);
+        if (validCheckpointSlot(previous)) {
+            try self.collectCheckpointReachablePages(previous, &reachable_pages);
+        }
+
+        var free_pages = std.ArrayListUnmanaged(u64).empty;
+        errdefer free_pages.deinit(self.allocator);
+
+        const max_entries = maxFreeMapEntries(self.header.page_size);
+        var page_id: u64 = 1;
+        while (page_id < next.page_count and free_pages.items.len < max_entries) : (page_id += 1) {
+            if (!reachable_pages.contains(page_id)) {
+                try free_pages.append(self.allocator, page_id);
+            }
+        }
+
+        return try free_pages.toOwnedSlice(self.allocator);
+    }
+
+    fn collectCheckpointReachablePages(self: *NativeFile, checkpoint: CheckpointSlot, out: *ReachablePageSet) !void {
+        var checkpoint_pages = std.AutoHashMapUnmanaged(u64, void){};
+        defer checkpoint_pages.deinit(self.allocator);
+
+        _ = try self.countReachableChainPagesForCheckpoint(.catalog, checkpoint.catalog_root_page, checkpoint, &checkpoint_pages);
+        _ = try self.countReachableChainPagesForCheckpoint(.catalog, checkpoint.index_catalog_root_page, checkpoint, &checkpoint_pages);
+        _ = try self.countReachableChainPagesForCheckpoint(.document, checkpoint.document_root_page, checkpoint, &checkpoint_pages);
+        if (checkpoint.free_map_root_page != 0) {
+            try self.markReachablePage(&checkpoint_pages, checkpoint.free_map_root_page, checkpoint.page_count);
+        }
+
+        var it = checkpoint_pages.iterator();
+        while (it.next()) |entry| {
+            try out.put(self.allocator, entry.key_ptr.*, {});
+        }
+    }
+
+    fn collectAllValidCheckpointReachablePages(self: *NativeFile, out: *ReachablePageSet) !void {
+        const file_size = (try self.file.stat(self.io_impl.io())).size;
+        for (self.header.checkpoints) |slot| {
+            if (!validCheckpointSlot(slot)) continue;
+            const expected_size = checkpointPrefixSize(slot, self.header.page_size) catch continue;
+            if (expected_size > file_size) continue;
+            try self.collectCheckpointReachablePages(slot, out);
+        }
+    }
+
+    fn validateFreePagesSafeForCheckpointSlots(self: *NativeFile, free_pages: []const u64) !void {
+        var protected_pages = std.AutoHashMapUnmanaged(u64, void){};
+        defer protected_pages.deinit(self.allocator);
+
+        try self.collectAllValidCheckpointReachablePages(&protected_pages);
+        for (free_pages) |page_id| {
+            if (protected_pages.contains(page_id)) return error.InvalidNativeFreeMap;
+        }
+    }
+
+    fn readValuePagesAlloc(self: *NativeFile, allocator: Allocator, root_page_id: u64, value_len: usize) ![]u8 {
+        if (value_len == 0 or root_page_id == 0) return error.InvalidNativeValueChain;
+
+        const value = try allocator.alloc(u8, value_len);
+        errdefer allocator.free(value);
+
+        var written: usize = 0;
+        var page_id = root_page_id;
+        var pages_seen: u64 = 0;
+        while (page_id != 0) {
+            pages_seen += 1;
+            if (pages_seen > self.activeCheckpoint().page_count) return error.InvalidNativeValueChain;
+
+            const payload = try self.readPagePayloadByKindAlloc(allocator, page_id, .value);
+            defer allocator.free(payload);
+            const page = try decodeValuePage(payload);
+            if (page.chunk.len == 0) return error.InvalidNativeValueChain;
+            if (page.chunk.len > value_len - written) return error.InvalidNativeValueChain;
+            @memcpy(value[written..][0..page.chunk.len], page.chunk);
+            written += page.chunk.len;
+            page_id = page.next_page;
+            if (written == value_len and page_id != 0) return error.InvalidNativeValueChain;
+        }
+
+        if (written != value_len) return error.InvalidNativeValueChain;
+        return value;
+    }
+
+    fn readValuePagesRangeAlloc(
+        self: *NativeFile,
+        allocator: Allocator,
+        root_page_id: u64,
+        value_len: usize,
+        range_start: usize,
+        range_len: usize,
+    ) ![]u8 {
+        if (value_len == 0 or root_page_id == 0) return error.InvalidNativeValueChain;
+
+        const out = try allocator.alloc(u8, range_len);
+        errdefer allocator.free(out);
+
+        const range_end = range_start + range_len;
+        var value_offset: usize = 0;
+        var written: usize = 0;
+        var page_id = root_page_id;
+        var pages_seen: u64 = 0;
+        while (page_id != 0) {
+            pages_seen += 1;
+            if (pages_seen > self.activeCheckpoint().page_count) return error.InvalidNativeValueChain;
+
+            const payload = try self.readPagePayloadByKindAlloc(allocator, page_id, .value);
+            defer allocator.free(payload);
+            const page = try decodeValuePage(payload);
+            if (page.chunk.len == 0) return error.InvalidNativeValueChain;
+            if (page.chunk.len > value_len - value_offset) return error.InvalidNativeValueChain;
+
+            const page_start = value_offset;
+            const page_end = page_start + page.chunk.len;
+            if (page_end > range_start and page_start < range_end) {
+                const copy_start = if (range_start > page_start) range_start - page_start else 0;
+                const copy_end = @min(page.chunk.len, range_end - page_start);
+                const copy_len = copy_end - copy_start;
+                @memcpy(out[written..][0..copy_len], page.chunk[copy_start..][0..copy_len]);
+                written += copy_len;
+            }
+
+            value_offset = page_end;
+            page_id = page.next_page;
+            if (value_offset == value_len and page_id != 0) return error.InvalidNativeValueChain;
+            if (value_offset >= range_end and written == range_len) {
+                break;
+            }
+        }
+
+        if (written != range_len) return error.InvalidNativeValueChain;
+        return out;
+    }
+
+    fn validateReachableValuePages(
+        self: *NativeFile,
+        root_page_id: u64,
+        value_len: usize,
+        checkpoint: CheckpointSlot,
+        reachable_pages: *ReachablePageSet,
+    ) !void {
+        if (value_len == 0 or root_page_id == 0) return error.InvalidNativeValueChain;
+
+        var remaining = value_len;
+        var page_id = root_page_id;
+        var pages_seen: u64 = 0;
+        while (page_id != 0) {
+            pages_seen += 1;
+            if (pages_seen > checkpoint.page_count) return error.InvalidNativeValueChain;
+
+            try self.markReachablePage(reachable_pages, page_id, checkpoint.page_count);
+            const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, page_id, .value, checkpoint);
+            defer self.allocator.free(payload);
+
+            const page = try decodeValuePage(payload);
+            if (page.chunk.len == 0) return error.InvalidNativeValueChain;
+            if (page.chunk.len > remaining) return error.InvalidNativeValueChain;
+            remaining -= page.chunk.len;
+            page_id = page.next_page;
+            if (remaining == 0 and page_id != 0) return error.InvalidNativeValueChain;
+        }
+
+        if (remaining != 0) return error.InvalidNativeValueChain;
+    }
+
+    fn validateReachableFreeMap(self: *NativeFile, checkpoint: CheckpointSlot, reachable_pages: *ReachablePageSet) !void {
+        if (checkpoint.free_map_root_page == 0) return;
+        try self.markReachablePage(reachable_pages, checkpoint.free_map_root_page, checkpoint.page_count);
+
+        const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
+        defer self.allocator.free(payload);
+        const free_map = try decodeFreeMapAlloc(self.allocator, payload, checkpoint.page_count);
+        defer self.allocator.free(free_map.free_pages);
+
+        for (free_map.free_pages) |page_id| {
+            if (reachable_pages.contains(page_id)) return error.InvalidNativeFreeMap;
+        }
+        try self.validateFreePagesSafeForCheckpointSlots(free_map.free_pages);
+    }
+
+    const LiveStats = struct {
+        record_count: u64,
+        bytes: u64,
+        compact_size: u64,
+    };
+
+    fn liveStats(self: *NativeFile) !LiveStats {
+        const catalog_records = try self.snapshotCatalogRecordsAlloc(self.allocator);
+        defer freeSnapshotCatalogRecords(self.allocator, catalog_records);
+
+        const index_catalog_records = try self.snapshotIndexCatalogRecordsAlloc(self.allocator);
+        defer freeSnapshotCatalogRecords(self.allocator, index_catalog_records);
+
+        const docs = try self.snapshotDocumentsAlloc(self.allocator);
+        defer freeSnapshotDocuments(self.allocator, docs);
+
+        var live_bytes: u64 = 0;
+        var compact_pages: u64 = 1;
+
+        for (catalog_records) |record| {
+            live_bytes +|= record.key.len + record.value.len;
+            compact_pages += 1;
+            if (record.value.len != 0 and !self.catalogEntryFitsInline(record.key, record.value)) {
+                compact_pages += self.valuePageCount(record.value.len);
+            }
+        }
+
+        for (index_catalog_records) |record| {
+            live_bytes +|= record.key.len + record.value.len;
+            compact_pages += 1;
+            if (record.value.len != 0 and !self.catalogEntryFitsInline(record.key, record.value)) {
+                compact_pages += self.valuePageCount(record.value.len);
+            }
+        }
+
+        for (docs) |doc| {
+            live_bytes +|= doc.key.len + doc.value.len;
+            compact_pages += 1;
+            if (!self.documentEntryFitsInline(doc.key, doc.value)) {
+                compact_pages += self.valuePageCount(doc.value.len);
+            }
+        }
+        if (self.activeCheckpoint().free_map_root_page != 0) compact_pages += 1;
+
+        return .{
+            .record_count = @intCast(catalog_records.len + index_catalog_records.len + docs.len),
+            .bytes = live_bytes,
+            .compact_size = compact_pages * @as(u64, self.header.page_size),
+        };
+    }
+
+    fn valuePageCount(self: *const NativeFile, value_len: usize) u64 {
+        std.debug.assert(value_len > 0);
+        return @intCast(std.math.divCeil(usize, value_len, self.maxValuePagePayloadBytes()) catch unreachable);
+    }
+
+    fn writePage(self: *NativeFile, page_id: u64, kind: PageKind, contents: []const u8) !void {
+        if (contents.len > self.maxPagePayloadBytes()) return error.PageTooLarge;
+
+        const page_size: usize = @intCast(self.header.page_size);
+        const page_offset = page_id * @as(u64, self.header.page_size);
+
+        const page = try self.allocator.alloc(u8, page_size);
+        defer self.allocator.free(page);
+        encodePage(page, kind, contents);
+
+        const page_end = page_offset + self.header.page_size;
+        const file_size = (try self.file.stat(self.io_impl.io())).size;
+        if (file_size < page_end) {
+            try self.file.setLength(self.io_impl.io(), page_end);
+        }
+        try self.file.writePositionalAll(self.io_impl.io(), page, page_offset);
+    }
+
+    fn publishCheckpoint(self: *NativeFile, checkpoint: CheckpointSlot) !void {
+        const next_slot: u8 = if (self.header.active_checkpoint == 0) 1 else 0;
+
+        var encoded_slot: [checkpoint_slot_size]u8 = undefined;
+        encodeCheckpointSlot(&encoded_slot, checkpoint);
+
+        try self.file.writePositionalAll(self.io_impl.io(), &encoded_slot, checkpointOffset(next_slot));
+        try self.syncIfRequired();
+        const active_checkpoint: [1]u8 = .{next_slot};
+        try self.file.writePositionalAll(self.io_impl.io(), &active_checkpoint, active_checkpoint_offset);
+        try self.syncIfRequired();
+
+        self.header.checkpoints[next_slot] = checkpoint;
+        self.header.active_checkpoint = next_slot;
+    }
+
+    fn syncIfRequired(self: *NativeFile) !void {
+        if (!self.no_sync) try self.file.sync(self.io_impl.io());
+    }
+    fn replaceOpenFileWithImage(self: *NativeFile, contents: []const u8) !void {
+        const io = self.io_impl.io();
+        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp-aflite-vacuum", .{self.path});
+        defer self.allocator.free(tmp_path);
+        errdefer deleteFilePath(io, tmp_path) catch {};
+
+        {
+            var tmp_file = try createSnapshotFile(io, tmp_path);
+            defer tmp_file.close(io);
+            try tmp_file.writePositionalAll(io, contents, 0);
+            try tmp_file.setLength(io, contents.len);
+            if (!self.no_sync) try tmp_file.sync(io);
+        }
+
+        try renameFilePath(io, tmp_path, self.path);
+        errdefer {
+            self.file = openDataFile(io, self.path, .writer) catch self.file;
+        }
+
+        const replacement = try openDataFile(io, self.path, .writer);
+        self.file.close(io);
+        self.file = replacement;
+    }
+};
+
+fn appendPageToImage(
+    allocator: Allocator,
+    image: *std.ArrayListUnmanaged(u8),
+    page_size: usize,
+    next_page_id: *u64,
+    kind: PageKind,
+    contents: []const u8,
+) !u64 {
+    if (contents.len > page_size - page_header_size) return error.PageTooLarge;
+    const page_id = next_page_id.*;
+    const page_offset = page_id * @as(u64, @intCast(page_size));
+    if (image.items.len != page_offset) return error.InvalidNativeCheckpoint;
+    try image.resize(allocator, image.items.len + page_size);
+    encodePage(image.items[@intCast(page_offset)..][0..page_size], kind, contents);
+    next_page_id.* += 1;
+    return page_id;
+}
+
+fn appendValuePagesToImage(
+    allocator: Allocator,
+    image: *std.ArrayListUnmanaged(u8),
+    page_size: usize,
+    chunk_size: usize,
+    next_page_id: *u64,
+    value: []const u8,
+) !u64 {
+    if (value.len == 0) return error.InvalidNativeValueChain;
+    if (chunk_size == 0) return error.InvalidNativePageLength;
+    const page_count = std.math.divCeil(usize, value.len, chunk_size) catch unreachable;
+    const root_page_id = next_page_id.*;
+
+    var offset: usize = 0;
+    var page_index: usize = 0;
+    while (offset < value.len) : (page_index += 1) {
+        const len = @min(chunk_size, value.len - offset);
+        const current_page_id = next_page_id.*;
+        const next_value_page = if (page_index + 1 < page_count) current_page_id + 1 else 0;
+
+        const payload = try allocator.alloc(u8, value_page_header_size + len);
+        defer allocator.free(payload);
+        std.mem.writeInt(u64, payload[0..8], next_value_page, .little);
+        @memcpy(payload[value_page_header_size..][0..len], value[offset..][0..len]);
+
+        _ = try appendPageToImage(allocator, image, page_size, next_page_id, .value, payload);
+        offset += len;
+    }
+
+    return root_page_id;
+}
+
+fn appendFreeMapPageToImage(
+    allocator: Allocator,
+    image: *std.ArrayListUnmanaged(u8),
+    page_size: usize,
+    next_page_id: *u64,
+    covered_page_count: u64,
+    free_pages: []const u64,
+) !u64 {
+    const payload = try encodeFreeMapAlloc(allocator, @intCast(page_size), covered_page_count, free_pages);
+    defer allocator.free(payload);
+    return try appendPageToImage(allocator, image, page_size, next_page_id, .free_map, payload);
+}
+
+fn catalogRootPage(slot: CheckpointSlot, root: CatalogRoot) u64 {
+    return switch (root) {
+        .metadata => slot.catalog_root_page,
+        .index => slot.index_catalog_root_page,
+    };
+}
+
+fn setCatalogRootPage(slot: *CheckpointSlot, root: CatalogRoot, page_id: u64) void {
+    switch (root) {
+        .metadata => slot.catalog_root_page = page_id,
+        .index => slot.index_catalog_root_page = page_id,
+    }
+}
+
+pub fn create(io: std.Io, path: []const u8) !void {
+    var writer_lock_file = try acquireWriterLock(std.heap.page_allocator, io, path);
+    defer writer_lock_file.close(io);
+
+    var encoded: [header_size]u8 = undefined;
+    encodeHeader(&encoded, .{});
+
+    var file = try createDataFile(io, path, .{ .truncate = true });
+    defer file.close(io);
+
+    try file.writePositionalAll(io, &encoded, 0);
+    try file.sync(io);
+}
+
+pub fn lockWriterPath(allocator: Allocator, path: []const u8) !PathWriterLock {
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    errdefer io_impl.deinit();
+
+    const file = try acquireWriterLock(allocator, io_impl.io(), path);
+    errdefer file.close(io_impl.io());
+
+    return .{
+        .io_impl = io_impl,
+        .file = file,
+    };
+}
+
+fn openDataFile(io: std.Io, path: []const u8, lock_mode: LockMode) !std.Io.File {
+    return std.Io.Dir.cwd().openFile(io, path, .{
+        .mode = if (lock_mode == .reader) .read_only else .read_write,
+        .lock = if (lock_mode == .reader) .shared else .none,
+        .lock_nonblocking = true,
+    }) catch |err| switch (err) {
+        error.FileLocksUnsupported => try std.Io.Dir.cwd().openFile(io, path, .{
+            .mode = if (lock_mode == .reader) .read_only else .read_write,
+        }),
+        else => return err,
+    };
+}
+
+const CreateDataFileOptions = struct {
+    truncate: bool = true,
+    exclusive: bool = false,
+};
+
+fn createDataFile(io: std.Io, path: []const u8, opts: CreateDataFileOptions) !std.Io.File {
+    return std.Io.Dir.cwd().createFile(io, path, .{
+        .read = true,
+        .truncate = opts.truncate,
+        .exclusive = opts.exclusive,
+    });
+}
+
+fn acquireWriterLock(allocator: Allocator, io: std.Io, path: []const u8) !std.Io.File {
+    const lock_path = try writerLockPathAlloc(allocator, io, path);
+    defer allocator.free(lock_path);
+    return std.Io.Dir.cwd().createFile(io, lock_path, .{
+        .read = true,
+        .truncate = false,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+    }) catch |err| switch (err) {
+        error.FileLocksUnsupported => try std.Io.Dir.cwd().createFile(io, lock_path, .{
+            .read = true,
+            .truncate = false,
+        }),
+        else => return err,
+    };
+}
+
+fn writerLockPathAlloc(allocator: Allocator, io: std.Io, path: []const u8) ![]u8 {
+    const canonical_data_path = realPathAlloc(allocator, io, path) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (canonical_data_path) |canonical| {
+        defer allocator.free(canonical);
+        return appendLockSuffix(allocator, canonical);
+    }
+
+    const dirname = std.fs.path.dirname(path) orelse ".";
+    const basename = std.fs.path.basename(path);
+    const canonical_parent = try realPathAlloc(allocator, io, dirname);
+    defer allocator.free(canonical_parent);
+    const canonical_missing_path = try std.fs.path.join(allocator, &.{ canonical_parent, basename });
+    defer allocator.free(canonical_missing_path);
+    return appendLockSuffix(allocator, canonical_missing_path);
+}
+
+fn pathsReferToSameExistingFile(allocator: Allocator, io: std.Io, a: []const u8, b: []const u8) !bool {
+    const a_real = realPathAlloc(allocator, io, a) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return err,
+    };
+    defer allocator.free(a_real);
+
+    const b_real = realPathAlloc(allocator, io, b) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return err,
+    };
+    defer allocator.free(b_real);
+
+    return std.mem.eql(u8, a_real, b_real);
+}
+
+fn realPathAlloc(allocator: Allocator, io: std.Io, path: []const u8) ![:0]u8 {
+    if (std.fs.path.isAbsolute(path)) {
+        return try std.Io.Dir.realPathFileAbsoluteAlloc(io, path, allocator);
+    }
+    return try std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator);
+}
+
+fn appendLockSuffix(allocator: Allocator, path: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(allocator, "{s}.lock", .{path});
+}
+
+fn acquireDataRewriteLock(io: std.Io, path: []const u8) !std.Io.File {
+    return std.Io.Dir.cwd().openFile(io, path, .{
+        .mode = .read_write,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+    }) catch |err| switch (err) {
+        error.FileLocksUnsupported => try std.Io.Dir.cwd().openFile(io, path, .{
+            .mode = .read_write,
+        }),
+        else => return err,
+    };
+}
+
+fn pathExists(io: std.Io, path: []const u8) bool {
+    if (std.fs.path.isAbsolute(path)) {
+        std.Io.Dir.accessAbsolute(io, path, .{}) catch return false;
+    } else {
+        std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    }
+    return true;
+}
+
+fn createSnapshotFile(io: std.Io, path: []const u8) !std.Io.File {
+    if (std.fs.path.isAbsolute(path)) {
+        return try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
+    }
+    return try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+}
+
+fn renameFilePath(io: std.Io, old_path: []const u8, new_path: []const u8) !void {
+    if (std.fs.path.isAbsolute(old_path) and std.fs.path.isAbsolute(new_path)) {
+        try std.Io.Dir.renameAbsolute(old_path, new_path, io);
+    } else {
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), old_path, std.Io.Dir.cwd(), new_path, io);
+    }
+}
+
+fn deleteFilePath(io: std.Io, path: []const u8) !void {
+    if (std.fs.path.isAbsolute(path)) {
+        try std.Io.Dir.deleteFileAbsolute(io, path);
+    } else {
+        try std.Io.Dir.cwd().deleteFile(io, path);
+    }
+}
+
+pub fn inspect(_: Allocator, io: std.Io, path: []const u8) !InspectReport {
+    var file = try openDataFile(io, path, .reader);
+    defer file.close(io);
+
+    var header_bytes: [header_size]u8 = undefined;
+    try readHeaderExactAt(file, io, &header_bytes);
+    return inspectBytes(&header_bytes);
+}
+
+pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var file = try openDataFile(io, path, .reader);
+    defer file.close(io);
+
+    const file_size = (try file.stat(io)).size;
+    var header_bytes: [header_size]u8 = undefined;
+    const read = try file.readPositionalAll(io, &header_bytes, 0);
+    if (read != header_size) {
+        return invalidCheck(.{
+            .valid = true,
+            .file_size = file_size,
+            .valid_prefix_size = 0,
+            .tail_bytes = file_size,
+            .record_count = 0,
+            .live_file_count = 0,
+            .live_bytes = 0,
+            .compact_size = 0,
+            .reclaimable_bytes = 0,
+        }, "truncated_header");
+    }
+    const header = decodeHeader(&header_bytes) catch |err| {
+        return invalidCheck(.{
+            .valid = true,
+            .file_size = file_size,
+            .valid_prefix_size = 0,
+            .tail_bytes = file_size,
+            .record_count = 0,
+            .live_file_count = 0,
+            .live_bytes = 0,
+            .compact_size = 0,
+            .reclaimable_bytes = 0,
+        }, issueForDecodeError(err));
+    };
+    _ = selectCompleteCheckpointForFile(header, file_size) catch |err| {
+        const checkpoint = header.checkpoints[header.active_checkpoint];
+        const expected_size = checkpointPrefixSize(checkpoint, header.page_size) catch 0;
+        return invalidCheck(.{
+            .valid = true,
+            .file_size = file_size,
+            .valid_prefix_size = file_size,
+            .tail_bytes = 0,
+            .record_count = if (expected_size > 0 and checkpoint.page_count > 0) checkpoint.page_count - 1 else 0,
+            .live_file_count = 0,
+            .live_bytes = 0,
+            .compact_size = expected_size,
+            .reclaimable_bytes = 0,
+        }, switch (err) {
+            error.InvalidNativeCheckpoint => "invalid_checkpoint",
+            error.TruncatedNativeFile => "truncated_file",
+        });
+    };
+    var native_file = try NativeFile.open(allocator, path, true);
+    defer native_file.close();
+    return try native_file.check();
+}
+
+pub fn copyStableSnapshot(allocator: Allocator, source_path: []const u8, dest_path: []const u8, replace: bool) !StableSnapshotReport {
+    if (std.mem.eql(u8, source_path, dest_path)) return error.InvalidNativeSnapshotPath;
+
+    var source = try NativeFile.open(allocator, source_path, true);
+    defer source.close();
+    return try source.copyStableSnapshotToPath(dest_path, replace);
+}
+
+pub fn inspectBytes(raw: []const u8) InspectReport {
+    const header = decodeHeader(raw) catch |err| {
+        return .{
+            .valid = false,
+            .format_version = 0,
+            .page_size = 0,
+            .active_checkpoint = 0,
+            .commit_sequence = 0,
+            .page_count = 0,
+            .issue = issueForDecodeError(err),
+        };
+    };
+    const active = header.checkpoints[header.active_checkpoint];
+    return .{
+        .valid = true,
+        .format_version = format_version,
+        .page_size = header.page_size,
+        .active_checkpoint = header.active_checkpoint,
+        .commit_sequence = active.commit_sequence,
+        .page_count = active.page_count,
+    };
+}
+
+pub fn encodeHeader(out: *[header_size]u8, header: Header) void {
+    @memset(out, 0);
+    @memcpy(out[magic_offset..][0..magic.len], magic);
+    std.mem.writeInt(u32, out[version_offset..][0..4], format_version, .little);
+    std.mem.writeInt(u32, out[page_size_offset..][0..4], header.page_size, .little);
+    std.mem.writeInt(u32, out[header_size_offset..][0..4], header_size, .little);
+    out[active_checkpoint_offset] = header.active_checkpoint;
+
+    for (header.checkpoints, 0..) |slot, index| {
+        encodeCheckpointSlot(out[checkpointOffset(index)..][0..checkpoint_slot_size], slot);
+    }
+
+    std.mem.writeInt(u32, out[header_checksum_offset..][0..4], headerChecksum(out), .little);
+}
+
+pub fn decodeHeader(raw: []const u8) !Header {
+    if (raw.len < header_size) return error.TruncatedNativeHeader;
+    const header_raw = raw[0..header_size];
+    if (!std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], magic)) return error.InvalidNativeMagic;
+
+    const version = std.mem.readInt(u32, header_raw[version_offset..][0..4], .little);
+    if (version != format_version) return error.UnsupportedNativeFormatVersion;
+
+    const encoded_header_size = std.mem.readInt(u32, header_raw[header_size_offset..][0..4], .little);
+    if (encoded_header_size != header_size) return error.InvalidNativeHeaderSize;
+
+    const expected_checksum = std.mem.readInt(u32, header_raw[header_checksum_offset..][0..4], .little);
+    if (expected_checksum != headerChecksum(header_raw)) return error.NativeHeaderChecksumMismatch;
+
+    const page_size = std.mem.readInt(u32, header_raw[page_size_offset..][0..4], .little);
+    if (!validPageSize(page_size)) return error.InvalidNativePageSize;
+
+    const active_hint = header_raw[active_checkpoint_offset];
+
+    var checkpoints: [checkpoint_slot_count]CheckpointSlot = undefined;
+    var valid_slots: [checkpoint_slot_count]bool = .{false} ** checkpoint_slot_count;
+    for (&checkpoints, 0..) |*slot, index| {
+        slot.* = decodeCheckpointSlot(header_raw[checkpointOffset(index)..][0..checkpoint_slot_size]) catch {
+            slot.* = .{};
+            continue;
+        };
+        valid_slots[index] = validCheckpointSlot(slot.*);
+    }
+    const active_checkpoint = try selectActiveCheckpoint(checkpoints, valid_slots, active_hint);
+
+    return .{
+        .page_size = page_size,
+        .active_checkpoint = active_checkpoint,
+        .checkpoints = checkpoints,
+    };
+}
+
+fn checkpointOffset(index: usize) usize {
+    return checkpoint_slots_offset + index * checkpoint_slot_size;
+}
+
+fn encodeCheckpointSlot(out: []u8, slot: CheckpointSlot) void {
+    std.debug.assert(out.len == checkpoint_slot_size);
+    @memset(out, 0);
+    std.mem.writeInt(u64, out[0..8], slot.commit_sequence, .little);
+    std.mem.writeInt(u64, out[8..16], slot.catalog_root_page, .little);
+    std.mem.writeInt(u64, out[16..24], slot.document_root_page, .little);
+    std.mem.writeInt(u64, out[24..32], slot.index_catalog_root_page, .little);
+    std.mem.writeInt(u64, out[32..40], slot.free_map_root_page, .little);
+    std.mem.writeInt(u64, out[40..48], slot.page_count, .little);
+    std.mem.writeInt(u32, out[checkpoint_slot_checksum_offset..][0..4], checkpointSlotChecksum(out), .little);
+}
+
+fn decodeCheckpointSlot(raw: []const u8) !CheckpointSlot {
+    std.debug.assert(raw.len == checkpoint_slot_size);
+    const expected_checksum = std.mem.readInt(u32, raw[checkpoint_slot_checksum_offset..][0..4], .little);
+    if (expected_checksum != 0 and expected_checksum != checkpointSlotChecksum(raw)) return error.NativeCheckpointChecksumMismatch;
+    return .{
+        .commit_sequence = std.mem.readInt(u64, raw[0..8], .little),
+        .catalog_root_page = std.mem.readInt(u64, raw[8..16], .little),
+        .document_root_page = std.mem.readInt(u64, raw[16..24], .little),
+        .index_catalog_root_page = std.mem.readInt(u64, raw[24..32], .little),
+        .free_map_root_page = std.mem.readInt(u64, raw[32..40], .little),
+        .page_count = std.mem.readInt(u64, raw[40..48], .little),
+    };
+}
+
+fn validCheckpointSlot(slot: CheckpointSlot) bool {
+    if (slot.page_count == 0) return false;
+    if (!validCheckpointRoot(slot.catalog_root_page, slot.page_count)) return false;
+    if (!validCheckpointRoot(slot.document_root_page, slot.page_count)) return false;
+    if (!validCheckpointRoot(slot.index_catalog_root_page, slot.page_count)) return false;
+    if (!validCheckpointRoot(slot.free_map_root_page, slot.page_count)) return false;
+    return true;
+}
+
+fn checkpointPrefixSize(slot: CheckpointSlot, page_size: u32) !u64 {
+    return std.math.mul(u64, slot.page_count, @as(u64, page_size)) catch error.InvalidNativeCheckpoint;
+}
+
+fn validCheckpointRoot(root_page: u64, page_count: u64) bool {
+    return root_page == 0 or root_page < page_count;
+}
+
+fn selectActiveCheckpoint(
+    checkpoints: [checkpoint_slot_count]CheckpointSlot,
+    valid_slots: [checkpoint_slot_count]bool,
+    active_hint: u8,
+) !u8 {
+    var best: ?u8 = null;
+    for (checkpoints, 0..) |slot, index| {
+        if (!valid_slots[index]) continue;
+        const slot_index: u8 = @intCast(index);
+        if (best) |best_index| {
+            const best_slot = checkpoints[best_index];
+            if (slot.commit_sequence > best_slot.commit_sequence or
+                (slot.commit_sequence == best_slot.commit_sequence and slot_index == active_hint))
+            {
+                best = slot_index;
+            }
+        } else {
+            best = slot_index;
+        }
+    }
+    return best orelse error.InvalidNativeCheckpoint;
+}
+
+fn selectCompleteCheckpointForFile(header: Header, file_size: u64) !u8 {
+    var best: ?u8 = null;
+    var saw_valid_slot = false;
+    var saw_invalid_size = false;
+    for (header.checkpoints, 0..) |slot, index| {
+        if (!validCheckpointSlot(slot)) continue;
+        saw_valid_slot = true;
+        const expected_size = checkpointPrefixSize(slot, header.page_size) catch {
+            saw_invalid_size = true;
+            continue;
+        };
+        if (expected_size > file_size) continue;
+        const slot_index: u8 = @intCast(index);
+        if (best) |best_index| {
+            const best_slot = header.checkpoints[best_index];
+            if (slot.commit_sequence > best_slot.commit_sequence or
+                (slot.commit_sequence == best_slot.commit_sequence and slot_index == header.active_checkpoint))
+            {
+                best = slot_index;
+            }
+        } else {
+            best = slot_index;
+        }
+    }
+    if (best) |index| return index;
+    if (saw_invalid_size) return error.InvalidNativeCheckpoint;
+    return if (saw_valid_slot) error.TruncatedNativeFile else error.InvalidNativeCheckpoint;
+}
+
+fn encodePage(out: []u8, kind: PageKind, payload: []const u8) void {
+    std.debug.assert(out.len >= page_header_size);
+    std.debug.assert(payload.len <= out.len - page_header_size);
+    @memset(out, 0);
+    @memcpy(out[0..page_magic.len], page_magic);
+    out[4] = @intFromEnum(kind);
+    std.mem.writeInt(u32, out[8..12], @intCast(payload.len), .little);
+    @memcpy(out[page_header_size..][0..payload.len], payload);
+
+    var crc = std.hash.Crc32.init();
+    crc.update(out[0..page_crc_offset]);
+    crc.update(out[page_header_size..][0..payload.len]);
+    std.mem.writeInt(u32, out[page_crc_offset..][0..4], crc.final(), .little);
+}
+
+fn decodePagePayloadAlloc(allocator: Allocator, raw: []const u8, expected_kind: PageKind) ![]u8 {
+    if (raw.len < page_header_size) return error.TruncatedNativePage;
+    if (!std.mem.eql(u8, raw[0..page_magic.len], page_magic)) return error.InvalidNativePageMagic;
+    const kind_raw = raw[4];
+    const kind: PageKind = switch (kind_raw) {
+        @intFromEnum(PageKind.data) => .data,
+        @intFromEnum(PageKind.catalog) => .catalog,
+        @intFromEnum(PageKind.document) => .document,
+        @intFromEnum(PageKind.value) => .value,
+        @intFromEnum(PageKind.free_map) => .free_map,
+        else => return error.InvalidNativePageKind,
+    };
+    if (kind != expected_kind) return error.UnexpectedNativePageKind;
+
+    const payload_len = std.mem.readInt(u32, raw[8..12], .little);
+    if (payload_len > raw.len - page_header_size) return error.InvalidNativePageLength;
+
+    var crc = std.hash.Crc32.init();
+    crc.update(raw[0..page_crc_offset]);
+    crc.update(raw[page_header_size..][0..payload_len]);
+    const expected_crc = std.mem.readInt(u32, raw[page_crc_offset..][0..4], .little);
+    if (crc.final() != expected_crc) return error.NativePageChecksumMismatch;
+
+    return try allocator.dupe(u8, raw[page_header_size..][0..payload_len]);
+}
+
+fn encodeCatalogEntry(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), entry: CatalogEntry) !void {
+    try encodeCatalogEntryRaw(allocator, out, .{
+        .previous_page = entry.previous_page,
+        .key = entry.key,
+        .value = entry.value,
+        .is_delete = entry.is_delete,
+        .external_value_root_page = entry.external_value_root_page,
+        .external_value_len = if (entry.external_value_root_page != 0 and entry.external_value_len == 0) entry.value.len else entry.external_value_len,
+    });
+}
+
+fn encodeCatalogEntryRaw(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), entry: EncodedCatalogEntry) !void {
+    const value_len = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
+    if (entry.key.len > catalog_key_len_mask or value_len > std.math.maxInt(u32)) return error.RecordTooLarge;
+    if (entry.is_delete and entry.external_value_root_page != 0) return error.InvalidNativeCatalogEntryFlags;
+    const external_value = entry.external_value_root_page != 0;
+    if (external_value and entry.external_value_len == 0) return error.InvalidNativeValueChain;
+
+    const start = out.items.len;
+    const stored_value_len: usize = if (external_value) 8 else value_len;
+    try out.resize(allocator, start + 16 + entry.key.len + stored_value_len);
+    const encoded = out.items[start..];
+    std.mem.writeInt(u64, encoded[0..8], entry.previous_page, .little);
+    const key_len_flags: u32 =
+        @as(u32, @intCast(entry.key.len)) |
+        (if (entry.is_delete) catalog_delete_flag else 0) |
+        (if (external_value) catalog_external_value_flag else 0);
+    std.mem.writeInt(u32, encoded[8..12], key_len_flags, .little);
+    std.mem.writeInt(u32, encoded[12..16], @intCast(value_len), .little);
+    @memcpy(encoded[16..][0..entry.key.len], entry.key);
+    if (external_value) {
+        std.mem.writeInt(u64, encoded[16 + entry.key.len ..][0..8], entry.external_value_root_page, .little);
+    } else {
+        @memcpy(encoded[16 + entry.key.len ..][0..entry.value.len], entry.value);
+    }
+}
+
+fn decodeCatalogEntry(raw: []const u8) !CatalogEntry {
+    if (raw.len < 16) return error.TruncatedNativeCatalogEntry;
+    const previous_page = std.mem.readInt(u64, raw[0..8], .little);
+    const key_len_flags = std.mem.readInt(u32, raw[8..12], .little);
+    const flags = key_len_flags & ~catalog_key_len_mask;
+    if (flags & ~(catalog_delete_flag | catalog_external_value_flag) != 0) return error.InvalidNativeCatalogEntryFlags;
+    const is_delete = flags & catalog_delete_flag != 0;
+    const external_value = flags & catalog_external_value_flag != 0;
+    if (is_delete and external_value) return error.InvalidNativeCatalogEntryFlags;
+
+    const key_len = key_len_flags & catalog_key_len_mask;
+    const value_len = std.mem.readInt(u32, raw[12..16], .little);
+    const stored_value_len: u64 = if (external_value) 8 else value_len;
+    const payload_len = @as(u64, key_len) + stored_value_len;
+    if (payload_len > raw.len - 16) return error.TruncatedNativeCatalogEntry;
+    const key_start: usize = 16;
+    const key_end = key_start + @as(usize, @intCast(key_len));
+    const stored_value_end = key_end + @as(usize, @intCast(stored_value_len));
+    const external_value_root_page = if (external_value) blk: {
+        if (value_len == 0) return error.InvalidNativeValueChain;
+        const root = std.mem.readInt(u64, raw[key_end..][0..8], .little);
+        if (root == 0) return error.InvalidNativeValueChain;
+        break :blk root;
+    } else 0;
+    return .{
+        .previous_page = previous_page,
+        .key = raw[key_start..key_end],
+        .value = if (external_value) raw[key_end..key_end] else raw[key_end..stored_value_end],
+        .is_delete = is_delete,
+        .external_value_root_page = external_value_root_page,
+        .external_value_len = if (external_value) @intCast(value_len) else 0,
+    };
+}
+
+fn encodeDocumentEntry(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), entry: DocumentEntry) !void {
+    if (entry.key.len > std.math.maxInt(u32) or entry.value.len > std.math.maxInt(u32)) return error.RecordTooLarge;
+    if (entry.is_delete and entry.external_value_root_page != 0) return error.InvalidNativeDocumentEntryFlags;
+    const external_value = entry.external_value_root_page != 0;
+    if (external_value and entry.value.len == 0) return error.InvalidNativeValueChain;
+
+    const start = out.items.len;
+    const stored_value_len: usize = if (external_value) 8 else entry.value.len;
+    try out.resize(allocator, start + 20 + entry.key.len + stored_value_len);
+    const encoded = out.items[start..];
+    std.mem.writeInt(u64, encoded[0..8], entry.previous_page, .little);
+    encoded[8] =
+        (if (entry.is_delete) document_delete_flag else 0) |
+        (if (external_value) document_external_value_flag else 0);
+    @memset(encoded[9..12], 0);
+    std.mem.writeInt(u32, encoded[12..16], @intCast(entry.key.len), .little);
+    std.mem.writeInt(u32, encoded[16..20], @intCast(entry.value.len), .little);
+    @memcpy(encoded[20..][0..entry.key.len], entry.key);
+    if (external_value) {
+        std.mem.writeInt(u64, encoded[20 + entry.key.len ..][0..8], entry.external_value_root_page, .little);
+    } else {
+        @memcpy(encoded[20 + entry.key.len ..][0..entry.value.len], entry.value);
+    }
+}
+
+fn decodeDocumentEntry(raw: []const u8) !DocumentEntry {
+    if (raw.len < 20) return error.TruncatedNativeDocumentEntry;
+    const previous_page = std.mem.readInt(u64, raw[0..8], .little);
+    const flags = raw[8];
+    if (flags & ~(document_delete_flag | document_external_value_flag) != 0) return error.InvalidNativeDocumentEntryFlags;
+    const is_delete = flags & document_delete_flag != 0;
+    const external_value = flags & document_external_value_flag != 0;
+    if (is_delete and external_value) return error.InvalidNativeDocumentEntryFlags;
+
+    const key_len = std.mem.readInt(u32, raw[12..16], .little);
+    const value_len = std.mem.readInt(u32, raw[16..20], .little);
+    const stored_value_len: u64 = if (external_value) 8 else value_len;
+    const payload_len = @as(u64, key_len) + stored_value_len;
+    if (payload_len > raw.len - 20) return error.TruncatedNativeDocumentEntry;
+    const key_start: usize = 20;
+    const key_end = key_start + @as(usize, @intCast(key_len));
+    const stored_value_end = key_end + @as(usize, @intCast(stored_value_len));
+    const external_value_root_page = if (external_value) blk: {
+        if (value_len == 0) return error.InvalidNativeValueChain;
+        const root = std.mem.readInt(u64, raw[key_end..][0..8], .little);
+        if (root == 0) return error.InvalidNativeValueChain;
+        break :blk root;
+    } else 0;
+    return .{
+        .previous_page = previous_page,
+        .key = raw[key_start..key_end],
+        .value = if (external_value) raw[key_end..key_end] else raw[key_end..stored_value_end],
+        .is_delete = is_delete,
+        .external_value_root_page = external_value_root_page,
+        .external_value_len = if (external_value) @intCast(value_len) else 0,
+    };
+}
+
+fn decodeValuePage(raw: []const u8) !ValuePage {
+    if (raw.len < value_page_header_size) return error.TruncatedNativeValuePage;
+    return .{
+        .next_page = std.mem.readInt(u64, raw[0..8], .little),
+        .chunk = raw[value_page_header_size..],
+    };
+}
+
+fn encodeFreeMapAlloc(allocator: Allocator, page_size: u32, covered_page_count: u64, free_pages: []const u64) ![]u8 {
+    if (free_pages.len > maxFreeMapEntries(page_size)) return error.NativeFreeMapTooLarge;
+    if (free_pages.len > std.math.maxInt(u32)) return error.NativeFreeMapTooLarge;
+
+    var previous_page_id: u64 = 0;
+    for (free_pages) |page_id| {
+        if (page_id == 0 or page_id >= covered_page_count) return error.InvalidNativeFreeMap;
+        if (page_id <= previous_page_id) return error.InvalidNativeFreeMap;
+        previous_page_id = page_id;
+    }
+
+    const payload = try allocator.alloc(u8, free_map_header_size + free_pages.len * 8);
+    errdefer allocator.free(payload);
+    std.mem.writeInt(u32, payload[0..4], free_map_format_version, .little);
+    std.mem.writeInt(u32, payload[4..8], @intCast(free_pages.len), .little);
+    std.mem.writeInt(u64, payload[8..16], covered_page_count, .little);
+    for (free_pages, 0..) |page_id, index| {
+        const offset = free_map_header_size + index * 8;
+        std.mem.writeInt(u64, payload[offset..][0..8], page_id, .little);
+    }
+    return payload;
+}
+
+fn decodeFreeMapAlloc(allocator: Allocator, raw: []const u8, checkpoint_page_count: u64) !FreeMap {
+    if (raw.len < free_map_header_size) return error.TruncatedNativeFreeMap;
+    const version = std.mem.readInt(u32, raw[0..4], .little);
+    if (version != free_map_format_version) return error.InvalidNativeFreeMap;
+    const free_page_count = std.mem.readInt(u32, raw[4..8], .little);
+    const covered_page_count = std.mem.readInt(u64, raw[8..16], .little);
+    if (covered_page_count != checkpoint_page_count) return error.InvalidNativeFreeMap;
+    const expected_len = free_map_header_size + @as(usize, free_page_count) * 8;
+    if (raw.len != expected_len) return error.InvalidNativeFreeMap;
+
+    const free_pages = try allocator.alloc(u64, free_page_count);
+    errdefer allocator.free(free_pages);
+    var previous_page_id: u64 = 0;
+    for (free_pages, 0..) |*page_id, index| {
+        const offset = free_map_header_size + index * 8;
+        page_id.* = std.mem.readInt(u64, raw[offset..][0..8], .little);
+        if (page_id.* == 0 or page_id.* >= checkpoint_page_count) return error.InvalidNativeFreeMap;
+        if (page_id.* <= previous_page_id) return error.InvalidNativeFreeMap;
+        previous_page_id = page_id.*;
+    }
+    return .{
+        .covered_page_count = covered_page_count,
+        .free_pages = free_pages,
+    };
+}
+
+fn maxFreeMapEntries(page_size: u32) usize {
+    std.debug.assert(page_size >= page_header_size + free_map_header_size);
+    return (@as(usize, @intCast(page_size)) - page_header_size - free_map_header_size) / 8;
+}
+
+fn readExactAt(file: std.Io.File, io: std.Io, out: []u8, offset: u64) !void {
+    const read = try file.readPositionalAll(io, out, offset);
+    if (read != out.len) return error.EndOfStream;
+}
+
+fn readHeaderExactAt(file: std.Io.File, io: std.Io, out: *[header_size]u8) !void {
+    const read = try file.readPositionalAll(io, out, 0);
+    if (read != header_size) return error.TruncatedNativeHeader;
+}
+
+fn headerChecksum(raw: []const u8) u32 {
+    var crc = std.hash.Crc32.init();
+    crc.update(raw[0..active_checkpoint_offset]);
+    crc.update(raw[active_checkpoint_offset + 1 .. checkpoint_slots_offset]);
+    crc.update(raw[checkpoint_slots_end..header_checksum_offset]);
+    return crc.final();
+}
+
+fn checkpointSlotChecksum(raw: []const u8) u32 {
+    var crc = std.hash.Crc32.init();
+    crc.update(raw[0..checkpoint_slot_payload_size]);
+    return crc.final();
+}
+
+fn validPageSize(page_size: u32) bool {
+    return page_size >= 4096 and page_size <= 65536 and std.math.isPowerOfTwo(page_size);
+}
+
+fn issueForDecodeError(err: anyerror) []const u8 {
+    return switch (err) {
+        error.TruncatedNativeHeader => "truncated_header",
+        error.InvalidNativeMagic => "invalid_magic",
+        error.UnsupportedNativeFormatVersion => "unsupported_format_version",
+        error.InvalidNativeHeaderSize => "invalid_header_size",
+        error.NativeHeaderChecksumMismatch => "header_checksum_mismatch",
+        error.InvalidNativePageSize => "invalid_page_size",
+        error.InvalidNativeCheckpointSlot => "invalid_checkpoint_slot",
+        error.NativeCheckpointChecksumMismatch => "checkpoint_checksum_mismatch",
+        error.InvalidNativeCheckpoint => "invalid_checkpoint",
+        else => "invalid_header",
+    };
+}
+
+fn issueForPageCheckError(err: anyerror) []const u8 {
+    return switch (err) {
+        error.InvalidPageId => "invalid_page_id",
+        error.TruncatedNativePage => "truncated_page",
+        error.InvalidNativePageMagic => "invalid_page_magic",
+        error.InvalidNativePageKind => "invalid_page_kind",
+        error.UnexpectedNativePageKind => "unexpected_page_kind",
+        error.InvalidNativePageLength => "invalid_page_length",
+        error.NativePageChecksumMismatch => "page_checksum_mismatch",
+        error.TruncatedNativeCatalogEntry => "truncated_catalog_entry",
+        error.InvalidNativeCatalogEntryFlags => "invalid_catalog_entry_flags",
+        error.TruncatedNativeDocumentEntry => "truncated_document_entry",
+        error.InvalidNativeDocumentEntryFlags => "invalid_document_entry_flags",
+        error.InvalidNativePageChain => "invalid_page_chain",
+        error.TruncatedNativeValuePage => "truncated_value_page",
+        error.InvalidNativeValueChain => "invalid_value_chain",
+        error.TruncatedNativeFreeMap,
+        error.InvalidNativeFreeMap,
+        error.UnsupportedNativeFreeMap,
+        => "invalid_free_map",
+        else => "invalid_page",
+    };
+}
+
+fn invalidCheck(report: CheckReport, issue: []const u8) CheckReport {
+    var invalid = report;
+    invalid.valid = false;
+    invalid.issue = issue;
+    return invalid;
+}
+
+fn testPath(allocator: Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
+}
+
+fn readHeaderForTest(path: []const u8) ![header_size]u8 {
+    var header_bytes: [header_size]u8 = undefined;
+    var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_only });
+    defer file.close(std.testing.io);
+    try readExactAt(file, std.testing.io, &header_bytes, 0);
+    return header_bytes;
+}
+
+test "lite native header round trips initial checkpoint" {
+    var encoded: [header_size]u8 = undefined;
+    encodeHeader(&encoded, .{});
+
+    const header = try decodeHeader(&encoded);
+    try std.testing.expectEqual(default_page_size, header.page_size);
+    try std.testing.expectEqual(@as(u8, 0), header.active_checkpoint);
+    try std.testing.expectEqual(@as(u64, 0), header.checkpoints[0].commit_sequence);
+    try std.testing.expectEqual(@as(u64, 1), header.checkpoints[0].page_count);
+
+    const report = inspectBytes(&encoded);
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(format_version, report.format_version);
+    try std.testing.expectEqual(@as(u64, 1), report.page_count);
+}
+
+test "lite native header rejects corrupted checksum" {
+    var encoded: [header_size]u8 = undefined;
+    encodeHeader(&encoded, .{});
+    encoded[page_size_offset] ^= 0xff;
+
+    const report = inspectBytes(&encoded);
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("header_checksum_mismatch", report.issue.?);
+}
+
+test "lite native header rejects unsupported format version" {
+    var encoded: [header_size]u8 = undefined;
+    encodeHeader(&encoded, .{});
+    std.mem.writeInt(u32, encoded[version_offset..][0..4], format_version + 1, .little);
+
+    const report = inspectBytes(&encoded);
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("unsupported_format_version", report.issue.?);
+    try std.testing.expectError(error.UnsupportedNativeFormatVersion, decodeHeader(&encoded));
+}
+
+test "lite native header selects newest valid checkpoint slot" {
+    var encoded: [header_size]u8 = undefined;
+    encodeHeader(&encoded, .{
+        .active_checkpoint = 0,
+        .checkpoints = .{
+            .{ .commit_sequence = 1, .page_count = 2 },
+            .{ .commit_sequence = 2, .page_count = 3 },
+        },
+    });
+
+    const header = try decodeHeader(&encoded);
+    try std.testing.expectEqual(@as(u8, 1), header.active_checkpoint);
+
+    const report = inspectBytes(&encoded);
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(@as(u8, 1), report.active_checkpoint);
+    try std.testing.expectEqual(@as(u64, 2), report.commit_sequence);
+    try std.testing.expectEqual(@as(u64, 3), report.page_count);
+}
+
+test "lite native header recovers from corrupted active checkpoint hint" {
+    var encoded: [header_size]u8 = undefined;
+    encodeHeader(&encoded, .{
+        .active_checkpoint = 1,
+        .checkpoints = .{
+            .{ .commit_sequence = 1, .page_count = 2 },
+            .{ .commit_sequence = 2, .page_count = 3 },
+        },
+    });
+    encoded[active_checkpoint_offset] = 0xff;
+
+    const header = try decodeHeader(&encoded);
+    try std.testing.expectEqual(@as(u8, 1), header.active_checkpoint);
+    try std.testing.expectEqual(@as(u64, 2), header.checkpoints[header.active_checkpoint].commit_sequence);
+}
+
+test "lite native header recovers previous checkpoint from a checksum-bad slot" {
+    var encoded: [header_size]u8 = undefined;
+    encodeHeader(&encoded, .{
+        .active_checkpoint = 1,
+        .checkpoints = .{
+            .{ .commit_sequence = 1, .page_count = 2 },
+            .{ .commit_sequence = 2, .page_count = 3 },
+        },
+    });
+    encoded[checkpointOffset(1)] ^= 0xff;
+
+    const header = try decodeHeader(&encoded);
+    try std.testing.expectEqual(@as(u8, 0), header.active_checkpoint);
+    try std.testing.expectEqual(@as(u64, 1), header.checkpoints[header.active_checkpoint].commit_sequence);
+}
+
+test "lite native create writes inspectable aflite file" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native.aflite");
+    defer allocator.free(path);
+
+    try create(std.testing.io, path);
+    const report = try inspect(allocator, std.testing.io, path);
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(format_version, report.format_version);
+    try std.testing.expectEqual(default_page_size, report.page_size);
+    try std.testing.expectEqual(@as(u8, 0), report.active_checkpoint);
+    try std.testing.expectEqual(@as(u64, 0), report.commit_sequence);
+    try std.testing.expectEqual(@as(u64, 1), report.page_count);
+}
+
+test "lite native open options propagate no_sync to file writes" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-no-sync.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.createWithOptions(allocator, path, .{ .no_sync = true });
+        defer file.close();
+        try std.testing.expect(file.no_sync);
+        try file.putDocument("doc:no-sync", "value");
+    }
+
+    {
+        var reopened = try NativeFile.openWithOptions(allocator, path, .{
+            .read_only = true,
+            .no_sync = true,
+        });
+        defer reopened.close();
+        try std.testing.expect(reopened.no_sync);
+
+        const value = (try reopened.getDocumentAlloc(allocator, "doc:no-sync")) orelse return error.TestExpectedEqual;
+        defer allocator.free(value);
+        try std.testing.expectEqualStrings("value", value);
+    }
+}
+
+test "lite native createNew rejects existing aflite without truncating" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-create-new-existing.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putDocument("doc:keep", "survives");
+    }
+
+    try std.testing.expectError(error.PathAlreadyExists, NativeFile.createNew(allocator, path));
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+    const value = (try reopened.getDocumentAlloc(allocator, "doc:keep")) orelse return error.TestExpectedEqual;
+    defer allocator.free(value);
+    try std.testing.expectEqualStrings("survives", value);
+}
+
+test "lite native open rejects unsupported format version" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-unsupported-version.aflite");
+    defer allocator.free(path);
+
+    try create(std.testing.io, path);
+    {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        var raw_version: [4]u8 = undefined;
+        std.mem.writeInt(u32, &raw_version, format_version + 1, .little);
+        try file.writePositionalAll(std.testing.io, &raw_version, version_offset);
+    }
+
+    try std.testing.expectError(error.UnsupportedNativeFormatVersion, NativeFile.open(allocator, path, true));
+}
+
+test "lite native open rejects short files as truncated native headers" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-short-header.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{});
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, "not enough header bytes", 0);
+    }
+
+    try std.testing.expectError(error.TruncatedNativeHeader, NativeFile.open(allocator, path, true));
+    try std.testing.expectError(error.TruncatedNativeHeader, inspect(allocator, std.testing.io, path));
+}
+
+test "lite native inspect reads only the header page" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-with-pages.aflite");
+    defer allocator.free(path);
+
+    try create(std.testing.io, path);
+    {
+        var file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .truncate = false });
+        defer file.close(std.testing.io);
+        const size = (try file.stat(std.testing.io)).size;
+        var writer = file.writer(std.testing.io, &.{});
+        try writer.seekTo(size);
+        try writer.interface.writeAll("future-page-data");
+        try writer.end();
+    }
+
+    const report = try inspect(allocator, std.testing.io, path);
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(format_version, report.format_version);
+}
+
+test "lite native file appends page and publishes checkpoint" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-pages.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+
+        const page_id = try file.allocatePage("hello native page");
+        try std.testing.expectEqual(@as(u64, 1), page_id);
+        try std.testing.expectEqual(@as(u64, 1), file.activeCheckpoint().commit_sequence);
+        try std.testing.expectEqual(@as(u64, 3), file.activeCheckpoint().page_count);
+        try std.testing.expectEqual(@as(u64, 2), file.activeCheckpoint().free_map_root_page);
+
+        const page = try file.readPagePayloadAlloc(allocator, page_id);
+        defer allocator.free(page);
+        try std.testing.expectEqualStrings("hello native page", page);
+    }
+
+    const report = try inspect(allocator, std.testing.io, path);
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(@as(u64, 1), report.commit_sequence);
+    try std.testing.expectEqual(@as(u64, 3), report.page_count);
+}
+
+test "lite native file reopens allocated pages" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-reopen.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        _ = try file.allocatePage("persisted");
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+    try std.testing.expectEqual(@as(u64, 1), reopened.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(@as(u64, 3), reopened.activeCheckpoint().page_count);
+    const page = try reopened.readPagePayloadAlloc(allocator, 1);
+    defer allocator.free(page);
+    try std.testing.expectEqualStrings("persisted", page);
+    try std.testing.expectError(error.ReadOnly, reopened.allocatePage("nope"));
+}
+
+test "lite native file publishes checkpoint without rewriting static header" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-slot-publish.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+
+        var before: [header_size]u8 = undefined;
+        try readExactAt(file.file, file.io_impl.io(), &before, 0);
+        _ = try file.allocatePage("slot-only publish");
+        var after: [header_size]u8 = undefined;
+        try readExactAt(file.file, file.io_impl.io(), &after, 0);
+
+        try std.testing.expectEqualSlices(u8, before[0..active_checkpoint_offset], after[0..active_checkpoint_offset]);
+        try std.testing.expectEqualSlices(u8, before[active_checkpoint_offset + 1 .. checkpoint_slots_offset], after[active_checkpoint_offset + 1 .. checkpoint_slots_offset]);
+        try std.testing.expectEqualSlices(u8, before[checkpointOffset(0)..][0..checkpoint_slot_size], after[checkpointOffset(0)..][0..checkpoint_slot_size]);
+        try std.testing.expectEqualSlices(u8, before[checkpoint_slots_end..header_size], after[checkpoint_slots_end..header_size]);
+        try std.testing.expectEqual(@as(u8, 1), after[active_checkpoint_offset]);
+        try std.testing.expect(!std.mem.eql(u8, before[checkpointOffset(1)..][0..checkpoint_slot_size], after[checkpointOffset(1)..][0..checkpoint_slot_size]));
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+    try std.testing.expectEqual(@as(u64, 1), reopened.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(@as(u64, 3), reopened.activeCheckpoint().page_count);
+}
+
+test "lite native file recovers older complete checkpoint when newest prefix is truncated" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-truncated-newest-checkpoint.aflite");
+    defer allocator.free(path);
+
+    const stable_size = blk: {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+
+        try file.putDocument("doc:recover", "stable");
+        const stable_checkpoint = file.activeCheckpoint();
+        const stable_size = try checkpointPrefixSize(stable_checkpoint, file.header.page_size);
+
+        try file.putDocument("doc:recover", "newer");
+        try std.testing.expect(file.activeCheckpoint().commit_sequence > stable_checkpoint.commit_sequence);
+        try std.testing.expect(try checkpointPrefixSize(file.activeCheckpoint(), file.header.page_size) > stable_size);
+        break :blk stable_size;
+    };
+
+    {
+        var raw = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer raw.close(std.testing.io);
+        try raw.setLength(std.testing.io, stable_size);
+        try raw.sync(std.testing.io);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+    try std.testing.expectEqual(@as(u64, 1), reopened.activeCheckpoint().commit_sequence);
+    const value = (try reopened.getDocumentAlloc(allocator, "doc:recover")).?;
+    defer allocator.free(value);
+    try std.testing.expectEqualStrings("stable", value);
+
+    const report = try checkFile(allocator, path);
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(@as(u64, 1), report.record_count);
+    try std.testing.expectEqual(@as(u64, 0), report.tail_bytes);
+}
+
+test "lite native file permits concurrent readers" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-reader-locks.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        _ = try file.allocatePage("persisted");
+    }
+
+    var reader_a = try NativeFile.open(allocator, path, true);
+    defer reader_a.close();
+
+    var reader_b = try NativeFile.open(allocator, path, true);
+    defer reader_b.close();
+
+    try std.testing.expectEqual(@as(u64, 3), reader_a.activeCheckpoint().page_count);
+    try std.testing.expectEqual(@as(u64, 3), reader_b.activeCheckpoint().page_count);
+}
+
+test "lite native file active writer permits readers but blocks second writer" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-writer-lock.aflite");
+    defer allocator.free(path);
+
+    var writer = try NativeFile.create(allocator, path);
+    defer writer.close();
+    _ = try writer.allocatePage("committed before reader");
+
+    try std.testing.expectError(error.WouldBlock, NativeFile.open(allocator, path, false));
+
+    var reader = try NativeFile.open(allocator, path, true);
+    defer reader.close();
+    try std.testing.expectEqual(@as(u64, 3), reader.activeCheckpoint().page_count);
+
+    const report = try inspect(allocator, std.testing.io, path);
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(@as(u64, 1), report.commit_sequence);
+
+    try std.testing.expectError(error.WouldBlock, writer.vacuum());
+}
+
+test "lite native file canonicalizes writer lock path spellings" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-writer-lock-canonical.aflite");
+    defer allocator.free(path);
+
+    var writer = try NativeFile.create(allocator, path);
+    defer writer.close();
+
+    const alternate_path = try std.fmt.allocPrint(allocator, "./{s}", .{path});
+    defer allocator.free(alternate_path);
+    try std.testing.expectError(error.WouldBlock, NativeFile.open(allocator, alternate_path, false));
+}
+
+test "lite native file detects corrupted page payload" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-corrupt-page.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        _ = try file.allocatePage("checksum");
+    }
+
+    {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, "X", default_page_size + page_header_size);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+    try std.testing.expectError(error.NativePageChecksumMismatch, reopened.readPagePayloadAlloc(allocator, 1));
+}
+
+test "lite native catalog stores and reopens records" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-catalog.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putCatalogRecord("schema", "{\"version\":1}");
+        try file.putCatalogRecord("index:text", "ready");
+        try file.putCatalogRecord("schema", "{\"version\":2}");
+        try std.testing.expectEqual(@as(u64, 3), file.activeCheckpoint().commit_sequence);
+        try std.testing.expect(file.activeCheckpoint().catalog_root_page != 0);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+
+    const schema = (try reopened.getCatalogRecordAlloc(allocator, "schema")).?;
+    defer allocator.free(schema);
+    try std.testing.expectEqualStrings("{\"version\":2}", schema);
+
+    const index = (try reopened.getCatalogRecordAlloc(allocator, "index:text")).?;
+    defer allocator.free(index);
+    try std.testing.expectEqualStrings("ready", index);
+
+    try std.testing.expectEqual(@as(?[]u8, null), try reopened.getCatalogRecordAlloc(allocator, "missing"));
+}
+
+test "lite native catalog supports tombstones and spilled values" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-catalog-large.aflite");
+    defer allocator.free(path);
+
+    const large = try allocator.alloc(u8, default_page_size * 3);
+    defer allocator.free(large);
+    for (large, 0..) |*byte, i| byte.* = @intCast(i % 251);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putCatalogRecord("index:large", large);
+        try file.putCatalogRecord("index:gone", "delete me");
+        try file.deleteCatalogRecord("index:gone");
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+
+    const got = (try reopened.getCatalogRecordAlloc(allocator, "index:large")).?;
+    defer allocator.free(got);
+    try std.testing.expectEqualSlices(u8, large, got);
+    try std.testing.expectEqual(@as(?[]u8, null), try reopened.getCatalogRecordAlloc(allocator, "index:gone"));
+
+    const records = try reopened.snapshotCatalogRecordsAlloc(allocator);
+    defer NativeFile.freeSnapshotCatalogRecords(allocator, records);
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expectEqualStrings("index:large", records[0].key);
+    try std.testing.expectEqualSlices(u8, large, records[0].value);
+
+    const report = try reopened.check();
+    try std.testing.expect(report.valid);
+}
+
+test "lite native index catalog snapshots live keys without values" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-index-catalog-keys.aflite");
+    defer allocator.free(path);
+
+    const large = try allocator.alloc(u8, default_page_size * 2);
+    defer allocator.free(large);
+    @memset(large, 'x');
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putIndexCatalogRecord("/index/b.tbl", large);
+        try file.putIndexCatalogRecord("/index/a.tbl", "small");
+        try file.putIndexCatalogRecord("/index/deleted.tbl", "gone");
+        try file.deleteIndexCatalogRecord("/index/deleted.tbl");
+        try file.putIndexCatalogRecord("/index/a.tbl", "newer");
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+
+    const keys = try reopened.snapshotIndexCatalogKeysAlloc(allocator);
+    defer NativeFile.freeSnapshotCatalogKeys(allocator, keys);
+    try std.testing.expectEqual(@as(usize, 2), keys.len);
+    try std.testing.expectEqualStrings("/index/a.tbl", keys[0].key);
+    try std.testing.expectEqualStrings("/index/b.tbl", keys[1].key);
+}
+
+test "lite native catalog detects corrupted root page" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-catalog-corrupt.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putCatalogRecord("schema", "value");
+    }
+
+    {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, "X", default_page_size + page_header_size);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+    try std.testing.expectError(error.NativePageChecksumMismatch, reopened.getCatalogRecordAlloc(allocator, "schema"));
+}
+
+test "lite native document store persists records" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-documents.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putDocument("doc:1", "{\"title\":\"one\"}");
+        try file.putDocument("doc:2", "{\"title\":\"two\"}");
+        try std.testing.expectEqual(@as(u64, 2), file.activeCheckpoint().commit_sequence);
+        try std.testing.expect(file.activeCheckpoint().document_root_page != 0);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+
+    const doc1 = (try reopened.getDocumentAlloc(allocator, "doc:1")).?;
+    defer allocator.free(doc1);
+    try std.testing.expectEqualStrings("{\"title\":\"one\"}", doc1);
+
+    const doc2 = (try reopened.getDocumentAlloc(allocator, "doc:2")).?;
+    defer allocator.free(doc2);
+    try std.testing.expectEqualStrings("{\"title\":\"two\"}", doc2);
+
+    try std.testing.expectEqual(@as(?[]u8, null), try reopened.getDocumentAlloc(allocator, "missing"));
+}
+
+test "lite native document store returns newest overwrite" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-document-overwrite.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.create(allocator, path);
+    defer file.close();
+
+    try file.putDocument("doc:1", "old");
+    try file.putDocument("doc:1", "new");
+
+    const value = (try file.getDocumentAlloc(allocator, "doc:1")).?;
+    defer allocator.free(value);
+    try std.testing.expectEqualStrings("new", value);
+}
+
+test "lite native free map reuses pages released by checkpoint rotation" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-free-map-reuse.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.create(allocator, path);
+    defer file.close();
+
+    try file.putDocument("doc:1", "v1");
+    try file.putDocument("doc:1", "v2");
+    try file.putDocument("doc:1", "v3");
+
+    const reusable = try file.readFreePagesAlloc(file.activeCheckpoint());
+    defer allocator.free(reusable);
+    try std.testing.expect(reusable.len > 0);
+
+    const before_size = (try file.file.stat(file.io_impl.io())).size;
+    try file.putDocument("doc:1", "v4");
+    const after_size = (try file.file.stat(file.io_impl.io())).size;
+
+    try std.testing.expectEqual(before_size + default_page_size, after_size);
+    const report = try file.check();
+    try std.testing.expect(report.valid);
+
+    const value = (try file.getDocumentAlloc(allocator, "doc:1")).?;
+    defer allocator.free(value);
+    try std.testing.expectEqualStrings("v4", value);
+}
+
+test "lite native free map does not reuse pages while reader pins older checkpoint" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-free-map-reader-protected.aflite");
+    defer allocator.free(path);
+
+    var writer = try NativeFile.create(allocator, path);
+    defer writer.close();
+
+    try writer.putDocument("doc:1", "v1");
+    try writer.putDocument("doc:1", "v2");
+    const before_size = (try writer.file.stat(writer.io_impl.io())).size;
+
+    var reader = try NativeFile.open(allocator, path, true);
+    defer reader.close();
+    const reader_checkpoint = reader.activeCheckpoint();
+    const reader_value_before = (try reader.getDocumentAlloc(allocator, "doc:1")).?;
+    defer allocator.free(reader_value_before);
+    try std.testing.expectEqualStrings("v2", reader_value_before);
+
+    try writer.putDocument("doc:1", "v3");
+    try writer.putDocument("doc:1", "v4");
+    const after_size = (try writer.file.stat(writer.io_impl.io())).size;
+    try std.testing.expect(after_size > before_size + default_page_size);
+
+    try std.testing.expectEqual(reader_checkpoint.commit_sequence, reader.activeCheckpoint().commit_sequence);
+    const reader_value_after = (try reader.getDocumentAlloc(allocator, "doc:1")).?;
+    defer allocator.free(reader_value_after);
+    try std.testing.expectEqualStrings("v2", reader_value_after);
+    const reader_free_pages = try reader.readFreePagesAlloc(reader.activeCheckpoint());
+    defer allocator.free(reader_free_pages);
+
+    const writer_value = (try writer.getDocumentAlloc(allocator, "doc:1")).?;
+    defer allocator.free(writer_value);
+    try std.testing.expectEqualStrings("v4", writer_value);
+
+    const report = try writer.check();
+    try std.testing.expect(report.valid);
+}
+
+test "lite native stable snapshot preserves pinned reader checkpoint while writer advances" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-pinned-reader-snapshot.aflite");
+    defer allocator.free(path);
+    const snapshot_path = try testPath(allocator, tmp, "native-pinned-reader-snapshot-copy.aflite");
+    defer allocator.free(snapshot_path);
+
+    var writer = try NativeFile.create(allocator, path);
+    defer writer.close();
+
+    try writer.putDocument("doc:1", "v1");
+    try writer.putDocument("doc:1", "v2");
+
+    var reader = try NativeFile.open(allocator, path, true);
+    defer reader.close();
+    const reader_checkpoint = reader.activeCheckpoint();
+    const reader_value_before = (try reader.getDocumentAlloc(allocator, "doc:1")).?;
+    defer allocator.free(reader_value_before);
+    try std.testing.expectEqualStrings("v2", reader_value_before);
+
+    try writer.putDocument("doc:1", "v3");
+    try writer.putDocument("doc:1", "v4");
+
+    const snapshot_report = try reader.copyStableSnapshotToPath(snapshot_path, false);
+    try std.testing.expectEqual(reader_checkpoint.commit_sequence, snapshot_report.checkpoint_sequence);
+    try std.testing.expect(snapshot_report.tail_bytes > 0);
+
+    const snapshot_check = try checkFile(allocator, snapshot_path);
+    try std.testing.expect(snapshot_check.valid);
+    try std.testing.expectEqual(@as(u64, 0), snapshot_check.tail_bytes);
+
+    var snapshot = try NativeFile.open(allocator, snapshot_path, true);
+    defer snapshot.close();
+    try std.testing.expectEqual(reader_checkpoint.commit_sequence, snapshot.activeCheckpoint().commit_sequence);
+    const snapshot_value = (try snapshot.getDocumentAlloc(allocator, "doc:1")).?;
+    defer allocator.free(snapshot_value);
+    try std.testing.expectEqualStrings("v2", snapshot_value);
+
+    const writer_value = (try writer.getDocumentAlloc(allocator, "doc:1")).?;
+    defer allocator.free(writer_value);
+    try std.testing.expectEqualStrings("v4", writer_value);
+}
+
+test "lite native document store spills large values into value pages" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-document-large.aflite");
+    defer allocator.free(path);
+
+    const large = try allocator.alloc(u8, 9000);
+    defer allocator.free(large);
+    for (large, 0..) |*byte, i| {
+        byte.* = @intCast('a' + (i % 26));
+    }
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        const value_pages = std.math.divCeil(usize, large.len, file.maxValuePagePayloadBytes()) catch unreachable;
+        try file.putDocument("doc:large", large);
+        try std.testing.expectEqual(@as(u64, @intCast(3 + value_pages)), file.activeCheckpoint().page_count);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+
+    const value = (try reopened.getDocumentAlloc(allocator, "doc:large")).?;
+    defer allocator.free(value);
+    try std.testing.expectEqualSlices(u8, large, value);
+
+    const docs = try reopened.snapshotDocumentsAlloc(allocator);
+    defer NativeFile.freeSnapshotDocuments(allocator, docs);
+    try std.testing.expectEqual(@as(usize, 1), docs.len);
+    try std.testing.expectEqualStrings("doc:large", docs[0].key);
+    try std.testing.expectEqualSlices(u8, large, docs[0].value);
+
+    const report = try reopened.check();
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(@as(u64, 1), report.record_count);
+}
+
+test "lite native document tombstone hides older value after reopen" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-document-delete.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putDocument("doc:1", "old");
+        try file.deleteDocument("doc:1");
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+    try std.testing.expectEqual(@as(?[]u8, null), try reopened.getDocumentAlloc(allocator, "doc:1"));
+}
+
+test "lite native document store detects corrupted root page" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-document-corrupt.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putDocument("doc:1", "value");
+    }
+
+    {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, "X", default_page_size + page_header_size);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+    try std.testing.expectError(error.NativePageChecksumMismatch, reopened.getDocumentAlloc(allocator, "doc:1"));
+}
+
+test "lite native document store detects corrupted external value page" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-document-large-corrupt.aflite");
+    defer allocator.free(path);
+
+    const large = try allocator.alloc(u8, 9000);
+    defer allocator.free(large);
+    @memset(large, 'x');
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putDocument("doc:large", large);
+    }
+
+    {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, "X", default_page_size + page_header_size);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+    try std.testing.expectError(error.NativePageChecksumMismatch, reopened.getDocumentAlloc(allocator, "doc:large"));
+
+    const report = try reopened.check();
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("page_checksum_mismatch", report.issue.?);
+}
+
+test "lite native document batch publishes one checkpoint" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-document-batch.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putDocumentBatch(&.{
+            .{ .key = "doc:b", .value = "second" },
+            .{ .key = "doc:a", .value = "first" },
+            .{ .key = "doc:b", .value = "newer second" },
+            .{ .key = "doc:c", .value = "deleted" },
+            .{ .key = "doc:c", .is_delete = true },
+        });
+        try std.testing.expectEqual(@as(u64, 1), file.activeCheckpoint().commit_sequence);
+        try std.testing.expectEqual(@as(u64, 7), file.activeCheckpoint().page_count);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+
+    const doc_a = (try reopened.getDocumentAlloc(allocator, "doc:a")).?;
+    defer allocator.free(doc_a);
+    try std.testing.expectEqualStrings("first", doc_a);
+
+    const doc_b = (try reopened.getDocumentAlloc(allocator, "doc:b")).?;
+    defer allocator.free(doc_b);
+    try std.testing.expectEqualStrings("newer second", doc_b);
+
+    try std.testing.expectEqual(@as(?[]u8, null), try reopened.getDocumentAlloc(allocator, "doc:c"));
+}
+
+test "lite native document snapshot returns sorted live records" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-document-snapshot.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.create(allocator, path);
+    defer file.close();
+
+    try file.putDocumentBatch(&.{
+        .{ .key = "doc:b", .value = "second" },
+        .{ .key = "doc:a", .value = "first" },
+        .{ .key = "doc:b", .value = "newer second" },
+        .{ .key = "doc:c", .value = "third" },
+        .{ .key = "doc:c", .is_delete = true },
+    });
+
+    const docs = try file.snapshotDocumentsAlloc(allocator);
+    defer NativeFile.freeSnapshotDocuments(allocator, docs);
+
+    try std.testing.expectEqual(@as(usize, 2), docs.len);
+    try std.testing.expectEqualStrings("doc:a", docs[0].key);
+    try std.testing.expectEqualStrings("first", docs[0].value);
+    try std.testing.expectEqualStrings("doc:b", docs[1].key);
+    try std.testing.expectEqualStrings("newer second", docs[1].value);
+}
+
+test "lite native check validates committed root chains" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-check.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.create(allocator, path);
+    defer file.close();
+
+    try file.putCatalogRecord("schema", "{\"version\":1}");
+    try file.putDocument("doc:1", "{\"title\":\"one\"}");
+
+    const report = try file.check();
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(@as(?[]const u8, null), report.issue);
+    try std.testing.expectEqual(@as(u64, 2), report.record_count);
+    try std.testing.expectEqual(@as(u64, 2), report.live_file_count);
+    try std.testing.expect(report.live_bytes > 0);
+    try std.testing.expectEqual(@as(u64, default_page_size * 5), report.file_size);
+    try std.testing.expectEqual(@as(u64, default_page_size * 4), report.compact_size);
+    try std.testing.expectEqual(@as(u64, 0), report.tail_bytes);
+    try std.testing.expectEqual(@as(u64, default_page_size), report.reclaimable_bytes);
+}
+
+test "lite native check validates committed index catalog root chain" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-check-index-catalog.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.create(allocator, path);
+    defer file.close();
+
+    try file.putCatalogRecord("schema", "{\"version\":1}");
+    try file.putIndexCatalogRecord("index/files/hbc/postings.bin", "index bytes");
+    try file.putDocument("doc:1", "{\"title\":\"one\"}");
+
+    const checkpoint = file.activeCheckpoint();
+    try std.testing.expect(checkpoint.catalog_root_page != 0);
+    try std.testing.expect(checkpoint.index_catalog_root_page != 0);
+    try std.testing.expect(checkpoint.document_root_page != 0);
+
+    const report = try file.check();
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(@as(?[]const u8, null), report.issue);
+    try std.testing.expectEqual(@as(u64, 3), report.record_count);
+    try std.testing.expectEqual(@as(u64, 3), report.live_file_count);
+    try std.testing.expect(report.live_bytes > 0);
+    try std.testing.expectEqual(@as(u64, default_page_size * 7), report.file_size);
+    try std.testing.expectEqual(@as(u64, default_page_size * 5), report.compact_size);
+    try std.testing.expectEqual(@as(u64, default_page_size * 2), report.reclaimable_bytes);
+
+    const index_file = (try file.getIndexCatalogRecordAlloc(allocator, "index/files/hbc/postings.bin")).?;
+    defer allocator.free(index_file);
+    try std.testing.expectEqualStrings("index bytes", index_file);
+}
+
+test "lite native check reports overlapping committed root pages" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-check-overlap.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+
+        try file.putCatalogRecord("schema", "{\"version\":1}");
+        try file.putIndexCatalogRecord("index/files/hbc/postings.bin", "index bytes");
+
+        const checkpoint = file.activeCheckpoint();
+        try std.testing.expect(checkpoint.catalog_root_page != 0);
+        try std.testing.expect(checkpoint.index_catalog_root_page != 0);
+        try std.testing.expect(checkpoint.catalog_root_page != checkpoint.index_catalog_root_page);
+    }
+
+    var header_bytes = try readHeaderForTest(path);
+    var header = try decodeHeader(&header_bytes);
+    header.checkpoints[header.active_checkpoint].index_catalog_root_page =
+        header.checkpoints[header.active_checkpoint].catalog_root_page;
+    encodeHeader(&header_bytes, header);
+
+    {
+        var raw = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer raw.close(std.testing.io);
+        try raw.writePositionalAll(std.testing.io, &header_bytes, 0);
+        try raw.sync(std.testing.io);
+    }
+
+    const report = try checkFile(allocator, path);
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("invalid_page_chain", report.issue.?);
+}
+
+test "lite native stable snapshot copies committed prefix without tail bytes" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const source_path = try testPath(allocator, tmp, "native-snapshot-source.aflite");
+    defer allocator.free(source_path);
+    const snapshot_path = try testPath(allocator, tmp, "native-snapshot-copy.aflite");
+    defer allocator.free(snapshot_path);
+
+    const snapshot_size = blk: {
+        var file = try NativeFile.create(allocator, source_path);
+        defer file.close();
+        try file.putCatalogRecord("schema", "{\"version\":1}");
+        try file.putIndexCatalogRecord("index/files/hbc/postings.bin", "index bytes");
+        try file.putDocument("doc:1", "{\"title\":\"one\"}");
+        const checkpoint = file.activeCheckpoint();
+        try std.testing.expect(checkpoint.free_map_root_page != 0);
+        break :blk try checkpointPrefixSize(checkpoint, file.header.page_size);
+    };
+
+    {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, source_path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, "uncommitted tail", snapshot_size);
+    }
+
+    const source_report = try checkFile(allocator, source_path);
+    try std.testing.expect(!source_report.valid);
+    try std.testing.expectEqualStrings("tail_bytes", source_report.issue.?);
+    try std.testing.expect(source_report.tail_bytes > 0);
+
+    const snapshot_report = try copyStableSnapshot(allocator, source_path, snapshot_path, false);
+    try std.testing.expectEqual(snapshot_size, snapshot_report.snapshot_size);
+    try std.testing.expectEqual(@as(u64, "uncommitted tail".len), snapshot_report.tail_bytes);
+
+    const clean_report = try checkFile(allocator, snapshot_path);
+    try std.testing.expect(clean_report.valid);
+    try std.testing.expectEqual(@as(?[]const u8, null), clean_report.issue);
+    try std.testing.expectEqual(@as(u64, 0), clean_report.tail_bytes);
+    try std.testing.expectEqual(snapshot_report.snapshot_size, clean_report.file_size);
+
+    var reopened = try NativeFile.open(allocator, snapshot_path, true);
+    defer reopened.close();
+    try std.testing.expect(reopened.activeCheckpoint().free_map_root_page != 0);
+
+    const schema = (try reopened.getCatalogRecordAlloc(allocator, "schema")).?;
+    defer allocator.free(schema);
+    try std.testing.expectEqualStrings("{\"version\":1}", schema);
+
+    const index_file = (try reopened.getIndexCatalogRecordAlloc(allocator, "index/files/hbc/postings.bin")).?;
+    defer allocator.free(index_file);
+    try std.testing.expectEqualStrings("index bytes", index_file);
+
+    const doc = (try reopened.getDocumentAlloc(allocator, "doc:1")).?;
+    defer allocator.free(doc);
+    try std.testing.expectEqualStrings("{\"title\":\"one\"}", doc);
+}
+
+test "lite native stable snapshot rejects same target by canonical path" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const path = try testPath(allocator, tmp, "native-snapshot-self.aflite");
+    defer allocator.free(path);
+    const nested_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/nested", .{tmp.sub_path});
+    defer allocator.free(nested_dir);
+    const alias_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/nested/../native-snapshot-self.aflite", .{tmp.sub_path});
+    defer allocator.free(alias_path);
+
+    try fs_paths.createDirPathPortable(io, nested_dir);
+    {
+        var writer = try NativeFile.create(allocator, path);
+        defer writer.close();
+        try writer.putDocument("doc:self", "{\"title\":\"same target\"}");
+    }
+
+    var reader = try NativeFile.open(allocator, path, true);
+    defer reader.close();
+    try std.testing.expectError(error.InvalidNativeSnapshotPath, reader.copyStableSnapshotToPath(alias_path, true));
+
+    const report = try checkFile(allocator, path);
+    try std.testing.expect(report.valid);
+}
+
+test "lite native stable snapshot holds output writer lock before staging" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const source_path = try testPath(allocator, tmp, "native-snapshot-lock-source.aflite");
+    defer allocator.free(source_path);
+    const snapshot_path = try testPath(allocator, tmp, "native-snapshot-lock-copy.aflite");
+    defer allocator.free(snapshot_path);
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp-aflite-snapshot", .{snapshot_path});
+    defer allocator.free(tmp_path);
+
+    {
+        var file = try NativeFile.create(allocator, source_path);
+        defer file.close();
+        try file.putDocument("doc:visible", "visible");
+    }
+
+    var dest_lock = try lockWriterPath(allocator, snapshot_path);
+    defer dest_lock.close();
+
+    try std.testing.expectError(error.WouldBlock, copyStableSnapshot(allocator, source_path, snapshot_path, false));
+    try std.testing.expect(!pathExists(std.testing.io, snapshot_path));
+    try std.testing.expect(!pathExists(std.testing.io, tmp_path));
+}
+
+test "lite native vacuum rewrites live catalog and document records" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-vacuum.aflite");
+    defer allocator.free(path);
+
+    const large_value = try allocator.alloc(u8, default_page_size * 2);
+    defer allocator.free(large_value);
+    @memset(large_value, 'x');
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+
+        try file.putCatalogRecord("schema", "{\"version\":1}");
+        try file.putCatalogRecord("schema", "{\"version\":2}");
+        try file.putDocument("doc:live", large_value);
+        try file.putDocument("doc:live", "small");
+        try file.putDocument("doc:gone", "deleted");
+        try file.deleteDocument("doc:gone");
+
+        const before = try file.check();
+        try std.testing.expect(before.record_count > 2);
+        try std.testing.expectEqual(@as(u64, 2), before.live_file_count);
+        try std.testing.expect(before.live_bytes > 0);
+        try std.testing.expect(before.compact_size < before.file_size);
+        try std.testing.expect(before.reclaimable_bytes > 0);
+
+        const vacuumed = try file.vacuum();
+        try std.testing.expect(vacuumed.before_size > vacuumed.after_size);
+        try std.testing.expect(vacuumed.reclaimed_bytes > 0);
+        try std.testing.expect(file.activeCheckpoint().free_map_root_page != 0);
+
+        const after = try file.check();
+        try std.testing.expect(after.valid);
+        try std.testing.expectEqual(vacuumed.after_size, after.file_size);
+        try std.testing.expectEqual(@as(u64, 2), after.record_count);
+        try std.testing.expectEqual(@as(u64, 2), after.live_file_count);
+        try std.testing.expectEqual(after.file_size, after.compact_size);
+        try std.testing.expectEqual(@as(u64, 0), after.reclaimable_bytes);
+
+        const schema = (try file.getCatalogRecordAlloc(allocator, "schema")).?;
+        defer allocator.free(schema);
+        try std.testing.expectEqualStrings("{\"version\":2}", schema);
+
+        const live = (try file.getDocumentAlloc(allocator, "doc:live")).?;
+        defer allocator.free(live);
+        try std.testing.expectEqualStrings("small", live);
+        try std.testing.expectEqual(@as(?[]u8, null), try file.getDocumentAlloc(allocator, "doc:gone"));
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+
+    const report = try reopened.check();
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(@as(u64, 2), report.record_count);
+
+    const schema = (try reopened.getCatalogRecordAlloc(allocator, "schema")).?;
+    defer allocator.free(schema);
+    try std.testing.expectEqualStrings("{\"version\":2}", schema);
+
+    const live = (try reopened.getDocumentAlloc(allocator, "doc:live")).?;
+    defer allocator.free(live);
+    try std.testing.expectEqualStrings("small", live);
+}
+
+test "lite native vacuum atomically replaces file and keeps writer handle usable" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-vacuum-replace.aflite");
+    defer allocator.free(path);
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp-aflite-vacuum", .{path});
+    defer allocator.free(tmp_path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+
+        try file.putDocument("doc:live", "old");
+        try file.putDocument("doc:live", "new");
+
+        const vacuumed = try file.vacuum();
+        try std.testing.expect(vacuumed.reclaimed_bytes > 0);
+        try std.testing.expect(!pathExists(file.io_impl.io(), tmp_path));
+
+        try file.putDocument("doc:after-vacuum", "writer still attached");
+        const after = (try file.getDocumentAlloc(allocator, "doc:after-vacuum")).?;
+        defer allocator.free(after);
+        try std.testing.expectEqualStrings("writer still attached", after);
+
+        const report = try file.check();
+        try std.testing.expect(report.valid);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+
+    const live = (try reopened.getDocumentAlloc(allocator, "doc:live")).?;
+    defer allocator.free(live);
+    try std.testing.expectEqualStrings("new", live);
+    const after = (try reopened.getDocumentAlloc(allocator, "doc:after-vacuum")).?;
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings("writer still attached", after);
+}
+
+test "lite native check validates committed free map root" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-free-map-corrupt.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.create(allocator, path);
+    defer file.close();
+
+    try file.putDocument("doc:1", "value");
+    _ = try file.vacuum();
+
+    const checkpoint = file.activeCheckpoint();
+    try std.testing.expect(checkpoint.free_map_root_page != 0);
+
+    const payload = try encodeFreeMapAlloc(allocator, default_page_size, checkpoint.page_count + 1, &.{});
+    defer allocator.free(payload);
+    var page: [default_page_size]u8 = undefined;
+    encodePage(&page, .free_map, payload);
+    try file.file.writePositionalAll(file.io_impl.io(), &page, checkpoint.free_map_root_page * default_page_size);
+    try file.file.sync(file.io_impl.io());
+
+    const report = try file.check();
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("invalid_free_map", report.issue.?);
+}
+
+test "lite native free map reads are bounded by supplied checkpoint" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-free-map-checkpoint-bound.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.create(allocator, path);
+    defer file.close();
+
+    try file.putDocument("doc:1", "value");
+
+    var checkpoint = file.activeCheckpoint();
+    try std.testing.expect(checkpoint.free_map_root_page != 0);
+    checkpoint.page_count = checkpoint.free_map_root_page;
+
+    try std.testing.expectError(error.InvalidPageId, file.readFreePagesAlloc(checkpoint));
+
+    var reachable_pages = std.AutoHashMapUnmanaged(u64, void){};
+    defer reachable_pages.deinit(allocator);
+    try std.testing.expectError(error.InvalidPageId, file.validateReachableFreeMap(checkpoint, &reachable_pages));
+}
+
+test "lite native free map cannot reclaim previous checkpoint pages" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-free-map-previous-protected.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.create(allocator, path);
+    defer file.close();
+
+    try file.putDocument("doc:1", "v1");
+    try file.putDocument("doc:1", "v2");
+
+    const active = file.activeCheckpoint();
+    const previous = file.header.checkpoints[if (file.header.active_checkpoint == 0) 1 else 0];
+    try std.testing.expect(active.free_map_root_page != 0);
+    try std.testing.expect(previous.free_map_root_page != 0);
+    try std.testing.expect(active.free_map_root_page != previous.free_map_root_page);
+
+    const payload = try encodeFreeMapAlloc(allocator, default_page_size, active.page_count, &.{previous.free_map_root_page});
+    defer allocator.free(payload);
+    var page: [default_page_size]u8 = undefined;
+    encodePage(&page, .free_map, payload);
+    try file.file.writePositionalAll(file.io_impl.io(), &page, active.free_map_root_page * default_page_size);
+    try file.file.sync(file.io_impl.io());
+
+    const report = try file.check();
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("invalid_free_map", report.issue.?);
+    try std.testing.expectError(error.InvalidNativeFreeMap, file.putDocument("doc:1", "v3"));
+}
+
+test "lite native check reports corrupted committed document page" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-check-corrupt.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putDocument("doc:1", "value");
+    }
+
+    {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, "X", default_page_size + page_header_size);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+    const report = try reopened.check();
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("page_checksum_mismatch", report.issue.?);
+}
+
+test "lite native check reports corrupted committed index catalog page" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-check-index-corrupt.aflite");
+    defer allocator.free(path);
+
+    const root_page = blk: {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putIndexCatalogRecord("index/files/hbc/postings.bin", "index bytes");
+        break :blk file.activeCheckpoint().index_catalog_root_page;
+    };
+
+    {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, "X", root_page * default_page_size + page_header_size);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+    const report = try reopened.check();
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("page_checksum_mismatch", report.issue.?);
+}
+
+test "lite native check reports corrupted index catalog external value page" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-check-index-value-corrupt.aflite");
+    defer allocator.free(path);
+
+    const large_value = try allocator.alloc(u8, default_page_size * 2);
+    defer allocator.free(large_value);
+    @memset(large_value, 'i');
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putIndexCatalogRecord("index/files/hbc/postings.bin", large_value);
+    }
+
+    {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, "X", default_page_size + page_header_size);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+    const report = try reopened.check();
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("page_checksum_mismatch", report.issue.?);
+}
+
+test "lite native check reports truncated committed file" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-check-truncated.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putDocument("doc:1", "value");
+    }
+
+    {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        try file.setLength(std.testing.io, default_page_size + 16);
+    }
+
+    {
+        var reopened = try NativeFile.open(allocator, path, true);
+        defer reopened.close();
+        try std.testing.expectEqual(@as(u64, 0), reopened.activeCheckpoint().commit_sequence);
+        try std.testing.expectEqual(@as(?[]u8, null), try reopened.getDocumentAlloc(allocator, "doc:1"));
+    }
+
+    const report = try checkFile(allocator, path);
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("tail_bytes", report.issue.?);
+}
+
+test "lite native checkFile reports corrupted header" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-check-header-corrupt.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putDocument("doc:1", "value");
+    }
+
+    {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, "X", page_size_offset);
+    }
+
+    const report = try checkFile(allocator, path);
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("header_checksum_mismatch", report.issue.?);
+}
+
+test "lite native checkFile reports invalid checkpoint metadata separately from truncation" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-check-invalid-checkpoint.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putDocument("doc:1", "value");
+    }
+
+    var header_bytes = try readHeaderForTest(path);
+    var header = try decodeHeader(&header_bytes);
+    for (&header.checkpoints) |*slot| {
+        slot.catalog_root_page = slot.page_count;
+        slot.document_root_page = slot.page_count;
+        slot.index_catalog_root_page = slot.page_count;
+        slot.free_map_root_page = slot.page_count;
+    }
+    encodeHeader(&header_bytes, header);
+
+    {
+        var raw = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer raw.close(std.testing.io);
+        try raw.writePositionalAll(std.testing.io, &header_bytes, 0);
+        try raw.sync(std.testing.io);
+    }
+
+    const report = try checkFile(allocator, path);
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("invalid_checkpoint", report.issue.?);
+}
+
+test "lite native checkFile reports checkpoint prefix overflow as invalid metadata" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-check-checkpoint-overflow.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putDocument("doc:1", "value");
+    }
+
+    var header_bytes = try readHeaderForTest(path);
+    var header = try decodeHeader(&header_bytes);
+    for (&header.checkpoints, 0..) |*slot, index| {
+        slot.* = .{
+            .commit_sequence = @as(u64, @intCast(index + 1)),
+            .catalog_root_page = 0,
+            .document_root_page = 0,
+            .index_catalog_root_page = 0,
+            .free_map_root_page = 0,
+            .page_count = std.math.maxInt(u64),
+        };
+    }
+    encodeHeader(&header_bytes, header);
+
+    {
+        var raw = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer raw.close(std.testing.io);
+        try raw.writePositionalAll(std.testing.io, &header_bytes, 0);
+        try raw.sync(std.testing.io);
+    }
+
+    const report = try checkFile(allocator, path);
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("invalid_checkpoint", report.issue.?);
+    try std.testing.expectEqual(@as(u64, 0), report.record_count);
+    try std.testing.expectEqual(@as(u64, 0), report.compact_size);
+}

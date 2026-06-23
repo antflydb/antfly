@@ -23,6 +23,7 @@ pub const swarm = @import("swarm.zig");
 pub const inference = @import("inference.zig");
 pub const ha = @import("ha.zig");
 pub const cli = @import("cli/mod.zig");
+pub const lite = @import("lite.zig");
 
 test "cmd module compiles" {
     _ = data;
@@ -36,4 +37,5 @@ test "cmd module compiles" {
     _ = inference;
     _ = ha;
     _ = cli;
+    _ = lite;
 }

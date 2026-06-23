@@ -58,6 +58,57 @@ export POSTGRES_URL="postgresql://postgres:postgres@localhost:5432/postgres"
 
 ## Memory Examples
 
+### [Antfly Lite Go](./antfly-lite-go/)
+
+Embed Antfly Lite directly in a Go process with a live `.aflite` database and
+export a portable `.afb` backup for restore or promotion.
+
+**Use cases:**
+- Local-first desktop and edge applications
+- Embedded search in Go services
+- Tests and demos that should not start a server
+
+**Features:**
+- Creates a native `.aflite` database on first run, then reopens it through the
+  Go Lite binding
+- Writes and reads JSON documents without a server process
+- Exports a portable `.afb` backup
+
+**Quick start:**
+```bash
+cd zig
+zig build lite-capi
+cd ../examples/antfly-lite-go
+GOWORK=off go run . --reset
+```
+
+### [Antfly Lite Retrieval Template](./antfly-lite-retrieval-go/)
+
+Build a local-first retrieval app on Antfly Lite with a native `.aflite`
+database, caller-supplied embeddings, full-text search, dense vector search, and
+hybrid search.
+
+**Use cases:**
+- Embedded retrieval in desktop, edge, or single-user apps
+- Local demos that should not require an inference service
+- Seeded retrieval fixtures that can later promote into normal Antfly
+
+**Features:**
+- Creates a native `.aflite` database on first run, then reopens it through the
+  Go Lite binding
+- Initializes schema, full-text, and dense vector indexes in one `.aflite` file
+- Writes documents with caller-supplied embeddings
+- Runs full-text, dense, and hybrid search locally
+- Exports a portable `.afb` backup for restore, promotion, or archival use
+
+**Quick start:**
+```bash
+cd zig
+zig build lite-capi
+cd ../examples/antfly-lite-retrieval-go
+GOWORK=off go run . --reset
+```
+
 ### [memoryaf + docsaf](./memoryaf/)
 
 Turn documentation into `memoryaf` records from local files, Git, S3, Google Drive, or web sources, with local watch mode for filesystem sync.

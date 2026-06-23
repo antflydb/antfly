@@ -233,6 +233,9 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
     for (batch.changed_artifact_keys) |key| {
         if (internal_keys.isGraphEdgeArtifactKey(key)) {
             try appendUniqueHintAlloc(alloc, &target_hints, .graph);
+        } else if (internal_keys.isChunkArtifactRecordKey(key)) {
+            try appendUniqueHintAlloc(alloc, &target_hints, .full_text);
+            try appendUniqueHintAlloc(alloc, &target_hints, .graph);
         } else if (internal_keys.isAssetArtifactKey(key)) {
             try appendUniqueHintAlloc(alloc, &target_hints, .graph);
             try appendUniqueHintAlloc(alloc, &target_hints, .resolution);
@@ -995,6 +998,23 @@ test "change journal graph-only derived batch encodes graph hint and artifact id
     const payload = try encodeRecord(alloc, record);
     defer alloc.free(payload);
     try std.testing.expectEqual(singleHintMask(.graph), try encodedRecordHintMask(payload));
+}
+
+test "change journal chunk artifact changes wake full-text replay" {
+    const alloc = std.testing.allocator;
+
+    const chunk_key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    defer alloc.free(chunk_key);
+
+    var record = try recordFromDerivedBatch(alloc, .{
+        .changed_artifact_keys = &.{chunk_key},
+    }, 18);
+    defer deinitRecord(alloc, &record);
+
+    try std.testing.expect(recordHasHint(record, .full_text));
+    try std.testing.expect(recordHasHint(record, .graph));
+    try std.testing.expectEqual(@as(usize, 1), record.changed_artifact_keys.len);
+    try std.testing.expectEqualStrings(chunk_key, record.changed_artifact_keys[0]);
 }
 
 test "change journal binary codec roundtrips and omits empty lists" {
