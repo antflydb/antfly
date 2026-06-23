@@ -839,10 +839,11 @@ fn lowerReadPlanWithOptionalSourceSchemaParsedSqlAlloc(
     function_bindings: SqlFunctionBindings,
 ) !LoweredReadPlan {
     if (schema.storage_mode == .document) {
-        if (source_schema != null) return error.UnsupportedSqlShape;
+        if (source_schema != null) return error.DocumentSqlUnsupportedJoin;
         return switch (parsed_sql.statement.readKind() orelse return error.UnsupportedSqlShape) {
             .aggregate => .{ .document_aggregate = try sql_adapter.lowerDocumentAlgebraicAggregatePlanParsedSqlAlloc(alloc, parsed_sql, schema) },
             .query => .{ .document_query = try sql_adapter.lowerDocumentReadPlanParsedSqlAlloc(alloc, parsed_sql, schema) },
+            .join, .lateral => error.DocumentSqlUnsupportedJoin,
             else => error.UnsupportedSqlShape,
         };
     }
@@ -1065,8 +1066,34 @@ fn lowerDocumentReadPlanFromBindingParsedSqlAlloc(
                 document.capabilities,
             ),
         },
+        .join, .lateral => error.DocumentSqlUnsupportedJoin,
         else => error.UnsupportedSqlShape,
     };
+}
+
+test "sql runtime rejects document joins with document diagnostic" {
+    const alloc = std.testing.allocator;
+    var parsed_schema = try schema_api.parseValidatedTableSchema(alloc,
+        \\{"version":1,"storage_mode":"document","default_type":"document","enforce_types":false,"document_schemas":{"document":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"}},"additionalProperties":true}}}}
+    );
+    defer parsed_schema.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(
+        alloc,
+        "SELECT docs._id FROM docs JOIN docs AS other_docs ON docs._id = other_docs._id",
+    );
+    defer parsed_sql.deinit(alloc);
+
+    try std.testing.expectError(
+        error.DocumentSqlUnsupportedJoin,
+        lowerReadPlanWithOptionalSourceSchemaParsedSqlAlloc(alloc, &parsed_sql, schema, null, &.{}, .{}),
+    );
+    try std.testing.expectError(
+        error.DocumentSqlUnsupportedJoin,
+        lowerReadPlanWithOptionalSourceSchemaParsedSqlAlloc(alloc, &parsed_sql, schema, schema, &.{}, .{}),
+    );
 }
 
 pub fn lowerExplainPlanAlloc(

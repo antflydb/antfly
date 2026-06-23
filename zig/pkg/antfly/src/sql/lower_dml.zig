@@ -12369,6 +12369,7 @@ fn lowerWritePlanWithCatalogParsedSqlForDmlTestAlloc(
     options: plan_mod.LowerWritePlanOptions,
     catalog: table_catalog.CatalogSource,
 ) !plan_mod.LoweredWritePlan {
+    if (schema.storage_mode == .document) return error.DocumentSqlWriteUnsupported;
     var context = lowering_context.CatalogWritePlanLoweringContext{
         .alloc = alloc,
         .schema = schema,
@@ -13073,6 +13074,25 @@ test "sql adapter lower dml routes write sql through typed plan families" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "sql adapter lower dml rejects catalog writes to document tables" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"}},"additionalProperties":true}}}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var catalog = corpus.AppParitySourceSchemaCatalog.init("docs", schema_json);
+
+    try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "INSERT INTO docs (_id, _doc) VALUES ('doc:a', '{}')",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    ));
 }
 
 test "sql adapter lower dml detects dotted path conflicts" {

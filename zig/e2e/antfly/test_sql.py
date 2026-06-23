@@ -67,6 +67,7 @@ DOCUMENT_SQL_SCHEMA = {
                     "title": {"type": "text"},
                     "body": {"type": "text"},
                     "status": {"type": "keyword"},
+                    "tags": {"type": "array", "items": {"type": "keyword"}},
                     "metadata": {"type": "json"},
                 },
                 "additionalProperties": True,
@@ -272,24 +273,28 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
                 "title": "alpha",
                 "body": "alpha search document",
                 "status": "active",
+                "tags": ["urgent", "search"],
                 "metadata": {"plan": "pro"},
             },
             "doc:b": {
                 "title": "beta",
                 "body": "beta archive document",
                 "status": "archived",
+                "tags": ["archive"],
                 "metadata": {"plan": "free"},
             },
             "doc:c": {
                 "title": "alpha followup",
                 "body": "alpha search followup",
                 "status": "active",
+                "tags": ["search"],
                 "metadata": {"plan": "team"},
             },
             "doc:d": {
                 "title": "delta archived",
                 "body": "delta search archive",
                 "status": "archived",
+                "tags": ["archive", "search"],
                 "metadata": {"plan": "enterprise"},
             },
         },
@@ -312,6 +317,27 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     )
     assert write_response.status_code == 400
     assert write_response.text == "document sql write unsupported"
+
+    array_response = stateful_api.s.post(
+        f"{stateful_api.url}/sql",
+        json={"sql": f"SELECT _id FROM {table} WHERE tags = 'urgent' LIMIT 10;"},
+        timeout=10,
+    )
+    assert array_response.status_code == 400
+    assert array_response.text == "document sql array requires unnest"
+
+    join_response = stateful_api.s.post(
+        f"{stateful_api.url}/sql",
+        json={
+            "sql": (
+                f"SELECT {table}._id FROM {table} "
+                f"JOIN {table} AS other_docs ON {table}._id = other_docs._id;"
+            )
+        },
+        timeout=10,
+    )
+    assert join_response.status_code == 400
+    assert join_response.text == "document sql unsupported join"
 
     by_id = _first_sql_json(
         sql_cli(

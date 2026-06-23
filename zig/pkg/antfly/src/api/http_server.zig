@@ -5552,11 +5552,14 @@ pub const ApiHttpServer = struct {
             &.{},
             self.catalogSource(),
             function_bindings,
-        ) catch |err| switch (err) {
-            error.InvalidSqlCatalog, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
-            error.DocumentSqlIndexUnavailable, error.DocumentSqlRequiresBoundedScan, error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid sql request"),
-            error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return try textResponse(self.alloc, 501, "unsupported sql statement"),
-            else => return err,
+        ) catch |err| {
+            if (documentSqlReadErrorMessage(err)) |message| return try textResponse(self.alloc, 400, message);
+            switch (err) {
+                error.InvalidSqlCatalog, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid sql request"),
+                error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return try textResponse(self.alloc, 501, "unsupported sql statement"),
+                else => return err,
+            }
         };
         defer lowered.deinit(self.alloc);
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
@@ -5570,13 +5573,16 @@ pub const ApiHttpServer = struct {
             schema,
             lowered,
             .read_index,
-        ) catch |err| switch (err) {
-            error.InvalidSqlCatalog, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
-            error.DocumentSqlIndexUnavailable, error.DocumentSqlRequiresBoundedScan, error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return try textResponse(self.alloc, 400, "invalid sql request"),
-            error.RelationalRowsCteSpillRequired => return try textResponse(self.alloc, 429, "sql read backpressured"),
-            error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return try textResponse(self.alloc, 501, "unsupported sql statement"),
-            error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
-            else => return err,
+        ) catch |err| {
+            if (documentSqlReadErrorMessage(err)) |message| return try textResponse(self.alloc, 400, message);
+            switch (err) {
+                error.InvalidSqlCatalog, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return try textResponse(self.alloc, 400, "invalid sql request"),
+                error.RelationalRowsCteSpillRequired => return try textResponse(self.alloc, 429, "sql read backpressured"),
+                error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return try textResponse(self.alloc, 501, "unsupported sql statement"),
+                error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+                else => return err,
+            }
         }) orelse return try textResponse(self.alloc, 404, "not found");
         defer result.deinit(self.alloc);
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
@@ -5588,6 +5594,16 @@ pub const ApiHttpServer = struct {
         );
         defer self.alloc.free(response_body);
         return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+    }
+
+    fn documentSqlReadErrorMessage(err: anyerror) ?[]const u8 {
+        return switch (err) {
+            error.DocumentSqlIndexUnavailable => "document sql index unavailable",
+            error.DocumentSqlRequiresBoundedScan => "document sql requires bounded scan",
+            error.DocumentSqlArrayRequiresUnnest => "document sql array requires unnest",
+            error.DocumentSqlUnsupportedJoin => "document sql unsupported join",
+            else => null,
+        };
     }
 
     pub fn handlePublicSql(self: *ApiHttpServer, body: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
