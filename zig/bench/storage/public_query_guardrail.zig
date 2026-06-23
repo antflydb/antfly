@@ -1637,13 +1637,9 @@ fn benchDbSearch(alloc: std.mem.Allocator, db: *db_mod.DB, query_bodies: []const
                 owned.req.primary_text_index_name = try alloc.dupe(u8, text_index_name);
             }
             const started = nowNs();
-            if (owned.req.dense != null or owned.req.dense_queries.len == 1) {
-                var dense_req = owned.req;
-                const dense = if (owned.req.dense) |dense_query| dense_query else blk: {
-                    dense_req.index_name = owned.req.dense_queries[0].index_name;
-                    dense_req.dense_queries = &.{};
-                    break :blk owned.req.dense_queries[0].query;
-                };
+            if (profiledDenseBenchQuery(owned.req, cfg.query_shape)) |dense_request| {
+                const dense_req = dense_request.req;
+                const dense = dense_request.query;
                 var profiled = try db.searchDenseProfiled(alloc, dense_req, dense);
                 defer profiled.result.deinit();
                 stats.total_ns += elapsedSince(started);
@@ -1731,6 +1727,38 @@ fn benchDirectHandler(
         }
     }
     return stats;
+}
+
+const ProfiledDenseBenchQuery = struct {
+    req: db_mod.types.SearchRequest,
+    query: db_mod.types.DenseKnnQuery,
+};
+
+fn profiledDenseBenchQuery(req: db_mod.types.SearchRequest, query_shape: QueryShape) ?ProfiledDenseBenchQuery {
+    switch (query_shape) {
+        .dense, .dense_filter, .algebraic_filter => {},
+        .full_text, .sparse_filter, .graph_expand, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project => return null,
+    }
+    if (req.sparse != null or req.sparse_queries.len > 0) return null;
+    if (req.graph_queries.len > 0) return null;
+    if (req.dense_queries.len > 1) return null;
+    if (req.merge_config != null) return null;
+    if (req.reranker != null) return null;
+    if (req.dense_queries.len == 1) {
+        var dense_req = req;
+        dense_req.index_name = req.dense_queries[0].index_name;
+        dense_req.dense_queries = &.{};
+        return .{
+            .req = dense_req,
+            .query = req.dense_queries[0].query,
+        };
+    }
+    return if (req.dense) |dense|
+        .{ .req = req, .query = dense }
+    else switch (req.query) {
+        .dense_knn => |dense| .{ .req = req, .query = dense },
+        else => null,
+    };
 }
 
 fn benchHandlerPipeline(
