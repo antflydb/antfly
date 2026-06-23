@@ -13,8 +13,13 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const build_options = @import("build_options");
 const template_mod = @import("template_stub.zig");
-const scraping = @import("antfly_scraping");
+const scraping = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
+    @import("scraping_stub.zig")
+else
+    @import("antfly_scraping");
 const common_secrets = @import("../../common/secrets.zig");
 
 const Allocator = std.mem.Allocator;

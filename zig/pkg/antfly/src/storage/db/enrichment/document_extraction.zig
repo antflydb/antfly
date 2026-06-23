@@ -15,7 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const pdf = if (builtin.os.tag == .freestanding or builtin.is_test)
+const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
     struct {
         pub const reader = struct {
             pub const Reader = struct {

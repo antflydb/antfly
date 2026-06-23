@@ -5801,6 +5801,8 @@ pub fn build(b: *std.Build) void {
     replay_bench_root_mod.addImport("bloom", bloom_mod);
     replay_bench_root_mod.addImport("antfly_vector", vector_mod);
     replay_bench_root_mod.addImport("antfly_vectorindex", vectorindex_mod);
+    replay_bench_root_mod.addImport("antfly_matcher", matcher_mod);
+    replay_bench_root_mod.addImport("antfly_resolver", resolver_mod);
     replay_bench_root_mod.addImport("antfly_vellum", vellum_mod);
     replay_bench_root_mod.addImport("antfly_regex", regex_mod);
     replay_bench_root_mod.addImport("antfly_reranking", reranking_mod);
