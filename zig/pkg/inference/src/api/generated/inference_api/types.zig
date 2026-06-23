@@ -371,8 +371,8 @@ pub const ToolCallFunctionDelta = struct {
     arguments: ?[]const u8 = null,
 };
 
-/// Model registry kind eligible for startup warming.
-pub const WarmModelKind = enum {
+/// Model registry kind.
+pub const ModelKind = enum {
     generator,
     embedder,
     reranker,
@@ -421,8 +421,8 @@ pub const WarmModelKind = enum {
     }
 };
 
-/// Optional backend preference for a warm target.
-pub const WarmModelBackend = enum {
+/// Optional backend preference for loading a model.
+pub const ModelBackend = enum {
     native,
     onnx,
     metal,
@@ -843,12 +843,12 @@ pub const ToolCallDelta = struct {
     function: ?ToolCallFunctionDelta = null,
 };
 
-/// Startup warm target. Keep this directive to model identity and backend selection; quantization and companion model metadata belong to the model artifact or a future typed runtime option once the warm path can honor it.
-pub const WarmModel = struct {
-    kind: WarmModelKind,
+/// Model reference used by startup preload and model-loading configuration.
+pub const ModelRef = struct {
+    kind: ModelKind,
     /// Model name to resolve within the registry for the selected kind.
     name: []const u8,
-    backend: ?WarmModelBackend = null,
+    backend: ?ModelBackend = null,
 };
 
 pub const ModelsResponse = struct {
@@ -1108,10 +1108,8 @@ pub const Config = struct {
     max_queue_size: ?i64 = null,
     /// Maximum time to wait for a request to complete, including queue wait time. Use Go duration format: "30s", "1m", "0" (no timeout, default). Requests exceeding this timeout receive 504 Gateway Timeout.
     request_timeout: ?[]const u8 = null,
-    /// Typed models to preload and warm at startup. Generators run a tiny generation request so native/Metal weights, KV setup, and kernels use the same budgeted path as request-time generation. Other model kinds use the best available warm path for that kind.
-    warm_models: ?[]const WarmModel = null,
-    /// Generator model names to load and warm at startup. These models are loaded immediately when inference starts, avoiding first-request latency. Use warm_models for non-generator targets or backend-specific generator warmup.
-    preload: ?[]const []const u8 = null,
+    /// Models to preload and warm at startup. Generators run a tiny generation request so native/Metal weights, KV setup, and kernels use the same budgeted path as request-time generation. Other model kinds use the best available warm path for that kind.
+    preload: ?[]const ModelRef = null,
     /// Maximum memory (in MB) to use for loaded models. When this limit is approached, least recently used models are unloaded. Set to 0 for unlimited (default). This is an advisory limit - actual memory usage depends on model sizes and may temporarily exceed this value. Works alongside max_loaded_models for fine-grained control.
     max_memory_mb: ?i64 = null,
     /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map use the default strategy based on keep_alive: - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle) - If keep_alive="0": eager loading (load at startup, never unload) When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.

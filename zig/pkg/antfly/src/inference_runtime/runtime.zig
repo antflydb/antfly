@@ -68,8 +68,7 @@ const EmbeddedServerConfig = struct {
     content_security: ?common_config.Config.ContentSecurityConfig = null,
     s3_credentials: ?common_config.Config.S3CredentialsConfig = null,
     generation_budget_overrides: ServerBudgetOverrides = .{},
-    warm_models: []const inference.server.WarmModel = &.{},
-    preload: []const []const u8 = &.{},
+    preload: []const inference.server.WarmModel = &.{},
 };
 
 const BudgetOverridesMb = struct {
@@ -227,7 +226,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         .models_dir = models_dir,
         .ml_dir = ml_dir,
         .generation_budget_overrides = budgetOverridesFromMb(budget_overrides_mb),
-        .warm_models = warm_models.items,
+        .preload = warm_models.items,
     });
     defer node.deinit();
 
@@ -249,7 +248,6 @@ pub fn spawnServerProcess(
         .models_dir = config.models_dir orelse defaultModelsDir(alloc),
         .ml_dir = config.ml_dir orelse defaultMlDir(alloc),
         .generation_budget_overrides = config.generation_budget_overrides,
-        .warm_models = config.warm_models,
         .preload = config.preload,
     };
     if (config.content_security) |sec| node_cfg.content_security = sec;

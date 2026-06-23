@@ -49,8 +49,7 @@ const RunConfig = struct {
     ml_dir: ?[]const u8 = null,
     content_security: ?inference.scraping.ContentSecurityConfig = null,
     s3_credentials: ?inference.scraping.S3CredentialsConfig = null,
-    warm_models: []const WarmModelConfig = &.{},
-    preload: []const []const u8 = &.{},
+    preload: []const WarmModelConfig = &.{},
     keep_alive_ms: ?u64 = null,
     max_loaded_models: ?usize = null,
     max_concurrent_requests: ?usize = null,
@@ -268,16 +267,15 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var node_cfg = inference.server.NodeConfig{
         .models_dir = models_dir,
         .ml_dir = ml_dir,
-        .warm_models = warm_models.items,
+        .preload = warm_models.items,
     };
     if (loaded_cfg) |cfg| {
         node_cfg.content_security = cfg.content_security;
         node_cfg.s3_credentials = cfg.s3_credentials;
         if (warm_models.items.len == 0) {
-            config_warm_models = try warmModelsFromConfig(allocator, cfg.warm_models);
-            node_cfg.warm_models = config_warm_models;
+            config_warm_models = try warmModelsFromConfig(allocator, cfg.preload);
+            node_cfg.preload = config_warm_models;
         }
-        node_cfg.preload = cfg.preload;
         if (cfg.keep_alive_ms) |value| node_cfg.keep_alive_ms = value;
         if (cfg.max_loaded_models) |value| node_cfg.max_loaded_models = value;
         if (cfg.max_concurrent_requests) |value| node_cfg.max_concurrent_requests = value;
@@ -452,10 +450,9 @@ test "run config parses shared scraping fields and ignores api_url" {
         \\  "s3_credentials": {
         \\    "endpoint": "s3.amazonaws.com"
         \\  },
-        \\  "warm_models": [
+        \\  "preload": [
         \\    { "kind": "generator", "name": "gemma-e2b", "backend": "metal" }
         \\  ],
-        \\  "preload": ["gemma-e4b"],
         \\  "max_loaded_models": 8,
         \\  "pool_size": 4
         \\}
@@ -470,12 +467,10 @@ test "run config parses shared scraping fields and ignores api_url" {
     try std.testing.expectEqualStrings("/tmp/ml", parsed.value.ml_dir.?);
     try std.testing.expectEqual(@as(?bool, true), parsed.value.content_security.?.block_private_ips);
     try std.testing.expectEqualStrings("s3.amazonaws.com", parsed.value.s3_credentials.?.endpoint.?);
-    try std.testing.expectEqual(@as(usize, 1), parsed.value.warm_models.len);
-    try std.testing.expectEqualStrings("generator", parsed.value.warm_models[0].kind);
-    try std.testing.expectEqualStrings("gemma-e2b", parsed.value.warm_models[0].name);
-    try std.testing.expectEqualStrings("metal", parsed.value.warm_models[0].backend.?);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.preload.len);
-    try std.testing.expectEqualStrings("gemma-e4b", parsed.value.preload[0]);
+    try std.testing.expectEqualStrings("generator", parsed.value.preload[0].kind);
+    try std.testing.expectEqualStrings("gemma-e2b", parsed.value.preload[0].name);
+    try std.testing.expectEqualStrings("metal", parsed.value.preload[0].backend.?);
     try std.testing.expectEqual(@as(?usize, 8), parsed.value.max_loaded_models);
     try std.testing.expectEqual(@as(?usize, 4), parsed.value.pool_size);
 }

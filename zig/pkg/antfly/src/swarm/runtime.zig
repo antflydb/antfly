@@ -902,8 +902,7 @@ pub fn runFromIterator(
         .ml_dir = resolveInferenceMlDir(cli, if (loaded_config) |*cfg| cfg else null) orelse
             antfly.inference_runtime.defaultMlDirForDataDir(alloc, data_dir),
         .generation_budget_overrides = resolveInferenceBudgetOverrides(cli),
-        .warm_models = resolved_warm_models.items,
-        .preload = if (loaded_config) |*cfg| cfg.inference.preload else &.{},
+        .preload = resolved_warm_models.items,
     };
     if (loaded_config) |*cfg| {
         if (cfg.effectiveAntflyContentSecurity()) |security| antfly_node_cfg.content_security = security.*;
@@ -2829,11 +2828,11 @@ fn resolveInferenceWarmModels(
         return .{ .items = cli.inference_warm_models.items };
     }
     const loaded = cfg orelse return .{ .items = &.{} };
-    if (loaded.inference.warm_models.len == 0) return .{ .items = &.{} };
+    if (loaded.inference.preload.len == 0) return .{ .items = &.{} };
 
-    const out = try alloc.alloc(inference.server.WarmModel, loaded.inference.warm_models.len);
+    const out = try alloc.alloc(inference.server.WarmModel, loaded.inference.preload.len);
     errdefer alloc.free(out);
-    for (loaded.inference.warm_models, 0..) |model, i| {
+    for (loaded.inference.preload, 0..) |model, i| {
         out[i] = .{
             .kind = parseWarmModelKind(model.kind) orelse return error.InvalidConfig,
             .name = model.name,
@@ -4126,7 +4125,7 @@ test "inference config falls back to common config" {
             .api_url = try alloc.dupe(u8, "http://127.0.0.1:8089"),
             .models_dir = try alloc.dupe(u8, "/tmp/antfly-models"),
             .ml_dir = try alloc.dupe(u8, "/tmp/antfly-ml"),
-            .warm_models = try alloc.dupe(antfly.common.config.Config.InferenceConfig.WarmModelConfig, &.{
+            .preload = try alloc.dupe(antfly.common.config.Config.InferenceConfig.WarmModelConfig, &.{
                 .{
                     .kind = try alloc.dupe(u8, "generator"),
                     .name = try alloc.dupe(u8, "gemma-e2b"),

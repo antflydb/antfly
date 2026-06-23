@@ -98,8 +98,7 @@ pub const NodeConfig = struct {
     ml_dir: []const u8 = "./ml",
     content_security: ?scraping.ContentSecurityConfig = null,
     s3_credentials: ?scraping.S3CredentialsConfig = null,
-    warm_models: []const WarmModel = &.{},
-    preload: []const []const u8 = &.{},
+    preload: []const WarmModel = &.{},
     keep_alive_ms: u64 = 300_000,
     max_loaded_models: usize = 10,
     max_concurrent_requests: usize = 32,
@@ -816,8 +815,7 @@ pub const Node = struct {
     }
 
     pub fn warmConfiguredModels(self: *Node, allocator: std.mem.Allocator) !void {
-        for (self.config.warm_models) |model| try self.warmModel(allocator, model);
-        for (self.config.preload) |model_name| try self.warmGenerator(allocator, model_name);
+        for (self.config.preload) |model| try self.warmModel(allocator, model);
     }
 
     pub fn warmConfiguredGenerators(self: *Node, allocator: std.mem.Allocator) !void {

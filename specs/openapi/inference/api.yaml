@@ -2768,9 +2768,9 @@ components:
         arguments:
           type: string
           description: Incremental arguments JSON string
-    WarmModelKind:
+    ModelKind:
       type: string
-      description: Model registry kind eligible for startup warming.
+      description: Model registry kind.
       enum:
         - generator
         - embedder
@@ -2782,32 +2782,29 @@ components:
         - reader
         - transcriber
         - extractor
-    WarmModelBackend:
+    ModelBackend:
       type: string
-      description: Optional backend preference for a warm target.
+      description: Optional backend preference for loading a model.
       enum:
         - native
         - onnx
         - metal
         - cuda
         - wasm
-    WarmModel:
+    ModelRef:
       type: object
-      description: |
-        Startup warm target. Keep this directive to model identity and backend selection;
-        quantization and companion model metadata belong to the model artifact or a future
-        typed runtime option once the warm path can honor it.
+      description: Model reference used by startup preload and model-loading configuration.
       required:
         - kind
         - name
       properties:
         kind:
-          $ref: '#/components/schemas/WarmModelKind'
+          $ref: '#/components/schemas/ModelKind'
         name:
           type: string
           description: Model name to resolve within the registry for the selected kind.
         backend:
-          $ref: '#/components/schemas/WarmModelBackend'
+          $ref: '#/components/schemas/ModelBackend'
     Config:
       type: object
       required:
@@ -2926,29 +2923,19 @@ components:
             Requests exceeding this timeout receive 504 Gateway Timeout.
           default: '0'
           example: 30s
-        warm_models:
+        preload:
           type: array
           description: |
-            Typed models to preload and warm at startup. Generators run a tiny
-            generation request so native/Metal weights, KV setup, and kernels use
-            the same budgeted path as request-time generation. Other model kinds
-            use the best available warm path for that kind.
+            Models to preload and warm at startup. Generators run a tiny generation
+            request so native/Metal weights, KV setup, and kernels use the same
+            budgeted path as request-time generation. Other model kinds use the
+            best available warm path for that kind.
           items:
-            $ref: '#/components/schemas/WarmModel'
+            $ref: '#/components/schemas/ModelRef'
           example:
             - kind: generator
               name: gemma-e2b
               backend: metal
-        preload:
-          type: array
-          items:
-            type: string
-          description: |
-            Generator model names to load and warm at startup.
-            These models are loaded immediately when inference starts, avoiding first-request latency.
-            Use warm_models for non-generator targets or backend-specific generator warmup.
-          example:
-            - gemma-e2b
         max_memory_mb:
           type: integer
           description: |
