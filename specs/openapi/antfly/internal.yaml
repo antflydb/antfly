@@ -1,0 +1,365 @@
+openapi: "3.0.3"
+info:
+  title: Antfly Internal API
+  version: v1alpha1
+  description: |
+    Node-to-node internal API for Antfly runtime traffic.
+
+    This API is separate from the public `/db/v1` API and from operator-facing
+    `/admin/v1` control-plane operations. It is intended for trusted Antfly
+    nodes in one deployment. Hot-standby WAL replication uses this surface for
+    identity probes, slot bootstrap, WAL pulls, and standby progress updates.
+servers:
+  - url: /internal/v1
+    description: Node-local internal API
+tags:
+  - name: ha-replication
+    x-displayName: HA Replication
+    description: Runtime-to-runtime hot-standby replication protocol.
+paths:
+  /ha/replication/identify:
+    get:
+      tags: [ha-replication]
+      operationId: identifyHAReplicationSystem
+      summary: Identify this primary replication system
+      responses:
+        "200":
+          description: Primary identity and replication format.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HAIdentifySystemResponse"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/replication/slots:
+    post:
+      tags: [ha-replication]
+      operationId: createHAReplicationStreamingSlot
+      summary: Create or reserve a runtime replication slot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HACreateReplicationSlotRequest"
+      responses:
+        "200":
+          description: Created replication slot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HAReplicationSlotResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/replication/start:
+    post:
+      tags: [ha-replication]
+      operationId: startHAReplication
+      summary: Pull ordered HA replication records from a slot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HAStartReplicationRequest"
+      responses:
+        "200":
+          description: Ordered replication records starting at the requested LSN.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HAStartReplicationResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /ha/replication/status:
+    post:
+      tags: [ha-replication]
+      operationId: updateHAStandbyStatus
+      summary: Report durable receive and apply progress for a standby slot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HAStandbyStatusUpdateRequest"
+      responses:
+        "200":
+          description: Persisted standby slot progress.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HAStandbyStatusUpdateResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+components:
+  responses:
+    BadRequest:
+      description: Invalid internal replication request.
+      content:
+        text/plain:
+          schema:
+            type: string
+    NotFound:
+      description: Requested replication resource was not found.
+      content:
+        text/plain:
+          schema:
+            type: string
+    Conflict:
+      description: Node role or replication state does not allow the request.
+      content:
+        text/plain:
+          schema:
+            type: string
+  schemas:
+    HAIdentifier:
+      type: string
+      description: Stable HA node or slot identifier. Identifiers are 1-128 ASCII bytes and may contain letters, digits, `_`, `-`, `.`, and `:`.
+      minLength: 1
+      maxLength: 128
+      pattern: "^[A-Za-z0-9_.:-]+$"
+    HASlotName:
+      description: Stable standby replication slot name.
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: "^[A-Za-z0-9_.:-]+$"
+    HAIdentity:
+      type: object
+      required: [cluster_id, shard_id, table_id, timeline_id, epoch]
+      properties:
+        cluster_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        shard_id:
+          type: integer
+          format: uint64
+          minimum: 0
+        table_id:
+          type: integer
+          format: uint64
+          minimum: 0
+        timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        epoch:
+          type: integer
+          format: uint64
+          minimum: 1
+    HAIdentifySystemResponse:
+      type: object
+      required: [identity, current_lsn, next_lsn, record_format_version]
+      properties:
+        identity:
+          $ref: "#/components/schemas/HAIdentity"
+        current_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        next_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        record_format_version:
+          type: integer
+          format: uint32
+          minimum: 1
+    HACreateReplicationSlotRequest:
+      type: object
+      required: [slot_name]
+      properties:
+        slot_name:
+          $ref: "#/components/schemas/HASlotName"
+        initial_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          description: Optional LSN to initialize the slot at. Defaults to the current primary LSN.
+    HAReplicationSlotResponse:
+      type: object
+      required:
+        - slot_name
+        - timeline_id
+        - restart_lsn
+        - received_lsn
+        - applied_lsn
+        - safe_read_lsn
+        - active
+        - reseed_required
+        - current_lsn
+      properties:
+        slot_name:
+          $ref: "#/components/schemas/HASlotName"
+        timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        restart_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        received_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        applied_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        safe_read_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        active:
+          type: boolean
+        reseed_required:
+          type: boolean
+        last_error:
+          type: string
+          nullable: true
+        current_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+    HAStartReplicationRequest:
+      type: object
+      required: [slot_name, from_lsn]
+      properties:
+        slot_name:
+          $ref: "#/components/schemas/HASlotName"
+        from_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        max_records:
+          type: integer
+          format: uint64
+          minimum: 0
+          description: Optional maximum record count. Zero means no record-count limit.
+        max_encoded_bytes:
+          type: integer
+          format: uint64
+          minimum: 0
+          description: Optional encoded byte budget. Zero means no byte limit.
+    HARecordKind:
+      type: string
+      enum:
+        - batch-mutation
+        - metadata-mutation
+        - derived-effect
+        - backup-start
+        - backup-end
+        - checkpoint
+        - manifest
+        - truncate
+        - timeline-switch
+    HAPayloadCodec:
+      type: string
+      enum: [raw, json, binary]
+    HAReplicationFrame:
+      type: object
+      required: [lsn, kind, payload_codec, encoded]
+      properties:
+        lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        kind:
+          $ref: "#/components/schemas/HARecordKind"
+        payload_codec:
+          $ref: "#/components/schemas/HAPayloadCodec"
+        encoded:
+          type: string
+          format: byte
+          description: Base64-encoded complete replication record envelope.
+    HAStartReplicationResponse:
+      type: object
+      required:
+        - slot_name
+        - identity
+        - record_format_version
+        - timeline_id
+        - from_lsn
+        - current_lsn
+        - last_sent_lsn
+        - next_lsn
+        - end_of_wal
+        - encoded_bytes
+        - records
+      properties:
+        slot_name:
+          $ref: "#/components/schemas/HASlotName"
+        identity:
+          $ref: "#/components/schemas/HAIdentity"
+        record_format_version:
+          type: integer
+          format: uint32
+          minimum: 1
+        timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        from_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        current_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        last_sent_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        next_lsn:
+          type: integer
+          format: uint64
+          minimum: 1
+        end_of_wal:
+          type: boolean
+        encoded_bytes:
+          type: integer
+          format: uint64
+          minimum: 0
+        records:
+          type: array
+          items:
+            $ref: "#/components/schemas/HAReplicationFrame"
+    HAStandbyStatusUpdateRequest:
+      type: object
+      required: [slot_name, timeline_id, received_lsn, applied_lsn]
+      properties:
+        slot_name:
+          $ref: "#/components/schemas/HASlotName"
+        timeline_id:
+          type: integer
+          format: uint64
+          minimum: 1
+        received_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        applied_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+        safe_read_lsn:
+          type: integer
+          format: uint64
+          minimum: 0
+          description: Optional safe-read boundary. Defaults to applied_lsn.
+    HAStandbyStatusUpdateResponse:
+      allOf:
+        - $ref: "#/components/schemas/HAReplicationSlotResponse"

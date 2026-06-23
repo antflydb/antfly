@@ -87,12 +87,14 @@ pub const serverless = @import("serverless/mod.zig");
 pub const serverless_server = @import("serverless/server.zig");
 pub const serverless_http_server = @import("serverless_http_server.zig");
 pub const serverless_http_client = @import("serverless_http_client.zig");
+pub const internal = @import("internal/mod.zig");
 
 // Tracing (TLA+ trace validation)
 pub const tracing = @import("tracing/mod.zig");
 
 // Raft integration
 pub const raft = @import("raft/mod.zig");
+pub const admin = @import("admin/mod.zig");
 pub const extensions = @import("extensions/mod.zig");
 pub const public_api = @import("api/mod.zig");
 pub const metadata = @import("metadata/mod.zig");
@@ -138,6 +140,9 @@ pub const storage_backend_scan = @import("storage/backend_scan.zig");
 pub const storage_sim_runtime = @import("storage/sim_runtime.zig");
 pub const object_storage = @import("storage/object_storage.zig");
 pub const host_environment = @import("storage/host_environment.zig");
+pub const lite = @import("storage/lite/mod.zig");
+pub const lite_backend = lite.backend;
+pub const lite_native = lite.native;
 pub const storage_lsm = @import("storage/lsm/mod.zig");
 pub const lmdb_backend = @import("storage/lmdb_backend.zig");
 pub const mem_backend = @import("storage/mem_backend.zig");
@@ -147,6 +152,7 @@ pub const lsm_backend_sim_test = @import("storage/lsm_backend_sim_test.zig");
 pub const lmdb = @import("storage/lmdb.zig");
 pub const lmdb_engine = @import("lmdb_engine");
 pub const hbc = @import("storage/hbc_adapter.zig");
+pub const ha = @import("storage/ha/mod.zig");
 pub const wal = @import("storage/wal.zig");
 pub const persistent = @import("storage/persistent.zig");
 pub const docstore = @import("storage/docstore.zig");
@@ -291,6 +297,7 @@ test {
     _ = lmdb;
     _ = lmdb_engine;
     _ = hbc;
+    _ = ha;
     _ = wal;
     _ = persistent;
     _ = docstore;

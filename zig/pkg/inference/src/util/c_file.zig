@@ -140,16 +140,53 @@ pub fn readRegion(allocator: std.mem.Allocator, path: []const u8, offset: u64, l
     const buf = try allocator.alloc(u8, len);
     errdefer allocator.free(buf);
 
+    try readRegionFromFd(fd, buf, offset);
+    return buf;
+}
+
+/// Read a byte range from a file into an existing buffer using pread.
+pub fn readRegionInto(allocator: std.mem.Allocator, path: []const u8, offset: u64, buf: []u8) !void {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    const fd = try openReadOnlyZ(path_z);
+    defer closeFd(fd);
+
+    const size: u64 = @intCast(try fileSizeFromFd(fd));
+    const end = try std.math.add(u64, offset, buf.len);
+    if (end > size) return error.RegionOutOfBounds;
+
+    try readRegionFromFd(fd, buf, offset);
+}
+
+fn readRegionFromFd(fd: std.posix.fd_t, buf: []u8, offset: u64) !void {
     var total: usize = 0;
-    while (total < len) {
+    while (total < buf.len) {
         const read_off = try std.math.add(u64, offset, total);
         const n = readAt(fd, buf[total..], read_off) catch break;
         if (n == 0) break;
         total += n;
     }
+    if (total != buf.len) return error.IncompleteRead;
+}
 
-    if (total != len) return error.IncompleteRead;
-    return buf;
+pub const FileAdvice = enum { normal, sequential, random, will_need, dont_need, no_reuse };
+
+pub fn adviseFileRange(allocator: std.mem.Allocator, path: []const u8, offset: u64, len: usize, advice: FileAdvice) void {
+    if (!comptime build_options.link_libc) return;
+    const path_z = allocator.dupeZ(u8, path) catch return;
+    defer allocator.free(path_z);
+    const fd = openReadOnlyZ(path_z) catch return;
+    defer closeFd(fd);
+    const c_advice = switch (advice) {
+        .normal => c.POSIX_FADV_NORMAL,
+        .sequential => c.POSIX_FADV_SEQUENTIAL,
+        .random => c.POSIX_FADV_RANDOM,
+        .will_need => c.POSIX_FADV_WILLNEED,
+        .dont_need => c.POSIX_FADV_DONTNEED,
+        .no_reuse => c.POSIX_FADV_NOREUSE,
+    };
+    _ = c.posix_fadvise(fd, @intCast(offset), @intCast(len), c_advice);
 }
 
 /// Check if a file exists at the given path.

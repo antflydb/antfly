@@ -6505,12 +6505,11 @@ test "relational schema parses application-time temporal constraints" {
     defer parsed_update_set_null.deinit(std.testing.allocator);
     try std.testing.expectEqual(ForeignKeyAction.set_null, parsed_update_set_null.foreign_keys[0].on_update);
 
-    try std.testing.expectError(
-        error.InvalidSchemaUpdateRequest,
-        parseSchema(std.testing.allocator,
-            \\{"storage_mode":"relational","default_type":"price","enforce_types":true,"document_schemas":{"price":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"sku":{"type":"keyword"},"valid_from":{"type":"datetime"},"valid_to":{"type":"datetime"}},"required":["tenant_id","sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["tenant_id","sku"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"price_parent_time_fkey","columns":["tenant_id","sku"],"period":"valid_time","references":{"table":"parent_prices","columns":["tenant_id","sku"],"period":"valid_time"},"on_update":"cascade"}]}
-        ),
+    var parsed_update_cascade = try parseSchema(std.testing.allocator,
+        \\{"storage_mode":"relational","default_type":"price","enforce_types":true,"document_schemas":{"price":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"sku":{"type":"keyword"},"valid_from":{"type":"datetime"},"valid_to":{"type":"datetime"}},"required":["tenant_id","sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["tenant_id","sku"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"price_parent_time_fkey","columns":["tenant_id","sku"],"period":"valid_time","references":{"table":"parent_prices","columns":["tenant_id","sku"],"period":"valid_time"},"on_update":"cascade"}]}
     );
+    defer parsed_update_cascade.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyAction.cascade, parsed_update_cascade.foreign_keys[0].on_update);
 
     try std.testing.expectError(
         error.InvalidSchemaUpdateRequest,

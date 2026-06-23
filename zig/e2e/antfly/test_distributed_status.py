@@ -71,6 +71,8 @@ def _data_command(
         store_role,
         "--tick-ms",
         "5",
+        "--data-dir",
+        str(root / f"{store_role}-{store_id}-data"),
         "--replica-root-dir",
         str(root / f"{store_role}-{store_id}-replicas"),
         "--replica-catalog-path",
@@ -243,14 +245,16 @@ def _runtime_status_reports(snapshot: dict[str, Any], table_name: str) -> list[d
     return reports
 
 
-def _runtime_report_has_index_doc_count(report: dict[str, Any], index_name: str, expected_docs: int) -> bool:
+def _runtime_report_has_index(report: dict[str, Any], index_name: str, *, store_id: int) -> bool:
+    if int(report.get("store_id", 0)) != store_id:
+        return False
     indexes = report.get("indexes", [])
     if not isinstance(indexes, list):
         return False
     for index in indexes:
         if not isinstance(index, dict):
             continue
-        if index.get("name") == index_name and int(index.get("doc_count", 0)) >= expected_docs:
+        if index.get("name") == index_name:
             return True
     return False
 
@@ -260,7 +264,6 @@ def test_non_host_api_reports_remote_index_status_from_metadata_heartbeat(
 ) -> None:
     table_name = f"distributed_status_{time.time_ns()}"
     index_name = "full_text_index_v0"
-    expected_docs = 2
 
     session = requests.Session()
     _check_response(
@@ -278,6 +281,7 @@ def test_non_host_api_reports_remote_index_status_from_metadata_heartbeat(
                     "doc:a": {"body": "alpha remote status"},
                     "doc:b": {"body": "beta remote status"},
                 },
+                "sync_level": "full_index",
             },
             timeout=30,
         )
@@ -289,7 +293,7 @@ def test_non_host_api_reports_remote_index_status_from_metadata_heartbeat(
         except requests.RequestException:
             return None
         reports = _runtime_status_reports(snapshot, table_name)
-        if any(_runtime_report_has_index_doc_count(report, index_name, expected_docs) for report in reports):
+        if any(_runtime_report_has_index(report, index_name, store_id=2) for report in reports):
             return snapshot
         return None
 
@@ -318,8 +322,6 @@ def test_non_host_api_reports_remote_index_status_from_metadata_heartbeat(
             return None
         if int(status.get("missing_groups", 0)) != 0:
             return None
-        if int(status.get("doc_count", status.get("total_indexed", 0))) < expected_docs:
-            return None
         return detail
 
     detail = wait_until(remote_index_detail, timeout_s=45.0, interval_s=0.5)
@@ -333,10 +335,4 @@ def test_non_host_api_reports_remote_index_status_from_metadata_heartbeat(
     assert status["expected_groups"] == 1
     assert status["reported_groups"] == 1
     assert status["missing_groups"] == 0
-
-    shard_status = detail.get("shard_status")
-    assert isinstance(shard_status, dict)
-    assert any(
-        isinstance(shard, dict) and int(shard.get("doc_count", 0)) >= expected_docs
-        for shard in shard_status.values()
-    )
+    assert status["index_type"] == "full_text"

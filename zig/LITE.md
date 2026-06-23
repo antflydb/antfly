@@ -1,0 +1,705 @@
+# Antfly Lite
+
+Antfly Lite is the embedded, local-first Antfly profile. It should feel like
+SQLite for Antfly: a developer opens a local database from an application
+process, writes documents and vectors, creates indexes, runs search and query
+workloads, and can later promote the same data into a normal Antfly deployment.
+
+The user-facing CLI surface is:
+
+```sh
+antfly lite <command>
+```
+
+The embedded library surface should use the same name in docs and packaging:
+Antfly Lite.
+
+## Goals
+
+- Provide an embedded Antfly database with no server process.
+- Keep the first-use path simple: `antfly lite init app.aflite`, then local
+  reads, writes, search, backup, restore, and health checks.
+- Preserve Antfly's core feature model: documents, schemas, text search, vector
+  search, sparse search, graph edges, enrichments, and retrieval-oriented query
+  APIs.
+- Make upgrade to normal Antfly explicit and reliable through portable backup
+  and restore.
+- Keep the embedded API stable enough for language bindings.
+- Make `.aflite` the public v1 database format, backed by a Lite-native
+  single-file engine instead of exposing a temporary directory-backed user
+  format.
+
+## Non-Goals
+
+- Antfly Lite is not a distributed database.
+- Antfly Lite does not run Raft, shard placement, cluster metadata heartbeats,
+  or multi-node balancing.
+- Antfly Lite does not require local inference to be available.
+- Antfly Lite does not need to support every operational feature of a normal
+  Antfly cluster on day one.
+- Antfly Lite should not silently emulate distributed behavior in ways that make
+  later promotion surprising.
+- Antfly Lite v1 should not include legacy fallback code for pre-release
+  `.aflite`, directory-backed, or LSM-container experiments. Unknown versions
+  and invalid headers should fail explicitly.
+
+## Existing Starting Point
+
+The repository already has the main ingredients:
+
+- `pkg/antfly-embedded` exposes a standalone embedded package.
+- `pkg/antfly/src/embedded/db.zig` wraps the high-level DB surface.
+- `pkg/antfly/src/embedded/api.zig` exposes JSON-oriented helpers for batch,
+  lookup, scan, search, stats, indexes, enrichments, capabilities, and
+  `runUntilIdle`.
+- `storage/db/db.zig` already supports open modes such as writer,
+  query-readonly, and status-only.
+- `storage/db/config.zig` already models primary backends as LMDB, memory, LSM
+  memory, or durable LSM.
+- The LSM backend already routes through a `Storage` abstraction with range
+  reads, writes, append, rename, delete, and atomic write hooks.
+
+That means the product work should harden and package the existing embedded
+path while adding a Lite-native single-file backend that avoids translating the
+embedded profile into many synthetic logical files. Directory-backed and
+LSM-container storage can remain internal development, migration, and test
+profiles, but `.aflite` should be the public v1 format.
+
+## Product Shape
+
+Antfly Lite has three related surfaces.
+
+### CLI
+
+The CLI should live under `antfly lite`:
+
+```sh
+antfly lite init app.aflite
+antfly lite status app.aflite
+antfly lite batch app.aflite --file writes.json
+antfly lite query app.aflite --file query.json
+antfly lite schema set app.aflite --file schema.json
+antfly lite schema get app.aflite
+antfly lite index create app.aflite --file index.json
+antfly lite enrichment create app.aflite --file enrichment.json
+antfly lite run-until-idle app.aflite
+antfly lite backup app.aflite --out app.afb
+antfly lite restore app.afb --out app.aflite
+antfly lite export app.aflite --out app.afb
+antfly lite import app.aflite --from app.afb
+antfly lite check app.aflite
+antfly lite compact app.aflite
+antfly lite vacuum app.aflite
+antfly lite serve app.aflite --addr 127.0.0.1:8080
+```
+
+`antfly lite init` should be non-destructive: it creates a new `.aflite` file
+and rejects an existing database path. Destructive replacement should stay on
+explicit restore/import flows where the source and target are both known.
+`antfly lite import <db.aflite> --from <backup.afb>` may import into an existing
+empty Lite database. `antfly lite import <db.aflite> --from <source.aflite>`
+must be treated as a physical snapshot replacement and require `--replace` when
+the target already exists; it should not silently merge one live Lite database
+into another.
+
+`antfly lite status` should include a storage block that identifies the live
+file format, the selected engine, the primary, replay, and index layouts, the
+v1 format version, page size, and active checkpoint sequence. That makes the
+public native `.aflite` path observable and keeps internal bridge profiles from
+being mistaken for the v1 contract.
+
+For native `.aflite`, the public status contract should report
+`primary_layout: native_document_pages`,
+`replay_layout: native_replay_lanes_in_document_catalog`, and
+`index_layout: native_index_catalog_pages`. Any LSM adapter used while the
+native index engine is being completed is an implementation detail and must not
+appear as the public index layout for native Lite files.
+
+`antfly lite serve` is optional convenience mode. It should expose a narrow
+local single-node HTTP API under `/lite/v1` for development, SDK smoke tests,
+and migration testing, but the primary contract is embedded use. It should not
+pretend to be the clustered `/db/v1` service API unless a future compatibility
+profile is deliberately added. The v1 serve command should bind only to
+loopback hosts; wildcard or LAN listeners should require a future explicit
+remote/development override.
+
+### Embedded Library
+
+The library API should be small and boring:
+
+- open/close
+- batch writes/deletes
+- lookup
+- scan
+- search/query
+- add/drop/list index
+- add/drop/list enrichment
+- set/get schema
+- run maintenance until idle
+- status/stats
+- backup/export
+- restore/import
+- integrity check
+
+`libantfly` should be the long-term stable C ABI boundary. The storage-neutral
+open surface, ABI evolution rules, and read-only backend contract live in
+[`CAPI.md`](CAPI.md). Antfly Lite should not have a separate
+independently-versioned ABI; `.aflite` is a storage/open mode and the
+`antfly_lite_*` names are convenience entrypoints in the same `libantfly` ABI.
+
+The C ABI should expose a single Lite status JSON call that mirrors
+`antfly lite status`: storage identity, DB stats, pending work, and capability
+flags. Bindings should not have to reconstruct Lite status by combining several
+lower-level calls differently in each language.
+
+The C ABI should also expose a path-level Lite check call, not only a
+handle-level check. Bindings need to inspect invalid, truncated, or corrupted
+`.aflite` files and receive the same JSON integrity report as `antfly lite
+check` without first opening the database successfully.
+
+The embedded Zig API should expose the same status shape for Lite handles, with
+the storage identity available as a typed value on the lower-level DB wrapper.
+It should also expose a path-level Lite integrity check so Zig users can inspect
+invalid `.aflite` files without first opening a handle.
+
+### File Format
+
+Antfly Lite v1 should use `.aflite` as the live database format. Users should
+not need to understand a temporary directory-backed layout.
+
+The single-file database should be implemented as a Lite-native backend, not as
+a long-term LSM directory packed into one file. The native backend should keep
+Antfly's document, index, enrichment, query, backup, and restore semantics, but
+map them onto file-local pages or segments directly. That avoids the extra I/O
+and coordination introduced by emulating logical files, manifests, renames, and
+asynchronous cleanup inside another single-file container.
+
+The v1 production target should therefore be:
+
+```text
+Antfly DB and indexes
+  -> Lite-native storage engine
+    -> .aflite single-file database
+```
+
+An LSM-backed `.aflite` container can still be useful as an incremental
+implementation bridge because it exercises the existing storage abstraction and
+lets the CLI, C ABI, backup, restore, portable-interoperability, and
+conformance tests land early. It should not define the long-term v1
+architecture. If benchmarks show meaningful I/O and coordination savings from
+the Lite-native path, the native backend is the v1 target, not a v2 candidate.
+
+Directory-backed LSM storage should remain available as an internal development,
+debug, and conformance-test profile. LSM-container storage should be treated the
+same way. Neither should be the public Lite v1 contract.
+
+### Compatibility Policy
+
+Because this is new, unreleased code, v1 should not carry a legacy fallback,
+pre-release importer, v0 directory reader, silent LSM-container upgrade path, or
+prototype-to-v1 auto-migrator. Prototype files can be recreated from tests or
+explicit exports while the format is still pre-release. `.aflite` readers should
+accept the documented v1 format and reject unknown versions loudly. Recovery
+from an older complete checkpoint root inside the same v1 file is crash
+recovery, not legacy compatibility; a file with no complete v1 checkpoint should
+fail with an explicit integrity error. Compatibility branches should only be
+added after a format has shipped and users can reasonably have files that need
+preservation.
+
+The implementation consequence is that the production Lite open path should be
+small and direct: parse the v1 header, validate the v1 checkpoint, recover within
+the v1 format if needed, and otherwise return an explicit error. It should not
+carry readers for discarded prototype layouts, and tests should assert rejection
+of invalid headers, unsupported versions, and bridge-profile files opened through
+the default `.aflite` path.
+
+Internal bridge profiles are explicit developer/test engine selections, not
+compatibility modes. The default `auto` path should never inspect a failed
+native open and then silently retry a bridge or prototype layout.
+
+The extension meanings should stay distinct:
+
+- `.aflite` is a live Antfly Lite single-file database.
+- `.afb` is the portable Antfly backup archive.
+- `~/.antfly/lite/` may be used for CLI registry data, caches, temporary
+  workspaces, and internal development databases, but not as the public database
+  format.
+
+## Storage Design
+
+### Lite-Native Single-File Backend
+
+The `.aflite` single-file format should be a database file with a native layout
+for embedded Antfly data:
+
+- database header and format version
+- checkpoint roots
+- catalog pages
+- document key/value pages or segments
+- text index files
+- dense vector/HBC posting files
+- sparse posting files
+- graph reverse indexes
+- catalog records
+- enrichment definitions and state
+- free-space map
+- integrity metadata
+- optional append journal or commit log
+
+The backend should provide Antfly database operations directly:
+
+- point lookup
+- ordered scan
+- compare-and-set or transaction commit
+- index definition reads and writes
+- posting-list reads and writes
+- vector/HBC reads and writes
+- graph edge reads and writes
+- enrichment queue/state reads and writes
+- snapshot creation for readers, backup, and restore
+- page or segment allocation and reclamation
+
+Important correctness rules:
+
+- Atomic publish must survive process crash.
+- Readers must not observe a partially committed transaction.
+- The backend must support integrity checking.
+- The backend must support online backup or a consistent checkpoint.
+- Vacuum/compaction should be explicit.
+
+LMDB may still be useful for an LMDB profile, but it should not be the only
+Antfly Lite story. LMDB gives an mmap data file plus a lock file and fits a
+simple KV shape well. Antfly's richer index stack already has its own LSM and
+posting-file needs, so the native backend gives us a more general product while
+removing the I/O cost of pretending those structures are separate filesystem
+objects.
+
+### Internal LSM Profiles
+
+The durable LSM directory and LSM-container layouts should remain useful
+internally:
+
+- exercising existing LSM conformance tests
+- comparing native `.aflite` behavior against the current filesystem storage
+- debugging corruption or recovery issues
+- measuring native backend performance against the bridge implementation
+
+These profiles should be hidden behind developer flags or build steps. They
+should not appear in the normal user docs as Lite database formats.
+
+## Concurrency Model
+
+Antfly Lite should match the familiar embedded database model:
+
+- One writer at a time.
+- Multiple concurrent readers where backend snapshots support it.
+- Cross-process locking for the database path.
+- Read-only opens for tooling and inspection.
+- Clear `ANTFLY_BUSY` errors when another process or in-process write handle
+  owns the writer lock.
+
+The CLI should expose this plainly:
+
+```sh
+antfly lite status app.aflite
+antfly lite query app.aflite --readonly --file query.json
+```
+
+The embedded API should expose open profiles:
+
+- writer
+- readonly query
+- status only
+- hosted/manual maintenance
+
+## Upgrade To Normal Antfly
+
+Upgrade should be backup/restore first.
+
+The durable, user-facing archival contract is the portable Antfly backup format,
+not a physical copy of the Lite storage engine. A Lite database should export
+the same portable logical content that a normal Antfly backend can restore:
+
+- documents
+- schemas
+- index definitions
+- enrichment definitions
+- reusable enrichment artifacts where portable
+- dense embeddings
+- sparse embeddings
+- graph edges
+- resolver/promotion artifacts where portable
+- table and shard metadata in a single-shard layout
+
+The flow:
+
+```sh
+antfly lite backup app.aflite --out app.afb
+antfly restore --format portable --input app.afb --table docs
+```
+
+or:
+
+```sh
+antfly lite promote app.aflite --target http://cluster:8080 --table docs
+```
+
+`promote` should just orchestrate portable backup upload plus normal restore. It
+should not invent a separate migration protocol until backup/restore proves too
+slow for large databases.
+
+When `antfly lite promote` needs a local staging location and the user does not
+pass `--location`, it should use `~/.antfly/lite/backups`, not a process-global
+`/tmp` directory. Explicit `--location` values continue to support normal
+Antfly backup targets such as `file://`, `s3://`, or `gs://`.
+The direct normal restore shortcut for `.aflite` input should use the same
+Lite-local default staging location when `--location` is omitted.
+
+Normal Antfly should also be able to restore directly from a `.aflite` live
+database file:
+
+```sh
+antfly restore --input app.aflite --table docs
+```
+
+That direct path should not make `.aflite` the backup format. It should open
+the `.aflite` database read-only, stream portable logical restore records, and
+restore them into normal Antfly. `.afb` remains the stable cross-backend,
+archival, streamable backup format. `.aflite` remains a live embedded database.
+
+### Upgrade Semantics
+
+Lite is a single-node, single-shard source. Restore into normal Antfly should:
+
+- create the target table if requested
+- restore source documents
+- restore schemas and index/enrichment definitions
+- rebuild or import indexes according to restore policy
+- map the Lite single shard into the cluster's placement model
+- start normal Antfly background workers after restore
+- report replay/enrichment/index readiness through normal status APIs
+
+Indexes should default to logical rebuild on restore. Physical index restore can
+be an optimization later when the source and target backend formats match.
+
+### Downgrade / Extract
+
+The reverse path should also work:
+
+```sh
+antfly backup --format portable --table docs --out docs.afb
+antfly lite restore docs.afb --out docs.aflite
+```
+
+This makes Lite useful for local development, debugging production data slices,
+offline demos, and customer support bundles.
+
+## Enrichments And Inference
+
+Antfly Lite should preserve the enrichment model, but inference execution needs
+clear modes. Enrichments are part of Antfly's feature set; inference is an
+execution dependency that may be local, remote, caller-supplied, or disabled.
+
+### Enrichment Modes
+
+Supported modes:
+
+1. Caller-supplied artifacts.
+2. Remote inference provider.
+3. Local embedded inference.
+4. Manual maintenance.
+5. Disabled/deferred enrichment.
+
+#### Caller-Supplied Artifacts
+
+This is the most reliable default. Applications can write documents with
+precomputed `_embeddings`, extracted assets, chunk artifacts, graph edges, or
+other enrichment outputs. Lite persists and indexes them without needing a model
+runtime.
+
+This mode should be the default for small applications and language bindings.
+
+#### Remote Inference Provider
+
+Lite can call a configured Antfly inference service, OpenAI-compatible endpoint,
+or other provider through the existing enrichment/provider interfaces.
+
+The CLI should support:
+
+```sh
+antfly lite enrichment create app.aflite --file embedding-index.json
+antfly lite run-until-idle app.aflite
+```
+
+Configuration must be explicit. A local file opened by a library should not
+unexpectedly start sending data to a network provider.
+
+#### Local Embedded Inference
+
+Local inference should be optional packaging:
+
+- `antfly lite` base build: database, search, vector indexes, no heavy model
+  runtime requirement.
+- `antfly lite` full build: bundled or dynamically available inference runtime.
+- Application embedding: caller links the inference runtime if wanted.
+
+Local inference is important for demos and offline use, but it should not be
+required for the core embedded database.
+
+#### Manual Maintenance
+
+Hosted/manual mode is important for environments such as WASM, mobile, plugins,
+or apps that want deterministic control of background work. In this mode, writes
+record replay/enrichment debt and the application drives progress:
+
+```zig
+try db.runUntilIdle();
+```
+
+The CLI equivalent is:
+
+```sh
+antfly lite run-until-idle app.aflite
+```
+
+#### Disabled Or Deferred Enrichment
+
+Users must be able to open a Lite database without configured inference. In that
+case:
+
+- writes still succeed if enrichment outputs are not required synchronously
+- pending work is visible in status
+- capabilities/status reports `inference_mode`,
+  `no_inference_configured_ok`, and whether caller-supplied artifacts, remote
+  providers, or a local inference runtime are available
+- queries that depend on missing index material return clear readiness/status
+  information
+- backup includes pending definitions and source documents
+- restore into a normal Antfly deployment can resume enrichment
+
+## Feature Coverage
+
+Antfly Lite should aim for feature parity at the API level where the feature is
+single-node and local.
+
+### Should Work In Lite
+
+- document writes/deletes
+- lookup and scan
+- schemas
+- text search
+- dense vector search
+- sparse vector search
+- hybrid search
+- graph edges and graph query where local-only
+- generated enrichments
+- caller-supplied embeddings/assets
+- local or remote inference-backed enrichment
+- TTL cleanup
+- local transactions/OCC where supported by the DB layer
+- backup/restore/export/import
+- integrity check
+- compaction/vacuum
+- read-only inspection
+
+### Should Be Explicitly Unsupported Or Different
+
+- distributed shard ownership
+- Raft replication
+- cluster placement
+- cross-node joins
+- remote shard fanout
+- distributed transaction coordination
+- server-side autoscaling
+- Kubernetes operator behavior
+- cluster heartbeat/status aggregation
+- S3/object-storage native serving as the primary Lite file
+
+Some of these can still be simulated for testing, but they should not be
+presented as production Lite capabilities. Lite status and capabilities should
+advertise these distributed-only features as explicit `false` values so
+bindings do not have to infer cluster semantics from missing fields.
+
+## CLI Details
+
+Suggested command groups:
+
+```text
+antfly lite init
+antfly lite info
+antfly lite status
+antfly lite check
+antfly lite batch
+antfly lite lookup
+antfly lite scan
+antfly lite query
+antfly lite index list
+antfly lite index create
+antfly lite index drop
+antfly lite enrichment list
+antfly lite enrichment create
+antfly lite enrichment drop
+antfly lite schema get
+antfly lite schema set
+antfly lite run-until-idle
+antfly lite compact
+antfly lite vacuum
+antfly lite backup
+antfly lite restore
+antfly lite promote
+antfly lite serve
+```
+
+The CLI should accept JSON request files that match the public API contracts.
+This keeps Lite compatible with normal Antfly examples, tests, and SDKs.
+
+## Packaging
+
+Packages:
+
+- `antfly` CLI with `antfly lite` subcommands.
+- `antfly-embedded` Zig package.
+- `libantfly` C ABI artifact, with `.aflite` exposed as an embedded storage
+  profile rather than a separate Lite-only ABI.
+- Language bindings generated or hand-written over the C ABI.
+- Optional full package with embedded inference runtime.
+
+Build profiles:
+
+- `lite-core`: embedded database, indexes, CLI, and narrow `/lite/v1` local
+  serve mode, with no heavyweight inference runtime.
+- `lite-full`: embedded database plus local inference runtime.
+- `lite-wasm`: hosted/manual maintenance profile.
+- `lite-dev`: debug/status tooling and compatibility experiments.
+
+## Testing
+
+Minimum test matrix:
+
+- open/close/reopen durability
+- crash during write
+- crash during index update
+- crash during commit/checkpoint publish
+- reader/writer concurrency
+- read-only open while writer exists
+- online backup or snapshot while a write transaction is open
+- backup from Lite, restore into normal Antfly
+- backup from normal Antfly, restore into Lite
+- direct restore from `.aflite` into normal Antfly through a portable restore
+  stream
+- enrichment disabled, then resumed
+- caller-supplied embeddings search
+- remote inference-backed enrichment
+- local inference-backed enrichment where available
+- integrity check detects truncated or corrupted database pages, segments, or
+  journal data
+
+The most important compatibility test is a round trip:
+
+```text
+Lite -> portable backup -> normal Antfly -> portable backup -> Lite
+```
+
+The restored documents, schemas, definitions, embeddings, graph edges, and
+query-visible results should match within documented index rebuild semantics.
+
+## Implementation Plan
+
+### Phase 1: Lite-Native Single-File Backend
+
+- Implement a Lite-native storage backend for embedded Antfly.
+- Add database header, catalog roots, page or segment allocator, free-space map,
+  commit/checkpoint publish, crash recovery, integrity checks, and vacuum.
+- Preserve Antfly's document ordering, range scans, index definitions,
+  enrichment state, vector/HBC artifacts, sparse artifacts, graph artifacts,
+  backup, and restore semantics.
+- Add `.aflite` as the live single-file database format.
+- Run existing DB conformance tests against the native `.aflite` backend.
+- Keep filesystem-backed LSM and LSM-container profiles as developer/test-only
+  bridge paths.
+- Do not add legacy fallback code for pre-release Lite layouts, v0 directories,
+  or LSM-container prototypes; reject unknown versions and invalid headers with
+  explicit errors while preserving same-format checkpoint recovery.
+- Add negative open tests proving that the default `.aflite` path does not fall
+  back to bridge profiles or prototype readers.
+
+### Phase 2: Name And CLI Shell
+
+- Add `antfly lite` command group.
+- Wire commands to existing embedded DB APIs.
+- Add `init`, `status`, `batch`, `lookup`, `scan`, `query`, `run-until-idle`.
+- Make `antfly lite init app.aflite` create a single-file database.
+- Keep `~/.antfly/lite/` for CLI registry data, caches, temporary workspaces,
+  and internal developer databases only.
+
+### Phase 3: Portable Upgrade Path
+
+- Add `antfly lite backup`.
+- Add `antfly lite restore`.
+- Treat `antfly lite export` as an alias for backup and `antfly lite import`
+  as the inverse restore shape.
+- Add `antfly lite promote` as a wrapper around portable backup and normal
+  restore.
+- Add normal Antfly restore support for `.aflite` input by opening it read-only
+  and producing the same portable logical restore stream as `.afb`. The normal
+  CLI shape should be:
+
+  ```sh
+  antfly restore --input app.aflite --table docs
+  ```
+
+- Extend portable backup coverage for schema, index definitions, enrichment
+  definitions, and portable artifacts that are not yet included.
+
+### Phase 4: Embedded API Hardening
+
+- Define stable `libantfly` C ABI.
+- Add ownership/error/result conventions.
+- Expose stable error-code names and descriptions for language bindings.
+- Provide a buffer free-and-zero helper for generated bindings while retaining
+  the raw pointer/length free function.
+- Add Go as the first post-Zig/C binding in `go/pkg/antflylite`, backed by the
+  stable C ABI and gated C-library smoke tests.
+- Freeze the Lite open options and capabilities response.
+
+### Phase 5: Enrichment And Inference Profiles
+
+- Add explicit inference modes.
+- Make "no inference configured" a clean status, not an error-prone partial
+  setup.
+- Expose inference profile fields in Lite status and capabilities so embedded
+  users and bindings can branch without probing errors.
+- Support caller-supplied artifacts as the default happy path.
+- Support remote inference providers.
+- Support optional local inference builds.
+
+### Phase 6: Product Polish
+
+- Add docs and examples.
+- Add app templates for common embedded use cases.
+- Add migration guides.
+- Add package publishing for CLI and language bindings.
+
+## Open Questions
+
+- Which enrichment artifacts are portable enough to backup/restore directly,
+  and which should always be rebuilt?
+- What is the minimum local inference package that is small enough for Lite
+  users but useful enough for demos?
+
+## Recommendation
+
+Ship Antfly Lite v1 as `.aflite`, not as a public directory-backed format. This
+keeps the product mental model simple: a Lite database is a file, and a portable
+backup is an `.afb` archive.
+
+This moves more work into v1 because the Lite-native storage engine must exist
+before the public Lite launch. That is the right tradeoff: it keeps the UX clean
+and avoids shipping a synthetic LSM container whose extra logical-file churn,
+vacuum pressure, and coordination become the public architecture.
+
+The naming recommendation is:
+
+- Live single-file Lite database: `*.aflite`
+- Portable backup archive: `*.afb`
+- CLI/internal workspace: `~/.antfly/lite/`

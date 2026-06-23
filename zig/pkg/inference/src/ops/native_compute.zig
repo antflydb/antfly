@@ -4693,13 +4693,26 @@ fn prefetchPriority(entry: *LazyWeightEntry) u64 {
     return entry.prefetch_score;
 }
 
-fn ensureLazyWeightLoadedLocked(data: *WeightStore, run_budget: ?*run_memory.RunBudget, entry: *LazyWeightEntry) !void {
+pub fn ensureLazyWeightLoadedLocked(data: *WeightStore, run_budget: ?*run_memory.RunBudget, entry: *LazyWeightEntry) !void {
+    const trace = platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_LAZY_TRACE");
+    const trace_start = platform.time.monotonicNs();
+    if (trace) {
+        std.log.info("native_lazy_trace: ensure_start name={s} active_tier={s} loaded={} ref_mb={d}", .{
+            entry.tensor_ref.name,
+            @tagName(entry.active_tier),
+            entry.loaded != null,
+            entry.tensor_ref.byte_len / (1024 * 1024),
+        });
+    }
     if (entry.expert_coord) |coord| {
         if (data.residency) |*residency| {
             try residency.noteTouch(coord, data.moe_num_experts);
         }
     }
-    if (entry.loaded != null) return;
+    if (entry.loaded != null) {
+        if (trace) std.log.info("native_lazy_trace: ensure_hit name={s}", .{entry.tensor_ref.name});
+        return;
+    }
     const tensor_store = data.tensor_store orelse return error.MissingWeight;
     var direct_quant_storage: ?QuantizedStorage = null;
     errdefer if (direct_quant_storage) |*storage| storage.deinit();
@@ -4766,6 +4779,13 @@ fn ensureLazyWeightLoadedLocked(data: *WeightStore, run_budget: ?*run_memory.Run
             entry.loaded.?.quantized = false;
         }
         entry.loaded_bytes = entry.loaded.?.tensor.data.len;
+    }
+    if (trace) {
+        std.log.info("native_lazy_trace: loaded name={s} loaded_mb={d} total_ms={d}", .{
+            entry.tensor_ref.name,
+            entry.loaded_bytes / (1024 * 1024),
+            (platform.time.monotonicNs() - trace_start) / 1_000_000,
+        });
     }
     entry.active_tier = .host;
     if (data.tier_cache) |*tier_cache| {

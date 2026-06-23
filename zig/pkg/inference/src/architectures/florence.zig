@@ -40,6 +40,11 @@ pub const EncoderForwardResult = struct {
     seq_len: usize,
 };
 
+pub const EncoderForwardTensorResult = struct {
+    hidden: CT,
+    seq_len: usize,
+};
+
 const VisionForwardResult = struct {
     features: []f32,
     seq_len: usize,
@@ -54,6 +59,22 @@ pub fn encoderForward(
     prompt_input_ids: []const i64,
     prompt_seq_len: usize,
 ) !EncoderForwardResult {
+    const encoder = try encoderForwardTensor(cb, allocator, config, pixel_values, batch, prompt_input_ids, prompt_seq_len);
+    defer cb.free(encoder.hidden);
+
+    const result = try cb.toFloat32(encoder.hidden, allocator);
+    return .{ .hidden = result, .seq_len = encoder.seq_len };
+}
+
+pub fn encoderForwardTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    pixel_values: []const f32,
+    batch: usize,
+    prompt_input_ids: []const i64,
+    prompt_seq_len: usize,
+) !EncoderForwardTensorResult {
     const image = try visionEncoderForward(cb, allocator, config, pixel_values, batch);
     defer allocator.free(image.features);
 
@@ -97,9 +118,7 @@ pub fn encoderForward(
         hidden = next;
     }
 
-    const result = try cb.toFloat32(hidden, allocator);
-    cb.free(hidden);
-    return .{ .hidden = result, .seq_len = total_seq };
+    return .{ .hidden = hidden, .seq_len = total_seq };
 }
 
 /// Run the Florence/BART text encoder without any vision inputs.
@@ -181,6 +200,33 @@ pub fn decoderForward(
     dec_seq: usize,
     enc_seq: usize,
 ) ![]f32 {
+    const logits = try decoderForwardTensor(
+        cb,
+        allocator,
+        config,
+        decoder_input_ids,
+        encoder_hidden,
+        encoder_mask,
+        batch,
+        dec_seq,
+        enc_seq,
+    );
+    defer cb.free(logits);
+
+    return try cb.toFloat32(logits, allocator);
+}
+
+pub fn decoderForwardTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    decoder_input_ids: []const i64,
+    encoder_hidden: CT,
+    encoder_mask: []const i64,
+    batch: usize,
+    dec_seq: usize,
+    enc_seq: usize,
+) !CT {
     const dec_total = batch * dec_seq;
     var hidden = try applyDecoderEmbeddings(cb, allocator, config, decoder_input_ids, batch, dec_seq);
 
@@ -204,22 +250,60 @@ pub fn decoderForward(
     }
 
     const lm_w = try lmHeadWeight(cb);
-    const logits = try cb.linearNoBias(hidden, lm_w, dec_total, config.d_model, config.vocab_size);
+    var logits = try cb.linearNoBias(hidden, lm_w, dec_total, config.d_model, config.vocab_size);
     cb.free(hidden);
+    errdefer cb.free(logits);
 
-    const result = try cb.toFloat32(logits, allocator);
-    cb.free(logits);
     if (try tryOptionalWeight(cb, "language_model.final_logits_bias")) |logits_bias| {
-        const bias = try cb.toFloat32(logits_bias, allocator);
-        defer allocator.free(bias);
-        const bias_offset: usize = if (bias.len == config.vocab_size) 0 else if (bias.len == config.vocab_size + 1) 1 else 0;
-        const bias_slice = bias[bias_offset..][0..config.vocab_size];
-        for (0..dec_total) |row| {
-            const row_slice = result[row * config.vocab_size ..][0..config.vocab_size];
-            for (row_slice, bias_slice) |*value, bias_value| value.* += bias_value;
-        }
+        const bias = try logitsBiasSlice(cb, allocator, logits_bias, config.vocab_size);
+        defer if (bias.owned) cb.free(bias.tensor);
+
+        const biased = try cb.add(logits, bias.tensor);
+        cb.free(logits);
+        logits = biased;
     }
-    return result;
+    return logits;
+}
+
+const LogitsBiasSlice = struct {
+    tensor: CT,
+    owned: bool,
+};
+
+fn logitsBiasSlice(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    logits_bias: CT,
+    vocab_size: usize,
+) !LogitsBiasSlice {
+    const shape = try cb.tensorShape(logits_bias, allocator);
+    defer allocator.free(shape);
+
+    var element_count: usize = 1;
+    for (shape) |dim| {
+        if (dim <= 0) return error.InvalidTensorShape;
+        element_count *= @intCast(dim);
+    }
+    if (element_count < vocab_size) return error.InvalidTensorShape;
+    if (element_count == vocab_size) {
+        if (shape.len == 1 and @as(usize, @intCast(shape[0])) == vocab_size) {
+            return .{ .tensor = logits_bias, .owned = false };
+        }
+        if (shape.len == 2 and shape[0] == 1 and @as(usize, @intCast(shape[1])) == vocab_size) {
+            return .{ .tensor = logits_bias, .owned = false };
+        }
+        const row_shape = [_]i64{@intCast(vocab_size)};
+        return .{ .tensor = try cb.primReshape(logits_bias, &row_shape), .owned = true };
+    }
+
+    const start: usize = if (element_count == vocab_size + 1) 1 else 0;
+    const flat_shape = [_]i64{ 1, @intCast(element_count) };
+    const flat_bias = try cb.primReshape(logits_bias, &flat_shape);
+    defer cb.free(flat_bias);
+    return .{
+        .tensor = try cb.sliceLastDim(flat_bias, start, start + vocab_size),
+        .owned = true,
+    };
 }
 
 fn visionEncoderForward(
@@ -244,18 +328,21 @@ fn visionEncoderForward(
         const depth: usize = config.depths[stage];
         if (useTensorNativeVision(cb)) {
             const stage_shape = [_]i32{ @intCast(batch * stage_h * stage_w), @intCast(config.dim_embed[stage]) };
-            var hidden = try cb.fromFloat32Shape(stage_tokens.?, &stage_shape);
+            var hidden: ?CT = try cb.fromFloat32Shape(stage_tokens.?, &stage_shape);
             allocator.free(stage_tokens.?);
             stage_tokens = null;
-            errdefer cb.free(hidden);
+            errdefer if (hidden) |h| cb.free(h);
 
             for (0..depth) |layer| {
-                const next = try daViTBlock(cb, allocator, config, hidden, batch, stage_h, stage_w, stage, layer);
+                const current = hidden.?;
+                hidden = null;
+                const next = try daViTBlock(cb, allocator, config, current, batch, stage_h, stage_w, stage, layer);
                 hidden = next;
             }
 
-            stage_tokens = try cb.toFloat32(hidden, allocator);
-            cb.free(hidden);
+            stage_tokens = try cb.toFloat32(hidden.?, allocator);
+            cb.free(hidden.?);
+            hidden = null;
         } else {
             for (0..depth) |layer| {
                 stage_tokens = try daViTBlockData(cb, allocator, config, stage_tokens.?, batch, stage_h, stage_w, stage, layer);

@@ -41,6 +41,12 @@ pub const format_version: u32 = 1;
 pub const cluster_format_version: u32 = 1;
 pub const table_backup_id = "table";
 pub const antfly_version = "zig-dev";
+pub const max_portable_backup_file_bytes: usize = 1024 * 1024 * 1024;
+
+pub const BackupFormat = enum {
+    native,
+    portable,
+};
 
 pub const TableBackupManifest = struct {
     format_version: u32 = format_version,
@@ -83,6 +89,7 @@ pub const ShardSnapshot = struct {
 pub const TableBackupPlan = struct {
     backup_root: []const u8,
     backup_id: []const u8,
+    format: BackupFormat = .native,
 };
 
 pub const TableRestorePlan = struct {
@@ -1227,6 +1234,44 @@ pub fn copyFileFromLocation(
             defer alloc.free(body);
             try writeFileAbsolute(dest_path, body);
         },
+    }
+}
+
+pub fn copyFileToLocation(
+    alloc: std.mem.Allocator,
+    location: *BackupLocation,
+    snapshot_path: []const u8,
+    src_path: []const u8,
+    content_type: []const u8,
+) !void {
+    switch (location.*) {
+        .file => |backup_root| {
+            const dest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path });
+            defer alloc.free(dest_path);
+            try copyFileAbsolute(src_path, dest_path);
+        },
+        .remote => |*store| {
+            const body = try readFileAbsoluteAlloc(alloc, src_path, max_portable_backup_file_bytes);
+            defer alloc.free(body);
+            try store.writeBytes(alloc, trimLeftSlash(snapshot_path), body, content_type);
+        },
+    }
+}
+
+pub fn writeFileToLocation(
+    alloc: std.mem.Allocator,
+    location: *BackupLocation,
+    snapshot_path: []const u8,
+    body: []const u8,
+    content_type: []const u8,
+) !void {
+    switch (location.*) {
+        .file => |backup_root| {
+            const dest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path });
+            defer alloc.free(dest_path);
+            try writeFileAbsolute(dest_path, body);
+        },
+        .remote => |*store| try store.writeBytes(alloc, trimLeftSlash(snapshot_path), body, content_type),
     }
 }
 

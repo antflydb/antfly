@@ -171,11 +171,8 @@ jobs:
       - name: Verify Zig version
         run: zig version
 
-      - name: Check Snowball generated sources
-        run: make zig-snowball-check
-
-      - name: Check OpenAPI generated sources
-        run: make zig-openapi-check
+      - name: Check generated sources
+        run: make zig-generated-check
 
       - name: Run SQL/API typed-plan parity gate
         if: needs.changes.outputs.zig_tests == 'true'

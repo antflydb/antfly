@@ -174,10 +174,13 @@ pub const TypeGenerator = struct {
             return;
         }
 
-        // oneOf/anyOf without discriminator but with top-level properties: emit struct
-        // (the properties are the common/shared fields)
+        // oneOf/anyOf without discriminator but with top-level properties:
+        // emit one flattened object struct. These schemas model a single JSON
+        // object with common fields plus variant-specific fields, for example
+        // index configs keyed by a "type" field. Emitting only the common
+        // fields would make request serialization lossy.
         if ((schema.one_of.len > 0 or schema.any_of.len > 0) and schema.properties.count() > 0) {
-            try self.generateStruct(type_name, schema);
+            try self.generateFlattenedUnionObjectStruct(type_name, schema);
             return;
         }
 
@@ -421,6 +424,39 @@ pub const TypeGenerator = struct {
         try self.w.line("}};", .{});
     }
 
+    /// Generate one struct from a JSON object schema that has common top-level
+    /// properties plus oneOf/anyOf object variants. Variant properties are
+    /// optional because only one variant is expected to be populated.
+    fn generateFlattenedUnionObjectStruct(self: *TypeGenerator, type_name: []const u8, schema: types.Schema) !void {
+        var emitted_inline_enums = std.StringArrayHashMapUnmanaged(void){};
+        try self.emitFlattenedInlineEnumTypes(type_name, schema, &emitted_inline_enums);
+
+        if (schema.description) |desc| try self.w.docComment(desc);
+        try self.w.line("pub const {s} = struct {{", .{type_name});
+        self.w.indent();
+
+        var all_required = std.StringArrayHashMapUnmanaged(void){};
+        for (schema.required) |r| {
+            try all_required.put(self.arena, r, {});
+        }
+
+        var emitted_props = std.StringArrayHashMapUnmanaged(void){};
+        try self.emitFlattenedSchemaProperties(type_name, schema, &emitted_props, &all_required, true);
+
+        try self.w.blank();
+        try self.w.line("pub fn jsonStringify(self: @This(), jw: anytype) !void {{", .{});
+        self.w.indent();
+        try self.w.line("try jw.beginObject();", .{});
+        var emitted_json_props = std.StringArrayHashMapUnmanaged(void){};
+        try self.emitFlattenedSchemaJsonStringifyFields(schema, &emitted_json_props, &all_required, true);
+        try self.w.line("try jw.endObject();", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+
+        self.w.dedent();
+        try self.w.line("}};", .{});
+    }
+
     fn emitFlattenedSchemaProperties(
         self: *TypeGenerator,
         owner_type_name: []const u8,
@@ -448,6 +484,60 @@ pub const TypeGenerator = struct {
         for (schema.any_of) |member| {
             const resolved = self.resolver.resolveSchema(member) catch continue;
             try self.emitFlattenedSchemaProperties(owner_type_name, resolved, emitted_props, required_fields, false);
+        }
+    }
+
+    fn emitFlattenedSchemaJsonStringifyFields(
+        self: *TypeGenerator,
+        schema: types.Schema,
+        emitted_props: *std.StringArrayHashMapUnmanaged(void),
+        required_fields: *const std.StringArrayHashMapUnmanaged(void),
+        allow_required: bool,
+    ) !void {
+        for (schema.properties.keys(), schema.properties.values()) |prop_name, prop_sor| {
+            if (emitted_props.contains(prop_name)) continue;
+            try emitted_props.put(self.arena, prop_name, {});
+
+            const field = try naming.zigFieldName(self.arena, prop_name);
+            const is_required = allow_required and required_fields.contains(prop_name);
+            const schema_nullable = switch (prop_sor) {
+                .schema => |s| s.isNullable(),
+                .ref => false,
+            };
+
+            if (is_required) {
+                try self.w.line("try jw.objectField(\"{s}\");", .{prop_name});
+                try self.w.line("try jw.write(self.{s});", .{field});
+            } else if (schema_nullable) {
+                try self.w.line("if (self.{s}) |value| {{", .{field});
+                self.w.indent();
+                try self.w.line("try jw.objectField(\"{s}\");", .{prop_name});
+                try self.w.line("try jw.write(value);", .{});
+                self.w.dedent();
+                try self.w.line("}}", .{});
+            } else {
+                try self.w.line("if (self.{s}) |value| {{", .{field});
+                self.w.indent();
+                try self.w.line("try jw.objectField(\"{s}\");", .{prop_name});
+                try self.w.line("try jw.write(value);", .{});
+                self.w.dedent();
+                try self.w.line("}}", .{});
+            }
+        }
+
+        for (schema.all_of) |member| {
+            const resolved = self.resolver.resolveSchema(member) catch continue;
+            try self.emitFlattenedSchemaJsonStringifyFields(resolved, emitted_props, required_fields, allow_required);
+        }
+
+        for (schema.one_of) |member| {
+            const resolved = self.resolver.resolveSchema(member) catch continue;
+            try self.emitFlattenedSchemaJsonStringifyFields(resolved, emitted_props, required_fields, false);
+        }
+
+        for (schema.any_of) |member| {
+            const resolved = self.resolver.resolveSchema(member) catch continue;
+            try self.emitFlattenedSchemaJsonStringifyFields(resolved, emitted_props, required_fields, false);
         }
     }
 
@@ -1228,4 +1318,73 @@ test "allOf flattens nested oneOf member properties into struct" {
     try std.testing.expect(std.mem.indexOf(u8, output, "max_chunks: ?i64 = null,") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "api_url: ?[]const u8 = null,") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "model: ?[]const u8 = null,") != null);
+}
+
+test "object schema with base properties and oneOf variants flattens variant fields" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var schemas = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try schemas.put(arena, "FullTextIndexConfig", .{
+        .schema = .{
+            .schema_type = .{ .single = "object" },
+            .properties = blk: {
+                var props = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+                try props.put(arena, "mem_only", .{ .schema = .{ .schema_type = .{ .single = "boolean" } } });
+                break :blk props;
+            },
+        },
+    });
+    try schemas.put(arena, "EmbeddingsIndexConfig", .{
+        .schema = .{
+            .schema_type = .{ .single = "object" },
+            .properties = blk: {
+                var props = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+                try props.put(arena, "template", .{ .schema = .{ .schema_type = .{ .single = "string" } } });
+                try props.put(arena, "embedder", .{ .schema = .{ .schema_type = .{ .single = "object" } } });
+                try props.put(arena, "chunker", .{ .schema = .{ .schema_type = .{ .single = "object" } } });
+                break :blk props;
+            },
+        },
+    });
+    try schemas.put(arena, "IndexConfig", .{
+        .schema = .{
+            .schema_type = .{ .single = "object" },
+            .one_of = &.{
+                .{ .ref = .{ .ref_string = "#/components/schemas/FullTextIndexConfig" } },
+                .{ .ref = .{ .ref_string = "#/components/schemas/EmbeddingsIndexConfig" } },
+            },
+            .required = &.{ "name", "type" },
+            .properties = blk: {
+                var props = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+                try props.put(arena, "name", .{ .schema = .{ .schema_type = .{ .single = "string" } } });
+                try props.put(arena, "type", .{ .schema = .{ .schema_type = .{ .single = "string" } } });
+                break :blk props;
+            },
+        },
+    });
+
+    const doc = types.OpenApiDoc{
+        .openapi = "3.0.3",
+        .info = .{ .title = "Test", .version = "1.0" },
+        .components = .{ .schemas = schemas },
+    };
+    var resolver = Resolver.init(arena, &doc);
+    var w = SourceWriter.init(arena);
+    var gen = TypeGenerator.init(arena, &w, &resolver);
+    try gen.generateAll(&doc);
+    const output = w.toSlice();
+
+    try std.testing.expect(std.mem.indexOf(u8, output, "pub const IndexConfig = struct {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "name: []const u8,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "@\"type\": []const u8,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "mem_only: ?bool = null,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "template: ?[]const u8 = null,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "embedder: ?std.json.Value = null,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "chunker: ?std.json.Value = null,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "pub fn jsonStringify(self: @This(), jw: anytype) !void {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "try jw.write(self.@\"type\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "if (self.template) |value| {") != null);
 }

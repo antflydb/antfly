@@ -11,6 +11,7 @@ import (
 	"io"
 	"maps"
 	"net/http"
+	"os"
 	"path"
 	"sort"
 	"strconv"
@@ -19,6 +20,8 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -40,6 +43,7 @@ import (
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
 	inferencev1alpha1 "github.com/antflydb/antfly/go/pkg/operator/api/inference/v1alpha1"
 	"github.com/antflydb/antfly/go/pkg/operator/controllers/internal/poddiagnostics"
+	adminsdk "github.com/antflydb/antfly/go/pkg/sdk/admin"
 )
 
 // AntflyClusterReconciler reconciles an AntflyCluster object
@@ -70,6 +74,25 @@ const (
 	antflySecretStoreDefaultKey  = "secrets.json"
 	antflySecretStoreDefaultPath = "/run/antfly/secrets/secrets.json" // #nosec G101 -- file path, not a credential
 	antflySecretStoreEnvVar      = "ANTFLY_SECRET_STORE_PATH"         // #nosec G101 -- environment variable name, not a credential
+
+	haPrimaryRouteTargetAnnotation          = "antfly.io/ha-primary-route-target"
+	haPrimaryRouteFenceAuthorityAnnotation  = "antfly.io/ha-primary-route-fence-authority"
+	haPrimaryRouteFenceGenerationAnnotation = "antfly.io/ha-primary-route-fence-generation"
+	haPrimaryRouteSelectorAnnotation        = "antfly.io/ha-primary-route-selector-applied"
+	haAdminTokenDefaultEnvVar               = "ANTFLY_HA_ADMIN_TOKEN" // #nosec G101 -- environment variable name, not a credential
+	defaultHAPrimaryLogPath                 = "/antflydb/ha/primary.wal"
+	defaultHAPrimarySlotsPath               = "/antflydb/ha/slots"
+	defaultHAFencePath                      = "/antflydb/ha/fence.wal"
+	defaultHAStandbyLogPath                 = "/antflydb/ha/standby.wal"
+	defaultHAStandbyProgressPath            = "/antflydb/ha/standby-progress.wal"
+	haAdminRetryRequeueAfter                = 5 * time.Second
+
+	haAdminJobPhaseWaitingDependency = "WaitingDependency"
+	haAdminJobPhasePending           = "Pending"
+	haAdminJobPhaseRunning           = "Running"
+	haAdminJobPhaseSucceeded         = "Succeeded"
+	haAdminJobPhaseFailed            = "Failed"
+	haAdminJobPhaseMissingAdminURL   = "MissingAdminURL"
 )
 
 //+kubebuilder:rbac:groups=antfly.io,resources=antflyclusters,verbs=get;list;watch;create;update;patch;delete
@@ -80,10 +103,13 @@ const (
 //+kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete
+//+kubebuilder:rbac:groups="",resources=pods/log,verbs=get
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups=metrics.k8s.io,resources=pods,verbs=get;list
 //+kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
+//+kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=antfly.io,resources=inferencepools,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=antfly.io,resources=inferencepools/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=antfly.io,resources=inferencepools/finalizers,verbs=update
@@ -120,11 +146,204 @@ func secretStoreEnv(store *antflyv1.SecretStoreSpec) []corev1.EnvVar {
 	}}
 }
 
+func haRuntimeAdminTokenEnv(ha *antflyv1.HighAvailabilitySpec) []corev1.EnvVar {
+	if ha == nil || ha.Runtime == nil || ha.Runtime.AdminTokenSecretRef == nil {
+		return nil
+	}
+	envVar := strings.TrimSpace(ha.Runtime.AdminTokenEnvVar)
+	if envVar == "" {
+		return nil
+	}
+	secretRef := ha.Runtime.AdminTokenSecretRef.DeepCopy()
+	optional := false
+	secretRef.Optional = &optional
+	return []corev1.EnvVar{{
+		Name: envVar,
+		ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: secretRef,
+		},
+	}}
+}
+
 func secretStoreArg(store *antflyv1.SecretStoreSpec) string {
 	if store == nil {
 		return ""
 	}
-	return fmt.Sprintf(" \\\n  --secret-store-path %s", secretStorePath(store))
+	return fmt.Sprintf(" \\\n  --secret-store-path %s", shellQuoteArg(secretStorePath(store)))
+}
+
+func swarmHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
+	if ha == nil || ha.Mode == antflyv1.HAModeDisabled || ha.Runtime == nil || ha.Identity == nil {
+		return ""
+	}
+	runtime := ha.Runtime
+	identity := ha.Identity
+	var args strings.Builder
+	fencePath := defaultHAFencePath
+	if value := strings.TrimSpace(runtime.FencePath); value != "" {
+		fencePath = value
+	}
+	formerPrimaryLogPath := strings.TrimSpace(runtime.FormerPrimaryLogPath)
+	adminTokenEnvVar := strings.TrimSpace(runtime.AdminTokenEnvVar)
+	appendHAArg := func(name, value string) {
+		args.WriteString(" \\\n  ")
+		args.WriteString(name)
+		args.WriteByte(' ')
+		args.WriteString(shellQuoteArg(strings.TrimSpace(value)))
+	}
+	appendHAUint := func(name string, value uint64) {
+		args.WriteString(" \\\n  ")
+		args.WriteString(name)
+		args.WriteByte(' ')
+		args.WriteString(strconv.FormatUint(value, 10))
+	}
+
+	switch runtime.Role {
+	case antflyv1.HARuntimeRolePrimary:
+		primary := runtime.Primary
+		logPath := defaultHAPrimaryLogPath
+		slotsPath := defaultHAPrimarySlotsPath
+		if primary != nil {
+			if value := strings.TrimSpace(primary.LogPath); value != "" {
+				logPath = value
+			}
+			if value := strings.TrimSpace(primary.SlotsPath); value != "" {
+				slotsPath = value
+			}
+		}
+		appendHAArg("--ha-primary-log", logPath)
+		appendHAArg("--ha-primary-slots", slotsPath)
+		appendHAArg("--ha-primary-node-id", runtime.NodeID)
+		appendHAArg("--ha-fence-wal", fencePath)
+		if formerPrimaryLogPath == "" {
+			formerPrimaryLogPath = logPath
+		}
+		if formerPrimaryLogPath != "" {
+			appendHAArg("--ha-former-primary-log", formerPrimaryLogPath)
+		}
+		if adminTokenEnvVar != "" {
+			appendHAArg("--ha-admin-token-env", adminTokenEnvVar)
+		}
+		if ha.Retention != nil && ha.Retention.MaxLagLSN > 0 {
+			appendHAUint("--ha-retention-max-lag-lsn", ha.Retention.MaxLagLSN)
+		}
+		if ha.Retention != nil && ha.Retention.MaxRetainedBytes > 0 {
+			appendHAUint("--ha-retention-max-retained-bytes", ha.Retention.MaxRetainedBytes)
+		}
+		if ha.Retention != nil && ha.Retention.MaxRetainedAgeNS > 0 {
+			appendHAUint("--ha-retention-max-retained-age-ns", ha.Retention.MaxRetainedAgeNS)
+		}
+		appendSwarmHASyncPolicyArgs(&args, ha.SyncPolicy)
+	case antflyv1.HARuntimeRoleStandby:
+		standby := runtime.Standby
+		logPath := defaultHAStandbyLogPath
+		progressPath := defaultHAStandbyProgressPath
+		if standby != nil {
+			if value := strings.TrimSpace(standby.LogPath); value != "" {
+				logPath = value
+			}
+			if value := strings.TrimSpace(standby.ProgressPath); value != "" {
+				progressPath = value
+			}
+		}
+		appendHAArg("--ha-standby-log", logPath)
+		appendHAArg("--ha-standby-progress", progressPath)
+		appendHAArg("--ha-standby-node-id", runtime.NodeID)
+		appendHAArg("--ha-fence-wal", fencePath)
+		if formerPrimaryLogPath != "" {
+			appendHAArg("--ha-former-primary-log", formerPrimaryLogPath)
+		}
+		if adminTokenEnvVar != "" {
+			appendHAArg("--ha-admin-token-env", adminTokenEnvVar)
+		}
+		if standby != nil && strings.TrimSpace(standby.UpstreamURL) != "" && strings.TrimSpace(standby.SlotName) != "" {
+			appendHAArg("--ha-standby-upstream-url", standby.UpstreamURL)
+			appendHAArg("--ha-standby-slot", standby.SlotName)
+		}
+	default:
+		return ""
+	}
+	appendHAUint("--ha-cluster-id", identity.ClusterID)
+	if identity.ShardID != 0 {
+		appendHAUint("--ha-shard-id", identity.ShardID)
+	}
+	if identity.TableID != 0 {
+		appendHAUint("--ha-table-id", identity.TableID)
+	}
+	appendHAUint("--ha-timeline-id", identity.TimelineID)
+	appendHAUint("--ha-epoch", identity.Epoch)
+	return args.String()
+}
+
+func appendSwarmHASyncPolicyArgs(args *strings.Builder, policy *antflyv1.HASyncPolicy) {
+	if policy == nil || policy.Mode == "" || policy.Mode == antflyv1.HADurabilityModeAsync {
+		return
+	}
+	appendArg := func(name, value string) {
+		args.WriteString(" \\\n  ")
+		args.WriteString(name)
+		args.WriteByte(' ')
+		args.WriteString(shellQuoteArg(strings.TrimSpace(value)))
+	}
+	appendUint := func(name string, value int32) {
+		args.WriteString(" \\\n  ")
+		args.WriteString(name)
+		args.WriteByte(' ')
+		args.WriteString(strconv.FormatInt(int64(value), 10))
+	}
+
+	appendArg("--ha-sync-mode", swarmHASyncMode(policy.Mode))
+	if policy.Selection != "" {
+		appendArg("--ha-sync-selection", swarmHAStandbySelection(policy.Selection))
+	}
+	if policy.Required > 0 {
+		appendUint("--ha-sync-required", policy.Required)
+	}
+	for _, name := range policy.StandbyNames {
+		if trimmed := strings.TrimSpace(name); trimmed != "" {
+			appendArg("--ha-sync-standby", trimmed)
+		}
+	}
+	if policy.FailurePolicy != "" {
+		appendArg("--ha-sync-failure", swarmHAFailurePolicy(policy.FailurePolicy))
+	}
+}
+
+func shellQuoteArg(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
+}
+
+func swarmHASyncMode(mode antflyv1.HADurabilityMode) string {
+	switch mode {
+	case antflyv1.HADurabilityModeRemoteApply:
+		return "remote-apply"
+	case antflyv1.HADurabilityModeRemoteWrite:
+		return "remote-write"
+	default:
+		return "async"
+	}
+}
+
+func swarmHAStandbySelection(selection antflyv1.HAStandbySelection) string {
+	switch selection {
+	case antflyv1.HAStandbySelectionFirst:
+		return "first"
+	case antflyv1.HAStandbySelectionAll:
+		return "all"
+	default:
+		return "any"
+	}
+}
+
+func swarmHAFailurePolicy(policy antflyv1.HAFailurePolicy) string {
+	switch policy {
+	case antflyv1.HAFailurePolicyFailClosed:
+		return "fail-closed"
+	case antflyv1.HAFailurePolicyDegradeToAsync:
+		return "degrade-to-async"
+	default:
+		return "block"
+	}
 }
 
 func secretStoreVolumeMounts(store *antflyv1.SecretStoreSpec) []corev1.VolumeMount {
@@ -205,6 +424,76 @@ func serviceSelectorLabels(clusterName, component string) map[string]string {
 		"app.kubernetes.io/name":      "antfly-database",
 		"app.kubernetes.io/component": component,
 		"app.kubernetes.io/instance":  clusterName,
+	}
+}
+
+func haCurrentPrimaryRouteTarget(cluster *antflyv1.AntflyCluster) string {
+	if cluster.Status.HAStatus != nil && cluster.Status.HAStatus.PrimaryRoute.CurrentTarget != "" {
+		return cluster.Status.HAStatus.PrimaryRoute.CurrentTarget
+	}
+	return "primary"
+}
+
+func haPrimaryRouteManaged(cluster *antflyv1.AntflyCluster) bool {
+	return cluster.Spec.HighAvailability != nil &&
+		cluster.Spec.HighAvailability.Mode != "" &&
+		cluster.Spec.HighAvailability.Mode != antflyv1.HAModeDisabled
+}
+
+func haPublicAPISelector(cluster *antflyv1.AntflyCluster, swarmMode bool, target string) (map[string]string, bool) {
+	if target == "" || target == "primary" {
+		component := "metadata"
+		if swarmMode {
+			component = "swarm"
+		}
+		return serviceSelectorLabels(cluster.Name, component), true
+	}
+	ha := cluster.Spec.HighAvailability
+	if ha == nil {
+		return nil, false
+	}
+	for _, standby := range ha.Standbys {
+		if standby.Name == target && len(standby.RouteSelector) > 0 {
+			return maps.Clone(standby.RouteSelector), true
+		}
+	}
+	return nil, false
+}
+
+func haPrimaryRouteServiceAnnotations(cluster *antflyv1.AntflyCluster, target string, selectorApplied bool) map[string]string {
+	annotations := map[string]string{
+		haPrimaryRouteTargetAnnotation:   target,
+		haPrimaryRouteSelectorAnnotation: strconv.FormatBool(selectorApplied),
+	}
+	if cluster.Status.HAStatus == nil || target == "" || target == "primary" {
+		return annotations
+	}
+	route := cluster.Status.HAStatus.PrimaryRoute
+	if route.FenceAuthority != "" {
+		annotations[haPrimaryRouteFenceAuthorityAnnotation] = string(route.FenceAuthority)
+	}
+	if route.FenceGeneration > 0 {
+		annotations[haPrimaryRouteFenceGenerationAnnotation] = strconv.FormatUint(route.FenceGeneration, 10)
+	}
+	return annotations
+}
+
+func syncHAPrimaryRouteServiceAnnotations(service *corev1.Service, desired map[string]string) {
+	if service.Annotations == nil {
+		service.Annotations = map[string]string{}
+	}
+	managedKeys := [...]string{
+		haPrimaryRouteTargetAnnotation,
+		haPrimaryRouteFenceAuthorityAnnotation,
+		haPrimaryRouteFenceGenerationAnnotation,
+		haPrimaryRouteSelectorAnnotation,
+	}
+	for _, key := range managedKeys {
+		if value, ok := desired[key]; ok {
+			service.Annotations[key] = value
+		} else {
+			delete(service.Annotations, key)
+		}
 	}
 }
 
@@ -1120,8 +1409,8 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, err
 		}
 
-		if storageAutoGrowEnabled(workingCluster) {
-			return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+		if requeueAfter := periodicRequeueAfter(workingCluster); requeueAfter > 0 {
+			return ctrl.Result{RequeueAfter: requeueAfter}, nil
 		}
 		return ctrl.Result{}, nil
 	}
@@ -1381,15 +1670,52 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	// If autoscaling is enabled, requeue for periodic evaluation
-	if workingCluster.Spec.DataNodes.AutoScaling != nil && workingCluster.Spec.DataNodes.AutoScaling.Enabled {
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-	}
-	if storageAutoGrowEnabled(workingCluster) {
-		return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+	if requeueAfter := periodicRequeueAfter(workingCluster); requeueAfter > 0 {
+		return ctrl.Result{RequeueAfter: requeueAfter}, nil
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func periodicRequeueAfter(cluster *antflyv1.AntflyCluster) time.Duration {
+	var requeueAfter time.Duration
+	if haKubernetesLeaseRenewalEnabled(cluster) {
+		requeueAfter = minPositiveDuration(requeueAfter, haFencingLeaseRenewalRequeueAfter())
+	}
+	if haRetryingDirectAdminAction(cluster) {
+		requeueAfter = minPositiveDuration(requeueAfter, haAdminRetryRequeueAfter)
+	}
+	if cluster.Spec.DataNodes.AutoScaling != nil && cluster.Spec.DataNodes.AutoScaling.Enabled {
+		requeueAfter = minPositiveDuration(requeueAfter, 30*time.Second)
+	}
+	if storageAutoGrowEnabled(cluster) {
+		requeueAfter = minPositiveDuration(requeueAfter, 60*time.Second)
+	}
+	return requeueAfter
+}
+
+func haRetryingDirectAdminAction(cluster *antflyv1.AntflyCluster) bool {
+	if cluster == nil || cluster.Status.HAStatus == nil {
+		return false
+	}
+	for _, action := range cluster.Status.HAStatus.PlannedActions {
+		if action.AdminJobName == haAdminDirectAPIName &&
+			action.AdminJobPhase == haAdminJobPhasePending &&
+			strings.TrimSpace(action.AdminError) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func minPositiveDuration(current time.Duration, candidate time.Duration) time.Duration {
+	if candidate <= 0 {
+		return current
+	}
+	if current <= 0 || candidate < current {
+		return candidate
+	}
+	return current
 }
 
 func (r *AntflyClusterReconciler) reconcileInferencePool(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
@@ -1861,6 +2187,9 @@ func (r *AntflyClusterReconciler) reconcileServices(ctx context.Context, cluster
 
 			service.Spec.PublishNotReadyAddresses = serviceDef.Spec.PublishNotReadyAddresses
 			service.Spec.Selector = serviceDef.Spec.Selector
+			if serviceDef.Name == cluster.Name+"-public-api" {
+				syncHAPrimaryRouteServiceAnnotations(service, serviceDef.Annotations)
+			}
 
 			// Copy ports, handling NodePort specially
 			service.Spec.Ports = make([]corev1.ServicePort, len(serviceDef.Spec.Ports))
@@ -1903,8 +2232,10 @@ func (r *AntflyClusterReconciler) createPublicAPIService(cluster *antflyv1.Antfl
 	}
 
 	targetPort := cluster.Spec.MetadataNodes.MetadataAPI.Port
+	component := "metadata"
 	if swarmMode && cluster.Spec.Swarm != nil {
 		targetPort = cluster.Spec.Swarm.MetadataAPI.Port
+		component = "swarm"
 	}
 
 	servicePort := corev1.ServicePort{
@@ -1920,20 +2251,30 @@ func (r *AntflyClusterReconciler) createPublicAPIService(cluster *antflyv1.Antfl
 		servicePort.NodePort = *cluster.Spec.PublicAPI.NodePort
 	}
 
+	selector := serviceSelectorLabels(cluster.Name, component)
+	var annotations map[string]string
+	if haPrimaryRouteManaged(cluster) {
+		target := haCurrentPrimaryRouteTarget(cluster)
+		routeSelectorApplied := false
+		if routeSelector, ok := haPublicAPISelector(cluster, swarmMode, target); ok {
+			selector = routeSelector
+			routeSelectorApplied = true
+		}
+		annotations = haPrimaryRouteServiceAnnotations(cluster, target, routeSelectorApplied)
+	} else if routeSelector, ok := haPublicAPISelector(cluster, swarmMode, "primary"); ok {
+		selector = routeSelector
+	}
+
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cluster.Name + "-public-api",
-			Namespace: cluster.Namespace,
+			Name:        cluster.Name + "-public-api",
+			Namespace:   cluster.Namespace,
+			Annotations: annotations,
 		},
 		Spec: corev1.ServiceSpec{
-			Type: serviceType,
-			Selector: serviceSelectorLabels(cluster.Name, func() string {
-				if swarmMode {
-					return "swarm"
-				}
-				return "metadata"
-			}()),
-			Ports: []corev1.ServicePort{servicePort},
+			Type:     serviceType,
+			Selector: selector,
+			Ports:    []corev1.ServicePort{servicePort},
 		},
 	}
 }
@@ -2117,7 +2458,7 @@ func (r *AntflyClusterReconciler) reconcileSwarmStatefulSet(ctx context.Context,
 						Image:           cluster.Spec.Image,
 						ImagePullPolicy: corev1.PullPolicy(cluster.Spec.ImagePullPolicy),
 						EnvFrom:         envFromSources,
-						Env:             secretStoreEnv(cluster.Spec.SecretStore),
+						Env:             append(secretStoreEnv(cluster.Spec.SecretStore), haRuntimeAdminTokenEnv(cluster.Spec.HighAvailability)...),
 						Ports: []corev1.ContainerPort{
 							{
 								Name:          "metadata-api",
@@ -2161,12 +2502,13 @@ func (r *AntflyClusterReconciler) reconcileSwarmStatefulSet(ctx context.Context,
 exec /antfly swarm --id %d --config /config/config.json \
   --host 0.0.0.0 \
   --port %d \
-  --health-port %d%s
+  --health-port %d%s%s
 							`,
 								swarm.NodeID,
 								swarm.MetadataAPI.Port,
 								swarm.Health.Port,
 								secretStoreArg(cluster.Spec.SecretStore),
+								swarmHAArgs(cluster.Spec.HighAvailability),
 							),
 						},
 						Resources: r.buildResourceRequirements(swarm.Resources),
@@ -3043,6 +3385,38 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 		r.setAvailableCondition(cluster, swarmFindings, readyReplicas >= swarm.Replicas && swarm.Replicas > 0)
 		r.recordClusterRuntimeFailureEvents(cluster, originalConditions)
 		r.updateProductTierStatus(cluster)
+		if err := r.observeHAPrimaryRouteStatus(ctx, cluster); err != nil {
+			return err
+		}
+		haAdminStatusErr := r.observeHAPrimaryAdminStatus(ctx, cluster)
+		if standbyErr := r.observeHAStandbyAdminStatuses(ctx, cluster); standbyErr != nil && haAdminStatusErr == nil {
+			haAdminStatusErr = standbyErr
+		}
+		if err := r.reconcileHAFencingLease(ctx, cluster); err != nil {
+			return err
+		}
+		if err := r.observeHAFencingStatus(ctx, cluster); err != nil {
+			return err
+		}
+		r.updateHAStatusAndConditions(cluster)
+		if haAdminStatusErr != nil {
+			setHACondition(
+				cluster,
+				antflyv1.TypeHADegraded,
+				metav1.ConditionTrue,
+				haAdminStatusUnavailableReason(cluster, antflyv1.ReasonHAAdminStatusUnavailable),
+				fmt.Sprintf("Unable to observe HA admin status: %v", haAdminStatusErr),
+			)
+		}
+		if err := r.reconcileHAAdminJobs(ctx, cluster); err != nil {
+			return err
+		}
+		r.updateHALastPromotionFromAdminJobs(ctx, cluster)
+		r.updateHAFormerPrimaryFromAdminJobs(ctx, cluster)
+		if err := r.reconcileHAPrimaryRoute(ctx, cluster); err != nil {
+			return err
+		}
+		r.updateHAAdminJobExecutionCondition(cluster)
 		r.updateServiceMeshReadyCondition(cluster)
 		return r.Status().Update(ctx, cluster)
 	}
@@ -3106,11 +3480,4155 @@ func (r *AntflyClusterReconciler) updateStatus(ctx context.Context, cluster *ant
 	r.setAvailableCondition(cluster, allRuntimeFindings, cluster.Status.Phase == "Running")
 	r.recordClusterRuntimeFailureEvents(cluster, originalConditions)
 	r.updateProductTierStatus(cluster)
+	if err := r.observeHAPrimaryRouteStatus(ctx, cluster); err != nil {
+		return err
+	}
+	haAdminStatusErr := r.observeHAPrimaryAdminStatus(ctx, cluster)
+	if standbyErr := r.observeHAStandbyAdminStatuses(ctx, cluster); standbyErr != nil && haAdminStatusErr == nil {
+		haAdminStatusErr = standbyErr
+	}
+	if err := r.reconcileHAFencingLease(ctx, cluster); err != nil {
+		return err
+	}
+	if err := r.observeHAFencingStatus(ctx, cluster); err != nil {
+		return err
+	}
+	r.updateHAStatusAndConditions(cluster)
+	if haAdminStatusErr != nil {
+		setHACondition(
+			cluster,
+			antflyv1.TypeHADegraded,
+			metav1.ConditionTrue,
+			haAdminStatusUnavailableReason(cluster, antflyv1.ReasonHAAdminStatusUnavailable),
+			fmt.Sprintf("Unable to observe HA admin status: %v", haAdminStatusErr),
+		)
+	}
+	if err := r.reconcileHAAdminJobs(ctx, cluster); err != nil {
+		return err
+	}
+	r.updateHALastPromotionFromAdminJobs(ctx, cluster)
+	r.updateHAFormerPrimaryFromAdminJobs(ctx, cluster)
+	if err := r.reconcileHAPrimaryRoute(ctx, cluster); err != nil {
+		return err
+	}
+	r.updateHAAdminJobExecutionCondition(cluster)
 
 	// Update ServiceMeshReady condition
 	r.updateServiceMeshReadyCondition(cluster)
 
 	return r.Status().Update(ctx, cluster)
+}
+
+func (r *AntflyClusterReconciler) reconcileHAAdminJobs(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	ha := cluster.Spec.HighAvailability
+	if ha == nil || ha.Admin == nil || !ha.Admin.ExecutePlannedActions ||
+		ha.Mode == "" || ha.Mode == antflyv1.HAModeDisabled ||
+		cluster.Status.HAStatus == nil {
+		return nil
+	}
+
+	for i := range cluster.Status.HAStatus.PlannedActions {
+		action := &cluster.Status.HAStatus.PlannedActions[i]
+		if strings.TrimSpace(action.AdminURL) == "" {
+			if haPlannedActionRequiresAdminTarget(*action) {
+				action.AdminJobPhase = haAdminJobPhaseMissingAdminURL
+			}
+			continue
+		}
+		if action.AdminJobPhase == haAdminJobPhaseSucceeded || action.AdminJobPhase == haAdminJobPhaseFailed {
+			if action.AdminJobPhase == haAdminJobPhaseSucceeded && action.AdminResult == nil {
+				r.updateHAAdminActionResultFromJobLogs(ctx, cluster, action)
+			}
+			continue
+		}
+		if !haPlannedActionDependenciesSucceededForStatus(cluster.Status.HAStatus, cluster.Status.HAStatus.PlannedActions, i) {
+			if action.AdminJobName == "" && action.AdminJobPhase == "" {
+				action.AdminJobPhase = haAdminJobPhaseWaitingDependency
+			}
+			continue
+		}
+		if handled, err := r.executeHAPlannedActionTyped(ctx, cluster, action); handled {
+			action.AdminJobName = haAdminDirectAPIName
+			if err != nil {
+				if adminsdk.HAIsRetryable(err) {
+					action.AdminJobPhase = haAdminJobPhasePending
+				} else {
+					action.AdminJobPhase = haAdminJobPhaseFailed
+				}
+				action.AdminError = err.Error()
+				if statusCode, ok := adminsdk.HAStatusCode(err); ok {
+					action.AdminStatusCode = statusCode
+				} else {
+					action.AdminStatusCode = 0
+				}
+			} else {
+				action.AdminJobPhase = haAdminJobPhaseSucceeded
+				action.AdminError = ""
+				action.AdminStatusCode = 0
+			}
+			continue
+		}
+		if action.Executor == string(haActionExecutorAdminAPI) {
+			action.AdminJobName = haAdminDirectAPIName
+			action.AdminJobPhase = haAdminJobPhaseFailed
+			action.AdminError = fmt.Sprintf("HA action %s is marked AdminAPI but no typed /admin/v1 request could be executed", action.Kind)
+			continue
+		}
+		if action.Executor != string(haActionExecutorCLIJob) {
+			continue
+		}
+		if haPlannedActionSupportsDirectAdminAPI(haActionKind(action.Kind)) {
+			action.AdminJobPhase = haAdminJobPhaseFailed
+			action.AdminError = fmt.Sprintf("HA action %s is marked CLIJob but has a typed /admin/v1 request; use AdminAPI execution or a pod-local action without a typed admin operation", action.Kind)
+			continue
+		}
+		if len(action.AdminCommand) == 0 {
+			continue
+		}
+
+		job := buildHAAdminJob(cluster, ha.Admin, *action)
+		action.AdminJobName = job.Name
+		if err := controllerutil.SetControllerReference(cluster, job, r.Scheme); err != nil {
+			return err
+		}
+
+		existing := &batchv1.Job{}
+		err := r.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: job.Namespace}, existing)
+		if errors.IsNotFound(err) {
+			action.AdminJobPhase = haAdminJobPhasePending
+			return r.Create(ctx, job)
+		}
+		if err != nil {
+			return err
+		}
+		action.AdminJobPhase = haAdminJobPhase(existing)
+		if action.AdminJobPhase == haAdminJobPhaseSucceeded && action.AdminResult == nil {
+			r.updateHAAdminActionResultFromJobLogs(ctx, cluster, action)
+		}
+		if !haAdminJobComplete(existing) {
+			continue
+		}
+	}
+	return nil
+}
+
+const haAdminDirectAPIName = "direct-admin-api"
+
+func haPlannedActionRequiresAdminTarget(action antflyv1.HAPlannedActionStatus) bool {
+	if action.Executor == string(haActionExecutorAdminAPI) &&
+		haPlannedActionSupportsDirectAdminAPI(haActionKind(action.Kind)) {
+		return true
+	}
+	return len(action.AdminCommand) > 0 ||
+		strings.TrimSpace(action.AdminMethod) != "" ||
+		strings.TrimSpace(action.AdminPath) != ""
+}
+
+func (r *AntflyClusterReconciler) executeHAPlannedActionTyped(ctx context.Context, cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus) (bool, error) {
+	if action == nil {
+		return false, nil
+	}
+	if action.Executor == string(haActionExecutorCLIJob) {
+		return false, nil
+	}
+	if !haPlannedActionSupportsDirectAdminAPI(haActionKind(action.Kind)) {
+		return false, nil
+	}
+	if err := haValidatePlannedActionAdminOperation(*action); err != nil {
+		return true, err
+	}
+	adminClient, err := r.haAdminSDKClient(cluster, action.AdminURL)
+	if err != nil {
+		return true, err
+	}
+	switch action.Kind {
+	case string(haActionCreateSlot):
+		slotName := haActionRequestSlotName(*action)
+		if slotName == "" {
+			return false, nil
+		}
+		if !haPlannedActionHasDirectAdminOperation(*action) {
+			return false, nil
+		}
+		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
+			return true, err
+		}
+		body := adminsdk.ReplicationSlotCreateRequest{SlotName: slotName}
+		if action.TargetLSN > 0 {
+			body.InitialLsn = action.TargetLSN
+		}
+		result, err := adminClient.CreateReplicationSlotResponse(ctx, body)
+		value, err := haAdminSDKResponseValue(result, err)
+		if err == nil {
+			err = requireHADirectAdminActionResultStatus(action, haAdminActionResultFromReplicationSlotSDK(*value))
+		}
+		return true, err
+	case string(haActionPauseSlot):
+		slotName := haActionRequestSlotName(*action)
+		if slotName == "" {
+			return false, nil
+		}
+		if !haPlannedActionHasDirectAdminOperation(*action) {
+			return false, nil
+		}
+		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
+			return true, err
+		}
+		result, err := adminClient.PauseReplicationSlotResponse(ctx, slotName)
+		value, err := haAdminSDKResponseValue(result, err)
+		if err == nil {
+			err = requireHADirectAdminActionResultStatus(action, haAdminActionResultFromReplicationSlotSDK(*value))
+		}
+		return true, err
+	case string(haActionResumeSlot):
+		slotName := haActionRequestSlotName(*action)
+		if slotName == "" {
+			return false, nil
+		}
+		if !haPlannedActionHasDirectAdminOperation(*action) {
+			return false, nil
+		}
+		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
+			return true, err
+		}
+		result, err := adminClient.ResumeReplicationSlotResponse(ctx, slotName)
+		value, err := haAdminSDKResponseValue(result, err)
+		if err == nil {
+			err = requireHADirectAdminActionResultStatus(action, haAdminActionResultFromReplicationSlotSDK(*value))
+		}
+		return true, err
+	case string(haActionDropSlot):
+		slotName := haActionRequestSlotName(*action)
+		if slotName == "" {
+			return false, nil
+		}
+		if !haPlannedActionHasDirectAdminOperation(*action) {
+			return false, nil
+		}
+		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
+			return true, err
+		}
+		result, err := adminClient.DropReplicationSlotResponse(ctx, slotName)
+		value, err := haAdminSDKResponseValue(result, err)
+		if err == nil {
+			err = requireHADirectAdminActionResultStatus(action, haAdminActionResultFromReplicationSlotSDK(*value))
+		}
+		return true, err
+	case string(haActionSeedStandby), string(haActionMarkReseed):
+		slotName := haActionRequestSlotName(*action)
+		if slotName == "" {
+			return false, nil
+		}
+		manifestID := haSeedBeginManifestID(*action, slotName)
+		if manifestID == "" {
+			return true, fmt.Errorf("HA admin action %s requires nonzero target LSN to create seed manifest", action.Kind)
+		}
+		if !haPlannedActionHasDirectAdminOperation(*action) {
+			return false, nil
+		}
+		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
+			return true, err
+		}
+		body := adminsdk.BaseBackupStartRequest{
+			SlotName:   slotName,
+			ManifestId: manifestID,
+		}
+		result, err := adminClient.BeginBaseBackupResponse(ctx, body)
+		value, err := haAdminSDKResponseValue(result, err)
+		if err == nil {
+			err = requireHADirectAdminActionResultStatus(action, haAdminActionResultFromBaseBackupBeginSDK(*value))
+		}
+		return true, err
+	case string(haActionFinishStandbySeed):
+		if strings.TrimSpace(action.SeedManifestPath) == "" {
+			return false, nil
+		}
+		if !haPlannedActionHasDirectAdminOperation(*action) {
+			return false, nil
+		}
+		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
+			return true, err
+		}
+		body := adminsdk.BaseBackupManifestPathRequest{ManifestPath: action.SeedManifestPath}
+		result, err := adminClient.FinishBaseBackupResponse(ctx, body)
+		value, err := haAdminSDKResponseValue(result, err)
+		if err == nil {
+			err = requireHADirectAdminActionResultStatus(action, haAdminActionResultFromBaseBackupFinishSDK(*value))
+		}
+		return true, err
+	case string(haActionBootstrapStandbySeed):
+		if strings.TrimSpace(action.SeedManifestPath) == "" {
+			return false, nil
+		}
+		if !haPlannedActionHasDirectAdminOperation(*action) {
+			return false, nil
+		}
+		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
+			return true, err
+		}
+		body := adminsdk.StandbyBootstrapRequest{ManifestPath: action.SeedManifestPath}
+		if strings.TrimSpace(action.SeedContentRoot) != "" {
+			body.ContentRoot = action.SeedContentRoot
+		}
+		result, err := adminClient.BootstrapStandbyResponse(ctx, body)
+		value, err := haAdminSDKResponseValue(result, err)
+		if err == nil {
+			err = requireHADirectAdminActionResultStatus(action, haAdminActionResultFromStandbyBootstrapSDK(*value))
+		}
+		return true, err
+	case string(haActionAcquireFence):
+		body, ok := haFenceAcquireBody(cluster, *action)
+		if !ok {
+			return false, nil
+		}
+		if !haPlannedActionHasDirectAdminOperation(*action) {
+			return false, nil
+		}
+		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
+			return true, err
+		}
+		result, err := adminClient.AcquireFenceResponse(ctx, body)
+		value, err := haAdminSDKResponseValue(result, err)
+		if err == nil {
+			err = requireHADirectFenceAcquireResultStatus(cluster, action, haAdminActionResultFromFenceSDK(*value))
+		}
+		return true, err
+	case string(haActionAssessPromotion):
+		body := haPromotionAssessBody(*action)
+		if !haPlannedActionHasDirectAdminOperation(*action) {
+			return false, nil
+		}
+		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
+			return true, err
+		}
+		result, err := adminClient.AssessPromotionResponse(ctx, body)
+		value, err := haAdminSDKResponseValue(result, err)
+		if err == nil {
+			err = requireHADirectPromotionAssessmentResultStatus(action, haAdminActionResultFromPromotionAssessSDK(*value))
+		}
+		return true, err
+	case string(haActionPromoteStandby):
+		if !haPlannedActionHasDirectAdminOperation(*action) {
+			return false, nil
+		}
+		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
+			return true, err
+		}
+		result, err := adminClient.PromoteWithCurrentFenceResponse(ctx)
+		value, err := haAdminSDKResponseValue(result, err)
+		if err == nil && !r.applyHADirectPromotionResultFromSDK(cluster, action, *value) {
+			err = fmt.Errorf("HA admin action %s succeeded without typed promotion receipt", action.Kind)
+		}
+		return true, err
+	case string(haActionDemoteFormerPrimary), string(haActionRewindFormerPrimary), string(haActionReseedFormerPrimary):
+		body, ok := haRejoinAssessBody(cluster, *action)
+		if !ok {
+			return false, nil
+		}
+		if !haPlannedActionHasDirectAdminOperation(*action) {
+			return false, nil
+		}
+		if err := haValidateDirectAdminNodeTarget(*action); err != nil {
+			return true, err
+		}
+		var result *adminsdk.HAResponse[adminsdk.HARejoinAssessResponse]
+		switch haActionKind(action.Kind) {
+		case haActionRewindFormerPrimary:
+			result, err = adminClient.RewindRejoinResponse(ctx, body)
+		case haActionReseedFormerPrimary:
+			result, err = adminClient.ReseedRejoinResponse(ctx, body)
+		default:
+			result, err = adminClient.AssessRejoinResponse(ctx, body)
+		}
+		value, err := haAdminSDKResponseValue(result, err)
+		if err == nil && !r.applyHADirectRejoinAssessResultFromSDK(cluster, action, *value) {
+			err = fmt.Errorf("HA admin action %s succeeded without typed rejoin assessment", action.Kind)
+		}
+		return true, err
+	default:
+		return false, nil
+	}
+}
+
+func (r *AntflyClusterReconciler) haAdminSDKClient(cluster *antflyv1.AntflyCluster, baseURL string) (*adminsdk.HAClient, error) {
+	if strings.TrimSpace(baseURL) == "" {
+		return nil, fmt.Errorf("HA admin API execution requires adminURL")
+	}
+	client, err := adminsdk.NewHAClient(baseURL, r.httpClient())
+	if err != nil {
+		return nil, err
+	}
+	token, err := haAdminBearerToken(cluster)
+	if err != nil {
+		return nil, err
+	}
+	if token != "" {
+		client.WithToken(token)
+	}
+	return client, nil
+}
+
+func haAdminBearerToken(cluster *antflyv1.AntflyCluster) (string, error) {
+	var admin *antflyv1.HAAdminSpec
+	if cluster != nil && cluster.Spec.HighAvailability != nil && cluster.Spec.HighAvailability.Admin != nil {
+		admin = cluster.Spec.HighAvailability.Admin
+	}
+	envVar := haAdminTokenEnvVar(admin)
+	token := strings.TrimSpace(os.Getenv(envVar))
+	if haAdminConfiguredTokenEnvVar(admin) != "" && token == "" {
+		return "", fmt.Errorf("configured HA admin token env var %s is empty or unset", envVar)
+	}
+	return token, nil
+}
+
+func haPlannedActionHasDirectAdminOperation(action antflyv1.HAPlannedActionStatus) bool {
+	_, _, ok := haPlannedActionDirectAdminOperation(action)
+	return ok
+}
+
+func haAdminSDKResponseValue[T any](value *adminsdk.HAResponse[T], err error) (*T, error) {
+	if err != nil {
+		var apiErr *adminsdk.HAAPIError
+		if stderrors.As(err, &apiErr) {
+			return nil, fmt.Errorf("HA admin API returned status %d: %s: %w", apiErr.StatusCode, strings.TrimSpace(apiErr.Body), err)
+		}
+		var validationErr *adminsdk.HAResponseValidationError
+		if stderrors.As(err, &validationErr) {
+			return nil, fmt.Errorf("HA admin action response missing typed result evidence: %w", err)
+		}
+		return nil, err
+	}
+	if value == nil || value.Value == nil {
+		return nil, fmt.Errorf("HA admin SDK response is nil")
+	}
+	return value.Value, nil
+}
+
+func haAdminStatusUnavailableReason(cluster *antflyv1.AntflyCluster, defaultReason string) string {
+	if cluster != nil &&
+		cluster.Status.HAStatus != nil &&
+		cluster.Status.HAStatus.PrimaryAdminStatusCode == http.StatusUnauthorized {
+		return antflyv1.ReasonHAAdminUnauthorized
+	}
+	return defaultReason
+}
+
+func haAdminActionResultFromReplicationSlotSDK(response adminsdk.HAReplicationSlotActionResponse) *antflyv1.HAAdminActionResultStatus {
+	result := haAdminActionResultFromReceipt(response.SchemaVersion, response.Action)
+	result.SlotAction = strings.TrimSpace(string(response.SlotAction))
+	result.SlotName = strings.TrimSpace(response.Slot.SlotName)
+	return result
+}
+
+func haAdminActionResultFromBaseBackupBeginSDK(response adminsdk.HABaseBackupBeginResponse) *antflyv1.HAAdminActionResultStatus {
+	result := haAdminActionResultFromReceipt(response.SchemaVersion, response.Action)
+	result.SlotName = strings.TrimSpace(response.SlotName)
+	result.ManifestID = strings.TrimSpace(response.ManifestId)
+	result.BackupLSN = response.BackupLsn
+	result.StartRecordLSN = response.StartRecordLsn
+	return result
+}
+
+func haAdminActionResultFromBaseBackupFinishSDK(response adminsdk.HABaseBackupFinishResponse) *antflyv1.HAAdminActionResultStatus {
+	result := haAdminActionResultFromReceipt(response.SchemaVersion, response.Action)
+	result.ManifestID = strings.TrimSpace(response.ManifestId)
+	result.BackupLSN = response.BackupLsn
+	result.EndRecordLSN = response.EndRecordLsn
+	return result
+}
+
+func haAdminActionResultFromStandbyBootstrapSDK(response adminsdk.HAStandbyBootstrapResponse) *antflyv1.HAAdminActionResultStatus {
+	result := haAdminActionResultFromReceipt(response.SchemaVersion, response.Action)
+	result.ManifestID = strings.TrimSpace(response.ManifestId)
+	result.BackupLSN = response.BackupLsn
+	result.CheckpointLSN = response.CheckpointLsn
+	return result
+}
+
+func haAdminActionResultFromFenceSDK(response adminsdk.HAFenceResponse) *antflyv1.HAAdminActionResultStatus {
+	result := haAdminActionResultFromReceipt(response.SchemaVersion, response.Action)
+	applyHAFenceReceiptToAdminActionResult(result, response.Receipt)
+	return result
+}
+
+func haAdminActionResultFromPromotionAssessSDK(response adminsdk.HAPromotionAssessResponse) *antflyv1.HAAdminActionResultStatus {
+	result := haAdminActionResultFromReceipt(response.SchemaVersion, response.Action)
+	applyHAPromotionAssessmentToAdminActionResult(result, response.Assessment)
+	return result
+}
+
+func applyHAFenceReceiptToAdminActionResult(result *antflyv1.HAAdminActionResultStatus, receipt adminsdk.HAFenceReceipt) {
+	if result == nil {
+		return
+	}
+	result.FenceGeneration = receipt.Generation
+	result.FenceToken = strings.TrimSpace(receipt.Token)
+	result.FenceClusterID = receipt.Identity.ClusterId
+	result.FenceShardID = receipt.Identity.ShardId
+	result.FenceTableID = receipt.Identity.TableId
+	result.FenceOldPrimaryID = strings.TrimSpace(receipt.OldPrimaryId)
+	result.FencePromotedNodeID = strings.TrimSpace(receipt.PromotedNodeId)
+	result.FenceParentTimelineID = receipt.ParentTimelineId
+	result.FenceParentEpoch = receipt.ParentEpoch
+	result.FenceNewTimelineID = receipt.NewTimelineId
+	result.FenceNewEpoch = receipt.NewEpoch
+	result.FenceRequiredLSN = receipt.RequiredLsn
+	result.FenceObservedLSN = receipt.ObservedLsn
+	result.FenceForced = receipt.Forced
+	result.FenceReason = strings.TrimSpace(receipt.Reason)
+}
+
+func applyHAPromotionAssessmentToAdminActionResult(result *antflyv1.HAAdminActionResultStatus, assessment adminsdk.HAPromotionAssessment) {
+	if result == nil {
+		return
+	}
+	result.PromotionRequiredLSN = assessment.RequiredLsn
+	result.PromotionReceivedLSN = assessment.ReceivedLsn
+	result.PromotionAppliedLSN = assessment.AppliedLsn
+	result.PromotionCanPromote = assessment.CanPromote
+	result.PromotionFenced = assessment.FencingConfirmed
+	result.PromotionSafe = assessment.Safe
+	result.PromotionForce = assessment.Force
+	result.PromotionMode = strings.TrimSpace(string(assessment.Mode))
+	result.PromotionDataLossPossible = assessment.DataLossPossible
+	result.PromotionRequiresFencing = assessment.RequiresFencing
+	result.PromotionRequiresForce = assessment.RequiresForce
+}
+
+func haAdminActionResultFromReceipt(schemaVersion uint32, receipt adminsdk.HAActionReceipt) *antflyv1.HAAdminActionResultStatus {
+	return &antflyv1.HAAdminActionResultStatus{
+		SchemaVersion: schemaVersion,
+		ActionID:      strings.TrimSpace(receipt.ActionId),
+		ActionKind:    strings.TrimSpace(string(receipt.ActionKind)),
+		ActionTarget:  strings.TrimSpace(receipt.Target),
+		ActionState:   strings.TrimSpace(string(receipt.State)),
+		ActionNodeID:  strings.TrimSpace(receipt.NodeId),
+	}
+}
+
+func haValidateDirectAdminNodeTarget(action antflyv1.HAPlannedActionStatus) error {
+	if strings.TrimSpace(action.AdminNodeID) == "" {
+		return fmt.Errorf("HA action %s requires adminNodeID before typed /admin/v1 execution", action.Kind)
+	}
+	return nil
+}
+
+func haPlannedActionDirectAdminOperation(action antflyv1.HAPlannedActionStatus) (string, string, bool) {
+	method := strings.TrimSpace(action.AdminMethod)
+	apiPath := strings.TrimSpace(action.AdminPath)
+	if method != "" && apiPath != "" {
+		return method, apiPath, true
+	}
+	if action.Executor == string(haActionExecutorAdminAPI) {
+		return method, apiPath, false
+	}
+	method, apiPath = haAdminOperation(haPlannedAction{
+		Kind:             haActionKind(action.Kind),
+		StandbyName:      action.StandbyName,
+		SlotName:         action.SlotName,
+		SeedManifestPath: action.SeedManifestPath,
+	})
+	return method, apiPath, method != "" && apiPath != ""
+}
+
+func haPlannedActionSupportsDirectAdminAPI(kind haActionKind) bool {
+	_, _, ok := haDirectAdminActionReceiptSpec(kind)
+	return ok
+}
+
+func haDirectAdminActionReceiptSpec(kind haActionKind) (string, string, bool) {
+	expectation := adminsdk.HAReceiptExpectation{}
+	ok := true
+	switch kind {
+	case haActionCreateSlot:
+		expectation = adminsdk.HAReplicationSlotCreateReceiptExpectation()
+	case haActionResumeSlot:
+		expectation = adminsdk.HAReplicationSlotResumeReceiptExpectation()
+	case haActionPauseSlot:
+		expectation = adminsdk.HAReplicationSlotPauseReceiptExpectation()
+	case haActionDropSlot:
+		expectation = adminsdk.HAReplicationSlotDropReceiptExpectation()
+	case haActionSeedStandby, haActionMarkReseed:
+		expectation = adminsdk.HABaseBackupBeginReceiptExpectation()
+	case haActionFinishStandbySeed:
+		expectation = adminsdk.HABaseBackupFinishReceiptExpectation()
+	case haActionBootstrapStandbySeed:
+		expectation = adminsdk.HAStandbyBootstrapReceiptExpectation()
+	case haActionAcquireFence:
+		expectation = adminsdk.HAFenceAcquireReceiptExpectation()
+	case haActionAssessPromotion:
+		expectation = adminsdk.HAPromotionAssessReceiptExpectation()
+	case haActionPromoteStandby:
+		expectation = adminsdk.HAPromotionReceiptExpectation()
+	case haActionDemoteFormerPrimary:
+		expectation = adminsdk.HARejoinAssessReceiptExpectation()
+	case haActionRewindFormerPrimary:
+		expectation = adminsdk.HARejoinRewindReceiptExpectation()
+	case haActionReseedFormerPrimary:
+		expectation = adminsdk.HARejoinReseedReceiptExpectation()
+	default:
+		ok = false
+	}
+	if !ok {
+		return "", "", false
+	}
+	expectedKind, expectedState := expectation.Strings()
+	return expectedKind, expectedState, true
+}
+
+func haValidatePlannedActionAdminOperation(action antflyv1.HAPlannedActionStatus) error {
+	method := strings.TrimSpace(action.AdminMethod)
+	apiPath := strings.TrimSpace(action.AdminPath)
+	if method == "" && apiPath == "" {
+		if action.Executor == string(haActionExecutorAdminAPI) &&
+			haPlannedActionSupportsDirectAdminAPI(haActionKind(action.Kind)) {
+			return fmt.Errorf("planned HA action %q is marked AdminAPI but status does not publish typed admin method/path", action.Kind)
+		}
+		return nil
+	}
+	expectedMethod, expectedPath := haAdminOperation(haPlannedAction{
+		Kind:        haActionKind(action.Kind),
+		StandbyName: action.StandbyName,
+		SlotName:    action.SlotName,
+	})
+	if expectedMethod == "" || expectedPath == "" {
+		return fmt.Errorf("planned HA action %q has typed admin operation %s %s but no matching direct admin API operation", action.Kind, action.AdminMethod, action.AdminPath)
+	}
+	if method != expectedMethod || apiPath != expectedPath {
+		return fmt.Errorf("planned HA action %q typed admin operation mismatch: status has %s %s, expected %s %s", action.Kind, action.AdminMethod, action.AdminPath, expectedMethod, expectedPath)
+	}
+	return nil
+}
+
+func haAdminIdentityRequestFromSpec(identity *antflyv1.HAReplicationIdentitySpec) adminsdk.HAIdentity {
+	if identity == nil {
+		return adminsdk.HAIdentity{}
+	}
+	return adminsdk.HAIdentity{
+		ClusterId:  identity.ClusterID,
+		ShardId:    identity.ShardID,
+		TableId:    identity.TableID,
+		TimelineId: identity.TimelineID,
+		Epoch:      identity.Epoch,
+	}
+}
+
+func haFenceAcquireBody(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) (adminsdk.FenceAcquireRequest, bool) {
+	if cluster == nil {
+		return adminsdk.FenceAcquireRequest{}, false
+	}
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	if identity == nil || identity.CurrentPrimaryID == "" || strings.TrimSpace(action.StandbyName) == "" {
+		return adminsdk.FenceAcquireRequest{}, false
+	}
+	reason := action.FenceReason
+	if strings.TrimSpace(reason) == "" {
+		reason = action.Reason
+	}
+	return adminsdk.FenceAcquireRequest{
+		Identity:       haAdminIdentityRequestFromSpec(identity),
+		OldPrimaryId:   identity.CurrentPrimaryID,
+		PromotedNodeId: action.StandbyName,
+		NewTimelineId:  identity.TimelineID + 1,
+		NewEpoch:       identity.Epoch + 1,
+		RequiredLsn:    action.TargetLSN,
+		ObservedLsn:    action.TargetLSN,
+		Reason:         reason,
+	}, true
+}
+
+func haPromotionAssessBody(action antflyv1.HAPlannedActionStatus) adminsdk.PromotionAssessRequest {
+	return adminsdk.PromotionAssessRequest{
+		RequiredLsn:      action.TargetLSN,
+		FencingConfirmed: false,
+		Force:            false,
+		UseCurrentFence:  true,
+	}
+}
+
+func haRejoinAssessBody(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) (adminsdk.RejoinAssessRequest, bool) {
+	if cluster == nil {
+		return adminsdk.RejoinAssessRequest{}, false
+	}
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	if identity == nil || strings.TrimSpace(action.StandbyName) == "" {
+		return adminsdk.RejoinAssessRequest{}, false
+	}
+	lastLSN := action.ObservedLSN
+	if lastLSN == 0 {
+		lastLSN = action.TargetLSN
+	}
+	body := adminsdk.RejoinAssessRequest{
+		NodeId:                          action.StandbyName,
+		Identity:                        haAdminIdentityRequestFromSpec(identity),
+		LastLsn:                         lastLSN,
+		RetainedFromLsn:                 action.RetainedFromLSN,
+		AllowRewindAfterForcedPromotion: false,
+	}
+	if receipt, ok := haRejoinFenceReceipt(cluster.Status.HAStatus, identity); ok {
+		body.Receipt = receipt
+	} else if haActionKind(action.Kind) == haActionRewindFormerPrimary ||
+		haActionKind(action.Kind) == haActionReseedFormerPrimary {
+		return adminsdk.RejoinAssessRequest{}, false
+	}
+	return body, true
+}
+
+func haRejoinFenceReceipt(status *antflyv1.HAStatus, identity *antflyv1.HAReplicationIdentitySpec) (adminsdk.HAFenceReceipt, bool) {
+	promotion := haPromotionReceipt(status)
+	if promotion == nil {
+		return adminsdk.HAFenceReceipt{}, false
+	}
+	if identity == nil {
+		return adminsdk.HAFenceReceipt{}, false
+	}
+	if promotion.OldPrimaryID != identity.CurrentPrimaryID ||
+		promotion.ParentTimelineID != identity.TimelineID ||
+		promotion.ParentEpoch != identity.Epoch {
+		return adminsdk.HAFenceReceipt{}, false
+	}
+	receiptIdentity := haAdminIdentityRequestFromSpec(identity)
+	receiptIdentity.TimelineId = promotion.NewTimelineID
+	receiptIdentity.Epoch = promotion.NewEpoch
+	return adminsdk.HAFenceReceipt{
+		Identity:         receiptIdentity,
+		OldPrimaryId:     promotion.OldPrimaryID,
+		PromotedNodeId:   promotion.PromotedStandbyID,
+		ParentTimelineId: promotion.ParentTimelineID,
+		ParentEpoch:      promotion.ParentEpoch,
+		NewTimelineId:    promotion.NewTimelineID,
+		NewEpoch:         promotion.NewEpoch,
+		RequiredLsn:      haPromotionRequiredLSN(promotion),
+		ObservedLsn:      haPromotionObservedLSN(promotion),
+		Generation:       promotion.FenceGeneration,
+		Forced:           promotion.Forced,
+		Token:            strings.TrimSpace(promotion.FenceToken),
+		Reason:           promotion.FenceReason,
+	}, true
+}
+
+func haActionRequestSlotName(action antflyv1.HAPlannedActionStatus) string {
+	if action.SlotName != "" {
+		return action.SlotName
+	}
+	return action.StandbyName
+}
+
+func haActionSlotName(action antflyv1.HAPlannedActionStatus) string {
+	if strings.TrimSpace(action.SlotName) != "" {
+		return strings.TrimSpace(action.SlotName)
+	}
+	return strings.TrimSpace(action.StandbyName)
+}
+
+func haSeedBeginManifestID(action antflyv1.HAPlannedActionStatus, slotName string) string {
+	for i := 0; i+1 < len(action.AdminCommand); i++ {
+		if action.AdminCommand[i] == "--manifest-id" {
+			if manifestID := strings.TrimSpace(action.AdminCommand[i+1]); manifestID != "" {
+				return manifestID
+			}
+		}
+	}
+	slotName = strings.TrimSpace(slotName)
+	if slotName == "" || action.TargetLSN == 0 {
+		return ""
+	}
+	return fmt.Sprintf("base-%s-%d", slotName, action.TargetLSN)
+}
+
+type haAdminActionReceiptJSON struct {
+	ActionID   string `json:"action_id"`
+	ActionKind string `json:"action_kind"`
+	Target     string `json:"target"`
+	State      string `json:"state"`
+	NodeID     string `json:"node_id"`
+}
+
+type haPromotionAssessmentJSON struct {
+	RequiredLSN        *uint64 `json:"required_lsn"`
+	ReceivedLSN        *uint64 `json:"received_lsn"`
+	AppliedLSN         *uint64 `json:"applied_lsn"`
+	HasRequiredLSN     *bool   `json:"has_required_lsn"`
+	CaughtUpToReceived *bool   `json:"caught_up_to_received"`
+	FencingConfirmed   *bool   `json:"fencing_confirmed"`
+	Force              *bool   `json:"force"`
+	Mode               string  `json:"mode"`
+	DataLossPossible   *bool   `json:"data_loss_possible"`
+	Safe               *bool   `json:"safe"`
+	RequiresFencing    *bool   `json:"requires_fencing"`
+	RequiresForce      *bool   `json:"requires_force"`
+	CanPromote         *bool   `json:"can_promote"`
+}
+
+type haFenceReceiptIdentityJSON struct {
+	ClusterID  *uint64 `json:"cluster_id"`
+	ShardID    *uint64 `json:"shard_id"`
+	TableID    *uint64 `json:"table_id"`
+	TimelineID *uint64 `json:"timeline_id"`
+	Epoch      *uint64 `json:"epoch"`
+}
+
+type haFenceReceiptJSON struct {
+	Identity         haFenceReceiptIdentityJSON `json:"identity"`
+	OldPrimaryID     string                     `json:"old_primary_id"`
+	PromotedNodeID   string                     `json:"promoted_node_id"`
+	ParentTimelineID *uint64                    `json:"parent_timeline_id"`
+	ParentEpoch      *uint64                    `json:"parent_epoch"`
+	NewTimelineID    *uint64                    `json:"new_timeline_id"`
+	NewEpoch         *uint64                    `json:"new_epoch"`
+	RequiredLSN      *uint64                    `json:"required_lsn"`
+	ObservedLSN      *uint64                    `json:"observed_lsn"`
+	Generation       *uint64                    `json:"generation"`
+	Forced           *bool                      `json:"forced"`
+	Token            string                     `json:"token"`
+	Reason           *string                    `json:"reason"`
+}
+
+type haReplicationSlotJSON struct {
+	SlotName       string  `json:"slot_name"`
+	TimelineID     *uint64 `json:"timeline_id"`
+	RestartLSN     *uint64 `json:"restart_lsn"`
+	ReceivedLSN    *uint64 `json:"received_lsn"`
+	AppliedLSN     *uint64 `json:"applied_lsn"`
+	SafeReadLSN    *uint64 `json:"safe_read_lsn"`
+	Active         *bool   `json:"active"`
+	ReseedRequired *bool   `json:"reseed_required"`
+	CurrentLSN     *uint64 `json:"current_lsn"`
+}
+
+type haDirectAdminActionResultJSON struct {
+	SchemaVersion  uint32                    `json:"schema_version"`
+	Action         haAdminActionReceiptJSON  `json:"action"`
+	SlotAction     string                    `json:"slot_action"`
+	Slot           haReplicationSlotJSON     `json:"slot"`
+	SlotName       string                    `json:"slot_name"`
+	ManifestID     string                    `json:"manifest_id"`
+	BackupLSN      uint64                    `json:"backup_lsn"`
+	StartRecordLSN uint64                    `json:"start_record_lsn"`
+	EndRecordLSN   uint64                    `json:"end_record_lsn"`
+	CheckpointLSN  uint64                    `json:"checkpoint_lsn"`
+	Assessment     haPromotionAssessmentJSON `json:"assessment"`
+	Receipt        haFenceReceiptJSON        `json:"receipt"`
+}
+
+type haDirectAdminActionResultEnvelope struct {
+	Result struct {
+		Slot          *haDirectAdminActionResultJSON `json:"slot,omitempty"`
+		SeedBegin     *haDirectAdminActionResultJSON `json:"seed_begin,omitempty"`
+		SeedFinish    *haDirectAdminActionResultJSON `json:"seed_finish,omitempty"`
+		SeedBootstrap *haDirectAdminActionResultJSON `json:"seed_bootstrap,omitempty"`
+		FenceAcquire  *haDirectAdminActionResultJSON `json:"fence_acquire,omitempty"`
+	} `json:"result"`
+}
+
+func requireHADirectAdminActionResultStatus(action *antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) error {
+	if action == nil || !haActionRequiresAdminResult(haActionKind(action.Kind)) {
+		return nil
+	}
+	action.AdminResult = result
+	if haActionHasRequiredAdminResult(*action) && haDirectAdminActionReceiptMatches(*action) {
+		return nil
+	}
+	action.AdminResult = nil
+	return fmt.Errorf("HA admin action %s succeeded without typed result evidence", action.Kind)
+}
+
+func parseHADirectAdminActionResult(raw []byte) (*antflyv1.HAAdminActionResultStatus, bool) {
+	var direct haDirectAdminActionResultJSON
+	if err := json.Unmarshal(raw, &direct); err != nil {
+		return nil, false
+	}
+	topLevel := haDirectAdminActionResultHasCorrelationFields(direct)
+	result := &direct
+	if !topLevel {
+		var envelope haDirectAdminActionResultEnvelope
+		if err := json.Unmarshal(raw, &envelope); err != nil {
+			return nil, false
+		}
+		switch {
+		case envelope.Result.Slot != nil:
+			result = envelope.Result.Slot
+		case envelope.Result.SeedBegin != nil:
+			result = envelope.Result.SeedBegin
+		case envelope.Result.SeedFinish != nil:
+			result = envelope.Result.SeedFinish
+		case envelope.Result.SeedBootstrap != nil:
+			result = envelope.Result.SeedBootstrap
+		case envelope.Result.FenceAcquire != nil:
+			result = envelope.Result.FenceAcquire
+		default:
+			return nil, false
+		}
+		if result.SchemaVersion == 0 {
+			result.SchemaVersion = direct.SchemaVersion
+		}
+	}
+	if result.SchemaVersion == 0 {
+		return nil, false
+	}
+	if topLevel && !haAdminActionReceiptPresent(result.Action) {
+		return nil, false
+	}
+	if topLevel &&
+		strings.HasPrefix(strings.TrimSpace(result.Action.ActionKind), "replication_slot_") &&
+		!haReplicationSlotJSONComplete(result.Slot) {
+		return nil, false
+	}
+	if topLevel && !haDirectAdminActionPayloadComplete(*result) {
+		return nil, false
+	}
+	if strings.TrimSpace(result.Action.ActionKind) == "promotion_assess" &&
+		(!haPromotionAssessmentJSONComplete(result.Assessment) ||
+			!haPromotionAssessmentJSONConsistent(result.Assessment)) {
+		return nil, false
+	}
+	status := &antflyv1.HAAdminActionResultStatus{
+		SchemaVersion:             result.SchemaVersion,
+		ActionID:                  strings.TrimSpace(result.Action.ActionID),
+		ActionKind:                strings.TrimSpace(result.Action.ActionKind),
+		ActionTarget:              strings.TrimSpace(result.Action.Target),
+		ActionState:               strings.TrimSpace(result.Action.State),
+		ActionNodeID:              strings.TrimSpace(result.Action.NodeID),
+		SlotAction:                strings.TrimSpace(result.SlotAction),
+		SlotName:                  strings.TrimSpace(result.SlotName),
+		ManifestID:                strings.TrimSpace(result.ManifestID),
+		BackupLSN:                 result.BackupLSN,
+		StartRecordLSN:            result.StartRecordLSN,
+		EndRecordLSN:              result.EndRecordLSN,
+		CheckpointLSN:             result.CheckpointLSN,
+		PromotionRequiredLSN:      haUint64JSONValue(result.Assessment.RequiredLSN),
+		PromotionReceivedLSN:      haUint64JSONValue(result.Assessment.ReceivedLSN),
+		PromotionAppliedLSN:       haUint64JSONValue(result.Assessment.AppliedLSN),
+		PromotionCanPromote:       haBoolJSONValue(result.Assessment.CanPromote),
+		PromotionFenced:           haBoolJSONValue(result.Assessment.FencingConfirmed),
+		PromotionSafe:             haBoolJSONValue(result.Assessment.Safe),
+		PromotionForce:            haBoolJSONValue(result.Assessment.Force),
+		PromotionMode:             strings.TrimSpace(result.Assessment.Mode),
+		PromotionDataLossPossible: haBoolJSONValue(result.Assessment.DataLossPossible),
+		PromotionRequiresFencing:  haBoolJSONValue(result.Assessment.RequiresFencing),
+		PromotionRequiresForce:    haBoolJSONValue(result.Assessment.RequiresForce),
+		FenceGeneration:           haUint64JSONValue(result.Receipt.Generation),
+		FenceToken:                strings.TrimSpace(result.Receipt.Token),
+		FenceClusterID:            haUint64JSONValue(result.Receipt.Identity.ClusterID),
+		FenceShardID:              haUint64JSONValue(result.Receipt.Identity.ShardID),
+		FenceTableID:              haUint64JSONValue(result.Receipt.Identity.TableID),
+		FenceOldPrimaryID:         strings.TrimSpace(result.Receipt.OldPrimaryID),
+		FencePromotedNodeID:       strings.TrimSpace(result.Receipt.PromotedNodeID),
+		FenceParentTimelineID:     haUint64JSONValue(result.Receipt.ParentTimelineID),
+		FenceParentEpoch:          haUint64JSONValue(result.Receipt.ParentEpoch),
+		FenceNewTimelineID:        haUint64JSONValue(result.Receipt.NewTimelineID),
+		FenceNewEpoch:             haUint64JSONValue(result.Receipt.NewEpoch),
+		FenceRequiredLSN:          haUint64JSONValue(result.Receipt.RequiredLSN),
+		FenceObservedLSN:          haUint64JSONValue(result.Receipt.ObservedLSN),
+		FenceForced:               haBoolJSONValue(result.Receipt.Forced),
+		FenceReason:               haStringJSONValue(result.Receipt.Reason),
+	}
+	if status.SlotName == "" {
+		status.SlotName = strings.TrimSpace(result.Slot.SlotName)
+	}
+	if status.SlotAction == "" &&
+		status.ActionID == "" &&
+		status.ActionKind == "" &&
+		status.ActionTarget == "" &&
+		status.ActionState == "" &&
+		status.ActionNodeID == "" &&
+		status.SlotName == "" &&
+		status.ManifestID == "" &&
+		status.BackupLSN == 0 &&
+		status.StartRecordLSN == 0 &&
+		status.EndRecordLSN == 0 &&
+		status.CheckpointLSN == 0 &&
+		status.FenceGeneration == 0 &&
+		status.FenceToken == "" {
+		return nil, false
+	}
+	return status, true
+}
+
+func haPromotionAssessmentJSONComplete(assessment haPromotionAssessmentJSON) bool {
+	return assessment.RequiredLSN != nil &&
+		assessment.ReceivedLSN != nil &&
+		assessment.AppliedLSN != nil &&
+		assessment.HasRequiredLSN != nil &&
+		assessment.CaughtUpToReceived != nil &&
+		assessment.FencingConfirmed != nil &&
+		assessment.Force != nil &&
+		strings.TrimSpace(assessment.Mode) != "" &&
+		assessment.DataLossPossible != nil &&
+		assessment.Safe != nil &&
+		assessment.RequiresFencing != nil &&
+		assessment.RequiresForce != nil &&
+		assessment.CanPromote != nil
+}
+
+func haReplicationSlotJSONComplete(slot haReplicationSlotJSON) bool {
+	return strings.TrimSpace(slot.SlotName) != "" &&
+		slot.TimelineID != nil &&
+		haUint64JSONValue(slot.TimelineID) > 0 &&
+		slot.RestartLSN != nil &&
+		slot.ReceivedLSN != nil &&
+		slot.AppliedLSN != nil &&
+		slot.SafeReadLSN != nil &&
+		slot.Active != nil &&
+		slot.ReseedRequired != nil &&
+		slot.CurrentLSN != nil
+}
+
+func haFenceReceiptJSONComplete(receipt haFenceReceiptJSON) bool {
+	return receipt.Identity.ClusterID != nil &&
+		haUint64JSONValue(receipt.Identity.ClusterID) > 0 &&
+		receipt.Identity.ShardID != nil &&
+		receipt.Identity.TableID != nil &&
+		receipt.Identity.TimelineID != nil &&
+		haUint64JSONValue(receipt.Identity.TimelineID) > 0 &&
+		receipt.Identity.Epoch != nil &&
+		haUint64JSONValue(receipt.Identity.Epoch) > 0 &&
+		strings.TrimSpace(receipt.OldPrimaryID) != "" &&
+		strings.TrimSpace(receipt.PromotedNodeID) != "" &&
+		receipt.ParentTimelineID != nil &&
+		haUint64JSONValue(receipt.ParentTimelineID) > 0 &&
+		receipt.ParentEpoch != nil &&
+		haUint64JSONValue(receipt.ParentEpoch) > 0 &&
+		receipt.NewTimelineID != nil &&
+		haUint64JSONValue(receipt.NewTimelineID) > 0 &&
+		receipt.NewEpoch != nil &&
+		haUint64JSONValue(receipt.NewEpoch) > 0 &&
+		receipt.RequiredLSN != nil &&
+		haUint64JSONValue(receipt.RequiredLSN) > 0 &&
+		receipt.ObservedLSN != nil &&
+		receipt.Generation != nil &&
+		haUint64JSONValue(receipt.Generation) > 0 &&
+		receipt.Forced != nil &&
+		strings.TrimSpace(receipt.Token) != "" &&
+		receipt.Reason != nil
+}
+
+func haDirectAdminActionPayloadComplete(result haDirectAdminActionResultJSON) bool {
+	switch strings.TrimSpace(result.Action.ActionKind) {
+	case "base_backup_begin":
+		return strings.TrimSpace(result.SlotName) != "" &&
+			strings.TrimSpace(result.ManifestID) != "" &&
+			result.BackupLSN > 0 &&
+			result.StartRecordLSN > 0
+	case "base_backup_finish":
+		return strings.TrimSpace(result.ManifestID) != "" &&
+			result.BackupLSN > 0 &&
+			result.EndRecordLSN > 0
+	case "standby_bootstrap":
+		return strings.TrimSpace(result.ManifestID) != "" &&
+			result.BackupLSN > 0 &&
+			result.CheckpointLSN > 0
+	case "fence_acquire":
+		return haFenceReceiptJSONComplete(result.Receipt)
+	default:
+		return true
+	}
+}
+
+func haUint64JSONValue(value *uint64) uint64 {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+func haBoolJSONValue(value *bool) bool {
+	return value != nil && *value
+}
+
+func haStringJSONValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return strings.TrimSpace(*value)
+}
+
+func haDirectAdminActionResultHasCorrelationFields(result haDirectAdminActionResultJSON) bool {
+	return strings.TrimSpace(result.SlotAction) != "" ||
+		strings.TrimSpace(result.Slot.SlotName) != "" ||
+		strings.TrimSpace(result.SlotName) != "" ||
+		strings.TrimSpace(result.ManifestID) != "" ||
+		result.BackupLSN != 0 ||
+		result.StartRecordLSN != 0 ||
+		result.EndRecordLSN != 0 ||
+		result.CheckpointLSN != 0 ||
+		strings.TrimSpace(result.Action.ActionID) != "" ||
+		strings.TrimSpace(result.Action.ActionKind) != "" ||
+		strings.TrimSpace(result.Action.Target) != "" ||
+		strings.TrimSpace(result.Action.State) != "" ||
+		strings.TrimSpace(result.Action.NodeID) != "" ||
+		result.Receipt.Generation != nil ||
+		strings.TrimSpace(result.Receipt.Token) != "" ||
+		result.Receipt.Identity.ClusterID != nil ||
+		result.Receipt.Identity.ShardID != nil ||
+		result.Receipt.Identity.TableID != nil ||
+		result.Receipt.Identity.TimelineID != nil ||
+		result.Receipt.Identity.Epoch != nil ||
+		strings.TrimSpace(result.Receipt.OldPrimaryID) != "" ||
+		strings.TrimSpace(result.Receipt.PromotedNodeID) != "" ||
+		result.Receipt.ParentTimelineID != nil ||
+		result.Receipt.ParentEpoch != nil ||
+		result.Receipt.NewTimelineID != nil ||
+		result.Receipt.NewEpoch != nil ||
+		result.Receipt.RequiredLSN != nil ||
+		result.Receipt.ObservedLSN != nil ||
+		result.Receipt.Forced != nil ||
+		result.Receipt.Reason != nil
+}
+
+func requireHADirectFenceAcquireResultStatus(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) error {
+	if action == nil {
+		return nil
+	}
+	action.AdminResult = result
+	if haActionHasRequiredAdminResult(*action) &&
+		haDirectAdminActionReceiptMatches(*action) &&
+		haFenceAcquireResultMatchesAction(cluster, action, action.AdminResult) {
+		return nil
+	}
+	action.AdminResult = nil
+	return fmt.Errorf("HA admin action %s succeeded without matching typed fence receipt", action.Kind)
+}
+
+func requireHADirectPromotionAssessmentResultStatus(action *antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) error {
+	if action == nil {
+		return nil
+	}
+	action.AdminResult = result
+	if haDirectAdminActionReceiptMatches(*action) &&
+		haPromotionAssessmentResultMatchesAction(*action, action.AdminResult) {
+		return nil
+	}
+	action.AdminResult = nil
+	return fmt.Errorf("HA admin action %s succeeded without safe typed promotion assessment", action.Kind)
+}
+
+func haFenceAcquireResultMatchesAction(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) bool {
+	if cluster == nil || action == nil || result == nil {
+		return false
+	}
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	if identity == nil || strings.TrimSpace(action.StandbyName) == "" {
+		return false
+	}
+	if result.FenceClusterID == 0 ||
+		result.FenceClusterID != identity.ClusterID ||
+		result.FenceShardID != identity.ShardID ||
+		result.FenceTableID != identity.TableID {
+		return false
+	}
+	if result.FenceOldPrimaryID != identity.CurrentPrimaryID ||
+		result.FencePromotedNodeID != strings.TrimSpace(action.StandbyName) {
+		return false
+	}
+	if result.FenceParentTimelineID != identity.TimelineID ||
+		result.FenceParentEpoch != identity.Epoch ||
+		result.FenceNewTimelineID != identity.TimelineID+1 ||
+		result.FenceNewEpoch != identity.Epoch+1 {
+		return false
+	}
+	if action.TargetLSN > 0 && result.FenceRequiredLSN != action.TargetLSN {
+		return false
+	}
+	if !result.FenceForced && result.FenceObservedLSN < result.FenceRequiredLSN {
+		return false
+	}
+	if action.FenceGeneration > 0 && result.FenceGeneration != action.FenceGeneration {
+		return false
+	}
+	return true
+}
+
+func (r *AntflyClusterReconciler) updateHAAdminActionResultFromJobLogs(ctx context.Context, cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus) {
+	if r.KubeClient == nil || action == nil || action.AdminJobName == "" || action.AdminJobName == haAdminDirectAPIName {
+		return
+	}
+	body, ok := r.haAdminJobLogBody(ctx, cluster, action.AdminJobName)
+	if !ok {
+		return
+	}
+	result, ok := parseHAAdminActionResultTable(body)
+	if !ok {
+		return
+	}
+	if haActionKind(action.Kind) == haActionPromoteStandby {
+		enrichHAPromotionAdminActionResult(result, haReplicationIdentity(cluster.Spec.HighAvailability), *action)
+	}
+	action.AdminResult = result
+}
+
+func parseHAAdminActionResultTable(body string) (*antflyv1.HAAdminActionResultStatus, bool) {
+	lines := parseHATableLines(body)
+	resultName := strings.TrimSpace(lines["result"])
+	if resultName == "" {
+		return nil, false
+	}
+	result := &antflyv1.HAAdminActionResultStatus{
+		ActionID:     strings.TrimSpace(lines["action.action_id"]),
+		ActionKind:   strings.TrimSpace(lines["action.action_kind"]),
+		ActionTarget: strings.TrimSpace(lines["action.target"]),
+		ActionState:  strings.TrimSpace(lines["action.state"]),
+		ActionNodeID: strings.TrimSpace(lines["action.node_id"]),
+		SlotAction:   strings.TrimSpace(lines["slot_action"]),
+		SlotName:     strings.TrimSpace(lines["slot_name"]),
+		ManifestID:   strings.TrimSpace(lines["manifest_id"]),
+		FenceToken:   strings.TrimSpace(lines["token"]),
+	}
+	if result.FenceToken == "" {
+		result.FenceToken = strings.TrimSpace(lines["fence_token"])
+	}
+	result.BackupLSN, _ = parseHAResultUint(lines, "backup_lsn")
+	result.StartRecordLSN, _ = parseHAResultUint(lines, "start_record_lsn")
+	result.EndRecordLSN, _ = parseHAResultUint(lines, "end_record_lsn")
+	result.CheckpointLSN, _ = parseHAResultUint(lines, "checkpoint_lsn")
+	result.FenceClusterID, _ = parseHAResultUint(lines, "identity.cluster_id")
+	result.FenceShardID, _ = parseHAResultUint(lines, "identity.shard_id")
+	result.FenceTableID, _ = parseHAResultUint(lines, "identity.table_id")
+	result.FenceOldPrimaryID = strings.TrimSpace(lines["old_primary_id"])
+	result.FencePromotedNodeID = strings.TrimSpace(lines["promoted_node_id"])
+	result.FenceParentTimelineID, _ = parseHAResultUint(lines, "parent_timeline_id")
+	result.FenceParentEpoch, _ = parseHAResultUint(lines, "parent_epoch")
+	result.FenceNewTimelineID, _ = parseHAResultUint(lines, "new_timeline_id")
+	result.FenceNewEpoch, _ = parseHAResultUint(lines, "new_epoch")
+	result.FenceRequiredLSN, _ = parseHAResultUint(lines, "required_lsn")
+	result.FenceObservedLSN, _ = parseHAResultUint(lines, "observed_lsn")
+	result.FenceForced, _ = parseHAResultBool(lines, "forced")
+	result.FenceReason = strings.TrimSpace(lines["reason"])
+	result.FenceGeneration, _ = parseHAResultUint(lines, "generation")
+	if result.FenceGeneration == 0 {
+		result.FenceGeneration, _ = parseHAResultUint(lines, "fence_generation")
+	}
+	if resultName == "promote_current_fence" || resultName == "promote" {
+		promotion, ok := parseHAPromotionJobResult(body)
+		if !ok {
+			return nil, false
+		}
+		return haPromotionAdminActionResult(promotion), true
+	}
+	if strings.HasPrefix(resultName, "rejoin_") {
+		rejoin, ok := parseHARejoinJobResult(body)
+		if !ok {
+			return nil, false
+		}
+		applyHARejoinAdminActionResult(result, rejoin)
+	}
+	if result.SlotName == "" {
+		result.SlotName = strings.TrimSpace(lines["name"])
+	}
+	if result.SlotAction == "" && strings.HasPrefix(resultName, "slot") {
+		result.SlotAction = resultName
+	}
+	if result.SlotAction == "" &&
+		result.ActionID == "" &&
+		result.ActionKind == "" &&
+		result.ActionTarget == "" &&
+		result.ActionState == "" &&
+		result.SlotName == "" &&
+		result.ManifestID == "" &&
+		result.BackupLSN == 0 &&
+		result.StartRecordLSN == 0 &&
+		result.EndRecordLSN == 0 &&
+		result.CheckpointLSN == 0 &&
+		result.FenceGeneration == 0 &&
+		result.FenceToken == "" &&
+		result.FencePromotedNodeID == "" &&
+		result.RejoinAction == "" {
+		return nil, false
+	}
+	return result, true
+}
+
+func (r *AntflyClusterReconciler) applyHADirectPromotionResultFromSDK(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus, response adminsdk.HAPromotionResponse) bool {
+	if cluster == nil || cluster.Status.HAStatus == nil || action == nil {
+		return false
+	}
+	return r.applyHADirectPromotionJobResult(cluster, action, haPromotionJobResultFromSDK(response))
+}
+
+func (r *AntflyClusterReconciler) applyHADirectPromotionJobResult(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus, result haPromotionJobResult) bool {
+	if cluster == nil || cluster.Status.HAStatus == nil || action == nil {
+		return false
+	}
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	if identity == nil || action.StandbyName == "" {
+		return false
+	}
+	if !haPromotionResultMatchesAction(result, identity, action) {
+		return false
+	}
+	if !haJobResultActionReceiptMatches(
+		result.ActionID,
+		result.ActionKind,
+		result.ActionTarget,
+		result.ActionState,
+		"promotion",
+		strings.TrimSpace(action.StandbyName),
+		"applied",
+	) {
+		return false
+	}
+	if !adminsdk.HAReceiptNodeMatches(adminsdk.HAActionReceipt{NodeId: result.ActionNodeID}, action.AdminNodeID, true) {
+		return false
+	}
+	action.AdminResult = haPromotionAdminActionResult(result)
+	enrichHAPromotionAdminActionResult(action.AdminResult, identity, *action)
+	if cluster.Status.HAStatus.LastPromotion == nil ||
+		!haPromotionStatusMatches(cluster.Status.HAStatus.LastPromotion, identity, *action) {
+		now := metav1.Now()
+		cluster.Status.HAStatus.LastPromotion = &antflyv1.HAPromotionStatus{
+			ClusterID:         identity.ClusterID,
+			ShardID:           identity.ShardID,
+			TableID:           identity.TableID,
+			OldPrimaryID:      identity.CurrentPrimaryID,
+			PromotedStandbyID: action.StandbyName,
+			FenceAuthority:    action.FenceAuthority,
+			FenceReason:       haPromotionFenceReason(*action),
+			CompletionTime:    &now,
+		}
+	}
+	applyHAPromotionJobResult(cluster.Status.HAStatus.LastPromotion, result)
+	if cluster.Status.HAStatus.LastPromotion.FenceAuthority == "" {
+		cluster.Status.HAStatus.LastPromotion.FenceAuthority = action.FenceAuthority
+	}
+	if cluster.Status.HAStatus.LastPromotion.FenceReason == "" {
+		cluster.Status.HAStatus.LastPromotion.FenceReason = haPromotionFenceReason(*action)
+	}
+	return true
+}
+
+func haPromotionJobResultFromSDK(response adminsdk.HAPromotionResponse) haPromotionJobResult {
+	return haPromotionJobResult{
+		SchemaVersion:    response.SchemaVersion,
+		ActionID:         strings.TrimSpace(response.Action.ActionId),
+		ActionKind:       strings.TrimSpace(string(response.Action.ActionKind)),
+		ActionTarget:     strings.TrimSpace(response.Action.Target),
+		ActionState:      strings.TrimSpace(string(response.Action.State)),
+		ActionNodeID:     strings.TrimSpace(response.Action.NodeId),
+		PromotedNodeID:   strings.TrimSpace(response.Promotion.NodeId),
+		SwitchLSN:        response.Promotion.SwitchLsn,
+		ParentClusterID:  response.Promotion.OldIdentity.ClusterId,
+		ParentShardID:    response.Promotion.OldIdentity.ShardId,
+		ParentTableID:    response.Promotion.OldIdentity.TableId,
+		ParentTimelineID: response.Promotion.OldIdentity.TimelineId,
+		ParentEpoch:      response.Promotion.OldIdentity.Epoch,
+		NewClusterID:     response.Promotion.NewIdentity.ClusterId,
+		NewShardID:       response.Promotion.NewIdentity.ShardId,
+		NewTableID:       response.Promotion.NewIdentity.TableId,
+		NewTimelineID:    response.Promotion.NewIdentity.TimelineId,
+		NewEpoch:         response.Promotion.NewIdentity.Epoch,
+		RequiredLSN:      response.Assessment.RequiredLsn,
+		ObservedLSN:      response.Assessment.ReceivedLsn,
+		FenceGeneration:  response.FenceGeneration,
+		FenceToken:       strings.TrimSpace(response.FenceToken),
+		Forced:           response.Forced || response.Promotion.Forced,
+		PromotionMode:    strings.TrimSpace(string(response.Assessment.Mode)),
+		DataLossPossible: response.Promotion.DataLossPossible,
+	}
+}
+
+func haPromotionAdminActionResult(result haPromotionJobResult) *antflyv1.HAAdminActionResultStatus {
+	return &antflyv1.HAAdminActionResultStatus{
+		SchemaVersion:             result.SchemaVersion,
+		ActionID:                  strings.TrimSpace(result.ActionID),
+		ActionKind:                strings.TrimSpace(result.ActionKind),
+		ActionTarget:              strings.TrimSpace(result.ActionTarget),
+		ActionState:               strings.TrimSpace(result.ActionState),
+		ActionNodeID:              strings.TrimSpace(result.ActionNodeID),
+		FenceGeneration:           result.FenceGeneration,
+		FenceToken:                result.FenceToken,
+		FenceClusterID:            result.NewClusterID,
+		FenceShardID:              result.NewShardID,
+		FenceTableID:              result.NewTableID,
+		FencePromotedNodeID:       strings.TrimSpace(result.PromotedNodeID),
+		FenceParentTimelineID:     result.ParentTimelineID,
+		FenceParentEpoch:          result.ParentEpoch,
+		FenceNewTimelineID:        result.NewTimelineID,
+		FenceNewEpoch:             result.NewEpoch,
+		FenceRequiredLSN:          result.RequiredLSN,
+		FenceObservedLSN:          result.ObservedLSN,
+		FenceForced:               result.Forced,
+		PromotionForce:            result.Forced,
+		PromotionMode:             strings.TrimSpace(result.PromotionMode),
+		PromotionDataLossPossible: result.DataLossPossible,
+	}
+}
+
+func enrichHAPromotionAdminActionResult(result *antflyv1.HAAdminActionResultStatus, identity *antflyv1.HAReplicationIdentitySpec, action antflyv1.HAPlannedActionStatus) {
+	if result == nil {
+		return
+	}
+	if identity != nil {
+		if result.FenceClusterID == 0 {
+			result.FenceClusterID = identity.ClusterID
+		}
+		if result.FenceShardID == 0 {
+			result.FenceShardID = identity.ShardID
+		}
+		if result.FenceTableID == 0 {
+			result.FenceTableID = identity.TableID
+		}
+		if result.FenceOldPrimaryID == "" {
+			result.FenceOldPrimaryID = identity.CurrentPrimaryID
+		}
+	}
+	if result.FencePromotedNodeID == "" {
+		result.FencePromotedNodeID = strings.TrimSpace(action.StandbyName)
+	}
+	if result.FenceReason == "" {
+		result.FenceReason = haPromotionFenceReason(action)
+	}
+}
+
+func haPromotionResultMatchesAction(result haPromotionJobResult, identity *antflyv1.HAReplicationIdentitySpec, action *antflyv1.HAPlannedActionStatus) bool {
+	if identity == nil || action == nil {
+		return false
+	}
+	if result.ParentClusterID != 0 &&
+		(result.ParentClusterID != identity.ClusterID ||
+			result.ParentShardID != identity.ShardID ||
+			result.ParentTableID != identity.TableID) {
+		return false
+	}
+	if result.NewClusterID != 0 &&
+		(result.NewClusterID != identity.ClusterID ||
+			result.NewShardID != identity.ShardID ||
+			result.NewTableID != identity.TableID) {
+		return false
+	}
+	if result.ParentTimelineID != identity.TimelineID || result.ParentEpoch != identity.Epoch {
+		return false
+	}
+	if result.NewTimelineID != identity.TimelineID+1 || result.NewEpoch != identity.Epoch+1 {
+		return false
+	}
+	if result.SwitchLSN == 0 || result.SwitchLSN != result.ObservedLSN+1 {
+		return false
+	}
+	if action.TargetLSN > 0 && result.RequiredLSN != action.TargetLSN {
+		return false
+	}
+	if strings.TrimSpace(action.StandbyName) != "" && result.PromotedNodeID != strings.TrimSpace(action.StandbyName) {
+		return false
+	}
+	if !result.Forced && result.ObservedLSN < result.RequiredLSN {
+		return false
+	}
+	if action.FenceGeneration > 0 && result.FenceGeneration != action.FenceGeneration {
+		return false
+	}
+	return true
+}
+
+func (r *AntflyClusterReconciler) updateHALastPromotionFromAdminJobs(ctx context.Context, cluster *antflyv1.AntflyCluster) {
+	if cluster.Status.HAStatus == nil {
+		return
+	}
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	if identity == nil {
+		return
+	}
+	for i, action := range cluster.Status.HAStatus.PlannedActions {
+		if action.Kind != string(haActionPromoteStandby) ||
+			action.AdminJobPhase != haAdminJobPhaseSucceeded ||
+			action.StandbyName == "" {
+			continue
+		}
+		if !haPlannedActionDependenciesSucceededForStatus(cluster.Status.HAStatus, cluster.Status.HAStatus.PlannedActions, i) {
+			continue
+		}
+		if action.AdminResult == nil {
+			r.updateHAAdminActionResultFromJobLogs(ctx, cluster, &action)
+			cluster.Status.HAStatus.PlannedActions[i] = action
+		}
+		if !haAdminActionSucceededWithEvidence(action) {
+			return
+		}
+		if haPromotionStatusMatches(cluster.Status.HAStatus.LastPromotion, identity, action) {
+			if cluster.Status.HAStatus.LastPromotion.FenceAuthority == "" {
+				cluster.Status.HAStatus.LastPromotion.FenceAuthority = action.FenceAuthority
+			}
+			r.updateHAPromotionStatusFromAdminJobLogs(ctx, cluster, action, cluster.Status.HAStatus.LastPromotion)
+			return
+		}
+		now := metav1.Now()
+		switchLSN := action.TargetLSN
+		observedLSN := action.TargetLSN
+		if action.AdminResult != nil && action.AdminResult.FenceObservedLSN > 0 {
+			observedLSN = action.AdminResult.FenceObservedLSN
+			switchLSN = action.AdminResult.FenceObservedLSN + 1
+		} else if action.TargetLSN > 0 {
+			switchLSN = action.TargetLSN + 1
+		}
+		cluster.Status.HAStatus.LastPromotion = &antflyv1.HAPromotionStatus{
+			ClusterID:         identity.ClusterID,
+			ShardID:           identity.ShardID,
+			TableID:           identity.TableID,
+			OldPrimaryID:      identity.CurrentPrimaryID,
+			PromotedStandbyID: action.StandbyName,
+			ParentTimelineID:  identity.TimelineID,
+			ParentEpoch:       identity.Epoch,
+			NewTimelineID:     identity.TimelineID + 1,
+			NewEpoch:          identity.Epoch + 1,
+			SwitchLSN:         switchLSN,
+			RequiredLSN:       action.TargetLSN,
+			ObservedLSN:       observedLSN,
+			FenceGeneration:   action.FenceGeneration,
+			FenceAuthority:    action.FenceAuthority,
+			FenceReason:       haPromotionFenceReason(action),
+			CompletionTime:    &now,
+		}
+		r.updateHAPromotionStatusFromAdminJobLogs(ctx, cluster, action, cluster.Status.HAStatus.LastPromotion)
+		return
+	}
+}
+
+func (r *AntflyClusterReconciler) applyHADirectRejoinAssessResultFromSDK(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus, response adminsdk.HARejoinAssessResponse) bool {
+	if cluster == nil || cluster.Status.HAStatus == nil || action == nil {
+		return false
+	}
+	return r.applyHADirectRejoinJobResult(cluster, action, haRejoinJobResultFromSDK(response))
+}
+
+func (r *AntflyClusterReconciler) applyHADirectRejoinJobResult(cluster *antflyv1.AntflyCluster, action *antflyv1.HAPlannedActionStatus, result haRejoinJobResult) bool {
+	if cluster == nil || cluster.Status.HAStatus == nil || action == nil {
+		return false
+	}
+	if !haDirectRejoinResultMatchesAction(result, cluster.Status.HAStatus, *action) {
+		return false
+	}
+	action.AdminResult = haRejoinAdminActionResult(result)
+	if !haActionHasRequiredAdminResult(*action) {
+		action.AdminResult = nil
+		return false
+	}
+	if cluster.Status.HAStatus.FormerPrimary == nil {
+		cluster.Status.HAStatus.FormerPrimary = &antflyv1.HAFormerPrimaryStatus{NodeID: action.StandbyName}
+	}
+	applyHAFormerPrimaryActionStatus(cluster.Status.HAStatus.FormerPrimary, *action, cluster.Status.HAStatus.LastPromotion)
+	applyHARejoinJobResult(cluster.Status.HAStatus.FormerPrimary, result)
+	return true
+}
+
+func haRejoinJobResultFromSDK(response adminsdk.HARejoinAssessResponse) haRejoinJobResult {
+	result := haRejoinJobResult{
+		SchemaVersion:     response.SchemaVersion,
+		ActionID:          strings.TrimSpace(response.Action.ActionId),
+		ActionKind:        strings.TrimSpace(string(response.Action.ActionKind)),
+		ActionTarget:      strings.TrimSpace(response.Action.Target),
+		ActionState:       strings.TrimSpace(string(response.Action.State)),
+		ActionNodeID:      strings.TrimSpace(response.Action.NodeId),
+		Action:            strings.TrimSpace(string(response.Assessment.Action)),
+		Reason:            strings.TrimSpace(string(response.Assessment.Reason)),
+		FormerNodeID:      strings.TrimSpace(response.Assessment.FormerNodeId),
+		TargetTimelineID:  response.Assessment.TargetTimelineId,
+		TargetEpoch:       response.Assessment.TargetEpoch,
+		ParentClusterID:   response.Assessment.ParentClusterId,
+		ParentShardID:     response.Assessment.ParentShardId,
+		ParentTableID:     response.Assessment.ParentTableId,
+		ParentTimelineID:  response.Assessment.ParentTimelineId,
+		ParentEpoch:       response.Assessment.ParentEpoch,
+		ForkLSN:           response.Assessment.ForkLsn,
+		FormerLastLSN:     response.Assessment.FormerLastLsn,
+		RetainedFromLSN:   response.Assessment.RetainedFromLsn,
+		DataLossDiscarded: response.Assessment.DataLossDiscarded,
+	}
+	if strings.TrimSpace(response.Rewind.NodeId) != "" {
+		result.RewindExecuted = true
+		result.RewindPreviousLastLSN = response.Rewind.PreviousLastLsn
+		result.RewindCurrentLastLSN = response.Rewind.CurrentLastLsn
+		result.RewindNextLSN = response.Rewind.NextLsn
+		result.RewindDiscardedLSNCount = response.Rewind.DiscardedLsnCount
+		result.DataLossDiscarded = result.DataLossDiscarded || response.Rewind.DataLossDiscarded
+	}
+	if strings.TrimSpace(response.Reseed.NodeId) != "" {
+		result.ReseedExecuted = true
+		result.ReseedSlotName = strings.TrimSpace(response.Reseed.SlotName)
+		result.ReseedRequired = response.Reseed.ReseedRequired
+		result.ReseedBaseBackupRequired = response.Reseed.BaseBackupRequired
+	}
+	return result
+}
+
+func haDirectRejoinResultMatchesAction(result haRejoinJobResult, status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus) bool {
+	var expectedActionKind string
+	expectedActionState := "applied"
+	switch haActionKind(action.Kind) {
+	case haActionDemoteFormerPrimary:
+		expectedActionKind = "rejoin_assess"
+		expectedActionState = "assessed"
+	case haActionRewindFormerPrimary:
+		expectedActionKind = "rejoin_rewind"
+	case haActionReseedFormerPrimary:
+		expectedActionKind = "rejoin_reseed"
+	default:
+		return false
+	}
+	if !haJobResultActionReceiptMatches(
+		result.ActionID,
+		result.ActionKind,
+		result.ActionTarget,
+		result.ActionState,
+		expectedActionKind,
+		strings.TrimSpace(action.StandbyName),
+		expectedActionState,
+	) {
+		return false
+	}
+	if !adminsdk.HAReceiptNodeMatches(adminsdk.HAActionReceipt{NodeId: result.ActionNodeID}, action.AdminNodeID, true) {
+		return false
+	}
+	if haActionKind(action.Kind) == haActionRewindFormerPrimary && !result.RewindExecuted {
+		return false
+	}
+	if haActionKind(action.Kind) == haActionReseedFormerPrimary &&
+		(!result.ReseedExecuted ||
+			!result.ReseedRequired ||
+			!result.ReseedBaseBackupRequired ||
+			strings.TrimSpace(result.ReseedSlotName) != strings.TrimSpace(result.FormerNodeID)) {
+		return false
+	}
+	if action.StandbyName != "" && result.FormerNodeID != action.StandbyName {
+		return false
+	}
+	if action.TargetLSN > 0 && result.ForkLSN != action.TargetLSN {
+		return false
+	}
+	if action.ObservedLSN > 0 && result.FormerLastLSN != action.ObservedLSN {
+		return false
+	}
+	if action.RetainedFromLSN > 0 && result.RetainedFromLSN != action.RetainedFromLSN {
+		return false
+	}
+	if status != nil && status.LastPromotion != nil {
+		promotion := status.LastPromotion
+		if promotion.NewTimelineID > 0 && result.TargetTimelineID != promotion.NewTimelineID {
+			return false
+		}
+		if promotion.NewEpoch > 0 && result.TargetEpoch != promotion.NewEpoch {
+			return false
+		}
+		if promotion.ClusterID > 0 {
+			if result.ParentClusterID != promotion.ClusterID ||
+				result.ParentShardID != promotion.ShardID ||
+				result.ParentTableID != promotion.TableID {
+				return false
+			}
+		}
+		if promotion.ParentTimelineID > 0 && result.ParentTimelineID != promotion.ParentTimelineID {
+			return false
+		}
+		if promotion.ParentEpoch > 0 && result.ParentEpoch != promotion.ParentEpoch {
+			return false
+		}
+	}
+	return haRejoinResultMatchesPromotion(status, action, haRejoinAdminActionResult(result))
+}
+
+func haJobResultActionReceiptMatches(actionID, actionKind, actionTarget, actionState, expectedKind, expectedTarget, expectedState string) bool {
+	return adminsdk.HAReceiptMatches(adminsdk.HAActionReceipt{
+		ActionId:   actionID,
+		ActionKind: adminsdk.HAActionReceiptActionKind(strings.TrimSpace(actionKind)),
+		Target:     actionTarget,
+		State:      adminsdk.HAActionReceiptState(strings.TrimSpace(actionState)),
+	}, adminsdk.HAReceiptExpectation{
+		ActionKind: adminsdk.HAActionReceiptActionKind(strings.TrimSpace(expectedKind)),
+		State:      adminsdk.HAActionReceiptState(strings.TrimSpace(expectedState)),
+	}, expectedTarget)
+}
+
+func haPromotionFenceReason(action antflyv1.HAPlannedActionStatus) string {
+	if action.FenceReason != "" {
+		return action.FenceReason
+	}
+	return action.Reason
+}
+
+func (r *AntflyClusterReconciler) updateHAPromotionStatusFromAdminJobLogs(ctx context.Context, cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus, promotion *antflyv1.HAPromotionStatus) {
+	if r.KubeClient == nil || action.AdminJobName == "" || promotion == nil {
+		return
+	}
+	body, ok := r.haAdminJobLogBody(ctx, cluster, action.AdminJobName)
+	if !ok {
+		return
+	}
+	result, ok := parseHAPromotionJobResult(body)
+	if !ok {
+		return
+	}
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	_ = applyHAPromotionJobResultIfMatches(promotion, result, identity, action)
+}
+
+func (r *AntflyClusterReconciler) updateHAFormerPrimaryFromAdminJobs(ctx context.Context, cluster *antflyv1.AntflyCluster) {
+	if cluster.Status.HAStatus == nil {
+		return
+	}
+	for i := range cluster.Status.HAStatus.PlannedActions {
+		action := &cluster.Status.HAStatus.PlannedActions[i]
+		if !haFormerPrimaryActionKind(action.Kind) ||
+			action.AdminJobPhase != haAdminJobPhaseSucceeded ||
+			action.AdminJobName == "" {
+			continue
+		}
+		if !haPlannedActionDependenciesSucceededForStatus(cluster.Status.HAStatus, cluster.Status.HAStatus.PlannedActions, i) {
+			continue
+		}
+		if action.AdminResult == nil {
+			r.updateHAAdminActionResultFromJobLogs(ctx, cluster, action)
+		}
+		if !haFormerPrimaryActionSucceededWithPromotionEvidence(cluster.Status.HAStatus, *action) {
+			return
+		}
+		result, ok := haRejoinJobResultFromAdminResult(action.AdminResult)
+		if !ok {
+			return
+		}
+		if cluster.Status.HAStatus.FormerPrimary == nil {
+			cluster.Status.HAStatus.FormerPrimary = &antflyv1.HAFormerPrimaryStatus{NodeID: action.StandbyName}
+		}
+		applyHAFormerPrimaryActionStatus(cluster.Status.HAStatus.FormerPrimary, *action, cluster.Status.HAStatus.LastPromotion)
+		applyHARejoinJobResult(cluster.Status.HAStatus.FormerPrimary, result)
+		return
+	}
+}
+
+func haFormerPrimaryActionKind(kind string) bool {
+	return kind == string(haActionDemoteFormerPrimary) ||
+		kind == string(haActionRewindFormerPrimary) ||
+		kind == string(haActionReseedFormerPrimary)
+}
+
+func applyHAFormerPrimaryActionStatus(former *antflyv1.HAFormerPrimaryStatus, action antflyv1.HAPlannedActionStatus, promotion *antflyv1.HAPromotionStatus) {
+	if former == nil {
+		return
+	}
+	if action.StandbyName != "" {
+		former.NodeID = action.StandbyName
+	}
+	if action.TargetLSN != 0 {
+		former.SwitchLSN = action.TargetLSN
+	}
+	if action.ObservedLSN != 0 {
+		former.ObservedLSN = action.ObservedLSN
+	}
+	if action.RetainedFromLSN != 0 {
+		former.RetainedFromLSN = action.RetainedFromLSN
+	}
+	former.FenceAuthority = action.FenceAuthority
+	former.FenceHolder = action.FenceHolder
+	former.FenceGeneration = action.FenceGeneration
+	if promotion != nil {
+		if former.NodeID == "" {
+			former.NodeID = promotion.OldPrimaryID
+		}
+		if former.ParentTimelineID == 0 {
+			former.ParentTimelineID = promotion.ParentTimelineID
+		}
+		if former.NewTimelineID == 0 {
+			former.NewTimelineID = promotion.NewTimelineID
+		}
+		if former.SwitchLSN == 0 {
+			former.SwitchLSN = promotion.SwitchLSN
+		}
+		if former.FenceAuthority == "" {
+			former.FenceAuthority = promotion.FenceAuthority
+		}
+		if former.FenceHolder == "" {
+			former.FenceHolder = promotion.PromotedStandbyID
+		}
+		if former.FenceGeneration == 0 {
+			former.FenceGeneration = promotion.FenceGeneration
+		}
+	}
+	if former.Action == "" {
+		former.Action = action.Kind
+	}
+	if former.Reason == "" {
+		former.Reason = action.Reason
+	}
+}
+
+func (r *AntflyClusterReconciler) haAdminJobLogBody(ctx context.Context, cluster *antflyv1.AntflyCluster, jobName string) (string, bool) {
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods, client.InNamespace(cluster.Namespace), client.MatchingLabels{"job-name": jobName}); err != nil {
+		log.FromContext(ctx).V(1).Info("Unable to list HA admin job pods", "job", jobName, "error", err)
+		return "", false
+	}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.Status.Phase != corev1.PodSucceeded {
+			continue
+		}
+		raw, err := r.KubeClient.CoreV1().Pods(cluster.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
+			Container: "ha-admin",
+		}).DoRaw(ctx)
+		if err != nil {
+			log.FromContext(ctx).V(1).Info("Unable to read HA admin job logs", "job", jobName, "pod", pod.Name, "error", err)
+			continue
+		}
+		return string(raw), true
+	}
+	return "", false
+}
+
+func haPromotionStatusMatches(status *antflyv1.HAPromotionStatus, identity *antflyv1.HAReplicationIdentitySpec, action antflyv1.HAPlannedActionStatus) bool {
+	return status != nil &&
+		(status.ClusterID == 0 || status.ClusterID == identity.ClusterID) &&
+		(status.ClusterID == 0 || status.ShardID == identity.ShardID) &&
+		(status.ClusterID == 0 || status.TableID == identity.TableID) &&
+		status.OldPrimaryID == identity.CurrentPrimaryID &&
+		status.PromotedStandbyID == action.StandbyName &&
+		status.ParentTimelineID == identity.TimelineID &&
+		status.ParentEpoch == identity.Epoch &&
+		status.NewTimelineID == identity.TimelineID+1 &&
+		status.NewEpoch == identity.Epoch+1 &&
+		(action.TargetLSN == 0 || haPromotionRequiredLSN(status) == action.TargetLSN) &&
+		(action.TargetLSN == 0 || haPromotionObservedLSN(status) >= action.TargetLSN) &&
+		(status.FenceAuthority == "" || status.FenceAuthority == action.FenceAuthority) &&
+		status.FenceGeneration == action.FenceGeneration
+}
+
+type haPromotionJobResult struct {
+	SchemaVersion    uint32
+	ActionID         string
+	ActionKind       string
+	ActionTarget     string
+	ActionState      string
+	ActionNodeID     string
+	PromotedNodeID   string
+	SwitchLSN        uint64
+	ParentClusterID  uint64
+	ParentShardID    uint64
+	ParentTableID    uint64
+	ParentTimelineID uint64
+	ParentEpoch      uint64
+	NewClusterID     uint64
+	NewShardID       uint64
+	NewTableID       uint64
+	NewTimelineID    uint64
+	NewEpoch         uint64
+	RequiredLSN      uint64
+	ObservedLSN      uint64
+	FenceGeneration  uint64
+	FenceToken       string
+	Forced           bool
+	PromotionMode    string
+	DataLossPossible bool
+}
+
+func parseHAPromotionJobResult(body string) (haPromotionJobResult, bool) {
+	lines := parseHATableLines(body)
+	resultName := lines["result"]
+	if resultName != "promote_current_fence" && resultName != "promote" {
+		return haPromotionJobResult{}, false
+	}
+
+	var result haPromotionJobResult
+	var ok bool
+	result.ActionID = strings.TrimSpace(lines["action.action_id"])
+	result.ActionKind = strings.TrimSpace(lines["action.action_kind"])
+	result.ActionTarget = strings.TrimSpace(lines["action.target"])
+	result.ActionState = strings.TrimSpace(lines["action.state"])
+	result.ActionNodeID = strings.TrimSpace(lines["action.node_id"])
+	result.PromotedNodeID = strings.TrimSpace(lines["promotion.node_id"])
+	if result.PromotedNodeID == "" {
+		return haPromotionJobResult{}, false
+	}
+	if result.SwitchLSN, ok = parseHAResultUint(lines, "promotion.switch_lsn"); !ok {
+		return haPromotionJobResult{}, false
+	}
+	result.ParentClusterID, _ = parseHAResultUint(lines, "promotion.old_identity.cluster_id")
+	result.ParentShardID, _ = parseHAResultUint(lines, "promotion.old_identity.shard_id")
+	result.ParentTableID, _ = parseHAResultUint(lines, "promotion.old_identity.table_id")
+	if result.ParentTimelineID, ok = parseHAResultUint(lines, "promotion.old_identity.timeline_id"); !ok {
+		return haPromotionJobResult{}, false
+	}
+	if result.ParentEpoch, ok = parseHAResultUint(lines, "promotion.old_identity.epoch"); !ok {
+		return haPromotionJobResult{}, false
+	}
+	result.NewClusterID, _ = parseHAResultUint(lines, "promotion.new_identity.cluster_id")
+	result.NewShardID, _ = parseHAResultUint(lines, "promotion.new_identity.shard_id")
+	result.NewTableID, _ = parseHAResultUint(lines, "promotion.new_identity.table_id")
+	if result.NewTimelineID, ok = parseHAResultUint(lines, "promotion.new_identity.timeline_id"); !ok {
+		return haPromotionJobResult{}, false
+	}
+	if result.NewEpoch, ok = parseHAResultUint(lines, "promotion.new_identity.epoch"); !ok {
+		return haPromotionJobResult{}, false
+	}
+	if result.FenceGeneration, ok = parseHAResultUint(lines, "fence_generation"); !ok {
+		return haPromotionJobResult{}, false
+	}
+	result.FenceToken = strings.TrimSpace(lines["fence_token"])
+	if result.FenceToken == "" {
+		return haPromotionJobResult{}, false
+	}
+	result.RequiredLSN, _ = parseHAResultUint(lines, "assessment.required_lsn")
+	if result.RequiredLSN == 0 {
+		return haPromotionJobResult{}, false
+	}
+	receivedLSN, ok := parseHAResultUint(lines, "assessment.received_lsn")
+	if !ok {
+		return haPromotionJobResult{}, false
+	}
+	if _, ok := parseHAResultUint(lines, "assessment.applied_lsn"); !ok {
+		return haPromotionJobResult{}, false
+	}
+	if result.SwitchLSN != receivedLSN+1 {
+		return haPromotionJobResult{}, false
+	}
+	result.ObservedLSN = receivedLSN
+	result.PromotionMode = strings.TrimSpace(lines["assessment.mode"])
+	if result.PromotionMode == "" {
+		return haPromotionJobResult{}, false
+	}
+	result.Forced, _ = parseHAResultBool(lines, "promotion.forced")
+	result.DataLossPossible, _ = parseHAResultBool(lines, "promotion.data_loss_possible")
+	if result.PromotionMode != haExpectedPromotionMode(result.Forced, result.DataLossPossible, true) {
+		return haPromotionJobResult{}, false
+	}
+	if !result.Forced && result.ObservedLSN < result.RequiredLSN {
+		return haPromotionJobResult{}, false
+	}
+	return result, true
+}
+
+type haPromotionAPIResultEnvelope struct {
+	haPromotionAPIResult
+	Result struct {
+		PromoteCurrentFence *haPromotionAPIResult `json:"promote_current_fence,omitempty"`
+		Promote             *haPromotionAPIResult `json:"promote,omitempty"`
+	} `json:"result"`
+}
+
+type haPromotionAPIResult struct {
+	SchemaVersion uint32                    `json:"schema_version"`
+	Action        haAdminActionReceiptJSON  `json:"action"`
+	Assessment    haPromotionAssessmentJSON `json:"assessment"`
+	Promotion     struct {
+		NodeID           string              `json:"node_id"`
+		SwitchLSN        *uint64             `json:"switch_lsn"`
+		OldIdentity      haAdminIdentityJSON `json:"old_identity"`
+		NewIdentity      haAdminIdentityJSON `json:"new_identity"`
+		Forced           *bool               `json:"forced"`
+		DataLossPossible *bool               `json:"data_loss_possible"`
+	} `json:"promotion"`
+	FenceGeneration uint64 `json:"fence_generation"`
+	FenceToken      string `json:"fence_token"`
+	Forced          *bool  `json:"forced"`
+}
+
+func parseHAPromotionAPIResult(raw []byte) (haPromotionJobResult, bool) {
+	var envelope haPromotionAPIResultEnvelope
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return haPromotionJobResult{}, false
+	}
+	topLevel := envelope.Promotion.SwitchLSN != nil
+	result := &envelope.haPromotionAPIResult
+	if result.Promotion.SwitchLSN == nil {
+		result = envelope.Result.PromoteCurrentFence
+	}
+	if result == nil {
+		result = envelope.Result.Promote
+	}
+	if result != nil && result.SchemaVersion == 0 {
+		result.SchemaVersion = envelope.SchemaVersion
+	}
+	if result == nil ||
+		result.SchemaVersion == 0 ||
+		!haPromotionAssessmentJSONComplete(result.Assessment) ||
+		!haPromotionAssessmentJSONConsistent(result.Assessment) ||
+		!haPromotionResultJSONComplete(result) ||
+		result.FenceGeneration == 0 ||
+		strings.TrimSpace(result.FenceToken) == "" {
+		return haPromotionJobResult{}, false
+	}
+	if topLevel && !haAdminActionReceiptPresent(result.Action) {
+		return haPromotionJobResult{}, false
+	}
+	observedLSN := haUint64JSONValue(result.Assessment.ReceivedLSN)
+	requiredLSN := haUint64JSONValue(result.Assessment.RequiredLSN)
+	if requiredLSN == 0 ||
+		haUint64JSONValue(result.Promotion.SwitchLSN) != observedLSN+1 ||
+		!haBoolJSONValue(result.Assessment.FencingConfirmed) ||
+		!haBoolJSONValue(result.Assessment.CanPromote) ||
+		haBoolJSONValue(result.Forced) != haBoolJSONValue(result.Promotion.Forced) ||
+		haBoolJSONValue(result.Assessment.Force) != haBoolJSONValue(result.Forced) ||
+		haBoolJSONValue(result.Promotion.DataLossPossible) != haBoolJSONValue(result.Assessment.DataLossPossible) ||
+		haUint64JSONValue(result.Promotion.OldIdentity.ClusterID) != haUint64JSONValue(result.Promotion.NewIdentity.ClusterID) ||
+		haUint64JSONValue(result.Promotion.OldIdentity.ShardID) != haUint64JSONValue(result.Promotion.NewIdentity.ShardID) ||
+		haUint64JSONValue(result.Promotion.OldIdentity.TableID) != haUint64JSONValue(result.Promotion.NewIdentity.TableID) ||
+		haUint64JSONValue(result.Promotion.NewIdentity.TimelineID) <= haUint64JSONValue(result.Promotion.OldIdentity.TimelineID) ||
+		haUint64JSONValue(result.Promotion.NewIdentity.Epoch) <= haUint64JSONValue(result.Promotion.OldIdentity.Epoch) {
+		return haPromotionJobResult{}, false
+	}
+	return haPromotionJobResult{
+		SchemaVersion:    result.SchemaVersion,
+		ActionID:         strings.TrimSpace(result.Action.ActionID),
+		ActionKind:       strings.TrimSpace(result.Action.ActionKind),
+		ActionTarget:     strings.TrimSpace(result.Action.Target),
+		ActionState:      strings.TrimSpace(result.Action.State),
+		ActionNodeID:     strings.TrimSpace(result.Action.NodeID),
+		PromotedNodeID:   strings.TrimSpace(result.Promotion.NodeID),
+		SwitchLSN:        haUint64JSONValue(result.Promotion.SwitchLSN),
+		ParentClusterID:  haUint64JSONValue(result.Promotion.OldIdentity.ClusterID),
+		ParentShardID:    haUint64JSONValue(result.Promotion.OldIdentity.ShardID),
+		ParentTableID:    haUint64JSONValue(result.Promotion.OldIdentity.TableID),
+		ParentTimelineID: haUint64JSONValue(result.Promotion.OldIdentity.TimelineID),
+		ParentEpoch:      haUint64JSONValue(result.Promotion.OldIdentity.Epoch),
+		NewClusterID:     haUint64JSONValue(result.Promotion.NewIdentity.ClusterID),
+		NewShardID:       haUint64JSONValue(result.Promotion.NewIdentity.ShardID),
+		NewTableID:       haUint64JSONValue(result.Promotion.NewIdentity.TableID),
+		NewTimelineID:    haUint64JSONValue(result.Promotion.NewIdentity.TimelineID),
+		NewEpoch:         haUint64JSONValue(result.Promotion.NewIdentity.Epoch),
+		RequiredLSN:      requiredLSN,
+		ObservedLSN:      observedLSN,
+		FenceGeneration:  result.FenceGeneration,
+		FenceToken:       strings.TrimSpace(result.FenceToken),
+		Forced:           haBoolJSONValue(result.Forced) || haBoolJSONValue(result.Promotion.Forced),
+		PromotionMode:    strings.TrimSpace(result.Assessment.Mode),
+		DataLossPossible: haBoolJSONValue(result.Promotion.DataLossPossible),
+	}, true
+}
+
+func haPromotionResultJSONComplete(result *haPromotionAPIResult) bool {
+	return result != nil &&
+		strings.TrimSpace(result.Promotion.NodeID) != "" &&
+		result.Promotion.SwitchLSN != nil &&
+		haUint64JSONValue(result.Promotion.SwitchLSN) > 0 &&
+		haAdminIdentityJSONComplete(result.Promotion.OldIdentity) &&
+		haAdminIdentityJSONComplete(result.Promotion.NewIdentity) &&
+		result.Promotion.Forced != nil &&
+		result.Promotion.DataLossPossible != nil &&
+		result.Forced != nil
+}
+
+func haPromotionAssessmentJSONConsistent(assessment haPromotionAssessmentJSON) bool {
+	if !haPromotionAssessmentJSONComplete(assessment) {
+		return false
+	}
+	requiredLSN := haUint64JSONValue(assessment.RequiredLSN)
+	receivedLSN := haUint64JSONValue(assessment.ReceivedLSN)
+	appliedLSN := haUint64JSONValue(assessment.AppliedLSN)
+	hasRequiredLSN := receivedLSN >= requiredLSN
+	caughtUpToReceived := appliedLSN >= receivedLSN
+	dataLossPossible := !hasRequiredLSN || !caughtUpToReceived || appliedLSN < requiredLSN
+	fencingConfirmed := haBoolJSONValue(assessment.FencingConfirmed)
+	forced := haBoolJSONValue(assessment.Force)
+	requiresFencing := !fencingConfirmed && !forced
+	requiresForce := dataLossPossible && !forced
+	canPromote := !requiresFencing && (!requiresForce || forced)
+	mode := haExpectedPromotionMode(forced, dataLossPossible, canPromote)
+	return haBoolJSONValue(assessment.HasRequiredLSN) == hasRequiredLSN &&
+		haBoolJSONValue(assessment.CaughtUpToReceived) == caughtUpToReceived &&
+		strings.TrimSpace(assessment.Mode) == mode &&
+		haBoolJSONValue(assessment.DataLossPossible) == dataLossPossible &&
+		haBoolJSONValue(assessment.Safe) == (fencingConfirmed && !dataLossPossible) &&
+		haBoolJSONValue(assessment.RequiresFencing) == requiresFencing &&
+		haBoolJSONValue(assessment.RequiresForce) == requiresForce &&
+		haBoolJSONValue(assessment.CanPromote) == canPromote
+}
+
+func haExpectedPromotionMode(force bool, dataLossPossible bool, canPromote bool) string {
+	if !canPromote {
+		return "blocked"
+	}
+	if dataLossPossible {
+		return "lossy"
+	}
+	if force {
+		return "forced"
+	}
+	return "safe"
+}
+
+func haAdminActionReceiptPresent(action haAdminActionReceiptJSON) bool {
+	return strings.TrimSpace(action.ActionID) != "" &&
+		strings.TrimSpace(action.ActionKind) != "" &&
+		strings.TrimSpace(action.Target) != "" &&
+		strings.TrimSpace(action.State) != "" &&
+		strings.TrimSpace(action.NodeID) != ""
+}
+
+type haRejoinJobResult struct {
+	SchemaVersion            uint32
+	ActionID                 string
+	ActionKind               string
+	ActionTarget             string
+	ActionState              string
+	ActionNodeID             string
+	Action                   string
+	Reason                   string
+	FormerNodeID             string
+	TargetTimelineID         uint64
+	TargetEpoch              uint64
+	ParentClusterID          uint64
+	ParentShardID            uint64
+	ParentTableID            uint64
+	ParentTimelineID         uint64
+	ParentEpoch              uint64
+	ForkLSN                  uint64
+	FormerLastLSN            uint64
+	RetainedFromLSN          uint64
+	DataLossDiscarded        bool
+	RewindExecuted           bool
+	RewindPreviousLastLSN    uint64
+	RewindCurrentLastLSN     uint64
+	RewindNextLSN            uint64
+	RewindDiscardedLSNCount  uint64
+	ReseedExecuted           bool
+	ReseedSlotName           string
+	ReseedRequired           bool
+	ReseedBaseBackupRequired bool
+}
+
+func parseHARejoinJobResult(body string) (haRejoinJobResult, bool) {
+	lines := parseHATableLines(body)
+	resultName := strings.TrimSpace(lines["result"])
+	var assessmentPrefix string
+	switch resultName {
+	case "rejoin_assess":
+		assessmentPrefix = ""
+	case "rejoin_rewind", "rejoin_reseed":
+		assessmentPrefix = "assessment."
+	default:
+		return haRejoinJobResult{}, false
+	}
+	result := haRejoinJobResult{
+		ActionID:     strings.TrimSpace(lines["action.action_id"]),
+		ActionKind:   strings.TrimSpace(lines["action.action_kind"]),
+		ActionTarget: strings.TrimSpace(lines["action.target"]),
+		ActionState:  strings.TrimSpace(lines["action.state"]),
+		ActionNodeID: strings.TrimSpace(lines["action.node_id"]),
+		Action:       strings.TrimSpace(lines[assessmentPrefix+"action"]),
+		Reason:       strings.TrimSpace(lines[assessmentPrefix+"reason"]),
+		FormerNodeID: strings.TrimSpace(lines[assessmentPrefix+"former_node_id"]),
+	}
+	if result.Action == "" || result.FormerNodeID == "" {
+		return haRejoinJobResult{}, false
+	}
+	var ok bool
+	if result.TargetTimelineID, ok = parseHAResultUint(lines, assessmentPrefix+"target_timeline_id"); !ok {
+		return haRejoinJobResult{}, false
+	}
+	if result.TargetEpoch, ok = parseHAResultUint(lines, assessmentPrefix+"target_epoch"); !ok {
+		return haRejoinJobResult{}, false
+	}
+	if result.ParentClusterID, ok = parseHAResultUint(lines, assessmentPrefix+"parent_cluster_id"); !ok {
+		return haRejoinJobResult{}, false
+	}
+	if result.ParentShardID, ok = parseHAResultUint(lines, assessmentPrefix+"parent_shard_id"); !ok {
+		return haRejoinJobResult{}, false
+	}
+	if result.ParentTableID, ok = parseHAResultUint(lines, assessmentPrefix+"parent_table_id"); !ok {
+		return haRejoinJobResult{}, false
+	}
+	if result.ParentTimelineID, ok = parseHAResultUint(lines, assessmentPrefix+"parent_timeline_id"); !ok {
+		return haRejoinJobResult{}, false
+	}
+	if result.ParentEpoch, ok = parseHAResultUint(lines, assessmentPrefix+"parent_epoch"); !ok {
+		return haRejoinJobResult{}, false
+	}
+	if result.ParentClusterID == 0 || result.ParentTimelineID == 0 || result.ParentEpoch == 0 {
+		return haRejoinJobResult{}, false
+	}
+	if result.ForkLSN, ok = parseHAResultUint(lines, assessmentPrefix+"fork_lsn"); !ok {
+		return haRejoinJobResult{}, false
+	}
+	if result.FormerLastLSN, ok = parseHAResultUint(lines, assessmentPrefix+"former_last_lsn"); !ok {
+		return haRejoinJobResult{}, false
+	}
+	if result.RetainedFromLSN, ok = parseHAResultUint(lines, assessmentPrefix+"retained_from_lsn"); !ok {
+		return haRejoinJobResult{}, false
+	}
+	result.DataLossDiscarded, _ = parseHAResultBool(lines, assessmentPrefix+"data_loss_discarded")
+	switch resultName {
+	case "rejoin_rewind":
+		if strings.TrimSpace(result.Action) != "rewind" {
+			return haRejoinJobResult{}, false
+		}
+		rewindNodeID := strings.TrimSpace(lines["rewind.node_id"])
+		if rewindNodeID == "" || rewindNodeID != strings.TrimSpace(result.FormerNodeID) {
+			return haRejoinJobResult{}, false
+		}
+		rewindForkLSN, ok := parseHAResultUint(lines, "rewind.fork_lsn")
+		if !ok || rewindForkLSN != result.ForkLSN {
+			return haRejoinJobResult{}, false
+		}
+		if result.RewindPreviousLastLSN, ok = parseHAResultUint(lines, "rewind.previous_last_lsn"); !ok {
+			return haRejoinJobResult{}, false
+		}
+		if result.RewindCurrentLastLSN, ok = parseHAResultUint(lines, "rewind.current_last_lsn"); !ok {
+			return haRejoinJobResult{}, false
+		}
+		if result.RewindNextLSN, ok = parseHAResultUint(lines, "rewind.next_lsn"); !ok {
+			return haRejoinJobResult{}, false
+		}
+		if result.RewindDiscardedLSNCount, ok = parseHAResultUint(lines, "rewind.discarded_lsn_count"); !ok {
+			return haRejoinJobResult{}, false
+		}
+		rewindTargetTimelineID, ok := parseHAResultUint(lines, "rewind.target_timeline_id")
+		if !ok || rewindTargetTimelineID != result.TargetTimelineID {
+			return haRejoinJobResult{}, false
+		}
+		rewindTargetEpoch, ok := parseHAResultUint(lines, "rewind.target_epoch")
+		if !ok || rewindTargetEpoch != result.TargetEpoch {
+			return haRejoinJobResult{}, false
+		}
+		rewindDataLossDiscarded, _ := parseHAResultBool(lines, "rewind.data_loss_discarded")
+		if result.RewindPreviousLastLSN != result.FormerLastLSN ||
+			result.RewindCurrentLastLSN != result.ForkLSN ||
+			result.RewindPreviousLastLSN < result.RewindCurrentLastLSN ||
+			result.RewindCurrentLastLSN == ^uint64(0) ||
+			result.RewindNextLSN != result.RewindCurrentLastLSN+1 ||
+			result.RewindDiscardedLSNCount != result.RewindPreviousLastLSN-result.RewindCurrentLastLSN {
+			return haRejoinJobResult{}, false
+		}
+		result.RewindExecuted = true
+		result.DataLossDiscarded = result.DataLossDiscarded || rewindDataLossDiscarded
+	case "rejoin_reseed":
+		if strings.TrimSpace(result.Action) != "reseed" {
+			return haRejoinJobResult{}, false
+		}
+		reseedNodeID := strings.TrimSpace(lines["reseed.node_id"])
+		if reseedNodeID == "" || reseedNodeID != strings.TrimSpace(result.FormerNodeID) {
+			return haRejoinJobResult{}, false
+		}
+		result.ReseedSlotName = strings.TrimSpace(lines["reseed.slot_name"])
+		reseedTargetTimelineID, ok := parseHAResultUint(lines, "reseed.target_timeline_id")
+		if !ok || reseedTargetTimelineID != result.TargetTimelineID {
+			return haRejoinJobResult{}, false
+		}
+		reseedTargetEpoch, ok := parseHAResultUint(lines, "reseed.target_epoch")
+		if !ok || reseedTargetEpoch != result.TargetEpoch {
+			return haRejoinJobResult{}, false
+		}
+		reseedForkLSN, ok := parseHAResultUint(lines, "reseed.fork_lsn")
+		if !ok || reseedForkLSN != result.ForkLSN {
+			return haRejoinJobResult{}, false
+		}
+		reseedFormerLastLSN, ok := parseHAResultUint(lines, "reseed.former_last_lsn")
+		if !ok || reseedFormerLastLSN != result.FormerLastLSN {
+			return haRejoinJobResult{}, false
+		}
+		if result.ReseedRequired, ok = parseHAResultBool(lines, "reseed.reseed_required"); !ok {
+			return haRejoinJobResult{}, false
+		}
+		if result.ReseedBaseBackupRequired, ok = parseHAResultBool(lines, "reseed.base_backup_required"); !ok {
+			return haRejoinJobResult{}, false
+		}
+		if result.ReseedSlotName == "" ||
+			result.ReseedSlotName != strings.TrimSpace(result.FormerNodeID) ||
+			!result.ReseedRequired ||
+			!result.ReseedBaseBackupRequired {
+			return haRejoinJobResult{}, false
+		}
+		result.ReseedExecuted = true
+	}
+	return result, true
+}
+
+type haRejoinAPIResultEnvelope struct {
+	SchemaVersion uint32                   `json:"schema_version"`
+	Action        haAdminActionReceiptJSON `json:"action"`
+	Assessment    haRejoinAPIResult        `json:"assessment"`
+	Rewind        *haRejoinAPIRewind       `json:"rewind,omitempty"`
+	Reseed        *haRejoinAPIReseed       `json:"reseed,omitempty"`
+}
+
+type haRejoinAPIResult struct {
+	Action            string  `json:"action"`
+	Reason            string  `json:"reason"`
+	FormerNodeID      string  `json:"former_node_id"`
+	TargetTimelineID  *uint64 `json:"target_timeline_id"`
+	TargetEpoch       *uint64 `json:"target_epoch"`
+	ParentClusterID   *uint64 `json:"parent_cluster_id"`
+	ParentShardID     *uint64 `json:"parent_shard_id"`
+	ParentTableID     *uint64 `json:"parent_table_id"`
+	ParentTimelineID  *uint64 `json:"parent_timeline_id"`
+	ParentEpoch       *uint64 `json:"parent_epoch"`
+	ForkLSN           *uint64 `json:"fork_lsn"`
+	FormerLastLSN     *uint64 `json:"former_last_lsn"`
+	RetainedFromLSN   *uint64 `json:"retained_from_lsn"`
+	DataLossDiscarded *bool   `json:"data_loss_discarded"`
+}
+
+type haRejoinAPIRewind struct {
+	NodeID            string  `json:"node_id"`
+	ForkLSN           *uint64 `json:"fork_lsn"`
+	PreviousLastLSN   *uint64 `json:"previous_last_lsn"`
+	CurrentLastLSN    *uint64 `json:"current_last_lsn"`
+	NextLSN           *uint64 `json:"next_lsn"`
+	DiscardedLSNCount *uint64 `json:"discarded_lsn_count"`
+	TargetTimelineID  *uint64 `json:"target_timeline_id"`
+	TargetEpoch       *uint64 `json:"target_epoch"`
+	DataLossDiscarded *bool   `json:"data_loss_discarded"`
+}
+
+type haRejoinAPIReseed struct {
+	NodeID             string  `json:"node_id"`
+	SlotName           string  `json:"slot_name"`
+	TargetTimelineID   *uint64 `json:"target_timeline_id"`
+	TargetEpoch        *uint64 `json:"target_epoch"`
+	ForkLSN            *uint64 `json:"fork_lsn"`
+	FormerLastLSN      *uint64 `json:"former_last_lsn"`
+	ReseedRequired     *bool   `json:"reseed_required"`
+	BaseBackupRequired *bool   `json:"base_backup_required"`
+}
+
+func parseHARejoinAPIResult(raw []byte) (haRejoinJobResult, bool) {
+	var envelope haRejoinAPIResultEnvelope
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return haRejoinJobResult{}, false
+	}
+	assessment := envelope.Assessment
+	if !haRejoinAssessmentJSONComplete(assessment) ||
+		envelope.SchemaVersion == 0 ||
+		!haAdminActionReceiptPresent(envelope.Action) ||
+		haUint64JSONValue(assessment.TargetTimelineID) == 0 ||
+		haUint64JSONValue(assessment.TargetEpoch) == 0 {
+		return haRejoinJobResult{}, false
+	}
+	targetTimelineID := haUint64JSONValue(assessment.TargetTimelineID)
+	targetEpoch := haUint64JSONValue(assessment.TargetEpoch)
+	parentClusterID := haUint64JSONValue(assessment.ParentClusterID)
+	parentShardID := haUint64JSONValue(assessment.ParentShardID)
+	parentTableID := haUint64JSONValue(assessment.ParentTableID)
+	parentTimelineID := haUint64JSONValue(assessment.ParentTimelineID)
+	parentEpoch := haUint64JSONValue(assessment.ParentEpoch)
+	forkLSN := haUint64JSONValue(assessment.ForkLSN)
+	formerLastLSN := haUint64JSONValue(assessment.FormerLastLSN)
+	retainedFromLSN := haUint64JSONValue(assessment.RetainedFromLSN)
+	result := haRejoinJobResult{
+		SchemaVersion:     envelope.SchemaVersion,
+		ActionID:          strings.TrimSpace(envelope.Action.ActionID),
+		ActionKind:        strings.TrimSpace(envelope.Action.ActionKind),
+		ActionTarget:      strings.TrimSpace(envelope.Action.Target),
+		ActionState:       strings.TrimSpace(envelope.Action.State),
+		ActionNodeID:      strings.TrimSpace(envelope.Action.NodeID),
+		Action:            strings.TrimSpace(assessment.Action),
+		Reason:            strings.TrimSpace(assessment.Reason),
+		FormerNodeID:      strings.TrimSpace(assessment.FormerNodeID),
+		TargetTimelineID:  targetTimelineID,
+		TargetEpoch:       targetEpoch,
+		ParentClusterID:   parentClusterID,
+		ParentShardID:     parentShardID,
+		ParentTableID:     parentTableID,
+		ParentTimelineID:  parentTimelineID,
+		ParentEpoch:       parentEpoch,
+		ForkLSN:           forkLSN,
+		FormerLastLSN:     formerLastLSN,
+		RetainedFromLSN:   retainedFromLSN,
+		DataLossDiscarded: haBoolJSONValue(assessment.DataLossDiscarded),
+	}
+	if rewind := envelope.Rewind; rewind != nil {
+		rewindForkLSN := haUint64JSONValue(rewind.ForkLSN)
+		rewindPreviousLastLSN := haUint64JSONValue(rewind.PreviousLastLSN)
+		rewindCurrentLastLSN := haUint64JSONValue(rewind.CurrentLastLSN)
+		rewindNextLSN := haUint64JSONValue(rewind.NextLSN)
+		rewindDiscardedLSNCount := haUint64JSONValue(rewind.DiscardedLSNCount)
+		rewindTargetTimelineID := haUint64JSONValue(rewind.TargetTimelineID)
+		rewindTargetEpoch := haUint64JSONValue(rewind.TargetEpoch)
+		if strings.TrimSpace(assessment.Action) != "rewind" ||
+			!haRejoinRewindJSONComplete(*rewind) ||
+			strings.TrimSpace(rewind.NodeID) != strings.TrimSpace(assessment.FormerNodeID) ||
+			rewindForkLSN != forkLSN ||
+			rewindPreviousLastLSN != formerLastLSN ||
+			rewindTargetTimelineID != targetTimelineID ||
+			rewindTargetEpoch != targetEpoch ||
+			rewindCurrentLastLSN != forkLSN ||
+			rewindPreviousLastLSN < rewindCurrentLastLSN ||
+			rewindCurrentLastLSN == ^uint64(0) ||
+			rewindNextLSN != rewindCurrentLastLSN+1 ||
+			rewindDiscardedLSNCount != rewindPreviousLastLSN-rewindCurrentLastLSN {
+			return haRejoinJobResult{}, false
+		}
+		result.RewindExecuted = true
+		result.RewindPreviousLastLSN = rewindPreviousLastLSN
+		result.RewindCurrentLastLSN = rewindCurrentLastLSN
+		result.RewindNextLSN = rewindNextLSN
+		result.RewindDiscardedLSNCount = rewindDiscardedLSNCount
+		result.DataLossDiscarded = result.DataLossDiscarded || haBoolJSONValue(rewind.DataLossDiscarded)
+	}
+	if reseed := envelope.Reseed; reseed != nil {
+		reseedTargetTimelineID := haUint64JSONValue(reseed.TargetTimelineID)
+		reseedTargetEpoch := haUint64JSONValue(reseed.TargetEpoch)
+		reseedForkLSN := haUint64JSONValue(reseed.ForkLSN)
+		reseedFormerLastLSN := haUint64JSONValue(reseed.FormerLastLSN)
+		if strings.TrimSpace(assessment.Action) != "reseed" ||
+			!haRejoinReseedJSONComplete(*reseed) ||
+			strings.TrimSpace(reseed.NodeID) != strings.TrimSpace(assessment.FormerNodeID) ||
+			strings.TrimSpace(reseed.SlotName) != strings.TrimSpace(assessment.FormerNodeID) ||
+			reseedTargetTimelineID != targetTimelineID ||
+			reseedTargetEpoch != targetEpoch ||
+			reseedForkLSN != forkLSN ||
+			reseedFormerLastLSN != formerLastLSN ||
+			!haBoolJSONValue(reseed.ReseedRequired) ||
+			!haBoolJSONValue(reseed.BaseBackupRequired) {
+			return haRejoinJobResult{}, false
+		}
+		result.ReseedExecuted = true
+		result.ReseedSlotName = strings.TrimSpace(reseed.SlotName)
+		result.ReseedRequired = haBoolJSONValue(reseed.ReseedRequired)
+		result.ReseedBaseBackupRequired = haBoolJSONValue(reseed.BaseBackupRequired)
+	}
+	return result, true
+}
+
+func haRejoinAssessmentJSONComplete(assessment haRejoinAPIResult) bool {
+	return strings.TrimSpace(assessment.Action) != "" &&
+		strings.TrimSpace(assessment.Reason) != "" &&
+		strings.TrimSpace(assessment.FormerNodeID) != "" &&
+		haRejoinAssessmentActionJSONValid(assessment.Action) &&
+		haRejoinAssessmentReasonJSONValid(assessment.Reason) &&
+		assessment.TargetTimelineID != nil &&
+		assessment.TargetEpoch != nil &&
+		assessment.ParentClusterID != nil &&
+		assessment.ParentShardID != nil &&
+		assessment.ParentTableID != nil &&
+		assessment.ParentTimelineID != nil &&
+		assessment.ParentEpoch != nil &&
+		haUint64JSONValue(assessment.ParentClusterID) > 0 &&
+		haUint64JSONValue(assessment.ParentTimelineID) > 0 &&
+		haUint64JSONValue(assessment.ParentEpoch) > 0 &&
+		assessment.ForkLSN != nil &&
+		assessment.FormerLastLSN != nil &&
+		assessment.RetainedFromLSN != nil &&
+		assessment.DataLossDiscarded != nil
+}
+
+func haRejoinAssessmentActionJSONValid(action string) bool {
+	switch strings.TrimSpace(action) {
+	case "reject_unfenced", "already_current", "rewind", "reseed":
+		return true
+	default:
+		return false
+	}
+}
+
+func haRejoinAssessmentReasonJSONValid(reason string) bool {
+	switch strings.TrimSpace(reason) {
+	case "no_fence",
+		"current_timeline",
+		"parent_timeline_retained",
+		"parent_timeline_wal_expired",
+		"incompatible_timeline",
+		"wrong_old_primary",
+		"wrong_cluster",
+		"wrong_shard",
+		"wrong_table",
+		"local_lsn_before_fork":
+		return true
+	default:
+		return false
+	}
+}
+
+func haRejoinRewindJSONComplete(rewind haRejoinAPIRewind) bool {
+	return strings.TrimSpace(rewind.NodeID) != "" &&
+		rewind.ForkLSN != nil &&
+		rewind.PreviousLastLSN != nil &&
+		rewind.CurrentLastLSN != nil &&
+		rewind.NextLSN != nil &&
+		rewind.DiscardedLSNCount != nil &&
+		rewind.TargetTimelineID != nil &&
+		rewind.TargetEpoch != nil &&
+		rewind.DataLossDiscarded != nil
+}
+
+func haRejoinReseedJSONComplete(reseed haRejoinAPIReseed) bool {
+	return strings.TrimSpace(reseed.NodeID) != "" &&
+		strings.TrimSpace(reseed.SlotName) != "" &&
+		reseed.TargetTimelineID != nil &&
+		reseed.TargetEpoch != nil &&
+		reseed.ForkLSN != nil &&
+		reseed.FormerLastLSN != nil &&
+		reseed.ReseedRequired != nil &&
+		reseed.BaseBackupRequired != nil
+}
+
+func haRejoinAdminActionResult(result haRejoinJobResult) *antflyv1.HAAdminActionResultStatus {
+	status := &antflyv1.HAAdminActionResultStatus{}
+	applyHARejoinAdminActionResult(status, result)
+	return status
+}
+
+func applyHARejoinAdminActionResult(status *antflyv1.HAAdminActionResultStatus, result haRejoinJobResult) {
+	if status == nil {
+		return
+	}
+	status.SchemaVersion = result.SchemaVersion
+	status.ActionID = strings.TrimSpace(result.ActionID)
+	status.ActionKind = strings.TrimSpace(result.ActionKind)
+	status.ActionTarget = strings.TrimSpace(result.ActionTarget)
+	status.ActionState = strings.TrimSpace(result.ActionState)
+	status.ActionNodeID = strings.TrimSpace(result.ActionNodeID)
+	status.RejoinAction = result.Action
+	status.RejoinReason = result.Reason
+	status.FormerNodeID = result.FormerNodeID
+	status.TargetTimelineID = result.TargetTimelineID
+	status.TargetEpoch = result.TargetEpoch
+	status.ForkLSN = result.ForkLSN
+	status.FormerLastLSN = result.FormerLastLSN
+	status.RetainedFromLSN = result.RetainedFromLSN
+	status.DataLossDiscarded = result.DataLossDiscarded
+	status.RewindExecuted = result.RewindExecuted
+	status.RewindPreviousLastLSN = result.RewindPreviousLastLSN
+	status.RewindCurrentLastLSN = result.RewindCurrentLastLSN
+	status.RewindNextLSN = result.RewindNextLSN
+	status.RewindDiscardedLSNCount = result.RewindDiscardedLSNCount
+	status.ReseedExecuted = result.ReseedExecuted
+	status.ReseedSlotName = result.ReseedSlotName
+	status.ReseedRequired = result.ReseedRequired
+	status.ReseedBaseBackupRequired = result.ReseedBaseBackupRequired
+}
+
+func haRejoinJobResultFromAdminResult(result *antflyv1.HAAdminActionResultStatus) (haRejoinJobResult, bool) {
+	if result == nil ||
+		strings.TrimSpace(result.RejoinAction) == "" ||
+		strings.TrimSpace(result.FormerNodeID) == "" ||
+		result.TargetTimelineID == 0 ||
+		result.TargetEpoch == 0 {
+		return haRejoinJobResult{}, false
+	}
+	return haRejoinJobResult{
+		SchemaVersion:            result.SchemaVersion,
+		ActionID:                 strings.TrimSpace(result.ActionID),
+		ActionKind:               strings.TrimSpace(result.ActionKind),
+		ActionTarget:             strings.TrimSpace(result.ActionTarget),
+		ActionState:              strings.TrimSpace(result.ActionState),
+		ActionNodeID:             strings.TrimSpace(result.ActionNodeID),
+		Action:                   strings.TrimSpace(result.RejoinAction),
+		Reason:                   strings.TrimSpace(result.RejoinReason),
+		FormerNodeID:             strings.TrimSpace(result.FormerNodeID),
+		TargetTimelineID:         result.TargetTimelineID,
+		TargetEpoch:              result.TargetEpoch,
+		ForkLSN:                  result.ForkLSN,
+		FormerLastLSN:            result.FormerLastLSN,
+		RetainedFromLSN:          result.RetainedFromLSN,
+		DataLossDiscarded:        result.DataLossDiscarded,
+		RewindExecuted:           result.RewindExecuted,
+		RewindPreviousLastLSN:    result.RewindPreviousLastLSN,
+		RewindCurrentLastLSN:     result.RewindCurrentLastLSN,
+		RewindNextLSN:            result.RewindNextLSN,
+		RewindDiscardedLSNCount:  result.RewindDiscardedLSNCount,
+		ReseedExecuted:           result.ReseedExecuted,
+		ReseedSlotName:           strings.TrimSpace(result.ReseedSlotName),
+		ReseedRequired:           result.ReseedRequired,
+		ReseedBaseBackupRequired: result.ReseedBaseBackupRequired,
+	}, true
+}
+
+func applyHARejoinJobResult(former *antflyv1.HAFormerPrimaryStatus, result haRejoinJobResult) {
+	if former == nil {
+		return
+	}
+	former.NodeID = result.FormerNodeID
+	former.TargetTimelineID = result.TargetTimelineID
+	former.TargetEpoch = result.TargetEpoch
+	former.ForkLSN = result.ForkLSN
+	former.FormerLastLSN = result.FormerLastLSN
+	former.RetainedFromLSN = result.RetainedFromLSN
+	former.DataLossDiscarded = result.DataLossDiscarded
+	former.AssessedAction = result.Action
+	former.AssessedReason = result.Reason
+	former.ObservedLSN = result.FormerLastLSN
+	former.RejoinRequired = true
+	former.RewindPossible = false
+	former.ReseedRequired = false
+	former.Diverged = false
+	switch result.Action {
+	case "reject_unfenced":
+		former.Fenced = false
+		former.Action = string(haActionDemoteFormerPrimary)
+	case "already_current":
+		former.Fenced = true
+		former.RejoinRequired = false
+		former.Action = "None"
+	case "rewind":
+		former.Fenced = true
+		former.RewindPossible = true
+		former.Action = string(haActionRewindFormerPrimary)
+	case "reseed":
+		former.Fenced = true
+		former.ReseedRequired = true
+		former.Diverged = true
+		former.Action = string(haActionReseedFormerPrimary)
+	default:
+		former.Action = result.Action
+	}
+	if result.Reason != "" {
+		former.Reason = result.Reason
+	}
+}
+
+func parseHAResultUint(lines map[string]string, key string) (uint64, bool) {
+	raw, ok := lines[key]
+	if !ok {
+		return 0, false
+	}
+	value, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 64)
+	return value, err == nil
+}
+
+func parseHAResultBool(lines map[string]string, key string) (bool, bool) {
+	raw, ok := lines[key]
+	if !ok {
+		return false, false
+	}
+	switch strings.TrimSpace(raw) {
+	case "true":
+		return true, true
+	case "false":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+func applyHAPromotionJobResult(promotion *antflyv1.HAPromotionStatus, result haPromotionJobResult) {
+	if result.NewClusterID != 0 {
+		promotion.ClusterID = result.NewClusterID
+		promotion.ShardID = result.NewShardID
+		promotion.TableID = result.NewTableID
+	} else if result.ParentClusterID != 0 {
+		promotion.ClusterID = result.ParentClusterID
+		promotion.ShardID = result.ParentShardID
+		promotion.TableID = result.ParentTableID
+	}
+	promotion.ParentTimelineID = result.ParentTimelineID
+	promotion.ParentEpoch = result.ParentEpoch
+	promotion.NewTimelineID = result.NewTimelineID
+	promotion.NewEpoch = result.NewEpoch
+	promotion.SwitchLSN = result.SwitchLSN
+	promotion.RequiredLSN = result.RequiredLSN
+	promotion.ObservedLSN = result.ObservedLSN
+	promotion.FenceGeneration = result.FenceGeneration
+	promotion.FenceToken = result.FenceToken
+	promotion.Forced = result.Forced
+	promotion.DataLossPossible = result.DataLossPossible
+}
+
+func applyHAPromotionJobResultIfMatches(promotion *antflyv1.HAPromotionStatus, result haPromotionJobResult, identity *antflyv1.HAReplicationIdentitySpec, action antflyv1.HAPlannedActionStatus) bool {
+	if promotion == nil || !haPromotionResultMatchesAction(result, identity, &action) {
+		return false
+	}
+	applyHAPromotionJobResult(promotion, result)
+	return true
+}
+
+func (r *AntflyClusterReconciler) observeHAPrimaryRouteStatus(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	if cluster.Spec.HighAvailability == nil || cluster.Spec.HighAvailability.Mode == "" ||
+		cluster.Spec.HighAvailability.Mode == antflyv1.HAModeDisabled {
+		return nil
+	}
+
+	service := &corev1.Service{}
+	err := r.Get(ctx, types.NamespacedName{Name: cluster.Name + "-public-api", Namespace: cluster.Namespace}, service)
+	if errors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	target := strings.TrimSpace(service.Annotations[haPrimaryRouteTargetAnnotation])
+	if target == "" {
+		target = "primary"
+	}
+	if cluster.Status.HAStatus == nil {
+		cluster.Status.HAStatus = &antflyv1.HAStatus{Mode: cluster.Spec.HighAvailability.Mode}
+	}
+	cluster.Status.HAStatus.PrimaryRoute.CurrentTarget = target
+	cluster.Status.HAStatus.PrimaryRoute.FenceAuthority = antflyv1.HAFencingAuthority(strings.TrimSpace(service.Annotations[haPrimaryRouteFenceAuthorityAnnotation]))
+	cluster.Status.HAStatus.PrimaryRoute.FenceGeneration = 0
+	if raw := strings.TrimSpace(service.Annotations[haPrimaryRouteFenceGenerationAnnotation]); raw != "" {
+		if fenceGeneration, err := strconv.ParseUint(raw, 10, 64); err == nil {
+			cluster.Status.HAStatus.PrimaryRoute.FenceGeneration = fenceGeneration
+		}
+	}
+	return nil
+}
+
+func (r *AntflyClusterReconciler) observeHAPrimaryAdminStatus(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	ha := cluster.Spec.HighAvailability
+	if ha == nil || ha.Mode == "" || ha.Mode == antflyv1.HAModeDisabled ||
+		ha.Admin == nil {
+		return nil
+	}
+	if cluster.Status.HAStatus == nil {
+		cluster.Status.HAStatus = &antflyv1.HAStatus{Mode: ha.Mode}
+	}
+	adminURL := haCurrentPrimaryAdminURL(ha, cluster.Status.HAStatus)
+	if strings.TrimSpace(adminURL) == "" {
+		if promoted := haPromotedPrimaryNodeID(cluster.Status.HAStatus); promoted != "" {
+			cluster.Status.HAStatus.PrimaryAdminReachable = false
+			cluster.Status.HAStatus.PrimaryAdminLastError = fmt.Sprintf("promoted primary %s admin URL is not configured", promoted)
+			cluster.Status.HAStatus.PrimaryAdminStatusCode = 0
+		}
+		return nil
+	}
+	status, err := r.observeHAPrimaryStatusTyped(ctx, cluster, adminURL, ha)
+	if err != nil {
+		cluster.Status.HAStatus.PrimaryAdminReachable = false
+		cluster.Status.HAStatus.PrimaryAdminLastError = err.Error()
+		if statusCode, ok := adminsdk.HAStatusCode(err); ok {
+			cluster.Status.HAStatus.PrimaryAdminStatusCode = statusCode
+		} else {
+			cluster.Status.HAStatus.PrimaryAdminStatusCode = 0
+		}
+		return err
+	}
+	cluster.Status.HAStatus.PrimaryAdminReachable = true
+	cluster.Status.HAStatus.PrimaryAdminLastError = ""
+	cluster.Status.HAStatus.PrimaryAdminStatusCode = 0
+	cluster.Status.HAStatus.PrimaryLSN = status.PrimaryLSN
+	cluster.Status.HAStatus.Retention = status.Retention
+	cluster.Status.HAStatus.Standbys = status.Standbys
+	if status.Sync != nil {
+		cluster.Status.HAStatus.Sync = *status.Sync
+	} else {
+		cluster.Status.HAStatus.Sync = antflyv1.HASyncStatus{}
+	}
+	return nil
+}
+
+func (r *AntflyClusterReconciler) observeHAStandbyAdminStatuses(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	ha := cluster.Spec.HighAvailability
+	if ha == nil || ha.Mode == "" || ha.Mode == antflyv1.HAModeDisabled {
+		return nil
+	}
+	if cluster.Status.HAStatus == nil {
+		cluster.Status.HAStatus = &antflyv1.HAStatus{Mode: ha.Mode}
+	}
+
+	currentPrimaryID := haCurrentPrimaryNodeID(ha, cluster.Status.HAStatus)
+	var observedErr error
+	for _, standby := range ha.Standbys {
+		if strings.TrimSpace(standby.Name) == currentPrimaryID {
+			continue
+		}
+		if !standbyDesired(standby) || strings.TrimSpace(standby.AdminURL) == "" {
+			continue
+		}
+		status, err := r.observeHAStandbyStatusTyped(ctx, cluster, standby.AdminURL, standby.Name, standbySlotName(standby), cluster.Status.HAStatus.PrimaryLSN, ha)
+		if err != nil {
+			markHAStandbyAdminError(cluster.Status.HAStatus, standby.Name, standbySlotName(standby), err)
+			if observedErr == nil {
+				observedErr = fmt.Errorf("standby %s: %w", standby.Name, err)
+			}
+			continue
+		}
+		mergeHAStandbyStatus(cluster.Status.HAStatus, status)
+	}
+	return observedErr
+}
+
+func (r *AntflyClusterReconciler) observeHAPrimaryStatusTyped(ctx context.Context, cluster *antflyv1.AntflyCluster, baseURL string, ha *antflyv1.HighAvailabilitySpec) (haObservedPrimaryStatus, error) {
+	adminClient, err := r.haAdminSDKClient(cluster, baseURL)
+	if err != nil {
+		return haObservedPrimaryStatus{}, err
+	}
+	response, err := adminClient.PrimaryStatusParsedResponse(ctx, haPrimaryStatusParams(ha))
+	if err != nil {
+		return haObservedPrimaryStatus{}, err
+	}
+	status := haObservedPrimaryStatusFromAdminSDK(*response.Value)
+	if err := haValidateObservedStatusIdentity(status.Identity, ha, cluster.Status.HAStatus); err != nil {
+		return haObservedPrimaryStatus{}, err
+	}
+	if err := haValidateObservedPrimaryNodeID(status.NodeID, ha, cluster.Status.HAStatus); err != nil {
+		return haObservedPrimaryStatus{}, err
+	}
+	return status, nil
+}
+
+func (r *AntflyClusterReconciler) observeHAStandbyStatusTyped(ctx context.Context, cluster *antflyv1.AntflyCluster, baseURL string, standbyName string, slotName string, upstreamLSN uint64, ha *antflyv1.HighAvailabilitySpec) (antflyv1.HAStandbyStatus, error) {
+	adminClient, err := r.haAdminSDKClient(cluster, baseURL)
+	if err != nil {
+		return antflyv1.HAStandbyStatus{}, err
+	}
+	response, err := adminClient.StandbyStatusParsedResponse(ctx, haStandbyStatusParams(upstreamLSN))
+	if err != nil {
+		return antflyv1.HAStandbyStatus{}, err
+	}
+	observed := haObservedStandbyStatusFromAdminSDK(*response.Value, standbyName, slotName)
+	if err := haValidateObservedStatusIdentity(observed.Identity, ha, cluster.Status.HAStatus); err != nil {
+		return antflyv1.HAStandbyStatus{}, err
+	}
+	if err := haValidateObservedNodeID(observed.NodeID, standbyName, "standby"); err != nil {
+		return antflyv1.HAStandbyStatus{}, err
+	}
+	return observed.Status, nil
+}
+
+func haPrimaryStatusParams(ha *antflyv1.HighAvailabilitySpec) *adminsdk.HAPrimaryStatusParams {
+	params := &adminsdk.HAPrimaryStatusParams{}
+	if ha == nil {
+		return params
+	}
+	if ha.Retention != nil && ha.Retention.MaxLagLSN > 0 {
+		params.MaxLagLsn = ha.Retention.MaxLagLSN
+	}
+	if ha.Retention != nil && ha.Retention.MaxRetainedBytes > 0 {
+		params.MaxRetainedBytes = ha.Retention.MaxRetainedBytes
+	}
+	if ha.Retention != nil && ha.Retention.MaxRetainedAgeNS > 0 {
+		params.MaxRetainedAgeNs = ha.Retention.MaxRetainedAgeNS
+	}
+	if ha.SyncPolicy != nil && ha.SyncPolicy.Mode != "" && ha.SyncPolicy.Mode != antflyv1.HADurabilityModeAsync {
+		params.SyncMode = haAdminSyncModeParam(ha.SyncPolicy.Mode)
+		if ha.SyncPolicy.Selection != "" {
+			params.SyncSelection = haAdminSyncSelectionParam(ha.SyncPolicy.Selection)
+		}
+		if ha.SyncPolicy.Required > 0 && ha.SyncPolicy.Selection != antflyv1.HAStandbySelectionAll {
+			params.SyncRequired = uint64(ha.SyncPolicy.Required)
+		}
+		for _, name := range ha.SyncPolicy.StandbyNames {
+			if strings.TrimSpace(name) != "" {
+				params.SyncStandby = append(params.SyncStandby, strings.TrimSpace(name))
+			}
+		}
+		if ha.SyncPolicy.FailurePolicy != "" {
+			params.SyncFailure = haAdminSyncFailureParam(ha.SyncPolicy.FailurePolicy)
+		}
+	}
+	return params
+}
+
+func haStandbyStatusParams(upstreamLSN uint64) *adminsdk.HAStandbyStatusParams {
+	params := &adminsdk.HAStandbyStatusParams{}
+	if upstreamLSN > 0 {
+		params.UpstreamLsn = upstreamLSN
+	}
+	return params
+}
+
+func haAdminSyncModeParam(mode antflyv1.HADurabilityMode) adminsdk.HAPrimaryStatusParamsSyncMode {
+	switch mode {
+	case antflyv1.HADurabilityModeRemoteWrite:
+		return adminsdk.HAPrimaryStatusSyncModeRemoteWrite
+	case antflyv1.HADurabilityModeRemoteApply:
+		return adminsdk.HAPrimaryStatusSyncModeRemoteApply
+	default:
+		return adminsdk.HAPrimaryStatusSyncModeAsync
+	}
+}
+
+func haAdminSyncSelectionParam(selection antflyv1.HAStandbySelection) adminsdk.HAPrimaryStatusParamsSyncSelection {
+	switch selection {
+	case antflyv1.HAStandbySelectionFirst:
+		return adminsdk.HAPrimaryStatusSyncSelectionFirst
+	case antflyv1.HAStandbySelectionAll:
+		return adminsdk.HAPrimaryStatusSyncSelectionAll
+	default:
+		return adminsdk.HAPrimaryStatusSyncSelectionAny
+	}
+}
+
+func haAdminSyncFailureParam(policy antflyv1.HAFailurePolicy) adminsdk.HAPrimaryStatusParamsSyncFail {
+	switch policy {
+	case antflyv1.HAFailurePolicyFailClosed:
+		return adminsdk.HAPrimaryStatusSyncFailureFailClosed
+	case antflyv1.HAFailurePolicyDegradeToAsync:
+		return adminsdk.HAPrimaryStatusSyncFailureDegradeToAsync
+	default:
+		return adminsdk.HAPrimaryStatusSyncFailureBlock
+	}
+}
+
+type haObservedPrimaryStatus struct {
+	NodeID     string
+	PrimaryLSN uint64
+	Retention  antflyv1.HARetentionStatus
+	Standbys   []antflyv1.HAStandbyStatus
+	Sync       *antflyv1.HASyncStatus
+	Identity   haObservedIdentity
+}
+
+type haObservedStandbyStatus struct {
+	NodeID   string
+	Status   antflyv1.HAStandbyStatus
+	Identity haObservedIdentity
+}
+
+type haObservedIdentity struct {
+	ClusterID  uint64
+	ShardID    uint64
+	TableID    uint64
+	TimelineID uint64
+	Epoch      uint64
+}
+
+type haAdminIdentityJSON struct {
+	ClusterID  *uint64 `json:"cluster_id"`
+	ShardID    *uint64 `json:"shard_id"`
+	TableID    *uint64 `json:"table_id"`
+	TimelineID *uint64 `json:"timeline_id"`
+	Epoch      *uint64 `json:"epoch"`
+}
+
+func parseHAPrimaryStatusJSON(raw []byte) (haObservedPrimaryStatus, error) {
+	parsed, err := adminsdk.ParseHAPrimaryStatus(raw)
+	if err != nil {
+		return haObservedPrimaryStatus{}, err
+	}
+	return haObservedPrimaryStatusFromAdminSDK(*parsed), nil
+}
+
+func haObservedPrimaryStatusFromAdminSDK(parsed adminsdk.ParsedHAPrimaryStatus) haObservedPrimaryStatus {
+	snapshot := parsed.Response.Snapshot
+	status := haObservedPrimaryStatus{
+		NodeID:     strings.TrimSpace(snapshot.NodeId),
+		Identity:   haObservedIdentityFromAdminSDK(snapshot.Identity),
+		PrimaryLSN: snapshot.CurrentLsn,
+		Retention: antflyv1.HARetentionStatus{
+			OldestRestartLSN:  snapshot.Retention.OldestRestartLsn,
+			RetainedLSNCount:  snapshot.Retention.RetainedLsnCount,
+			RetainedByteCount: snapshot.Retention.RetainedByteCount,
+			RetainedAgeNS:     snapshot.Retention.RetainedAgeNs,
+			ActiveSlots:       haUint64ToInt32(snapshot.Retention.ActiveSlots),
+			ReseedRecommended: haUint64ToInt32(snapshot.Retention.ReseedRecommended),
+		},
+	}
+	for _, slot := range snapshot.Slots {
+		status.Standbys = append(status.Standbys, antflyv1.HAStandbyStatus{
+			Name:           strings.TrimSpace(slot.Name),
+			SlotName:       strings.TrimSpace(slot.Name),
+			TimelineID:     slot.TimelineId,
+			Active:         slot.Active,
+			ReseedRequired: slot.ReseedRequired,
+			RestartLSN:     slot.RestartLsn,
+			ReceivedLSN:    slot.ReceivedLsn,
+			AppliedLSN:     slot.AppliedLsn,
+			SafeReadLSN:    slot.SafeReadLsn,
+			WriteLagLSN:    slot.WriteLagLsn,
+			ApplyLagLSN:    slot.ApplyLagLsn,
+			SafeReadLagLSN: slot.SafeReadLagLsn,
+			Status:         strings.TrimSpace(string(slot.Status)),
+			LastError:      strings.TrimSpace(slot.LastError),
+		})
+	}
+	if parsed.HasDurability {
+		status.Sync = haSyncStatusFromAdminDurability(snapshot.Durability)
+	}
+	return status
+}
+
+func haSyncStatusFromAdminDurability(durability adminsdk.HADurabilityDecision) *antflyv1.HASyncStatus {
+	mode := haDurabilityModeFromAdmin(strings.TrimSpace(string(durability.Mode)))
+	if mode == "" {
+		mode = antflyv1.HADurabilityModeAsync
+	}
+	selection := haStandbySelectionFromAdmin(strings.TrimSpace(string(durability.Selection)))
+	if selection == "" {
+		selection = antflyv1.HAStandbySelectionAny
+	}
+	degraded, action := haSyncActionFromAdminDurabilityStatus(strings.TrimSpace(string(durability.Status)))
+	return &antflyv1.HASyncStatus{
+		Mode:       mode,
+		Selection:  selection,
+		Required:   haUint64ToInt32(durability.RequiredCount),
+		Satisfied:  haUint64ToInt32(durability.SatisfiedCount),
+		Candidates: haUint64ToInt32(durability.CandidateCount),
+		Degraded:   degraded,
+		Action:     action,
+	}
+}
+
+func haDurabilityModeFromAdmin(raw string) antflyv1.HADurabilityMode {
+	switch raw {
+	case "remote_write", "remote-write":
+		return antflyv1.HADurabilityModeRemoteWrite
+	case "remote_apply", "remote-apply":
+		return antflyv1.HADurabilityModeRemoteApply
+	case "async":
+		return antflyv1.HADurabilityModeAsync
+	default:
+		return ""
+	}
+}
+
+func haStandbySelectionFromAdmin(raw string) antflyv1.HAStandbySelection {
+	switch raw {
+	case "first":
+		return antflyv1.HAStandbySelectionFirst
+	case "all":
+		return antflyv1.HAStandbySelectionAll
+	case "any":
+		return antflyv1.HAStandbySelectionAny
+	default:
+		return ""
+	}
+}
+
+func haSyncActionFromAdminDurabilityStatus(raw string) (bool, string) {
+	switch raw {
+	case "satisfied":
+		return false, "Satisfied"
+	case "degraded_to_async":
+		return true, "DegradeToAsync"
+	case "fail_closed":
+		return true, "RejectWrites"
+	case "would_block":
+		return true, "BlockWrites"
+	default:
+		return true, "Unknown"
+	}
+}
+
+func parseHAStandbyStatusJSON(raw []byte, standbyName string, slotName string) (antflyv1.HAStandbyStatus, error) {
+	observed, err := parseHAStandbyStatusJSONWithIdentity(raw, standbyName, slotName)
+	if err != nil {
+		return antflyv1.HAStandbyStatus{}, err
+	}
+	return observed.Status, nil
+}
+
+func parseHAStandbyStatusJSONWithIdentity(raw []byte, standbyName string, slotName string) (haObservedStandbyStatus, error) {
+	response, err := adminsdk.ParseHAStandbyStatus(raw)
+	if err != nil {
+		return haObservedStandbyStatus{}, err
+	}
+	return haObservedStandbyStatusFromAdminSDK(*response, standbyName, slotName), nil
+}
+
+func haObservedStandbyStatusFromAdminSDK(response adminsdk.HAStandbyStatusResponse, standbyName string, slotName string) haObservedStandbyStatus {
+	snapshot := response.Snapshot
+	status := antflyv1.HAStandbyStatus{
+		Name:               standbyName,
+		SlotName:           slotName,
+		Active:             true,
+		TimelineID:         snapshot.Identity.TimelineId,
+		SafeReadLSN:        snapshot.SafeReadLsn,
+		UnappliedLSNCount:  snapshot.UnappliedLsnCount,
+		CaughtUpToReceived: snapshot.CaughtUpToReceived,
+		CanServeSafeReads:  snapshot.CanServeSafeReads,
+	}
+	status.ReceivedLSN = snapshot.ReceivedLsn
+	status.AppliedLSN = snapshot.AppliedLsn
+	status.UpstreamLSN = snapshot.UpstreamLsn
+	status.WriteLagLSN = snapshot.WriteLagLsn
+	status.ReceiveLagLSN = snapshot.ReceiveLagLsn
+	status.ApplyLagLSN = snapshot.ApplyLagLsn
+	status.LastError = strings.TrimSpace(snapshot.LastError)
+	status.LastAttemptNs = snapshot.LastAttemptNs
+	status.LastSuccessNs = snapshot.LastSuccessNs
+	status.ReplicationFailuresTotal = snapshot.ReplicationFailuresTotal
+	if status.LastError != "" {
+		status.Status = "unhealthy"
+	} else if status.ReceiveLagLSN > 0 || status.ApplyLagLSN > 0 {
+		status.Status = "lagging"
+	} else if status.CanServeSafeReads && status.Status == "" {
+		status.Status = "healthy"
+	}
+	return haObservedStandbyStatus{
+		NodeID:   strings.TrimSpace(snapshot.NodeId),
+		Status:   status,
+		Identity: haObservedIdentityFromAdminSDK(snapshot.Identity),
+	}
+}
+
+func haObservedIdentityFromAdminSDK(identity adminsdk.HAIdentity) haObservedIdentity {
+	return haObservedIdentity{
+		ClusterID:  identity.ClusterId,
+		ShardID:    identity.ShardId,
+		TableID:    identity.TableId,
+		TimelineID: identity.TimelineId,
+		Epoch:      identity.Epoch,
+	}
+}
+
+func haValidateObservedStatusIdentity(observed haObservedIdentity, ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) error {
+	identity := haReplicationIdentity(ha)
+	if identity == nil {
+		return nil
+	}
+	if observed.ClusterID != identity.ClusterID ||
+		observed.ShardID != identity.ShardID ||
+		observed.TableID != identity.TableID {
+		return fmt.Errorf(
+			"observed HA admin identity scope mismatch: got cluster_id=%d shard_id=%d table_id=%d, expected cluster_id=%d shard_id=%d table_id=%d",
+			observed.ClusterID,
+			observed.ShardID,
+			observed.TableID,
+			identity.ClusterID,
+			identity.ShardID,
+			identity.TableID,
+		)
+	}
+	expectedTimelineID := identity.TimelineID
+	expectedEpoch := identity.Epoch
+	if haPromotionAdvancesIdentity(status, identity) {
+		expectedTimelineID = status.LastPromotion.NewTimelineID
+		expectedEpoch = status.LastPromotion.NewEpoch
+	}
+	if observed.TimelineID != expectedTimelineID || observed.Epoch != expectedEpoch {
+		return fmt.Errorf(
+			"observed HA admin identity timeline mismatch: got timeline_id=%d epoch=%d, expected timeline_id=%d epoch=%d",
+			observed.TimelineID,
+			observed.Epoch,
+			expectedTimelineID,
+			expectedEpoch,
+		)
+	}
+	return nil
+}
+
+func haValidateObservedPrimaryNodeID(observed string, ha *antflyv1.HighAvailabilitySpec, status *antflyv1.HAStatus) error {
+	expected := haCurrentPrimaryNodeID(ha, status)
+	if strings.TrimSpace(expected) == "" {
+		if strings.TrimSpace(observed) == "" {
+			return fmt.Errorf("observed HA admin primary node_id is missing")
+		}
+		return nil
+	}
+	return haValidateObservedNodeID(observed, expected, "primary")
+}
+
+func haValidateObservedNodeID(observed string, expected string, label string) error {
+	observed = strings.TrimSpace(observed)
+	expected = strings.TrimSpace(expected)
+	if observed == "" {
+		return fmt.Errorf("observed HA admin %s node_id is missing", label)
+	}
+	if expected == "" {
+		return fmt.Errorf("expected HA admin %s node_id is missing", label)
+	}
+	if observed != expected {
+		return fmt.Errorf("observed HA admin %s node_id mismatch: got %q, expected %q", label, observed, expected)
+	}
+	return nil
+}
+
+func haPromotionAdvancesIdentity(status *antflyv1.HAStatus, identity *antflyv1.HAReplicationIdentitySpec) bool {
+	promotion := haPromotionReceipt(status)
+	if promotion == nil || identity == nil {
+		return false
+	}
+	if promotion.ParentTimelineID != identity.TimelineID || promotion.ParentEpoch != identity.Epoch {
+		return false
+	}
+	if promotion.ClusterID != 0 &&
+		(promotion.ClusterID != identity.ClusterID ||
+			promotion.ShardID != identity.ShardID ||
+			promotion.TableID != identity.TableID) {
+		return false
+	}
+	return true
+}
+
+func haAdminIdentityJSONComplete(identity haAdminIdentityJSON) bool {
+	return identity.ClusterID != nil &&
+		haUint64JSONValue(identity.ClusterID) > 0 &&
+		identity.ShardID != nil &&
+		identity.TableID != nil &&
+		identity.TimelineID != nil &&
+		haUint64JSONValue(identity.TimelineID) > 0 &&
+		identity.Epoch != nil &&
+		haUint64JSONValue(identity.Epoch) > 0
+}
+
+func haUint64ToInt32(raw uint64) int32 {
+	if raw > uint64(^uint32(0)>>1) {
+		return int32(^uint32(0) >> 1)
+	}
+	return int32(raw)
+}
+
+func mergeHAStandbyStatus(status *antflyv1.HAStatus, observed antflyv1.HAStandbyStatus) {
+	if status == nil || observed.Name == "" {
+		return
+	}
+	for i := range status.Standbys {
+		existing := &status.Standbys[i]
+		if !haStandbyStatusMatches(*existing, observed.Name, observed.SlotName) {
+			continue
+		}
+		if observed.TimelineID != 0 {
+			existing.TimelineID = observed.TimelineID
+		}
+		existing.Active = existing.Active || observed.Active
+		if observed.ReceivedLSN != 0 {
+			existing.ReceivedLSN = observed.ReceivedLSN
+		}
+		if observed.AppliedLSN != 0 {
+			existing.AppliedLSN = observed.AppliedLSN
+		}
+		if observed.SafeReadLSN != 0 {
+			existing.SafeReadLSN = observed.SafeReadLSN
+		}
+		if observed.UpstreamLSN != 0 {
+			existing.UpstreamLSN = observed.UpstreamLSN
+		}
+		existing.WriteLagLSN = observed.WriteLagLSN
+		existing.ReceiveLagLSN = observed.ReceiveLagLSN
+		existing.ApplyLagLSN = observed.ApplyLagLSN
+		existing.UnappliedLSNCount = observed.UnappliedLSNCount
+		existing.CaughtUpToReceived = observed.CaughtUpToReceived
+		existing.CanServeSafeReads = observed.CanServeSafeReads
+		existing.LastAttemptNs = observed.LastAttemptNs
+		existing.LastSuccessNs = observed.LastSuccessNs
+		existing.ReplicationFailuresTotal = observed.ReplicationFailuresTotal
+		if observed.Status != "" {
+			existing.Status = observed.Status
+		}
+		existing.LastError = observed.LastError
+		existing.AdminStatusCode = 0
+		return
+	}
+	status.Standbys = append(status.Standbys, observed)
+}
+
+func markHAStandbyAdminError(status *antflyv1.HAStatus, standbyName string, slotName string, err error) {
+	if status == nil || err == nil {
+		return
+	}
+	standbyName = strings.TrimSpace(standbyName)
+	slotName = strings.TrimSpace(slotName)
+	if standbyName == "" && slotName == "" {
+		return
+	}
+	lastError := strings.TrimSpace(err.Error())
+	if lastError == "" {
+		lastError = "standby admin status unavailable"
+	}
+	adminStatusCode := 0
+	if statusCode, ok := adminsdk.HAStatusCode(err); ok {
+		adminStatusCode = statusCode
+	}
+	for i := range status.Standbys {
+		existing := &status.Standbys[i]
+		if !haStandbyStatusMatches(*existing, standbyName, slotName) {
+			continue
+		}
+		if existing.Name == "" {
+			existing.Name = standbyName
+		}
+		if existing.SlotName == "" {
+			existing.SlotName = slotName
+		}
+		existing.Status = "unreachable"
+		existing.LastError = lastError
+		existing.AdminStatusCode = adminStatusCode
+		existing.CaughtUpToReceived = false
+		existing.CanServeSafeReads = false
+		return
+	}
+	status.Standbys = append(status.Standbys, antflyv1.HAStandbyStatus{
+		Name:            standbyName,
+		SlotName:        slotName,
+		Status:          "unreachable",
+		LastError:       lastError,
+		AdminStatusCode: adminStatusCode,
+	})
+}
+
+func haStandbyStatusMatches(existing antflyv1.HAStandbyStatus, standbyName string, slotName string) bool {
+	return (standbyName != "" && existing.Name == standbyName) ||
+		(slotName != "" && existing.SlotName == slotName)
+}
+
+func parseHATableLines(body string) map[string]string {
+	lines := map[string]string{}
+	for _, line := range strings.Split(body, "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok || key == "" {
+			continue
+		}
+		lines[key] = value
+	}
+	return lines
+}
+
+func (r *AntflyClusterReconciler) reconcileHAPrimaryRoute(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
+	if cluster.Spec.HighAvailability == nil || cluster.Spec.HighAvailability.Mode == "" ||
+		cluster.Spec.HighAvailability.Mode == antflyv1.HAModeDisabled ||
+		cluster.Status.HAStatus == nil {
+		return nil
+	}
+	for i, action := range cluster.Status.HAStatus.PlannedActions {
+		if action.Kind != string(haActionUpdatePrimaryRoute) {
+			continue
+		}
+		if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, i) {
+			return nil
+		}
+		if !haPrimaryRouteActionHasPromotionEvidence(cluster.Status.HAStatus, cluster.Status.HAStatus.PlannedActions, i) {
+			return nil
+		}
+		if action.RouteTo == "" {
+			return nil
+		}
+		return r.updateHAPrimaryRouteService(ctx, cluster, action)
+	}
+	return nil
+}
+
+func (r *AntflyClusterReconciler) updateHAPrimaryRouteService(ctx context.Context, cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) error {
+	service := &corev1.Service{}
+	if err := r.Get(ctx, types.NamespacedName{Name: cluster.Name + "-public-api", Namespace: cluster.Namespace}, service); err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	selector, selectorOK := haPublicAPISelector(cluster, effectiveTopologyMode(cluster) == topologyModeSwarm, action.RouteTo)
+	if !selectorOK {
+		cluster.Status.HAStatus.PrimaryRoute.DesiredTarget = action.RouteTo
+		cluster.Status.HAStatus.PrimaryRoute.Stale = true
+		cluster.Status.HAStatus.PrimaryRoute.Action = string(haActionUpdatePrimaryRoute)
+		cluster.Status.HAStatus.PrimaryRoute.Reason = antflyv1.ReasonHAPrimaryRouteSelectorMissing
+		setHACondition(
+			cluster,
+			antflyv1.TypeHADegraded,
+			metav1.ConditionTrue,
+			antflyv1.ReasonHAPrimaryRouteSelectorMissing,
+			fmt.Sprintf("HA primary route target %s has no public-api Service selector", action.RouteTo),
+		)
+		return nil
+	}
+	patch := client.MergeFrom(service.DeepCopy())
+	if service.Annotations == nil {
+		service.Annotations = map[string]string{}
+	}
+	service.Annotations[haPrimaryRouteTargetAnnotation] = action.RouteTo
+	if action.FenceAuthority != "" {
+		service.Annotations[haPrimaryRouteFenceAuthorityAnnotation] = string(action.FenceAuthority)
+	} else {
+		delete(service.Annotations, haPrimaryRouteFenceAuthorityAnnotation)
+	}
+	if action.FenceGeneration > 0 {
+		service.Annotations[haPrimaryRouteFenceGenerationAnnotation] = strconv.FormatUint(action.FenceGeneration, 10)
+	} else {
+		delete(service.Annotations, haPrimaryRouteFenceGenerationAnnotation)
+	}
+	service.Spec.Selector = selector
+	service.Annotations[haPrimaryRouteSelectorAnnotation] = "true"
+	if err := r.Patch(ctx, service, patch); err != nil {
+		return err
+	}
+	cluster.Status.HAStatus.PrimaryRoute.CurrentTarget = action.RouteTo
+	cluster.Status.HAStatus.PrimaryRoute.FenceAuthority = action.FenceAuthority
+	cluster.Status.HAStatus.PrimaryRoute.FenceGeneration = action.FenceGeneration
+	cluster.Status.HAStatus.PrimaryRoute.Stale = false
+	cluster.Status.HAStatus.PrimaryRoute.Action = "None"
+	cluster.Status.HAStatus.PrimaryRoute.Reason = "PrimaryRouteCurrent"
+	return nil
+}
+
+func haPriorAdminActionsSucceeded(actions []antflyv1.HAPlannedActionStatus) bool {
+	for _, action := range actions {
+		if !haPlannedActionRequiresAdminTarget(action) {
+			continue
+		}
+		if !haAdminActionSucceededWithEvidence(action) {
+			return false
+		}
+	}
+	return true
+}
+
+func haPlannedActionDependenciesSucceeded(actions []antflyv1.HAPlannedActionStatus, index int) bool {
+	if index < 0 || index >= len(actions) {
+		return false
+	}
+	action := actions[index]
+	if action.DependsOn == "" {
+		return haPriorAdminActionsSucceeded(actions[:index])
+	}
+	for i := 0; i < index; i++ {
+		dependency := actions[i]
+		if dependency.Kind != action.DependsOn {
+			continue
+		}
+		if dependency.AdminJobName != haAdminDirectAPIName && !haPlannedActionRequiresAdminTarget(dependency) {
+			return true
+		}
+		return haAdminActionSucceededWithEvidence(dependency)
+	}
+	return false
+}
+
+func haPlannedActionDependenciesSucceededForStatus(status *antflyv1.HAStatus, actions []antflyv1.HAPlannedActionStatus, index int) bool {
+	if !haPlannedActionDependenciesSucceeded(actions, index) {
+		return false
+	}
+	action := actions[index]
+	if action.DependsOn == "" {
+		for i := 0; i < index; i++ {
+			dependency := actions[i]
+			if !haFormerPrimaryActionKind(dependency.Kind) {
+				continue
+			}
+			if !haFormerPrimaryActionSucceededWithPromotionEvidence(status, dependency) {
+				return false
+			}
+		}
+		return true
+	}
+	for i := 0; i < index; i++ {
+		dependency := actions[i]
+		if dependency.Kind != action.DependsOn {
+			continue
+		}
+		if !haFormerPrimaryActionKind(dependency.Kind) {
+			return true
+		}
+		return haFormerPrimaryActionSucceededWithPromotionEvidence(status, dependency)
+	}
+	return false
+}
+
+func haPrimaryRouteActionHasPromotionEvidence(status *antflyv1.HAStatus, actions []antflyv1.HAPlannedActionStatus, index int) bool {
+	if index < 0 || index >= len(actions) {
+		return false
+	}
+	action := actions[index]
+	if action.Kind != string(haActionUpdatePrimaryRoute) || action.RouteTo == "" || action.RouteTo == "primary" {
+		return true
+	}
+	recordedMatches := haPrimaryRouteActionMatchesRecordedPromotion(status, action)
+	for i := index - 1; i >= 0; i-- {
+		dependency := actions[i]
+		if dependency.Kind != string(haActionPromoteStandby) {
+			continue
+		}
+		return haAdminActionSucceededWithEvidence(dependency) &&
+			haPrimaryRouteActionMatchesPromotionResult(status, action, dependency.AdminResult)
+	}
+	return recordedMatches
+}
+
+func haPrimaryRouteActionMatchesRecordedPromotion(status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus) bool {
+	promotion := haPromotionReceipt(status)
+	if promotion == nil ||
+		promotion.Forced ||
+		promotion.DataLossPossible ||
+		strings.TrimSpace(promotion.PromotedStandbyID) != strings.TrimSpace(action.RouteTo) {
+		return false
+	}
+	if action.FenceAuthority != "" && promotion.FenceAuthority != action.FenceAuthority {
+		return false
+	}
+	if action.FenceGeneration != 0 && promotion.FenceGeneration != action.FenceGeneration {
+		return false
+	}
+	if action.TargetLSN != 0 {
+		return haPromotionRequiredLSN(promotion) == action.TargetLSN &&
+			haPromotionObservedLSN(promotion) >= action.TargetLSN
+	}
+	return true
+}
+
+func haPrimaryRouteActionMatchesPromotionResult(status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) bool {
+	if result == nil ||
+		result.FenceForced ||
+		result.PromotionForce ||
+		result.PromotionDataLossPossible ||
+		strings.TrimSpace(result.FencePromotedNodeID) != strings.TrimSpace(action.RouteTo) ||
+		strings.TrimSpace(result.FenceToken) == "" {
+		return false
+	}
+	if action.FenceGeneration != 0 && result.FenceGeneration != action.FenceGeneration {
+		return false
+	}
+	if action.FenceAuthority != "" && result.FenceGeneration == 0 {
+		return false
+	}
+	if action.TargetLSN != 0 {
+		if result.FenceRequiredLSN != action.TargetLSN ||
+			result.FenceObservedLSN < action.TargetLSN {
+			return false
+		}
+	} else if result.FenceRequiredLSN == 0 || result.FenceObservedLSN < result.FenceRequiredLSN {
+		return false
+	}
+	if promotion := haPromotionReceipt(status); promotion != nil {
+		return !promotion.Forced &&
+			!promotion.DataLossPossible &&
+			strings.TrimSpace(promotion.PromotedStandbyID) == strings.TrimSpace(action.RouteTo) &&
+			(action.FenceAuthority == "" || promotion.FenceAuthority == action.FenceAuthority) &&
+			(action.FenceGeneration == 0 || promotion.FenceGeneration == action.FenceGeneration) &&
+			(promotion.FenceToken == "" || promotion.FenceToken == result.FenceToken) &&
+			result.FenceClusterID != 0 &&
+			(promotion.ClusterID == 0 || promotion.ClusterID == result.FenceClusterID) &&
+			(promotion.ClusterID == 0 || promotion.ShardID == result.FenceShardID) &&
+			(promotion.ClusterID == 0 || promotion.TableID == result.FenceTableID) &&
+			(promotion.ParentTimelineID == 0 || promotion.ParentTimelineID == result.FenceParentTimelineID) &&
+			(promotion.ParentEpoch == 0 || promotion.ParentEpoch == result.FenceParentEpoch) &&
+			(promotion.NewTimelineID == 0 || promotion.NewTimelineID == result.FenceNewTimelineID) &&
+			(promotion.NewEpoch == 0 || promotion.NewEpoch == result.FenceNewEpoch) &&
+			(haPromotionRequiredLSN(promotion) == 0 || haPromotionRequiredLSN(promotion) == result.FenceRequiredLSN) &&
+			haPromotionObservedLSN(promotion) >= result.FenceRequiredLSN
+	}
+	return true
+}
+
+func haAdminActionSucceededWithEvidence(action antflyv1.HAPlannedActionStatus) bool {
+	if action.AdminJobPhase != haAdminJobPhaseSucceeded {
+		return false
+	}
+	if !haActionRequiresAdminResult(haActionKind(action.Kind)) {
+		return true
+	}
+	if action.AdminJobName == haAdminDirectAPIName {
+		if !haDirectAdminActionReceiptMatches(action) {
+			return false
+		}
+	} else if !haAdminActionReceiptMatches(action) {
+		return false
+	}
+	return haActionHasRequiredAdminResult(action)
+}
+
+func haAdminActionSucceededWithStatusEvidence(status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus) bool {
+	if haFormerPrimaryActionKind(action.Kind) {
+		return haFormerPrimaryActionSucceededWithPromotionEvidence(status, action)
+	}
+	if action.Kind == string(haActionPromoteStandby) {
+		return haPromotionActionSucceededWithStatusEvidence(status, action)
+	}
+	return haAdminActionSucceededWithEvidence(action)
+}
+
+func haPromotionActionSucceededWithStatusEvidence(status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus) bool {
+	if !haAdminActionSucceededWithEvidence(action) {
+		return false
+	}
+	promotion := haPromotionReceipt(status)
+	if promotion == nil {
+		return true
+	}
+	result := action.AdminResult
+	return result != nil &&
+		!promotion.Forced &&
+		!promotion.DataLossPossible &&
+		strings.TrimSpace(promotion.OldPrimaryID) == strings.TrimSpace(result.FenceOldPrimaryID) &&
+		strings.TrimSpace(promotion.PromotedStandbyID) == strings.TrimSpace(action.StandbyName) &&
+		strings.TrimSpace(promotion.PromotedStandbyID) == strings.TrimSpace(result.FencePromotedNodeID) &&
+		result.FenceClusterID != 0 &&
+		(promotion.ClusterID == 0 || promotion.ClusterID == result.FenceClusterID) &&
+		(promotion.ClusterID == 0 || promotion.ShardID == result.FenceShardID) &&
+		(promotion.ClusterID == 0 || promotion.TableID == result.FenceTableID) &&
+		(action.FenceAuthority == "" || promotion.FenceAuthority == action.FenceAuthority) &&
+		(action.FenceGeneration == 0 || promotion.FenceGeneration == action.FenceGeneration) &&
+		promotion.FenceGeneration == result.FenceGeneration &&
+		promotion.FenceToken == result.FenceToken &&
+		promotion.ParentTimelineID == result.FenceParentTimelineID &&
+		promotion.ParentEpoch == result.FenceParentEpoch &&
+		promotion.NewTimelineID == result.FenceNewTimelineID &&
+		promotion.NewEpoch == result.FenceNewEpoch &&
+		haPromotionRequiredLSN(promotion) == result.FenceRequiredLSN &&
+		haPromotionObservedLSN(promotion) >= result.FenceRequiredLSN &&
+		result.FenceObservedLSN >= result.FenceRequiredLSN
+}
+
+func haActionRequiresAdminResult(kind haActionKind) bool {
+	_, _, ok := haDirectAdminActionReceiptSpec(kind)
+	return ok
+}
+
+func haActionHasRequiredAdminResult(action antflyv1.HAPlannedActionStatus) bool {
+	result := action.AdminResult
+	if result == nil {
+		return false
+	}
+	expectedSlotName := haActionSlotName(action)
+	expectedManifestID := haExpectedSeedBeginManifestID(action, expectedSlotName)
+	switch haActionKind(action.Kind) {
+	case haActionCreateSlot:
+		return result.SlotAction == "create" && haResultSlotNameMatches(result.SlotName, expectedSlotName)
+	case haActionResumeSlot:
+		return result.SlotAction == "resume" && haResultSlotNameMatches(result.SlotName, expectedSlotName)
+	case haActionPauseSlot:
+		return result.SlotAction == "pause" && haResultSlotNameMatches(result.SlotName, expectedSlotName)
+	case haActionDropSlot:
+		return result.SlotAction == "drop" && haResultSlotNameMatches(result.SlotName, expectedSlotName)
+	case haActionSeedStandby, haActionMarkReseed:
+		return haResultSlotNameMatches(result.SlotName, expectedSlotName) &&
+			haResultManifestMatches(result.ManifestID, expectedManifestID) &&
+			haResultBackupLSNMatches(result.BackupLSN, action.TargetLSN) &&
+			result.StartRecordLSN > 0
+	case haActionFinishStandbySeed:
+		return haResultManifestMatches(result.ManifestID, expectedManifestID) &&
+			haResultBackupLSNMatches(result.BackupLSN, action.TargetLSN) &&
+			result.EndRecordLSN > 0
+	case haActionBootstrapStandbySeed:
+		return haResultManifestMatches(result.ManifestID, expectedManifestID) &&
+			haResultBackupLSNMatches(result.BackupLSN, action.TargetLSN) &&
+			result.CheckpointLSN > 0
+	case haActionAcquireFence:
+		return result.FenceGeneration > 0 &&
+			(action.FenceGeneration == 0 || result.FenceGeneration == action.FenceGeneration) &&
+			result.FenceToken != "" &&
+			(action.StandbyName == "" || result.FencePromotedNodeID == action.StandbyName)
+	case haActionAssessPromotion:
+		return haPromotionAssessmentResultMatchesAction(action, result)
+	case haActionPromoteStandby:
+		return haPromotionAdminResultHasEvidence(action, result)
+	case haActionDemoteFormerPrimary, haActionRewindFormerPrimary, haActionReseedFormerPrimary:
+		return haRejoinResultMatchesRequiredAdminResult(action, result)
+	default:
+		return true
+	}
+}
+
+func haPromotionAssessmentResultMatchesAction(action antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) bool {
+	if result == nil ||
+		!result.PromotionCanPromote ||
+		!result.PromotionFenced ||
+		!result.PromotionSafe ||
+		result.PromotionForce ||
+		strings.TrimSpace(result.PromotionMode) != "safe" ||
+		result.PromotionDataLossPossible ||
+		result.PromotionRequiresFencing ||
+		result.PromotionRequiresForce {
+		return false
+	}
+	if action.TargetLSN > 0 {
+		return result.PromotionRequiredLSN == action.TargetLSN &&
+			result.PromotionReceivedLSN >= action.TargetLSN &&
+			result.PromotionAppliedLSN >= action.TargetLSN
+	}
+	return result.PromotionReceivedLSN >= result.PromotionRequiredLSN &&
+		result.PromotionAppliedLSN >= result.PromotionRequiredLSN
+}
+
+func haDirectAdminActionReceiptMatches(action antflyv1.HAPlannedActionStatus) bool {
+	result := action.AdminResult
+	if result == nil || result.SchemaVersion == 0 {
+		return false
+	}
+	return haAdminActionReceiptMatches(action)
+}
+
+func haAdminActionReceiptMatches(action antflyv1.HAPlannedActionStatus) bool {
+	result := action.AdminResult
+	if result == nil {
+		return false
+	}
+	expectedKind, expectedTarget, expectedState := haDirectAdminActionReceiptExpectation(action)
+	requireExpectedNode := haAdminActionReceiptRequiresPlannedNode(action)
+	return adminsdk.HAReceiptMatchesNode(adminsdk.HAActionReceipt{
+		ActionId:   result.ActionID,
+		ActionKind: adminsdk.HAActionReceiptActionKind(strings.TrimSpace(result.ActionKind)),
+		Target:     result.ActionTarget,
+		State:      adminsdk.HAActionReceiptState(strings.TrimSpace(result.ActionState)),
+		NodeId:     result.ActionNodeID,
+	}, adminsdk.HAReceiptExpectation{
+		ActionKind: adminsdk.HAActionReceiptActionKind(strings.TrimSpace(expectedKind)),
+		State:      adminsdk.HAActionReceiptState(strings.TrimSpace(expectedState)),
+	}, expectedTarget, action.AdminNodeID, requireExpectedNode)
+}
+
+func haAdminActionReceiptRequiresPlannedNode(action antflyv1.HAPlannedActionStatus) bool {
+	return action.AdminJobName == haAdminDirectAPIName ||
+		strings.TrimSpace(action.AdminURL) != "" ||
+		strings.TrimSpace(action.AdminMethod) != "" ||
+		strings.TrimSpace(action.AdminPath) != ""
+}
+
+func haDirectAdminActionReceiptExpectation(action antflyv1.HAPlannedActionStatus) (string, string, string) {
+	expectedKind, expectedState, ok := haDirectAdminActionReceiptSpec(haActionKind(action.Kind))
+	if !ok {
+		return "", "", ""
+	}
+	return expectedKind, haDirectAdminActionReceiptTarget(action), expectedState
+}
+
+func haDirectAdminActionReceiptTarget(action antflyv1.HAPlannedActionStatus) string {
+	expectedSlotName := haActionSlotName(action)
+	expectedManifestID := haExpectedSeedBeginManifestID(action, expectedSlotName)
+	switch haActionKind(action.Kind) {
+	case haActionCreateSlot, haActionResumeSlot, haActionPauseSlot, haActionDropSlot:
+		return expectedSlotName
+	case haActionSeedStandby, haActionMarkReseed:
+		return expectedManifestID
+	case haActionFinishStandbySeed, haActionBootstrapStandbySeed:
+		return expectedManifestID
+	case haActionAcquireFence, haActionAssessPromotion, haActionPromoteStandby, haActionDemoteFormerPrimary, haActionRewindFormerPrimary, haActionReseedFormerPrimary:
+		return strings.TrimSpace(action.StandbyName)
+	default:
+		return ""
+	}
+}
+
+func haPromotionAdminResultHasEvidence(action antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) bool {
+	if result == nil ||
+		result.FenceGeneration == 0 ||
+		(action.FenceGeneration != 0 && result.FenceGeneration != action.FenceGeneration) ||
+		strings.TrimSpace(result.FenceToken) == "" ||
+		result.FenceClusterID == 0 ||
+		strings.TrimSpace(result.FenceOldPrimaryID) == "" ||
+		strings.TrimSpace(result.FencePromotedNodeID) == "" ||
+		(action.StandbyName != "" && result.FencePromotedNodeID != action.StandbyName) ||
+		result.FenceParentTimelineID == 0 ||
+		result.FenceParentEpoch == 0 ||
+		result.FenceNewTimelineID == 0 ||
+		result.FenceNewEpoch == 0 ||
+		result.FenceRequiredLSN == 0 ||
+		result.FenceObservedLSN < result.FenceRequiredLSN ||
+		result.FenceForced ||
+		result.PromotionForce ||
+		strings.TrimSpace(result.PromotionMode) != "safe" ||
+		result.PromotionDataLossPossible {
+		return false
+	}
+	if action.TargetLSN != 0 && result.FenceRequiredLSN != action.TargetLSN {
+		return false
+	}
+	return true
+}
+
+func haRejoinResultMatchesRequiredAdminResult(action antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) bool {
+	if result == nil ||
+		strings.TrimSpace(result.RejoinAction) == "" ||
+		strings.TrimSpace(result.FormerNodeID) == "" ||
+		result.TargetTimelineID == 0 ||
+		result.TargetEpoch == 0 {
+		return false
+	}
+	switch haActionKind(action.Kind) {
+	case haActionDemoteFormerPrimary:
+		switch result.RejoinAction {
+		case "reject_unfenced", "already_current", "rewind", "reseed":
+		default:
+			return false
+		}
+	case haActionRewindFormerPrimary:
+		if result.RejoinAction != "rewind" {
+			return false
+		}
+		if !result.RewindExecuted ||
+			result.RewindPreviousLastLSN == 0 ||
+			result.RewindCurrentLastLSN != result.ForkLSN ||
+			result.RewindNextLSN != result.ForkLSN+1 ||
+			result.RewindPreviousLastLSN < result.RewindCurrentLastLSN ||
+			result.RewindDiscardedLSNCount != result.RewindPreviousLastLSN-result.RewindCurrentLastLSN {
+			return false
+		}
+	case haActionReseedFormerPrimary:
+		if result.RejoinAction != "reseed" {
+			return false
+		}
+		if !result.ReseedExecuted ||
+			!result.ReseedRequired ||
+			!result.ReseedBaseBackupRequired ||
+			strings.TrimSpace(result.ReseedSlotName) != strings.TrimSpace(result.FormerNodeID) {
+			return false
+		}
+	default:
+		return false
+	}
+	if action.StandbyName != "" && result.FormerNodeID != action.StandbyName {
+		return false
+	}
+	if action.TargetLSN > 0 && result.ForkLSN != action.TargetLSN {
+		return false
+	}
+	if action.ObservedLSN > 0 && result.FormerLastLSN != action.ObservedLSN {
+		return false
+	}
+	if action.RetainedFromLSN > 0 && result.RetainedFromLSN != action.RetainedFromLSN {
+		return false
+	}
+	return true
+}
+
+func haFormerPrimaryActionSucceededWithPromotionEvidence(status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus) bool {
+	return haAdminActionSucceededWithEvidence(action) &&
+		haRejoinResultMatchesPromotion(status, action, action.AdminResult)
+}
+
+func haRejoinResultMatchesPromotion(status *antflyv1.HAStatus, action antflyv1.HAPlannedActionStatus, result *antflyv1.HAAdminActionResultStatus) bool {
+	if !haRejoinResultMatchesRequiredAdminResult(action, result) {
+		return false
+	}
+	promotion := haPromotionReceipt(status)
+	if promotion == nil {
+		return false
+	}
+	if strings.TrimSpace(result.FormerNodeID) != strings.TrimSpace(promotion.OldPrimaryID) {
+		return false
+	}
+	if result.TargetTimelineID != promotion.NewTimelineID || result.TargetEpoch != promotion.NewEpoch {
+		return false
+	}
+	if promotion.SwitchLSN != 0 && result.ForkLSN != promotion.SwitchLSN {
+		return false
+	}
+	if promotion.RequiredLSN != 0 && result.ForkLSN != promotion.RequiredLSN {
+		return false
+	}
+	if haActionKind(action.Kind) == haActionRewindFormerPrimary &&
+		(promotion.Forced || promotion.DataLossPossible) {
+		return false
+	}
+	if action.FenceAuthority != "" && promotion.FenceAuthority != action.FenceAuthority {
+		return false
+	}
+	if action.FenceGeneration != 0 && promotion.FenceGeneration != action.FenceGeneration {
+		return false
+	}
+	return true
+}
+
+func haResultSlotNameMatches(resultSlotName string, expectedSlotName string) bool {
+	resultSlotName = strings.TrimSpace(resultSlotName)
+	if resultSlotName == "" {
+		return false
+	}
+	expectedSlotName = strings.TrimSpace(expectedSlotName)
+	return expectedSlotName == "" || resultSlotName == expectedSlotName
+}
+
+func haResultManifestMatches(resultManifestID string, expectedManifestID string) bool {
+	resultManifestID = strings.TrimSpace(resultManifestID)
+	if resultManifestID == "" {
+		return false
+	}
+	expectedManifestID = strings.TrimSpace(expectedManifestID)
+	return expectedManifestID == "" || resultManifestID == expectedManifestID
+}
+
+func haResultBackupLSNMatches(resultBackupLSN uint64, expectedBackupLSN uint64) bool {
+	if resultBackupLSN == 0 {
+		return false
+	}
+	return expectedBackupLSN == 0 || resultBackupLSN == expectedBackupLSN
+}
+
+func haExpectedSeedBeginManifestID(action antflyv1.HAPlannedActionStatus, slotName string) string {
+	for i := 0; i+1 < len(action.AdminCommand); i++ {
+		if action.AdminCommand[i] == "--manifest-id" {
+			return strings.TrimSpace(action.AdminCommand[i+1])
+		}
+	}
+	if manifestID := haManifestIDFromPath(action.SeedManifestPath); manifestID != "" {
+		return manifestID
+	}
+	if strings.TrimSpace(slotName) == "" || action.TargetLSN == 0 {
+		return ""
+	}
+	return fmt.Sprintf("base-%s-%d", strings.TrimSpace(slotName), action.TargetLSN)
+}
+
+func haManifestIDFromPath(manifestPath string) string {
+	manifestPath = strings.TrimSpace(manifestPath)
+	if manifestPath == "" {
+		return ""
+	}
+	name := path.Base(manifestPath)
+	if name == "." || name == "/" {
+		return ""
+	}
+	return strings.TrimSuffix(name, ".afha")
+}
+
+func (r *AntflyClusterReconciler) updateHAAdminJobExecutionCondition(cluster *antflyv1.AntflyCluster) {
+	if cluster.Status.HAStatus == nil {
+		return
+	}
+	for _, action := range cluster.Status.HAStatus.PlannedActions {
+		if action.AdminJobPhase != haAdminJobPhaseMissingAdminURL {
+			continue
+		}
+		setHACondition(
+			cluster,
+			antflyv1.TypeHADegraded,
+			metav1.ConditionTrue,
+			antflyv1.ReasonHAAdminURLMissing,
+			fmt.Sprintf("HA admin action %s cannot execute because no target admin URL is configured", action.Kind),
+		)
+		return
+	}
+	for _, action := range cluster.Status.HAStatus.PlannedActions {
+		if action.AdminJobPhase != haAdminJobPhaseFailed {
+			continue
+		}
+		jobName := action.AdminJobName
+		if jobName == "" {
+			jobName = "unknown"
+		}
+		message := fmt.Sprintf("HA admin action %s failed in Job %s", action.Kind, jobName)
+		if strings.TrimSpace(action.AdminError) != "" {
+			message = fmt.Sprintf("%s: %s", message, strings.TrimSpace(action.AdminError))
+		}
+		reason := antflyv1.ReasonHAAdminJobFailed
+		if action.AdminStatusCode == http.StatusUnauthorized {
+			reason = antflyv1.ReasonHAAdminUnauthorized
+		}
+		setHACondition(
+			cluster,
+			antflyv1.TypeHADegraded,
+			metav1.ConditionTrue,
+			reason,
+			message,
+		)
+		return
+	}
+	for _, action := range cluster.Status.HAStatus.PlannedActions {
+		if action.AdminJobPhase != haAdminJobPhasePending || strings.TrimSpace(action.AdminError) == "" {
+			continue
+		}
+		executor := action.AdminJobName
+		if executor == "" {
+			executor = "unknown"
+		}
+		setHACondition(
+			cluster,
+			antflyv1.TypeHADegraded,
+			metav1.ConditionTrue,
+			antflyv1.ReasonHAAdminActionRetrying,
+			fmt.Sprintf("HA admin action %s is retrying in %s after a transient error: %s", action.Kind, executor, strings.TrimSpace(action.AdminError)),
+		)
+		return
+	}
+	for _, action := range cluster.Status.HAStatus.PlannedActions {
+		if action.AdminJobPhase != haAdminJobPhaseSucceeded ||
+			!haActionRequiresAdminResult(haActionKind(action.Kind)) ||
+			haAdminActionSucceededWithStatusEvidence(cluster.Status.HAStatus, action) {
+			continue
+		}
+		jobName := action.AdminJobName
+		if jobName == "" {
+			jobName = "unknown"
+		}
+		setHACondition(
+			cluster,
+			antflyv1.TypeHADegraded,
+			metav1.ConditionTrue,
+			antflyv1.ReasonHAAdminResultMissing,
+			fmt.Sprintf("HA admin action %s succeeded in Job %s, but the operator has not observed typed result evidence and a matching action receipt; dependent HA actions remain blocked", action.Kind, jobName),
+		)
+		return
+	}
+
+	identity := haReplicationIdentity(cluster.Spec.HighAvailability)
+	if identity == nil {
+		return
+	}
+	for i, action := range cluster.Status.HAStatus.PlannedActions {
+		if action.Kind != string(haActionPromoteStandby) ||
+			action.AdminJobPhase != haAdminJobPhaseSucceeded ||
+			action.StandbyName == "" {
+			continue
+		}
+		if !haPlannedActionDependenciesSucceeded(cluster.Status.HAStatus.PlannedActions, i) {
+			continue
+		}
+		if !haPromotionStatusMatches(cluster.Status.HAStatus.LastPromotion, identity, action) {
+			continue
+		}
+		if haPromotionReceipt(cluster.Status.HAStatus) != nil {
+			continue
+		}
+		jobName := action.AdminJobName
+		if jobName == "" {
+			jobName = "unknown"
+		}
+		setHACondition(
+			cluster,
+			antflyv1.TypeHADegraded,
+			metav1.ConditionTrue,
+			antflyv1.ReasonHAPromotionReceiptMissing,
+			fmt.Sprintf("HA promotion action %s succeeded in Job %s, but the operator has not observed a complete promotion receipt with a fence token; former-primary rejoin remains blocked", action.Kind, jobName),
+		)
+		return
+	}
+}
+
+func buildHAAdminJob(cluster *antflyv1.AntflyCluster, admin *antflyv1.HAAdminSpec, action antflyv1.HAPlannedActionStatus) *batchv1.Job {
+	args := []string{"ha", "--ha-url", action.AdminURL}
+	if tokenEnvVar := haAdminConfiguredTokenEnvVar(admin); tokenEnvVar != "" {
+		args = append(args, "--ha-token-env", tokenEnvVar)
+	}
+	args = append(args, "--")
+	args = append(args, action.AdminCommand...)
+	labels := haAdminJobLabels(cluster, action)
+	annotations := map[string]string{
+		"antfly.io/ha-action-kind":  action.Kind,
+		"antfly.io/ha-admin-url":    action.AdminURL,
+		"antfly.io/ha-command-hash": haAdminActionHash(action),
+	}
+	if action.DependsOn != "" {
+		annotations["antfly.io/ha-action-depends-on"] = action.DependsOn
+	}
+	if action.AdminMethod != "" {
+		annotations["antfly.io/ha-admin-method"] = action.AdminMethod
+	}
+	if action.AdminPath != "" {
+		annotations["antfly.io/ha-admin-path"] = action.AdminPath
+	}
+	deadlineSeconds := haAdminJobTimeoutSeconds(admin)
+	backoffLimit := haAdminJobBackoffLimit(admin)
+	ttlSecondsAfterFinished := haAdminJobTTLSecondsAfterFinished(admin)
+
+	return &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        haAdminJobName(cluster, action),
+			Namespace:   cluster.Namespace,
+			Labels:      labels,
+			Annotations: annotations,
+		},
+		Spec: batchv1.JobSpec{
+			ActiveDeadlineSeconds:   &deadlineSeconds,
+			BackoffLimit:            &backoffLimit,
+			TTLSecondsAfterFinished: &ttlSecondsAfterFinished,
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				Spec: corev1.PodSpec{
+					ServiceAccountName: cluster.Spec.ServiceAccountName,
+					RestartPolicy:      corev1.RestartPolicyOnFailure,
+					SecurityContext:    antflyPodSecurityContext(),
+					Containers: []corev1.Container{{
+						Name:            "ha-admin",
+						Image:           cluster.Spec.Image,
+						ImagePullPolicy: corev1.PullPolicy(cluster.Spec.ImagePullPolicy),
+						Command:         []string{"/antfly"},
+						Args:            args,
+						EnvFrom:         append([]corev1.EnvFromSource{}, admin.EnvFrom...),
+						VolumeMounts:    append([]corev1.VolumeMount{}, admin.VolumeMounts...),
+					}},
+					Volumes: append([]corev1.Volume{}, admin.Volumes...),
+				},
+			},
+		},
+	}
+}
+
+func haAdminTokenEnvVar(admin *antflyv1.HAAdminSpec) string {
+	if configured := haAdminConfiguredTokenEnvVar(admin); configured != "" {
+		return configured
+	}
+	return haAdminTokenDefaultEnvVar
+}
+
+func haAdminConfiguredTokenEnvVar(admin *antflyv1.HAAdminSpec) string {
+	if admin == nil {
+		return ""
+	}
+	return strings.TrimSpace(admin.TokenEnvVar)
+}
+
+func haAdminJobBackoffLimit(admin *antflyv1.HAAdminSpec) int32 {
+	if admin != nil && admin.JobBackoffLimit != nil {
+		return *admin.JobBackoffLimit
+	}
+	return 3
+}
+
+func haAdminJobTimeoutSeconds(admin *antflyv1.HAAdminSpec) int64 {
+	if admin != nil && admin.JobTimeoutSeconds != nil {
+		return *admin.JobTimeoutSeconds
+	}
+	return 600
+}
+
+func haAdminJobTTLSecondsAfterFinished(admin *antflyv1.HAAdminSpec) int32 {
+	if admin != nil && admin.JobTTLSecondsAfterFinished != nil {
+		return *admin.JobTTLSecondsAfterFinished
+	}
+	return 86400
+}
+
+func haAdminJobLabels(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) map[string]string {
+	labels := podLabels(cluster, "ha-admin")
+	labels["antfly.io/ha-action-kind"] = strings.ToLower(action.Kind)
+	labels["antfly.io/ha-command-hash"] = haAdminActionHash(action)[:10]
+	if action.StandbyName != "" {
+		labels["antfly.io/ha-standby"] = action.StandbyName
+	}
+	return labels
+}
+
+func haAdminJobComplete(job *batchv1.Job) bool {
+	return haAdminJobPhase(job) == haAdminJobPhaseSucceeded
+}
+
+func haAdminJobPhase(job *batchv1.Job) string {
+	for _, condition := range job.Status.Conditions {
+		if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue {
+			return haAdminJobPhaseFailed
+		}
+		if condition.Type == batchv1.JobComplete && condition.Status == corev1.ConditionTrue {
+			return haAdminJobPhaseSucceeded
+		}
+	}
+	if job.Status.Active > 0 {
+		return haAdminJobPhaseRunning
+	}
+	return haAdminJobPhasePending
+}
+
+func haAdminJobName(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) string {
+	hash := haAdminActionHash(action)[:10]
+	kind := strings.ToLower(action.Kind)
+	base := fmt.Sprintf("%s-ha-%s", cluster.Name, kind)
+	maxBaseLen := 63 - len(hash) - 1
+	if len(base) > maxBaseLen {
+		base = strings.TrimRight(base[:maxBaseLen], "-")
+	}
+	if base == "" {
+		base = "ha"
+	}
+	return fmt.Sprintf("%s-%s", base, hash)
+}
+
+func haAdminActionHash(action antflyv1.HAPlannedActionStatus) string {
+	rendered, err := json.Marshal(struct {
+		Kind         string   `json:"kind"`
+		Phase        string   `json:"phase,omitempty"`
+		Executor     string   `json:"executor,omitempty"`
+		DependsOn    string   `json:"dependsOn,omitempty"`
+		StandbyName  string   `json:"standbyName,omitempty"`
+		SlotName     string   `json:"slotName,omitempty"`
+		TargetLSN    uint64   `json:"targetLSN,omitempty"`
+		ObservedLSN  uint64   `json:"observedLSN,omitempty"`
+		RetainedLSN  uint64   `json:"retainedFromLSN,omitempty"`
+		RouteFrom    string   `json:"routeFrom,omitempty"`
+		RouteTo      string   `json:"routeTo,omitempty"`
+		FenceAuth    string   `json:"fenceAuthority,omitempty"`
+		FenceHolder  string   `json:"fenceHolder,omitempty"`
+		FenceGen     uint64   `json:"fenceGeneration,omitempty"`
+		FenceReason  string   `json:"fenceReason,omitempty"`
+		SeedManifest string   `json:"seedManifestPath,omitempty"`
+		SeedRoot     string   `json:"seedContentRoot,omitempty"`
+		AdminURL     string   `json:"adminURL,omitempty"`
+		AdminNodeID  string   `json:"adminNodeID,omitempty"`
+		AdminMethod  string   `json:"adminMethod,omitempty"`
+		AdminPath    string   `json:"adminPath,omitempty"`
+		AdminCommand []string `json:"adminCommand,omitempty"`
+		Reason       string   `json:"reason,omitempty"`
+	}{
+		Kind:         action.Kind,
+		Phase:        action.Phase,
+		Executor:     action.Executor,
+		DependsOn:    action.DependsOn,
+		StandbyName:  action.StandbyName,
+		SlotName:     action.SlotName,
+		TargetLSN:    action.TargetLSN,
+		ObservedLSN:  action.ObservedLSN,
+		RetainedLSN:  action.RetainedFromLSN,
+		RouteFrom:    action.RouteFrom,
+		RouteTo:      action.RouteTo,
+		FenceAuth:    string(action.FenceAuthority),
+		FenceHolder:  action.FenceHolder,
+		FenceGen:     action.FenceGeneration,
+		FenceReason:  action.FenceReason,
+		SeedManifest: action.SeedManifestPath,
+		SeedRoot:     action.SeedContentRoot,
+		AdminURL:     action.AdminURL,
+		AdminNodeID:  action.AdminNodeID,
+		AdminMethod:  action.AdminMethod,
+		AdminPath:    action.AdminPath,
+		AdminCommand: action.AdminCommand,
+		Reason:       action.Reason,
+	})
+	if err != nil {
+		rendered = []byte(fmt.Sprintf("%s/%s/%s/%d/%s/%d/%s/%s/%v/%s", action.Kind, action.StandbyName, action.SlotName, action.TargetLSN, action.FenceAuthority, action.FenceGeneration, action.FenceHolder, action.AdminURL, action.AdminCommand, action.Reason))
+	}
+	sum := sha256.Sum256(rendered)
+	return fmt.Sprintf("%x", sum)
 }
 
 func (r *AntflyClusterReconciler) updateRolloutCondition(cluster *antflyv1.AntflyCluster, statefulSets ...*appsv1.StatefulSet) {
@@ -4263,6 +8781,8 @@ func (r *AntflyClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ConfigMap{}).
+		Owns(&coordinationv1.Lease{}).
+		Owns(&batchv1.Job{}).
 		Owns(&policyv1.PodDisruptionBudget{}).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.requestsForPod))
 	if r.ManageInferencePools {

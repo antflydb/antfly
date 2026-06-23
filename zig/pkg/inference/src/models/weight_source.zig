@@ -305,10 +305,19 @@ pub const ShardedSafetensorsSource = struct {
         reader: *safetensors.MMapReader,
         meta: safetensors.TensorMeta,
     } {
+        const resolved = try self.findTensorMetaWithShard(name);
+        return .{ .reader = resolved.reader, .meta = resolved.meta };
+    }
+
+    pub fn findTensorMetaWithShard(self: *ShardedSafetensorsSource, name: []const u8) !struct {
+        shard_name: []const u8,
+        reader: *safetensors.MMapReader,
+        meta: safetensors.TensorMeta,
+    } {
         const shard_name = self.index.weight_map.get(name) orelse return error.TensorNotFound;
         const reader = try self.getOrOpenReader(shard_name);
         const meta = reader.header.tensors.get(name) orelse return error.TensorNotFound;
-        return .{ .reader = reader, .meta = meta };
+        return .{ .shard_name = shard_name, .reader = reader, .meta = meta };
     }
 
     fn getOrOpenReader(self: *ShardedSafetensorsSource, shard_name: []const u8) !*safetensors.MMapReader {

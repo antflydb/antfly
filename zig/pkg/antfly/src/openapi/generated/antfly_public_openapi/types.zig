@@ -5,8 +5,8 @@ const std = @import("std");
 const antfly_indexes_openapi = @import("antfly_indexes_openapi");
 const antfly_schema_openapi = @import("antfly_schema_openapi");
 const antfly_generating_api_openapi = @import("antfly_generating_api_openapi");
-const antfly_eval_openapi = @import("antfly_eval_openapi");
 const antfly_generating_openapi = @import("antfly_generating_openapi");
+const antfly_eval_openapi = @import("antfly_eval_openapi");
 const antfly_reranking_openapi = @import("antfly_reranking_openapi");
 
 pub const Error = struct {
@@ -1143,6 +1143,19 @@ pub const RowsDocKeyRange = struct {
     start: ?[]const u8 = null,
     /// Exclusive physical row-key upper bound.
     end: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.start) |value| {
+            try jw.objectField("start");
+            try jw.write(value);
+        }
+        if (self.end) |value| {
+            try jw.objectField("end");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const RowsExpressionField = struct {
@@ -1753,20 +1766,10 @@ pub const PruneStats = struct {
     tokens_pruned: ?i64 = null,
 };
 
-/// Configuration for the retrieval agent's pipeline steps and tool-use behavior. Each step can have its own generator (or chain of generators) and step-specific options. If a step is not configured, it is skipped (retrieval always runs).
-pub const RetrievalAgentSteps = struct {
-    /// Tool configuration for the retrieval agent. Controls which tools are available and their settings. If not specified, tools are automatically determined from the table's available indexes.
+/// Configuration for the retrieval step. Retrieval tools are constrained by the top-level request tools policy when both are present.
+pub const RetrievalStepConfig = struct {
+    /// Tool configuration for the retrieval step. When set, this narrows the top-level tools policy for retrieval execution.
     tools: ?antfly_generating_api_openapi.ChatToolsConfig = null,
-    /// Configuration for query classification and transformation. When set, runs classification before retrieval to select the optimal strategy (simple/decompose/step_back/hyde) and transform the query.
-    classification: ?antfly_generating_api_openapi.ClassificationStepConfig = null,
-    /// Configuration for generation from retrieved documents. When set, generates a response with citations after retrieval completes.
-    generation: ?antfly_generating_api_openapi.GenerationStepConfig = null,
-    /// Configuration for generating follow-up questions. Requires steps.generation to be set.
-    followup: ?antfly_generating_api_openapi.FollowupStepConfig = null,
-    /// Configuration for confidence assessment of the generated response. Requires steps.generation to be set.
-    confidence: ?antfly_generating_api_openapi.ConfidenceStepConfig = null,
-    /// Configuration for inline evaluation. Runs evaluators on retrieved documents and/or generated response. Requires steps.generation for generation-quality evaluators (faithfulness, completeness, etc.).
-    eval: ?antfly_eval_openapi.EvalConfig = null,
 };
 
 /// DEPRECATED: Use RetrievalAgentSteps instead. Configuration for the answer agent's pipeline steps.
@@ -2479,6 +2482,19 @@ pub const TransactionCommitResponse = struct {
 pub const RowSelector = struct {
     primary: ?RowPrimarySelector = null,
     unique: ?RowUniqueSelector = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.primary) |value| {
+            try jw.objectField("primary");
+            try jw.write(value);
+        }
+        if (self.unique) |value| {
+            try jw.objectField("unique");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Conjunction of partial-unique predicate atoms.
@@ -2720,6 +2736,22 @@ pub const RetrievalAgentUsage = struct {
     resources_retrieved: ?i64 = null,
     /// Token pruning statistics, present when max_context_tokens was configured
     prune_stats: ?PruneStats = null,
+};
+
+/// Configuration for the retrieval agent's pipeline steps and tool-use behavior. Each step can have its own generator (or chain of generators) and step-specific options. If a step is not configured, it is skipped (retrieval always runs).
+pub const RetrievalAgentSteps = struct {
+    /// Configuration for query classification and transformation. When set, runs classification before retrieval to select the optimal strategy (simple/decompose/step_back/hyde) and transform the query.
+    classification: ?antfly_generating_api_openapi.ClassificationStepConfig = null,
+    /// Configuration for retrieval tool execution. Retrieval-step tools narrow the top-level tools policy when both are provided.
+    retrieval: ?RetrievalStepConfig = null,
+    /// Configuration for generation from retrieved documents. When set, generates a response with citations after retrieval completes.
+    generation: ?antfly_generating_api_openapi.GenerationStepConfig = null,
+    /// Configuration for generating follow-up questions. Requires steps.generation to be set.
+    followup: ?antfly_generating_api_openapi.FollowupStepConfig = null,
+    /// Configuration for confidence assessment of the generated response. Requires steps.generation to be set.
+    confidence: ?antfly_generating_api_openapi.ConfidenceStepConfig = null,
+    /// Configuration for inline evaluation. Runs evaluators on retrieved documents and/or generated response. Requires steps.generation for generation-quality evaluators (faithfulness, completeness, etc.).
+    eval: ?antfly_eval_openapi.EvalConfig = null,
 };
 
 /// Condition for matching rows between tables.
@@ -3529,7 +3561,9 @@ pub const RetrievalAgentRequest = struct {
     generator: ?antfly_generating_openapi.GeneratorConfig = null,
     /// Chain of generators
     chain: ?[]const antfly_generating_openapi.ChainLink = null,
-    /// Tool and step configuration
+    /// Default tool policy for this agent run. Step-specific tool policies narrow this default for their step; retrieval currently uses steps.retrieval.tools.
+    tools: ?antfly_generating_api_openapi.ChatToolsConfig = null,
+    /// Step configuration
     steps: ?RetrievalAgentSteps = null,
     /// Handlebars template for rendering documents in the generation prompt. Default uses TOON format for token efficiency. Requires steps.generation to be set.
     document_renderer: ?[]const u8 = null,
@@ -3614,6 +3648,19 @@ pub const RowsConflictTarget = struct {
     /// Set to `true` to target the declared primary key.
     primary: ?bool = null,
     unique: ?RowsConflictUniqueTarget = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.primary) |value| {
+            try jw.objectField("primary");
+            try jw.write(value);
+        }
+        if (self.unique) |value| {
+            try jw.objectField("unique");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Typed conflict action for insert operations. `nothing` skips the insert when the target already exists. `update` applies the same typed update operators as ordinary row updates, with expression sources allowed to reference `existing` and `proposed` row images.

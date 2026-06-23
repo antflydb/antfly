@@ -125,7 +125,7 @@ pub fn forwardPreparedGreedyFromFinalHidden(
     lm_head_linear_slot: usize,
 ) !?i64 {
     if (preparedTailDisabled()) return null;
-    // Final logit softcap is monotonic, so it preserves greedy argmax.
+    if (!gpt_arch.canUseFastGreedyArgmaxForConfig(gpt_config)) return null;
     timing_stats.greedy_calls += 1;
     const started_at = monotonicNowNs();
     const token = switch (norm_kind) {
@@ -174,19 +174,21 @@ pub fn forwardGreedyFromFinalHidden(
     defer cb.free(lm_head_weight);
 
     started_at = monotonicNowNs();
-    if (try applyFinalNormLinearArgmax(
-        cb,
-        norm_kind,
-        norm_slot,
-        lm_head_weight,
-        final_hidden,
-        gpt_config.hidden_size,
-        gpt_config.norm_eps,
-        gpt_config.vocab_size,
-    )) |argmax_id| {
-        finished_at = monotonicNowNs();
-        if (finished_at > started_at) timing_stats.greedy_fast_argmax_nanos += finished_at - started_at;
-        return @intCast(argmax_id);
+    if (gpt_arch.canUseFastGreedyArgmaxForConfig(gpt_config)) {
+        if (try applyFinalNormLinearArgmax(
+            cb,
+            norm_kind,
+            norm_slot,
+            lm_head_weight,
+            final_hidden,
+            gpt_config.hidden_size,
+            gpt_config.norm_eps,
+            gpt_config.vocab_size,
+        )) |argmax_id| {
+            finished_at = monotonicNowNs();
+            if (finished_at > started_at) timing_stats.greedy_fast_argmax_nanos += finished_at - started_at;
+            return @intCast(argmax_id);
+        }
     }
     finished_at = monotonicNowNs();
     if (finished_at > started_at) timing_stats.greedy_fast_argmax_nanos += finished_at - started_at;
@@ -211,10 +213,12 @@ pub fn forwardGreedyFromFinalHidden(
     defer cb.free(logits);
 
     started_at = monotonicNowNs();
-    if (try cb.argmaxLastRow(logits, 1, gpt_config.vocab_size)) |argmax_id| {
-        finished_at = monotonicNowNs();
-        if (finished_at > started_at) timing_stats.greedy_fallback_host_nanos += finished_at - started_at;
-        return @intCast(argmax_id);
+    if (gpt_arch.canUseFastGreedyArgmaxForConfig(gpt_config)) {
+        if (try cb.argmaxLastRow(logits, 1, gpt_config.vocab_size)) |argmax_id| {
+            finished_at = monotonicNowNs();
+            if (finished_at > started_at) timing_stats.greedy_fallback_host_nanos += finished_at - started_at;
+            return @intCast(argmax_id);
+        }
     }
 
     const logits_host = try cb.toFloat32(logits, allocator);

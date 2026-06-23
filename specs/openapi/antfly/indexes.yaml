@@ -587,7 +587,7 @@ components:
       description: "Configuration for graph index type"
       properties:
         summarizer:
-          description: "Configuration for generating node summaries (enables tree navigation in AnswerAgent)"
+          description: "Configuration for generating node summaries (enables tree navigation in Retrieval Agent)"
           $ref: "../shared/generating.yaml#/components/schemas/GeneratorConfig"
         template:
           x-go-type-skip-optional-pointer: true

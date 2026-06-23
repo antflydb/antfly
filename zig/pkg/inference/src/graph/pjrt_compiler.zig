@@ -23,7 +23,7 @@
 //!   fused_linear, fused_linear_no_bias, fused_linear_no_bias_pair,
 //!   fused_rms_norm, fused_layer_norm,
 //!   fused_gelu, fused_relu, fused_silu, fused_quick_gelu, fused_sigmoid, fused_tanh_act,
-//!   fused_elem_add, fused_elem_multiply,
+//!   fused_elem_add, fused_elem_multiply, fused_add_mul_scalar,
 //!   fused_from_float32, fused_to_float32, fused_rope,
 //!   fused_gqa_causal_attention (static batch-1 full-recompute),
 //!   fused_embedding_lookup, fused_concat
@@ -394,6 +394,14 @@ pub fn compilePartitionWithOptions(
                 const x = try getHloId(node_map, ins[0]);
                 const y = try getHloId(node_map, ins[1]);
                 node_map[nid] = try b.multiply(x, y);
+            },
+
+            .fused_add_mul_scalar => {
+                const x = try getHloId(node_map, ins[0]);
+                const y = try getHloId(node_map, ins[1]);
+                const scalar = try getHloId(node_map, ins[2]);
+                const sum = try b.add(x, y);
+                node_map[nid] = try b.multiply(sum, scalar);
             },
 
             .fused_embedding_lookup => {

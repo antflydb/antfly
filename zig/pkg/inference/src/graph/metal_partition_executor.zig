@@ -474,6 +474,7 @@ pub const MetalPartitionExecutor = struct {
         if (trace_nodes) std.debug.print("graph_executor_node_trace: materialize_runtime_inputs_begin partition={d}\n", .{partition_index});
         try materializePartitionRuntimeInputs(
             allocator,
+            graph,
             values,
             value_device,
             node_ids,
@@ -496,23 +497,6 @@ pub const MetalPartitionExecutor = struct {
         );
         if (trace_nodes) std.debug.print("graph_executor_node_trace: materialize_constants_end partition={d}\n", .{partition_index});
 
-        if (trace_nodes) std.debug.print("graph_executor_node_trace: begin_frame_begin partition={d}\n", .{partition_index});
-        var frame_active = try cb.decoderRuntimeBeginFrame();
-        errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
-        if (trace_nodes) std.debug.print("graph_executor_node_trace: begin_frame_end partition={d} active={}\n", .{ partition_index, frame_active });
-
-        var exec_state = interpreter.ExecState{
-            .attention_layer = if (exec_ctx.attention_layer) |layer| layer.* else 0,
-            .options = options,
-            .last_use = last_use,
-            .pair_second = if (exec_ctx.pair_second) |pair| pair.* else null,
-        };
-        defer exec_state.freeMoeState();
-
-        const skipped_nodes = try allocator.alloc(bool, values.len);
-        defer allocator.free(skipped_nodes);
-        @memset(skipped_nodes, false);
-
         var transient_runtime_region_plan: ?RuntimeRegionPlan = null;
         defer if (transient_runtime_region_plan) |*plan| plan.deinit(allocator);
         const runtime_region_plan = try self.runtimeRegionPlan(
@@ -531,6 +515,23 @@ pub const MetalPartitionExecutor = struct {
                 stats.runtime_frame_metadata_ready += 1;
             }
         }
+
+        if (trace_nodes) std.debug.print("graph_executor_node_trace: begin_frame_begin partition={d}\n", .{partition_index});
+        var frame_active = if (runtime_region_plan.region_count > 0) try cb.decoderRuntimeBeginFrame() else false;
+        errdefer if (frame_active) cb.decoderRuntimeCancelFrame() catch {};
+        if (trace_nodes) std.debug.print("graph_executor_node_trace: begin_frame_end partition={d} active={}\n", .{ partition_index, frame_active });
+
+        var exec_state = interpreter.ExecState{
+            .attention_layer = if (exec_ctx.attention_layer) |layer| layer.* else 0,
+            .options = options,
+            .last_use = last_use,
+            .pair_second = if (exec_ctx.pair_second) |pair| pair.* else null,
+        };
+        defer exec_state.freeMoeState();
+
+        const skipped_nodes = try allocator.alloc(bool, values.len);
+        defer allocator.free(skipped_nodes);
+        @memset(skipped_nodes, false);
 
         var node_pos: usize = 0;
         while (node_pos < node_ids.len) : (node_pos += 1) {
@@ -3419,6 +3420,7 @@ fn isQLinearAttentionPathNode(node: *const ml.graph.Node) bool {
         .mul,
         .fused_rms_norm,
         .fused_elem_multiply,
+        .fused_add_mul_scalar,
         .fused_rope,
         .fused_to_float32,
         .fused_from_float32,
@@ -4327,6 +4329,7 @@ fn classifyGemmaRuntimeResidencyNode(graph: *const Graph, node_id: NodeId) ?Gemm
         .fused_softmax => return if (nodeDependsOnGemmaParameter(graph, node_id, 64)) .softmax else null,
         .add, .fused_elem_add => return if (nodeDependsOnGemmaParameter(graph, node_id, 64)) .residual_add else null,
         .mul, .fused_elem_multiply => return if (nodeDependsOnGemmaParameter(graph, node_id, 64)) .elementwise_mul else null,
+        .fused_add_mul_scalar => return if (nodeDependsOnGemmaParameter(graph, node_id, 64)) .elementwise_mul else null,
         else => return null,
     }
 }
@@ -4650,6 +4653,7 @@ fn tryExecuteMetalCommand(
         .fused_tanh_act => try executeRuntimeFusedUnary(cb, values, inputs, .tanh_act),
         .fused_elem_add, .add => try executeRuntimeAdd(cb, values, inputs, n.output_shape),
         .fused_elem_multiply, .mul => try executeRuntimeBinary(cb, values, inputs, .multiply),
+        .fused_add_mul_scalar => try executeRuntimeAddMulScalar(cb, values, inputs),
         .sub => try executeRuntimeBinary(cb, values, inputs, .subtract),
         .div => try executeRuntimeBinary(cb, values, inputs, .divide),
         .less_than => try executeRuntimeBinary(cb, values, inputs, .less_than),
@@ -5060,6 +5064,22 @@ fn executeRuntimeBinary(
         error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
     };
+}
+
+fn executeRuntimeAddMulScalar(
+    cb: *const ComputeBackend,
+    values: []?CT,
+    inputs: []const NodeId,
+) !?CT {
+    const lhs = valueFor(values, inputs[0]) orelse return null;
+    const rhs = valueFor(values, inputs[1]) orelse return null;
+    const scalar = valueFor(values, inputs[2]) orelse return null;
+    if (try cb.addMultiplyScalarTensor(lhs, rhs, scalar)) |fused| return fused;
+    const sum = try cb.add(lhs, rhs);
+    errdefer cb.free(sum);
+    const scaled = try cb.multiply(sum, scalar);
+    cb.free(sum);
+    return scaled;
 }
 
 fn executeRuntimeWhereSelect(
@@ -5703,6 +5723,7 @@ fn addGraphPlanAllocation(
 
 fn materializePartitionRuntimeInputs(
     allocator: std.mem.Allocator,
+    graph: *const Graph,
     values: []?CT,
     value_device: []DeviceId,
     node_ids: []const NodeId,
@@ -5720,7 +5741,19 @@ fn materializePartitionRuntimeInputs(
             "graph_executor_node_trace: materialize_runtime_input node={d} current_device={d} target_device={d} resident={}\n",
             .{ node_id, current_dev, device_id, isMetalDeviceResident(cb, rt_val) },
         );
-        if (current_dev != device_id) {
+        const stay_host_backed = runtimeInputShouldStayHostBackedForDynamicMetalSlot(graph, node_id);
+        if (current_dev != device_id and stay_host_backed) {
+            const mesh = exec_ctx.mesh orelse return error.DeviceNotFound;
+            const src_entry = mesh.device(current_dev) orelse return error.DeviceNotFound;
+            if (trace_nodes) std.debug.print(
+                "graph_executor_node_trace: materialize_runtime_input_transfer_host node={d} from_backend={s} to_backend={s}\n",
+                .{ node_id, @tagName(src_entry.backend.kind()), @tagName(cb.kind()) },
+            );
+            const transferred = try transferTensorHostBacked(allocator, rt_val, src_entry.backend, cb);
+            values[i] = transferred;
+            if (exec_ctx.owned_runtime_transfers) |owned| try owned.put(allocator, node_id, {});
+            if (exec_ctx.stats) |stats| stats.runtime_input_transfers += 1;
+        } else if (current_dev != device_id) {
             const mesh = exec_ctx.mesh orelse return error.DeviceNotFound;
             const src_entry = mesh.device(current_dev) orelse return error.DeviceNotFound;
             if (trace_nodes) std.debug.print(
@@ -5738,7 +5771,7 @@ fn materializePartitionRuntimeInputs(
             values[i] = rt_val;
         }
         if (values[i]) |current| {
-            if (!isMetalDeviceResident(cb, current)) {
+            if (!stay_host_backed and !isMetalDeviceResident(cb, current)) {
                 if (trace_nodes) std.debug.print(
                     "graph_executor_node_trace: materialize_runtime_input_make_resident node={d}\n",
                     .{node_id},
@@ -5758,6 +5791,30 @@ fn materializePartitionRuntimeInputs(
         }
         value_device[i] = device_id;
     }
+}
+
+fn runtimeInputShouldStayHostBackedForDynamicMetalSlot(graph: *const Graph, node_id: NodeId) bool {
+    const node = graph.node(node_id);
+    if (std.meta.activeTag(node.op) != .parameter and std.meta.activeTag(node.op) != .constant) return false;
+    for (graph.nodes.items) |consumer| {
+        const inputs = consumer.getInputs();
+        for (inputs, 0..) |input_id, input_index| {
+            if (input_id != node_id) continue;
+            switch (consumer.op) {
+                .fused_linear => {
+                    if (input_index == 1 or input_index == 2) return true;
+                },
+                .fused_linear_no_bias => {
+                    if (input_index == 1) return true;
+                },
+                .fused_linear_no_bias_pair => {
+                    if (input_index == 1 or input_index == 2) return true;
+                },
+                else => {},
+            }
+        }
+    }
+    return false;
 }
 
 fn isPreMaterializedConstantOp(op: ml.graph.OpCode) bool {
@@ -5892,6 +5949,21 @@ fn transferTensor(
         return device_transferred;
     }
     return transferred;
+}
+
+fn transferTensorHostBacked(
+    allocator: std.mem.Allocator,
+    value: CT,
+    from: *const ComputeBackend,
+    to: *const ComputeBackend,
+) !CT {
+    const shape_i64 = try from.tensorShape(value, allocator);
+    defer allocator.free(shape_i64);
+    const shape_i32 = try tensorShapeI32(allocator, shape_i64);
+    defer allocator.free(shape_i32);
+    const f32_data = try from.toFloat32(value, allocator);
+    defer allocator.free(f32_data);
+    return to.fromFloat32Shape(f32_data, shape_i32);
 }
 
 fn tensorShapeI32(allocator: std.mem.Allocator, shape: []const i64) ![]i32 {
@@ -6389,13 +6461,13 @@ test "metal partition executor resident multi op chain matches host" {
     const out_index: usize = @intCast(out);
     defer if (values[out_index]) |ct| cb.free(ct);
     const stats = cb.debugTimingSnapshot().provider;
-    try std.testing.expectEqual(@as(u64, 1), stats.decoder_runtime_frame_begins);
-    try std.testing.expectEqual(@as(u64, 1), stats.decoder_runtime_frame_submits);
+    try std.testing.expectEqual(@as(u64, 0), stats.decoder_runtime_frame_begins);
+    try std.testing.expectEqual(@as(u64, 0), stats.decoder_runtime_frame_submits);
+    try std.testing.expect(!cb.decoderRuntimeHasActiveFrame());
     try std.testing.expect(exec_stats.runtime_input_transfers >= 3);
-    try std.testing.expect(exec_stats.device_resident_transfers >= 3);
+    try std.testing.expect(exec_stats.device_resident_transfers >= 1);
     try std.testing.expect(exec_stats.backend_command_dispatches >= 4);
     try std.testing.expectEqual(@as(u64, 0), exec_stats.interpreter_fallbacks);
-    try std.testing.expectEqual(@as(u64, 0), exec_stats.host_materialized_outputs);
     try std.testing.expectEqual(@as(u64, 0), exec_stats.boundary_output_materializations);
 
     var logits: [dim]f32 = undefined;

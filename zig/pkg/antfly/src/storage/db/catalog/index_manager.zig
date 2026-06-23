@@ -4232,6 +4232,14 @@ pub const IndexManager = struct {
                 return true;
             }
         }
+        for (self.text_indexes.items) |entry| {
+            if (excluded_index_name) |index_name| {
+                if (std.mem.eql(u8, entry.config.name, index_name)) continue;
+            }
+            const chunk_name = entry.chunk_name orelse continue;
+            const chunk_cfg = self.getEnrichmentExcluding(.chunk, chunk_name, excluded_enrichment) orelse continue;
+            if (chunk_cfg.source_artifact_name.len == 0) return true;
+        }
         for (self.enrichments.items) |entry| {
             if (excluded_enrichment) |skip| {
                 if (entry.kind == skip.kind and std.mem.eql(u8, entry.name, skip.name)) continue;
@@ -4480,7 +4488,10 @@ pub const IndexManager = struct {
         explicit_sparse: []const mapper.SparseEmbeddingWrite,
     ) ![]enrichment_types.GeneratedEnrichmentRequest {
         var requests = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
-        errdefer enrichment_types.deinitGeneratedRequests(alloc, requests.items);
+        errdefer {
+            for (requests.items) |request| enrichment_types.freeGeneratedRequest(alloc, request);
+            requests.deinit(alloc);
+        }
 
         for (self.enrichments.items) |entry| {
             if (entry.kind != .asset) continue;
@@ -4494,6 +4505,26 @@ pub const IndexManager = struct {
                 .content_type = if (entry.content_type.len > 0) try alloc.dupe(u8, entry.content_type) else "",
                 .producer_json = if (entry.producer_json.len > 0) try alloc.dupe(u8, entry.producer_json) else "",
             });
+        }
+
+        for (self.text_indexes.items) |entry| {
+            const chunk_name = entry.chunk_name orelse continue;
+            const chunk_cfg = self.getEnrichment(.chunk, chunk_name) orelse continue;
+            if (chunk_cfg.source_artifact_name.len > 0) continue;
+            if (!hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
+                try requests.append(alloc, .{
+                    .kind = .chunk_text,
+                    .index_name = try alloc.dupe(u8, entry.config.name),
+                    .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
+                    .doc_key = try alloc.dupe(u8, doc_key),
+                    .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
+                    .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
+                    .chunk_size = chunk_cfg.chunk_size,
+                    .chunk_overlap = chunk_cfg.chunk_overlap,
+                    .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                    .full_text_index = true,
+                });
+            }
         }
 
         for (self.dense_indexes.items) |entry| {
@@ -7003,7 +7034,21 @@ pub const IndexManager = struct {
                     try ensureIndexDir(self.alloc, self.base_path, path);
                 }
             },
-            .dense_vector, .sparse_vector, .graph => try ensureIndexDir(self.alloc, self.base_path, path),
+            .dense_vector => {
+                if (self.dense_lsm_storage == null) {
+                    try ensureIndexDir(self.alloc, self.base_path, path);
+                }
+            },
+            .sparse_vector => {
+                if (self.sparse_lsm_storage == null) {
+                    try ensureIndexDir(self.alloc, self.base_path, path);
+                }
+            },
+            .graph => {
+                if (self.graph_lsm_storage == null) {
+                    try ensureIndexDir(self.alloc, self.base_path, path);
+                }
+            },
             .algebraic => {},
         }
     }
@@ -7381,7 +7426,7 @@ pub const IndexManager = struct {
                 defer self.alloc.free(forward_path);
                 const reverse_path = try std.fmt.allocPrint(self.alloc, "{s}/reverse", .{path});
                 defer self.alloc.free(reverse_path);
-                const reverse_store_missing = if (comptime builtin.os.tag == .freestanding) true else blk: {
+                const reverse_store_missing = if (self.graph_lsm_storage != null) false else if (comptime builtin.os.tag == .freestanding) true else blk: {
                     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
                     defer io_impl.deinit();
                     var reverse_dir = std.Io.Dir.cwd().openDir(io_impl.io(), reverse_path, .{}) catch |err| switch (err) {

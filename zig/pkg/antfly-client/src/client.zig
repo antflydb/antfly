@@ -255,10 +255,11 @@ pub const AntflyClient = struct {
             .headers = if (auth_headers) |*h| h[0..] else null,
             .timeout_ms = retrieval_agent_timeout_ms,
         });
+        defer resp.deinit();
         return .{
             .status_code = resp.status.code,
             .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null,
-            .content_type = resp.contentType(),
+            .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null,
             .allocator = self.allocator,
         };
     }
@@ -286,10 +287,8 @@ pub const AntflyClient = struct {
     // --- Helpers ---
 
     fn apiErrorFromResponse(self: *AntflyClient, resp: anytype) error{ ApiError, OutOfMemory } {
-        const msg = if (resp.err_body) |b|
-            (self.allocator.dupe(u8, b) catch "unknown error")
-        else
-            (self.allocator.dupe(u8, "unknown error") catch "unknown error");
+        _ = self;
+        const msg = resp.err_body orelse "unknown error";
         std.debug.print("API error {d}: {s}\n", .{ resp.status_code, msg });
         return error.ApiError;
     }

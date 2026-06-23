@@ -83,11 +83,16 @@ fn createTable(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.
             cli.fatal("reading config file {s}: {}", .{ path, err });
         };
         defer allocator.free(file_data);
-        var parsed = std.json.parseFromSlice(antfly_client.types.CreateTableRequest, allocator, file_data, .{ .ignore_unknown_fields = true }) catch |err| {
+        var parsed = std.json.parseFromSlice(antfly_client.types.CreateTableRequest, allocator, file_data, .{}) catch |err| {
             cli.fatal("parsing config file {s}: {}", .{ path, err });
         };
         defer parsed.deinit();
-        body = parsed.value;
+        if (shards != null) {
+            cli.fatal("--shards with --file is not supported; put num_shards in {s}", .{path});
+        }
+        try client.createTable(name, parsed.value);
+        std.debug.print("Create table command successful.\n", .{});
+        return;
     }
 
     if (shards) |s| body.num_shards = s;

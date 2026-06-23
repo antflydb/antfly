@@ -452,7 +452,7 @@ export interface ChatAgentTurnResult {
   messages: ChatMessage[];
 }
 
-// Web search result from websearch tool
+// Web search result from the web_search tool
 export interface WebSearchResultItem {
   title: string;
   url: string;

@@ -126,6 +126,20 @@ pub fn readFileAlloc(io: std.Io, allocator: std.mem.Allocator, path: []const u8,
     return try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_bytes));
 }
 
+pub fn splitCommaListAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]const []const u8 {
+    var list: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer list.deinit(allocator);
+
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |item| {
+        const trimmed = std.mem.trim(u8, item, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        try list.append(allocator, trimmed);
+    }
+
+    return try list.toOwnedSlice(allocator);
+}
+
 pub fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
     std.debug.print("error: " ++ fmt ++ "\n", args);
     std.process.exit(1);

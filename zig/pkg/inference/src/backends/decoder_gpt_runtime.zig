@@ -75,7 +75,7 @@ fn forwardPreparedGreedyFromNormalizedHidden(
     final_hidden: ops.CT,
 ) !?i64 {
     if (preparedLmHeadDisabled()) return null;
-    // Final logit softcap is monotonic, so it preserves greedy argmax.
+    if (!gpt_arch.canUseFastGreedyArgmaxForConfig(gpt_config)) return null;
     const token = try cb.decoderRuntimeApplyLinearArgmax(&.{
         .slot = finalLmHeadSlot(configured_layer_count),
         .input = final_hidden,
@@ -124,15 +124,19 @@ fn forwardGreedyFromNormalizedHidden(
     const lm_head_weight = try decoder_tail_runtime.getLmHeadWeight(cb, gpt_config);
     defer cb.free(lm_head_weight);
 
-    if (try cb.linearNoBiasArgmaxLastRow(final_hidden, lm_head_weight, 1, gpt_config.hidden_size, gpt_config.vocab_size)) |token| {
-        return @intCast(token);
+    if (gpt_arch.canUseFastGreedyArgmaxForConfig(gpt_config)) {
+        if (try cb.linearNoBiasArgmaxLastRow(final_hidden, lm_head_weight, 1, gpt_config.hidden_size, gpt_config.vocab_size)) |token| {
+            return @intCast(token);
+        }
     }
 
     const logits = try cb.linearNoBias(final_hidden, lm_head_weight, 1, gpt_config.hidden_size, gpt_config.vocab_size);
     defer cb.free(logits);
 
-    if (try cb.argmaxLastRow(logits, 1, gpt_config.vocab_size)) |token| {
-        return @intCast(token);
+    if (gpt_arch.canUseFastGreedyArgmaxForConfig(gpt_config)) {
+        if (try cb.argmaxLastRow(logits, 1, gpt_config.vocab_size)) |token| {
+            return @intCast(token);
+        }
     }
 
     const logits_host = try cb.toFloat32(logits, allocator);

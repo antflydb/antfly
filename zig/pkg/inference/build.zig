@@ -177,9 +177,9 @@ pub fn build(b: *std.Build) void {
         }
     }
     const enable_cuda = if (enable_wasm or !link_libc) false else (b.option(bool, "cuda", "Enable CUDA backend through the NVIDIA Driver API") orelse false);
-    const cuda_artifacts = b.option([]const u8, "cuda-artifacts", "CUDA artifact bundle: fatbin SASS+PTX or portable PTX") orelse "fatbin";
-    if (!std.mem.eql(u8, cuda_artifacts, "portable") and !std.mem.eql(u8, cuda_artifacts, "fatbin")) {
-        @panic("invalid -Dcuda-artifacts (expected portable or fatbin)");
+    const cuda_artifacts = b.option([]const u8, "cuda-artifacts", "CUDA artifact bundle: fatbin SASS+PTX, portable PTX, or sm89 cubin") orelse "fatbin";
+    if (!std.mem.eql(u8, cuda_artifacts, "portable") and !std.mem.eql(u8, cuda_artifacts, "fatbin") and !std.mem.eql(u8, cuda_artifacts, "sm89")) {
+        @panic("invalid -Dcuda-artifacts (expected portable, fatbin, or sm89)");
     }
     const cuda_libraries = b.option([]const u8, "cuda-libs", "CUDA library acceleration policy: auto, off, or required") orelse "auto";
     if (!std.mem.eql(u8, cuda_libraries, "auto") and !std.mem.eql(u8, cuda_libraries, "off") and !std.mem.eql(u8, cuda_libraries, "required")) {
@@ -601,10 +601,10 @@ pub fn build(b: *std.Build) void {
     // Tests
     const runtime_test_filter = b.option(bool, "runtime-test-filter", "Build unit tests with a simple runtime-filtering test runner") orelse false;
     const main_test_filters = if (runtime_test_filter) &.{} else selectTestFilters(b, &.{});
-    const runtime_filter_test_runner: ?std.Build.Step.Compile.TestRunner = if (runtime_test_filter) .{
+    const runtime_filter_test_runner: std.Build.Step.Compile.TestRunner = .{
         .path = b.path("src/test_runner_filter.zig"),
         .mode = .simple,
-    } else null;
+    };
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/inference.zig"),

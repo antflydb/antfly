@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  printf 'usage: %s [--check|--write] [--portable|--fatbin|--all]\n' "$0"
+  printf 'usage: %s [--check|--write] [--portable|--fatbin|--sm89|--all]\n' "$0"
   printf 'Regenerates checked-in CUDA artifacts with the pinned CUDA 13.2 toolkit contract.\n'
 }
 
@@ -26,6 +26,9 @@ while [ $# -gt 0 ]; do
     --fatbin)
       artifact_mode="fatbin"
       ;;
+    --sm89)
+      artifact_mode="sm89"
+      ;;
     --all)
       artifact_mode="all"
       ;;
@@ -42,6 +45,7 @@ pkg_dir="$(cd "$script_dir/.." && pwd)"
 src="$pkg_dir/src/ops/cuda/artifacts/inference_cuda_kernels.cu"
 ptx_dst="$pkg_dir/src/ops/cuda/artifacts/inference_cuda_kernels.ptx"
 fatbin_dst="$pkg_dir/src/ops/cuda/artifacts/inference_cuda_kernels.fatbin"
+sm89_dst="$pkg_dir/src/ops/cuda/artifacts/inference_cuda_kernels_sm89.cubin"
 
 cuda_home="${CUDA_HOME:-}"
 
@@ -61,11 +65,14 @@ if [ -z "$nvcc" ]; then
 fi
 
 version="$("$nvcc" --version)"
-if [[ "$version" != *"release 13.2"* ]]; then
-  printf 'error: expected CUDA toolkit 13.2 for artifact regeneration.\n' >&2
-  printf '%s\n' "$version" >&2
-  exit 1
-fi
+case "$version" in
+  *"release 13.2"*) ;;
+  *)
+    printf 'error: expected CUDA toolkit 13.2 for artifact regeneration.\n' >&2
+    printf '%s\n' "$version" >&2
+    exit 1
+    ;;
+esac
 
 cuobjdump=""
 if [ -n "${CUOBJDUMP:-}" ]; then
@@ -80,20 +87,30 @@ fi
 
 tmp_ptx="$(mktemp "${TMPDIR:-/tmp}/inference_cuda_kernels.XXXXXX.ptx")"
 tmp_fatbin="$(mktemp "${TMPDIR:-/tmp}/inference_cuda_kernels.XXXXXX.fatbin")"
-trap 'rm -f "$tmp_ptx" "$tmp_fatbin"' EXIT
+tmp_sm89="$(mktemp "${TMPDIR:-/tmp}/inference_cuda_kernels.XXXXXX.sm89.cubin")"
+trap 'rm -f "$tmp_ptx" "$tmp_fatbin" "$tmp_sm89"' EXIT
 
 required_symbols=(
   termite_fill_f32
-  termite_cast_f32_to_f16
-  termite_cast_f32_to_bf16
-  termite_embedding_lookup_weight_f16_f32
-  termite_embedding_lookup_weight_bf16_f32
-  termite_linear_weight_f16_f32
-  termite_linear_bias_weight_f16_f32
-  termite_linear_weight_bf16_f32
-  termite_linear_bias_weight_bf16_f32
+  termite_f32_to_bf16
+  termite_linear_bf16_weight_f32_tiled
+  termite_embedding_lookup_bf16_weight_f32
   termite_attention_f32_block
   termite_deberta_attention_f32
+  termite_gliner_gather_concat_relu_f32
+  termite_split_last_dim3_f32
+  termite_rope_per_item_f32
+  termite_rms_norm_heads_rope_decode_scalars_f32
+  termite_gqa_attention_decode_scalars_f32
+  termite_kv_write_suffix_decode_scalars_f32
+  termite_gqa_attention_decode_turboquant_f32
+  termite_kv_write_suffix_turboquant_f32
+  termite_gemma4_mtp_masked_argmax_f32
+  termite_gemma4_mtp_verify_commit_u32
+  termite_linear_q8_0_argmax_rows_stage1_tile4
+  termite_linear_q4_0_argmax_rows_stage1_tile4
+  termite_linear_q4_k_argmax_rows_stage1_tile4
+  termite_argmax_reduce_rows_pairs_f32
   termite_linear_q8_0_f32_tile4_r2
   termite_linear_q8_0_bias_f32_tile4_r2
   termite_linear_q8_0_bias_gelu_f32_tile4_r2
@@ -131,6 +148,9 @@ required_symbols=(
   termite_linear_q4_k_span_pair_bias_f32_tile8_r2
   termite_linear_q4_k_span_pair_bias_relu_f32_tile8_r2
   termite_linear_q4_k_span_pair2_bias_f32_tile8_r2
+  termite_linear_bf16_weight_f32_qkv_nobias_tiled
+  termite_linear_q4_k_q4_k_f32_qkv_nobias_tiled
+  termite_embedding_lookup_i32_q4_k_f32
 )
 
 check_required_symbols() {
@@ -205,6 +225,23 @@ build_fatbin() {
   write_or_check "$tmp_fatbin" "$fatbin_dst" "fatbin"
 }
 
+build_sm89() {
+  "$nvcc" -cubin -arch=sm_89 "$src" -o "$tmp_sm89"
+
+  if [ ! -s "$tmp_sm89" ]; then
+    printf 'error: generated sm89 cubin is empty\n' >&2
+    exit 1
+  fi
+  if [ -n "$cuobjdump" ]; then
+    dump="$("$cuobjdump" --dump-elf "$tmp_sm89" 2>/dev/null || true)"
+    if ! grep -q "sm_89" <<<"$dump"; then
+      printf 'error: generated sm89 cubin is missing sm_89\n' >&2
+      exit 1
+    fi
+  fi
+  write_or_check "$tmp_sm89" "$sm89_dst" "sm89"
+}
+
 case "$artifact_mode" in
   portable)
     build_portable_ptx
@@ -212,9 +249,13 @@ case "$artifact_mode" in
   fatbin)
     build_fatbin
     ;;
+  sm89)
+    build_sm89
+    ;;
   all)
     build_portable_ptx
     build_fatbin
+    build_sm89
     ;;
   *)
     printf 'error: invalid artifact mode\n' >&2

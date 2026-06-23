@@ -67,7 +67,7 @@ const gemma4_chat_template =
     "{{ '<turn|>\\n' }}" ++
     "{%- endfor -%}" ++
     "{%- if add_generation_prompt -%}" ++
-    "{{ '<|turn>model\\n' }}" ++
+    "{{ '<|turn>model\\n<|channel>thought\\n<channel|>' }}" ++
     "{%- endif -%}";
 
 pub const ModelType = enum {
@@ -320,6 +320,20 @@ pub const ModelManifest = struct {
             self.tokenizer_json_path == null or
             self.tokenizer_config_path == null or
             self.processor_config_path == null;
+    }
+
+    pub fn isFlorence2GgufBundle(self: *const ModelManifest) bool {
+        return std.mem.eql(u8, self.inference_bundle_family, "florence2_gguf_bundle/v1");
+    }
+
+    pub fn hasIncompleteFlorence2GgufBundle(self: *const ModelManifest) bool {
+        if (!self.isFlorence2GgufBundle()) return false;
+        return self.gguf_path == null or
+            self.config_path == null or
+            self.model_manifest_path == null or
+            self.tokenizer_json_path == null or
+            self.tokenizer_config_path == null or
+            self.preprocessor_config_path == null;
     }
 
     pub fn hasInput(self: *const ModelManifest, input: []const u8) bool {
@@ -772,10 +786,10 @@ fn applyGgufTokenizerMetadata(
             manifest.tokenizer_type = .sentencepiece;
         } else if (c_file.fileExistsInDir(allocator, model_dir_path, "tokenizer.json")) {
             manifest.tokenizer_type = .huggingface;
-        } else if (supportsGgufSentencePieceFallback(model_name) and hasGgufSentencePieceMetadata(&parsed)) {
-            manifest.tokenizer_type = .sentencepiece;
         } else if (supportsGgufHuggingFaceFallback(model_name) and hasGgufHuggingFaceMetadata(&parsed)) {
             manifest.tokenizer_type = .huggingface;
+        } else if (supportsGgufSentencePieceFallback(model_name) and hasGgufSentencePieceMetadata(&parsed)) {
+            manifest.tokenizer_type = .sentencepiece;
         } else {
             manifest.tokenizer_type = null;
         }
@@ -806,13 +820,15 @@ fn applyGgufTokenizerMetadata(
     applyGgufSpecialTokenString(allocator, &parsed, "tokenizer.ggml.padding_token_id", &manifest.pad_token);
 }
 
-fn shouldUseBuiltInGemma4GgufChatTemplate(model_name: []const u8, chat_template: []const u8) bool {
-    if (!std.mem.eql(u8, model_name, "gemma4")) return false;
-
+fn gemma4ChatTemplateRequiresBuiltInFallback(chat_template: []const u8) bool {
     return std.mem.indexOf(u8, chat_template, "macro format_parameters") != null or
         std.mem.indexOf(u8, chat_template, "namespace(") != null or
         std.mem.indexOf(u8, chat_template, "{% set captured_content") != null or
         std.mem.indexOf(u8, chat_template, "{%- set captured_content") != null;
+}
+
+fn shouldUseBuiltInGemma4GgufChatTemplate(model_name: []const u8, chat_template: []const u8) bool {
+    return std.mem.eql(u8, model_name, "gemma4") and gemma4ChatTemplateRequiresBuiltInFallback(chat_template);
 }
 
 fn supportsGgufSentencePieceFallback(model_name: []const u8) bool {
@@ -820,7 +836,7 @@ fn supportsGgufSentencePieceFallback(model_name: []const u8) bool {
 }
 
 fn supportsGgufHuggingFaceFallback(model_name: []const u8) bool {
-    return std.mem.eql(u8, model_name, "gpt2");
+    return std.mem.eql(u8, model_name, "gpt2") or std.mem.eql(u8, model_name, "gemma4");
 }
 
 fn hasGgufSentencePieceMetadata(parsed: *const gguf_format.File) bool {
@@ -1430,6 +1446,16 @@ fn parseInferenceBundleJson(manifest: *ModelManifest, allocator: std.mem.Allocat
             manifest.config_model_arch = allocator.dupe(u8, "clipclap") catch "";
             try setManifestInputs(allocator, manifest, &.{ "text", "image", "audio" });
         }
+        if (std.mem.eql(u8, bundle_family, "florence2_gguf_bundle/v1")) {
+            const model = obj.get("model") orelse obj.get("gguf") orelse return;
+            if (model == .string and model.string.len > 0) {
+                try applyFlorence2GgufBundle(
+                    manifest,
+                    allocator,
+                    try resolveBundlePath(allocator, model_dir_path, model.string),
+                );
+            }
+        }
     }
 }
 
@@ -1467,6 +1493,9 @@ fn parseInferenceVariantsJson(manifest: *ModelManifest, allocator: std.mem.Alloc
     const obj = parsed.value.object;
     const variants_family = obj.get("family") orelse return;
     if (variants_family != .string) return;
+    if (std.mem.eql(u8, variants_family.string, "florence2_variants/v1")) {
+        return parseFlorence2InferenceVariantsJson(manifest, allocator, model_dir_path, obj);
+    }
     if (std.mem.eql(u8, variants_family.string, "gliner2_variants/v1")) {
         return parseGliner2InferenceVariantsJson(manifest, allocator, model_dir_path, obj);
     }
@@ -1569,6 +1598,68 @@ fn parseGliner2InferenceVariantsJson(
     try setManifestInputs(allocator, manifest, &.{"text"});
 }
 
+fn parseFlorence2InferenceVariantsJson(
+    manifest: *ModelManifest,
+    allocator: std.mem.Allocator,
+    model_dir_path: []const u8,
+    obj: std.json.ObjectMap,
+) !void {
+    const variants = obj.get("variants") orelse return;
+    if (variants != .array) return;
+
+    var selected: ?ResolvedFlorence2Gguf = null;
+    errdefer if (selected) |*model| model.deinit(allocator);
+    for (variants.array.items) |variant| {
+        if (!isFlorence2GgufVariant(variant)) continue;
+        var model = (try resolveExistingFlorence2GgufVariant(allocator, model_dir_path, variant)) orelse continue;
+        if (variant.object.get("format")) |format| {
+            if (format == .string and std.mem.eql(u8, format.string, "Q4_K")) {
+                if (selected) |*old| old.deinit(allocator);
+                selected = model;
+                break;
+            }
+        }
+        if (selected == null) {
+            selected = model;
+        } else {
+            model.deinit(allocator);
+        }
+    }
+
+    var model = selected orelse return;
+    selected = null;
+    errdefer model.deinit(allocator);
+
+    try applyFlorence2GgufBundle(manifest, allocator, model.model_path);
+    model.model_path = "";
+}
+
+fn applyFlorence2GgufBundle(
+    manifest: *ModelManifest,
+    allocator: std.mem.Allocator,
+    gguf_path: []const u8,
+) !void {
+    var path = gguf_path;
+    errdefer if (path.len > 0) allocator.free(path);
+
+    var family = try allocator.dupe(u8, "florence2_gguf_bundle/v1");
+    errdefer if (family.len > 0) allocator.free(family);
+    var arch = try allocator.dupe(u8, "florence2");
+    errdefer if (arch.len > 0) allocator.free(arch);
+
+    if (manifest.inference_bundle_family.len > 0) allocator.free(manifest.inference_bundle_family);
+    manifest.inference_bundle_family = family;
+    family = "";
+    setOptionalPath(allocator, &manifest.gguf_path, path);
+    path = "";
+    manifest.native_arch_hint = .florence;
+    manifest.model_type = .reader;
+    if (manifest.config_model_arch.len > 0) allocator.free(manifest.config_model_arch);
+    manifest.config_model_arch = arch;
+    arch = "";
+    try setManifestInputs(allocator, manifest, &.{ "text", "image" });
+}
+
 fn setManifestInputs(allocator: std.mem.Allocator, manifest: *ModelManifest, inputs: []const []const u8) !void {
     if (manifest.inputs.len > 0) {
         for (manifest.inputs) |input| allocator.free(input);
@@ -1609,6 +1700,15 @@ const ResolvedGliner2GgufPair = struct {
         if (self.encoder_path.len > 0) allocator.free(self.encoder_path);
         if (self.head_path.len > 0) allocator.free(self.head_path);
         self.* = .{ .encoder_path = "", .head_path = "" };
+    }
+};
+
+const ResolvedFlorence2Gguf = struct {
+    model_path: []const u8,
+
+    fn deinit(self: *ResolvedFlorence2Gguf, allocator: std.mem.Allocator) void {
+        if (self.model_path.len > 0) allocator.free(self.model_path);
+        self.* = .{ .model_path = "" };
     }
 };
 
@@ -1656,6 +1756,23 @@ fn resolveExistingGliner2GgufVariant(
     return .{ .encoder_path = encoder_path, .head_path = head_path };
 }
 
+fn resolveExistingFlorence2GgufVariant(
+    allocator: std.mem.Allocator,
+    model_dir_path: []const u8,
+    variant: std.json.Value,
+) !?ResolvedFlorence2Gguf {
+    const model = variant.object.get("model") orelse variant.object.get("gguf") orelse return null;
+    if (model != .string or model.string.len == 0) return null;
+
+    const model_path = try resolveBundlePath(allocator, model_dir_path, model.string);
+    errdefer allocator.free(model_path);
+    if (!c_file.fileExists(allocator, model_path)) {
+        allocator.free(model_path);
+        return null;
+    }
+    return .{ .model_path = model_path };
+}
+
 fn isClipclapGgufVariant(variant: std.json.Value) bool {
     if (variant != .object) return false;
     const target = variant.object.get("target") orelse return false;
@@ -1672,6 +1789,14 @@ fn isGliner2GgufVariant(variant: std.json.Value) bool {
     const encoder = variant.object.get("encoder") orelse return false;
     const head = variant.object.get("head") orelse return false;
     return encoder == .string and encoder.string.len > 0 and head == .string and head.string.len > 0;
+}
+
+fn isFlorence2GgufVariant(variant: std.json.Value) bool {
+    if (variant != .object) return false;
+    const target = variant.object.get("target") orelse return false;
+    if (target != .string or !std.mem.eql(u8, target.string, "gguf")) return false;
+    const model = variant.object.get("model") orelse variant.object.get("gguf") orelse return false;
+    return model == .string and model.string.len > 0;
 }
 
 fn resolveBundlePath(allocator: std.mem.Allocator, model_dir_path: []const u8, path: []const u8) ![]const u8 {
@@ -1820,10 +1945,16 @@ fn parseTokenizerConfig(manifest: *ModelManifest, allocator: std.mem.Allocator, 
         }
     }
 
-    // Gemma 4 models may lack a chat_template field — detect by sot_token and apply built-in.
-    if (manifest.chat_template == null) {
-        if (obj.get("sot_token")) |v| {
-            if (v == .string and std.mem.eql(u8, v.string, "<|turn>")) {
+    // Gemma 4 models use <|turn> and may ship a tool-capable upstream
+    // template that requires Jinja features outside our rendering subset.
+    if (obj.get("sot_token")) |v| {
+        if (v == .string and std.mem.eql(u8, v.string, "<|turn>")) {
+            if (manifest.chat_template) |existing| {
+                if (gemma4ChatTemplateRequiresBuiltInFallback(existing)) {
+                    allocator.free(existing);
+                    manifest.chat_template = try allocator.dupe(u8, gemma4_chat_template);
+                }
+            } else {
                 manifest.chat_template = try allocator.dupe(u8, gemma4_chat_template);
             }
         }
@@ -2116,6 +2247,26 @@ test "manifest parses clipclap gguf bundle marker" {
     try std.testing.expect(manifest.hasInput("text"));
     try std.testing.expect(manifest.hasInput("image"));
     try std.testing.expect(manifest.hasInput("audio"));
+}
+
+test "manifest parses florence2 gguf bundle marker" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    try parseInferenceBundleJson(&manifest, allocator, "/tmp/florence2-q4_k",
+        \\{"family":"florence2_gguf_bundle/v1","model":"florence-2-base.Q4_K.gguf","inputs":["text","image"]}
+    );
+
+    try std.testing.expect(manifest.isFlorence2GgufBundle());
+    try std.testing.expect(manifest.hasIncompleteFlorence2GgufBundle());
+    try std.testing.expectEqual(ModelType.reader, manifest.model_type);
+    try std.testing.expectEqual(NativeArchHint.florence, manifest.native_arch_hint);
+    try std.testing.expectEqualStrings("florence2", manifest.config_model_arch);
+    try std.testing.expect(manifest.gguf_path != null);
+    try std.testing.expect(std.mem.endsWith(u8, manifest.gguf_path.?, "/tmp/florence2-q4_k/florence-2-base.Q4_K.gguf"));
+    try std.testing.expect(manifest.hasInput("text"));
+    try std.testing.expect(manifest.hasInput("image"));
 }
 
 test "manifest discovers clip onnx variants and prefers f16 over i8" {
@@ -2418,6 +2569,146 @@ test "manifest parses gliner2 variants gguf pair" {
     try std.testing.expect(manifest.hasInput("text"));
 }
 
+test "manifest parses florence2 variants gguf model" {
+    const allocator = std.testing.allocator;
+    const dir_path = try testScratchDir(allocator, "manifest-florence2-variants-gguf");
+    defer {
+        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+    const q4_path = try std.fs.path.join(allocator, &.{ dir_path, "florence-2-base.Q4_K.gguf" });
+    defer allocator.free(q4_path);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = q4_path, .data = "GGUFstub" });
+
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    try parseInferenceVariantsJson(&manifest, allocator, dir_path,
+        \\{
+        \\  "family": "florence2_variants/v1",
+        \\  "variants": [
+        \\    {
+        \\      "id": "gguf-Q4_K",
+        \\      "target": "gguf",
+        \\      "format": "Q4_K",
+        \\      "model": "florence-2-base.Q4_K.gguf"
+        \\    }
+        \\  ]
+        \\}
+    );
+
+    try std.testing.expect(manifest.isFlorence2GgufBundle());
+    try std.testing.expectEqual(ModelType.reader, manifest.model_type);
+    try std.testing.expectEqual(NativeArchHint.florence, manifest.native_arch_hint);
+    try std.testing.expectEqualStrings("florence2", manifest.config_model_arch);
+    try std.testing.expectEqualStrings(q4_path, manifest.gguf_path.?);
+    try std.testing.expect(manifest.hasInput("text"));
+    try std.testing.expect(manifest.hasInput("image"));
+}
+
+test "manifest loads canonical antfly florence2 variants before first gguf fallback" {
+    const allocator = std.testing.allocator;
+    const dir_path = try testScratchDir(allocator, "manifest-florence2-canonical-variants");
+    defer {
+        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+    const q8_path = try std.fs.path.join(allocator, &.{ dir_path, "florence-2-base.Q8_0.gguf" });
+    defer allocator.free(q8_path);
+    const q4_path = try std.fs.path.join(allocator, &.{ dir_path, "florence-2-base.Q4_K.gguf" });
+    defer allocator.free(q4_path);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = q8_path, .data = "GGUFstub" });
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = q4_path, .data = "GGUFstub" });
+
+    const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
+    defer allocator.free(config_path);
+    try compat.cwd().writeFile(compat.io(), .{
+        .sub_path = config_path,
+        .data = "{\"model_type\":\"florence2\",\"text_config\":{\"d_model\":768},\"vision_config\":{\"image_size\":768}}",
+    });
+    const model_manifest_path = try std.fs.path.join(allocator, &.{ dir_path, "model_manifest.json" });
+    defer allocator.free(model_manifest_path);
+    try compat.cwd().writeFile(compat.io(), .{
+        .sub_path = model_manifest_path,
+        .data = "{\"type\":\"reader\",\"tasks\":[\"read\"],\"inputs\":[\"text\",\"image\"]}",
+    });
+    const tokenizer_path = try std.fs.path.join(allocator, &.{ dir_path, "tokenizer.json" });
+    defer allocator.free(tokenizer_path);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = tokenizer_path, .data = "{}" });
+    const tokenizer_config_path = try std.fs.path.join(allocator, &.{ dir_path, "tokenizer_config.json" });
+    defer allocator.free(tokenizer_config_path);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = tokenizer_config_path, .data = "{}" });
+    const preprocessor_path = try std.fs.path.join(allocator, &.{ dir_path, "preprocessor_config.json" });
+    defer allocator.free(preprocessor_path);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = preprocessor_path, .data = "{\"size\":{\"height\":768,\"width\":768}}" });
+
+    const variants_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_variants.json" });
+    defer allocator.free(variants_path);
+    try compat.cwd().writeFile(compat.io(), .{
+        .sub_path = variants_path,
+        .data =
+        \\{
+        \\  "family": "florence2_variants/v1",
+        \\  "variants": [
+        \\    {
+        \\      "id": "gguf-Q8_0",
+        \\      "target": "gguf",
+        \\      "format": "Q8_0",
+        \\      "model": "florence-2-base.Q8_0.gguf"
+        \\    },
+        \\    {
+        \\      "id": "gguf-Q4_K",
+        \\      "target": "gguf",
+        \\      "format": "Q4_K",
+        \\      "model": "florence-2-base.Q4_K.gguf"
+        \\    }
+        \\  ]
+        \\}
+        ,
+    });
+
+    var manifest = try loadFromDir(allocator, dir_path);
+    defer manifest.deinit();
+
+    try std.testing.expect(manifest.isFlorence2GgufBundle());
+    try std.testing.expect(!manifest.hasIncompleteFlorence2GgufBundle());
+    try std.testing.expectEqual(ModelType.reader, manifest.model_type);
+    try std.testing.expectEqual(NativeArchHint.florence, manifest.native_arch_hint);
+    try std.testing.expectEqualStrings("florence2", manifest.config_model_arch);
+    try std.testing.expectEqualStrings(q4_path, manifest.gguf_path.?);
+    try std.testing.expect(manifest.hasInput("text"));
+    try std.testing.expect(manifest.hasInput("image"));
+}
+
+test "manifest ignores stale florence2 variants with missing gguf files" {
+    const allocator = std.testing.allocator;
+    const dir_path = try testScratchDir(allocator, "manifest-florence2-stale-variants");
+    defer {
+        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    try parseInferenceVariantsJson(&manifest, allocator, dir_path,
+        \\{
+        \\  "family": "florence2_variants/v1",
+        \\  "variants": [
+        \\    {
+        \\      "id": "gguf-Q4_K",
+        \\      "target": "gguf",
+        \\      "format": "Q4_K",
+        \\      "model": "florence-2-base.Q4_K.gguf"
+        \\    }
+        \\  ]
+        \\}
+    );
+
+    try std.testing.expect(!manifest.isFlorence2GgufBundle());
+    try std.testing.expectEqual(@as(?[]const u8, null), manifest.gguf_path);
+}
+
 test "manifest uses clipclap variants when default ONNX bundle is partial" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-clipclap-partial-onnx");
@@ -2646,6 +2937,21 @@ test "manifest treats gemma4 unified config as generator" {
     try std.testing.expect(manifest.gguf_projector_path != null);
 }
 
+test "gemma4 tokenizer config replaces unsupported upstream chat template" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    manifest.chat_template = try allocator.dupe(u8, "{%- macro format_parameters(properties, required) -%}{%- endmacro -%}");
+    defer manifest.deinit();
+
+    try parseTokenizerConfig(&manifest, allocator,
+        \\{"sot_token":"<|turn>","bos_token":"<bos>","eos_token":"<eos>","pad_token":"<pad>","unk_token":"<unk>"}
+    );
+
+    try std.testing.expect(manifest.chat_template != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.chat_template.?, "<|turn>model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.chat_template.?, "format_parameters") == null);
+}
+
 test "manifest infers huggingface tokenizer from gguf gpt2 metadata" {
     const allocator = std.testing.allocator;
 
@@ -2668,6 +2974,28 @@ test "manifest infers huggingface tokenizer from gguf gpt2 metadata" {
     try std.testing.expectEqualStrings("<|end_of_text|>", manifest.eos_token);
 }
 
+test "manifest prefers huggingface tokenizer from gemma4 gguf bpe metadata" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const gguf_bytes = try buildTestGgufWithGemma4Tokenizer(allocator);
+    defer allocator.free(gguf_bytes);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "gemma4-q4_0.gguf", .data = gguf_bytes });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+
+    var manifest = try loadFromDir(allocator, model_dir);
+    defer manifest.deinit();
+
+    try std.testing.expect(manifest.gguf_path != null);
+    try std.testing.expectEqual(TokenizerType.huggingface, manifest.tokenizer_type.?);
+    try std.testing.expectEqualStrings("<bos>", manifest.bos_token);
+    try std.testing.expectEqualStrings("<eos>", manifest.eos_token);
+}
+
 fn buildTestGgufWithGpt2Tokenizer(allocator: std.mem.Allocator) ![]u8 {
     var data = std.ArrayListUnmanaged(u8).empty;
     defer data.deinit(allocator);
@@ -2688,6 +3016,38 @@ fn buildTestGgufWithGpt2Tokenizer(allocator: std.mem.Allocator) ![]u8 {
     try appendTestMetadataI32Array(allocator, &data, "tokenizer.ggml.token_type", &.{ 3, 1, 3 });
     try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.bos_token_id", 0);
     try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.eos_token_id", 2);
+    try appendTestMetadataBool(allocator, &data, "tokenizer.ggml.add_bos_token", true);
+
+    return data.toOwnedSlice(allocator);
+}
+
+fn buildTestGgufWithGemma4Tokenizer(allocator: std.mem.Allocator) ![]u8 {
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(allocator);
+
+    try data.appendSlice(allocator, gguf_format.magic);
+    try appendTestLe(u32, allocator, &data, 3);
+    try appendTestLe(u64, allocator, &data, 0);
+    try appendTestLe(u64, allocator, &data, 11);
+
+    try appendTestMetadataString(allocator, &data, "general.architecture", "gemma4");
+    try appendTestMetadataString(allocator, &data, "tokenizer.ggml.model", "gemma4");
+    try appendTestMetadataStringArray(allocator, &data, "tokenizer.ggml.tokens", &.{
+        "<pad>",
+        "<eos>",
+        "<bos>",
+        "<unk>",
+        "hello",
+        "▁world",
+        "<|turn>",
+    });
+    try appendTestMetadataStringArray(allocator, &data, "tokenizer.ggml.merges", &.{});
+    try appendTestMetadataF32Array(allocator, &data, "tokenizer.ggml.scores", &.{ 0, 0, 0, 0, 0, 0, 0 });
+    try appendTestMetadataI32Array(allocator, &data, "tokenizer.ggml.token_type", &.{ 3, 3, 3, 2, 1, 1, 3 });
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.bos_token_id", 2);
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.eos_token_id", 1);
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.padding_token_id", 0);
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.unknown_token_id", 3);
     try appendTestMetadataBool(allocator, &data, "tokenizer.ggml.add_bos_token", true);
 
     return data.toOwnedSlice(allocator);
@@ -2735,4 +3095,12 @@ fn appendTestMetadataI32Array(allocator: std.mem.Allocator, data: *std.ArrayList
     try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.i32));
     try appendTestLe(u64, allocator, data, values.len);
     for (values) |value| try appendTestLe(i32, allocator, data, value);
+}
+
+fn appendTestMetadataF32Array(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, values: []const f32) !void {
+    try appendTestString(allocator, data, key);
+    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.array));
+    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.f32));
+    try appendTestLe(u64, allocator, data, values.len);
+    for (values) |value| try appendTestLe(u32, allocator, data, @bitCast(value));
 }

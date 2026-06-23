@@ -150,7 +150,7 @@ pub fn logger() Middleware {
                 const response = try next.call(ctx);
                 const duration = milliTimestamp(ctx.io) - start;
 
-                std.debug.print("{s} {s} - {d}ms\n", .{
+                std.log.info("{s} {s} - {d}ms", .{
                     ctx.request.method.toString(),
                     ctx.request.uri.path,
                     duration,

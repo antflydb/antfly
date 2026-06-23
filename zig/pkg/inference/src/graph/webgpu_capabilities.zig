@@ -70,6 +70,7 @@ pub fn supportsWebGpuGraph(op: OpCode) bool {
         .fused_elem_add,
         .mul,
         .fused_elem_multiply,
+        .fused_add_mul_scalar,
         .sub,
         .div,
         .less_than,

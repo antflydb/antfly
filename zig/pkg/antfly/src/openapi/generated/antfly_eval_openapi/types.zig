@@ -105,7 +105,7 @@ pub const EvalSummary = struct {
     total: ?i64 = null,
 };
 
-/// Configuration for inline evaluation of query results. Add to RAGRequest, QueryRequest, or AnswerAgentRequest.
+/// Configuration for inline evaluation of query results. Add to RetrievalAgentRequest, QueryRequest, or other evaluation-capable request schemas.
 pub const EvalConfig = struct {
     /// List of evaluators to run
     evaluators: ?[]const EvaluatorName = null,

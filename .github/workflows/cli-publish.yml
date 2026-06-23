@@ -63,6 +63,9 @@ jobs:
           node-version: 24.x
           registry-url: https://registry.npmjs.org/
 
+      - name: Test Antfly C ABI packaging
+        run: python scripts/packaging/test_cabi_packaging.py
+
       - name: Build wheels and populate npm packages
         run: |
           python scripts/packaging/package_cli_release.py \

@@ -32,6 +32,9 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
     var generator_json: ?[]const u8 = null;
     var semantic_search: ?[]const u8 = null;
     var full_text_search: ?[]const u8 = null;
+    var indexes_str: ?[]const u8 = null;
+    var fields_str: ?[]const u8 = null;
+    var limit: i64 = 5;
     var prompt: ?[]const u8 = null;
     var system_prompt: ?[]const u8 = null;
     var streaming = true;
@@ -40,6 +43,7 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
     var generate = false;
     var followup = false;
     var confidence = false;
+    var max_context_tokens: ?i64 = null;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
@@ -50,10 +54,20 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
             semantic_search = args.next();
         } else if (std.mem.eql(u8, arg, "--full-text-search")) {
             full_text_search = args.next();
+        } else if (std.mem.eql(u8, arg, "--indexes") or std.mem.eql(u8, arg, "-i")) {
+            indexes_str = args.next();
+        } else if (std.mem.eql(u8, arg, "--fields")) {
+            fields_str = args.next();
+        } else if (std.mem.eql(u8, arg, "--limit")) {
+            if (args.next()) |s| limit = std.fmt.parseInt(i64, s, 10) catch limit;
         } else if (std.mem.eql(u8, arg, "--prompt")) {
             prompt = args.next();
         } else if (std.mem.eql(u8, arg, "--system-prompt")) {
             system_prompt = args.next();
+        } else if (std.mem.eql(u8, arg, "--max-context-tokens")) {
+            if (args.next()) |s| max_context_tokens = std.fmt.parseInt(i64, s, 10) catch |err| {
+                cli.fatal("invalid --max-context-tokens: {}", .{err});
+            };
         } else if (std.mem.eql(u8, arg, "--streaming")) {
             streaming = true;
         } else if (std.mem.eql(u8, arg, "--no-streaming")) {
@@ -68,6 +82,8 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
             followup = true;
         } else if (std.mem.eql(u8, arg, "--confidence")) {
             confidence = true;
+        } else {
+            cli.fatal("unknown agents retrieval flag: {s}", .{arg});
         }
     }
 
@@ -78,56 +94,61 @@ fn retrieval(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.An
     }
     const query_text = prompt orelse semantic_search orelse full_text_search orelse "";
 
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    const writer = &out.writer;
+    var generator_value = parseJsonArg(antfly_client.types.GeneratorConfig, allocator, "--generator", gen_json);
+    defer generator_value.deinit();
 
-    try writer.writeAll("{");
-    try writer.print("\"generator\":{s}", .{gen_json});
-    try writer.writeAll(",\"query\":");
-    try std.json.Stringify.value(query_text, .{}, writer);
-    try writer.print(",\"stream\":{}", .{streaming});
-    try writer.writeAll(",\"queries\":[{");
-    try writer.writeAll("\"table\":");
-    try std.json.Stringify.value(table, .{}, writer);
-    if (semantic_search) |s| {
-        try writer.writeAll(",\"semantic_search\":");
-        try std.json.Stringify.value(s, .{}, writer);
-    }
-    if (full_text_search) |f| {
-        try writer.writeAll(",\"full_text_search\":{\"query\":");
-        try std.json.Stringify.value(f, .{}, writer);
-        try writer.writeAll("}");
-    }
-    try writer.writeAll(",\"limit\":5");
-    try writer.writeAll("}]");
+    var full_text_value: ?std.json.Parsed(std.json.Value) = null;
+    defer if (full_text_value) |*parsed| parsed.deinit();
+    if (full_text_search) |q| full_text_value = buildFullTextSearchValue(allocator, q);
 
-    try writer.writeAll(",\"steps\":{");
-    try writer.print("\"classification\":{{\"enabled\":{},\"with_reasoning\":{}}}", .{ classify or reasoning, reasoning });
-    try writer.writeAll(",\"generation\":{");
-    try writer.print("\"enabled\":{}", .{generate});
-    if (system_prompt) |sp| {
-        try writer.writeAll(",\"system_prompt\":");
-        try std.json.Stringify.value(sp, .{}, writer);
-    }
-    try writer.writeAll("}");
-    try writer.print(",\"followup\":{{\"enabled\":{}}}", .{followup});
-    try writer.print(",\"confidence\":{{\"enabled\":{}}}", .{confidence});
-    try writer.writeAll("}");
+    var fields: ?[]const []const u8 = null;
+    defer if (fields) |slice| allocator.free(slice);
+    if (fields_str) |raw| fields = try cli.splitCommaListAlloc(allocator, raw);
 
-    try writer.writeAll("}");
+    var indexes: ?[]const []const u8 = null;
+    defer if (indexes) |slice| allocator.free(slice);
+    if (indexes_str) |raw| indexes = try cli.splitCommaListAlloc(allocator, raw);
 
-    const json_body = out.written();
-
-    var parsed = std.json.parseFromSlice(antfly_client.types.RetrievalAgentRequest, allocator, json_body, .{ .ignore_unknown_fields = true }) catch |err| {
-        cli.fatal("failed to build retrieval agent request: {}", .{err});
+    const retrieval_query = antfly_client.types.RetrievalQueryRequest{
+        .table = table,
+        .full_text_search = if (full_text_value) |*parsed| parsed.value else null,
+        .semantic_search = semantic_search,
+        .indexes = indexes,
+        .fields = fields,
+        .limit = limit,
     };
-    defer parsed.deinit();
+    const queries = [_]antfly_client.types.RetrievalQueryRequest{retrieval_query};
 
-    var resp = try client.retrievalAgent(parsed.value);
+    const steps = antfly_client.types.RetrievalAgentSteps{
+        .classification = .{
+            .enabled = classify or reasoning,
+            .with_reasoning = reasoning,
+        },
+        .generation = .{
+            .enabled = generate,
+            .system_prompt = system_prompt,
+        },
+        .followup = .{
+            .enabled = followup,
+        },
+        .confidence = .{
+            .enabled = confidence,
+        },
+    };
+
+    const body = antfly_client.types.RetrievalAgentRequest{
+        .query = query_text,
+        .queries = queries[0..],
+        .max_context_tokens = max_context_tokens,
+        .stream = streaming,
+        .generator = generator_value.value,
+        .steps = steps,
+    };
+
+    var resp = try client.retrievalAgent(body);
     defer resp.deinit();
-    if (resp.body) |body| {
-        cli.writeStdout(io, body);
+    if (resp.body) |response_body| {
+        cli.writeStdout(io, response_body);
         cli.writeStdout(io, "\n");
     }
 }
@@ -150,26 +171,41 @@ fn queryBuilder(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client
     const i = intent orelse cli.fatal("--intent is required", .{});
     const gen_json = generator_json orelse cli.fatal("--generator is required", .{});
 
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    const writer = &out.writer;
+    var generator_value = parseJsonArg(antfly_client.types.GeneratorConfig, allocator, "--generator", gen_json);
+    defer generator_value.deinit();
 
-    try writer.writeAll("{");
-    try writer.print("\"intent\":\"{s}\"", .{i});
-    try writer.print(",\"generator\":{s}", .{gen_json});
-    if (table_name) |t| try writer.print(",\"table\":\"{s}\"", .{t});
-    try writer.writeAll("}");
-
-    const json_body = out.written();
-
-    var parsed = std.json.parseFromSlice(antfly_client.types.QueryBuilderRequest, allocator, json_body, .{ .ignore_unknown_fields = true }) catch |err| {
-        cli.fatal("failed to build query builder request: {}", .{err});
+    const body = antfly_client.types.QueryBuilderRequest{
+        .intent = i,
+        .table = table_name,
+        .generator = generator_value.value,
     };
-    defer parsed.deinit();
 
-    var resp = try client.queryBuilder(parsed.value);
+    var resp = try client.queryBuilder(body);
     defer resp.deinit();
     if (resp.data) |data| {
         try cli.writeJson(allocator, io, data.value);
     }
+}
+
+fn buildFullTextSearchValue(allocator: std.mem.Allocator, query: []const u8) std.json.Parsed(std.json.Value) {
+    const escaped = std.json.Stringify.valueAlloc(allocator, query, .{}) catch |err| {
+        cli.fatal("failed to encode --full-text-search: {}", .{err});
+    };
+    defer allocator.free(escaped);
+
+    const json_body = std.fmt.allocPrint(allocator, "{{\"query\":{s}}}", .{escaped}) catch |err| {
+        cli.fatal("failed to build --full-text-search value: {}", .{err});
+    };
+    defer allocator.free(json_body);
+
+    return parseJsonArg(std.json.Value, allocator, "--full-text-search", json_body);
+}
+
+fn parseJsonArg(comptime T: type, allocator: std.mem.Allocator, flag: []const u8, raw: []const u8) std.json.Parsed(T) {
+    return std.json.parseFromSlice(T, allocator, raw, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch |err| {
+        cli.fatal("invalid JSON for {s}: {}", .{ flag, err });
+    };
 }

@@ -210,6 +210,7 @@ pub const SSEToolMode = types.SSEToolMode;
 pub const SSEError = types.SSEError;
 pub const PruneStats = types.PruneStats;
 pub const RetrievalAgentUsage = types.RetrievalAgentUsage;
+pub const RetrievalStepConfig = types.RetrievalStepConfig;
 pub const RetrievalAgentSteps = types.RetrievalAgentSteps;
 pub const RetrievalAgentRequest = types.RetrievalAgentRequest;
 pub const RetrievalAgentResult = types.RetrievalAgentResult;

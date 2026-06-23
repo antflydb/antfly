@@ -28,6 +28,7 @@ pub fn Queue(comptime Item: type) type {
         process_ctx: *anyopaque,
         process_fn: *const fn (ctx: *anyopaque, item: Item) void,
         priority_fn: ?*const fn (item: Item) u64 = null,
+        process_with_lock: bool = true,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -49,6 +50,17 @@ pub fn Queue(comptime Item: type) type {
         ) Self {
             var self = init(allocator, process_ctx, process_fn);
             self.priority_fn = priority_fn;
+            return self;
+        }
+
+        pub fn initWithPriorityUnlocked(
+            allocator: std.mem.Allocator,
+            process_ctx: *anyopaque,
+            process_fn: *const fn (ctx: *anyopaque, item: Item) void,
+            priority_fn: *const fn (item: Item) u64,
+        ) Self {
+            var self = initWithPriority(allocator, process_ctx, process_fn, priority_fn);
+            self.process_with_lock = false;
             return self;
         }
 
@@ -114,7 +126,13 @@ pub fn Queue(comptime Item: type) type {
                 }
                 if (self.items.items.len > 0) {
                     const item = self.items.orderedRemove(self.pickIndexLocked());
-                    self.process_fn(self.process_ctx, item);
+                    if (self.process_with_lock) {
+                        self.process_fn(self.process_ctx, item);
+                    } else {
+                        self.unlock();
+                        self.process_fn(self.process_ctx, item);
+                        continue;
+                    }
                     self.unlock();
                     continue;
                 }
@@ -127,7 +145,13 @@ pub fn Queue(comptime Item: type) type {
             var remaining = @min(max_items, self.items.items.len);
             while (remaining > 0 and self.items.items.len > 0) : (remaining -= 1) {
                 const item = self.items.orderedRemove(self.pickIndexLocked());
-                self.process_fn(self.process_ctx, item);
+                if (self.process_with_lock) {
+                    self.process_fn(self.process_ctx, item);
+                } else {
+                    self.unlock();
+                    self.process_fn(self.process_ctx, item);
+                    self.lock();
+                }
             }
         }
 

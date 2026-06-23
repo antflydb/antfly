@@ -686,6 +686,8 @@ pub const LookupKeyPathParams = struct {
 pub const LookupKeyParams = struct {
     /// Comma-separated list of fields to include in the response. If not specified, returns the full document. Supports: - Simple fields: "title,author" - Nested paths: "user.address.city" - Wildcards: "_chunks.*" - Exclusions: "-_chunks.*._embedding" - Special fields: "_embeddings,_summaries,_chunks"
     fields: ?[]const u8 = null,
+    /// Read consistency for the lookup. The default `read_index` routes to the primary for linearizable reads. `stale` allows a hot standby to serve the lookup at its safe-read LSN.
+    consistency: ?[]const u8 = null,
 };
 
 /// List derived document artifact manifests
@@ -1826,6 +1828,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             const key = ctx.param("key") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: key" });
             const query_params = LookupKeyParams{
                 .fields = ctx.query("fields"),
+                .consistency = ctx.query("consistency"),
             };
             return impl.lookupKey(ctx, table_name, key, query_params);
         }

@@ -36,6 +36,8 @@ const doc_set = @import("../storage/db/doc_set.zig");
 const catalog_resources = @import("catalog_resources.zig");
 const db_embedder = @import("../storage/db/enrichment/embedder.zig");
 const asset_producer_mod = @import("../storage/db/enrichment/asset_producer.zig");
+const ha_read_gate_mod = @import("../storage/ha/read_gate.zig");
+const ha_standby_mod = @import("../storage/ha/standby.zig");
 const hbc_mod = @import("../storage/hbc_adapter.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
@@ -724,6 +726,25 @@ pub const GroupVisibleRootGenerationSource = struct {
     /// not the storage engine's physical per-write generation.
     pub fn visibleRootGenerationForGroup(self: GroupVisibleRootGenerationSource, group_id: u64) u64 {
         return self.visible_root_generation_for_group(self.ptr, group_id);
+    }
+};
+
+pub const HAReadGate = struct {
+    standby: *const ha_standby_mod.Standby,
+
+    pub fn check(self: HAReadGate, consistency: raft_mod.ReadConsistency) !void {
+        const decision = try ha_read_gate_mod.evaluateStandby(self.standby, .{
+            .consistency = switch (consistency) {
+                .stale => .stale_ok,
+                .leader_lease, .read_index => .primary,
+            },
+        });
+        switch (decision.action) {
+            .serve_standby => {},
+            .wait_for_apply => return error.HAReadWaitForApply,
+            .wait_for_metadata => return error.HAReadWaitForMetadata,
+            .route_to_primary => return error.HAReadRequiresPrimary,
+        }
     }
 };
 
@@ -2980,6 +3001,7 @@ pub const ProvisionedTableReadSource = struct {
     prepare_for_read: ?ReadPreparation = null,
     group_visible_root_generation: ?GroupVisibleRootGenerationSource = null,
     primary_lookup_db: ?PrimaryLookupDbSource = null,
+    ha_read_gate: ?HAReadGate = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
@@ -3034,6 +3056,18 @@ pub const ProvisionedTableReadSource = struct {
     ) *ProvisionedTableReadSource {
         self.group_visible_root_generation = generation_source;
         return self;
+    }
+
+    pub fn withHAReadGate(
+        self: *ProvisionedTableReadSource,
+        gate: ?HAReadGate,
+    ) *ProvisionedTableReadSource {
+        self.ha_read_gate = gate;
+        return self;
+    }
+
+    fn ensureHAReadAllowed(self: *ProvisionedTableReadSource, consistency: raft_mod.ReadConsistency) !void {
+        if (self.ha_read_gate) |gate| try gate.check(consistency);
     }
 
     pub fn source(self: *ProvisionedTableReadSource) TableReadSource {
@@ -3115,6 +3149,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?LookupResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
         const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, key)) orelse return null;
         return try lookupProvisionedHostedLocal(self.primary_lookup_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency);
@@ -3134,6 +3169,35 @@ pub const ProvisionedTableReadSource = struct {
         return try lookup(ptr, alloc, table_name, key, opts, consistency);
     }
 
+    fn documentArtifactManifest(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.DocumentArtifactManifest {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
+        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
+        const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
+        return try documentArtifactManifestProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, artifact_name, consistency);
+    }
+
+    fn documentArtifactManifests(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        doc_key: []const u8,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.DocumentArtifactManifestList {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
+        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
+        const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
+        return try documentArtifactManifestsProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, consistency);
+    }
+
     fn scan(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -3144,6 +3208,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?ScanResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
         const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, from_key, to_key);
         defer alloc.free(group_ids);
@@ -3176,6 +3241,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, readPreparationKindForQuery(req));
         const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
         defer alloc.free(group_ids);
@@ -3256,6 +3322,7 @@ pub const ProvisionedTableReadSource = struct {
         max_work: u32,
     ) !?db_mod.RuntimePreflightSummary {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, readPreparationKindForQuery(req));
         const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
         defer alloc.free(group_ids);
@@ -3282,6 +3349,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?LookupResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
         return try lookupProvisionedHostedLocal(self.primary_lookup_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, key, opts, consistency);
     }
@@ -3295,6 +3363,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?[]u8 {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
         const group_id = try resolveSingleUniqueOwnerGroup(alloc, self.catalog, table_name, constraint_name, encoded_value);
         return try lookupRelationalUniqueOwnerProvisionedHostedLocal(
@@ -3387,6 +3456,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?[]u8 {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
         return try lookupRelationalTemporalUniqueOwnerProvisionedHostedLocal(
             self.primary_lookup_db,
@@ -3601,6 +3671,7 @@ pub const ProvisionedTableReadSource = struct {
         max_work: u32,
     ) !?db_mod.RuntimePreflightSummary {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         return try preflightHostedLocal(
             self.cache,
             self.replica_root_dir,
@@ -3628,6 +3699,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?ScanResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
         return try scanProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, from_key, to_key, opts, consistency);
     }
@@ -3641,6 +3713,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, readPreparationKindForQuery(req));
         const start_ns = platform_time.monotonicNs();
         const execution = try queryHostedLocalDetailed(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, self.antfly_provider, self.secret_store, self.remote_content, table_name, req, consistency);
@@ -3667,6 +3740,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.SearchResult {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, readPreparationKindForQuery(req));
         return try queryHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, self.antfly_provider, self.secret_store, self.remote_content, table_name, req, consistency);
     }
@@ -3702,6 +3776,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?distributed_graph.GraphExpandResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         const expansions = try alloc.alloc(distributed_graph.GraphExpansion, req.frontier.len);
         var initialized: usize = 0;
         errdefer {
@@ -3743,6 +3818,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?distributed_graph.GraphHydrateResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, req.topology_epoch);
         return try executeProvisionedGraphHydrate(ptr, alloc, group_id, table_name, req, consistency);
     }
@@ -3756,6 +3832,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?distributed_graph.GraphEdgesResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
         return try graphGetEdgesLocal(alloc, self.replica_root_dir, self.catalog, self.requester, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, req, consistency);
     }
 
@@ -5008,10 +5085,13 @@ fn executeLoweredDocumentSqlReadPlanAlloc(
     }
 
     switch (lowered.producer) {
-        .id_lookup => |ids| {
-            for (ids) |id| {
+        .id_lookup => |lookup_plan| {
+            for (lookup_plan.ids) |id| {
                 var lookup = (try documentSqlLookupAlloc(alloc, source, target, native_table_name, public_table_name, id, .{}, consistency)) orelse continue;
                 defer lookup.deinit(alloc);
+                if (lookup_plan.residual_filter_json) |filter| {
+                    if (!try documentSqlResidualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
+                }
                 try rows.append(alloc, try documentSqlProjectedRowJsonAlloc(alloc, id, lookup.json, lowered.projection));
                 if (lowered.limit) |limit| {
                     if (rows.items.len >= limit) break;
@@ -5100,11 +5180,14 @@ fn executeLoweredDocumentSqlAlgebraicAggregatePlanAlloc(
     }
 
     const count: u32 = if (lowered.candidate_producer) |producer| switch (producer) {
-        .id_lookup => |ids| blk: {
+        .id_lookup => |lookup_plan| blk: {
             var total: u32 = 0;
-            for (ids) |id| {
+            for (lookup_plan.ids) |id| {
                 var lookup = (try documentSqlLookupAlloc(alloc, source, target, native_table_name, public_table_name, id, .{}, consistency)) orelse continue;
                 defer lookup.deinit(alloc);
+                if (lookup_plan.residual_filter_json) |filter| {
+                    if (!try documentSqlResidualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
+                }
                 total += 1;
             }
             break :blk total;
@@ -5181,10 +5264,13 @@ fn executeLoweredDocumentSqlGroupedCountAggregatePlanAlloc(
     }
 
     switch (lowered.candidate_producer.?) {
-        .id_lookup => |ids| {
-            for (ids) |id| {
+        .id_lookup => |lookup_plan| {
+            for (lookup_plan.ids) |id| {
                 var lookup = (try documentSqlLookupAlloc(alloc, source, target, native_table_name, public_table_name, id, .{}, consistency)) orelse continue;
                 defer lookup.deinit(alloc);
+                if (lookup_plan.residual_filter_json) |filter| {
+                    if (!try documentSqlResidualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
+                }
                 try appendDocumentSqlCountGroupFromDocJsonAlloc(alloc, &groups, group_by, lookup.json);
             }
         },
@@ -5355,10 +5441,13 @@ fn executeOrderedLoweredDocumentSqlReadPlanAlloc(
     }
 
     switch (lowered.producer) {
-        .id_lookup => |ids| {
-            for (ids) |id| {
+        .id_lookup => |lookup_plan| {
+            for (lookup_plan.ids) |id| {
                 var lookup = (try documentSqlLookupAlloc(alloc, source, target, native_table_name, public_table_name, id, .{}, consistency)) orelse continue;
                 defer lookup.deinit(alloc);
+                if (lookup_plan.residual_filter_json) |filter| {
+                    if (!try documentSqlResidualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
+                }
                 try appendOrderedDocumentSqlCandidateAlloc(alloc, &candidates, id, lookup.json, order_by);
             }
         },
@@ -5932,10 +6021,37 @@ fn documentSqlFilterValueMatches(
     filter: std.json.Value,
 ) anyerror!bool {
     if (filter != .object) return error.InvalidRowsRequest;
+    if (filter.object.get("match_all") != null) return true;
+    if (filter.object.get("match_none") != null) return false;
     if (filter.object.get("bool")) |bool_value| {
         if (bool_value != .object) return error.InvalidRowsRequest;
-        const filter_value = bool_value.object.get("filter") orelse return error.InvalidRowsRequest;
-        return try documentSqlFilterConjunctionMatches(alloc, doc, filter_value);
+        var has_clause = false;
+        var matched_positive = false;
+        if (bool_value.object.get("must")) |must_value| {
+            has_clause = true;
+            if (!try documentSqlFilterConjunctionMatches(alloc, doc, must_value)) return false;
+            matched_positive = true;
+        }
+        if (bool_value.object.get("filter")) |filter_value| {
+            has_clause = true;
+            if (!try documentSqlFilterConjunctionMatches(alloc, doc, filter_value)) return false;
+            matched_positive = true;
+        }
+        if (bool_value.object.get("should")) |should_value| {
+            has_clause = true;
+            const minimum_should_match = try documentSqlFilterMinimumShouldMatch(bool_value, if (matched_positive) 0 else 1);
+            if (!try documentSqlFilterShouldMatches(alloc, doc, should_value, minimum_should_match)) return false;
+        }
+        if (bool_value.object.get("must_not")) |must_not_value| {
+            has_clause = true;
+            if (try documentSqlFilterDisjunctionMatches(alloc, doc, must_not_value)) return false;
+        }
+        if (!has_clause) return error.InvalidRowsRequest;
+        return true;
+    }
+    if (filter.object.get("exists")) |exists| {
+        const path = try documentSqlFilterPath(exists);
+        return documentSqlProjectedValue(doc, path) != null;
     }
     if (filter.object.get("term")) |term| {
         const path = try documentSqlFilterPath(term);
@@ -5997,6 +6113,47 @@ fn documentSqlFilterConjunctionMatches(
             if (!try documentSqlFilterValueMatches(alloc, doc, item)) return false;
         }
         return true;
+    }
+    return try documentSqlFilterValueMatches(alloc, doc, filter);
+}
+
+fn documentSqlFilterShouldMatches(
+    alloc: std.mem.Allocator,
+    doc: std.json.Value,
+    filter: std.json.Value,
+    minimum_should_match: u32,
+) anyerror!bool {
+    var matches: u32 = 0;
+    if (filter == .array) {
+        for (filter.array.items) |item| {
+            if (try documentSqlFilterValueMatches(alloc, doc, item)) matches += 1;
+        }
+    } else if (try documentSqlFilterValueMatches(alloc, doc, filter)) {
+        matches += 1;
+    }
+    return matches >= minimum_should_match;
+}
+
+fn documentSqlFilterMinimumShouldMatch(bool_value: std.json.Value, default_value: u32) !u32 {
+    if (bool_value != .object) return error.InvalidRowsRequest;
+    const value = bool_value.object.get("minimum_should_match") orelse bool_value.object.get("min_should") orelse return default_value;
+    return switch (value) {
+        .integer => |item| if (item < 0) error.InvalidRowsRequest else @intCast(item),
+        .number_string => |text| try std.fmt.parseUnsigned(u32, text, 10),
+        else => error.InvalidRowsRequest,
+    };
+}
+
+fn documentSqlFilterDisjunctionMatches(
+    alloc: std.mem.Allocator,
+    doc: std.json.Value,
+    filter: std.json.Value,
+) anyerror!bool {
+    if (filter == .array) {
+        for (filter.array.items) |item| {
+            if (try documentSqlFilterValueMatches(alloc, doc, item)) return true;
+        }
+        return false;
     }
     return try documentSqlFilterValueMatches(alloc, doc, filter);
 }
@@ -6092,6 +6249,70 @@ fn documentSqlFilterBool(value: std.json.Value, name: []const u8, default_value:
     if (value != .object) return default_value;
     const item = value.object.get(name) orelse return default_value;
     return item == .bool and item.bool;
+}
+
+test "document SQL residual filter supports bool must not" {
+    const alloc = std.testing.allocator;
+    const active_west_doc =
+        \\{"status":"active","region":"west"}
+    ;
+    const archived_west_doc =
+        \\{"status":"archived","region":"west"}
+    ;
+    const active_east_doc =
+        \\{"status":"active","region":"east"}
+    ;
+    const filter =
+        \\{"bool":{"filter":[{"term":{"path":"/region","value":"west"}}],"must_not":[{"term":{"path":"/status","value":"archived"}}]}}
+    ;
+
+    try std.testing.expect(try documentSqlResidualFilterMatchesAlloc(alloc, active_west_doc, filter));
+    try std.testing.expect(!try documentSqlResidualFilterMatchesAlloc(alloc, archived_west_doc, filter));
+    try std.testing.expect(!try documentSqlResidualFilterMatchesAlloc(alloc, active_east_doc, filter));
+
+    const exclusion_only =
+        \\{"bool":{"must_not":[{"term":{"path":"/status","value":"archived"}}]}}
+    ;
+    try std.testing.expect(try documentSqlResidualFilterMatchesAlloc(alloc, active_west_doc, exclusion_only));
+    try std.testing.expect(!try documentSqlResidualFilterMatchesAlloc(alloc, archived_west_doc, exclusion_only));
+}
+
+test "document SQL residual filter supports null and existence predicates" {
+    const alloc = std.testing.allocator;
+    const active_doc =
+        \\{"status":"active"}
+    ;
+    const null_doc =
+        \\{"status":null}
+    ;
+    const missing_doc =
+        \\{"region":"west"}
+    ;
+    const is_null_filter =
+        \\{"bool":{"should":[{"term":{"path":"/status","value":null}},{"bool":{"must_not":[{"exists":{"path":"/status"}}]}}],"minimum_should_match":1}}
+    ;
+
+    try std.testing.expect(!try documentSqlResidualFilterMatchesAlloc(alloc, active_doc, is_null_filter));
+    try std.testing.expect(try documentSqlResidualFilterMatchesAlloc(alloc, null_doc, is_null_filter));
+    try std.testing.expect(try documentSqlResidualFilterMatchesAlloc(alloc, missing_doc, is_null_filter));
+
+    const is_not_null_filter =
+        \\{"bool":{"filter":[{"exists":{"path":"/status"}}],"must_not":[{"term":{"path":"/status","value":null}}]}}
+    ;
+    try std.testing.expect(try documentSqlResidualFilterMatchesAlloc(alloc, active_doc, is_not_null_filter));
+    try std.testing.expect(!try documentSqlResidualFilterMatchesAlloc(alloc, null_doc, is_not_null_filter));
+    try std.testing.expect(!try documentSqlResidualFilterMatchesAlloc(alloc, missing_doc, is_not_null_filter));
+}
+
+test "document SQL residual filter supports match all and match none" {
+    const alloc = std.testing.allocator;
+    const doc =
+        \\{"status":"active"}
+    ;
+
+    try std.testing.expect(try documentSqlResidualFilterMatchesAlloc(alloc, doc, "{\"match_all\":{}}"));
+    try std.testing.expect(!try documentSqlResidualFilterMatchesAlloc(alloc, doc, "{\"match_none\":{}}"));
+    try std.testing.expect(!try documentSqlResidualFilterMatchesAlloc(alloc, doc, "{\"bool\":{\"filter\":[{\"match_none\":{}},{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}]}}"));
 }
 
 fn documentSqlWildcardMatches(pattern: []const u8, text: []const u8) bool {
@@ -10801,6 +11022,102 @@ fn lookupProvisionedHostedLocal(
 ) !?LookupResponse {
     return lookupProvisionedLocal(primary_lookup_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, table_name, key, opts, consistency) catch |err| switch (err) {
         error.NotLeader => if (consistency == .stale) err else try lookupProvisionedLocal(primary_lookup_db, cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, table_name, key, opts, .stale),
+        else => err,
+    };
+}
+
+fn documentArtifactManifestProvisionedLocal(
+    cache: ?*ProvisionedTableReadCache,
+    replica_root_dir: []const u8,
+    catalog: table_catalog.CatalogSource,
+    requester: raft_mod.ReadableLeaseRequester,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lsm_root_generation: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.DocumentArtifactManifest {
+    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
+    defer alloc.free(path);
+    if (cache) |cached| {
+        var db_lease = try cached.getOrOpen(path, catalog, group_id, lsm_root_generation, table_name);
+        defer db_lease.release();
+        var reads = raft_mod.FeatureDBReads.init(group_id, requester);
+        return try reads.documentArtifactManifestWithConsistency(alloc, db_lease.db, doc_key, artifact_name, consistency);
+    }
+
+    var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, catalog, table_name, group_id, lsm_root_generation, backend_runtime);
+    defer db.close();
+    var reads = raft_mod.FeatureDBReads.init(group_id, requester);
+    return try reads.documentArtifactManifestWithConsistency(alloc, &db, doc_key, artifact_name, consistency);
+}
+
+fn documentArtifactManifestProvisionedHostedLocal(
+    cache: ?*ProvisionedTableReadCache,
+    replica_root_dir: []const u8,
+    catalog: table_catalog.CatalogSource,
+    requester: raft_mod.ReadableLeaseRequester,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lsm_root_generation: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    doc_key: []const u8,
+    artifact_name: []const u8,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.DocumentArtifactManifest {
+    return documentArtifactManifestProvisionedLocal(cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, table_name, doc_key, artifact_name, consistency) catch |err| switch (err) {
+        error.NotLeader => if (consistency == .stale) err else try documentArtifactManifestProvisionedLocal(cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, table_name, doc_key, artifact_name, .stale),
+        else => err,
+    };
+}
+
+fn documentArtifactManifestsProvisionedLocal(
+    cache: ?*ProvisionedTableReadCache,
+    replica_root_dir: []const u8,
+    catalog: table_catalog.CatalogSource,
+    requester: raft_mod.ReadableLeaseRequester,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lsm_root_generation: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    doc_key: []const u8,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.DocumentArtifactManifestList {
+    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
+    defer alloc.free(path);
+    if (cache) |cached| {
+        var db_lease = try cached.getOrOpen(path, catalog, group_id, lsm_root_generation, table_name);
+        defer db_lease.release();
+        var reads = raft_mod.FeatureDBReads.init(group_id, requester);
+        return try reads.documentArtifactManifestsWithConsistency(alloc, db_lease.db, doc_key, consistency);
+    }
+
+    var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, catalog, table_name, group_id, lsm_root_generation, backend_runtime);
+    defer db.close();
+    var reads = raft_mod.FeatureDBReads.init(group_id, requester);
+    return try reads.documentArtifactManifestsWithConsistency(alloc, &db, doc_key, consistency);
+}
+
+fn documentArtifactManifestsProvisionedHostedLocal(
+    cache: ?*ProvisionedTableReadCache,
+    replica_root_dir: []const u8,
+    catalog: table_catalog.CatalogSource,
+    requester: raft_mod.ReadableLeaseRequester,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lsm_root_generation: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    doc_key: []const u8,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.DocumentArtifactManifestList {
+    return documentArtifactManifestsProvisionedLocal(cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, table_name, doc_key, consistency) catch |err| switch (err) {
+        error.NotLeader => if (consistency == .stale) err else try documentArtifactManifestsProvisionedLocal(cache, replica_root_dir, catalog, requester, alloc, group_id, lsm_root_generation, backend_runtime, table_name, doc_key, .stale),
         else => err,
     };
 }
@@ -24673,6 +24990,69 @@ test "provisioned table read source routes lookup and scan across ranges" {
     try std.testing.expectEqual(@as(usize, 2), rows.len);
     try std.testing.expectEqualStrings("alpha", rows[0].title);
     try std.testing.expectEqualStrings("zeta", rows[1].title);
+}
+
+test "provisioned standby read gate permits stale reads and routes non-stale reads to primary" {
+    const alloc = std.testing.allocator;
+    const root = ".zig-cache/tmp/table-reads-ha-read-gate";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), root) catch {};
+    try std.Io.Dir.cwd().createDirPath(io_impl.io(), root);
+
+    const receive_path_raw = try std.fmt.allocPrint(alloc, "{s}/received.wal", .{root});
+    defer alloc.free(receive_path_raw);
+    const receive_path = try alloc.dupeZ(u8, receive_path_raw);
+    defer alloc.free(receive_path);
+    const progress_path_raw = try std.fmt.allocPrint(alloc, "{s}/progress.wal", .{root});
+    defer alloc.free(progress_path_raw);
+    const progress_path = try alloc.dupeZ(u8, progress_path_raw);
+    defer alloc.free(progress_path);
+
+    var standby = try ha_standby_mod.Standby.open(alloc, receive_path.ptr, progress_path.ptr, .{
+        .cluster_id = 100,
+        .shard_id = 10,
+        .table_id = 20,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer standby.close();
+
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = ProvisionedTableReadSource.init("/tmp/unused-antfly-ha-read-gate", NoCatalog.iface(), raft_mod.read_gate.noopReadableLeaseRequester());
+    _ = source.withHAReadGate(.{ .standby = &standby });
+
+    try std.testing.expectError(
+        error.HAReadRequiresPrimary,
+        source.source().lookup(alloc, "docs", "doc:a", .{}, .read_index),
+    );
+    try std.testing.expectError(
+        error.HAReadRequiresPrimary,
+        source.source().lookup(alloc, "docs", "doc:a", .{}, .leader_lease),
+    );
+    try std.testing.expectError(
+        error.UnexpectedCatalogCall,
+        source.source().lookup(alloc, "docs", "doc:a", .{}, .stale),
+    );
 }
 
 test "fanout planner uses io cap and request shape" {

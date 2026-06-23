@@ -21,7 +21,7 @@ T = TypeVar("T", bound="EvalConfig")
 @_attrs_define
 class EvalConfig:
     """Configuration for inline evaluation of query results.
-    Add to RAGRequest, QueryRequest, or AnswerAgentRequest.
+    Add to RetrievalAgentRequest, QueryRequest, or other evaluation-capable request schemas.
 
         Attributes:
             evaluators (list[EvaluatorName] | Unset): List of evaluators to run

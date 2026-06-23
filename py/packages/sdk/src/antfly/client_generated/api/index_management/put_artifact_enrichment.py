@@ -1,0 +1,244 @@
+from http import HTTPStatus
+from typing import Any
+from urllib.parse import quote
+
+import httpx
+
+from ... import errors
+from ...client import AuthenticatedClient, Client
+from ...models.enrichment_config import EnrichmentConfig
+from ...models.error import Error
+from ...models.put_artifact_enrichment_response_201 import PutArtifactEnrichmentResponse201
+from ...types import Response
+
+
+def _get_kwargs(
+    table_name: str,
+    artifact_name: str,
+    *,
+    body: EnrichmentConfig,
+) -> dict[str, Any]:
+    headers: dict[str, Any] = {}
+
+    _kwargs: dict[str, Any] = {
+        "method": "put",
+        "url": "/db/v1/tables/{table_name}/artifacts/{artifact_name}/enrichment".format(
+            table_name=quote(str(table_name), safe=""),
+            artifact_name=quote(str(artifact_name), safe=""),
+        ),
+    }
+
+    _kwargs["json"] = body.to_dict()
+
+    headers["Content-Type"] = "application/json"
+
+    _kwargs["headers"] = headers
+    return _kwargs
+
+
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Error | PutArtifactEnrichmentResponse201 | None:
+    if response.status_code == 201:
+        response_201 = PutArtifactEnrichmentResponse201.from_dict(response.json())
+
+        return response_201
+
+    if response.status_code == 400:
+        response_400 = Error.from_dict(response.json())
+
+        return response_400
+
+    if response.status_code == 404:
+        response_404 = Error.from_dict(response.json())
+
+        return response_404
+
+    if response.status_code == 405:
+        response_405 = Error.from_dict(response.json())
+
+        return response_405
+
+    if response.status_code == 500:
+        response_500 = Error.from_dict(response.json())
+
+        return response_500
+
+    if response.status_code == 503:
+        response_503 = Error.from_dict(response.json())
+
+        return response_503
+
+    if client.raise_on_unexpected_status:
+        raise errors.UnexpectedStatus(response.status_code, response.content)
+    else:
+        return None
+
+
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Error | PutArtifactEnrichmentResponse201]:
+    return Response(
+        status_code=HTTPStatus(response.status_code),
+        content=response.content,
+        headers=response.headers,
+        parsed=_parse_response(client=client, response=response),
+    )
+
+
+def sync_detailed(
+    table_name: str,
+    artifact_name: str,
+    *,
+    client: AuthenticatedClient,
+    body: EnrichmentConfig,
+) -> Response[Error | PutArtifactEnrichmentResponse201]:
+    """Register or replace an artifact enrichment
+
+     Registers a table-level generated artifact definition. Reusing the same
+    artifact name replaces the existing mapping. Chunk enrichments may set
+    `full_text_index: true` to map generated chunk text into the table's
+    default full-text index.
+
+    Args:
+        table_name (str):
+        artifact_name (str):
+        body (EnrichmentConfig): Inline managed enrichment definition. Enrichments materialize
+            generated artifacts before indexing and may target source rows or previously generated
+            artifact streams.
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        Response[Error | PutArtifactEnrichmentResponse201]
+    """
+
+    kwargs = _get_kwargs(
+        table_name=table_name,
+        artifact_name=artifact_name,
+        body=body,
+    )
+
+    response = client.get_httpx_client().request(
+        **kwargs,
+    )
+
+    return _build_response(client=client, response=response)
+
+
+def sync(
+    table_name: str,
+    artifact_name: str,
+    *,
+    client: AuthenticatedClient,
+    body: EnrichmentConfig,
+) -> Error | PutArtifactEnrichmentResponse201 | None:
+    """Register or replace an artifact enrichment
+
+     Registers a table-level generated artifact definition. Reusing the same
+    artifact name replaces the existing mapping. Chunk enrichments may set
+    `full_text_index: true` to map generated chunk text into the table's
+    default full-text index.
+
+    Args:
+        table_name (str):
+        artifact_name (str):
+        body (EnrichmentConfig): Inline managed enrichment definition. Enrichments materialize
+            generated artifacts before indexing and may target source rows or previously generated
+            artifact streams.
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        Error | PutArtifactEnrichmentResponse201
+    """
+
+    return sync_detailed(
+        table_name=table_name,
+        artifact_name=artifact_name,
+        client=client,
+        body=body,
+    ).parsed
+
+
+async def asyncio_detailed(
+    table_name: str,
+    artifact_name: str,
+    *,
+    client: AuthenticatedClient,
+    body: EnrichmentConfig,
+) -> Response[Error | PutArtifactEnrichmentResponse201]:
+    """Register or replace an artifact enrichment
+
+     Registers a table-level generated artifact definition. Reusing the same
+    artifact name replaces the existing mapping. Chunk enrichments may set
+    `full_text_index: true` to map generated chunk text into the table's
+    default full-text index.
+
+    Args:
+        table_name (str):
+        artifact_name (str):
+        body (EnrichmentConfig): Inline managed enrichment definition. Enrichments materialize
+            generated artifacts before indexing and may target source rows or previously generated
+            artifact streams.
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        Response[Error | PutArtifactEnrichmentResponse201]
+    """
+
+    kwargs = _get_kwargs(
+        table_name=table_name,
+        artifact_name=artifact_name,
+        body=body,
+    )
+
+    response = await client.get_async_httpx_client().request(**kwargs)
+
+    return _build_response(client=client, response=response)
+
+
+async def asyncio(
+    table_name: str,
+    artifact_name: str,
+    *,
+    client: AuthenticatedClient,
+    body: EnrichmentConfig,
+) -> Error | PutArtifactEnrichmentResponse201 | None:
+    """Register or replace an artifact enrichment
+
+     Registers a table-level generated artifact definition. Reusing the same
+    artifact name replaces the existing mapping. Chunk enrichments may set
+    `full_text_index: true` to map generated chunk text into the table's
+    default full-text index.
+
+    Args:
+        table_name (str):
+        artifact_name (str):
+        body (EnrichmentConfig): Inline managed enrichment definition. Enrichments materialize
+            generated artifacts before indexing and may target source rows or previously generated
+            artifact streams.
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        Error | PutArtifactEnrichmentResponse201
+    """
+
+    return (
+        await asyncio_detailed(
+            table_name=table_name,
+            artifact_name=artifact_name,
+            client=client,
+            body=body,
+        )
+    ).parsed

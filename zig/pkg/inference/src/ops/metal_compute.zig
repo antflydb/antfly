@@ -140,6 +140,10 @@ fn traceMissingWeightDebug() bool {
     return getenvBool("TERMITE_METAL_TRACE_MISSING_WEIGHT");
 }
 
+fn traceKvCacheMiss() bool {
+    return getenvBool("TERMITE_METAL_TRACE_KV_CACHE_MISS");
+}
+
 fn prepareDecodeInputsDebug() bool {
     return getenvBool("TERMITE_METAL_PREPARE_DECODE_INPUTS_DEBUG");
 }
@@ -209,6 +213,14 @@ fn traceAttentionResidualNullRequested() bool {
 
 fn traceAttentionResidualNullLayerTarget() ?usize {
     return getenvUsize("TERMITE_METAL_TRACE_ATTN_RESIDUAL_NULL_LAYER");
+}
+
+fn strictFlorence2ResidentMetal() bool {
+    return getenvBool("TERMITE_FLORENCE2_METAL_STRICT_RESIDENT");
+}
+
+fn traceFlorence2ResidentMetal() bool {
+    return getenvBool("TERMITE_FLORENCE2_METAL_TRACE_RESIDENT");
 }
 
 fn enableContiguousSliceDeviceView() bool {
@@ -3027,13 +3039,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const key = dynamicLinearSlotKey(weight, bias, in_dim, out_dim);
         if (self.dynamic_linear_slots.get(key)) |slot| return slot;
         const slot = self.nextFreeDynamicLinearSlot() orelse return null;
+        const weight_buf = toBuf(weight);
+        const retain_dense_fallback = weight_buf.quantized_storage != null or weight_buf.runtime_quantized_storage != null;
         if (!(try decoderRuntimePrepareLinearOp(self, &.{
             .slot = slot,
             .weight = weight,
             .bias = bias,
             .in_dim = in_dim,
             .out_dim = out_dim,
-            .retain_dense_fallback = true,
+            .retain_dense_fallback = retain_dense_fallback,
         }))) return null;
         try self.dynamic_linear_slots.put(self.allocator, key, slot);
         return slot;
@@ -3836,6 +3850,21 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const shape_i64 = shape_override orelse buf.logical_shape orelse &[_]i64{@intCast(bufElemCount(buf))};
         const shape_i32 = try self.i32ShapeFromI64(shape_i64);
         defer self.allocator.free(shape_i32);
+        if (buf.quantized_storage) |storage| {
+            const host = try self.dequantizeStorageToFloat32(ct, storage, self.allocator);
+            defer self.allocator.free(host);
+            return native_ctx.cb.fromFloat32Shape(host, shape_i32);
+        }
+        if (buf.runtime_quantized_storage) |storage| {
+            const host = try self.dequantizeStorageToFloat32(ct, storage, self.allocator);
+            defer self.allocator.free(host);
+            return native_ctx.cb.fromFloat32Shape(host, shape_i32);
+        }
+        if (buf.owned_quantized_storage) |storage| {
+            const host = try self.dequantizeStorageToFloat32(ct, storage, self.allocator);
+            defer self.allocator.free(host);
+            return native_ctx.cb.fromFloat32Shape(host, shape_i32);
+        }
         if (buf.native_dense_bytes != null and buf.native_dense_dtype != null and buf.data.len == 0) {
             const expected_count = try shapeNumel(shape_i64);
             const host = try convertNativeDenseBytesToOwnedF32(
@@ -4143,6 +4172,87 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             else => null,
         };
         if (maybe_tensor) |tensor| return self.ctFromOwnedMetalTensor(tensor);
+        return null;
+    }
+
+    const Matrix2DShape = struct {
+        rows: usize,
+        cols: usize,
+    };
+
+    fn concreteMatrix2DShape(buf: *const Buf) ?Matrix2DShape {
+        if (buf.logical_shape) |shape| {
+            if (shape.len == 2 and shape[0] > 0 and shape[1] > 0) {
+                return .{ .rows = @intCast(shape[0]), .cols = @intCast(shape[1]) };
+            }
+        }
+        if (buf.metal_tensor) |*metal_tensor| {
+            if (metal_tensor.ndim() == 2 and metal_tensor.dim(0) > 0 and metal_tensor.dim(1) > 0) {
+                return .{ .rows = @intCast(metal_tensor.dim(0)), .cols = @intCast(metal_tensor.dim(1)) };
+            }
+        }
+        return null;
+    }
+
+    fn isRowVectorForColumns(buf: *const Buf, cols: usize) bool {
+        if (buf.logical_shape) |shape| {
+            if (shape.len == 1) return shape[0] > 0 and @as(usize, @intCast(shape[0])) == cols;
+            if (shape.len == 2) {
+                return shape[0] == 1 and shape[1] > 0 and @as(usize, @intCast(shape[1])) == cols;
+            }
+            return false;
+        }
+        if (buf.metal_tensor) |*metal_tensor| {
+            if (metal_tensor.ndim() == 1) return metal_tensor.dim(0) > 0 and @as(usize, @intCast(metal_tensor.dim(0))) == cols;
+            if (metal_tensor.ndim() == 2) {
+                return metal_tensor.dim(0) == 1 and metal_tensor.dim(1) > 0 and @as(usize, @intCast(metal_tensor.dim(1))) == cols;
+            }
+        }
+        return false;
+    }
+
+    fn tryDeviceRowBroadcastAdd(
+        self: *MetalCompute,
+        row_ct: CT,
+        matrix_buf: *const Buf,
+        row_buf: *const Buf,
+    ) !?CT {
+        const matrix_shape = concreteMatrix2DShape(matrix_buf) orelse return null;
+        const row_len = bufElemCount(row_buf);
+        if (matrix_shape.rows == 0 or matrix_shape.cols == 0 or row_len != matrix_shape.cols) return null;
+        if (!isRowVectorForColumns(row_buf, matrix_shape.cols)) return null;
+        const matrix_metal = matrix_buf.metal_tensor orelse return null;
+        if (!matrix_metal.isDevice()) return null;
+
+        var lhs = try matrix_metal.retainedCopy();
+        defer lhs.deinit();
+        var row = try self.ownedDeviceMetalTensorFromCt(row_ct);
+        defer row.deinit();
+        if (!row.isDevice()) return null;
+
+        const output_elems = std.math.mul(usize, matrix_shape.rows, matrix_shape.cols) catch return error.InvalidTensorShape;
+        const output_shape = [_]i32{ @intCast(matrix_shape.rows), @intCast(matrix_shape.cols) };
+        const out_strides = [_]u32{ @intCast(matrix_shape.cols), 1 };
+        const input_strides = [_]u32{ 0, 1 };
+        var broadcasted = (try metal_runtime.decoderRuntimeBroadcastF32Device(
+            self.provider_impl,
+            row,
+            &out_strides,
+            &input_strides,
+            2,
+            matrix_shape.cols,
+            output_elems,
+            &output_shape,
+        )) orelse return null;
+        defer broadcasted.deinit();
+
+        if (try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
+            .lhs = lhs,
+            .rhs = broadcasted,
+            .dim = output_elems,
+        }, &self.timing_stats)) |tensor| {
+            return self.ctFromOwnedMetalTensor(tensor);
+        }
         return null;
     }
 
@@ -4954,6 +5064,566 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             padding_w,
             groups,
         );
+    }
+
+    fn tokenGridConv2dOp(
+        ctx: *anyopaque,
+        input: CT,
+        weight: CT,
+        bias: CT,
+        batch: usize,
+        in_channels: usize,
+        out_channels: usize,
+        height: usize,
+        width: usize,
+        kernel_h: usize,
+        kernel_w: usize,
+        stride_h: usize,
+        stride_w: usize,
+        padding_h: usize,
+        padding_w: usize,
+        groups: usize,
+    ) anyerror!CT {
+        const out_h = (height + 2 * padding_h - kernel_h) / stride_h + 1;
+        const out_w = (width + 2 * padding_w - kernel_w) / stride_w + 1;
+
+        const token_4d_shape = [_]i64{
+            @intCast(batch),
+            @intCast(height),
+            @intCast(width),
+            @intCast(in_channels),
+        };
+        const token_4d = try primReshapeOp(ctx, input, &token_4d_shape);
+        defer freeOp(ctx, token_4d);
+
+        const to_nchw = [_]u8{ 0, 3, 1, 2 };
+        const image_nchw = try primTransposeOp(ctx, token_4d, &to_nchw, &token_4d_shape);
+        defer freeOp(ctx, image_nchw);
+
+        const conv_nchw = try conv2dOp(
+            ctx,
+            image_nchw,
+            weight,
+            bias,
+            batch,
+            in_channels,
+            out_channels,
+            height,
+            width,
+            kernel_h,
+            kernel_w,
+            stride_h,
+            stride_w,
+            padding_h,
+            padding_w,
+            groups,
+        );
+        defer freeOp(ctx, conv_nchw);
+
+        const conv_shape = [_]i64{
+            @intCast(batch),
+            @intCast(out_channels),
+            @intCast(out_h),
+            @intCast(out_w),
+        };
+        const to_nhwc = [_]u8{ 0, 2, 3, 1 };
+        const tokens_4d = try primTransposeOp(ctx, conv_nchw, &to_nhwc, &conv_shape);
+        defer freeOp(ctx, tokens_4d);
+
+        const out_token_shape = [_]i64{
+            @intCast(batch * out_h * out_w),
+            @intCast(out_channels),
+        };
+        return primReshapeOp(ctx, tokens_4d, &out_token_shape);
+    }
+
+    fn isDeviceResidentCt(tensor: CT) bool {
+        const buf = toBuf(tensor);
+        if (buf.metal_tensor) |*metal_tensor| return metal_tensor.isDevice();
+        return false;
+    }
+
+    fn requireFlorence2DeviceResident(tensor: CT) !void {
+        if (strictFlorence2ResidentMetal() and !isDeviceResidentCt(tensor)) return error.UnsupportedFlorence2ResidentMetal;
+    }
+
+    fn florenceWindowPackDevice(
+        self: *MetalCompute,
+        input: CT,
+        batch: usize,
+        height: usize,
+        width: usize,
+        dim: usize,
+        window_size: usize,
+    ) !?CT {
+        const input_buf = toBuf(input);
+        if (input_buf.quantized_storage != null or
+            input_buf.runtime_quantized_storage != null or
+            input_buf.owned_quantized_storage != null)
+        {
+            return null;
+        }
+        if (strictFlorence2ResidentMetal() and !isDeviceResidentCt(input)) return error.UnsupportedFlorence2ResidentMetal;
+        var input_mt = try self.ownedDeviceMetalTensorFromCt(input);
+        defer input_mt.deinit();
+        if (!input_mt.isDevice()) return null;
+        if (try metal_runtime.decoderRuntimeFlorenceWindowPackF32Device(
+            self.provider_impl,
+            input_mt,
+            batch,
+            height,
+            width,
+            dim,
+            window_size,
+        )) |tensor| {
+            return self.ctFromOwnedMetalTensor(tensor);
+        }
+        return null;
+    }
+
+    fn florenceWindowUnpackDevice(
+        self: *MetalCompute,
+        input: CT,
+        batch: usize,
+        height: usize,
+        width: usize,
+        dim: usize,
+        window_size: usize,
+    ) !?CT {
+        const input_buf = toBuf(input);
+        if (input_buf.quantized_storage != null or
+            input_buf.runtime_quantized_storage != null or
+            input_buf.owned_quantized_storage != null)
+        {
+            return null;
+        }
+        if (strictFlorence2ResidentMetal() and !isDeviceResidentCt(input)) return error.UnsupportedFlorence2ResidentMetal;
+        var input_mt = try self.ownedDeviceMetalTensorFromCt(input);
+        defer input_mt.deinit();
+        if (!input_mt.isDevice()) return null;
+        if (try metal_runtime.decoderRuntimeFlorenceWindowUnpackF32Device(
+            self.provider_impl,
+            input_mt,
+            batch,
+            height,
+            width,
+            dim,
+            window_size,
+        )) |tensor| {
+            return self.ctFromOwnedMetalTensor(tensor);
+        }
+        return null;
+    }
+
+    fn tryWindowedSelfAttentionResident(
+        self: *MetalCompute,
+        ctx: *anyopaque,
+        input: CT,
+        norm_weight: CT,
+        norm_bias: CT,
+        qkv_weight: CT,
+        qkv_bias: CT,
+        proj_weight: CT,
+        proj_bias: CT,
+        batch: usize,
+        height: usize,
+        width: usize,
+        dim: usize,
+        num_heads: usize,
+        window_size: usize,
+    ) !?CT {
+        if (batch == 0 or height == 0 or width == 0 or dim == 0 or num_heads == 0 or window_size == 0) return null;
+        if (dim % num_heads != 0) return null;
+        const pad_h = (window_size - (height % window_size)) % window_size;
+        const pad_w = (window_size - (width % window_size)) % window_size;
+        const padded_h = height + pad_h;
+        const padded_w = width + pad_w;
+        const windows_h = padded_h / window_size;
+        const windows_w = padded_w / window_size;
+        const window_count = batch * windows_h * windows_w;
+        const window_area = window_size * window_size;
+        const rows = window_count * window_area;
+        const head_dim = dim / num_heads;
+
+        try requireFlorence2DeviceResident(input);
+        const normed = try layerNormOp(ctx, input, norm_weight, norm_bias, dim, 1e-5);
+        defer freeOp(ctx, normed);
+        try requireFlorence2DeviceResident(normed);
+
+        const packed_windows = (try self.florenceWindowPackDevice(normed, batch, height, width, dim, window_size)) orelse return null;
+        defer freeOp(ctx, packed_windows);
+        try requireFlorence2DeviceResident(packed_windows);
+
+        const qkv = try linearOp(ctx, packed_windows, qkv_weight, qkv_bias, rows, dim, dim * 3);
+        defer freeOp(ctx, qkv);
+        try requireFlorence2DeviceResident(qkv);
+
+        const q = try sliceLastDimOp(ctx, qkv, 0, dim);
+        defer freeOp(ctx, q);
+        try requireFlorence2DeviceResident(q);
+        const k = try sliceLastDimOp(ctx, qkv, dim, dim * 2);
+        defer freeOp(ctx, k);
+        try requireFlorence2DeviceResident(k);
+        const v = try sliceLastDimOp(ctx, qkv, dim * 2, dim * 3);
+        defer freeOp(ctx, v);
+        try requireFlorence2DeviceResident(v);
+
+        const empty_mask = [_]i64{};
+        const attended = try scaledDotProductAttentionOp(ctx, q, k, v, &empty_mask, null, window_count, window_area, num_heads, head_dim);
+        defer freeOp(ctx, attended);
+        try requireFlorence2DeviceResident(attended);
+
+        const projected = try linearOp(ctx, attended, proj_weight, proj_bias, rows, dim, dim);
+        defer freeOp(ctx, projected);
+        try requireFlorence2DeviceResident(projected);
+
+        const output = (try self.florenceWindowUnpackDevice(projected, batch, height, width, dim, window_size)) orelse return null;
+        try requireFlorence2DeviceResident(output);
+        return output;
+    }
+
+    fn florenceChannelAttentionDevice(
+        self: *MetalCompute,
+        qkv: CT,
+        batch: usize,
+        seq_len: usize,
+        dim: usize,
+        groups: usize,
+    ) !?CT {
+        const qkv_buf = toBuf(qkv);
+        if (qkv_buf.quantized_storage != null or
+            qkv_buf.runtime_quantized_storage != null or
+            qkv_buf.owned_quantized_storage != null)
+        {
+            return null;
+        }
+        if (strictFlorence2ResidentMetal() and !isDeviceResidentCt(qkv)) return error.UnsupportedFlorence2ResidentMetal;
+        var qkv_mt = try self.ownedDeviceMetalTensorFromCt(qkv);
+        defer qkv_mt.deinit();
+        if (!qkv_mt.isDevice()) return null;
+        if (try metal_runtime.decoderRuntimeFlorenceChannelAttentionF32Device(
+            self.provider_impl,
+            qkv_mt,
+            batch,
+            seq_len,
+            dim,
+            groups,
+        )) |tensor| {
+            return self.ctFromOwnedMetalTensor(tensor);
+        }
+        return null;
+    }
+
+    fn tryChannelSelfAttentionResident(
+        self: *MetalCompute,
+        ctx: *anyopaque,
+        input: CT,
+        norm_weight: CT,
+        norm_bias: CT,
+        qkv_weight: CT,
+        qkv_bias: CT,
+        proj_weight: CT,
+        proj_bias: CT,
+        batch: usize,
+        seq_len: usize,
+        dim: usize,
+        groups: usize,
+    ) !?CT {
+        if (batch == 0 or seq_len == 0 or dim == 0 or groups == 0 or dim % groups != 0) return null;
+        const rows = batch * seq_len;
+
+        try requireFlorence2DeviceResident(input);
+        const normed = try layerNormOp(ctx, input, norm_weight, norm_bias, dim, 1e-5);
+        defer freeOp(ctx, normed);
+        try requireFlorence2DeviceResident(normed);
+
+        const qkv = try linearOp(ctx, normed, qkv_weight, qkv_bias, rows, dim, dim * 3);
+        defer freeOp(ctx, qkv);
+        try requireFlorence2DeviceResident(qkv);
+
+        const attended = (try self.florenceChannelAttentionDevice(qkv, batch, seq_len, dim, groups)) orelse return null;
+        defer freeOp(ctx, attended);
+        try requireFlorence2DeviceResident(attended);
+
+        const projected = try linearOp(ctx, attended, proj_weight, proj_bias, rows, dim, dim);
+        errdefer freeOp(ctx, projected);
+        try requireFlorence2DeviceResident(projected);
+        return projected;
+    }
+
+    fn windowedSelfAttentionOp(
+        ctx: *anyopaque,
+        input: CT,
+        norm_weight: CT,
+        norm_bias: CT,
+        qkv_weight: CT,
+        qkv_bias: CT,
+        proj_weight: CT,
+        proj_bias: CT,
+        batch: usize,
+        height: usize,
+        width: usize,
+        dim: usize,
+        num_heads: usize,
+        window_size: usize,
+    ) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryWindowedSelfAttentionResident(
+            ctx,
+            input,
+            norm_weight,
+            norm_bias,
+            qkv_weight,
+            qkv_bias,
+            proj_weight,
+            proj_bias,
+            batch,
+            height,
+            width,
+            dim,
+            num_heads,
+            window_size,
+        )) |resident| {
+            if (traceFlorence2ResidentMetal()) {
+                std.debug.print(
+                    "florence2-metal: resident op=windowed_self_attention batch={d} height={d} width={d} dim={d} heads={d} window={d}\n",
+                    .{ batch, height, width, dim, num_heads, window_size },
+                );
+            }
+            return resident;
+        }
+        if (strictFlorence2ResidentMetal()) return error.UnsupportedFlorence2ResidentMetal;
+        if (traceFlorence2ResidentMetal()) {
+            std.debug.print("florence2-metal: host-fallback op=windowed_self_attention\n", .{});
+        }
+        var native_ctx = try HostFallbackNative.init(self.allocator);
+        defer native_ctx.deinit();
+
+        const input_shape = [_]i64{ @intCast(batch * height * width), @intCast(dim) };
+        const norm_shape = [_]i64{@intCast(dim)};
+        const qkv_weight_shape = [_]i64{ @intCast(dim * 3), @intCast(dim) };
+        const qkv_bias_shape = [_]i64{@intCast(dim * 3)};
+        const proj_weight_shape = [_]i64{ @intCast(dim), @intCast(dim) };
+        const proj_bias_shape = [_]i64{@intCast(dim)};
+
+        const n_input = try self.importCtToHostNative(&native_ctx, input, &input_shape);
+        defer native_ctx.cb.free(n_input);
+        const n_norm_weight = try self.importCtToHostNative(&native_ctx, norm_weight, &norm_shape);
+        defer native_ctx.cb.free(n_norm_weight);
+        const n_norm_bias = try self.importCtToHostNative(&native_ctx, norm_bias, &norm_shape);
+        defer native_ctx.cb.free(n_norm_bias);
+        const n_qkv_weight = try self.importCtToHostNative(&native_ctx, qkv_weight, &qkv_weight_shape);
+        defer native_ctx.cb.free(n_qkv_weight);
+        const n_qkv_bias = try self.importCtToHostNative(&native_ctx, qkv_bias, &qkv_bias_shape);
+        defer native_ctx.cb.free(n_qkv_bias);
+        const n_proj_weight = try self.importCtToHostNative(&native_ctx, proj_weight, &proj_weight_shape);
+        defer native_ctx.cb.free(n_proj_weight);
+        const n_proj_bias = try self.importCtToHostNative(&native_ctx, proj_bias, &proj_bias_shape);
+        defer native_ctx.cb.free(n_proj_bias);
+
+        const n_output = try native_ctx.cb.windowedSelfAttention(
+            n_input,
+            n_norm_weight,
+            n_norm_bias,
+            n_qkv_weight,
+            n_qkv_bias,
+            n_proj_weight,
+            n_proj_bias,
+            batch,
+            height,
+            width,
+            dim,
+            num_heads,
+            window_size,
+        );
+        defer native_ctx.cb.free(n_output);
+        return self.exportCtFromHostNative(&native_ctx, n_output, &input_shape);
+    }
+
+    fn channelSelfAttentionOp(
+        ctx: *anyopaque,
+        input: CT,
+        norm_weight: CT,
+        norm_bias: CT,
+        qkv_weight: CT,
+        qkv_bias: CT,
+        proj_weight: CT,
+        proj_bias: CT,
+        batch: usize,
+        seq_len: usize,
+        dim: usize,
+        groups: usize,
+    ) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (try self.tryChannelSelfAttentionResident(
+            ctx,
+            input,
+            norm_weight,
+            norm_bias,
+            qkv_weight,
+            qkv_bias,
+            proj_weight,
+            proj_bias,
+            batch,
+            seq_len,
+            dim,
+            groups,
+        )) |resident| {
+            if (traceFlorence2ResidentMetal()) {
+                std.debug.print(
+                    "florence2-metal: resident op=channel_self_attention batch={d} seq_len={d} dim={d} groups={d}\n",
+                    .{ batch, seq_len, dim, groups },
+                );
+            }
+            return resident;
+        }
+        if (strictFlorence2ResidentMetal()) return error.UnsupportedFlorence2ResidentMetal;
+        if (traceFlorence2ResidentMetal()) {
+            std.debug.print("florence2-metal: host-fallback op=channel_self_attention\n", .{});
+        }
+        var native_ctx = try HostFallbackNative.init(self.allocator);
+        defer native_ctx.deinit();
+
+        const input_shape = [_]i64{ @intCast(batch * seq_len), @intCast(dim) };
+        const norm_shape = [_]i64{@intCast(dim)};
+        const qkv_weight_shape = [_]i64{ @intCast(dim * 3), @intCast(dim) };
+        const qkv_bias_shape = [_]i64{@intCast(dim * 3)};
+        const proj_weight_shape = [_]i64{ @intCast(dim), @intCast(dim) };
+        const proj_bias_shape = [_]i64{@intCast(dim)};
+
+        const n_input = try self.importCtToHostNative(&native_ctx, input, &input_shape);
+        defer native_ctx.cb.free(n_input);
+        const n_norm_weight = try self.importCtToHostNative(&native_ctx, norm_weight, &norm_shape);
+        defer native_ctx.cb.free(n_norm_weight);
+        const n_norm_bias = try self.importCtToHostNative(&native_ctx, norm_bias, &norm_shape);
+        defer native_ctx.cb.free(n_norm_bias);
+        const n_qkv_weight = try self.importCtToHostNative(&native_ctx, qkv_weight, &qkv_weight_shape);
+        defer native_ctx.cb.free(n_qkv_weight);
+        const n_qkv_bias = try self.importCtToHostNative(&native_ctx, qkv_bias, &qkv_bias_shape);
+        defer native_ctx.cb.free(n_qkv_bias);
+        const n_proj_weight = try self.importCtToHostNative(&native_ctx, proj_weight, &proj_weight_shape);
+        defer native_ctx.cb.free(n_proj_weight);
+        const n_proj_bias = try self.importCtToHostNative(&native_ctx, proj_bias, &proj_bias_shape);
+        defer native_ctx.cb.free(n_proj_bias);
+
+        const n_output = try native_ctx.cb.channelSelfAttention(
+            n_input,
+            n_norm_weight,
+            n_norm_bias,
+            n_qkv_weight,
+            n_qkv_bias,
+            n_proj_weight,
+            n_proj_bias,
+            batch,
+            seq_len,
+            dim,
+            groups,
+        );
+        defer native_ctx.cb.free(n_output);
+        return self.exportCtFromHostNative(&native_ctx, n_output, &input_shape);
+    }
+
+    fn crossAttentionOp(
+        ctx: *anyopaque,
+        q_ct: CT,
+        k_ct: CT,
+        v_ct: CT,
+        enc_mask: []const i64,
+        batch: usize,
+        dec_seq: usize,
+        enc_seq: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const hidden_dim = num_heads * head_dim;
+        if (batch == 1 and dec_seq != 0 and enc_seq != 0 and num_heads != 0 and head_dim != 0) resident_path: {
+            for (enc_mask) |value| {
+                if (value == 0) break :resident_path;
+            }
+            const q_buf = toBuf(q_ct);
+            const k_buf = toBuf(k_ct);
+            const v_buf = toBuf(v_ct);
+            if (q_buf.quantized_storage != null or k_buf.quantized_storage != null or v_buf.quantized_storage != null) break :resident_path;
+            if (q_buf.runtime_quantized_storage != null or k_buf.runtime_quantized_storage != null or v_buf.runtime_quantized_storage != null) break :resident_path;
+            if (q_buf.owned_quantized_storage != null or k_buf.owned_quantized_storage != null or v_buf.owned_quantized_storage != null) break :resident_path;
+
+            const q_existing = q_buf.metal_tensor;
+            const k_existing = k_buf.metal_tensor;
+            const v_existing = v_buf.metal_tensor;
+            if (strictFlorence2ResidentMetal()) {
+                if (q_existing == null or k_existing == null or v_existing == null) return error.UnsupportedFlorence2ResidentMetal;
+                if (!q_existing.?.isDevice() or !k_existing.?.isDevice() or !v_existing.?.isDevice()) return error.UnsupportedFlorence2ResidentMetal;
+            }
+
+            var q_mt = try self.ownedDeviceMetalTensorFromCt(q_ct);
+            defer q_mt.deinit();
+            var k_mt = try self.ownedDeviceMetalTensorFromCt(k_ct);
+            defer k_mt.deinit();
+            var v_mt = try self.ownedDeviceMetalTensorFromCt(v_ct);
+            defer v_mt.deinit();
+            if (!q_mt.isDevice() or !k_mt.isDevice() or !v_mt.isDevice()) break :resident_path;
+            if (q_mt.elemCount() != dec_seq * hidden_dim or
+                k_mt.elemCount() != enc_seq * hidden_dim or
+                v_mt.elemCount() != enc_seq * hidden_dim)
+            {
+                break :resident_path;
+            }
+
+            if (try metal_runtime.decoderRuntimeApplyAttentionF32(self.provider_impl, .{
+                .q = q_mt,
+                .k = k_mt,
+                .v = v_mt,
+                .q_len = dec_seq,
+                .kv_len = enc_seq,
+                .num_heads = num_heads,
+                .num_kv_heads = num_heads,
+                .head_dim = head_dim,
+                .query_position_offset = enc_seq,
+                .kv_position_offset = 0,
+                .sliding_window = 0,
+                .total_sequence_len = enc_seq + dec_seq,
+            })) |tensor| {
+                if (traceFlorence2ResidentMetal()) {
+                    std.debug.print(
+                        "florence2-metal: resident op=cross_attention dec_seq={d} enc_seq={d} heads={d} head_dim={d}\n",
+                        .{ dec_seq, enc_seq, num_heads, head_dim },
+                    );
+                }
+                return self.ctFromOwnedMetalTensor(tensor);
+            }
+        }
+
+        if (strictFlorence2ResidentMetal()) return error.UnsupportedFlorence2ResidentMetal;
+        if (traceFlorence2ResidentMetal()) {
+            std.debug.print("florence2-metal: host-fallback op=cross_attention\n", .{});
+        }
+        var native_ctx = try HostFallbackNative.init(self.allocator);
+        defer native_ctx.deinit();
+
+        const q_shape = [_]i64{ @intCast(batch * dec_seq), @intCast(hidden_dim) };
+        const kv_shape = [_]i64{ @intCast(batch * enc_seq), @intCast(hidden_dim) };
+
+        const n_q = try self.importCtToHostNative(&native_ctx, q_ct, &q_shape);
+        defer native_ctx.cb.free(n_q);
+        const n_k = try self.importCtToHostNative(&native_ctx, k_ct, &kv_shape);
+        defer native_ctx.cb.free(n_k);
+        const n_v = try self.importCtToHostNative(&native_ctx, v_ct, &kv_shape);
+        defer native_ctx.cb.free(n_v);
+
+        const n_output = try native_ctx.cb.crossAttention(
+            n_q,
+            n_k,
+            n_v,
+            enc_mask,
+            batch,
+            dec_seq,
+            enc_seq,
+            num_heads,
+            head_dim,
+        );
+        defer native_ctx.cb.free(n_output);
+        return self.exportCtFromHostNative(&native_ctx, n_output, &q_shape);
     }
 
     fn tryDeviceConv1d(
@@ -7722,7 +8392,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (try gatherPagedKvLayerFromStorageHost(allocator, storage, kv, token_count, layer_index)) |rows| {
                 return rows;
             }
-            if (!storage.getPool(kv.pool_id).?.config.store_cpu_bytes) {
+            if (traceKvCacheMiss() and !storage.getPool(kv.pool_id).?.config.store_cpu_bytes) {
                 std.log.info(
                     "metal backend kv cache miss: no entry seq={d} layer={d} tokens={d} offset={d} source=0x{x}",
                     .{ kv.sequence_id, layer_index, token_count, kv.position_offset, key.source_ptr_id },
@@ -7731,7 +8401,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return null;
         };
         if (!backendEntryMatches(entry, token_count, kv.position_offset, entry.row_width, kvViewBlockSignature(kv))) {
-            if (!storage.getPool(kv.pool_id).?.config.store_cpu_bytes) {
+            if (traceKvCacheMiss() and !storage.getPool(kv.pool_id).?.config.store_cpu_bytes) {
                 std.log.info(
                     "metal backend kv cache miss: shape/signature mismatch seq={d} layer={d} want_tokens={d} have_tokens={d} want_offset={d} have_offset={d} want_sig=0x{x} have_sig=0x{x} source=0x{x}",
                     .{ kv.sequence_id, layer_index, token_count, entry.token_count, kv.position_offset, entry.position_offset, kvViewBlockSignature(kv), entry.block_signature, key.source_ptr_id },
@@ -11621,6 +12291,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const use_active_paged_block = metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime) and
                 (attention.mode == .paged_prefill or enableActiveCompressedQuantBlock());
             const direct_paged_request = .{
+                .layer_index = attention.layer_index,
                 .num_heads = request.num_heads,
                 .num_kv_heads = request.num_kv_heads,
                 .head_dim = request.head_dim,
@@ -13274,6 +13945,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const a_len = bufElemCount(a_buf);
             const b_len = bufElemCount(b_buf);
             if (try self.tryAnyDeviceEqualSizeBinaryRuntimeOp(a, b, a_len, b_len, .add)) |device_result| return device_result;
+            if (try self.tryDeviceRowBroadcastAdd(b, a_buf, b_buf)) |device_result| return device_result;
+            if (try self.tryDeviceRowBroadcastAdd(a, b_buf, a_buf)) |device_result| return device_result;
             if (a_buf.metal_tensor) |*a_metal| {
                 if (b_buf.metal_tensor) |*b_metal| {
                     if (a_metal.isDevice() and b_metal.isDevice() and a_metal.elemCount() == b_metal.elemCount()) {
@@ -15705,6 +16378,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) final_tail_blk: {
             var tail_region_scope = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .tail);
             defer tail_region_scope.deinit();
+            const tail_quant_format = self.preparedLinearMatmulFormatForLinearSlot(
+                request.final_lm_head_slot,
+                request.hidden_size,
+                request.vocab_size,
+            ) orelse break :final_tail_blk;
             var tail_plan_storage = metal_command_planner.TailCommandLowerer{};
             tail_plan_storage.build(.{
                 .final_norm_slot = request.final_norm_slot,
@@ -15713,6 +16391,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .region = @intFromEnum(metal_runtime.ComputeRegion.tail),
                 .hidden_size = request.hidden_size,
                 .vocab_size = request.vocab_size,
+                .quant_format = tail_quant_format,
             }) catch {};
             var planned_tail_op_storage = [_]u16{0} ** 3;
             var planned_tail_barrier_storage = [_]u8{0} ** 3;
@@ -15814,6 +16493,35 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return result;
     }
 
+    fn activeDecodeFrameDirectBlocksSupported(
+        self: *MetalCompute,
+        request: *const ops.DecoderRuntimeDecodeRequest,
+    ) bool {
+        const has_ple = switch (request.contract) {
+            .gemma4_gated_ple_shared_kv => true,
+            .gliner_deberta_encoder, .qwen3_dense_text_embedding => false,
+        };
+        for (request.layers, 0..) |layer, layer_index| {
+            if (!metal_runtime.supportsDirectPagedGatedDecoderBlockSlots(self.provider_impl, .{
+                .layer_index = layer_index,
+                .num_heads = request.num_attention_heads,
+                .head_dim = layer.head_dim,
+                .hidden_size = request.hidden_size,
+                .intermediate_size = layer.intermediate_size,
+                .attention_linear_slot = layer.attention_linear_slot,
+                .gate_ffn_linear_slot = layer.gate_ffn_linear_slot,
+                .up_ffn_linear_slot = layer.up_ffn_linear_slot,
+                .down_ffn_linear_slot = layer.down_ffn_linear_slot,
+                .has_ple = has_ple,
+                .ple_gate_linear_slot = layer.ple_gate_linear_slot,
+                .ple_proj_linear_slot = layer.ple_proj_linear_slot,
+                .ple_post_norm_slot = layer.ple_post_norm_slot,
+                .ple_hidden_size = request.ple_hidden_size,
+            })) return false;
+        }
+        return true;
+    }
+
     fn decoderRuntimeDecodeOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeDecodeRequest) anyerror!bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         self.timing_stats.active_decode_frame_attempts += 1;
@@ -15871,11 +16579,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .gliner_deberta_encoder => return false,
             .qwen3_dense_text_embedding => return false,
         }
+        const active_decode_frame_requested = enableActiveDecodeFrame();
+        if (active_decode_frame_requested and !self.activeDecodeFrameDirectBlocksSupported(request)) {
+            self.timing_stats.active_decode_frame_disabled += 1;
+            return false;
+        }
         if (!metal_runtime.decoderRuntimeReserveGreedyTailScratch(self.provider_impl, request.vocab_size)) {
             self.timing_stats.active_decode_frame_scratch_failures += 1;
             return false;
         }
-        const active_decode_frame_enabled = enableActiveDecodeFrame();
+        const active_decode_frame_enabled = active_decode_frame_requested;
         if (active_decode_frame_enabled) {
             for (request.layers) |layer| {
                 if (layer.head_dim == 0 or layer.kv_heads == 0 or layer.intermediate_size == 0) return false;
@@ -17326,6 +18039,98 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return best_idx;
     }
 
+    fn tokenSuppressed(token_id: usize, suppress_token_ids: []const i32) bool {
+        for (suppress_token_ids) |raw| {
+            if (raw >= 0 and @as(usize, @intCast(raw)) == token_id) return true;
+        }
+        return false;
+    }
+
+    fn argmaxDenseRowSuppress(row: []const f32, suppress_token_ids: []const i32) u32 {
+        var best_idx: u32 = 0;
+        var best_val: f32 = -std.math.inf(f32);
+        var found = false;
+        for (row, 0..) |value, idx| {
+            if (tokenSuppressed(idx, suppress_token_ids)) continue;
+            if (!found or value > best_val) {
+                found = true;
+                best_val = value;
+                best_idx = @intCast(idx);
+            }
+        }
+        return best_idx;
+    }
+
+    fn argmaxRowsSuppressOp(
+        ctx: *anyopaque,
+        tensor: CT,
+        row_start: usize,
+        row_count: usize,
+        dim: usize,
+        suppress_token_ids: []const i32,
+        allocator: std.mem.Allocator,
+    ) anyerror!?[]u32 {
+        if (row_count == 0 or dim == 0) return error.InvalidTensorShape;
+        const row_end = std.math.add(usize, row_start, row_count) catch return error.InvalidTensorShape;
+        const elem_count = std.math.mul(usize, row_end, dim) catch return error.InvalidTensorShape;
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const buf = toBuf(tensor);
+        if (buf.quantized_storage != null) return error.UnsupportedTensorType;
+
+        const tokens = try allocator.alloc(u32, row_count);
+        errdefer allocator.free(tokens);
+
+        if (buf.metal_tensor) |*metal_tensor| {
+            if (metal_tensor.isDevice()) {
+                for (tokens, 0..) |*token, row_idx| {
+                    const row = row_start + row_idx;
+                    const elem_offset = std.math.mul(usize, row, dim) catch return error.InvalidTensorShape;
+                    const byte_offset = std.math.mul(usize, elem_offset, @sizeOf(f32)) catch return error.InvalidTensorShape;
+                    const byte_len = std.math.mul(usize, dim, @sizeOf(f32)) catch return error.InvalidTensorShape;
+                    const shape = [_]i32{ 1, @intCast(dim) };
+                    var row_view = try metal_tensor.retainedView(byte_offset, byte_len, &shape);
+                    defer row_view.deinit();
+                    const selected = if (suppress_token_ids.len == 0)
+                        try metal_runtime.argmaxLogitsDevice(self.provider_impl, row_view, dim)
+                    else
+                        try metal_runtime.argmaxLogitsSuppressDevice(self.provider_impl, row_view, dim, suppress_token_ids);
+                    if (selected) |token_id| {
+                        token.* = @intCast(token_id);
+                    } else {
+                        if (strictFlorence2ResidentMetal()) return error.UnsupportedFlorence2ResidentMetal;
+                        break;
+                    }
+                } else {
+                    return tokens;
+                }
+            }
+        }
+
+        if (strictFlorence2ResidentMetal() and isDeviceResidentCt(tensor)) return error.UnsupportedFlorence2ResidentMetal;
+        const data = if (buf.metal_tensor) |*metal_tensor|
+            try metal_tensor.toHostSlice()
+        else
+            buf.data;
+        if (data.len < elem_count) return error.InvalidTensorShape;
+        for (tokens, 0..) |*token, row_idx| {
+            const row = row_start + row_idx;
+            const row_data = data[row * dim ..][0..dim];
+            token.* = argmaxDenseRowSuppress(row_data, suppress_token_ids);
+        }
+        return tokens;
+    }
+
+    fn argmaxLastRowSuppressTensorOp(ctx: *anyopaque, tensor: CT, rows: usize, dim: usize, suppress_token_ids: []const i32) anyerror!?CT {
+        if (rows == 0 or dim == 0) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const tokens = (try argmaxRowsSuppressOp(ctx, tensor, rows - 1, 1, dim, suppress_token_ids, self.allocator)) orelse return null;
+        defer self.allocator.free(tokens);
+        if (tokens.len != 1) return error.InvalidTensorShape;
+        const token_f32 = [_]f32{@floatFromInt(tokens[0])};
+        const shape = [_]i32{1};
+        return try fromFloat32ShapeOp(ctx, &token_f32, &shape);
+    }
+
     fn sampleLastRowOp(ctx: *anyopaque, request: *const ops.SampleLastRowRequest) anyerror!?u32 {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (request.rows == 0 or request.dim == 0) return null;
@@ -17764,6 +18569,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.sliceLastDim = sliceLastDimOp;
         vt.evalTensor = evalTensorOp;
         vt.argmaxLastRow = argmaxLastRowOp;
+        vt.argmaxRowsSuppress = argmaxRowsSuppressOp;
+        vt.argmaxLastRowSuppressTensor = argmaxLastRowSuppressTensorOp;
         vt.sampleLastRow = sampleLastRowOp;
         vt.zeroTensor = zeroTensorOp;
         vt.subtract = subtractOp;
@@ -17795,9 +18602,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.scaledDotProductAttention = scaledDotProductAttentionOp;
         vt.disentangledRelativeAttention = disentangledRelativeAttentionOp;
         vt.causalSelfAttention = causalSelfAttentionOp;
+        vt.crossAttention = crossAttentionOp;
         vt.logSoftmaxOp = logSoftmaxOp;
         vt.conv1d = conv1dOp;
         vt.conv2d = conv2dOp;
+        vt.tokenGridConv2d = tokenGridConv2dOp;
+        vt.windowedSelfAttention = windowedSelfAttentionOp;
+        vt.channelSelfAttention = channelSelfAttentionOp;
         vt.unaryConsume = unsupportedUnaryConsumeOp;
         vt.addConsumeLeft = addConsumeLeftOp;
         vt.addConsumeRight = addConsumeRightOp;
@@ -20393,6 +21204,61 @@ test "metal_compute: add uploads equal-size host peer instead of downloading dev
     const out_data = try metal_cb.toFloat32(out, allocator);
     defer allocator.free(out_data);
     try std.testing.expectEqualSlices(f32, &.{ 11, 22, 33, 44, 55, 66 }, out_data);
+}
+
+test "metal_compute: add keeps row-wise rhs broadcast resident" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const lhs_host = try metal_cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 2, 3 });
+    defer metal_cb.free(lhs_host);
+    const rhs = try metal_cb.fromFloat32Shape(&.{ 10, 20, 30 }, &.{3});
+    defer metal_cb.free(rhs);
+    const lhs_mt = try metal_compute.ownedDeviceMetalTensorFromCt(lhs_host);
+    const lhs = try metal_compute.ctFromOwnedMetalTensor(lhs_mt);
+    defer metal_cb.free(lhs);
+
+    const out = try metal_cb.add(lhs, rhs);
+    defer metal_cb.free(out);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, out));
+
+    const out_shape = try metal_cb.tensorShape(out, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, out_shape);
+    const out_data = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(out_data);
+    try std.testing.expectEqualSlices(f32, &.{ 11, 22, 33, 14, 25, 36 }, out_data);
+}
+
+test "metal_compute: add rejects column-shaped rhs with row-sized flat length" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const lhs_host = try metal_cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 2, 3 });
+    defer metal_cb.free(lhs_host);
+    const rhs = try metal_cb.fromFloat32Shape(&.{ 10, 20, 30 }, &.{ 3, 1 });
+    defer metal_cb.free(rhs);
+    const lhs_mt = try metal_compute.ownedDeviceMetalTensorFromCt(lhs_host);
+    const lhs = try metal_compute.ctFromOwnedMetalTensor(lhs_mt);
+    defer metal_cb.free(lhs);
+
+    try std.testing.expectError(error.UnsupportedShape, metal_cb.add(lhs, rhs));
 }
 
 test "metal_compute: multiply uploads equal-size host peer instead of downloading device operand" {

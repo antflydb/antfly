@@ -19,18 +19,21 @@ T = TypeVar("T", bound="ChatToolsConfig")
 
 @_attrs_define
 class ChatToolsConfig:
-    """Configuration for chat agent tools.
+    """Configuration for retrieval agent tools.
 
-    If `enabled_tools` is empty/omitted, defaults to: add_filter, ask_clarification, search.
+    If `enabled_tools` is empty/omitted, retrieval agents default to all retrieval tools
+    available for the request. Explicit retrieval policies should use semantic_search
+    for vector retrieval.
 
     For models that don't support native tool calling (e.g., Ollama),
     a prompt-based fallback is used with structured output parsing.
 
         Attributes:
-            enabled_tools (list[ChatToolName] | Unset): List of tools to enable. If empty, defaults to filter,
-                clarification, and search.
-                 Example: ['add_filter', 'search', 'websearch'].
-            websearch_config (WebSearchConfig | Unset): A unified configuration for web search providers.
+            enabled_tools (list[ChatToolName] | Unset): List of tools to enable. If empty, retrieval agents default to all
+                retrieval
+                tools available for the request.
+                 Example: ['add_filter', 'semantic_search', 'web_search'].
+            web_search_config (WebSearchConfig | Unset): A unified configuration for web search providers.
 
                 Each provider has specific configuration requirements. Use the appropriate
                 provider-specific config or set common options at the top level.
@@ -43,7 +46,7 @@ class ChatToolsConfig:
                 - YOU_API_KEY
                 - LINKUP_API_KEY
                 - GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION
-            websearch_connection (str | Unset): Name of a configured connections.<id> resource with kind web_search.
+            web_search_connection (str | Unset): Name of a configured connections.<id> resource with kind web_search.
                 Request-level tool options may reduce scope, but cannot expand the
                 connection's configured capabilities or policy.
             fetch_config (FetchConfig | Unset): Configuration for URL content fetching.
@@ -67,8 +70,8 @@ class ChatToolsConfig:
     """
 
     enabled_tools: list[ChatToolName] | Unset = UNSET
-    websearch_config: WebSearchConfig | Unset = UNSET
-    websearch_connection: str | Unset = UNSET
+    web_search_config: WebSearchConfig | Unset = UNSET
+    web_search_connection: str | Unset = UNSET
     fetch_config: FetchConfig | Unset = UNSET
     max_tool_iterations: int | Unset = 5
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -81,11 +84,11 @@ class ChatToolsConfig:
                 enabled_tools_item = enabled_tools_item_data.value
                 enabled_tools.append(enabled_tools_item)
 
-        websearch_config: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.websearch_config, Unset):
-            websearch_config = self.websearch_config.to_dict()
+        web_search_config: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.web_search_config, Unset):
+            web_search_config = self.web_search_config.to_dict()
 
-        websearch_connection = self.websearch_connection
+        web_search_connection = self.web_search_connection
 
         fetch_config: dict[str, Any] | Unset = UNSET
         if not isinstance(self.fetch_config, Unset):
@@ -98,10 +101,10 @@ class ChatToolsConfig:
         field_dict.update({})
         if enabled_tools is not UNSET:
             field_dict["enabled_tools"] = enabled_tools
-        if websearch_config is not UNSET:
-            field_dict["websearch_config"] = websearch_config
-        if websearch_connection is not UNSET:
-            field_dict["websearch_connection"] = websearch_connection
+        if web_search_config is not UNSET:
+            field_dict["web_search_config"] = web_search_config
+        if web_search_connection is not UNSET:
+            field_dict["web_search_connection"] = web_search_connection
         if fetch_config is not UNSET:
             field_dict["fetch_config"] = fetch_config
         if max_tool_iterations is not UNSET:
@@ -124,14 +127,14 @@ class ChatToolsConfig:
 
                 enabled_tools.append(enabled_tools_item)
 
-        _websearch_config = d.pop("websearch_config", UNSET)
-        websearch_config: WebSearchConfig | Unset
-        if isinstance(_websearch_config, Unset):
-            websearch_config = UNSET
+        _web_search_config = d.pop("web_search_config", UNSET)
+        web_search_config: WebSearchConfig | Unset
+        if isinstance(_web_search_config, Unset):
+            web_search_config = UNSET
         else:
-            websearch_config = WebSearchConfig.from_dict(_websearch_config)
+            web_search_config = WebSearchConfig.from_dict(_web_search_config)
 
-        websearch_connection = d.pop("websearch_connection", UNSET)
+        web_search_connection = d.pop("web_search_connection", UNSET)
 
         _fetch_config = d.pop("fetch_config", UNSET)
         fetch_config: FetchConfig | Unset
@@ -144,8 +147,8 @@ class ChatToolsConfig:
 
         chat_tools_config = cls(
             enabled_tools=enabled_tools,
-            websearch_config=websearch_config,
-            websearch_connection=websearch_connection,
+            web_search_config=web_search_config,
+            web_search_connection=web_search_connection,
             fetch_config=fetch_config,
             max_tool_iterations=max_tool_iterations,
         )
