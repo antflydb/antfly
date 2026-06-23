@@ -1,0 +1,463 @@
+---
+title: Antfly Lite
+description: Use Antfly as an embedded local-first database with a single .aflite file
+prerequisites:
+  - "Antfly CLI built or installed"
+difficulty: intermediate
+estimatedTime: "20 min"
+tags: [lite, embedded, local-first, backup, migration]
+---
+
+Antfly Lite is the embedded profile of Antfly. It stores documents, schemas,
+indexes, enrichments, and query-visible artifacts in a local `.aflite` database
+file so an application can use Antfly without running a server process.
+
+Use Lite when you want a local-first database for development, desktop apps,
+edge workers, tests, or single-user deployments. Use normal Antfly when you need
+Raft replication, shard placement, multi-node scaling, cluster metadata, or
+distributed operations.
+
+## File Types
+
+Antfly Lite uses two file types with different jobs:
+
+- `.aflite` is a live embedded Lite database.
+- `.afb` is a portable Antfly backup archive.
+
+Do not use `.aflite` as an archival backup format. Create an `.afb` when you
+need a portable backup, a migration artifact, or a restore source for normal
+Antfly.
+
+<Callout type="info">
+Lite v1 does not include legacy fallback readers for pre-release directory or
+LSM-container experiments. A Lite database must be a valid v1 `.aflite` file;
+unknown versions and invalid headers fail explicitly.
+</Callout>
+
+## Create A Database
+
+Create a new Lite database:
+
+```bash
+antfly lite init app.aflite
+```
+
+`init` is non-destructive. It rejects an existing path instead of replacing it.
+
+Check the storage identity:
+
+```bash
+antfly lite status app.aflite
+```
+
+The status output includes the live format and engine:
+
+```json
+{
+  "storage": {
+    "format": "aflite",
+    "engine": "native_single_file",
+    "format_version": 1
+  },
+  "inference": {
+    "mode": "caller_supplied_or_disabled",
+    "available_modes": [
+      "caller_supplied_artifacts",
+      "remote_provider",
+      "disabled_deferred"
+    ],
+    "configured": false,
+    "no_inference_configured_ok": true
+  }
+}
+```
+
+## Write And Read Documents
+
+Create a batch request:
+
+`writes.json`:
+
+```json
+{
+  "inserts": {
+    "doc:lite:1": {
+      "title": "Local Antfly",
+      "body": "Antfly Lite stores this document in app.aflite."
+    }
+  },
+  "sync_level": "full_index"
+}
+```
+
+Write it:
+
+```bash
+antfly lite batch app.aflite --file writes.json
+```
+
+Look up a document:
+
+```bash
+antfly lite lookup app.aflite --key doc:lite:1
+```
+
+Run a scan:
+
+`scan.json`:
+
+```json
+{
+  "from": "doc:",
+  "to": "doc;",
+  "include_documents": true,
+  "limit": 10
+}
+```
+
+```bash
+antfly lite scan app.aflite --file scan.json
+```
+
+## Add Search Indexes
+
+Indexes use the same logical Antfly index model as normal Antfly. For example,
+create a full-text index:
+
+`full-text-index.json`:
+
+```json
+{
+  "name": "body_text",
+  "kind": "full_text",
+  "config_json": "{\"fields\":[\"title\",\"body\"]}"
+}
+```
+
+```bash
+antfly lite index create app.aflite --file full-text-index.json
+antfly lite run-until-idle app.aflite
+```
+
+Query it:
+
+`query.json`:
+
+```json
+{
+  "full_text_search": {
+    "match": {
+      "field": "body",
+      "text": "local antfly"
+    }
+  },
+  "limit": 5
+}
+```
+
+```bash
+antfly lite query app.aflite --file query.json
+```
+
+Lite also supports dense vector, sparse vector, graph, schema, and enrichment
+catalog operations through the `antfly lite` CLI and embedded APIs.
+
+## Enrichments And Inference
+
+Lite can run without local inference configured. That is an expected state, not
+a partial setup error. In this mode, applications can still:
+
+- store caller-supplied embeddings and sparse vectors
+- create and query indexes over supplied artifacts
+- define enrichment metadata
+- inspect status and capabilities to decide whether inference-backed work is
+  available
+
+Check capabilities:
+
+```bash
+antfly lite status app.aflite
+```
+
+The capabilities block reports fields such as `inference_mode`,
+`supported_inference_modes`, `available_inference_modes`,
+`no_inference_configured_ok`, `caller_supplied_artifacts`, and
+`local_inference_runtime`. It also reports retrieval feature flags including
+`text_search`, `dense_vector_search`, `sparse_vector_search`, `hybrid_search`,
+`graph_search`, and `caller_supplied_embeddings`.
+
+Supported inference modes are:
+
+- `caller_supplied_artifacts`: applications write embeddings, sparse vectors,
+  assets, chunks, graph edges, or other artifacts directly.
+- `remote_provider`: Lite may call an explicitly configured inference provider.
+- `local_embedded`: a full build may provide an embedded inference runtime.
+- `manual_maintenance`: hosted profiles expose work for the application to
+  drain with `run-until-idle`.
+- `disabled_deferred`: definitions and source documents are stored, and work can
+  resume later.
+
+The status output also includes an `inference` block. A fresh Lite database
+reports `configured: false` with `no_inference_configured_ok: true`; this means
+caller-supplied artifacts and deferred enrichment are valid, not that the
+database is unhealthy.
+
+Embedded applications that configure a remote inference provider should mark
+that at open time. Lite status then reports `mode: "remote_provider"`,
+`configured: true`, and `remote_provider_configured: true`, so bindings and
+applications can branch from status instead of probing enrichment failures.
+Applications that embed a local inference runtime should mark that at open time
+as well; status then reports `mode: "local_embedded"`,
+`local_runtime_configured: true`, and `local_runtime_available: true`.
+
+Use `antfly lite run-until-idle app.aflite` after writes when you want the CLI
+to drain available local maintenance work before querying or backing up.
+
+## Local HTTP Serve Mode
+
+For SDK smoke tests or local tools, Lite can expose a narrow single-node API:
+
+```bash
+antfly lite serve app.aflite --addr 127.0.0.1:8080
+```
+
+The local API is under `/lite/v1`, for example:
+
+```bash
+curl http://127.0.0.1:8080/lite/v1/status
+curl http://127.0.0.1:8080/lite/v1/capabilities
+```
+
+This is not the clustered `/db/v1` service API. Treat it as a local convenience
+surface for Lite, not as a distributed Antfly compatibility mode. In v1,
+`serve` only accepts loopback listen hosts such as `127.0.0.1`, `localhost`, or
+`::1`; wildcard and LAN binds are rejected.
+
+## Back Up And Restore Lite
+
+Create a portable `.afb` backup:
+
+```bash
+antfly lite backup app.aflite --out app.afb
+```
+
+`export` is an alias for backup:
+
+```bash
+antfly lite export app.aflite --out app.afb
+```
+
+Restore a backup into a new Lite database:
+
+```bash
+antfly lite restore app.afb --out restored.aflite
+```
+
+Import a portable `.afb` into an existing empty Lite database:
+
+```bash
+antfly lite init empty.aflite
+antfly lite import empty.aflite --from app.afb
+```
+
+If the target database already contains data, replacement must be explicit:
+
+```bash
+antfly lite import restored.aflite --from app.afb --replace
+```
+
+You can also copy a stable live `.aflite` snapshot:
+
+```bash
+antfly lite snapshot app.aflite --out copy.aflite
+```
+
+`antfly lite import <target.aflite> --from <source.aflite>` is a physical
+snapshot replacement, not a logical merge. It requires `--replace` when the
+target already exists.
+
+Use snapshots for local file copies. Use `.afb` for portable backups and
+migrations.
+
+## Promote Lite To Normal Antfly
+
+The upgrade path from Lite to normal Antfly is explicit backup and restore.
+There are two equivalent workflows.
+
+Use `antfly lite promote` when you have a running Antfly target:
+
+```bash
+antfly lite promote app.aflite \
+  --target http://localhost:8080 \
+  --table docs \
+  --location file:///tmp/antfly_backups
+```
+
+If you omit `--location`, Lite stages the portable restore backup under
+`~/.antfly/lite/backups`. Pass `--location` when the normal Antfly target should
+restore from a shared filesystem or object-storage location.
+
+Or use the normal restore command directly with a Lite input:
+
+```bash
+antfly restore \
+  --input app.aflite \
+  --table docs \
+  --url http://localhost:8080
+```
+
+Both paths open the `.aflite` database read-only, stage a portable restore
+backup, and restore that backup into the target Antfly table. They do not make
+`.aflite` the backup format.
+If you omit `--location`, direct `.aflite` restore input also stages under
+`~/.antfly/lite/backups`.
+
+For full upgrade, downgrade, restore, snapshot, and enrichment behavior, see the
+[Antfly Lite migration guide](/docs/guides/lite-migration).
+
+## Zig Embedded Package
+
+Zig applications can use the `antfly-embedded` package directly. The Lite DB
+surface creates native `.aflite` files with `db.DB.createLite` and opens
+existing files with `db.DB.openLite`. Package-level helpers inspect and
+snapshot files without requiring the caller to keep a DB handle open:
+
+```zig
+const antfly = @import("antfly-embedded");
+
+var db = try antfly.db.DB.createLite(allocator, "zig-app.aflite", .{});
+defer db.close();
+
+const report = try antfly.db.checkLiteFile(allocator, "zig-app.aflite");
+_ = report.valid;
+
+_ = try antfly.db.copyStableLiteSnapshotFile(
+    allocator,
+    "zig-app.aflite",
+    "zig-copy.aflite",
+    false,
+);
+```
+
+Use `antfly.api.checkLiteFileJson` and
+`antfly.api.copyStableLiteSnapshotFileJson` when an embedding wants the same
+JSON reports exposed by the CLI and C ABI.
+
+## Go Embedded Binding
+
+The first language binding above Zig and C is Go:
+
+```bash
+go get github.com/antflydb/antfly/go/pkg/antflylite
+```
+
+Example:
+
+```go
+package main
+
+import (
+	"log"
+
+	"github.com/antflydb/antfly/go/pkg/antflylite"
+)
+
+func main() {
+	db, err := antflylite.Create("go-app.aflite")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	err = db.Batch([]antflylite.WriteIntent{{
+		Key:   "doc:go:1",
+		Value: []byte(`{"title":"embedded go lite"}`),
+	}}, 1)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	status, err := db.StatusJSON()
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("%s", status)
+}
+```
+
+Use `antflylite.Open` for an existing `.aflite` file. `Create` is the explicit
+first-use path; `Open` does not create missing files or upgrade pre-release
+layouts.
+
+When building from the source tree, build the C ABI first:
+
+```bash
+cd zig
+zig build lite-capi
+cd ../go/pkg/antflylite
+go test -tags antflylite_capi ./...
+```
+
+The Go package exposes constants such as
+`antflylite.InferenceModeCallerSuppliedArtifacts` and
+`antflylite.InferenceModeDisabledDeferred` for branching on status or
+capability responses without hard-coding JSON strings.
+
+## Embedded App Templates
+
+The repository includes runnable Lite templates:
+
+- `examples/antfly-lite-go`: minimal create/open, write, lookup, status, and
+  backup.
+- `examples/antfly-lite-retrieval-go`: create/open, schema, full-text index,
+  dense vector index with caller-supplied embeddings, full-text search, dense
+  search, hybrid search, status, and portable backup.
+
+Both examples are gated by `zig build lite-core` against the built
+`libantfly` C ABI.
+
+## Build Profiles
+
+The repository exposes focused Lite build profiles:
+
+```bash
+zig build lite-core
+zig build lite-full -Dlite-local-inference-runtime=true
+zig build lite-wasm
+zig build lite-package-test
+zig build lite-dev
+```
+
+`lite-core` builds the embedded database, CLI, narrow `/lite/v1` serve mode,
+and `libantfly` without a heavyweight local inference runtime. `lite-full`
+builds the full Antfly CLI with Lite support and requires the local inference
+runtime capability flag so Lite status, C ABI, and bindings advertise
+`local_embedded` correctly. `lite-wasm` builds the
+hosted/manual-maintenance Lite profile for `wasm32-freestanding` without
+pulling in the broader server or inference WASM bundle. `lite-package-test`
+checks that release packaging preserves the `libantfly` header and library
+artifacts. `lite-dev` runs the broader development and compatibility checks,
+including the Lite WASM profile and packaging regression.
+
+## Integrity And Maintenance
+
+Run integrity checks:
+
+```bash
+antfly lite check app.aflite
+```
+
+Compact index work and reclaim space:
+
+```bash
+antfly lite compact app.aflite
+```
+
+Run only file-level vacuum:
+
+```bash
+antfly lite vacuum app.aflite
+```
+
+For production applications, pair regular `.afb` backups with `check` in your
+maintenance workflow.

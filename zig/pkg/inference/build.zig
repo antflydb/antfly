@@ -612,10 +612,10 @@ pub fn build(b: *std.Build) void {
     // Tests
     const runtime_test_filter = b.option(bool, "runtime-test-filter", "Build unit tests with a simple runtime-filtering test runner") orelse false;
     const main_test_filters = if (runtime_test_filter) &.{} else selectTestFilters(b, &.{});
-    const runtime_filter_test_runner: ?std.Build.Step.Compile.TestRunner = if (runtime_test_filter) .{
+    const runtime_filter_test_runner: std.Build.Step.Compile.TestRunner = .{
         .path = b.path("src/test_runner_filter.zig"),
         .mode = .simple,
-    } else null;
+    };
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/inference.zig"),

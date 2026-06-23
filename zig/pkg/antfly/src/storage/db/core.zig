@@ -1344,6 +1344,7 @@ pub fn changeJournalOpenOptionsForPrimaryKind(
 pub fn openCoreResourcesFromPrimaryStore(
     alloc: Allocator,
     path: []const u8,
+    index_base_path: []const u8,
     map_size: usize,
     no_sync: bool,
     primary_backend_kind: PrimaryBackendKind,
@@ -1355,6 +1356,7 @@ pub fn openCoreResourcesFromPrimaryStore(
     configured_identity_namespace: ?doc_identity.Namespace,
     persist_identity_namespace_if_missing: bool,
     identity_namespace_mismatch_policy: doc_identity.NamespaceMismatchPolicy,
+    external_derived_checkpoints: bool,
 ) !OpenedCoreResources {
     var owned_path: ?[]u8 = null;
     var owned_applied_sequence_checkpoint_path: ?[]u8 = null;
@@ -1398,10 +1400,10 @@ pub fn openCoreResourcesFromPrimaryStore(
     owned_log_mutex = log_mutex;
     const path_copy = try alloc.dupe(u8, path);
     owned_path = path_copy;
-    const applied_sequence_checkpoint_path = switch (primary_backend_kind) {
+    const applied_sequence_checkpoint_path = if (external_derived_checkpoints) switch (primary_backend_kind) {
         .lmdb, .lsm => try apply_state.checkpointPathAlloc(alloc, path),
         .mem, .lsm_memory => null,
-    };
+    } else null;
     owned_applied_sequence_checkpoint_path = applied_sequence_checkpoint_path;
 
     const change_journal_path = try std.fmt.allocPrint(alloc, "{s}/change_journal", .{path});
@@ -1435,7 +1437,7 @@ pub fn openCoreResourcesFromPrimaryStore(
 
     index_manager.* = try index_manager_mod.IndexManager.initWithOptions(
         alloc,
-        path,
+        index_base_path,
         index_backends,
     );
     index_manager.setAppliedSequenceCheckpointPath(applied_sequence_checkpoint_path);

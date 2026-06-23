@@ -203,6 +203,7 @@ pub const TableApi = struct {
             alloc: std.mem.Allocator,
             table_name: []const u8,
             backup_id: []const u8,
+            format: backups_api.BackupFormat,
             location: *backups_api.BackupLocation,
         ) ExecuteBackupError!void,
         execute_table_restore: *const fn (
@@ -312,9 +313,10 @@ pub const TableApi = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
         backup_id: []const u8,
+        format: backups_api.BackupFormat,
         location: *backups_api.BackupLocation,
     ) ExecuteBackupError!void {
-        return try self.vtable.execute_table_backup(self.ptr, alloc, table_name, backup_id, location);
+        return try self.vtable.execute_table_backup(self.ptr, alloc, table_name, backup_id, format, location);
     }
 
     pub fn executeTableRestore(
@@ -587,14 +589,9 @@ pub fn handleTableBackup(
     };
     defer parsed_req.deinit();
 
-    if (parsed_req.value.format) |format| {
-        if (!std.mem.eql(u8, format, "native")) {
-            return .{
-                .status = 400,
-                .body = try alloc.dupe(u8, "portable table backups are not supported; omit format or use native"),
-            };
-        }
-    }
+    const backup_format = parseBackupFormat(parsed_req.value.format) catch {
+        return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported backup format") };
+    };
 
     var location = backups_api.openBackupLocationWithSecrets(alloc, parsed_req.value.location, secret_store) catch |err| {
         if (backups_api.backupLocationErrorMessage(err)) |msg| {
@@ -604,7 +601,7 @@ pub fn handleTableBackup(
     };
     defer location.deinit(alloc);
 
-    api.executeTableBackup(alloc, table_name, parsed_req.value.backup_id, &location) catch |err| switch (err) {
+    api.executeTableBackup(alloc, table_name, parsed_req.value.backup_id, backup_format, &location) catch |err| switch (err) {
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.UnsupportedBackupMigrationState => return .{ .status = 400, .body = try alloc.dupe(u8, "backup does not support active schema migration") },
@@ -616,6 +613,13 @@ pub fn handleTableBackup(
         .status = 201,
         .body = try backups_api.encodeBackupSuccess(alloc),
     };
+}
+
+fn parseBackupFormat(value: ?[]const u8) !backups_api.BackupFormat {
+    const format = value orelse return .native;
+    if (std.mem.eql(u8, format, "native")) return .native;
+    if (std.mem.eql(u8, format, "portable")) return .portable;
+    return error.UnsupportedBackupFormat;
 }
 
 pub fn handleTableRestore(
@@ -1136,6 +1140,7 @@ fn unsupportedBackup(
     _: std.mem.Allocator,
     _: []const u8,
     _: []const u8,
+    _: backups_api.BackupFormat,
     _: *backups_api.BackupLocation,
 ) TableApi.ExecuteBackupError!void {
     return error.InternalFailure;
@@ -1785,6 +1790,7 @@ test "public table backup handler maps unsupported multi-range error" {
             _: std.mem.Allocator,
             _: []const u8,
             _: []const u8,
+            _: backups_api.BackupFormat,
             _: *backups_api.BackupLocation,
         ) TableApi.ExecuteBackupError!void {
             return error.UnsupportedMultiRangeTable;
@@ -1804,16 +1810,18 @@ test "public table backup handler maps unsupported multi-range error" {
     try std.testing.expectEqualStrings("backup does not support multi-range tables", resp.body);
 }
 
-test "public table backup handler rejects portable format" {
+test "public table backup handler accepts portable format" {
     const Backend = struct {
-        fn iface() TableApi {
+        seen_portable: bool = false,
+
+        fn iface(self: *@This()) TableApi {
             return .{
-                .ptr = undefined,
+                .ptr = self,
                 .vtable = &.{
                     .execute_table_batch = unsupportedBatch,
                     .execute_table_query_request = unsupportedQueryRequest,
                     .execute_table_query_view = unsupportedQueryView,
-                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_backup = executeTableBackup,
                     .execute_table_restore = unsupportedRestore,
                     .execute_table_list_indexes = unsupportedListIndexes,
                     .execute_table_get_index = unsupportedGetIndex,
@@ -1822,19 +1830,32 @@ test "public table backup handler rejects portable format" {
                 },
             };
         }
+
+        fn executeTableBackup(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            format: backups_api.BackupFormat,
+            _: *backups_api.BackupLocation,
+        ) TableApi.ExecuteBackupError!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.seen_portable = format == .portable;
+        }
     };
 
+    var backend = Backend{};
     var resp = try handleTableBackup(
         std.testing.allocator,
         "docs",
         "{\"backup_id\":\"snap\",\"location\":\"file:///tmp/out\",\"format\":\"portable\"}",
-        Backend.iface(),
+        backend.iface(),
         null,
     );
     defer resp.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(u16, 400), resp.status);
-    try std.testing.expectEqualStrings("portable table backups are not supported; omit format or use native", resp.body);
+    try std.testing.expectEqual(@as(u16, 201), resp.status);
+    try std.testing.expect(backend.seen_portable);
 }
 
 test "public table restore handler maps target already exists" {

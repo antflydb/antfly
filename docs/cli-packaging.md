@@ -4,11 +4,36 @@ Antfly has separate packages for SDKs and CLI installation:
 
 - Python SDK: `antfly-sdk`
 - TypeScript SDK: `@antfly/sdk`
+- Go Antfly Lite binding: `github.com/antflydb/antfly/go/pkg/antflylite`
 - Python CLI installer: `antfly-cli`
 - npm CLI installer: `@antfly/cli`
 
 The CLI packages do not build Antfly from source. They repack the native Zig
 runtime archives produced by the main release workflow.
+
+The native Zig runtime archives are also the distribution vehicle for Antfly
+Lite's C ABI. Each archive contains:
+
+```text
+antfly
+share/
+lib/
+include/antfly.h
+README.md
+LICENSE
+```
+
+`lib/` contains the platform-specific `libantfly` shared library. Language
+bindings that embed Lite, including the Go `antflylite` binding, link against
+that library and include `include/antfly.h`.
+
+The Python, npm, and Homebrew CLI installer packages preserve the same Lite C
+ABI files from the native archive. Consumers that need embedded Lite can install
+one of those packages or unpack the native runtime archive, then point their
+language binding at the packaged `libantfly` library. The Go `antflylite`
+module carries a matching header copy for standalone builds, but the release
+packages and archives also keep `include/antfly.h` available for direct C
+consumers.
 
 ## Release Flow
 
@@ -29,6 +54,10 @@ antfly_0.2.0_Darwin_arm64.tar.gz
 antfly_0.2.0_Linux_arm64.tar.gz
 antfly_0.2.0_Linux_x86_64.tar.gz
 ```
+
+Those archives must include `include/antfly.h` and the platform library
+under `lib/`; `scripts/packaging/build_zig_release_archive.sh` builds the normal
+runtime and then the `lite-capi` target into the same archive prefix.
 
 For prerelease tags, npm uses the release version directly. Python wheels use
 PEP 440 equivalents, for example `v0.2.0-dev10` becomes `0.2.0.dev10`.

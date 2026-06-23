@@ -1078,6 +1078,7 @@ pub const CompositeGlinerStore = struct {
 
 pub fn openFromManifest(allocator: std.mem.Allocator, manifest: manifest_mod.ModelManifest) !TensorStore {
     if (manifest.hasIncompleteGlinerBundle()) return error.IncompleteGlinerBundle;
+    if (manifest.hasIncompleteFlorence2GgufBundle()) return error.IncompleteFlorence2Bundle;
     if (manifest.gliner_model_type.len > 0 and manifest.gguf_path != null and (manifest.gliner_head_gguf_path != null or manifest.gliner_head_safetensors_path != null)) {
         const head_path = manifest.gliner_head_gguf_path orelse manifest.gliner_head_safetensors_path.?;
         const store = try CompositeGlinerStore.initAbsolute(allocator, manifest.gguf_path.?, head_path, manifest.gliner_head_gguf_path != null);

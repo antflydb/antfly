@@ -47,6 +47,7 @@ pub fn makeRootBuildOptions(
     with_tla: bool,
     link_libc: bool,
     swarm_runtime_focused_test: bool,
+    lite_local_inference_runtime: bool,
     antfly_version: []const u8,
 ) *std.Build.Step.Options {
     const options = b.addOptions();
@@ -56,6 +57,7 @@ pub fn makeRootBuildOptions(
     options.addOption(bool, "with_tla", with_tla);
     options.addOption(bool, "link_libc", link_libc);
     options.addOption(bool, "swarm_runtime_focused_test", swarm_runtime_focused_test);
+    options.addOption(bool, "lite_local_inference_runtime", lite_local_inference_runtime);
     options.addOption(bool, "bench_minimal_deps", false);
     options.addOption([]const u8, "antfly_version", antfly_version);
     options.addOption([]const u8, "ard_openapi_ard_yaml", readBuildFileAlloc(b, "../specs/openapi/ard/api.yaml"));

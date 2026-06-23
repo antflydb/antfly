@@ -20,6 +20,8 @@ const backup_codec = @import("backup_codec.zig");
 const internal_keys = @import("internal_keys.zig");
 const docstore_mod = @import("docstore.zig");
 const doc_identity = @import("db/doc_identity.zig");
+const db_types = @import("db/types.zig");
+const artifact_ids = @import("db/artifact_ids.zig");
 const enrichment_artifact_codec = @import("db/enrichment/artifact_codec.zig");
 const DocStore = docstore_mod.DocStore;
 const KeyEncoder = docstore_mod.KeyEncoder;
@@ -27,6 +29,18 @@ const KVPair = docstore_mod.KVPair;
 
 /// Target batch size in bytes before flushing a document/embedding/edge batch.
 const batch_target_bytes: usize = 4 * 1024 * 1024;
+const resolution_public_id_prefix = "af1:resolution:";
+
+const ResolutionArtifactRef = struct {
+    doc_key: []u8,
+    artifact_name: []u8,
+
+    fn deinit(self: *ResolutionArtifactRef, alloc: Allocator) void {
+        alloc.free(self.doc_key);
+        alloc.free(self.artifact_name);
+        self.* = undefined;
+    }
+};
 
 // ============================================================================
 // Export
@@ -38,6 +52,23 @@ const batch_target_bytes: usize = 4 * 1024 * 1024;
 pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !void {
     const pairs = try store.scanRange(alloc, "", "");
     defer DocStore.freeResults(alloc, pairs);
+
+    var document_timestamps = std.StringHashMapUnmanaged(u64).empty;
+    defer {
+        var it = document_timestamps.iterator();
+        while (it.next()) |entry| alloc.free(entry.key_ptr.*);
+        document_timestamps.deinit(alloc);
+    }
+    for (pairs) |kv| {
+        if (!internal_keys.isTtlKey(kv.key) or kv.value.len < 8) continue;
+        const doc_key = (try internal_keys.decodeDocumentComponentAlloc(alloc, kv.key)) orelse continue;
+        errdefer alloc.free(doc_key);
+        const gop = try document_timestamps.getOrPut(alloc, doc_key);
+        if (gop.found_existing) {
+            alloc.free(doc_key);
+        }
+        gop.value_ptr.* = std.mem.readInt(u64, kv.value[0..8], .little);
+    }
 
     // Write file header
     const backup_id = [_]u8{0} ** 16; // zero UUID for now
@@ -75,6 +106,22 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
     defer identity_batch.deinit(alloc);
     var identity_batch_bytes: usize = 0;
 
+    var metadata_batch = std.ArrayListUnmanaged(backup_codec.KeyValueEntry).empty;
+    defer metadata_batch.deinit(alloc);
+    var metadata_batch_bytes: usize = 0;
+
+    var chunk_batch = std.ArrayListUnmanaged(backup_codec.KeyValueEntry).empty;
+    defer chunk_batch.deinit(alloc);
+    var chunk_batch_bytes: usize = 0;
+
+    var artifact_batch = std.ArrayListUnmanaged(backup_codec.KeyValueEntry).empty;
+    defer artifact_batch.deinit(alloc);
+    var artifact_batch_bytes: usize = 0;
+
+    var resolution_batch = std.ArrayListUnmanaged(backup_codec.KeyValueEntry).empty;
+    defer resolution_batch.deinit(alloc);
+    var resolution_batch_bytes: usize = 0;
+
     // Embeddings keyed by index name
     var emb_batches = std.StringHashMapUnmanaged(EmbeddingBatch).empty;
     defer {
@@ -84,6 +131,17 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
             entry.value_ptr.deinit(alloc);
         }
         emb_batches.deinit(alloc);
+    }
+
+    // Sparse embeddings keyed by index name
+    var sparse_batches = std.StringHashMapUnmanaged(SparseBatch).empty;
+    defer {
+        var it = sparse_batches.iterator();
+        while (it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(alloc);
+        }
+        sparse_batches.deinit(alloc);
     }
 
     // Edges keyed by index name
@@ -100,6 +158,19 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
     var counts = Counts{};
 
     for (pairs) |kv| {
+        if (isPortableMetadataKey(kv.key)) {
+            try metadata_batch.append(alloc, .{
+                .key = try alloc.dupe(u8, kv.key),
+                .value = try alloc.dupe(u8, kv.value),
+            });
+            metadata_batch_bytes += kv.key.len + kv.value.len;
+            if (metadata_batch_bytes >= batch_target_bytes) {
+                try flushMetadataBatch(alloc, out, &metadata_batch);
+                metadata_batch_bytes = 0;
+            }
+            continue;
+        }
+
         if (kv.key.len > 0 and kv.key[0] == internal_keys.identity_namespace) {
             try identity_batch.append(alloc, .{
                 .key = try alloc.dupe(u8, kv.key),
@@ -123,7 +194,7 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
                     .key = try alloc.dupe(u8, user_key),
                     .value_flags = 0,
                     .value = try alloc.dupe(u8, kv.value),
-                    .timestamp_ns = 0,
+                    .timestamp_ns = document_timestamps.get(user_key) orelse 0,
                 });
                 doc_batch_bytes += user_key.len + kv.value.len;
 
@@ -131,15 +202,34 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
                     try flushDocBatch(alloc, out, &doc_batch, &counts);
                     doc_batch_bytes = 0;
                 }
+            } else if (internal_keys.isChunkArtifactRecordKey(kv.key)) {
+                try appendChunkArtifactEntry(alloc, &chunk_batch, kv.key, kv.value);
+                chunk_batch_bytes += kv.key.len + kv.value.len;
+                if (chunk_batch_bytes >= batch_target_bytes) {
+                    try flushChunkBatch(alloc, out, &chunk_batch);
+                    chunk_batch_bytes = 0;
+                }
             } else if (internal_keys.isEmbeddingArtifactKey(kv.key)) {
-                try collectEmbedding(alloc, &emb_batches, kv.key, kv.value);
+                try collectEmbedding(alloc, &emb_batches, &sparse_batches, kv.key, kv.value);
             } else if (internal_keys.isGraphEdgeArtifactKey(kv.key)) {
                 try collectGraphEdgeArtifact(alloc, &edge_batches, kv.key, kv.value);
             } else if (try parseStandaloneGraphIndexEdgeKeyAlloc(alloc, kv.key)) |parsed| {
                 defer parsed.deinit(alloc);
                 try appendEdgeBatchEntry(alloc, &edge_batches, parsed.index_name, parsed.source, parsed.target, parsed.edge_type, kv.value);
+            } else if (try appendResolutionArtifactEntry(alloc, &resolution_batch, kv.key, kv.value)) {
+                resolution_batch_bytes += kv.key.len + kv.value.len;
+                if (resolution_batch_bytes >= batch_target_bytes) {
+                    try flushKeyValueBlock(alloc, out, &resolution_batch, .resolution_batch);
+                    resolution_batch_bytes = 0;
+                }
+            } else if (try appendPortableArtifactEntry(alloc, &artifact_batch, kv.key, kv.value, .asset)) {
+                artifact_batch_bytes += kv.key.len + kv.value.len;
+                if (artifact_batch_bytes >= batch_target_bytes) {
+                    try flushKeyValueBlock(alloc, out, &artifact_batch, .artifact_batch);
+                    artifact_batch_bytes = 0;
+                }
             }
-            // Skip: TTL, summary, chunk, derived embedding keys
+            // Skip: TTL, summary, and derived embedding keys
             continue;
         }
 
@@ -162,6 +252,18 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
     if (identity_batch.items.len > 0) {
         try flushIdentityBatch(alloc, out, &identity_batch);
     }
+    if (metadata_batch.items.len > 0) {
+        try flushMetadataBatch(alloc, out, &metadata_batch);
+    }
+    if (chunk_batch.items.len > 0) {
+        try flushChunkBatch(alloc, out, &chunk_batch);
+    }
+    if (artifact_batch.items.len > 0) {
+        try flushKeyValueBlock(alloc, out, &artifact_batch, .artifact_batch);
+    }
+    if (resolution_batch.items.len > 0) {
+        try flushKeyValueBlock(alloc, out, &resolution_batch, .resolution_batch);
+    }
 
     // Flush embedding batches
     {
@@ -173,6 +275,19 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
             const encoded = try backup_codec.encodeEmbeddingBatch(alloc, entry.key_ptr.*, dim, batch.entries.items);
             defer alloc.free(encoded);
             try backup_codec.writeBlock(out, alloc, .embedding_batch, encoded);
+            counts.embeddings += batch.entries.items.len;
+        }
+    }
+
+    // Flush sparse embedding batches
+    {
+        var it = sparse_batches.iterator();
+        while (it.next()) |entry| {
+            const batch = entry.value_ptr;
+            if (batch.entries.items.len == 0) continue;
+            const encoded = try backup_codec.encodeSparseBatch(alloc, entry.key_ptr.*, batch.entries.items);
+            defer alloc.free(encoded);
+            try backup_codec.writeBlock(out, alloc, .sparse_batch, encoded);
             counts.embeddings += batch.entries.items.len;
         }
     }
@@ -231,6 +346,23 @@ const EmbeddingBatch = struct {
         for (self.entries.items) |e| {
             alloc.free(e.doc_key);
             alloc.free(e.vector);
+        }
+        self.entries.deinit(alloc);
+    }
+};
+
+const SparseBatch = struct {
+    entries: std.ArrayListUnmanaged(backup_codec.SparseEntry),
+
+    fn init() SparseBatch {
+        return .{ .entries = .empty };
+    }
+
+    fn deinit(self: *SparseBatch, alloc: Allocator) void {
+        for (self.entries.items) |e| {
+            alloc.free(e.doc_key);
+            alloc.free(e.indices);
+            alloc.free(e.values);
         }
         self.entries.deinit(alloc);
     }
@@ -333,6 +465,12 @@ fn flushDocBatch(
     batch.clearRetainingCapacity();
 }
 
+fn timestampValueAlloc(alloc: Allocator, timestamp_ns: u64) ![]u8 {
+    const value = try alloc.alloc(u8, 8);
+    std.mem.writeInt(u64, value[0..8], timestamp_ns, .little);
+    return value;
+}
+
 fn flushIdentityBatch(
     alloc: Allocator,
     out: *ArrayList(u8),
@@ -349,10 +487,178 @@ fn flushIdentityBatch(
     batch.clearRetainingCapacity();
 }
 
+fn flushMetadataBatch(
+    alloc: Allocator,
+    out: *ArrayList(u8),
+    batch: *std.ArrayListUnmanaged(backup_codec.KeyValueEntry),
+) !void {
+    const encoded = try backup_codec.encodeKeyValueBatch(alloc, batch.items);
+    defer alloc.free(encoded);
+    try backup_codec.writeBlock(out, alloc, .metadata_batch, encoded);
+
+    for (batch.items) |e| {
+        alloc.free(e.key);
+        alloc.free(e.value);
+    }
+    batch.clearRetainingCapacity();
+}
+
+fn flushChunkBatch(
+    alloc: Allocator,
+    out: *ArrayList(u8),
+    batch: *std.ArrayListUnmanaged(backup_codec.KeyValueEntry),
+) !void {
+    const encoded = try backup_codec.encodeKeyValueBatch(alloc, batch.items);
+    defer alloc.free(encoded);
+    try backup_codec.writeBlock(out, alloc, .chunk_batch, encoded);
+
+    for (batch.items) |e| {
+        alloc.free(e.key);
+        alloc.free(e.value);
+    }
+    batch.clearRetainingCapacity();
+}
+
+fn flushKeyValueBlock(
+    alloc: Allocator,
+    out: *ArrayList(u8),
+    batch: *std.ArrayListUnmanaged(backup_codec.KeyValueEntry),
+    block_type: backup_codec.BlockType,
+) !void {
+    const encoded = try backup_codec.encodeKeyValueBatch(alloc, batch.items);
+    defer alloc.free(encoded);
+    try backup_codec.writeBlock(out, alloc, block_type, encoded);
+
+    for (batch.items) |e| {
+        alloc.free(e.key);
+        alloc.free(e.value);
+    }
+    batch.clearRetainingCapacity();
+}
+
+fn isPortableMetadataKey(key: []const u8) bool {
+    return std.mem.eql(u8, key, "\x00\x00__metadata__:schema") or
+        std.mem.startsWith(u8, key, "\x00\x00__metadata__:schema_v") or
+        std.mem.eql(u8, key, "\x00\x00__metadata__:schema_json") or
+        std.mem.eql(u8, key, "\x00\x00__metadata__:indexes") or
+        std.mem.eql(u8, key, "\x00\x00__metadata__:enrichments") or
+        std.mem.eql(u8, key, "\x00\x00__metadata__:resolvers");
+}
+
+fn appendChunkArtifactEntry(
+    alloc: Allocator,
+    batch: *std.ArrayListUnmanaged(backup_codec.KeyValueEntry),
+    key: []const u8,
+    value: []const u8,
+) !void {
+    var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, key)) orelse return;
+    defer artifact_ref.deinit(alloc);
+    if (artifact_ref.kind != .chunk) return;
+
+    const public_id = try artifact_ids.artifactPublicIdAlloc(alloc, artifact_ref);
+    errdefer alloc.free(public_id);
+    const owned_value = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned_value);
+    try batch.append(alloc, .{
+        .key = public_id,
+        .value = owned_value,
+    });
+}
+
+fn appendPortableArtifactEntry(
+    alloc: Allocator,
+    batch: *std.ArrayListUnmanaged(backup_codec.KeyValueEntry),
+    key: []const u8,
+    value: []const u8,
+    allowed_kind: db_types.ArtifactKind,
+) !bool {
+    var artifact_ref = (artifact_ids.decodeArtifactRefAlloc(alloc, key) catch |err| switch (err) {
+        error.InvalidInternalUserKey => return false,
+        else => return err,
+    }) orelse return false;
+    defer artifact_ref.deinit(alloc);
+    if (artifact_ref.kind != allowed_kind) return false;
+
+    const public_id = try artifact_ids.artifactPublicIdAlloc(alloc, artifact_ref);
+    errdefer alloc.free(public_id);
+    const owned_value = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned_value);
+    try batch.append(alloc, .{
+        .key = public_id,
+        .value = owned_value,
+    });
+    return true;
+}
+
+fn appendResolutionArtifactEntry(
+    alloc: Allocator,
+    batch: *std.ArrayListUnmanaged(backup_codec.KeyValueEntry),
+    key: []const u8,
+    value: []const u8,
+) !bool {
+    const parsed = (try internal_keys.parseResolutionArtifactKeyAlloc(alloc, key)) orelse return false;
+    defer {
+        alloc.free(parsed.doc_key);
+        alloc.free(parsed.artifact_name);
+    }
+
+    const public_id = try resolutionPublicIdAlloc(alloc, parsed.doc_key, parsed.artifact_name);
+    errdefer alloc.free(public_id);
+    const owned_value = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned_value);
+    try batch.append(alloc, .{
+        .key = public_id,
+        .value = owned_value,
+    });
+    return true;
+}
+
+fn resolutionPublicIdAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+
+    try out.appendSlice(alloc, resolution_public_id_prefix);
+    try appendBase64UrlComponent(alloc, &out, doc_key);
+    try out.append(alloc, ':');
+    try appendBase64UrlComponent(alloc, &out, artifact_name);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn decodeResolutionPublicIdAlloc(alloc: Allocator, public_id: []const u8) !?ResolutionArtifactRef {
+    if (!std.mem.startsWith(u8, public_id, resolution_public_id_prefix)) return null;
+
+    const body = public_id[resolution_public_id_prefix.len..];
+    const separator = std.mem.indexOfScalar(u8, body, ':') orelse return error.InvalidBackupRequest;
+    if (std.mem.indexOfScalar(u8, body[separator + 1 ..], ':') != null) return error.InvalidBackupRequest;
+
+    return .{
+        .doc_key = try decodeBase64UrlComponentAlloc(alloc, body[0..separator]),
+        .artifact_name = try decodeBase64UrlComponentAlloc(alloc, body[separator + 1 ..]),
+    };
+}
+
+fn appendBase64UrlComponent(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), bytes: []const u8) !void {
+    const encoder = std.base64.url_safe_no_pad.Encoder;
+    const encoded_len = encoder.calcSize(bytes.len);
+    const start = out.items.len;
+    try out.resize(alloc, start + encoded_len);
+    _ = encoder.encode(out.items[start .. start + encoded_len], bytes);
+}
+
+fn decodeBase64UrlComponentAlloc(alloc: Allocator, encoded: []const u8) ![]u8 {
+    const decoder = std.base64.url_safe_no_pad.Decoder;
+    const decoded_len = decoder.calcSizeForSlice(encoded) catch return error.InvalidBackupRequest;
+    const out = try alloc.alloc(u8, decoded_len);
+    errdefer alloc.free(out);
+    decoder.decode(out, encoded) catch return error.InvalidBackupRequest;
+    return out;
+}
+
 /// Parse an embedding artifact value and collect into the appropriate batch.
 fn collectEmbedding(
     alloc: Allocator,
     batches: *std.StringHashMapUnmanaged(EmbeddingBatch),
+    sparse_batches: *std.StringHashMapUnmanaged(SparseBatch),
     key: []const u8,
     value: []const u8,
 ) !void {
@@ -360,9 +666,17 @@ fn collectEmbedding(
     defer alloc.free(parsed_key.doc_key);
     defer alloc.free(parsed_key.artifact_name);
 
-    const vector = if (enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, value)) |decoded|
-        decoded
-    else |_| blk: {
+    if (enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, value)) |vector| {
+        try appendDenseEmbedding(alloc, batches, parsed_key.artifact_name, parsed_key.doc_key, vector);
+        return;
+    } else |_| {}
+
+    if (enrichment_artifact_codec.decodeSparseEmbeddingAlloc(alloc, value)) |sparse| {
+        try appendSparseEmbedding(alloc, sparse_batches, parsed_key.artifact_name, parsed_key.doc_key, sparse);
+        return;
+    } else |_| {}
+
+    {
         // Legacy imported portable data used JSON: {"dims": N, "vector": [...]}.
         const EmbPayload = struct {
             dims: u32,
@@ -373,11 +687,21 @@ fn collectEmbedding(
             .ignore_unknown_fields = true,
         }) catch return; // skip malformed embeddings
         defer json_parsed.deinit();
-        break :blk try alloc.dupe(f32, json_parsed.value.vector);
-    };
+        const vector = try alloc.dupe(f32, json_parsed.value.vector);
+        try appendDenseEmbedding(alloc, batches, parsed_key.artifact_name, parsed_key.doc_key, vector);
+    }
+}
+
+fn appendDenseEmbedding(
+    alloc: Allocator,
+    batches: *std.StringHashMapUnmanaged(EmbeddingBatch),
+    index_name: []const u8,
+    doc_key: []const u8,
+    vector: []f32,
+) !void {
     errdefer alloc.free(vector);
 
-    const idx_name = try alloc.dupe(u8, parsed_key.artifact_name);
+    const idx_name = try alloc.dupe(u8, index_name);
     const gop = try batches.getOrPut(alloc, idx_name);
     if (!gop.found_existing) {
         gop.value_ptr.* = EmbeddingBatch.init();
@@ -386,10 +710,40 @@ fn collectEmbedding(
         alloc.free(idx_name);
     }
 
+    const owned_doc_key = try alloc.dupe(u8, doc_key);
+    errdefer alloc.free(owned_doc_key);
     try gop.value_ptr.entries.append(alloc, .{
-        .doc_key = try alloc.dupe(u8, parsed_key.doc_key),
+        .doc_key = owned_doc_key,
         .hash_id = 0, // Zig doesn't store hash_id in embedding values
         .vector = vector,
+    });
+}
+
+fn appendSparseEmbedding(
+    alloc: Allocator,
+    batches: *std.StringHashMapUnmanaged(SparseBatch),
+    index_name: []const u8,
+    doc_key: []const u8,
+    sparse: enrichment_artifact_codec.SparseEmbedding,
+) !void {
+    var owned_sparse = sparse;
+    errdefer owned_sparse.deinit(alloc);
+
+    const idx_name = try alloc.dupe(u8, index_name);
+    const gop = try batches.getOrPut(alloc, idx_name);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = SparseBatch.init();
+    } else {
+        alloc.free(idx_name);
+    }
+
+    const owned_doc_key = try alloc.dupe(u8, doc_key);
+    errdefer alloc.free(owned_doc_key);
+    try gop.value_ptr.entries.append(alloc, .{
+        .doc_key = owned_doc_key,
+        .hash_id = 0,
+        .indices = owned_sparse.indices,
+        .values = owned_sparse.values,
     });
 }
 
@@ -456,7 +810,13 @@ pub fn importPortable(alloc: Allocator, store: *DocStore, data: []const u8) !voi
     return try importPortableWithOptions(alloc, store, data, .{});
 }
 
+pub fn validatePortable(alloc: Allocator, data: []const u8) !void {
+    try validatePortableImportBlocks(alloc, data, .{});
+}
+
 pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []const u8, opts: ImportOptions) !void {
+    try validatePortableImportBlocks(alloc, data, opts);
+
     var reader = backup_codec.SliceReader.init(data);
     _ = try reader.readHeader();
     var imported_identity = false;
@@ -471,7 +831,8 @@ pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []con
                 try importIdentityBatch(alloc, store, block.payload);
                 imported_identity = true;
             },
-            // Skip: sparse, summary, chunk, transaction (rebuilt by enrichment)
+            .metadata_batch => try importMetadataBatch(alloc, store, block.payload),
+            // Skip: derived indexes in the first pass; they are restored after documents.
             .cluster_manifest, .table_manifest, .shard_header, .shard_footer, .file_footer => {},
             else => {},
         }
@@ -490,11 +851,136 @@ pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []con
             defer alloc.free(block.payload);
 
             switch (block.block_type) {
+                .chunk_batch => try importChunkBatch(alloc, store, block.payload),
+                .artifact_batch => try importPublicArtifactBatch(alloc, store, block.payload, .asset),
+                .resolution_batch => try importResolutionArtifactBatch(alloc, store, block.payload),
                 .embedding_batch => try importEmbeddingBatch(alloc, store, block.payload, opts.embedding_source_fields),
+                .sparse_batch => try importSparseBatch(alloc, store, block.payload, opts.embedding_source_fields),
                 .edge_batch => try importEdgeBatch(alloc, store, block.payload),
                 else => {},
             }
         }
+    }
+}
+
+fn validatePortableImportBlocks(alloc: Allocator, data: []const u8, opts: ImportOptions) !void {
+    var reader = backup_codec.SliceReader.init(data);
+    _ = try reader.readHeader();
+    while (reader.pos < reader.data.len) {
+        const block = try reader.readBlock(alloc);
+        defer alloc.free(block.payload);
+        try validatePortableImportBlockPayload(alloc, block.block_type, block.payload, opts);
+    }
+}
+
+fn validatePortableImportBlockPayload(alloc: Allocator, block_type: backup_codec.BlockType, payload: []const u8, opts: ImportOptions) !void {
+    switch (block_type) {
+        .document_batch => try validateDocumentBatchPayload(alloc, payload),
+        .doc_identity_batch => try validateIdentityBatchPayload(alloc, payload),
+        .metadata_batch => try validateMetadataBatchPayload(alloc, payload),
+        .chunk_batch => if (opts.import_derived_indexes) try validatePublicArtifactBatchPayload(alloc, payload, .chunk),
+        .artifact_batch => if (opts.import_derived_indexes) try validatePublicArtifactBatchPayload(alloc, payload, .asset),
+        .resolution_batch => if (opts.import_derived_indexes) try validateResolutionArtifactBatchPayload(alloc, payload),
+        .embedding_batch => if (opts.import_derived_indexes) try validateEmbeddingBatchPayload(alloc, payload),
+        .sparse_batch => if (opts.import_derived_indexes) try validateSparseBatchPayload(alloc, payload),
+        .edge_batch => if (opts.import_derived_indexes) try validateEdgeBatchPayload(alloc, payload),
+        .shard_header => {
+            const header = try backup_codec.decodeShardHeader(alloc, payload);
+            alloc.free(header.table_name);
+            alloc.free(header.start_key);
+            alloc.free(header.end_key);
+        },
+        .shard_footer => _ = try backup_codec.decodeShardFooter(payload),
+        .file_footer => _ = try backup_codec.decodeFileFooter(payload),
+        .cluster_manifest, .table_manifest, .summary_batch, .transaction_batch => {},
+        else => {},
+    }
+}
+
+fn validateDocumentBatchPayload(alloc: Allocator, payload: []const u8) !void {
+    const entries = try backup_codec.decodeDocumentBatch(alloc, payload);
+    defer {
+        for (entries) |entry| {
+            alloc.free(entry.key);
+            alloc.free(entry.value);
+        }
+        alloc.free(entries);
+    }
+}
+
+fn validateIdentityBatchPayload(alloc: Allocator, payload: []const u8) !void {
+    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
+    defer freeKeyValueEntries(alloc, entries);
+    for (entries) |entry| {
+        if (entry.key.len == 0 or entry.key[0] != internal_keys.identity_namespace) {
+            return error.InvalidDocIdentityBatch;
+        }
+    }
+}
+
+fn validateMetadataBatchPayload(alloc: Allocator, payload: []const u8) !void {
+    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
+    defer freeKeyValueEntries(alloc, entries);
+    for (entries) |entry| {
+        if (!isPortableMetadataKey(entry.key)) return error.InvalidMetadataBatch;
+    }
+}
+
+fn validatePublicArtifactBatchPayload(alloc: Allocator, payload: []const u8, allowed_kind: db_types.ArtifactKind) !void {
+    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
+    defer freeKeyValueEntries(alloc, entries);
+    for (entries) |entry| {
+        var artifact_ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, entry.key)) orelse return error.InvalidBackupRequest;
+        defer artifact_ref.deinit(alloc);
+        if (artifact_ref.kind != allowed_kind) return error.InvalidBackupRequest;
+    }
+}
+
+fn validateResolutionArtifactBatchPayload(alloc: Allocator, payload: []const u8) !void {
+    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
+    defer freeKeyValueEntries(alloc, entries);
+    for (entries) |entry| {
+        var artifact_ref = (try decodeResolutionPublicIdAlloc(alloc, entry.key)) orelse return error.InvalidBackupRequest;
+        defer artifact_ref.deinit(alloc);
+    }
+}
+
+fn validateEmbeddingBatchPayload(alloc: Allocator, payload: []const u8) !void {
+    const result = try backup_codec.decodeEmbeddingBatch(alloc, payload);
+    defer {
+        alloc.free(result.index_name);
+        for (result.entries) |entry| {
+            alloc.free(entry.doc_key);
+            alloc.free(entry.vector);
+        }
+        alloc.free(result.entries);
+    }
+}
+
+fn validateSparseBatchPayload(alloc: Allocator, payload: []const u8) !void {
+    const result = try backup_codec.decodeSparseBatch(alloc, payload);
+    defer {
+        alloc.free(result.index_name);
+        for (result.entries) |entry| {
+            alloc.free(entry.doc_key);
+            alloc.free(entry.indices);
+            alloc.free(entry.values);
+        }
+        alloc.free(result.entries);
+    }
+}
+
+fn validateEdgeBatchPayload(alloc: Allocator, payload: []const u8) !void {
+    const result = try decodeEdgeBatch(alloc, payload);
+    defer {
+        alloc.free(result.index_name);
+        for (result.entries) |entry| {
+            alloc.free(entry.source_key);
+            alloc.free(entry.target_key);
+            alloc.free(entry.edge_type);
+            alloc.free(entry.value);
+        }
+        alloc.free(result.entries);
     }
 }
 
@@ -533,6 +1019,13 @@ fn importDocumentBatch(alloc: Allocator, store: *DocStore, payload: []const u8) 
             try alloc.dupe(u8, e.value);
         try owned_keys.append(alloc, value);
         try writes.append(alloc, .{ .key = store_key, .value = value });
+        if (e.timestamp_ns != 0) {
+            const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, e.key);
+            try owned_keys.append(alloc, timestamp_key);
+            const timestamp_value = try timestampValueAlloc(alloc, e.timestamp_ns);
+            try owned_keys.append(alloc, timestamp_value);
+            try writes.append(alloc, .{ .key = timestamp_key, .value = timestamp_value });
+        }
     }
 
     if (writes.items.len > 0) {
@@ -563,6 +1056,184 @@ fn importIdentityBatch(alloc: Allocator, store: *DocStore, payload: []const u8) 
     if (writes.items.len > 0) {
         try store.putBatch(writes.items, &.{});
     }
+}
+
+fn importMetadataBatch(alloc: Allocator, store: *DocStore, payload: []const u8) !void {
+    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
+    defer {
+        for (entries) |e| {
+            alloc.free(e.key);
+            alloc.free(e.value);
+        }
+        alloc.free(entries);
+    }
+
+    var writes = std.ArrayListUnmanaged(KVPair).empty;
+    defer writes.deinit(alloc);
+
+    for (entries) |e| {
+        if (!isPortableMetadataKey(e.key)) return error.InvalidMetadataBatch;
+        try writes.append(alloc, .{ .key = e.key, .value = e.value });
+    }
+
+    if (writes.items.len > 0) {
+        try store.putBatch(writes.items, &.{});
+    }
+}
+
+fn importChunkBatch(
+    alloc: Allocator,
+    store: *DocStore,
+    payload: []const u8,
+) !void {
+    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
+    defer freeKeyValueEntries(alloc, entries);
+
+    var writes = std.ArrayListUnmanaged(KVPair).empty;
+    defer writes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |k| alloc.free(k);
+        owned_keys.deinit(alloc);
+    }
+    var owned_vals = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_vals.items) |v| alloc.free(v);
+        owned_vals.deinit(alloc);
+    }
+
+    for (entries) |entry| {
+        var artifact_ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, entry.key)) orelse return error.InvalidBackupRequest;
+        defer artifact_ref.deinit(alloc);
+        if (artifact_ref.kind != .chunk) return error.InvalidBackupRequest;
+
+        const store_key = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, artifact_ref);
+        var store_key_owned = true;
+        errdefer if (store_key_owned) alloc.free(store_key);
+        try owned_keys.append(alloc, store_key);
+        store_key_owned = false;
+
+        const store_value = try alloc.dupe(u8, entry.value);
+        var store_value_owned = true;
+        errdefer if (store_value_owned) alloc.free(store_value);
+        try owned_vals.append(alloc, store_value);
+        store_value_owned = false;
+
+        try writes.append(alloc, .{
+            .key = store_key,
+            .value = store_value,
+        });
+    }
+
+    if (writes.items.len > 0) {
+        try store.putBatch(writes.items, &.{});
+    }
+}
+
+fn importPublicArtifactBatch(
+    alloc: Allocator,
+    store: *DocStore,
+    payload: []const u8,
+    allowed_kind: db_types.ArtifactKind,
+) !void {
+    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
+    defer freeKeyValueEntries(alloc, entries);
+
+    var writes = std.ArrayListUnmanaged(KVPair).empty;
+    defer writes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |k| alloc.free(k);
+        owned_keys.deinit(alloc);
+    }
+    var owned_vals = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_vals.items) |v| alloc.free(v);
+        owned_vals.deinit(alloc);
+    }
+
+    for (entries) |entry| {
+        var artifact_ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, entry.key)) orelse return error.InvalidBackupRequest;
+        defer artifact_ref.deinit(alloc);
+        if (artifact_ref.kind != allowed_kind) return error.InvalidBackupRequest;
+
+        const store_key = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, artifact_ref);
+        var store_key_owned = true;
+        errdefer if (store_key_owned) alloc.free(store_key);
+        try owned_keys.append(alloc, store_key);
+        store_key_owned = false;
+
+        const store_value = try alloc.dupe(u8, entry.value);
+        var store_value_owned = true;
+        errdefer if (store_value_owned) alloc.free(store_value);
+        try owned_vals.append(alloc, store_value);
+        store_value_owned = false;
+
+        try writes.append(alloc, .{
+            .key = store_key,
+            .value = store_value,
+        });
+    }
+
+    if (writes.items.len > 0) {
+        try store.putBatch(writes.items, &.{});
+    }
+}
+
+fn importResolutionArtifactBatch(
+    alloc: Allocator,
+    store: *DocStore,
+    payload: []const u8,
+) !void {
+    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
+    defer freeKeyValueEntries(alloc, entries);
+
+    var writes = std.ArrayListUnmanaged(KVPair).empty;
+    defer writes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |k| alloc.free(k);
+        owned_keys.deinit(alloc);
+    }
+    var owned_vals = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_vals.items) |v| alloc.free(v);
+        owned_vals.deinit(alloc);
+    }
+
+    for (entries) |entry| {
+        var artifact_ref = (try decodeResolutionPublicIdAlloc(alloc, entry.key)) orelse return error.InvalidBackupRequest;
+        defer artifact_ref.deinit(alloc);
+
+        const store_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, artifact_ref.doc_key, artifact_ref.artifact_name);
+        var store_key_owned = true;
+        errdefer if (store_key_owned) alloc.free(store_key);
+        try owned_keys.append(alloc, store_key);
+        store_key_owned = false;
+
+        const store_value = try alloc.dupe(u8, entry.value);
+        var store_value_owned = true;
+        errdefer if (store_value_owned) alloc.free(store_value);
+        try owned_vals.append(alloc, store_value);
+        store_value_owned = false;
+
+        try writes.append(alloc, .{
+            .key = store_key,
+            .value = store_value,
+        });
+    }
+
+    if (writes.items.len > 0) {
+        try store.putBatch(writes.items, &.{});
+    }
+}
+
+fn freeKeyValueEntries(alloc: Allocator, entries: []backup_codec.KeyValueEntry) void {
+    for (entries) |entry| {
+        alloc.free(entry.key);
+        alloc.free(entry.value);
+    }
+    alloc.free(entries);
 }
 
 fn importEmbeddingBatch(
@@ -600,6 +1271,51 @@ fn importEmbeddingBatch(
 
         const source_hash = try embeddingSourceHashForDocument(alloc, store, e.doc_key, result.index_name, source_fields);
         const artifact_value = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, source_hash, e.vector);
+        try owned_vals.append(alloc, artifact_value);
+        try writes.append(alloc, .{ .key = store_key, .value = artifact_value });
+    }
+
+    if (writes.items.len > 0) {
+        try store.putBatch(writes.items, &.{});
+    }
+}
+
+fn importSparseBatch(
+    alloc: Allocator,
+    store: *DocStore,
+    payload: []const u8,
+    source_fields: []const ImportOptions.EmbeddingSourceField,
+) !void {
+    const result = try backup_codec.decodeSparseBatch(alloc, payload);
+    defer {
+        alloc.free(result.index_name);
+        for (result.entries) |e| {
+            alloc.free(e.doc_key);
+            alloc.free(e.indices);
+            alloc.free(e.values);
+        }
+        alloc.free(result.entries);
+    }
+
+    var writes = std.ArrayListUnmanaged(KVPair).empty;
+    defer writes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |k| alloc.free(k);
+        owned_keys.deinit(alloc);
+    }
+    var owned_vals = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_vals.items) |v| alloc.free(v);
+        owned_vals.deinit(alloc);
+    }
+
+    for (result.entries) |e| {
+        const store_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, e.doc_key, result.index_name);
+        try owned_keys.append(alloc, store_key);
+
+        const source_hash = try embeddingSourceHashForDocument(alloc, store, e.doc_key, result.index_name, source_fields);
+        const artifact_value = try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(alloc, source_hash, e.indices, e.values);
         try owned_vals.append(alloc, artifact_value);
         try writes.append(alloc, .{ .key = store_key, .value = artifact_value });
     }
@@ -854,6 +1570,132 @@ test "export and import documents round trip" {
     }
 }
 
+test "import preflights full portable envelope before mutating destination" {
+    const alloc = std.testing.allocator;
+
+    var tmp_src = std.testing.tmpDir(.{});
+    defer tmp_src.cleanup();
+    var src = try openTestStore(alloc, &tmp_src);
+    defer src.close();
+
+    const store_key = try internal_keys.documentKeyAlloc(alloc, "doc:truncated-import");
+    defer alloc.free(store_key);
+    try src.putBatch(&.{.{ .key = store_key, .value = "{\"title\":\"must not import\"}" }}, &.{});
+
+    var portable: ArrayList(u8) = .empty;
+    defer portable.deinit(alloc);
+    try exportPortable(alloc, &src, &portable);
+    try std.testing.expect(portable.items.len > backup_codec.header_size);
+    const truncated = portable.items[0 .. portable.items.len - 1];
+
+    var tmp_dst = std.testing.tmpDir(.{});
+    defer tmp_dst.cleanup();
+    var dst = try openTestStore(alloc, &tmp_dst);
+    defer dst.close();
+
+    try std.testing.expectError(error.EndOfStream, importPortable(alloc, &dst, truncated));
+    try std.testing.expectError(error.NotFound, dst.get(alloc, store_key));
+}
+
+test "import preflights logical block payloads before mutating destination" {
+    const alloc = std.testing.allocator;
+
+    var portable: ArrayList(u8) = .empty;
+    defer portable.deinit(alloc);
+    try backup_codec.writeHeader(&portable, alloc, .{
+        .format_version = backup_codec.format_version,
+        .flags = 0,
+        .created_at_ns = 0,
+        .backup_id = [_]u8{0} ** 16,
+        .table_count = 1,
+        .shard_count = 1,
+    });
+
+    const good_doc = try backup_codec.encodeDocumentBatch(alloc, &.{
+        .{
+            .key = "doc:valid-before-malformed",
+            .value_flags = 0,
+            .value = "{\"title\":\"must not import\"}",
+            .timestamp_ns = 0,
+        },
+    });
+    defer alloc.free(good_doc);
+    try backup_codec.writeBlock(&portable, alloc, .document_batch, good_doc);
+
+    const malformed_doc_payload = [_]u8{ 1, 0, 0, 0 };
+    try backup_codec.writeBlock(&portable, alloc, .document_batch, &malformed_doc_payload);
+
+    var tmp_dst = std.testing.tmpDir(.{});
+    defer tmp_dst.cleanup();
+    var dst = try openTestStore(alloc, &tmp_dst);
+    defer dst.close();
+
+    const store_key = try internal_keys.documentKeyAlloc(alloc, "doc:valid-before-malformed");
+    defer alloc.free(store_key);
+    try std.testing.expectError(error.Truncated, importPortable(alloc, &dst, portable.items));
+    try std.testing.expectError(error.NotFound, dst.get(alloc, store_key));
+}
+
+test "export and import documents preserve timestamps" {
+    const alloc = std.testing.allocator;
+
+    var tmp_src = std.testing.tmpDir(.{});
+    defer tmp_src.cleanup();
+    var src = try openTestStore(alloc, &tmp_src);
+    defer src.close();
+
+    const doc_key = "doc:ttl";
+    const timestamp_ns: u64 = 1_700_000_000_000_000_123;
+    const store_key = try internal_keys.documentKeyAlloc(alloc, doc_key);
+    defer alloc.free(store_key);
+    const ttl_key = try internal_keys.ttlKeyAlloc(alloc, doc_key);
+    defer alloc.free(ttl_key);
+    const ttl_value = try timestampValueAlloc(alloc, timestamp_ns);
+    defer alloc.free(ttl_value);
+    try src.putBatch(&.{
+        .{ .key = store_key, .value = "{\"id\":\"doc:ttl\"}" },
+        .{ .key = ttl_key, .value = ttl_value },
+    }, &.{});
+
+    var out: ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try exportPortable(alloc, &src, &out);
+
+    var saw_timestamp = false;
+    var reader = backup_codec.SliceReader.init(out.items);
+    _ = try reader.readHeader();
+    while (reader.pos < reader.data.len) {
+        const block = try reader.readBlock(alloc);
+        defer alloc.free(block.payload);
+        if (block.block_type != .document_batch) continue;
+        const entries = try backup_codec.decodeDocumentBatch(alloc, block.payload);
+        defer {
+            for (entries) |entry| {
+                alloc.free(entry.key);
+                alloc.free(entry.value);
+            }
+            alloc.free(entries);
+        }
+        for (entries) |entry| {
+            if (!std.mem.eql(u8, entry.key, doc_key)) continue;
+            try std.testing.expectEqual(timestamp_ns, entry.timestamp_ns);
+            saw_timestamp = true;
+        }
+    }
+    try std.testing.expect(saw_timestamp);
+
+    var tmp_dst = std.testing.tmpDir(.{});
+    defer tmp_dst.cleanup();
+    var dst = try openTestStore(alloc, &tmp_dst);
+    defer dst.close();
+    try importPortable(alloc, &dst, out.items);
+
+    const restored_ttl = try dst.get(alloc, ttl_key);
+    defer alloc.free(restored_ttl);
+    try std.testing.expectEqual(@as(usize, 8), restored_ttl.len);
+    try std.testing.expectEqual(timestamp_ns, std.mem.readInt(u64, restored_ttl[0..8], .little));
+}
+
 test "export and import preserves doc identity metadata" {
     const alloc = std.testing.allocator;
 
@@ -928,6 +1770,43 @@ test "export and import preserves doc identity metadata" {
     try std.testing.expectEqual(@as(u64, 2), stats.allocated_ordinals);
     try std.testing.expectEqual(@as(u64, 1), stats.live_ordinals);
     try std.testing.expectEqual(@as(u64, 1), stats.tombstone_ordinals);
+}
+
+test "export and import preserves portable schema and catalog metadata" {
+    const alloc = std.testing.allocator;
+
+    var tmp_src = std.testing.tmpDir(.{});
+    defer tmp_src.cleanup();
+    var src = try openTestStore(alloc, &tmp_src);
+    defer src.close();
+
+    const portable_entries = [_]KVPair{
+        .{ .key = "\x00\x00__metadata__:schema_json", .value = "{\"version\":1}" },
+        .{ .key = "\x00\x00__metadata__:schema", .value = "runtime-schema" },
+        .{ .key = "\x00\x00__metadata__:schema_v1", .value = "runtime-schema-v1" },
+        .{ .key = "\x00\x00__metadata__:indexes", .value = "[{\"name\":\"ft\",\"kind\":\"full_text\",\"config_json\":\"{}\"}]" },
+        .{ .key = "\x00\x00__metadata__:enrichments", .value = "[]" },
+        .{ .key = "\x00\x00__metadata__:resolvers", .value = "[]" },
+    };
+    try src.putBatch(&portable_entries, &.{});
+    try src.putBatch(&.{.{ .key = "\x00\x00__metadata__:text_field_analyzers:ft", .value = "{}" }}, &.{});
+
+    var out: ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try exportPortable(alloc, &src, &out);
+
+    var tmp_dst = std.testing.tmpDir(.{});
+    defer tmp_dst.cleanup();
+    var dst = try openTestStore(alloc, &tmp_dst);
+    defer dst.close();
+    try importPortable(alloc, &dst, out.items);
+
+    for (portable_entries) |entry| {
+        const restored = try dst.get(alloc, entry.key);
+        defer alloc.free(restored);
+        try std.testing.expectEqualStrings(entry.value, restored);
+    }
+    try std.testing.expectError(error.NotFound, dst.get(alloc, "\x00\x00__metadata__:text_field_analyzers:ft"));
 }
 
 test "import rejects doc identity metadata with invalid canonical ids" {
@@ -1085,6 +1964,51 @@ test "export and import embeddings round trip" {
     }
 }
 
+test "export and import sparse embeddings round trip" {
+    const alloc = std.testing.allocator;
+
+    var tmp_src = std.testing.tmpDir(.{});
+    defer tmp_src.cleanup();
+    var src = try openTestStore(alloc, &tmp_src);
+    defer src.close();
+
+    const doc_store_key = try internal_keys.documentKeyAlloc(alloc, "sparse-doc");
+    defer alloc.free(doc_store_key);
+    try src.putBatch(&.{.{ .key = doc_store_key, .value = "{\"id\":\"sparse-doc\",\"body\":\"alpha beta\"}" }}, &.{});
+
+    const sparse_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "sparse-doc", "sparse_idx");
+    defer alloc.free(sparse_key);
+    const sparse_val = try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(
+        alloc,
+        null,
+        &.{ 2, 9, 17 },
+        &.{ 0.5, 1.25, 0.75 },
+    );
+    defer alloc.free(sparse_val);
+    try src.putBatch(&.{.{ .key = sparse_key, .value = sparse_val }}, &.{});
+
+    var out: ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try exportPortable(alloc, &src, &out);
+
+    var tmp_dst = std.testing.tmpDir(.{});
+    defer tmp_dst.cleanup();
+    var dst = try openTestStore(alloc, &tmp_dst);
+    defer dst.close();
+    try importPortable(alloc, &dst, out.items);
+
+    const val = try dst.get(alloc, sparse_key);
+    defer alloc.free(val);
+
+    var decoded = try enrichment_artifact_codec.decodeSparseEmbeddingAlloc(alloc, val);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 9, 17 }, decoded.indices);
+    try std.testing.expectEqual(@as(usize, 3), decoded.values.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), decoded.values[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.25), decoded.values[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), decoded.values[2], 1e-6);
+}
+
 test "export and import graph edge artifacts round trip with arbitrary ids" {
     const alloc = std.testing.allocator;
 
@@ -1133,6 +2057,166 @@ test "export and import graph edge artifacts round trip with arbitrary ids" {
         try std.testing.expectEqual(@as(u64, 22), decoded.updated_at);
         try std.testing.expectEqualStrings("{\"ok\":true}", decoded.metadata_json);
     }
+}
+
+test "export and import chunk artifacts round trip with public artifact ids" {
+    const alloc = std.testing.allocator;
+
+    var tmp_src = std.testing.tmpDir(.{});
+    defer tmp_src.cleanup();
+    var src = try openTestStore(alloc, &tmp_src);
+    defer src.close();
+
+    const doc_key = "doc:chunk-source";
+    const chunk_key = try internal_keys.chunkArtifactKeyAlloc(alloc, doc_key, "body_chunks_v1", 7);
+    defer alloc.free(chunk_key);
+    const unit_chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, doc_key, "asset_chunks_v1", "unit:alpha", 3);
+    defer alloc.free(unit_chunk_key);
+    const chunk_value = "{\"body\":\"chunk seven\",\"_chunk_id\":7}";
+    const unit_chunk_value = "{\"body\":\"unit chunk three\",\"_chunk_id\":3}";
+
+    try src.putBatch(&.{
+        .{ .key = chunk_key, .value = chunk_value },
+        .{ .key = unit_chunk_key, .value = unit_chunk_value },
+    }, &.{});
+
+    var out: ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try exportPortable(alloc, &src, &out);
+
+    var saw_chunk_batch = false;
+    var reader = backup_codec.SliceReader.init(out.items);
+    _ = try reader.readHeader();
+    while (reader.pos < reader.data.len) {
+        const block = try reader.readBlock(alloc);
+        defer alloc.free(block.payload);
+        if (block.block_type != .chunk_batch) continue;
+        saw_chunk_batch = true;
+        const entries = try backup_codec.decodeKeyValueBatch(alloc, block.payload);
+        defer freeKeyValueEntries(alloc, entries);
+        try std.testing.expectEqual(@as(usize, 2), entries.len);
+        for (entries) |entry| {
+            try std.testing.expect(std.mem.startsWith(u8, entry.key, "af1:chunk:"));
+        }
+    }
+    try std.testing.expect(saw_chunk_batch);
+
+    var tmp_dst = std.testing.tmpDir(.{});
+    defer tmp_dst.cleanup();
+    var dst = try openTestStore(alloc, &tmp_dst);
+    defer dst.close();
+    try importPortable(alloc, &dst, out.items);
+
+    const restored_chunk = try dst.get(alloc, chunk_key);
+    defer alloc.free(restored_chunk);
+    try std.testing.expectEqualStrings(chunk_value, restored_chunk);
+
+    const restored_unit_chunk = try dst.get(alloc, unit_chunk_key);
+    defer alloc.free(restored_unit_chunk);
+    try std.testing.expectEqualStrings(unit_chunk_value, restored_unit_chunk);
+}
+
+test "export and import asset artifacts round trip with public artifact ids" {
+    const alloc = std.testing.allocator;
+
+    var tmp_src = std.testing.tmpDir(.{});
+    defer tmp_src.cleanup();
+    var src = try openTestStore(alloc, &tmp_src);
+    defer src.close();
+
+    const doc_key = "doc:asset-source";
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", "document_units_v1");
+    defer alloc.free(asset_key);
+    const unit_asset_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, doc_key, "document_units_v1", "page:000001");
+    defer alloc.free(unit_asset_key);
+    const asset_value = "{\"units\":[\"page:000001\"]}";
+    const unit_asset_value = "{\"text\":\"page one text\",\"page\":1}";
+
+    try src.putBatch(&.{
+        .{ .key = asset_key, .value = asset_value },
+        .{ .key = unit_asset_key, .value = unit_asset_value },
+    }, &.{});
+
+    var out: ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try exportPortable(alloc, &src, &out);
+
+    var saw_artifact_batch = false;
+    var reader = backup_codec.SliceReader.init(out.items);
+    _ = try reader.readHeader();
+    while (reader.pos < reader.data.len) {
+        const block = try reader.readBlock(alloc);
+        defer alloc.free(block.payload);
+        if (block.block_type != .artifact_batch) continue;
+        saw_artifact_batch = true;
+        const entries = try backup_codec.decodeKeyValueBatch(alloc, block.payload);
+        defer freeKeyValueEntries(alloc, entries);
+        try std.testing.expectEqual(@as(usize, 2), entries.len);
+        for (entries) |entry| {
+            try std.testing.expect(std.mem.startsWith(u8, entry.key, "af1:asset:"));
+        }
+    }
+    try std.testing.expect(saw_artifact_batch);
+
+    var tmp_dst = std.testing.tmpDir(.{});
+    defer tmp_dst.cleanup();
+    var dst = try openTestStore(alloc, &tmp_dst);
+    defer dst.close();
+    try importPortable(alloc, &dst, out.items);
+
+    const restored_asset = try dst.get(alloc, asset_key);
+    defer alloc.free(restored_asset);
+    try std.testing.expectEqualStrings(asset_value, restored_asset);
+
+    const restored_unit_asset = try dst.get(alloc, unit_asset_key);
+    defer alloc.free(restored_unit_asset);
+    try std.testing.expectEqualStrings(unit_asset_value, restored_unit_asset);
+}
+
+test "export and import resolution artifacts round trip with public artifact ids" {
+    const alloc = std.testing.allocator;
+
+    var tmp_src = std.testing.tmpDir(.{});
+    defer tmp_src.cleanup();
+    var src = try openTestStore(alloc, &tmp_src);
+    defer src.close();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:mention-source", "people_resolver_v1");
+    defer alloc.free(resolution_key);
+    const resolution_value =
+        \\{"mentions":[{"text":"Ada","entity_id":"entity:ada","confidence":0.98}]}
+    ;
+
+    try src.putBatch(&.{.{ .key = resolution_key, .value = resolution_value }}, &.{});
+
+    var out: ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try exportPortable(alloc, &src, &out);
+
+    var saw_resolution_batch = false;
+    var reader = backup_codec.SliceReader.init(out.items);
+    _ = try reader.readHeader();
+    while (reader.pos < reader.data.len) {
+        const block = try reader.readBlock(alloc);
+        defer alloc.free(block.payload);
+        if (block.block_type != .resolution_batch) continue;
+        saw_resolution_batch = true;
+        const entries = try backup_codec.decodeKeyValueBatch(alloc, block.payload);
+        defer freeKeyValueEntries(alloc, entries);
+        try std.testing.expectEqual(@as(usize, 1), entries.len);
+        try std.testing.expect(std.mem.startsWith(u8, entries[0].key, resolution_public_id_prefix));
+    }
+    try std.testing.expect(saw_resolution_batch);
+
+    var tmp_dst = std.testing.tmpDir(.{});
+    defer tmp_dst.cleanup();
+    var dst = try openTestStore(alloc, &tmp_dst);
+    defer dst.close();
+    try importPortable(alloc, &dst, out.items);
+
+    const restored_resolution = try dst.get(alloc, resolution_key);
+    defer alloc.free(restored_resolution);
+    try std.testing.expectEqualStrings(resolution_value, restored_resolution);
 }
 
 test "export skips derived data" {

@@ -29,8 +29,15 @@ const transactions_mod = antfly.transactions;
 const aggregations_mod = db_mod.aggregations;
 const search_agg_mod = antfly.aggregation;
 const geo_mod = antfly.geo;
-const schema_mod = antfly.schema;
+const lite_backend = antfly.lite.backend;
+const lite_restore_staging = antfly.lite.restore_staging;
+const backup_codec = antfly.backup_codec;
+const portable_backup = antfly.portable_backup;
+const batch_api = antfly.public_api.batch;
+const query_api = antfly.public_api.query;
 const Allocator = std.mem.Allocator;
+
+const lite_abi_version: u32 = 1;
 
 fn monotonicNowNs() u64 {
     return antfly.platform_time.monotonicNs();
@@ -49,10 +56,22 @@ fn tempTestPath(alloc: Allocator, label: []const u8) ![:0]u8 {
     return try alloc.dupeZ(u8, path);
 }
 
+fn tempTestAflitePath(alloc: Allocator, label: []const u8) ![:0]u8 {
+    const base = try tempTestPath(alloc, label);
+    defer alloc.free(base);
+    const path = try std.fmt.allocPrint(alloc, "{s}.aflite", .{base});
+    defer alloc.free(path);
+    return try alloc.dupeZ(u8, path);
+}
+
 const Handle = struct {
     alloc: std.mem.Allocator,
     db: db_mod.DB,
+    open_mode: db_mod.OpenOptions.OpenMode = .writer,
     readable_lease_hook: ?ReadableLeaseHook = null,
+    owned_lite_backend: ?lite_backend.Handle = null,
+    lite_profile: ?lite_backend.Profile = null,
+    lite_inference_status: ?lite_backend.InferenceStatus = null,
 
     fn prepareSearchRequest(self: *Handle, req: db_mod.types.SearchRequest) !void {
         const hook = self.readable_lease_hook orelse return;
@@ -94,6 +113,25 @@ const Handle = struct {
         try hook.featureReads().prepareScan(hook.group_id, from_key, to_key, opts);
     }
 };
+
+fn closeHandle(handle: *Handle) void {
+    if (handle.owned_lite_backend != null and liteOpenModeCanWrite(handle.open_mode)) {
+        handle.db.sync(true) catch {};
+        handle.db.syncIndexes(true) catch {};
+    }
+    handle.db.close();
+    if (handle.owned_lite_backend) |*backend| {
+        backend.deinit();
+    }
+    handle.alloc.destroy(handle);
+}
+
+fn liteOpenModeCanWrite(open_mode: db_mod.OpenOptions.OpenMode) bool {
+    return switch (open_mode) {
+        .writer, .writer_no_replay => true,
+        else => false,
+    };
+}
 
 fn currentIdentityReadGenerationForHandle(handle: *Handle, requested: ?u64) !u64 {
     return try handle.db.currentIdentityReadGenerationForRequest(requested);
@@ -143,6 +181,7 @@ const ReadableLeaseHook = struct {
             .version_conflict => return error.VersionConflict,
             .intent_conflict => return error.IntentConflict,
             .txn_not_found => return error.TxnNotFound,
+            .busy => return error.WouldBlock,
             .internal => return error.Internal,
         }
     }
@@ -157,6 +196,19 @@ fn cleanupTestDir(path: []const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+}
+
+fn cleanupTestFile(path: []const u8) void {
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteFile(io_impl.io(), path) catch {};
+}
+
+fn testPathExists(path: []const u8) bool {
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().access(io_impl.io(), path, .{}) catch return false;
+    return true;
 }
 
 fn beginWithIdAndParticipants(
@@ -296,6 +348,13 @@ fn decodeBase64Alloc(alloc: Allocator, encoded: []const u8) ![]u8 {
     errdefer alloc.free(out);
     try std.base64.standard.Decoder.decode(out, encoded);
     return out;
+}
+
+fn parseEnrichmentKind(kind: []const u8) ?db_mod.types.EnrichmentKind {
+    if (std.mem.eql(u8, kind, "chunk")) return .chunk;
+    if (std.mem.eql(u8, kind, "asset")) return .asset;
+    if (std.mem.eql(u8, kind, "embedding")) return .embedding;
+    return null;
 }
 
 fn graphFreeEdges(alloc: Allocator, edges: []graph_mod.Edge) void {
@@ -1532,22 +1591,808 @@ const JsonGraphNode = struct {
     }
 };
 
-pub export fn antfly_db_open(path: [*:0]const u8, out_handle: *?*anyopaque) capi.ErrorCode {
+pub export fn antfly_db_open(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
+    const out = out_handle orelse return .invalid_argument;
+    out.* = null;
+    const path_slice = cStringSpan(path) orelse return .invalid_argument;
+    const handle = openDefaultDirectoryHandle(path_slice) catch |err| return capi.mapError(err);
+    out.* = handle;
+    return .ok;
+}
+
+fn openDefaultDirectoryHandle(path: []const u8) !*Handle {
     const alloc = std.heap.c_allocator;
-    const handle = alloc.create(Handle) catch return .internal;
+    var db = try db_mod.DB.open(alloc, path, .{});
+    errdefer db.close();
+    const handle = alloc.create(Handle) catch return error.OutOfMemory;
     errdefer alloc.destroy(handle);
     handle.* = .{
         .alloc = alloc,
-        .db = db_mod.DB.open(alloc, std.mem.span(path), .{}) catch |err| return capi.mapError(err),
+        .db = db,
     };
-    out_handle.* = handle;
-    return .ok;
+    return handle;
 }
 
 pub export fn antfly_db_close(handle_ptr: ?*anyopaque) void {
     const handle = asHandle(handle_ptr) orelse return;
-    handle.db.close();
-    handle.alloc.destroy(handle);
+    closeHandle(handle);
+}
+
+pub export fn antfly_abi_version() u32 {
+    return lite_abi_version;
+}
+
+pub export fn antfly_lite_abi_version() u32 {
+    return antfly_abi_version();
+}
+
+pub export fn antfly_lite_open_options_size() u32 {
+    return @intCast(@sizeOf(capi.LiteOpenOptions));
+}
+
+pub export fn antfly_open_options_size() u32 {
+    return @intCast(@sizeOf(capi.OpenOptions));
+}
+
+pub export fn antfly_error_code_name(code: c_int) [*:0]const u8 {
+    return capi.errorCodeName(code);
+}
+
+pub export fn antfly_error_code_description(code: c_int) [*:0]const u8 {
+    return capi.errorCodeDescription(code);
+}
+
+pub export fn antfly_lite_open_options_init(options: ?*capi.LiteOpenOptions) capi.ErrorCode {
+    const opts = options orelse return .invalid_argument;
+    opts.* = .{};
+    return .ok;
+}
+
+pub export fn antfly_open_options_init(options: ?*capi.OpenOptions) capi.ErrorCode {
+    const opts = options orelse return .invalid_argument;
+    opts.* = .{};
+    return .ok;
+}
+
+const lite_open_known_flags = capi.lite_open_flag_no_sync |
+    capi.lite_open_flag_ttl_cleanup |
+    capi.lite_open_flag_remote_provider_configured |
+    capi.lite_open_flag_local_runtime_configured |
+    capi.lite_open_flag_generated_enrichment_replay;
+
+const open_known_flags = capi.open_flag_no_sync |
+    capi.open_flag_ttl_cleanup |
+    capi.open_flag_remote_provider_configured |
+    capi.open_flag_local_runtime_configured |
+    capi.open_flag_generated_enrichment_replay;
+
+const StorageKind = enum {
+    directory,
+    lite,
+};
+
+const LiteResolvedOpenOptions = struct {
+    storage_kind: StorageKind = .lite,
+    open_mode: db_mod.OpenOptions.OpenMode = .writer,
+    profile: lite_backend.Profile = .native,
+    map_size: ?usize = null,
+    no_sync: bool = false,
+    ttl_cleanup: ?db_mod.ttl_runtime.Config = null,
+    inference: lite_backend.InferenceOpenOptions = .{},
+    generated_enrichment_replay: bool = false,
+};
+
+fn optionFieldType(comptime Options: type, comptime field_name: []const u8) type {
+    return @TypeOf(@field(@as(Options, .{}), field_name));
+}
+
+fn optionHasField(comptime Options: type, comptime field_name: []const u8) bool {
+    inline for (std.meta.fields(Options)) |field| {
+        if (std.mem.eql(u8, field.name, field_name)) return true;
+    }
+    return false;
+}
+
+fn optionFieldPresent(comptime Options: type, abi_size: u32, comptime field_name: []const u8) bool {
+    const Field = optionFieldType(Options, field_name);
+    const offset = @offsetOf(Options, field_name);
+    return abi_size >= offset + @sizeOf(Field);
+}
+
+fn readOptionField(
+    comptime Options: type,
+    options: *const Options,
+    abi_size: u32,
+    comptime field_name: []const u8,
+) ?optionFieldType(Options, field_name) {
+    const Field = optionFieldType(Options, field_name);
+    const offset = @offsetOf(Options, field_name);
+    if (abi_size < offset + @sizeOf(Field)) return null;
+    const raw: [*]const u8 = @ptrCast(options);
+    return std.mem.bytesAsValue(Field, raw[offset..][0..@sizeOf(Field)]).*;
+}
+
+fn validateOpenOptionsReserved(comptime Options: type, options: *const Options, abi_size: u32) !void {
+    if (comptime optionHasField(Options, "reserved0")) {
+        if (optionFieldPresent(Options, abi_size, "reserved0")) {
+            if (readOptionField(Options, options, abi_size, "reserved0").? != 0) return error.InvalidArgument;
+        }
+    }
+    if (comptime !optionHasField(Options, "reserved")) {
+        return;
+    }
+    const reserved_offset = @offsetOf(Options, "reserved");
+    if (abi_size <= reserved_offset) return;
+    const available = @min(@as(usize, abi_size) - reserved_offset, @sizeOf(optionFieldType(Options, "reserved")));
+    if (available % @sizeOf(u64) != 0) return error.InvalidArgument;
+    const raw: [*]const u8 = @ptrCast(options);
+    var offset: usize = reserved_offset;
+    var remaining = available;
+    while (remaining >= @sizeOf(u64)) : ({
+        offset += @sizeOf(u64);
+        remaining -= @sizeOf(u64);
+    }) {
+        const word = std.mem.bytesAsValue(u64, raw[offset..][0..@sizeOf(u64)]).*;
+        if (word != 0) return error.InvalidArgument;
+    }
+}
+
+fn openModeFromU32(value: u32) !db_mod.OpenOptions.OpenMode {
+    return switch (value) {
+        0 => .writer,
+        1 => .query_readonly,
+        2 => .status_only,
+        else => return error.InvalidArgument,
+    };
+}
+
+fn profileFromU32(value: u32) !lite_backend.Profile {
+    return switch (value) {
+        0 => .native,
+        1 => .hosted,
+        else => return error.InvalidArgument,
+    };
+}
+
+fn validateResolvedOpenOptions(resolved: LiteResolvedOpenOptions) !void {
+    if (resolved.profile == .hosted and resolved.ttl_cleanup != null) {
+        return error.InvalidArgument;
+    }
+    if (resolved.profile == .hosted and resolved.generated_enrichment_replay) {
+        return error.InvalidArgument;
+    }
+}
+
+fn resolveLiteOpenOptions(options_ptr: ?*const capi.LiteOpenOptions) !LiteResolvedOpenOptions {
+    const options = options_ptr orelse return .{};
+    const abi_size = options.abi_size;
+    if (abi_size < @offsetOf(capi.LiteOpenOptions, "open_mode")) return error.InvalidArgument;
+    const flags = readOptionField(capi.LiteOpenOptions, options, abi_size, "flags") orelse 0;
+    if ((flags & ~lite_open_known_flags) != 0) return error.InvalidArgument;
+    try validateOpenOptionsReserved(capi.LiteOpenOptions, options, abi_size);
+
+    const open_mode = try openModeFromU32(readOptionField(capi.LiteOpenOptions, options, abi_size, "open_mode") orelse capi.lite_open_mode_writer);
+    const profile = try profileFromU32(readOptionField(capi.LiteOpenOptions, options, abi_size, "profile") orelse capi.lite_profile_native);
+    const map_size = readOptionField(capi.LiteOpenOptions, options, abi_size, "map_size") orelse 0;
+    if (map_size > std.math.maxInt(usize)) return error.InvalidArgument;
+
+    var resolved = LiteResolvedOpenOptions{
+        .open_mode = open_mode,
+        .profile = profile,
+        .map_size = if (map_size == 0) null else @as(usize, @intCast(map_size)),
+        .no_sync = (flags & capi.lite_open_flag_no_sync) != 0,
+        .inference = .{
+            .remote_provider_configured = (flags & capi.lite_open_flag_remote_provider_configured) != 0,
+            .local_runtime_configured = (flags & capi.lite_open_flag_local_runtime_configured) != 0,
+        },
+        .generated_enrichment_replay = (flags & capi.lite_open_flag_generated_enrichment_replay) != 0,
+    };
+    if ((flags & capi.lite_open_flag_ttl_cleanup) != 0) {
+        const owner_id = readOptionField(capi.LiteOpenOptions, options, abi_size, "ttl_cleanup_owner_id") orelse capi.Slice{};
+        if (owner_id.ptr == null and owner_id.len != 0) {
+            return error.InvalidArgument;
+        }
+        var ttl_cfg = db_mod.ttl_runtime.Config{
+            .enabled = readOptionField(capi.LiteOpenOptions, options, abi_size, "ttl_cleanup_enabled") orelse false,
+            .lease_owned = readOptionField(capi.LiteOpenOptions, options, abi_size, "ttl_cleanup_lease_owned") orelse false,
+        };
+        if (owner_id.len != 0) {
+            ttl_cfg.owner_id = owner_id.ptr.?[0..owner_id.len];
+        }
+        const lease_ttl_ms = readOptionField(capi.LiteOpenOptions, options, abi_size, "ttl_cleanup_lease_ttl_ms") orelse 0;
+        const interval_ms = readOptionField(capi.LiteOpenOptions, options, abi_size, "ttl_cleanup_interval_ms") orelse 0;
+        const batch_size = readOptionField(capi.LiteOpenOptions, options, abi_size, "ttl_cleanup_batch_size") orelse 0;
+        const grace_period_ns = readOptionField(capi.LiteOpenOptions, options, abi_size, "ttl_cleanup_grace_period_ns") orelse 0;
+        if (lease_ttl_ms != 0) ttl_cfg.lease_ttl_ms = lease_ttl_ms;
+        if (interval_ms != 0) ttl_cfg.interval_ms = interval_ms;
+        if (batch_size != 0) ttl_cfg.batch_size = batch_size;
+        if (grace_period_ns != 0) ttl_cfg.grace_period_ns = grace_period_ns;
+        resolved.ttl_cleanup = ttl_cfg;
+    }
+    try validateResolvedOpenOptions(resolved);
+    return resolved;
+}
+
+fn resolveOpenOptions(options_ptr: ?*const capi.OpenOptions) !LiteResolvedOpenOptions {
+    const options = options_ptr orelse return .{ .storage_kind = .directory };
+    const abi_size = options.abi_size;
+    if (abi_size < @offsetOf(capi.OpenOptions, "storage_kind")) return error.InvalidArgument;
+    const flags = readOptionField(capi.OpenOptions, options, abi_size, "flags") orelse 0;
+    if ((flags & ~open_known_flags) != 0) return error.InvalidArgument;
+    try validateOpenOptionsReserved(capi.OpenOptions, options, abi_size);
+
+    const storage_kind: StorageKind = switch (readOptionField(capi.OpenOptions, options, abi_size, "storage_kind") orelse capi.storage_kind_directory) {
+        capi.storage_kind_directory => .directory,
+        capi.storage_kind_lite => .lite,
+        else => return error.InvalidArgument,
+    };
+    const open_mode = try openModeFromU32(readOptionField(capi.OpenOptions, options, abi_size, "open_mode") orelse capi.open_mode_writer);
+    const profile = try profileFromU32(readOptionField(capi.OpenOptions, options, abi_size, "profile") orelse capi.profile_native);
+    const map_size = readOptionField(capi.OpenOptions, options, abi_size, "map_size") orelse 0;
+    if (map_size > std.math.maxInt(usize)) return error.InvalidArgument;
+
+    var resolved = LiteResolvedOpenOptions{
+        .storage_kind = storage_kind,
+        .open_mode = open_mode,
+        .profile = profile,
+        .map_size = if (map_size == 0) null else @as(usize, @intCast(map_size)),
+        .no_sync = (flags & capi.open_flag_no_sync) != 0,
+        .inference = .{
+            .remote_provider_configured = (flags & capi.open_flag_remote_provider_configured) != 0,
+            .local_runtime_configured = (flags & capi.open_flag_local_runtime_configured) != 0,
+        },
+        .generated_enrichment_replay = (flags & capi.open_flag_generated_enrichment_replay) != 0,
+    };
+    if ((flags & capi.open_flag_ttl_cleanup) != 0) {
+        const owner_id = readOptionField(capi.OpenOptions, options, abi_size, "ttl_cleanup_owner_id") orelse capi.Slice{};
+        if (owner_id.ptr == null and owner_id.len != 0) {
+            return error.InvalidArgument;
+        }
+        var ttl_cfg = db_mod.ttl_runtime.Config{
+            .enabled = readOptionField(capi.OpenOptions, options, abi_size, "ttl_cleanup_enabled") orelse false,
+            .lease_owned = readOptionField(capi.OpenOptions, options, abi_size, "ttl_cleanup_lease_owned") orelse false,
+        };
+        if (owner_id.len != 0) {
+            ttl_cfg.owner_id = owner_id.ptr.?[0..owner_id.len];
+        }
+        const lease_ttl_ms = readOptionField(capi.OpenOptions, options, abi_size, "ttl_cleanup_lease_ttl_ms") orelse 0;
+        const interval_ms = readOptionField(capi.OpenOptions, options, abi_size, "ttl_cleanup_interval_ms") orelse 0;
+        const batch_size = readOptionField(capi.OpenOptions, options, abi_size, "ttl_cleanup_batch_size") orelse 0;
+        const grace_period_ns = readOptionField(capi.OpenOptions, options, abi_size, "ttl_cleanup_grace_period_ns") orelse 0;
+        if (lease_ttl_ms != 0) ttl_cfg.lease_ttl_ms = lease_ttl_ms;
+        if (interval_ms != 0) ttl_cfg.interval_ms = interval_ms;
+        if (batch_size != 0) ttl_cfg.batch_size = batch_size;
+        if (grace_period_ns != 0) ttl_cfg.grace_period_ns = grace_period_ns;
+        resolved.ttl_cleanup = ttl_cfg;
+    }
+    try validateResolvedOpenOptions(resolved);
+    return resolved;
+}
+
+fn openLiteHandle(
+    path: []const u8,
+    resolved: LiteResolvedOpenOptions,
+    create: bool,
+    out_handle: ?*?*anyopaque,
+) capi.ErrorCode {
+    const out = out_handle orelse return .invalid_argument;
+    out.* = null;
+    const handle = openLiteHandleAlloc(path, resolved, create) catch |err| return capi.mapError(err);
+    out.* = handle;
+    return .ok;
+}
+
+fn openLiteHandleAlloc(
+    path: []const u8,
+    resolved: LiteResolvedOpenOptions,
+    create: bool,
+) !*Handle {
+    const alloc = std.heap.c_allocator;
+
+    if (create and !liteOpenModeCanWrite(resolved.open_mode)) return error.InvalidArgument;
+    var backend = if (create)
+        try lite_backend.Handle.createWithOptions(alloc, path, .{
+            .exclusive = true,
+            .no_sync = resolved.no_sync,
+        })
+    else
+        try lite_backend.Handle.open(alloc, path, .{
+            .read_only = resolved.open_mode == .query_readonly or resolved.open_mode == .status_only,
+            .no_sync = resolved.no_sync,
+        });
+    errdefer backend.deinit();
+
+    var opts = db_mod.OpenOptions{
+        .open_mode = resolved.open_mode,
+        .external_derived_checkpoints = false,
+    };
+    if (resolved.map_size) |map_size| opts.map_size = map_size;
+    opts.no_sync = resolved.no_sync;
+    if (resolved.ttl_cleanup) |ttl_cleanup| opts.ttl_cleanup = ttl_cleanup;
+    if (resolved.generated_enrichment_replay) {
+        opts.enrichment = .{ .enable_without_producers = true };
+    }
+    if (resolved.profile == .hosted) {
+        opts.executor = .{ .backend = .manual };
+        opts.ttl_cleanup = .{ .enabled = false };
+        opts.transaction_recovery = .{ .enabled = false };
+        opts.text_merge = .{ .enabled = false };
+        opts.sparse_compaction = .{ .enabled = false };
+    }
+    try backend.configureDbOpenOptions(&opts);
+
+    var db = try db_mod.DB.open(alloc, path, opts);
+    errdefer db.close();
+
+    const handle = alloc.create(Handle) catch return error.OutOfMemory;
+    errdefer alloc.destroy(handle);
+    handle.* = .{
+        .alloc = alloc,
+        .db = db,
+        .open_mode = resolved.open_mode,
+        .owned_lite_backend = backend,
+        .lite_profile = resolved.profile,
+        .lite_inference_status = lite_backend.inferenceStatusForProfileWithOptions(resolved.profile, resolved.inference),
+    };
+    return handle;
+}
+
+fn dbOpenOptionsFromResolved(resolved: LiteResolvedOpenOptions, lite: bool) db_mod.OpenOptions {
+    var opts = db_mod.OpenOptions{
+        .open_mode = resolved.open_mode,
+        .external_derived_checkpoints = !lite,
+    };
+    if (resolved.map_size) |map_size| opts.map_size = map_size;
+    opts.no_sync = resolved.no_sync;
+    if (resolved.ttl_cleanup) |ttl_cleanup| opts.ttl_cleanup = ttl_cleanup;
+    if (resolved.generated_enrichment_replay) {
+        opts.enrichment = .{ .enable_without_producers = true };
+    }
+    if (resolved.profile == .hosted) {
+        opts.executor = .{ .backend = .manual };
+        opts.ttl_cleanup = .{ .enabled = false };
+        opts.transaction_recovery = .{ .enabled = false };
+        opts.text_merge = .{ .enabled = false };
+        opts.sparse_compaction = .{ .enabled = false };
+    }
+    return opts;
+}
+
+fn openDirectoryHandle(
+    path: []const u8,
+    resolved: LiteResolvedOpenOptions,
+    create: bool,
+    out_handle: ?*?*anyopaque,
+) capi.ErrorCode {
+    const out = out_handle orelse return .invalid_argument;
+    out.* = null;
+    if (create) return .invalid_argument;
+    const handle = openDirectoryHandleAlloc(path, resolved) catch |err| return capi.mapError(err);
+    out.* = handle;
+    return .ok;
+}
+
+fn openDirectoryHandleAlloc(path: []const u8, resolved: LiteResolvedOpenOptions) !*Handle {
+    const alloc = std.heap.c_allocator;
+    var db = try db_mod.DB.open(alloc, path, dbOpenOptionsFromResolved(resolved, false));
+    errdefer db.close();
+    const handle = alloc.create(Handle) catch return error.OutOfMemory;
+    errdefer alloc.destroy(handle);
+    handle.* = .{
+        .alloc = alloc,
+        .db = db,
+        .open_mode = resolved.open_mode,
+    };
+    return handle;
+}
+
+fn openGenericHandle(
+    path: []const u8,
+    resolved: LiteResolvedOpenOptions,
+    create: bool,
+    out_handle: ?*?*anyopaque,
+) capi.ErrorCode {
+    return switch (resolved.storage_kind) {
+        .directory => openDirectoryHandle(path, resolved, create, out_handle),
+        .lite => openLiteHandle(path, resolved, create, out_handle),
+    };
+}
+
+fn cStringSpan(path: ?[*:0]const u8) ?[]const u8 {
+    const ptr = path orelse return null;
+    return std.mem.span(ptr);
+}
+
+pub export fn antfly_db_open_with_options(path: ?[*:0]const u8, options: ?*const capi.OpenOptions, out_handle: ?*?*anyopaque) capi.ErrorCode {
+    const out = out_handle orelse return .invalid_argument;
+    out.* = null;
+    const path_slice = cStringSpan(path) orelse return .invalid_argument;
+    const resolved = resolveOpenOptions(options) catch |err| return capi.mapError(err);
+    return openGenericHandle(path_slice, resolved, false, out);
+}
+
+pub export fn antfly_db_create_with_options(path: ?[*:0]const u8, options: ?*const capi.OpenOptions, out_handle: ?*?*anyopaque) capi.ErrorCode {
+    const out = out_handle orelse return .invalid_argument;
+    out.* = null;
+    const path_slice = cStringSpan(path) orelse return .invalid_argument;
+    const resolved = resolveOpenOptions(options) catch |err| return capi.mapError(err);
+    return openGenericHandle(path_slice, resolved, true, out);
+}
+
+pub export fn antfly_lite_open(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
+    const path_slice = cStringSpan(path) orelse {
+        if (out_handle) |out| out.* = null;
+        return .invalid_argument;
+    };
+    return openLiteHandle(path_slice, .{}, false, out_handle);
+}
+
+pub export fn antfly_lite_create(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
+    const path_slice = cStringSpan(path) orelse {
+        if (out_handle) |out| out.* = null;
+        return .invalid_argument;
+    };
+    return openLiteHandle(path_slice, .{}, true, out_handle);
+}
+
+pub export fn antfly_lite_open_with_options(path: ?[*:0]const u8, options: ?*const capi.LiteOpenOptions, out_handle: ?*?*anyopaque) capi.ErrorCode {
+    const out = out_handle orelse return .invalid_argument;
+    out.* = null;
+    const path_slice = cStringSpan(path) orelse return .invalid_argument;
+    const resolved = resolveLiteOpenOptions(options) catch |err| return capi.mapError(err);
+    return openLiteHandle(path_slice, resolved, false, out);
+}
+
+pub export fn antfly_lite_create_with_options(path: ?[*:0]const u8, options: ?*const capi.LiteOpenOptions, out_handle: ?*?*anyopaque) capi.ErrorCode {
+    const out = out_handle orelse return .invalid_argument;
+    out.* = null;
+    const path_slice = cStringSpan(path) orelse return .invalid_argument;
+    const resolved = resolveLiteOpenOptions(options) catch |err| return capi.mapError(err);
+    return openLiteHandle(path_slice, resolved, true, out);
+}
+
+pub export fn antfly_lite_open_hosted(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
+    const path_slice = cStringSpan(path) orelse {
+        if (out_handle) |out| out.* = null;
+        return .invalid_argument;
+    };
+    return openLiteHandle(path_slice, .{ .profile = .hosted }, false, out_handle);
+}
+
+pub export fn antfly_lite_create_hosted(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
+    const path_slice = cStringSpan(path) orelse {
+        if (out_handle) |out| out.* = null;
+        return .invalid_argument;
+    };
+    return openLiteHandle(path_slice, .{ .profile = .hosted }, true, out_handle);
+}
+
+pub export fn antfly_lite_open_readonly(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
+    const path_slice = cStringSpan(path) orelse {
+        if (out_handle) |out| out.* = null;
+        return .invalid_argument;
+    };
+    return openLiteHandle(path_slice, .{ .open_mode = .query_readonly }, false, out_handle);
+}
+
+pub export fn antfly_lite_open_status_only(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
+    const path_slice = cStringSpan(path) orelse {
+        if (out_handle) |out| out.* = null;
+        return .invalid_argument;
+    };
+    return openLiteHandle(path_slice, .{ .open_mode = .status_only }, false, out_handle);
+}
+
+fn resetOutBuffer(out_buf: ?*capi.Buffer) ?*capi.Buffer {
+    const out = out_buf orelse return null;
+    out.* = .{};
+    return out;
+}
+
+pub export fn antfly_lite_capabilities_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    if (handle.owned_lite_backend == null) return .invalid_argument;
+    const profile = handle.lite_profile orelse .native;
+    const inference = handle.lite_inference_status orelse lite_backend.inferenceStatusForProfile(profile);
+    out.* = stringifyJson(lite_backend.capabilitiesForProfileWithInferenceStatus(profile, inference)) catch return .internal;
+    return .ok;
+}
+
+pub export fn antfly_lite_status_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const backend = if (handle.owned_lite_backend) |*backend| backend else return .invalid_argument;
+
+    const stats = handle.db.stats(handle.alloc) catch |err| return capi.mapError(err);
+    defer db_mod.types.freeDBStats(handle.alloc, stats);
+
+    const indexes = dbIndexStatsProjectionAlloc(handle.alloc, stats) catch return .internal;
+    defer if (indexes.len > 0) handle.alloc.free(indexes);
+
+    const profile = handle.lite_profile orelse .native;
+    const inference = handle.lite_inference_status orelse lite_backend.inferenceStatusForProfile(profile);
+    const status = lite_backend.Status(JsonDBStats){
+        .storage = backend.storageStatus(),
+        .stats = jsonDBStatsProjection(stats, indexes),
+        .pending_work = handle.db.pendingWorkStats(),
+        .inference = inference,
+        .capabilities = lite_backend.capabilitiesForProfileWithInferenceStatus(profile, inference),
+    };
+
+    const bytes = std.fmt.allocPrint(handle.alloc, "{f}", .{std.json.fmt(status, .{})}) catch return .internal;
+    out.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+
+pub export fn antfly_lite_backup(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    const out_buf_ptr = resetOutBuffer(out_buf) orelse return .invalid_argument;
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    if (handle.owned_lite_backend == null) return .invalid_argument;
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(handle.alloc);
+    portable_backup.exportPortable(handle.alloc, handle.db.core.store, &out) catch |err| return capi.mapError(err);
+    portable_backup.validatePortable(handle.alloc, out.items) catch |err| return capi.mapError(err);
+    const bytes = out.toOwnedSlice(handle.alloc) catch return .internal;
+    out = .empty;
+    out_buf_ptr.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+
+pub export fn antfly_lite_export(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    return antfly_lite_backup(handle_ptr, out_buf);
+}
+
+pub export fn antfly_lite_import_backup(handle_ptr: ?*anyopaque, backup: capi.Slice) capi.ErrorCode {
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    if (handle.owned_lite_backend == null) return .invalid_argument;
+    if (backup.len == 0) return .invalid_argument;
+    if (backup.ptr == null and backup.len != 0) return .invalid_argument;
+    if (!(lite_restore_staging.isImportTargetEmpty(handle.alloc, &handle.db) catch |err| return capi.mapError(err))) return .invalid_argument;
+    const bytes = backup.bytes();
+    lite_restore_staging.importPortableIntoLiteDb(handle.alloc, &handle.db, bytes) catch |err| return capi.mapError(err);
+    return .ok;
+}
+
+pub export fn antfly_lite_import(handle_ptr: ?*anyopaque, backup: capi.Slice) capi.ErrorCode {
+    return antfly_lite_import_backup(handle_ptr, backup);
+}
+
+const LiteRestoreReport = struct {
+    format: []const u8 = "aflite",
+    path: []const u8,
+};
+
+pub export fn antfly_lite_restore_backup_json(
+    dest_path: ?[*:0]const u8,
+    backup: capi.Slice,
+    replace: bool,
+    out_buf: ?*capi.Buffer,
+) capi.ErrorCode {
+    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
+    const path = cStringSpan(dest_path) orelse return .invalid_argument;
+    if (backup.len == 0) return .invalid_argument;
+    if (backup.ptr == null and backup.len != 0) return .invalid_argument;
+
+    const alloc = std.heap.c_allocator;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+
+    restorePortableBackupToLiteFile(alloc, io_impl.io(), path, backup.bytes(), replace) catch |err| return capi.mapError(err);
+    const report = LiteRestoreReport{ .path = path };
+    out.* = stringifyJson(report) catch return .internal;
+    return .ok;
+}
+
+pub export fn antfly_lite_restore_json(
+    dest_path: ?[*:0]const u8,
+    backup: capi.Slice,
+    replace: bool,
+    out_buf: ?*capi.Buffer,
+) capi.ErrorCode {
+    return antfly_lite_restore_backup_json(dest_path, backup, replace, out_buf);
+}
+
+pub export fn antfly_lite_check_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    if (handle.owned_lite_backend) |*backend| {
+        out.* = stringifyJson(backend.check() catch |err| return capi.mapError(err)) catch return .internal;
+        return .ok;
+    }
+    return .invalid_argument;
+}
+
+pub export fn antfly_lite_check_file_json(path: ?[*:0]const u8, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
+    const path_slice = cStringSpan(path) orelse return .invalid_argument;
+    const alloc = std.heap.c_allocator;
+    const report = lite_backend.checkFile(alloc, path_slice) catch |err| return capi.mapError(err);
+    out.* = stringifyJson(report) catch return .internal;
+    return .ok;
+}
+
+pub export fn antfly_lite_copy_stable_snapshot_json(
+    handle_ptr: ?*anyopaque,
+    dest_path: ?[*:0]const u8,
+    replace: bool,
+    out_buf: ?*capi.Buffer,
+) capi.ErrorCode {
+    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    if (handle.owned_lite_backend) |*backend| {
+        const dest = cStringSpan(dest_path) orelse return .invalid_argument;
+        out.* = stringifyJson(backend.copyStableSnapshot(dest, replace) catch |err| return capi.mapError(err)) catch return .internal;
+        return .ok;
+    }
+    return .invalid_argument;
+}
+
+pub export fn antfly_lite_copy_stable_snapshot_file_json(
+    src_path: ?[*:0]const u8,
+    dest_path: ?[*:0]const u8,
+    replace: bool,
+    out_buf: ?*capi.Buffer,
+) capi.ErrorCode {
+    _ = resetOutBuffer(out_buf) orelse return .invalid_argument;
+    var handle_ptr: ?*anyopaque = null;
+    const open_status = antfly_lite_open_readonly(src_path, &handle_ptr);
+    if (open_status != .ok) return open_status;
+    defer antfly_db_close(handle_ptr);
+    return antfly_lite_copy_stable_snapshot_json(handle_ptr, dest_path, replace, out_buf);
+}
+
+const LiteCompactReport = struct {
+    compacted: bool,
+    vacuum: lite_backend.VacuumReport,
+};
+
+fn prepareLiteCompact(handle: *Handle) !void {
+    try handle.db.runUntilIdle();
+    try handle.db.forceCompactTextIndexes();
+    try handle.db.drainScheduledTextMerges();
+    try handle.db.sync(true);
+    try handle.db.syncIndexes(true);
+}
+
+pub export fn antfly_lite_compact_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    if (handle.owned_lite_backend) |*backend| {
+        prepareLiteCompact(handle) catch |err| return capi.mapError(err);
+        const report = LiteCompactReport{
+            .compacted = true,
+            .vacuum = backend.vacuum() catch |err| return capi.mapError(err),
+        };
+        out.* = stringifyJson(report) catch return .internal;
+        return .ok;
+    }
+    return .invalid_argument;
+}
+
+pub export fn antfly_lite_vacuum_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    if (handle.owned_lite_backend) |*backend| {
+        out.* = stringifyJson(backend.vacuum() catch |err| return capi.mapError(err)) catch return .internal;
+        return .ok;
+    }
+    return .invalid_argument;
+}
+
+pub export fn antfly_lite_run_until_idle(handle_ptr: ?*anyopaque) capi.ErrorCode {
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    if (handle.owned_lite_backend == null) return .invalid_argument;
+    handle.db.runUntilIdle() catch |err| return capi.mapError(err);
+    return .ok;
+}
+
+pub export fn antfly_lite_run_until_idle_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    if (handle.owned_lite_backend == null) return .invalid_argument;
+    handle.db.runUntilIdle() catch |err| return capi.mapError(err);
+    out.* = stringifyJson(handle.db.pendingWorkStats()) catch return .internal;
+    return .ok;
+}
+
+const LiteReplayGeneratedEnrichmentsReport = struct {
+    replayed: usize,
+};
+
+pub export fn antfly_lite_replay_generated_enrichments_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    if (handle.owned_lite_backend == null) return .invalid_argument;
+    const replayed = handle.db.replayGeneratedEnrichmentsFromStoredDocs(handle.alloc) catch |err| return capi.mapError(err);
+    out.* = stringifyJson(LiteReplayGeneratedEnrichmentsReport{ .replayed = replayed }) catch return .internal;
+    return .ok;
+}
+
+pub export fn antfly_lite_pending_work_stats_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    if (handle.owned_lite_backend == null) return .invalid_argument;
+    out.* = stringifyJson(handle.db.pendingWorkStats()) catch return .internal;
+    return .ok;
+}
+
+fn restorePortableBackupToLiteFile(
+    alloc: Allocator,
+    io: std.Io,
+    dest_path: []const u8,
+    backup: []const u8,
+    replace: bool,
+) !void {
+    if (!lite_backend.isAflitePath(dest_path)) return error.InvalidArgument;
+    if (backup.len == 0) return error.InvalidArgument;
+    try portable_backup.validatePortable(alloc, backup);
+
+    const dest_exists = liteCapiPathExists(io, dest_path);
+    if (dest_exists and !replace) return error.PathAlreadyExists;
+
+    var dest_lock = try antfly.lite.native.lockWriterPath(alloc, dest_path);
+    defer dest_lock.close();
+
+    if (!dest_exists and !replace and liteCapiPathExists(io, dest_path)) return error.PathAlreadyExists;
+
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.restore-tmp.aflite", .{dest_path});
+    defer alloc.free(tmp_path);
+    try liteCapiDeleteFileIfExists(io, tmp_path);
+    errdefer liteCapiDeleteFilePath(io, tmp_path) catch {};
+
+    {
+        var backend = try lite_backend.Handle.create(alloc, tmp_path, true);
+        defer backend.deinit();
+
+        var opts = db_mod.OpenOptions{
+            .open_mode = .writer,
+            .external_derived_checkpoints = false,
+        };
+        try backend.configureDbOpenOptions(&opts);
+
+        var db = try db_mod.DB.open(alloc, tmp_path, opts);
+        defer db.close();
+        try lite_restore_staging.importPortableIntoLiteDb(alloc, &db, backup);
+    }
+
+    liteCapiRenameFilePath(io, tmp_path, dest_path) catch |err| {
+        liteCapiDeleteFilePath(io, tmp_path) catch {};
+        return err;
+    };
+}
+
+fn liteCapiPathExists(io: std.Io, path: []const u8) bool {
+    if (std.fs.path.isAbsolute(path)) {
+        std.Io.Dir.accessAbsolute(io, path, .{}) catch return false;
+    } else {
+        std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    }
+    return true;
+}
+
+fn liteCapiDeleteFileIfExists(io: std.Io, path: []const u8) !void {
+    liteCapiDeleteFilePath(io, path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+fn liteCapiRenameFilePath(io: std.Io, old_path: []const u8, new_path: []const u8) !void {
+    if (std.fs.path.isAbsolute(old_path) or std.fs.path.isAbsolute(new_path)) {
+        try std.Io.Dir.renameAbsolute(old_path, new_path, io);
+    } else {
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), old_path, std.Io.Dir.cwd(), new_path, io);
+    }
+}
+
+fn liteCapiDeleteFilePath(io: std.Io, path: []const u8) !void {
+    if (std.fs.path.isAbsolute(path)) {
+        try std.Io.Dir.deleteFileAbsolute(io, path);
+    } else {
+        try std.Io.Dir.cwd().deleteFile(io, path);
+    }
 }
 
 pub export fn antfly_db_set_readable_lease_hook(
@@ -1572,6 +2417,39 @@ pub export fn antfly_db_set_readable_lease_hook(
 pub export fn antfly_db_buffer_free(ptr: ?[*]u8, len: usize) void {
     if (ptr == null or len == 0) return;
     std.heap.c_allocator.free(ptr.?[0..len]);
+}
+
+pub export fn antfly_buffer_free(buffer: ?*capi.Buffer) void {
+    const out = buffer orelse return;
+    antfly_db_buffer_free(out.ptr, out.len);
+    out.* = .{};
+}
+
+fn wipeBufferBytes(buffer: capi.Buffer) void {
+    if (buffer.ptr == null or buffer.len == 0) return;
+    std.crypto.secureZero(u8, buffer.ptr.?[0..buffer.len]);
+}
+
+pub export fn antfly_db_buffer_free_zero(buffer: ?*capi.Buffer) void {
+    const out = buffer orelse return;
+    wipeBufferBytes(out.*);
+    antfly_buffer_free(out);
+}
+
+pub export fn antfly_buffer_free_zero(buffer: ?*capi.Buffer) void {
+    antfly_db_buffer_free_zero(buffer);
+}
+
+test "capi zero buffer helper wipes bytes before free" {
+    var bytes = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
+    wipeBufferBytes(.{ .ptr = &bytes, .len = bytes.len });
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, &bytes);
+    wipeBufferBytes(.{});
+
+    var empty: capi.Buffer = .{};
+    antfly_db_buffer_free_zero(&empty);
+    try std.testing.expect(empty.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
 }
 
 pub export fn antfly_db_dense_search_result_free(result: *capi.DenseSearchResult) void {
@@ -2313,27 +3191,29 @@ pub export fn antfly_db_scan_hash_result_free(result: *capi.ScanHashResult) void
 
 pub export fn antfly_db_begin_transaction_with_id(
     handle_ptr: ?*anyopaque,
-    txn_id_ptr: *const [16]u8,
+    txn_id_ptr: ?*const [16]u8,
     timestamp_ns: u64,
     participants_ptr: ?[*]const capi.Slice,
     participant_count: usize,
 ) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
-    beginWithIdAndParticipants(handle, txn_id_ptr.*, timestamp_ns, participants_ptr, participant_count) catch |err| return capi.mapError(err);
+    const txn_id = txn_id_ptr orelse return .invalid_argument;
+    beginWithIdAndParticipants(handle, txn_id.*, timestamp_ns, participants_ptr, participant_count) catch |err| return capi.mapError(err);
     return .ok;
 }
 
 pub export fn antfly_db_write_transaction(
     handle_ptr: ?*anyopaque,
-    txn_id_ptr: *const [16]u8,
+    txn_id_ptr: ?*const [16]u8,
     writes_ptr: ?[*]const capi.WriteIntent,
     write_count: usize,
     predicates_ptr: ?[*]const capi.VersionPredicate,
     predicate_count: usize,
 ) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const txn_id = txn_id_ptr orelse return .invalid_argument;
     if ((write_count > 0 and writes_ptr == null) or (predicate_count > 0 and predicates_ptr == null)) return .invalid_argument;
-    writeIntentsInternal(handle, txn_id_ptr.*, writes_ptr, write_count, predicates_ptr, predicate_count) catch |err| return capi.mapError(err);
+    writeIntentsInternal(handle, txn_id.*, writes_ptr, write_count, predicates_ptr, predicate_count) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -2352,41 +3232,66 @@ pub export fn antfly_db_batch(
     return .ok;
 }
 
+pub export fn antfly_db_batch_json(
+    handle_ptr: ?*anyopaque,
+    request_json: capi.Slice,
+    out_buf: *capi.Buffer,
+) capi.ErrorCode {
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    var owned = batch_api.parseBatchRequest(handle.alloc, request_json.bytes()) catch |err| return capi.mapError(err);
+    defer owned.deinit(handle.alloc);
+
+    handle.db.batch(owned.req) catch |err| return capi.mapError(err);
+    const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch |err| return capi.mapError(err);
+    out_buf.* = .{
+        .ptr = response.ptr,
+        .len = response.len,
+    };
+    return .ok;
+}
+
 pub export fn antfly_db_resolve_intents(
     handle_ptr: ?*anyopaque,
-    txn_id_ptr: *const [16]u8,
+    txn_id_ptr: ?*const [16]u8,
     status: u8,
     commit_version: u64,
 ) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const txn_id = txn_id_ptr orelse return .invalid_argument;
     const txn_status: transactions_mod.TxnStatus = switch (status) {
         0 => .pending,
         1 => .committed,
         2 => .aborted,
         else => return .invalid_argument,
     };
-    handle.db.resolveTransactionIntents(txn_id_ptr.*, txn_status, commit_version) catch |err| return capi.mapError(err);
+    handle.db.resolveTransactionIntents(txn_id.*, txn_status, commit_version) catch |err| return capi.mapError(err);
     return .ok;
 }
 
 pub export fn antfly_db_get_transaction_status(
     handle_ptr: ?*anyopaque,
-    txn_id_ptr: *const [16]u8,
-    out_status: *u8,
+    txn_id_ptr: ?*const [16]u8,
+    out_status: ?*u8,
 ) capi.ErrorCode {
+    const out = out_status orelse return .invalid_argument;
+    out.* = 0;
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
-    const status = handle.db.getTransactionStatus(txn_id_ptr.*) catch |err| return capi.mapError(err);
-    out_status.* = @intFromEnum(status);
+    const txn_id = txn_id_ptr orelse return .invalid_argument;
+    const status = handle.db.getTransactionStatus(txn_id.*) catch |err| return capi.mapError(err);
+    out.* = @intFromEnum(status);
     return .ok;
 }
 
 pub export fn antfly_db_get_commit_version(
     handle_ptr: ?*anyopaque,
-    txn_id_ptr: *const [16]u8,
-    out_commit_version: *u64,
+    txn_id_ptr: ?*const [16]u8,
+    out_commit_version: ?*u64,
 ) capi.ErrorCode {
+    const out = out_commit_version orelse return .invalid_argument;
+    out.* = 0;
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
-    out_commit_version.* = handle.db.getCommitVersion(txn_id_ptr.*) catch |err| return capi.mapError(err);
+    const txn_id = txn_id_ptr orelse return .invalid_argument;
+    out.* = handle.db.getCommitVersion(txn_id.*) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -2470,93 +3375,51 @@ pub export fn antfly_db_decode_artifact_id_json(
     return .ok;
 }
 
+pub export fn antfly_db_get_schema_json(
+    handle_ptr: ?*anyopaque,
+    out_buf: *capi.Buffer,
+) capi.ErrorCode {
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    if (handle.db.getSchemaJson(handle.alloc) catch |err| return capi.mapError(err)) |schema_json| {
+        out_buf.* = .{ .ptr = schema_json.ptr, .len = schema_json.len };
+    } else {
+        out_buf.* = dupBytes("null") catch return .internal;
+    }
+    return .ok;
+}
+
 pub export fn antfly_db_set_schema_json(
     handle_ptr: ?*anyopaque,
     schema_json: capi.Slice,
 ) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
-    const Request = struct {
-        version: u32 = 0,
-        default_type: []const u8 = "_default",
-        ttl_duration_ns: u64 = 0,
-        ttl_field: []const u8 = "_timestamp",
-        enforce_types: bool = false,
-        dynamic_templates: []const struct {
-            name: []const u8 = "",
-            match_pattern: ?[]const u8 = null,
-            path_match: ?[]const u8 = null,
-            mapping: struct {
-                field_type: []const u8 = "text",
-                do_index: bool = true,
-                store: bool = true,
-                doc_values: bool = false,
-                include_in_all: bool = false,
-                analyzer: []const u8 = "standard",
-            } = .{},
-        } = &.{},
-    };
-
-    var parsed = std.json.parseFromSlice(Request, handle.alloc, schema_json.bytes(), .{}) catch return .invalid_argument;
-    defer parsed.deinit();
-
-    var templates = handle.alloc.alloc(schema_mod.DynamicTemplate, parsed.value.dynamic_templates.len) catch return .internal;
-    var initialized: usize = 0;
-    errdefer {
-        for (templates[0..initialized]) |tmpl| {
-            handle.alloc.free(tmpl.name);
-            if (tmpl.match_pattern) |value| handle.alloc.free(value);
-            if (tmpl.path_match) |value| handle.alloc.free(value);
-            handle.alloc.free(tmpl.mapping.analyzer);
-        }
-        handle.alloc.free(templates);
-    }
-
-    for (parsed.value.dynamic_templates, 0..) |tmpl, i| {
-        const field_type = parseSchemaFieldType(tmpl.mapping.field_type) catch return .invalid_argument;
-        templates[i] = .{
-            .name = handle.alloc.dupe(u8, tmpl.name) catch return .internal,
-            .match_pattern = if (tmpl.match_pattern) |value| handle.alloc.dupe(u8, value) catch return .internal else null,
-            .path_match = if (tmpl.path_match) |value| handle.alloc.dupe(u8, value) catch return .internal else null,
-            .mapping = .{
-                .field_type = field_type,
-                .do_index = tmpl.mapping.do_index,
-                .store = tmpl.mapping.store,
-                .doc_values = tmpl.mapping.doc_values,
-                .include_in_all = tmpl.mapping.include_in_all,
-                .analyzer = handle.alloc.dupe(u8, tmpl.mapping.analyzer) catch return .internal,
-            },
-        };
-        initialized += 1;
-    }
-
-    const table_schema: schema_mod.TableSchema = .{
-        .version = parsed.value.version,
-        .default_type = handle.alloc.dupe(u8, parsed.value.default_type) catch return .internal,
-        .ttl_duration_ns = parsed.value.ttl_duration_ns,
-        .ttl_field = handle.alloc.dupe(u8, parsed.value.ttl_field) catch return .internal,
-        .enforce_types = parsed.value.enforce_types,
-        .dynamic_templates = templates,
-    };
-    defer schema_mod.freeSchema(handle.alloc, table_schema);
-
-    handle.db.setSchema(table_schema) catch |err| return capi.mapError(err);
+    handle.db.setSchemaJson(handle.alloc, schema_json.bytes()) catch |err| return capi.mapError(err);
     return .ok;
 }
 
-fn parseSchemaFieldType(name: []const u8) !schema_mod.AntflyType {
-    if (std.mem.eql(u8, name, "text")) return .text;
-    if (std.mem.eql(u8, name, "keyword")) return .keyword;
-    if (std.mem.eql(u8, name, "numeric")) return .numeric;
-    if (std.mem.eql(u8, name, "embedding")) return .embedding;
-    if (std.mem.eql(u8, name, "link")) return .link;
-    if (std.mem.eql(u8, name, "boolean")) return .boolean;
-    if (std.mem.eql(u8, name, "datetime")) return .datetime;
-    if (std.mem.eql(u8, name, "geopoint")) return .geopoint;
-    if (std.mem.eql(u8, name, "geoshape")) return .geoshape;
-    if (std.mem.eql(u8, name, "blob")) return .blob;
-    if (std.mem.eql(u8, name, "html")) return .html;
-    if (std.mem.eql(u8, name, "search_as_you_type")) return .search_as_you_type;
-    return error.InvalidArgument;
+pub export fn antfly_db_run_until_idle(handle_ptr: ?*anyopaque) capi.ErrorCode {
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    handle.db.runUntilIdle() catch |err| return capi.mapError(err);
+    return .ok;
+}
+
+pub export fn antfly_db_run_until_idle_json(
+    handle_ptr: ?*anyopaque,
+    out_buf: *capi.Buffer,
+) capi.ErrorCode {
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    handle.db.runUntilIdle() catch |err| return capi.mapError(err);
+    out_buf.* = stringifyJson(handle.db.pendingWorkStats()) catch return .internal;
+    return .ok;
+}
+
+pub export fn antfly_db_pending_work_stats_json(
+    handle_ptr: ?*anyopaque,
+    out_buf: *capi.Buffer,
+) capi.ErrorCode {
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    out_buf.* = stringifyJson(handle.db.pendingWorkStats()) catch return .internal;
+    return .ok;
 }
 
 fn antflyDbExtractEnrichmentsJson(
@@ -2773,6 +3636,17 @@ pub export fn antfly_db_list_indexes_json(
     return .ok;
 }
 
+pub export fn antfly_db_list_enrichments_json(
+    handle_ptr: ?*anyopaque,
+    out_buf: *capi.Buffer,
+) capi.ErrorCode {
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const configs = handle.db.listEnrichments(handle.alloc) catch |err| return capi.mapError(err);
+    defer db_mod.types.freeEnrichmentConfigs(handle.alloc, configs);
+    out_buf.* = stringifyJson(configs) catch return .internal;
+    return .ok;
+}
+
 pub export fn antfly_db_scan_json(
     handle_ptr: ?*anyopaque,
     request_json: capi.Slice,
@@ -2904,11 +3778,23 @@ pub export fn antfly_db_stats_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
-    const stats = handle.db.stats(handle.alloc) catch |err| return capi.mapError(err);
+    const bytes = dbStatsJsonAlloc(handle) catch |err| return capi.mapError(err);
+    out_buf.* = .{ .ptr = bytes.ptr, .len = bytes.len };
+    return .ok;
+}
+
+fn dbStatsJsonAlloc(handle: *Handle) ![]u8 {
+    const stats = try handle.db.stats(handle.alloc);
     defer db_mod.types.freeDBStats(handle.alloc, stats);
 
-    var indexes = handle.alloc.alloc(JsonDBIndexStats, stats.indexes.len) catch return .internal;
+    const indexes = try dbIndexStatsProjectionAlloc(handle.alloc, stats);
     defer if (indexes.len > 0) handle.alloc.free(indexes);
+
+    return try std.fmt.allocPrint(handle.alloc, "{f}", .{std.json.fmt(jsonDBStatsProjection(stats, indexes), .{})});
+}
+
+fn dbIndexStatsProjectionAlloc(alloc: Allocator, stats: db_mod.types.DBStats) ![]JsonDBIndexStats {
+    var indexes = try alloc.alloc(JsonDBIndexStats, stats.indexes.len);
     for (stats.indexes, 0..) |item, i| {
         indexes[i] = .{
             .name = item.name,
@@ -2919,8 +3805,11 @@ pub export fn antfly_db_stats_json(
             .node_count = item.node_count,
         };
     }
+    return indexes;
+}
 
-    out_buf.* = stringifyJson(JsonDBStats{
+fn jsonDBStatsProjection(stats: db_mod.types.DBStats, indexes: []JsonDBIndexStats) JsonDBStats {
+    return JsonDBStats{
         .doc_count = stats.doc_count,
         .index_count = stats.index_count,
         .indexes = indexes,
@@ -3002,7 +3891,43 @@ pub export fn antfly_db_stats_json(
         },
         .term_doc_freq_cache_hits = stats.term_doc_freq_cache_hits,
         .term_doc_freq_cache_misses = stats.term_doc_freq_cache_misses,
-    }) catch return .internal;
+    };
+}
+
+fn requestLooksLikePublicQueryJson(bytes: []const u8) bool {
+    return std.mem.indexOf(u8, bytes, "\"full_text_search\"") != null or
+        std.mem.indexOf(u8, bytes, "\"embeddings\"") != null or
+        std.mem.indexOf(u8, bytes, "\"graph_searches\"") != null or
+        std.mem.indexOf(u8, bytes, "\"merge_config\"") != null or
+        std.mem.indexOf(u8, bytes, "\"indexes\"") != null or
+        std.mem.indexOf(u8, bytes, "\"query\"") != null;
+}
+
+fn searchPublicQueryJson(handle: *Handle, request_json: capi.Slice, out_buf: *capi.Buffer) capi.ErrorCode {
+    var owned = query_api.parsePublicQueryRequest(
+        handle.alloc,
+        null,
+        "docs",
+        request_json.bytes(),
+    ) catch |err| return capi.mapError(err);
+    defer owned.deinit(handle.alloc);
+
+    stampSearchRequestIdentityGeneration(handle, &owned.req) catch |err| return capi.mapError(err);
+    handle.prepareSearchRequest(owned.req) catch |err| return capi.mapError(err);
+
+    var result = handle.db.search(handle.alloc, owned.req) catch |err| return capi.mapError(err);
+    defer result.deinit();
+
+    var response = query_api.encodeQueryResponses(
+        handle.alloc,
+        "docs",
+        owned.req,
+        .{},
+        result,
+    ) catch |err| return capi.mapError(err);
+    defer response.deinit(handle.alloc);
+
+    out_buf.* = dupBytes(response.json) catch return .internal;
     return .ok;
 }
 
@@ -3012,6 +3937,9 @@ pub export fn antfly_db_search_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    if (requestLooksLikePublicQueryJson(request_json.bytes())) {
+        return searchPublicQueryJson(handle, request_json, out_buf);
+    }
     const Request = struct {
         mode: []const u8,
         index_name: []const u8 = "",
@@ -5215,10 +6143,39 @@ pub export fn antfly_db_add_index_json(
 pub export fn antfly_db_delete_index(
     handle_ptr: ?*anyopaque,
     name: capi.Slice,
-    out_deleted: *bool,
+    out_deleted: ?*bool,
+) capi.ErrorCode {
+    const out = out_deleted orelse return .invalid_argument;
+    out.* = false;
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    out.* = handle.db.deleteIndex(name.bytes()) catch |err| return capi.mapError(err);
+    return .ok;
+}
+
+pub export fn antfly_db_add_enrichment_json(
+    handle_ptr: ?*anyopaque,
+    config_json: capi.Slice,
 ) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
-    out_deleted.* = handle.db.deleteIndex(name.bytes()) catch |err| return capi.mapError(err);
+    var parsed = std.json.parseFromSlice(db_mod.types.EnrichmentConfig, handle.alloc, config_json.bytes(), .{
+        .ignore_unknown_fields = true,
+    }) catch return .invalid_argument;
+    defer parsed.deinit();
+    handle.db.addEnrichment(parsed.value) catch |err| return capi.mapError(err);
+    return .ok;
+}
+
+pub export fn antfly_db_delete_enrichment(
+    handle_ptr: ?*anyopaque,
+    kind_slice: capi.Slice,
+    name: capi.Slice,
+    out_deleted: ?*bool,
+) capi.ErrorCode {
+    const out = out_deleted orelse return .invalid_argument;
+    out.* = false;
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const kind = parseEnrichmentKind(kind_slice.bytes()) orelse return .invalid_argument;
+    out.* = handle.db.deleteEnrichment(kind, name.bytes()) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -5619,6 +6576,18 @@ test "capi transaction lifecycle" {
     defer antfly_db_close(handle_ptr);
 
     const txn_id: [16]u8 = .{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_begin_transaction_with_id(handle_ptr, null, 1_000, null, 0));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_write_transaction(handle_ptr, null, null, 0, null, 0));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_resolve_intents(handle_ptr, null, @intFromEnum(transactions_mod.TxnStatus.committed), 2_000));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_get_transaction_status(handle_ptr, &txn_id, null));
+    var reset_status: u8 = 99;
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_get_transaction_status(handle_ptr, null, &reset_status));
+    try std.testing.expectEqual(@as(u8, 0), reset_status);
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_get_commit_version(handle_ptr, &txn_id, null));
+    var reset_commit_version: u64 = 99;
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_get_commit_version(handle_ptr, null, &reset_commit_version));
+    try std.testing.expectEqual(@as(u64, 0), reset_commit_version);
+
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_begin_transaction_with_id(handle_ptr, &txn_id, 1_000, null, 0));
 
     const writes = [_]capi.WriteIntent{
@@ -5666,6 +6635,1113 @@ test "capi batch and lookup json" {
     }, &out));
     defer antfly_db_buffer_free(out.ptr, out.len);
     try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"title\":\"ok\"") != null);
+
+    const batch_json = "{\"inserts\":{\"doc:capi-batch-json\":{\"title\":\"json path\"}},\"sync_level\":\"write\"}";
+    var batch_json_out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle_ptr, .{
+        .ptr = batch_json.ptr,
+        .len = batch_json.len,
+    }, &batch_json_out));
+    defer antfly_db_buffer_free(batch_json_out.ptr, batch_json_out.len);
+    try std.testing.expect(std.mem.indexOf(u8, batch_json_out.ptr.?[0..batch_json_out.len], "\"inserted\":1") != null);
+
+    var json_out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(handle_ptr, .{
+        .ptr = "doc:capi-batch-json",
+        .len = "doc:capi-batch-json".len,
+    }, &json_out));
+    defer antfly_db_buffer_free(json_out.ptr, json_out.len);
+    try std.testing.expect(std.mem.indexOf(u8, json_out.ptr.?[0..json_out.len], "\"title\":\"json path\"") != null);
+
+    var invalid_json_out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_batch_json(handle_ptr, .{
+        .ptr = "{".ptr,
+        .len = 1,
+    }, &invalid_json_out));
+}
+
+test "capi lite opens exports imports checks and vacuums aflite" {
+    const alloc = std.testing.allocator;
+    const plain_path = try tempTestPath(alloc, "capi-lite-plain");
+    defer alloc.free(plain_path);
+    const invalid_lite_path = try tempTestPath(alloc, "capi-lite-invalid");
+    defer alloc.free(invalid_lite_path);
+    const missing_readonly_path = try tempTestAflitePath(alloc, "capi-lite-missing-readonly");
+    defer alloc.free(missing_readonly_path);
+    const missing_status_path = try tempTestAflitePath(alloc, "capi-lite-missing-status");
+    defer alloc.free(missing_status_path);
+    const short_lite_path = try tempTestAflitePath(alloc, "capi-lite-short");
+    defer alloc.free(short_lite_path);
+    const src_path = try tempTestAflitePath(alloc, "capi-lite-src");
+    defer alloc.free(src_path);
+    const remote_inference_path = try tempTestAflitePath(alloc, "capi-lite-remote-inference");
+    defer alloc.free(remote_inference_path);
+    const local_inference_path = try tempTestAflitePath(alloc, "capi-lite-local-inference");
+    defer alloc.free(local_inference_path);
+    const dst_path = try tempTestAflitePath(alloc, "capi-lite-dst");
+    defer alloc.free(dst_path);
+    const bad_dst_path = try tempTestAflitePath(alloc, "capi-lite-bad-dst");
+    defer alloc.free(bad_dst_path);
+    const schema_dst_path = try tempTestAflitePath(alloc, "capi-lite-schema-dst");
+    defer alloc.free(schema_dst_path);
+    const snapshot_path = try tempTestAflitePath(alloc, "capi-lite-snapshot");
+    defer alloc.free(snapshot_path);
+    const snapshot_file_path = try tempTestAflitePath(alloc, "capi-lite-snapshot-file");
+    defer alloc.free(snapshot_file_path);
+    const pinned_snapshot_path = try tempTestAflitePath(alloc, "capi-lite-pinned-snapshot");
+    defer alloc.free(pinned_snapshot_path);
+    const restore_path = try tempTestAflitePath(alloc, "capi-lite-restore");
+    defer alloc.free(restore_path);
+    const restore_alias_path = try tempTestAflitePath(alloc, "capi-lite-restore-alias");
+    defer alloc.free(restore_alias_path);
+    const locked_restore_path = try tempTestAflitePath(alloc, "capi-lite-restore-locked");
+    defer alloc.free(locked_restore_path);
+    const restore_malformed_path = try tempTestAflitePath(alloc, "capi-lite-restore-malformed");
+    defer alloc.free(restore_malformed_path);
+    const invalid_snapshot_path = try tempTestPath(alloc, "capi-lite-snapshot-invalid");
+    defer alloc.free(invalid_snapshot_path);
+    const invalid_snapshot_file_path = try tempTestPath(alloc, "capi-lite-snapshot-file-invalid");
+    defer alloc.free(invalid_snapshot_file_path);
+    cleanupTestDir(plain_path);
+    cleanupTestFile(invalid_lite_path);
+    cleanupTestFile(missing_readonly_path);
+    cleanupTestFile(missing_status_path);
+    cleanupTestFile(short_lite_path);
+    cleanupTestFile(src_path);
+    cleanupTestFile(remote_inference_path);
+    cleanupTestFile(local_inference_path);
+    cleanupTestFile(dst_path);
+    cleanupTestFile(bad_dst_path);
+    cleanupTestFile(schema_dst_path);
+    cleanupTestFile(snapshot_path);
+    cleanupTestFile(snapshot_file_path);
+    cleanupTestFile(pinned_snapshot_path);
+    cleanupTestFile(restore_path);
+    cleanupTestFile(restore_alias_path);
+    cleanupTestFile(locked_restore_path);
+    cleanupTestFile(restore_malformed_path);
+    cleanupTestFile(invalid_snapshot_path);
+    cleanupTestFile(invalid_snapshot_file_path);
+    defer cleanupTestDir(plain_path);
+    defer cleanupTestFile(invalid_lite_path);
+    defer cleanupTestFile(missing_readonly_path);
+    defer cleanupTestFile(missing_status_path);
+    defer cleanupTestFile(short_lite_path);
+    defer cleanupTestFile(src_path);
+    defer cleanupTestFile(remote_inference_path);
+    defer cleanupTestFile(local_inference_path);
+    defer cleanupTestFile(dst_path);
+    defer cleanupTestFile(bad_dst_path);
+    defer cleanupTestFile(schema_dst_path);
+    defer cleanupTestFile(snapshot_path);
+    defer cleanupTestFile(snapshot_file_path);
+    defer cleanupTestFile(pinned_snapshot_path);
+    defer cleanupTestFile(restore_path);
+    defer cleanupTestFile(restore_alias_path);
+    defer cleanupTestFile(locked_restore_path);
+    defer cleanupTestFile(restore_malformed_path);
+    defer cleanupTestFile(invalid_snapshot_path);
+    defer cleanupTestFile(invalid_snapshot_file_path);
+
+    try std.testing.expectEqual(@as(u32, 1), antfly_abi_version());
+    try std.testing.expectEqualStrings("ANTFLY_OK", std.mem.span(antfly_error_code_name(@intFromEnum(capi.ErrorCode.ok))));
+    try std.testing.expectEqualStrings("ANTFLY_INVALID_ARGUMENT", std.mem.span(antfly_error_code_name(@intFromEnum(capi.ErrorCode.invalid_argument))));
+    try std.testing.expectEqualStrings("ANTFLY_UNKNOWN_ERROR", std.mem.span(antfly_error_code_name(12345)));
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(antfly_error_code_description(@intFromEnum(capi.ErrorCode.busy))), "writer") != null);
+    try std.testing.expectEqualStrings("unknown Antfly error code", std.mem.span(antfly_error_code_description(12345)));
+    try std.testing.expectEqual(capi.ErrorCode.busy, capi.mapError(error.FileBusy));
+    try std.testing.expectEqual(capi.ErrorCode.not_found, capi.mapError(error.NotFound));
+    try std.testing.expectEqual(capi.ErrorCode.txn_not_found, capi.mapError(error.TxnNotFound));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, capi.mapError(error.TruncatedNativeHeader));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, capi.mapError(error.UnsupportedNativeFormatVersion));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open(src_path, null));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_create(src_path, null));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open_with_options(src_path, null, null));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_create_with_options(src_path, null, null));
+    var null_path_sentinel: u8 = 0;
+    var null_path_handle: ?*anyopaque = &null_path_sentinel;
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open(null, &null_path_handle));
+    try std.testing.expect(null_path_handle == null);
+
+    var plain_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(plain_path, &plain_handle));
+    defer antfly_db_close(plain_handle);
+    var scratch: [1]u8 = .{0xaa};
+    var invalid_caps: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_capabilities_json(plain_handle, &invalid_caps));
+    try std.testing.expect(invalid_caps.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), invalid_caps.len);
+    var invalid_status: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_status_json(plain_handle, &invalid_status));
+    try std.testing.expect(invalid_status.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), invalid_status.len);
+    var invalid_backup: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_backup(plain_handle, &invalid_backup));
+    try std.testing.expect(invalid_backup.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), invalid_backup.len);
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_run_until_idle(plain_handle));
+    var invalid_idle: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_run_until_idle_json(plain_handle, &invalid_idle));
+    try std.testing.expect(invalid_idle.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), invalid_idle.len);
+    var invalid_pending: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_pending_work_stats_json(plain_handle, &invalid_pending));
+    try std.testing.expect(invalid_pending.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), invalid_pending.len);
+
+    var invalid_lite_sentinel: u8 = 0;
+    var invalid_lite_handle: ?*anyopaque = &invalid_lite_sentinel;
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open(invalid_lite_path, &invalid_lite_handle));
+    try std.testing.expect(invalid_lite_handle == null);
+    defer antfly_db_close(invalid_lite_handle);
+
+    try std.testing.expect(!testPathExists(src_path));
+    var missing_writer_sentinel: u8 = 0;
+    var missing_writer_handle: ?*anyopaque = &missing_writer_sentinel;
+    try std.testing.expectEqual(capi.ErrorCode.not_found, antfly_lite_open(src_path, &missing_writer_handle));
+    try std.testing.expect(missing_writer_handle == null);
+    try std.testing.expect(!testPathExists(src_path));
+    defer antfly_db_close(missing_writer_handle);
+
+    try std.testing.expect(!testPathExists(missing_readonly_path));
+    var missing_readonly_sentinel: u8 = 0;
+    var missing_readonly_handle: ?*anyopaque = &missing_readonly_sentinel;
+    try std.testing.expectEqual(capi.ErrorCode.not_found, antfly_lite_open_readonly(missing_readonly_path, &missing_readonly_handle));
+    try std.testing.expect(missing_readonly_handle == null);
+    try std.testing.expect(!testPathExists(missing_readonly_path));
+    defer antfly_db_close(missing_readonly_handle);
+
+    try std.testing.expect(!testPathExists(missing_status_path));
+    var missing_status_sentinel: u8 = 0;
+    var missing_status_handle: ?*anyopaque = &missing_status_sentinel;
+    try std.testing.expectEqual(capi.ErrorCode.not_found, antfly_lite_open_status_only(missing_status_path, &missing_status_handle));
+    try std.testing.expect(missing_status_handle == null);
+    try std.testing.expect(!testPathExists(missing_status_path));
+    defer antfly_db_close(missing_status_handle);
+
+    {
+        var short_file = try std.Io.Dir.cwd().createFile(std.testing.io, short_lite_path, .{});
+        defer short_file.close(std.testing.io);
+        try short_file.writePositionalAll(std.testing.io, "short native lite header", 0);
+    }
+    var short_lite_sentinel: u8 = 0;
+    var short_lite_handle: ?*anyopaque = &short_lite_sentinel;
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open_readonly(short_lite_path, &short_lite_handle));
+    try std.testing.expect(short_lite_handle == null);
+    defer antfly_db_close(short_lite_handle);
+
+    var short_check: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_check_file_json(short_lite_path, &short_check));
+    defer antfly_db_buffer_free(short_check.ptr, short_check.len);
+    const short_check_json = short_check.ptr.?[0..short_check.len];
+    try std.testing.expect(std.mem.indexOf(u8, short_check_json, "\"valid\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, short_check_json, "\"issue\":\"truncated_header\"") != null);
+
+    var src_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(src_path, &src_handle));
+    defer antfly_db_close(src_handle);
+
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_status_json(src_handle, null));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_capabilities_json(src_handle, null));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_backup(src_handle, null));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_check_json(src_handle, null));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_check_file_json(src_path, null));
+    var null_check_file_path: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_check_file_json(null, &null_check_file_path));
+    try std.testing.expect(null_check_file_path.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), null_check_file_path.len);
+    var invalid_check_file_path: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_check_file_json(plain_path, &invalid_check_file_path));
+    try std.testing.expect(invalid_check_file_path.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), invalid_check_file_path.len);
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_copy_stable_snapshot_json(src_handle, snapshot_path, false, null));
+    var null_snapshot_dest: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_copy_stable_snapshot_json(src_handle, null, false, &null_snapshot_dest));
+    try std.testing.expect(null_snapshot_dest.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), null_snapshot_dest.len);
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_copy_stable_snapshot_file_json(src_path, snapshot_file_path, false, null));
+    var null_snapshot_file_src: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_copy_stable_snapshot_file_json(null, snapshot_file_path, false, &null_snapshot_file_src));
+    try std.testing.expect(null_snapshot_file_src.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), null_snapshot_file_src.len);
+    var null_snapshot_file_dest: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_copy_stable_snapshot_file_json(src_path, null, false, &null_snapshot_file_dest));
+    try std.testing.expect(null_snapshot_file_dest.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), null_snapshot_file_dest.len);
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_compact_json(src_handle, null));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_vacuum_json(src_handle, null));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_run_until_idle_json(src_handle, null));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_replay_generated_enrichments_json(src_handle, null));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_pending_work_stats_json(src_handle, null));
+
+    var status: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_status_json(src_handle, &status));
+    const status_json = status.ptr.?[0..status.len];
+    const native_local_runtime_available = lite_backend.capabilitiesForProfile(.native).local_inference_runtime;
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"storage\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"format\":\"aflite\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"engine\":\"native_single_file\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"primary_layout\":\"native_document_pages\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"replay_layout\":\"native_replay_lanes_in_document_catalog\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"index_layout\":\"native_index_catalog_pages\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"index_layout\":\"lsm") == null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"index_namespace\":\"__antfly_lite\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"format_version\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"page_size\":4096") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"active_checkpoint\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"stats\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"pending_work\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"inference\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"mode\":\"caller_supplied_or_disabled\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"configured\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"remote_provider_configured\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"local_runtime_configured\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, if (native_local_runtime_available) "\"local_runtime_available\":true" else "\"local_runtime_available\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"capabilities\":") != null);
+    antfly_db_buffer_free_zero(&status);
+    try std.testing.expect(status.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), status.len);
+
+    var remote_options = capi.LiteOpenOptions{
+        .abi_size = @sizeOf(capi.LiteOpenOptions),
+        .flags = capi.lite_open_flag_remote_provider_configured,
+    };
+    var remote_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_with_options(remote_inference_path, &remote_options, &remote_handle));
+    defer antfly_db_close(remote_handle);
+    var remote_status: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_status_json(remote_handle, &remote_status));
+    defer antfly_db_buffer_free(remote_status.ptr, remote_status.len);
+    const remote_status_json = remote_status.ptr.?[0..remote_status.len];
+    try std.testing.expect(std.mem.indexOf(u8, remote_status_json, "\"mode\":\"remote_provider\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, remote_status_json, "\"configured\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, remote_status_json, "\"remote_provider_configured\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, remote_status_json, "\"local_runtime_configured\":false") != null);
+
+    var local_options = capi.LiteOpenOptions{
+        .abi_size = @sizeOf(capi.LiteOpenOptions),
+        .flags = capi.lite_open_flag_local_runtime_configured,
+    };
+    var local_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_with_options(local_inference_path, &local_options, &local_handle));
+    defer antfly_db_close(local_handle);
+    var local_status: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_status_json(local_handle, &local_status));
+    defer antfly_db_buffer_free(local_status.ptr, local_status.len);
+    const local_status_json = local_status.ptr.?[0..local_status.len];
+    if (native_local_runtime_available) {
+        try std.testing.expect(std.mem.indexOf(u8, local_status_json, "\"mode\":\"local_embedded\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, local_status_json, "\"configured\":true") != null);
+    } else {
+        try std.testing.expect(std.mem.indexOf(u8, local_status_json, "\"mode\":\"caller_supplied_or_disabled\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, local_status_json, "\"configured\":false") != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, local_status_json, "\"remote_provider_configured\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, local_status_json, "\"local_runtime_configured\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, local_status_json, if (native_local_runtime_available) "\"local_runtime_available\":true" else "\"local_runtime_available\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, local_status_json, "\"capabilities\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, local_status_json, if (native_local_runtime_available) "\"inference_mode\":\"local_embedded\"" else "\"inference_mode\":\"caller_supplied_or_disabled\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, local_status_json, if (native_local_runtime_available) "\"local_inference_runtime\":true" else "\"local_inference_runtime\":false") != null);
+
+    var capabilities: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_capabilities_json(src_handle, &capabilities));
+    defer antfly_db_buffer_free(capabilities.ptr, capabilities.len);
+    const capabilities_json = capabilities.ptr.?[0..capabilities.len];
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"hosted_profile\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"manual_maintenance\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"dense_vector_search\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"sparse_vector_search\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"inference_mode\":\"caller_supplied_or_disabled\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"no_inference_configured_ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"caller_supplied_artifacts\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, if (native_local_runtime_available) "\"local_inference_runtime\":true" else "\"local_inference_runtime\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"raft_replication\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"cluster_placement\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"cross_node_joins\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"remote_shard_fanout\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"distributed_transaction_coordination\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"cluster_heartbeat_status_aggregation\":false") != null);
+
+    var local_capabilities: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_capabilities_json(local_handle, &local_capabilities));
+    defer antfly_db_buffer_free(local_capabilities.ptr, local_capabilities.len);
+    const local_capabilities_json = local_capabilities.ptr.?[0..local_capabilities.len];
+    try std.testing.expect(std.mem.indexOf(u8, local_capabilities_json, if (native_local_runtime_available) "\"inference_mode\":\"local_embedded\"" else "\"inference_mode\":\"caller_supplied_or_disabled\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, local_capabilities_json, if (native_local_runtime_available) "\"available_inference_modes\":[\"caller_supplied_artifacts\",\"remote_provider\",\"local_embedded\",\"disabled_deferred\"]" else "\"available_inference_modes\":[\"caller_supplied_artifacts\",\"remote_provider\",\"disabled_deferred\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, local_capabilities_json, if (native_local_runtime_available) "\"local_inference_runtime\":true" else "\"local_inference_runtime\":false") != null);
+
+    var pending: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_pending_work_stats_json(src_handle, &pending));
+    defer antfly_db_buffer_free(pending.ptr, pending.len);
+    const pending_json = pending.ptr.?[0..pending.len];
+    try std.testing.expect(std.mem.indexOf(u8, pending_json, "\"has_async_indexes\":") != null);
+
+    var idle: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_run_until_idle_json(src_handle, &idle));
+    defer antfly_db_buffer_free(idle.ptr, idle.len);
+    const idle_json = idle.ptr.?[0..idle.len];
+    try std.testing.expect(std.mem.indexOf(u8, idle_json, "\"derived_target_sequence\":") != null);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_run_until_idle(src_handle));
+
+    var replayed: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_replay_generated_enrichments_json(src_handle, &replayed));
+    defer antfly_db_buffer_free(replayed.ptr, replayed.len);
+    const replayed_json = replayed.ptr.?[0..replayed.len];
+    try std.testing.expect(std.mem.indexOf(u8, replayed_json, "\"replayed\":") != null);
+
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_delete_index(src_handle, .{
+        .ptr = "missing-index",
+        .len = "missing-index".len,
+    }, null));
+    var missing_index_deleted = true;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_delete_index(src_handle, .{
+        .ptr = "missing-index",
+        .len = "missing-index".len,
+    }, &missing_index_deleted));
+    try std.testing.expect(!missing_index_deleted);
+
+    const schema_json =
+        \\{"version":0,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true}}}}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_schema_json(src_handle, .{
+        .ptr = schema_json,
+        .len = schema_json.len,
+    }));
+
+    var loaded_schema: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_schema_json(src_handle, &loaded_schema));
+    defer antfly_db_buffer_free(loaded_schema.ptr, loaded_schema.len);
+    try std.testing.expectEqualStrings(schema_json, loaded_schema.ptr.?[0..loaded_schema.len]);
+
+    const enrichment_json =
+        \\{"name":"body_chunks_v1","kind":"chunk","field":"body","chunk_size":8,"chunk_overlap":2}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_enrichment_json(src_handle, .{
+        .ptr = enrichment_json,
+        .len = enrichment_json.len,
+    }));
+
+    const scratch_enrichment_json =
+        \\{"name":"scratch_chunks_v1","kind":"chunk","field":"scratch","chunk_size":4,"chunk_overlap":1}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_enrichment_json(src_handle, .{
+        .ptr = scratch_enrichment_json,
+        .len = scratch_enrichment_json.len,
+    }));
+
+    var enrichments: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_list_enrichments_json(src_handle, &enrichments));
+    defer antfly_db_buffer_free(enrichments.ptr, enrichments.len);
+    try std.testing.expect(std.mem.indexOf(u8, enrichments.ptr.?[0..enrichments.len], "\"body_chunks_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, enrichments.ptr.?[0..enrichments.len], "\"chunk_size\":8") != null);
+
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_delete_enrichment(src_handle, .{
+        .ptr = "chunk",
+        .len = "chunk".len,
+    }, .{
+        .ptr = "scratch_chunks_v1",
+        .len = "scratch_chunks_v1".len,
+    }, null));
+    var invalid_enrichment_deleted = true;
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_delete_enrichment(src_handle, .{
+        .ptr = "unknown",
+        .len = "unknown".len,
+    }, .{
+        .ptr = "scratch_chunks_v1",
+        .len = "scratch_chunks_v1".len,
+    }, &invalid_enrichment_deleted));
+    try std.testing.expect(!invalid_enrichment_deleted);
+
+    var deleted_enrichment = false;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_delete_enrichment(src_handle, .{
+        .ptr = "chunk",
+        .len = "chunk".len,
+    }, .{
+        .ptr = "scratch_chunks_v1",
+        .len = "scratch_chunks_v1".len,
+    }, &deleted_enrichment));
+    try std.testing.expect(deleted_enrichment);
+
+    const writes_a = [_]capi.WriteIntent{
+        .{
+            .key = .{ .ptr = "doc:capi-lite", .len = "doc:capi-lite".len },
+            .value = .{ .ptr = "{\"title\":\"first\"}", .len = "{\"title\":\"first\"}".len },
+            .is_delete = false,
+        },
+        .{
+            .key = .{ .ptr = "doc:gone", .len = "doc:gone".len },
+            .value = .{ .ptr = "{\"title\":\"remove\"}", .len = "{\"title\":\"remove\"}".len },
+            .is_delete = false,
+        },
+    };
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch(src_handle, &writes_a, writes_a.len, null, 0, 1_000, 0));
+
+    const writes_b = [_]capi.WriteIntent{
+        .{
+            .key = .{ .ptr = "doc:capi-lite", .len = "doc:capi-lite".len },
+            .value = .{ .ptr = "{\"title\":\"second\"}", .len = "{\"title\":\"second\"}".len },
+            .is_delete = false,
+        },
+        .{
+            .key = .{ .ptr = "doc:gone", .len = "doc:gone".len },
+            .value = .{},
+            .is_delete = true,
+        },
+    };
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch(src_handle, &writes_b, writes_b.len, null, 0, 2_000, 0));
+
+    const lite_txn_id: [16]u8 = .{ 0x6c, 0x69, 0x74, 0x65, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_begin_transaction_with_id(src_handle, &lite_txn_id, 3_000, null, 0));
+    const txn_writes = [_]capi.WriteIntent{.{
+        .key = .{ .ptr = "doc:capi-lite-txn", .len = "doc:capi-lite-txn".len },
+        .value = .{ .ptr = "{\"title\":\"transactional\"}", .len = "{\"title\":\"transactional\"}".len },
+        .is_delete = false,
+    }};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_write_transaction(src_handle, &lite_txn_id, &txn_writes, txn_writes.len, null, 0));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_resolve_intents(src_handle, &lite_txn_id, @intFromEnum(transactions_mod.TxnStatus.committed), 4_000));
+    var lite_txn_status: u8 = 0;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_transaction_status(src_handle, &lite_txn_id, &lite_txn_status));
+    try std.testing.expectEqual(@as(u8, @intFromEnum(transactions_mod.TxnStatus.committed)), lite_txn_status);
+    var lite_txn_commit_version: u64 = 0;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_commit_version(src_handle, &lite_txn_id, &lite_txn_commit_version));
+    try std.testing.expectEqual(@as(u64, 4_000), lite_txn_commit_version);
+    var lite_txn_lookup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(src_handle, .{
+        .ptr = "doc:capi-lite-txn",
+        .len = "doc:capi-lite-txn".len,
+    }, &lite_txn_lookup));
+    defer antfly_db_buffer_free(lite_txn_lookup.ptr, lite_txn_lookup.len);
+    try std.testing.expect(std.mem.indexOf(u8, lite_txn_lookup.ptr.?[0..lite_txn_lookup.len], "\"transactional\"") != null);
+
+    const pinned_seed_writes = [_]capi.WriteIntent{.{
+        .key = .{ .ptr = "doc:capi-pinned", .len = "doc:capi-pinned".len },
+        .value = .{ .ptr = "{\"title\":\"pinned-before\"}", .len = "{\"title\":\"pinned-before\"}".len },
+        .is_delete = false,
+    }};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch(src_handle, &pinned_seed_writes, pinned_seed_writes.len, null, 0, 4_100, 0));
+
+    var concurrent_readonly_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_readonly(src_path, &concurrent_readonly_handle));
+    defer antfly_db_close(concurrent_readonly_handle);
+    try std.testing.expectEqual(db_mod.OpenOptions.OpenMode.query_readonly, asHandle(concurrent_readonly_handle).?.open_mode);
+    var second_writer_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.busy, antfly_lite_open(src_path, &second_writer_handle));
+    defer antfly_db_close(second_writer_handle);
+    var concurrent_lookup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(concurrent_readonly_handle, .{
+        .ptr = "doc:capi-lite",
+        .len = "doc:capi-lite".len,
+    }, &concurrent_lookup));
+    defer antfly_db_buffer_free(concurrent_lookup.ptr, concurrent_lookup.len);
+    try std.testing.expect(std.mem.indexOf(u8, concurrent_lookup.ptr.?[0..concurrent_lookup.len], "\"second\"") != null);
+
+    const pinned_advance_a = [_]capi.WriteIntent{.{
+        .key = .{ .ptr = "doc:capi-pinned", .len = "doc:capi-pinned".len },
+        .value = .{ .ptr = "{\"title\":\"pinned-after-a\"}", .len = "{\"title\":\"pinned-after-a\"}".len },
+        .is_delete = false,
+    }};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch(src_handle, &pinned_advance_a, pinned_advance_a.len, null, 0, 4_200, 0));
+    const pinned_advance_b = [_]capi.WriteIntent{.{
+        .key = .{ .ptr = "doc:capi-pinned", .len = "doc:capi-pinned".len },
+        .value = .{ .ptr = "{\"title\":\"pinned-after-b\"}", .len = "{\"title\":\"pinned-after-b\"}".len },
+        .is_delete = false,
+    }};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch(src_handle, &pinned_advance_b, pinned_advance_b.len, null, 0, 4_300, 0));
+
+    var pinned_snapshot_report: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_copy_stable_snapshot_json(concurrent_readonly_handle, pinned_snapshot_path, false, &pinned_snapshot_report));
+    defer antfly_db_buffer_free(pinned_snapshot_report.ptr, pinned_snapshot_report.len);
+    try std.testing.expect(std.mem.indexOf(u8, pinned_snapshot_report.ptr.?[0..pinned_snapshot_report.len], "\"tail_bytes\":") != null);
+
+    var pinned_snapshot_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_readonly(pinned_snapshot_path, &pinned_snapshot_handle));
+    defer antfly_db_close(pinned_snapshot_handle);
+    var pinned_snapshot_check: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_check_json(pinned_snapshot_handle, &pinned_snapshot_check));
+    defer antfly_db_buffer_free(pinned_snapshot_check.ptr, pinned_snapshot_check.len);
+    try std.testing.expect(std.mem.indexOf(u8, pinned_snapshot_check.ptr.?[0..pinned_snapshot_check.len], "\"valid\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pinned_snapshot_check.ptr.?[0..pinned_snapshot_check.len], "\"tail_bytes\":0") != null);
+
+    var pinned_snapshot_lookup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(pinned_snapshot_handle, .{
+        .ptr = "doc:capi-pinned",
+        .len = "doc:capi-pinned".len,
+    }, &pinned_snapshot_lookup));
+    defer antfly_db_buffer_free(pinned_snapshot_lookup.ptr, pinned_snapshot_lookup.len);
+    try std.testing.expect(std.mem.indexOf(u8, pinned_snapshot_lookup.ptr.?[0..pinned_snapshot_lookup.len], "\"pinned-before\"") != null);
+
+    var pinned_writer_lookup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(src_handle, .{
+        .ptr = "doc:capi-pinned",
+        .len = "doc:capi-pinned".len,
+    }, &pinned_writer_lookup));
+    defer antfly_db_buffer_free(pinned_writer_lookup.ptr, pinned_writer_lookup.len);
+    try std.testing.expect(std.mem.indexOf(u8, pinned_writer_lookup.ptr.?[0..pinned_writer_lookup.len], "\"pinned-after-b\"") != null);
+
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_batch(concurrent_readonly_handle, &writes_a, 1, null, 0, 4_500, 0));
+
+    var concurrent_status_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_status_only(src_path, &concurrent_status_handle));
+    defer antfly_db_close(concurrent_status_handle);
+    try std.testing.expectEqual(db_mod.OpenOptions.OpenMode.status_only, asHandle(concurrent_status_handle).?.open_mode);
+    var concurrent_status: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_stats_json(concurrent_status_handle, &concurrent_status));
+    defer antfly_db_buffer_free(concurrent_status.ptr, concurrent_status.len);
+    try std.testing.expect(std.mem.indexOf(u8, concurrent_status.ptr.?[0..concurrent_status.len], "\"doc_count\":") != null);
+    var blocked_vacuum: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.busy, antfly_lite_vacuum_json(src_handle, &blocked_vacuum));
+    try std.testing.expect(blocked_vacuum.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), blocked_vacuum.len);
+    antfly_db_close(concurrent_status_handle);
+    concurrent_status_handle = null;
+    antfly_db_close(concurrent_readonly_handle);
+    concurrent_readonly_handle = null;
+
+    var check_before: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_check_json(src_handle, &check_before));
+    defer antfly_db_buffer_free(check_before.ptr, check_before.len);
+    try std.testing.expect(std.mem.indexOf(u8, check_before.ptr.?[0..check_before.len], "\"valid\":true") != null);
+
+    {
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        var file = try std.Io.Dir.cwd().openFile(io, src_path, .{ .mode = .read_write });
+        defer file.close(io);
+        const source_size = (try file.stat(io)).size;
+        try file.writePositionalAll(io, "tail", source_size);
+    }
+
+    var invalid_snapshot_report: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_copy_stable_snapshot_json(src_handle, invalid_snapshot_path, false, &invalid_snapshot_report));
+    try std.testing.expect(invalid_snapshot_report.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), invalid_snapshot_report.len);
+
+    var snapshot_report: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_copy_stable_snapshot_json(src_handle, snapshot_path, false, &snapshot_report));
+    defer antfly_db_buffer_free(snapshot_report.ptr, snapshot_report.len);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_report.ptr.?[0..snapshot_report.len], "\"tail_bytes\":4") != null);
+
+    var snapshot_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_readonly(snapshot_path, &snapshot_handle));
+    defer antfly_db_close(snapshot_handle);
+
+    var snapshot_check: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_check_json(snapshot_handle, &snapshot_check));
+    defer antfly_db_buffer_free(snapshot_check.ptr, snapshot_check.len);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_check.ptr.?[0..snapshot_check.len], "\"valid\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_check.ptr.?[0..snapshot_check.len], "\"tail_bytes\":0") != null);
+
+    var snapshot_lookup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(snapshot_handle, .{
+        .ptr = "doc:capi-lite",
+        .len = "doc:capi-lite".len,
+    }, &snapshot_lookup));
+    defer antfly_db_buffer_free(snapshot_lookup.ptr, snapshot_lookup.len);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_lookup.ptr.?[0..snapshot_lookup.len], "\"second\"") != null);
+
+    var invalid_snapshot_file_report: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_copy_stable_snapshot_file_json(src_path, invalid_snapshot_file_path, false, &invalid_snapshot_file_report));
+    try std.testing.expect(invalid_snapshot_file_report.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), invalid_snapshot_file_report.len);
+
+    var snapshot_file_report: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_copy_stable_snapshot_file_json(src_path, snapshot_file_path, false, &snapshot_file_report));
+    defer antfly_db_buffer_free(snapshot_file_report.ptr, snapshot_file_report.len);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_file_report.ptr.?[0..snapshot_file_report.len], "\"tail_bytes\":4") != null);
+    var snapshot_file_existing_report: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_copy_stable_snapshot_file_json(src_path, snapshot_file_path, false, &snapshot_file_existing_report));
+    try std.testing.expect(snapshot_file_existing_report.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), snapshot_file_existing_report.len);
+
+    var snapshot_file_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_readonly(snapshot_file_path, &snapshot_file_handle));
+    defer antfly_db_close(snapshot_file_handle);
+    var snapshot_file_check: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_check_json(snapshot_file_handle, &snapshot_file_check));
+    defer antfly_db_buffer_free(snapshot_file_check.ptr, snapshot_file_check.len);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_file_check.ptr.?[0..snapshot_file_check.len], "\"valid\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_file_check.ptr.?[0..snapshot_file_check.len], "\"tail_bytes\":0") != null);
+    var snapshot_file_lookup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(snapshot_file_handle, .{
+        .ptr = "doc:capi-lite",
+        .len = "doc:capi-lite".len,
+    }, &snapshot_file_lookup));
+    defer antfly_db_buffer_free(snapshot_file_lookup.ptr, snapshot_file_lookup.len);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_file_lookup.ptr.?[0..snapshot_file_lookup.len], "\"second\"") != null);
+
+    var compacted: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_compact_json(src_handle, &compacted));
+    defer antfly_db_buffer_free(compacted.ptr, compacted.len);
+    try std.testing.expect(std.mem.indexOf(u8, compacted.ptr.?[0..compacted.len], "\"compacted\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compacted.ptr.?[0..compacted.len], "\"vacuum\":") != null);
+
+    var vacuumed: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_vacuum_json(src_handle, &vacuumed));
+    defer antfly_db_buffer_free(vacuumed.ptr, vacuumed.len);
+    try std.testing.expect(std.mem.indexOf(u8, vacuumed.ptr.?[0..vacuumed.len], "\"reclaimed_bytes\":") != null);
+
+    var backup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_backup(src_handle, &backup));
+    defer antfly_db_buffer_free(backup.ptr, backup.len);
+    try std.testing.expect(backup.len > 0);
+
+    var exported_backup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_export(src_handle, &exported_backup));
+    defer antfly_db_buffer_free(exported_backup.ptr, exported_backup.len);
+    try std.testing.expect(exported_backup.len > 0);
+
+    var dst_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(dst_path, &dst_handle));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_import_backup(dst_handle, .{
+        .ptr = null,
+        .len = 16,
+    }));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_import(dst_handle, .{
+        .ptr = null,
+        .len = 16,
+    }));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_import_backup(dst_handle, .{
+        .ptr = null,
+        .len = 0,
+    }));
+
+    var bad_dst_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(bad_dst_path, &bad_dst_handle));
+    defer antfly_db_close(bad_dst_handle);
+
+    const target_writes = [_]capi.WriteIntent{.{
+        .key = .{ .ptr = "doc:capi-import-target", .len = "doc:capi-import-target".len },
+        .value = .{ .ptr = "{\"title\":\"target survives bad capi import\"}", .len = "{\"title\":\"target survives bad capi import\"}".len },
+        .is_delete = false,
+    }};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch(bad_dst_handle, &target_writes, target_writes.len, null, 0, 5_000, 0));
+
+    var malformed = std.ArrayList(u8).empty;
+    defer malformed.deinit(alloc);
+    try backup_codec.writeHeader(&malformed, alloc, .{
+        .format_version = backup_codec.format_version,
+        .flags = 0,
+        .created_at_ns = 0,
+        .backup_id = [_]u8{0} ** 16,
+        .table_count = 1,
+        .shard_count = 1,
+    });
+    const malformed_doc_payload = [_]u8{ 1, 0, 0, 0 };
+    try backup_codec.writeBlock(&malformed, alloc, .document_batch, &malformed_doc_payload);
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_import_backup(bad_dst_handle, .{
+        .ptr = malformed.items.ptr,
+        .len = malformed.items.len,
+    }));
+
+    var target_lookup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(bad_dst_handle, .{
+        .ptr = "doc:capi-import-target",
+        .len = "doc:capi-import-target".len,
+    }, &target_lookup));
+    defer antfly_db_buffer_free(target_lookup.ptr, target_lookup.len);
+    try std.testing.expect(std.mem.indexOf(u8, target_lookup.ptr.?[0..target_lookup.len], "\"target survives bad capi import\"") != null);
+
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_import_backup(bad_dst_handle, .{
+        .ptr = backup.ptr,
+        .len = backup.len,
+    }));
+
+    var target_after_valid_rejected: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(bad_dst_handle, .{
+        .ptr = "doc:capi-import-target",
+        .len = "doc:capi-import-target".len,
+    }, &target_after_valid_rejected));
+    defer antfly_db_buffer_free(target_after_valid_rejected.ptr, target_after_valid_rejected.len);
+    try std.testing.expect(std.mem.indexOf(u8, target_after_valid_rejected.ptr.?[0..target_after_valid_rejected.len], "\"target survives bad capi import\"") != null);
+
+    var schema_dst_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(schema_dst_path, &schema_dst_handle));
+    defer antfly_db_close(schema_dst_handle);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_schema_json(schema_dst_handle, .{
+        .ptr = schema_json,
+        .len = schema_json.len,
+    }));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_import_backup(schema_dst_handle, .{
+        .ptr = backup.ptr,
+        .len = backup.len,
+    }));
+    var schema_after_valid_rejected: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_schema_json(schema_dst_handle, &schema_after_valid_rejected));
+    defer antfly_db_buffer_free(schema_after_valid_rejected.ptr, schema_after_valid_rejected.len);
+    try std.testing.expectEqualStrings(schema_json, schema_after_valid_rejected.ptr.?[0..schema_after_valid_rejected.len]);
+
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_import(dst_handle, .{
+        .ptr = exported_backup.ptr,
+        .len = exported_backup.len,
+    }));
+
+    var lookup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(dst_handle, .{
+        .ptr = "doc:capi-lite",
+        .len = "doc:capi-lite".len,
+    }, &lookup));
+    defer antfly_db_buffer_free(lookup.ptr, lookup.len);
+    try std.testing.expect(std.mem.indexOf(u8, lookup.ptr.?[0..lookup.len], "\"second\"") != null);
+
+    antfly_db_close(dst_handle);
+    dst_handle = null;
+
+    var restore_report: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_restore_backup_json(restore_path, .{
+        .ptr = backup.ptr,
+        .len = backup.len,
+    }, false, &restore_report));
+    defer antfly_db_buffer_free(restore_report.ptr, restore_report.len);
+    try std.testing.expect(std.mem.indexOf(u8, restore_report.ptr.?[0..restore_report.len], "\"format\":\"aflite\"") != null);
+
+    var restored_file_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_readonly(restore_path, &restored_file_handle));
+    defer antfly_db_close(restored_file_handle);
+    var restored_file_lookup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(restored_file_handle, .{
+        .ptr = "doc:capi-lite",
+        .len = "doc:capi-lite".len,
+    }, &restored_file_lookup));
+    defer antfly_db_buffer_free(restored_file_lookup.ptr, restored_file_lookup.len);
+    try std.testing.expect(std.mem.indexOf(u8, restored_file_lookup.ptr.?[0..restored_file_lookup.len], "\"second\"") != null);
+
+    var restore_alias_report: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_restore_json(restore_alias_path, .{
+        .ptr = exported_backup.ptr,
+        .len = exported_backup.len,
+    }, false, &restore_alias_report));
+    defer antfly_db_buffer_free(restore_alias_report.ptr, restore_alias_report.len);
+    try std.testing.expect(std.mem.indexOf(u8, restore_alias_report.ptr.?[0..restore_alias_report.len], "\"format\":\"aflite\"") != null);
+
+    var restored_alias_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_readonly(restore_alias_path, &restored_alias_handle));
+    defer antfly_db_close(restored_alias_handle);
+    var restored_alias_lookup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(restored_alias_handle, .{
+        .ptr = "doc:capi-lite",
+        .len = "doc:capi-lite".len,
+    }, &restored_alias_lookup));
+    defer antfly_db_buffer_free(restored_alias_lookup.ptr, restored_alias_lookup.len);
+    try std.testing.expect(std.mem.indexOf(u8, restored_alias_lookup.ptr.?[0..restored_alias_lookup.len], "\"second\"") != null);
+
+    const locked_restore_tmp_path = try std.fmt.allocPrint(alloc, "{s}.restore-tmp.aflite", .{locked_restore_path});
+    defer alloc.free(locked_restore_tmp_path);
+    {
+        var locked_restore = try antfly.lite.native.lockWriterPath(alloc, locked_restore_path);
+        defer locked_restore.close();
+
+        var locked_restore_report: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+        try std.testing.expectEqual(capi.ErrorCode.busy, antfly_lite_restore_backup_json(locked_restore_path, .{
+            .ptr = backup.ptr,
+            .len = backup.len,
+        }, false, &locked_restore_report));
+        try std.testing.expect(locked_restore_report.ptr == null);
+        try std.testing.expectEqual(@as(usize, 0), locked_restore_report.len);
+    }
+    {
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        try std.testing.expect(!liteCapiPathExists(io_impl.io(), locked_restore_path));
+        try std.testing.expect(!liteCapiPathExists(io_impl.io(), locked_restore_tmp_path));
+    }
+
+    var restore_existing: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_restore_backup_json(restore_path, .{
+        .ptr = backup.ptr,
+        .len = backup.len,
+    }, false, &restore_existing));
+    try std.testing.expect(restore_existing.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), restore_existing.len);
+
+    var malformed_restore_report: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_restore_backup_json(restore_malformed_path, .{
+        .ptr = malformed.items.ptr,
+        .len = malformed.items.len,
+    }, false, &malformed_restore_report));
+    try std.testing.expect(malformed_restore_report.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), malformed_restore_report.len);
+    {
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        try std.testing.expect(!liteCapiPathExists(io_impl.io(), restore_malformed_path));
+    }
+
+    var readonly_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_readonly(dst_path, &readonly_handle));
+    defer antfly_db_close(readonly_handle);
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_batch(readonly_handle, &writes_a, 1, null, 0, 3_000, 0));
+}
+
+test "capi lite exposes hosted and status-only profiles" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, "capi-lite-profiles");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var hosted_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_hosted(path, &hosted_handle));
+
+    var hosted_caps: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_capabilities_json(hosted_handle, &hosted_caps));
+    defer antfly_db_buffer_free(hosted_caps.ptr, hosted_caps.len);
+    const hosted_caps_json = hosted_caps.ptr.?[0..hosted_caps.len];
+    try std.testing.expect(std.mem.indexOf(u8, hosted_caps_json, "\"hosted_profile\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hosted_caps_json, "\"manual_maintenance\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hosted_caps_json, "\"background_enrichment_runtime\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hosted_caps_json, "\"ttl_cleanup_runtime\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hosted_caps_json, "\"transaction_recovery_runtime\":false") != null);
+
+    const index_json =
+        \\{"name":"full_text_index_v0","kind":"full_text","config_json":"{}"}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_index_json(hosted_handle, .{
+        .ptr = index_json,
+        .len = index_json.len,
+    }));
+
+    const writes = [_]capi.WriteIntent{.{
+        .key = .{ .ptr = "doc:capi-lite-profile", .len = "doc:capi-lite-profile".len },
+        .value = .{ .ptr = "{\"title\":\"hosted\"}", .len = "{\"title\":\"hosted\"}".len },
+        .is_delete = false,
+    }};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch(hosted_handle, &writes, writes.len, null, 0, 1_000, 0));
+
+    var pending_before: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_pending_work_stats_json(hosted_handle, &pending_before));
+    defer antfly_db_buffer_free(pending_before.ptr, pending_before.len);
+    try std.testing.expect(std.mem.indexOf(u8, pending_before.ptr.?[0..pending_before.len], "\"has_async_indexes\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pending_before.ptr.?[0..pending_before.len], "\"derived_target_sequence\":") != null);
+
+    var idle_after: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle_json(hosted_handle, &idle_after));
+    defer antfly_db_buffer_free(idle_after.ptr, idle_after.len);
+    try std.testing.expect(std.mem.indexOf(u8, idle_after.ptr.?[0..idle_after.len], "\"text_merge\"") != null);
+
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(hosted_handle));
+
+    const hosted_query =
+        \\{"full_text_search":{"match":{"field":"title","text":"hosted"}},"limit":1}
+    ;
+    var hosted_search: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_json(hosted_handle, .{
+        .ptr = hosted_query,
+        .len = hosted_query.len,
+    }, &hosted_search));
+    defer antfly_db_buffer_free(hosted_search.ptr, hosted_search.len);
+    try std.testing.expect(std.mem.indexOf(u8, hosted_search.ptr.?[0..hosted_search.len], "\"doc:capi-lite-profile\"") != null);
+
+    antfly_db_close(hosted_handle);
+    hosted_handle = null;
+
+    var status_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_status_only(path, &status_handle));
+    defer antfly_db_close(status_handle);
+
+    var status_caps: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_capabilities_json(status_handle, &status_caps));
+    defer antfly_db_buffer_free(status_caps.ptr, status_caps.len);
+    const status_caps_json = status_caps.ptr.?[0..status_caps.len];
+    try std.testing.expect(std.mem.indexOf(u8, status_caps_json, "\"hosted_profile\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_caps_json, "\"manual_maintenance\":false") != null);
+
+    var stats: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_stats_json(status_handle, &stats));
+    defer antfly_db_buffer_free(stats.ptr, stats.len);
+    try std.testing.expect(std.mem.indexOf(u8, stats.ptr.?[0..stats.len], "\"doc_count\":") != null);
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_batch(status_handle, &writes, writes.len, null, 0, 2_000, 0));
+}
+
+test "capi lite open options validate and configure ttl cleanup" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, "capi-lite-open-options");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    try std.testing.expectEqual(@as(u32, @intCast(@sizeOf(capi.LiteOpenOptions))), antfly_lite_open_options_size());
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open_options_init(null));
+    try std.testing.expectEqual(@as(u32, @intCast(@sizeOf(capi.OpenOptions))), antfly_open_options_size());
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_open_options_init(null));
+
+    var generic_defaults = capi.OpenOptions{
+        .abi_size = 0,
+        .storage_kind = 99,
+        .open_mode = 99,
+        .profile = 99,
+        .flags = std.math.maxInt(u32),
+        .reserved0 = 1,
+        .reserved = .{1} ** 8,
+    };
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&generic_defaults));
+    try std.testing.expectEqual(@as(u32, @sizeOf(capi.OpenOptions)), generic_defaults.abi_size);
+    try std.testing.expectEqual(capi.storage_kind_directory, generic_defaults.storage_kind);
+    try std.testing.expectEqual(capi.open_mode_writer, generic_defaults.open_mode);
+    try std.testing.expectEqual(capi.profile_native, generic_defaults.profile);
+    try std.testing.expectEqual(@as(u32, 0), generic_defaults.flags);
+    try std.testing.expectEqual(@as(u32, 0), generic_defaults.reserved0);
+    for (generic_defaults.reserved) |word| try std.testing.expectEqual(@as(u64, 0), word);
+
+    var defaults = capi.LiteOpenOptions{
+        .abi_size = 0,
+        .open_mode = 99,
+        .profile = 99,
+        .flags = std.math.maxInt(u32),
+        .map_size = std.math.maxInt(u64),
+        .ttl_cleanup_enabled = true,
+        .reserved = .{1} ** 8,
+    };
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_options_init(&defaults));
+    try std.testing.expectEqual(@as(u32, @sizeOf(capi.LiteOpenOptions)), defaults.abi_size);
+    try std.testing.expectEqual(capi.lite_open_mode_writer, defaults.open_mode);
+    try std.testing.expectEqual(capi.lite_profile_native, defaults.profile);
+    try std.testing.expectEqual(@as(u32, 0), defaults.flags);
+    try std.testing.expectEqual(@as(u64, 0), defaults.map_size);
+    try std.testing.expect(!defaults.ttl_cleanup_enabled);
+    for (defaults.reserved) |word| try std.testing.expectEqual(@as(u64, 0), word);
+
+    var default_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_with_options(path, &defaults, &default_handle));
+    antfly_db_close(default_handle);
+    default_handle = null;
+
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_with_options(path, &defaults, &default_handle));
+    antfly_db_close(default_handle);
+    default_handle = null;
+    cleanupTestFile(path);
+
+    var prefix_lite_options = capi.LiteOpenOptions{
+        .abi_size = @offsetOf(capi.LiteOpenOptions, "flags"),
+        .open_mode = capi.lite_open_mode_readonly,
+        .profile = capi.lite_profile_native,
+        .flags = std.math.maxInt(u32),
+        .reserved = .{1} ** 8,
+    };
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_with_options(path, &defaults, &default_handle));
+    antfly_db_close(default_handle);
+    default_handle = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_with_options(path, &prefix_lite_options, &default_handle));
+    antfly_db_close(default_handle);
+    default_handle = null;
+    cleanupTestFile(path);
+
+    var generic_lite_options = capi.OpenOptions{
+        .storage_kind = capi.storage_kind_lite,
+    };
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &generic_lite_options, &default_handle));
+    antfly_db_close(default_handle);
+    default_handle = null;
+    generic_lite_options.open_mode = capi.open_mode_readonly;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(path, &generic_lite_options, &default_handle));
+    antfly_db_close(default_handle);
+    default_handle = null;
+    cleanupTestFile(path);
+
+    const dir_path = try tempTestPath(alloc, "capi-generic-directory-open");
+    defer alloc.free(dir_path);
+    cleanupTestDir(dir_path);
+    defer cleanupTestDir(dir_path);
+    var directory_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_create_with_options(dir_path, &generic_defaults, &directory_handle));
+    try std.testing.expectEqual(@as(?*anyopaque, null), directory_handle);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(dir_path, &generic_defaults, &directory_handle));
+    const generic_writes = [_]capi.WriteIntent{.{
+        .key = .{ .ptr = "doc:generic", .len = "doc:generic".len },
+        .value = .{ .ptr = "{\"title\":\"generic\"}", .len = "{\"title\":\"generic\"}".len },
+        .is_delete = false,
+    }};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch(directory_handle, &generic_writes, generic_writes.len, null, 0, 1_000, 0));
+    antfly_db_close(directory_handle);
+    directory_handle = null;
+    var generic_readonly = capi.OpenOptions{
+        .storage_kind = capi.storage_kind_directory,
+        .open_mode = capi.open_mode_readonly,
+    };
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(dir_path, &generic_readonly, &directory_handle));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_batch(directory_handle, &generic_writes, generic_writes.len, null, 0, 2_000, 0));
+    antfly_db_close(directory_handle);
+    directory_handle = null;
+
+    var sentinel: u8 = 0;
+    var invalid_handle: ?*anyopaque = &sentinel;
+    var invalid_options = capi.LiteOpenOptions{
+        .abi_size = @sizeOf(capi.LiteOpenOptions),
+        .open_mode = 99,
+    };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open_with_options(path, &invalid_options, &invalid_handle));
+    try std.testing.expect(invalid_handle == null);
+
+    var hosted_ttl_handle: ?*anyopaque = &sentinel;
+    var hosted_ttl_options = capi.LiteOpenOptions{
+        .abi_size = @sizeOf(capi.LiteOpenOptions),
+        .profile = capi.lite_profile_hosted,
+        .flags = capi.lite_open_flag_ttl_cleanup,
+        .ttl_cleanup_enabled = true,
+    };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open_with_options(path, &hosted_ttl_options, &hosted_ttl_handle));
+    try std.testing.expect(hosted_ttl_handle == null);
+
+    var hosted_generated_replay_handle: ?*anyopaque = &sentinel;
+    var hosted_generated_replay_options = capi.LiteOpenOptions{
+        .abi_size = @sizeOf(capi.LiteOpenOptions),
+        .profile = capi.lite_profile_hosted,
+        .flags = capi.lite_open_flag_generated_enrichment_replay,
+    };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open_with_options(path, &hosted_generated_replay_options, &hosted_generated_replay_handle));
+    try std.testing.expect(hosted_generated_replay_handle == null);
+
+    const owner_id = "capi-ttl-owner";
+    var open_options = capi.LiteOpenOptions{
+        .abi_size = @sizeOf(capi.LiteOpenOptions),
+        .flags = capi.lite_open_flag_no_sync | capi.lite_open_flag_ttl_cleanup,
+        .ttl_cleanup_enabled = true,
+        .ttl_cleanup_lease_owned = true,
+        .ttl_cleanup_batch_size = 8,
+        .ttl_cleanup_owner_id = .{ .ptr = owner_id, .len = owner_id.len },
+        .ttl_cleanup_lease_ttl_ms = 250,
+        .ttl_cleanup_interval_ms = 10,
+        .ttl_cleanup_grace_period_ns = 1,
+    };
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_with_options(path, &open_options, &handle));
+    defer antfly_db_close(handle);
+
+    const schema_json =
+        \\{"default_type":"doc","ttl_duration_ns":1,"ttl_field":"expires_at","document_schemas":{"doc":{"schema":{"type":"object","properties":{"expires_at":{"type":"datetime"},"title":{"type":"text"}}}}}}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_schema_json(handle, .{
+        .ptr = schema_json,
+        .len = schema_json.len,
+    }));
+
+    const doc_json = "{\"title\":\"gone\",\"expires_at\":1}";
+    const writes = [_]capi.WriteIntent{.{
+        .key = .{ .ptr = "doc:expired", .len = "doc:expired".len },
+        .value = .{ .ptr = doc_json, .len = doc_json.len },
+        .is_delete = false,
+    }};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch(handle, &writes, writes.len, null, 0, 1, 0));
+
+    var stats: capi.Buffer = .{};
+    var attempts: usize = 0;
+    while (attempts < 200) : (attempts += 1) {
+        antfly_db_buffer_free(stats.ptr, stats.len);
+        stats = .{};
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_stats_json(handle, &stats));
+        const stats_json = stats.ptr.?[0..stats.len];
+        if (std.mem.indexOf(u8, stats_json, "\"enabled\":true") != null and
+            std.mem.indexOf(u8, stats_json, "\"lease_owned\":true") != null and
+            std.mem.indexOf(u8, stats_json, "\"deleted_docs\":1") != null and
+            std.mem.indexOf(u8, stats_json, "\"scanned_timestamps\":1") != null)
+        {
+            break;
+        }
+        antfly.platform_clock.Clock.real().sleepMs(10);
+    }
+    defer antfly_db_buffer_free(stats.ptr, stats.len);
+    try std.testing.expect(attempts < 200);
 }
 
 test "capi execute graph queries honors identity read generation" {

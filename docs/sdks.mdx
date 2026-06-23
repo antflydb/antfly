@@ -14,6 +14,23 @@ Antfly provides type-safe client libraries for Go, TypeScript, Python, and Rust.
 | Python | `antfly-sdk` | [PyPI](https://pypi.org/project/antfly-sdk/) | [GitHub](https://github.com/antflydb/antfly/tree/main/py/packages/sdk) |
 | Rust | `antfly-sdk` | [crates.io](https://crates.io/crates/antfly-sdk) | [GitHub](https://github.com/antflydb/antfly/tree/main/rs/crates/sdk) |
 
+## Embedded Lite Binding
+
+Antfly Lite embeds Antfly directly in an application process with a live
+`.aflite` database file. The first Lite binding above Zig and C is Go:
+
+```bash
+go get github.com/antflydb/antfly/go/pkg/antflylite
+```
+
+The Lite binding is separate from the network SDK. Use
+`github.com/antflydb/antfly/go/pkg/sdk` for a running Antfly service and
+`github.com/antflydb/antfly/go/pkg/antflylite` for embedded local databases.
+
+See the [Antfly Lite guide](/docs/guides/lite) for CLI and Go embedded
+examples, and the [Antfly Lite migration guide](/docs/guides/lite-migration)
+for backup, restore, and promotion workflows.
+
 ## Installation
 
 <CodeTabs persistKey="sdk-lang" samples={[

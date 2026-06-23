@@ -16,6 +16,9 @@ pub const backend_adapter = @import("storage/backend_adapter.zig");
 pub const backend_types = @import("storage/backend_types.zig");
 pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
 pub const lsm_storage = lsm_backend.storage_io;
+pub const lite = @import("storage/lite/mod.zig");
+pub const lite_backend = lite.backend;
+pub const lite_native = lite.native;
 pub const host_environment = @import("storage/host_environment.zig");
 pub const object_storage = @import("storage/object_storage.zig");
 pub const db = @import("storage/db/db.zig");
@@ -31,11 +34,16 @@ pub const schema = @import("storage/schema.zig");
 pub const batch = @import("api/batch.zig");
 pub const query = @import("api/query.zig");
 pub const query_contract = @import("api/query_contract.zig");
+pub const backup_codec = @import("storage/backup_codec.zig");
+pub const portable_backup = @import("storage/portable_backup.zig");
 
 test {
     _ = backend_adapter;
     _ = backend_types;
     _ = lsm_backend;
+    _ = lite;
+    _ = lite_backend;
+    _ = lite_native;
     _ = host_environment;
     _ = object_storage;
     _ = db;
@@ -49,4 +57,6 @@ test {
     _ = batch;
     _ = query;
     _ = query_contract;
+    _ = backup_codec;
+    _ = portable_backup;
 }

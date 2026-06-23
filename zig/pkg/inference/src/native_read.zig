@@ -23,8 +23,11 @@ const metal_runtime = if (build_options.enable_metal) @import("backends/metal_ru
 const c_file = @import("util/c_file.zig");
 const model_manager_mod = @import("server/model_manager.zig");
 const native_backend_guard = @import("native_backend_guard.zig");
+const platform = @import("antfly_platform");
 const readers_mod = @import("readers/reader.zig");
+const reading_pipeline = @import("pipelines/reading.zig");
 const runtime = @import("runtime/root.zig");
+const compat = @import("io/compat.zig");
 
 const print = std.debug.print;
 
@@ -33,6 +36,7 @@ const BackendChoice = enum {
     onnx,
     native,
     metal,
+    cuda,
 };
 
 const Options = struct {
@@ -42,6 +46,27 @@ const Options = struct {
     prompt: ?[]const u8 = null,
     max_tokens: ?usize = null,
     cache_dtype: ?[]const u8 = null,
+    warmup_iters: usize = 1,
+    measure_iters: ?usize = null,
+    json_timing_path: ?[]const u8 = null,
+};
+
+const Timing = struct {
+    total_ns: u64,
+    avg_ns: u64,
+    p50_ns: u64,
+    p95_ns: u64,
+    min_ns: u64,
+    max_ns: u64,
+    iters: usize,
+};
+
+const ReadBenchmarkResult = struct {
+    load_ns: u64,
+    timing: Timing,
+    image_bytes: usize,
+    last_text: []const u8,
+    telemetry: reading_pipeline.ReadTelemetry,
 };
 
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
@@ -56,19 +81,37 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
     defer model_manager.deinit();
 
+    const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
+    if (debug_cuda_session) std.log.info("read: load reader start model={s}", .{opts.model_dir});
+    const load_start_ns = nowNs();
     var reader = try readers_mod.LoadedReader.loadFromDir(
         allocator,
         opts.model_dir,
         &model_manager.session_manager,
         &model_manager,
     );
-    defer reader.deinit();
+    const load_ns = nowNs() - load_start_ns;
+    if (debug_cuda_session) std.log.info("read: load reader done model={s}", .{opts.model_dir});
+    defer {
+        if (debug_cuda_session) std.log.info("read: reader deinit start model={s}", .{opts.model_dir});
+        reader.deinit();
+        if (debug_cuda_session) std.log.info("read: reader deinit done model={s}", .{opts.model_dir});
+    }
 
+    if (opts.measure_iters != null) {
+        const bench = try runWarmBenchmark(allocator, &reader, image_data, opts, load_ns);
+        defer allocator.free(bench.last_text);
+        try writeBenchmarkJson(allocator, io, opts.model_dir, opts, bench);
+        return;
+    }
+
+    if (debug_cuda_session) std.log.info("read: inference start model={s}", .{opts.model_dir});
     var result = try reader.read(image_data, .{
         .prompt = opts.prompt,
         .max_tokens = opts.max_tokens,
         .cache_dtype = opts.cache_dtype,
     });
+    if (debug_cuda_session) std.log.info("read: inference done model={s}", .{opts.model_dir});
     defer result.deinit();
     try writeResultJson(allocator, opts.model_dir, result);
 }
@@ -99,11 +142,25 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingMaxTokensValue;
             opts.max_tokens = try std.fmt.parseInt(usize, args[i], 10);
+            if (opts.max_tokens.? == 0) return error.InvalidMaxTokens;
         } else if (std.mem.eql(u8, arg, "--cache-dtype")) {
             i += 1;
             if (i >= args.len) return error.MissingCacheDtype;
             if (runtime.kv.pool.parseKvDType(args[i]) == null) return error.InvalidCacheDtype;
             opts.cache_dtype = args[i];
+        } else if (std.mem.eql(u8, arg, "--warmup-iters")) {
+            i += 1;
+            if (i >= args.len) return error.MissingWarmupIters;
+            opts.warmup_iters = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--measure-iters")) {
+            i += 1;
+            if (i >= args.len) return error.MissingMeasureIters;
+            opts.measure_iters = try std.fmt.parseInt(usize, args[i], 10);
+            if (opts.measure_iters.? == 0) return error.InvalidMeasureIters;
+        } else if (std.mem.eql(u8, arg, "--json-timing")) {
+            i += 1;
+            if (i >= args.len) return error.MissingJsonTimingPath;
+            opts.json_timing_path = args[i];
         } else {
             printUsage();
             return error.InvalidArguments;
@@ -111,6 +168,85 @@ fn parseArgs(args: []const []const u8) !Options {
     }
 
     return opts;
+}
+
+fn runWarmBenchmark(
+    allocator: std.mem.Allocator,
+    reader: *readers_mod.LoadedReader,
+    image_data: []const u8,
+    opts: Options,
+    load_ns: u64,
+) !ReadBenchmarkResult {
+    const read_opts = readers_mod.ReadOptions{
+        .prompt = opts.prompt,
+        .max_tokens = opts.max_tokens,
+        .cache_dtype = opts.cache_dtype,
+    };
+
+    for (0..opts.warmup_iters) |_| {
+        var result = try reader.read(image_data, read_opts);
+        result.deinit();
+    }
+
+    const measure_iters = opts.measure_iters orelse return error.InvalidMeasureIters;
+    const samples = try allocator.alloc(u64, measure_iters);
+    defer allocator.free(samples);
+
+    var last_text: []const u8 = "";
+    errdefer if (last_text.len > 0) allocator.free(last_text);
+    for (samples, 0..) |*sample, i| {
+        const start = nowNs();
+        var result = try reader.read(image_data, read_opts);
+        sample.* = nowNs() - start;
+        if (i + 1 == measure_iters) {
+            last_text = try allocator.dupe(u8, result.text);
+        }
+        result.deinit();
+    }
+
+    return .{
+        .load_ns = load_ns,
+        .timing = try timingFromSamples(allocator, samples),
+        .image_bytes = image_data.len,
+        .last_text = last_text,
+        .telemetry = reading_pipeline.lastReadTelemetry(),
+    };
+}
+
+fn timingFromSamples(allocator: std.mem.Allocator, samples: []const u64) !Timing {
+    if (samples.len == 0) return error.InvalidMeasureIters;
+    const sorted = try allocator.dupe(u64, samples);
+    defer allocator.free(sorted);
+    var total: u64 = 0;
+    for (samples) |sample| total += sample;
+    std.mem.sort(u64, sorted, {}, std.sort.asc(u64));
+    return .{
+        .total_ns = total,
+        .avg_ns = total / samples.len,
+        .p50_ns = sorted[percentileIndex(sorted.len, 50)],
+        .p95_ns = sorted[percentileIndex(sorted.len, 95)],
+        .min_ns = sorted[0],
+        .max_ns = sorted[sorted.len - 1],
+        .iters = samples.len,
+    };
+}
+
+fn percentileIndex(len: usize, percentile: usize) usize {
+    if (len <= 1) return 0;
+    const rank = (len * percentile + 99) / 100;
+    return @min(len - 1, if (rank == 0) 0 else rank - 1);
+}
+
+fn nowNs() u64 {
+    var ts: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts))) {
+        .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
+        else => return 0,
+    }
+}
+
+fn nsToMs(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1.0e6;
 }
 
 const ParsedInt = struct { value: i64, len: usize };
@@ -205,10 +341,111 @@ fn writeResultJson(allocator: std.mem.Allocator, model_name: []const u8, result:
     print("{s}", .{buf.items});
 }
 
+fn writeBenchmarkJson(allocator: std.mem.Allocator, io: std.Io, model_name: []const u8, opts: Options, result: ReadBenchmarkResult) !void {
+    var buf = std.ArrayListUnmanaged(u8).empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "{\"model\":");
+    try jsonEncodeString(&buf, allocator, model_name);
+    try buf.appendSlice(allocator, ",\"backend\":");
+    try jsonEncodeString(&buf, allocator, @tagName(opts.backend));
+    try buf.appendSlice(allocator, ",\"mode\":\"warm_read\"");
+    try buf.appendSlice(allocator, ",\"prompt\":");
+    if (opts.prompt) |prompt| {
+        try jsonEncodeString(&buf, allocator, prompt);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",\"max_tokens\":");
+    if (opts.max_tokens) |max_tokens| {
+        try appendIntJson(&buf, allocator, max_tokens);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",\"cache_dtype\":");
+    if (opts.cache_dtype) |cache_dtype| {
+        try jsonEncodeString(&buf, allocator, cache_dtype);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",\"image_bytes\":");
+    try appendIntJson(&buf, allocator, result.image_bytes);
+    try buf.appendSlice(allocator, ",\"warmup_iters\":");
+    try appendIntJson(&buf, allocator, opts.warmup_iters);
+    try buf.appendSlice(allocator, ",\"measure_iters\":");
+    try appendIntJson(&buf, allocator, result.timing.iters);
+    try buf.appendSlice(allocator, ",\"load_ms\":");
+    try appendFloatJson(&buf, allocator, nsToMs(result.load_ns));
+    try buf.appendSlice(allocator, ",\"avg_ms\":");
+    try appendFloatJson(&buf, allocator, nsToMs(result.timing.avg_ns));
+    try buf.appendSlice(allocator, ",\"p50_ms\":");
+    try appendFloatJson(&buf, allocator, nsToMs(result.timing.p50_ns));
+    try buf.appendSlice(allocator, ",\"p95_ms\":");
+    try appendFloatJson(&buf, allocator, nsToMs(result.timing.p95_ns));
+    try buf.appendSlice(allocator, ",\"min_ms\":");
+    try appendFloatJson(&buf, allocator, nsToMs(result.timing.min_ns));
+    try buf.appendSlice(allocator, ",\"max_ms\":");
+    try appendFloatJson(&buf, allocator, nsToMs(result.timing.max_ns));
+    try buf.appendSlice(allocator, ",\"total_ms\":");
+    try appendFloatJson(&buf, allocator, nsToMs(result.timing.total_ns));
+    try buf.appendSlice(allocator, ",\"generated_tokens\":");
+    if (result.telemetry.generated_tokens) |generated_tokens| {
+        try appendIntJson(&buf, allocator, generated_tokens);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",\"resident_decoder\":");
+    try appendBoolJson(&buf, allocator, result.telemetry.resident_decoder);
+    try buf.appendSlice(allocator, ",\"kv_cache\":");
+    try appendBoolJson(&buf, allocator, result.telemetry.kv_cache);
+    try buf.appendSlice(allocator, ",\"kv_cache_mode\":");
+    if (result.telemetry.kv_cache_mode) |mode| {
+        try jsonEncodeString(&buf, allocator, mode);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",\"lm_head_path\":");
+    if (result.telemetry.lm_head_path) |path| {
+        try jsonEncodeString(&buf, allocator, path);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",\"cuda_graph_replay\":");
+    try appendBoolJson(&buf, allocator, result.telemetry.cuda_graph_replay);
+    try buf.appendSlice(allocator, ",\"cuda_graph_capture_steps\":");
+    try appendIntJson(&buf, allocator, result.telemetry.cuda_graph_capture_steps);
+    try buf.appendSlice(allocator, ",\"cuda_graph_replay_steps\":");
+    try appendIntJson(&buf, allocator, result.telemetry.cuda_graph_replay_steps);
+    try buf.appendSlice(allocator, ",\"cuda_graph_fallback_reason\":");
+    if (result.telemetry.cuda_graph_fallback_reason) |reason| {
+        try jsonEncodeString(&buf, allocator, reason);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",\"last_text\":");
+    try jsonEncodeString(&buf, allocator, result.last_text);
+    try buf.appendSlice(allocator, "}\n");
+
+    if (opts.json_timing_path) |path| {
+        try compat.cwd().writeFile(io, .{ .sub_path = path, .data = buf.items });
+    }
+    print("{s}", .{buf.items});
+}
+
 fn appendFloatJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: anytype) !void {
     const value_str = try std.fmt.allocPrint(allocator, "{d}", .{value});
     defer allocator.free(value_str);
     try buf.appendSlice(allocator, value_str);
+}
+
+fn appendIntJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: anytype) !void {
+    const value_str = try std.fmt.allocPrint(allocator, "{d}", .{value});
+    defer allocator.free(value_str);
+    try buf.appendSlice(allocator, value_str);
+}
+
+fn appendBoolJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: bool) !void {
+    try buf.appendSlice(allocator, if (value) "true" else "false");
 }
 
 fn jsonEncodeString(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, s: []const u8) !void {
@@ -239,18 +476,22 @@ fn parseBackendChoice(value: []const u8) ?BackendChoice {
     if (std.mem.eql(u8, value, "onnx")) return .onnx;
     if (std.mem.eql(u8, value, "native")) return .native;
     if (std.mem.eql(u8, value, "metal")) return .metal;
+    if (std.mem.eql(u8, value, "cuda")) return .cuda;
     return null;
 }
 
 fn configureBackendPreference(session_manager: *backends.SessionManager, choice: BackendChoice) void {
     session_manager.preferred_backends = switch (choice) {
-        .auto => if (build_options.enable_metal)
+        .auto => if (build_options.enable_cuda)
+            &.{ backends.BackendType.onnx, backends.BackendType.cuda, backends.BackendType.native }
+        else if (build_options.enable_metal)
             &.{ backends.BackendType.onnx, backends.BackendType.metal, backends.BackendType.native }
         else
             &.{ backends.BackendType.onnx, backends.BackendType.native },
         .onnx => &.{backends.BackendType.onnx},
         .native => &.{backends.BackendType.native},
         .metal => if (build_options.enable_metal) &.{backends.BackendType.metal} else &.{backends.BackendType.native},
+        .cuda => if (build_options.enable_cuda) &.{backends.BackendType.cuda} else &.{backends.BackendType.native},
     };
 }
 
@@ -258,6 +499,7 @@ fn ensureRequestedBackendAvailable(choice: BackendChoice) !void {
     switch (choice) {
         .auto, .native => return,
         .onnx => return,
+        .cuda => if (!build_options.enable_cuda) return error.BackendUnavailable,
         .metal => {
             if (native_backend_guard.checkMetal(build_options.enable_metal, metal_runtime.metalDeviceAvailable())) |failure| {
                 native_backend_guard.printFailure(failure);
@@ -270,8 +512,9 @@ fn ensureRequestedBackendAvailable(choice: BackendChoice) !void {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference read <model-dir> <image-path> [--backend auto|onnx|native|metal] [--prompt <prompt>] [--max-tokens <n>] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3]
+        \\usage: antfly inference read <model-dir> <image-path> [--backend auto|onnx|native|metal|cuda] [--prompt <prompt>] [--max-tokens <n>] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--warmup-iters <n>] [--measure-iters <n>] [--json-timing <path>]
         \\  Runs local document/image reading and prints a JSON response to stdout.
+        \\  With --measure-iters, keeps the model loaded and prints warm request latency JSON. --json-timing also writes that JSON to a file.
         \\
     , .{});
 }
@@ -288,6 +531,12 @@ test "parseArgs accepts backend, prompt, and max tokens" {
         "128",
         "--cache-dtype",
         "turbo3",
+        "--warmup-iters",
+        "2",
+        "--measure-iters",
+        "3",
+        "--json-timing",
+        "/tmp/read.json",
     });
 
     try std.testing.expectEqualStrings("/tmp/model", opts.model_dir);
@@ -296,8 +545,24 @@ test "parseArgs accepts backend, prompt, and max tokens" {
     try std.testing.expectEqualStrings("<CAPTION>", opts.prompt.?);
     try std.testing.expectEqual(@as(?usize, 128), opts.max_tokens);
     try std.testing.expectEqualStrings("turbo3", opts.cache_dtype.?);
+    try std.testing.expectEqual(@as(usize, 2), opts.warmup_iters);
+    try std.testing.expectEqual(@as(?usize, 3), opts.measure_iters);
+    try std.testing.expectEqualStrings("/tmp/read.json", opts.json_timing_path.?);
+}
+
+test "parseArgs rejects zero max tokens" {
+    try std.testing.expectError(error.InvalidMaxTokens, parseArgs(&.{
+        "/tmp/model",
+        "/tmp/image.jpg",
+        "--max-tokens",
+        "0",
+    }));
 }
 
 test "parseBackendChoice accepts onnx" {
     try std.testing.expectEqual(BackendChoice.onnx, parseBackendChoice("onnx").?);
+}
+
+test "parseBackendChoice accepts cuda" {
+    try std.testing.expectEqual(BackendChoice.cuda, parseBackendChoice("cuda").?);
 }
