@@ -52,11 +52,11 @@ inference-e2e-models: ## Prefetch the curated inference E2E model set with `antf
 # TLA+ Verification Commands
 # ====================================================================================
 
-.PHONY: generate generated-check openapi-generate openapi-check snowball-generate snowball-check license-headers license-check tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-check-lsm tla-trace-raft tla-trace-txn
+.PHONY: generate generated-check openapi-generate openapi-check snowball-generate snowball-check cabi-header-generate cabi-header-check license-headers license-check tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-check-lsm tla-trace-raft tla-trace-txn
 
-generate: openapi-generate snowball-generate ## Regenerate checked-in generated sources.
+generate: openapi-generate snowball-generate cabi-header-generate ## Regenerate checked-in generated sources.
 
-generated-check: openapi-check snowball-check ## Check all checked-in generated sources are current.
+generated-check: openapi-check snowball-check cabi-header-check ## Check all checked-in generated sources are current.
 
 openapi-generate:
 	$(SCRIPTS_PY) ../scripts/join_public_openapi.py openapi.yaml
@@ -72,6 +72,12 @@ snowball-generate:
 
 snowball-check:
 	$(ZIG) build check-snowball
+
+cabi-header-generate:
+	$(SCRIPTS_PY) ../scripts/packaging/sync_cabi_header.py
+
+cabi-header-check:
+	$(SCRIPTS_PY) ../scripts/packaging/sync_cabi_header.py --check
 
 license-headers: ## Add license headers to first-party source files.
 	$(SCRIPTS_PY) ../scripts/license_headers.py

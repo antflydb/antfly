@@ -29,7 +29,7 @@ def load_module(name: str, path: Path):
 
 
 package_cli_release = load_module(
-    "package_cli_release_for_lite_cabi_test",
+    "package_cli_release_for_cabi_test",
     PACKAGING_DIR / "package_cli_release.py",
 )
 
@@ -56,8 +56,8 @@ def write_release_archive(root: Path, version: str, os_name: str, arch: str) -> 
     return archive
 
 
-class LiteCAbiPackagingTests(unittest.TestCase):
-    def test_python_and_npm_packages_preserve_lite_cabi_artifacts(self) -> None:
+class CAbiPackagingTests(unittest.TestCase):
+    def test_python_and_npm_packages_preserve_cabi_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             repo = root / "repo"
@@ -95,7 +95,7 @@ class LiteCAbiPackagingTests(unittest.TestCase):
             self.assertIn("antfly_cli/lib/libantfly.dylib", names)
             self.assertIn("antfly_cli/share/antfly/asset.txt", names)
 
-    def test_homebrew_formula_installs_lite_cabi_artifacts(self) -> None:
+    def test_homebrew_formula_installs_cabi_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             archive_dir = root / "archives"
