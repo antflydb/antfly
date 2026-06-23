@@ -386,7 +386,7 @@ pub fn encodeIndexListForTable(
     var first = true;
     var it = object.iterator();
     while (it.next()) |entry| {
-        if (isReservedIndexMetadataEntry(entry.key_ptr.*)) continue;
+        if (isReservedIndexMetadataEntry(entry.key_ptr.*) or isLegacyTypedPathMetadataConfig(entry.value_ptr.*)) continue;
         if (!first) try out.append(alloc, ',');
         first = false;
         try appendIndexStatus(alloc, &out, entry.key_ptr.*, entry.value_ptr.*, expected_group_ids, local_statuses);
@@ -482,7 +482,7 @@ pub fn encodeIndexConfigMap(
     var first = true;
     var it = object.iterator();
     while (it.next()) |entry| {
-        if (isReservedIndexMetadataEntry(entry.key_ptr.*)) continue;
+        if (isReservedIndexMetadataEntry(entry.key_ptr.*) or isLegacyTypedPathMetadataConfig(entry.value_ptr.*)) continue;
         if (!first) try out.append(alloc, ',');
         first = false;
         try appendJsonString(alloc, &out, entry.key_ptr.*);
@@ -544,6 +544,8 @@ pub fn lookupSingleIndexConfig(
     indexes_json: []const u8,
     index_name: []const u8,
 ) !?SingleIndexConfigLookup {
+    if (isReservedIndexMetadataEntry(index_name)) return null;
+
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexesJsonSource(indexes_json), .{});
     errdefer parsed.deinit();
 
@@ -555,6 +557,10 @@ pub fn lookupSingleIndexConfig(
         parsed.deinit();
         return null;
     };
+    if (isLegacyTypedPathMetadataConfig(config)) {
+        parsed.deinit();
+        return null;
+    }
     return .{
         .parsed = parsed,
         .config = config,
@@ -607,7 +613,25 @@ fn indexesJsonSource(indexes_json: []const u8) []const u8 {
 }
 
 fn isReservedIndexMetadataEntry(name: []const u8) bool {
-    return std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments");
+    return std.mem.eql(u8, name, "resolvers") or
+        std.mem.eql(u8, name, "enrichments") or
+        std.mem.eql(u8, name, "typed_paths");
+}
+
+fn isLegacyTypedPathMetadataConfig(value: std.json.Value) bool {
+    if (value != .object) return false;
+    const type_value = value.object.get("type") orelse return false;
+    if (type_value != .string) return false;
+    // Earlier branch builds accepted scalar-shaped entries under `indexes`.
+    // They are metadata only and must not be surfaced as public index configs.
+    return std.mem.eql(u8, type_value.string, "scalar") or
+        std.mem.eql(u8, type_value.string, "path") or
+        std.mem.eql(u8, type_value.string, "secondary") or
+        std.mem.eql(u8, type_value.string, "keyword") or
+        std.mem.eql(u8, type_value.string, "numeric") or
+        std.mem.eql(u8, type_value.string, "boolean") or
+        std.mem.eql(u8, type_value.string, "datetime") or
+        std.mem.eql(u8, type_value.string, "term");
 }
 
 fn expectedTableGroupIds(
@@ -2618,6 +2642,14 @@ test "single index config encoder infers shorthand embeddings type" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"name\":\"semantic_chunked_idx\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"type\":\"embeddings\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"dimension\":3") != null);
+}
+
+test "single index config encoder omits typed path metadata" {
+    try std.testing.expect((try encodeSingleIndexConfig(
+        std.testing.allocator,
+        "{\"typed_paths\":{\"numeric\":[\"metrics.score\"]}}",
+        "typed_paths",
+    )) == null);
 }
 
 test "single index helpers use default index metadata when indexes_json is empty" {

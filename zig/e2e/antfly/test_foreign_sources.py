@@ -584,7 +584,7 @@ def test_foreign_table_join_with_antfly(table_api, pg_customers_table):
                 "body": "order widget c",
             },
         },
-        sync_level="full_text" if table_api.backend == "stateful" else "write",
+        sync_level="query" if table_api.backend == "stateful" else "write",
     )
     assert batch["inserted"] == 3
 
@@ -661,7 +661,7 @@ def test_direct_foreign_table_join_with_antfly(table_api, pg_customers_table):
                 "body": "vip customer note",
             },
         },
-        sync_level="full_text" if table_api.backend == "stateful" else "write",
+        sync_level="query" if table_api.backend == "stateful" else "write",
     )
     assert batch["inserted"] == 2
     assert _wait_for_stateful_lookup(table_api, table_name, "cust-1", timeout_s=30.0, interval_s=0.25) is not None
@@ -738,7 +738,7 @@ def test_direct_foreign_table_right_join_with_antfly(table_api, pg_customers_tab
                 "body": "unmatched customer note",
             },
         },
-        sync_level="full_text" if table_api.backend == "stateful" else "write",
+        sync_level="query" if table_api.backend == "stateful" else "write",
     )
     assert batch["inserted"] == 2
     assert _wait_for_stateful_lookup(table_api, table_name, "cust-1", timeout_s=30.0, interval_s=0.25) is not None
@@ -841,7 +841,7 @@ def test_nested_foreign_leaf_join_with_antfly(table_api, pg_addresses_table):
             "cust-2": {"name": "Bob", "address_id": "addr-2"},
             "cust-3": {"name": "Charlie", "address_id": "addr-3"},
         },
-        sync_level="full_text" if table_api.backend == "stateful" else "write",
+        sync_level="query" if table_api.backend == "stateful" else "write",
     )
     assert customer_batch["inserted"] == 3
 
@@ -859,7 +859,7 @@ def test_nested_foreign_leaf_join_with_antfly(table_api, pg_addresses_table):
                 "body": "customer order b",
             },
         },
-        sync_level="full_text" if table_api.backend == "stateful" else "write",
+        sync_level="query" if table_api.backend == "stateful" else "write",
     )
     assert docs_batch["inserted"] == 2
 
@@ -992,7 +992,7 @@ def test_foreign_table_nested_foreign_leaf_join(table_api, pg_customers_table, p
                 "body": "order widget b",
             },
         },
-        sync_level="full_text" if table_api.backend == "stateful" else "write",
+        sync_level="query" if table_api.backend == "stateful" else "write",
     )
     assert batch["inserted"] == 2
 

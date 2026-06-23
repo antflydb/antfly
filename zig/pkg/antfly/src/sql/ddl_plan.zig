@@ -629,6 +629,15 @@ pub fn parseDdlPlanAlloc(
     if (cursor.matchKeyword("set")) {
         if (cursor.peekKeyword("constraints")) return .{ .transaction_control = .{ .constraint_mode = try parseConstraintModePlanTailAlloc(alloc, tokens, pos) } };
         if (cursor.peekKeyword("transaction")) return .{ .transaction_control = .{ .transaction_mode = try parseTransactionModePlanTail(tokens, pos, .set_transaction) } };
+        if (cursor.peekKeyword("session")) {
+            const checkpoint = pos.*;
+            if (parseSetSessionCharacteristicsPlanTailAlloc(alloc, tokens, pos)) |plan| {
+                return .{ .session_catalog = .{ .set_setting = plan } };
+            } else |err| switch (err) {
+                error.UnsupportedSqlShape => pos.* = checkpoint,
+                else => return err,
+            }
+        }
         if (cursor.peekKeyword("local") or cursor.peekKeyword("session") or cursor.peekKeyword("search_path")) {
             const checkpoint = pos.*;
             if (parseSetSearchPathPlanTailAlloc(alloc, tokens, pos)) |plan| {
@@ -3706,6 +3715,34 @@ pub fn parseTransactionModePlanTail(
 ) !TransactionModePlan {
     const syntax = try grammar.parseTransactionModeTail(tokens, pos, transactionModeStarterToSyntax(starter));
     return transactionModePlanFromSyntax(syntax);
+}
+
+pub fn parseSetSessionCharacteristicsPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !SetSessionSettingPlan {
+    var cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("session");
+    try cursor.expectKeyword("characteristics");
+    try cursor.expectKeyword("as");
+    const transaction = try parseTransactionModePlanTail(tokens, pos, .begin);
+    if (transaction.isolation_level != null or transaction.deferrable != null) return error.UnsupportedSqlShape;
+    const access_mode = transaction.access_mode orelse return error.UnsupportedSqlShape;
+    const value = switch (access_mode) {
+        .read_only => "on",
+        .read_write => "off",
+    };
+    const name_owned = try alloc.dupe(u8, "default_transaction_read_only");
+    errdefer alloc.free(name_owned);
+    const value_owned = try alloc.dupe(u8, value);
+    errdefer alloc.free(value_owned);
+    return .{
+        .name = name_owned,
+        .value = value_owned,
+        .kind = .runtime,
+        .local = false,
+    };
 }
 
 pub fn parseAdvisoryLockPlanTail(
@@ -11337,6 +11374,34 @@ test "sql adapter ddl plan lowers session catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
+    var set_transaction_read_only = try lowerDdlPlanForTestAlloc(alloc, "SET default_transaction_read_only = on;");
+    defer set_transaction_read_only.deinit(alloc);
+    switch (set_transaction_read_only) {
+        .session_catalog => |plan| switch (plan) {
+            .set_setting => |set| {
+                try std.testing.expectEqualStrings("default_transaction_read_only", set.name);
+                try std.testing.expectEqualStrings("on", set.value);
+                try std.testing.expectEqual(SessionSettingKind.runtime, set.kind);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var set_session_transaction_read_only = try lowerDdlPlanForTestAlloc(alloc, "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;");
+    defer set_session_transaction_read_only.deinit(alloc);
+    switch (set_session_transaction_read_only) {
+        .session_catalog => |plan| switch (plan) {
+            .set_setting => |set| {
+                try std.testing.expectEqualStrings("default_transaction_read_only", set.name);
+                try std.testing.expectEqualStrings("on", set.value);
+                try std.testing.expectEqual(SessionSettingKind.runtime, set.kind);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     var reset_app_setting = try lowerDdlPlanForTestAlloc(alloc, "RESET app.tenant_id;");
     defer reset_app_setting.deinit(alloc);
     switch (reset_app_setting) {
@@ -14502,7 +14567,7 @@ test "SQL adapter DDL domain plans own nested defaults and checks" {
     };
     var create: DomainCatalogPlan = .{ .create = .{
         .domain_name = try alloc.dupe(u8, "status_text"),
-        .field_type = .string,
+        .field_type = .text,
         .not_null = true,
         .default_value = .{
             .kind = .literal,

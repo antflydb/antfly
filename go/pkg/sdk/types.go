@@ -221,6 +221,9 @@ type (
 	RowsQueryResultSet                        = oapi.RowsQueryResultSet
 	RowsAggregateResultSet                    = oapi.RowsAggregateResultSet
 	RowsStreamResultSet                       = oapi.RowsStreamResultSet
+	SqlStatementRequest                       = oapi.SqlStatementRequest
+	SqlStatementResponse                      = oapi.SqlStatementResponse
+	SqlStatementResponseKind                  = oapi.SqlStatementResponseKind
 
 	// Transform types for MongoDB-style atomic updates
 	Transform       = oapi.Transform
@@ -470,10 +473,14 @@ const (
 	// SyncLevel values
 	SyncLevelPropose     = oapi.SyncLevelPropose
 	SyncLevelWrite       = oapi.SyncLevelWrite
-	SyncLevelFullText    = oapi.SyncLevelFullText
-	SyncLevelAknn        = oapi.SyncLevelAknn
+	SyncLevelQuery       = oapi.SyncLevelQuery
 	SyncLevelFullIndex   = oapi.SyncLevelFullIndex
 	SyncLevelEnrichments = oapi.SyncLevelEnrichments
+
+	// SQL statement response kinds
+	SqlStatementResponseKindDdl   = oapi.SqlStatementResponseKindDdl
+	SqlStatementResponseKindRead  = oapi.SqlStatementResponseKindRead
+	SqlStatementResponseKindWrite = oapi.SqlStatementResponseKindWrite
 
 	// RouteType values
 	RouteTypeQuestion = oapi.RouteTypeQuestion
@@ -629,9 +636,6 @@ const (
 	TransformOpTypePop         = oapi.TransformOpTypePop
 	TransformOpTypeRename      = oapi.TransformOpTypeRename
 	TransformOpTypeCurrentDate = oapi.TransformOpTypeCurrentDate
-
-	// SyncLevel embeddings (renamed from SyncLevelAknn)
-	SyncLevelEmbeddings = oapi.SyncLevelAknn
 
 	// EdgeDirection values
 	EdgeDirectionBoth = oapi.EdgeDirectionBoth

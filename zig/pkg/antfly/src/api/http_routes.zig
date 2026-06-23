@@ -153,6 +153,7 @@ pub const Routes = struct {
     pub const indexes_suffix = "/indexes";
     pub const indexes_marker = "/indexes/";
     pub const graph_metrics_marker = "/graph-metrics/";
+    pub const graph_metric_actions_marker = "/actions/";
     pub const reprocess_jobs_suffix = "/reprocess-jobs";
     pub const reprocess_jobs_marker = "/reprocess-jobs/";
     pub const enrichment_suffix = "/enrichment";
@@ -827,9 +828,9 @@ pub const Routes = struct {
         if (index_name.len == 0 or std.mem.indexOfScalar(u8, index_name, '/') != null) return null;
 
         const metric_action = index_and_metric[graph_metric_marker_index + graph_metrics_marker.len ..];
-        const action_index = std.mem.lastIndexOfScalar(u8, metric_action, ':') orelse return null;
+        const action_index = std.mem.indexOf(u8, metric_action, graph_metric_actions_marker) orelse return null;
         const metric_name = metric_action[0..action_index];
-        const action = metric_action[action_index + 1 ..];
+        const action = metric_action[action_index + graph_metric_actions_marker.len ..];
         if (metric_name.len == 0 or action.len == 0) return null;
         if (std.mem.indexOfScalar(u8, metric_name, '/') != null) return null;
         if (std.mem.indexOfScalar(u8, action, '/') != null) return null;
@@ -1733,12 +1734,12 @@ test "public api routes compile" {
     try std.testing.expectEqualStrings("docs", index.table_name);
     try std.testing.expectEqualStrings("search_idx", index.index_name);
     try std.testing.expect(Routes.matchTableIndex("/tables/docs/indexes/search_idx/algebraic") == null);
-    const graph_metric = Routes.matchTableGraphMetric("/tables/docs/indexes/graph_idx/graph-metrics/pagerank:refresh").?;
+    const graph_metric = Routes.matchTableGraphMetric("/tables/docs/indexes/graph_idx/graph-metrics/pagerank/actions/refresh").?;
     try std.testing.expectEqualStrings("docs", graph_metric.table_name);
     try std.testing.expectEqualStrings("graph_idx", graph_metric.index_name);
     try std.testing.expectEqualStrings("pagerank", graph_metric.metric_name);
     try std.testing.expectEqualStrings("refresh", graph_metric.action);
-    try std.testing.expect(Routes.matchTableIndex("/tables/docs/indexes/graph_idx/graph-metrics/pagerank:refresh") == null);
+    try std.testing.expect(Routes.matchTableIndex("/tables/docs/indexes/graph_idx/graph-metrics/pagerank/actions/refresh") == null);
     const artifact = Routes.matchTableDocumentArtifact("/tables/docs/documents/doc%2Fa/artifacts/document_units_v1").?;
     try std.testing.expectEqualStrings("docs", artifact.table_name);
     try std.testing.expectEqualStrings("doc%2Fa", artifact.key);

@@ -173,6 +173,37 @@ func (c *AntflyClient) Query(ctx context.Context, opts ...QueryRequest) (*QueryR
 	return &result, nil
 }
 
+// ExecuteSQL executes one SQL statement through Antfly's public SQL ingress.
+// Reuse the returned session_id on later calls when session state must persist.
+func (c *AntflyClient) ExecuteSQL(ctx context.Context, request SqlStatementRequest) (*SqlStatementResponse, error) {
+	reqBody, err := json.Marshal(request)
+	if err != nil {
+		return nil, fmt.Errorf("marshalling sql request: %w", err)
+	}
+
+	resp, err := c.client.ExecuteSqlWithBody(ctx, "application/json", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("sql execution failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("sql execution failed: %w", readErrorResponse(resp))
+	}
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading sql response body: %w", err)
+	}
+
+	var result SqlStatementResponse
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return nil, fmt.Errorf("parsing sql response: %w", err)
+	}
+
+	return &result, nil
+}
+
 // Batch performs a batch operation on a table
 func (c *AntflyClient) Batch(ctx context.Context, tableName string, request BatchRequest) (*BatchResult, error) {
 	return c.BatchWithOptions(ctx, tableName, request, WriteOptions{})

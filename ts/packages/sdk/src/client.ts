@@ -42,6 +42,8 @@ import type {
   RetrievalAgentResult,
   RetrievalAgentStreamCallbacks,
   ScanKeysRequest,
+  SqlStatementRequest,
+  SqlStatementResponse,
   TableSchema,
   User,
   WriteOptions,
@@ -438,6 +440,35 @@ export class AntflyClient {
    */
   async multiquery(requests: QueryRequest[]): Promise<QueryResponses | undefined> {
     return this.performMultiquery("/db/v1/query", requests);
+  }
+
+  /**
+   * SQL statement operations.
+   */
+  sql = {
+    /**
+     * Execute a SQL statement through the public SQL ingress.
+     *
+     * Reuse the returned session_id on subsequent calls when session state
+     * should persist across statements.
+     */
+    execute: async (request: SqlStatementRequest): Promise<SqlStatementResponse> => {
+      const { data, error } = await this.client.POST("/db/v1/sql", {
+        body: request,
+      });
+      if (error) throw new Error(`SQL execution failed: ${apiErrorMessage(error)}`);
+      if (!data) throw new Error("SQL execution failed: unexpected empty response");
+      return data;
+    },
+  };
+
+  /**
+   * Execute one SQL statement through Antfly's public SQL ingress.
+   *
+   * This is an ergonomic alias for `client.sql.execute(request)`.
+   */
+  async executeSql(request: SqlStatementRequest): Promise<SqlStatementResponse> {
+    return this.sql.execute(request);
   }
 
   /**

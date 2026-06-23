@@ -31003,9 +31003,8 @@ test "sql adapter lower expr disambiguates select all extra outputs" {
     try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.field_aliases.len);
     try std.testing.expectEqualStrings("status", lowered.plan.query.field_aliases[0].field);
     try std.testing.expectEqualStrings("status_3", lowered.plan.query.field_aliases[0].output);
-    try std.testing.expectEqual(@as(usize, 2), lowered.select_outputs.len);
-    try std.testing.expectEqual(ast.SelectOutputKind.expression, lowered.select_outputs[0].kind);
-    try std.testing.expectEqual(ast.SelectOutputKind.field_alias, lowered.select_outputs[1].kind);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expressions.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.field_aliases.len);
 }
 
 test "sql adapter lower expr lowers coalesce projections" {

@@ -8868,7 +8868,7 @@ test "http handler honors public serverless sync levels on table batch writes" {
         .method = .post,
         .path = "/tables/docs/batch",
         .body =
-        \\{"inserts":{"doc:a":{"body":"alpha sync level"}},"sync_level":"full_text"}
+        \\{"inserts":{"doc:a":{"body":"alpha sync level"}},"sync_level":"query"}
         ,
     });
     defer full_text_batch.deinit(alloc);

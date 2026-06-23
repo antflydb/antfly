@@ -712,15 +712,15 @@ test "metadata openapi module generates extractor surface for routed endpoints" 
 }
 
 test "public chunker config keeps flattened provider-specific fields" {
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "provider"));
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "max_chunks"));
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "threshold"));
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "text"));
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "audio"));
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "api_url"));
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "model"));
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "store_chunks"));
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "full_text_index"));
+    try std.testing.expect(@hasField(chunking_generated.ChunkerConfig, "provider"));
+    try std.testing.expect(@hasField(chunking_generated.ChunkerConfig, "max_chunks"));
+    try std.testing.expect(@hasField(chunking_generated.ChunkerConfig, "threshold"));
+    try std.testing.expect(@hasField(chunking_generated.ChunkerConfig, "text"));
+    try std.testing.expect(@hasField(chunking_generated.ChunkerConfig, "audio"));
+    try std.testing.expect(@hasField(chunking_generated.ChunkerConfig, "api_url"));
+    try std.testing.expect(@hasField(chunking_generated.ChunkerConfig, "model"));
+    try std.testing.expect(@hasField(chunking_generated.ChunkerConfig, "store_chunks"));
+    try std.testing.expect(@hasField(chunking_generated.ChunkerConfig, "full_text_index"));
 }
 
 test "public bundled root still exposes foreign-owned shared contract types" {

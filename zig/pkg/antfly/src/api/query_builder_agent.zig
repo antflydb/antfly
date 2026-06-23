@@ -47,6 +47,14 @@ pub const GenerationRunner = struct {
     }
 };
 
+fn testChatMessageText(message: generating.ChatMessage) []const u8 {
+    const content = message.content orelse return "";
+    return switch (content) {
+        .text => |text| text,
+        .parts => "",
+    };
+}
+
 pub fn buildQueryBuilderResponse(
     alloc: std.mem.Allocator,
     request: metadata_openapi.QueryBuilderRequest,
@@ -5784,10 +5792,10 @@ test "query builder uses generated full text specialist when runner is provided"
             try std.testing.expectEqual(@as(usize, 1), chain.len);
             try std.testing.expectEqualStrings("local-generator", chain[0].generator.model);
             try std.testing.expectEqual(@as(usize, 2), messages.len);
-            try std.testing.expect(std.mem.indexOf(u8, messages[0].content, "Native Bleve") != null or std.mem.indexOf(u8, messages[0].content, "native Bleve") != null);
-            try std.testing.expect(std.mem.indexOf(u8, messages[0].content, "Full-text indexes:") != null);
-            try std.testing.expect(std.mem.indexOf(u8, messages[0].content, "search_idx fields: title, body") != null);
-            try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "raft snapshots") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[0]), "Native Bleve") != null or std.mem.indexOf(u8, testChatMessageText(messages[0]), "native Bleve") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[0]), "Full-text indexes:") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[0]), "search_idx fields: title, body") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "raft snapshots") != null);
             return .{
                 .content = try alloc.dupe(u8,
                     \\{"query":{"match_phrase":"raft snapshots","field":"body"},"explanation":"Uses phrase search over body.","confidence":0.91,"warnings":["checked schema fields"]}
@@ -5849,10 +5857,10 @@ test "query builder uses generated semantic specialist with embedding metadata p
             try std.testing.expectEqual(@as(usize, 1), chain.len);
             try std.testing.expectEqualStrings("local-generator", chain[0].generator.model);
             try std.testing.expectEqual(@as(usize, 2), messages.len);
-            try std.testing.expect(std.mem.indexOf(u8, messages[0].content, "Allowed dense embedding indexes:") != null);
-            try std.testing.expect(std.mem.indexOf(u8, messages[0].content, "body_embedding dense dimension: 384 model: e5-small") != null);
-            try std.testing.expect(std.mem.indexOf(u8, messages[0].content, "sparse_idx sparse model: splade") != null);
-            try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "raft snapshots") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[0]), "Allowed dense embedding indexes:") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[0]), "body_embedding dense dimension: 384 model: e5-small") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[0]), "sparse_idx sparse model: splade") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "raft snapshots") != null);
             return .{
                 .content = try alloc.dupe(u8,
                     \\{"semantic_search":"raft snapshot architecture","indexes":["body_embedding"],"full_text_search":null,"explanation":"Uses dense semantic retrieval.","confidence":0.88,"warnings":["kept sparse index out"]}
@@ -6053,8 +6061,8 @@ test "query builder uses generated hybrid specialist with full text validation" 
         ) !generating.GenerateResult {
             try std.testing.expectEqual(@as(usize, 1), chain.len);
             try std.testing.expectEqual(@as(usize, 2), messages.len);
-            try std.testing.expect(std.mem.indexOf(u8, messages[0].content, "Hybrid mode must also include full_text_search") != null);
-            try std.testing.expect(std.mem.indexOf(u8, messages[0].content, "search_idx fields: title, body") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[0]), "Hybrid mode must also include full_text_search") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[0]), "search_idx fields: title, body") != null);
             return .{
                 .content = try alloc.dupe(u8,
                     \\{"semantic_search":"raft snapshot architecture","indexes":["body_embedding"],"full_text_search":{"match_phrase":"raft snapshots","field":"body"},"explanation":"Combines phrase search with dense retrieval.","confidence":0.9,"warnings":[]}
@@ -6916,8 +6924,8 @@ test "query builder repairs invalid generated full text once" {
             }
 
             try std.testing.expectEqual(@as(usize, 3), messages.len);
-            try std.testing.expect(std.mem.indexOf(u8, messages[2].content, "failed validation") != null);
-            try std.testing.expect(std.mem.indexOf(u8, messages[2].content, "Return only the corrected JSON object") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[2]), "failed validation") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[2]), "Return only the corrected JSON object") != null);
             return .{
                 .content = try alloc.dupe(u8,
                     \\{"query":{"match_phrase":"raft consensus","field":"body"},"explanation":"Repaired to use a schema field.","confidence":0.88}
@@ -6983,8 +6991,8 @@ test "query builder repairs generated full text from plan validator feedback" {
             }
 
             try std.testing.expectEqual(@as(usize, 3), messages.len);
-            try std.testing.expect(std.mem.indexOf(u8, messages[2].content, "Query-builder plan validation feedback") != null);
-            try std.testing.expect(std.mem.indexOf(u8, messages[2].content, "full-text validator rejected") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[2]), "Query-builder plan validation feedback") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[2]), "full-text validator rejected") != null);
             return .{
                 .content = try alloc.dupe(u8,
                     \\{"query":{"match_phrase":"raft snapshot","field":"body"},"explanation":"Repaired from full-text validator feedback.","confidence":0.9}
@@ -7068,11 +7076,11 @@ test "query builder uses generated graph specialist when runner is provided" {
             try std.testing.expectEqual(@as(usize, 1), chain.len);
             try std.testing.expectEqualStrings("local-generator", chain[0].generator.model);
             try std.testing.expectEqual(@as(usize, 2), messages.len);
-            try std.testing.expect(std.mem.indexOf(u8, messages[0].content, "GraphQuery") != null);
-            try std.testing.expect(std.mem.indexOf(u8, messages[0].content, "doc_graph") != null);
-            try std.testing.expect(std.mem.indexOf(u8, messages[0].content, "references (graph)") != null);
-            try std.testing.expect(std.mem.indexOf(u8, messages[0].content, "parent (tree)") != null);
-            try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "related raft documents") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[0]), "GraphQuery") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[0]), "doc_graph") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[0]), "references (graph)") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[0]), "parent (tree)") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "related raft documents") != null);
             return .{
                 .content = try alloc.dupe(u8,
                     \\{"graph_searches":{"related":{"type":"neighbors","index_name":"doc_graph","start_nodes":{"result_ref":"$full_text_results","limit":5},"params":{"edge_types":["references"],"max_depth":1},"fields":["title"]}},"explanation":"Expands from lexical matches through reference edges.","confidence":0.87,"warnings":["used table graph index"]}
@@ -7148,8 +7156,8 @@ test "query builder repairs invalid generated graph plan once" {
             }
 
             try std.testing.expectEqual(@as(usize, 3), messages.len);
-            try std.testing.expect(std.mem.indexOf(u8, messages[2].content, "failed deterministic validation") != null);
-            try std.testing.expect(std.mem.indexOf(u8, messages[2].content, "Regenerate a valid response") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[2]), "failed deterministic validation") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[2]), "Regenerate a valid response") != null);
             return .{
                 .content = try alloc.dupe(u8,
                     \\{"graph_searches":{"repaired":{"type":"neighbors","index_name":"doc_graph","start_nodes":{"result_ref":"$full_text_results","limit":3},"params":{"edge_types":["references"],"max_depth":1}}},"explanation":"Repaired to use the table graph index.","confidence":0.72}
@@ -7220,8 +7228,8 @@ test "query builder repairs generated graph plan with unavailable seed ref" {
             }
 
             try std.testing.expectEqual(@as(usize, 3), messages.len);
-            try std.testing.expect(std.mem.indexOf(u8, messages[2].content, "Query-builder plan validation feedback") != null);
-            try std.testing.expect(std.mem.indexOf(u8, messages[2].content, "$embeddings_results") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[2]), "Query-builder plan validation feedback") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[2]), "$embeddings_results") != null);
             return .{
                 .content = try alloc.dupe(u8,
                     \\{"graph_searches":{"related":{"type":"neighbors","index_name":"doc_graph","start_nodes":{"result_ref":"$full_text_results","limit":3},"params":{"edge_types":["references"],"max_depth":1}}},"explanation":"Repaired to use the available lexical seed.","confidence":0.76}
@@ -7335,8 +7343,8 @@ test "query builder repairs generated graph plan from validator feedback" {
             }
 
             try std.testing.expectEqual(@as(usize, 3), messages.len);
-            try std.testing.expect(std.mem.indexOf(u8, messages[2].content, "Query-builder plan validation feedback") != null);
-            try std.testing.expect(std.mem.indexOf(u8, messages[2].content, "missing_edge") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[2]), "Query-builder plan validation feedback") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[2]), "missing_edge") != null);
             return .{
                 .content = try alloc.dupe(u8,
                     \\{"graph_searches":{"related":{"type":"neighbors","index_name":"doc_graph","start_nodes":{"result_ref":"$full_text_results"},"params":{"edge_types":["references"],"max_depth":1}}},"explanation":"Uses the available reference edge type.","confidence":0.84}

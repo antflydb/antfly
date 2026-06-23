@@ -24700,7 +24700,7 @@ test "relational rows query contract rejects shorthand equality and validates ty
     const range_start = try physicalPrimaryKeyFromRowJsonAlloc(std.testing.allocator, schema, rows[1]);
     var range_start_transferred = false;
     errdefer if (!range_start_transferred) std.testing.allocator.free(range_start);
-    const range_end = try physicalPrimaryKeyFromRowJsonAlloc(std.testing.allocator, schema, rows[3]);
+    const range_end = try physicalPrimaryKeyFromRowJsonAlloc(std.testing.allocator, schema, "{\"tenant_id\":\"t1\",\"id\":\"u4\",\"status\":\"active\",\"rank\":4}");
     var range_end_transferred = false;
     errdefer if (!range_end_transferred) std.testing.allocator.free(range_end);
     ranged_request.doc_key_range = .{ .start = range_start, .end = range_end };
@@ -27080,7 +27080,7 @@ test "relational rows insert source contract parses typed source assignments" {
 
     var insert_source_plan = try parseRowsInsertSourcePlanRequest(
         std.testing.allocator,
-        "{\"ctes\":[{\"name\":\"ready_sources\",\"query\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"READY\"},\"select\":[\"source_id\",\"status\",\"amount\"]}}],\"insert_source\":{\"op\":\"insert\",\"source\":{\"source_cte\":\"ready_sources\",\"order_by\":[{\"field\":\"amount\",\"direction\":\"desc\"}]},\"assignments\":[{\"target_field\":\"id\",\"expr\":{\"field\":\"source_id\"}},{\"target_field\":\"status\",\"expr\":{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]}},{\"target_field\":\"amount\",\"expr\":{\"op\":\"add\",\"args\":[{\"field\":\"amount\"},{\"value\":1}]}}],\"returning\":[\"id\",\"status\"]},\"sync_level\":\"full_text\"}",
+        "{\"ctes\":[{\"name\":\"ready_sources\",\"query\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"READY\"},\"select\":[\"source_id\",\"status\",\"amount\"]}}],\"insert_source\":{\"op\":\"insert\",\"source\":{\"source_cte\":\"ready_sources\",\"order_by\":[{\"field\":\"amount\",\"direction\":\"desc\"}]},\"assignments\":[{\"target_field\":\"id\",\"expr\":{\"field\":\"source_id\"}},{\"target_field\":\"status\",\"expr\":{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]}},{\"target_field\":\"amount\",\"expr\":{\"op\":\"add\",\"args\":[{\"field\":\"amount\"},{\"value\":1}]}}],\"returning\":[\"id\",\"status\"]},\"sync_level\":\"query\"}",
         schema,
     );
     defer insert_source_plan.deinit(std.testing.allocator);

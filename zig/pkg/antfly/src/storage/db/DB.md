@@ -94,6 +94,67 @@ does not recreate the same coupling across files:
   smallest shared owner instead of importing one implementation module from the
   other.
 
+## New Cross-Cutting Responsibilities
+
+Recent HA and Lite work adds DB-level contracts that should be preserved during
+any extraction. They are not just implementation details of callers.
+
+### HA Write Ownership and Mirrors
+
+`DB` now owns HA write admission and best-effort/synchronous mirror orchestration
+through `ha_write_gate`, `ha_async_effect_mirror`, `ha_async_batch_mirror`, and
+`ha_async_metadata_mirror`.
+
+Any extracted module that can mutate durable state must keep the current guard
+sequence local and visible:
+
+- reject read-only open modes with `openModeRequiresReadOnlyBackends`
+- call the HA write gate unless the path is an explicit replicated-apply path
+  with a narrowly scoped bypass option
+- preflight synchronous HA commit gates before applying local mutations
+- mirror committed batch/effect/metadata payloads after the local mutation has
+  reached the same durability point as today
+
+This means HA helper plumbing belongs in shared DB orchestration support, but
+HA policy must not disappear into lower-level stores. `core.zig`,
+`relational_store.zig`, Lite page stores, and query/index modules should remain
+usable without knowing whether a particular `DB` handle is primary, standby, or
+fenced. The `DB` layer is the boundary that combines local mutation semantics
+with HA ownership semantics.
+
+If a future extraction creates a dedicated `db/ha_replication.zig`, it should
+own the gate and mirror helper functions. Public write, schema, restore, split,
+and relational-integrity methods should still expose explicit forwarding methods
+or obvious helper calls so reviewers can verify HA behavior at the mutating
+entry point.
+
+### Lite Single-File and Local Metadata
+
+`DB` is also the runtime used by Antfly Lite. Lite is not a separate mini-DB;
+it opens the same `DB` API over a Lite backend with an `OpenMode` profile such
+as writer, query-readonly, or status-only. Future splits must keep this as a
+first-class constraint:
+
+- read APIs must work with read-only Lite backends
+- write, schema, restore, and maintenance APIs must reject read-only modes
+- lifecycle/open code must keep runtime startup consistent with Lite profiles
+  that disable background or distributed behavior
+- schema/catalog metadata used by Lite SQL must stay durable with the schema
+  transition that makes it valid
+
+The local metadata keys `local_schema_json_key` and
+`local_lite_sql_table_record_json_key` are DB-owned schema/catalog metadata, not
+CLI state. `applyLiteSqlTableRecord` must persist the full table record and the
+runtime schema together so Lite SQL reopens with the same table identity and
+generated index metadata that DDL produced. Legacy `local_schema_json_key`-only
+databases may still be read through the compatibility path, but new DDL should
+write the full table record.
+
+This likely belongs with `db/schema_runtime.zig` unless the Lite-specific
+surface grows enough to justify a small `db/lite_metadata.zig`. Either way, it
+should not move into `cmd/lite_sql.zig`; the command layer should parse SQL and
+call DB APIs, not own DB metadata durability.
+
 ## Proposed Coarse Modules
 
 Start with these large modules, adjusting names as the code settles:
@@ -114,7 +175,8 @@ Start with these large modules, adjusting names as the code settles:
 
 - `db/schema_runtime.zig`
   Schema apply, schema rewrite jobs, schema transition validation, generated
-  column backfill, relational storage-mode checks, and algebraic schema reload.
+  column backfill, relational storage-mode checks, Lite local schema/table
+  record metadata, and algebraic schema reload.
 
 - `db/relational_integrity.zig`
   Foreign key and unique constraint validation, repair, integrity progress,
@@ -130,6 +192,11 @@ Start with these large modules, adjusting names as the code settles:
   Search entry points, planning stats, text search, dense/sparse search,
   graph search composition, doc-set filters, algebraic doc filters, and
   hydrated-result projection callbacks.
+
+- `db/ha_replication.zig` if HA helper volume continues to grow.
+  HA write-gate evaluation, mirror preflight, commit gating, best-effort mirror
+  helpers, and shared HA context plumbing. Mutating modules should still make
+  HA guard calls obvious at their public DB entry points.
 
 Keep existing domain modules such as `core.zig`, `types.zig`,
 `relational_store.zig`, `query/`, `catalog/`, `derived/`, `enrichment/`, and
@@ -166,26 +233,32 @@ graph: `db.zig` and implementation modules may import it, but it must not import
 2. Create the minimal shared internal module.
    Move only the cross-cutting structs/helpers needed by the first extraction.
 
-3. Move `split_restore.zig`.
+3. Isolate HA guard and mirror helper plumbing before moving more mutating
+   entry points.
+   This reduces the chance that write, schema, restore, or integrity extraction
+   accidentally drops a gate or mirror call.
+
+4. Move `split_restore.zig`.
    It has a clear public surface and is relatively separate from the core write
    path.
 
-4. Move `schema_runtime.zig`.
+5. Move `schema_runtime.zig`.
    It is large, but its ownership is clear and many routines already route
-   through schema and relational-store helpers.
+   through schema and relational-store helpers. Keep Lite local table metadata
+   with this migration unless a dedicated Lite metadata module is justified.
 
-5. Move `search_runtime.zig`.
+6. Move `search_runtime.zig`.
    Existing `query/` modules already provide natural lower-level boundaries.
 
-6. Move `relational_rows.zig`.
+7. Move `relational_rows.zig`.
    This is likely the biggest single readability win, but it has many helper
    dependencies, so it benefits from the earlier structure.
 
-7. Move `relational_integrity.zig`.
+8. Move `relational_integrity.zig`.
    This overlaps transactions and schema semantics, so split it after the
    surrounding modules are stable.
 
-8. Move `write_path.zig` last.
+9. Move `write_path.zig` last.
    It touches nearly every subsystem and should be split only once the target
    ownership boundaries are proven.
 
@@ -209,6 +282,17 @@ Cross-subsystem workflow tests can remain in `db.zig` when they prove the whole
 `DB` composition through public behavior. Examples include restore plus
 enrichment plus dense rebuild, split plus relational rows plus index replay, and
 transaction plus foreign key action scheduling.
+
+HA and Lite tests should be kept where they prove the boundary:
+
+- HA write-gate and mirror-helper tests stay with the HA helper module if one is
+  extracted, with workflow tests left in `db.zig` when they prove a public DB
+  write path is correctly gated or mirrored.
+- Lite open-mode, native backend, and `.aflite` page-store tests stay under
+  `storage/lite/`.
+- Lite DB metadata tests that prove `DB` persists schema/table metadata together
+  should move with schema-runtime code if that code is extracted.
+- CLI-only Lite SQL parsing/splitting tests can stay with `cmd/lite_sql.zig`.
 
 If `db.zig` is still too noisy after implementation-local tests move, introduce
 a small coarse workflow test root such as `db/workflow_tests.zig`. If tests move

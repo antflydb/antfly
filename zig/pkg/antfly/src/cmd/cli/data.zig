@@ -708,9 +708,8 @@ fn parsePositive(comptime T: type, raw: ?[]const u8, flag: []const u8) T {
 fn parseSyncLevel(text: []const u8) ?antfly_client.types.SyncLevel {
     if (std.mem.eql(u8, text, "propose")) return .propose;
     if (std.mem.eql(u8, text, "write")) return .write;
-    if (std.mem.eql(u8, text, "full_text")) return .full_text;
+    if (std.mem.eql(u8, text, "query")) return .query;
     if (std.mem.eql(u8, text, "enrichments")) return .enrichments;
-    if (std.mem.eql(u8, text, "aknn")) return .aknn;
     if (std.mem.eql(u8, text, "full_index")) return .full_index;
     return null;
 }
@@ -719,9 +718,8 @@ fn syncLevelName(level: antfly_client.types.SyncLevel) []const u8 {
     return switch (level) {
         .propose => "propose",
         .write => "write",
-        .full_text => "full_text",
+        .query => "query",
         .enrichments => "enrichments",
-        .aknn => "aknn",
         .full_index => "full_index",
     };
 }
@@ -1116,10 +1114,11 @@ test "load processor rejects empty rendered id template" {
 test "load sync level parser supports public values" {
     try std.testing.expectEqual(antfly_client.types.SyncLevel.propose, parseSyncLevel("propose").?);
     try std.testing.expectEqual(antfly_client.types.SyncLevel.write, parseSyncLevel("write").?);
-    try std.testing.expectEqual(antfly_client.types.SyncLevel.full_text, parseSyncLevel("full_text").?);
+    try std.testing.expectEqual(antfly_client.types.SyncLevel.query, parseSyncLevel("query").?);
     try std.testing.expectEqual(antfly_client.types.SyncLevel.enrichments, parseSyncLevel("enrichments").?);
-    try std.testing.expectEqual(antfly_client.types.SyncLevel.aknn, parseSyncLevel("aknn").?);
     try std.testing.expectEqual(antfly_client.types.SyncLevel.full_index, parseSyncLevel("full_index").?);
+    try std.testing.expect(parseSyncLevel("full_text") == null);
+    try std.testing.expect(parseSyncLevel("aknn") == null);
     try std.testing.expect(parseSyncLevel("full-text") == null);
 }
 
@@ -1155,7 +1154,7 @@ test "checkpoint validation rejects changed source and load config" {
         .table_name = "t",
         .file_path = "a.ndjson",
         .id_field = "id",
-        .sync_level = .full_text,
+        .sync_level = .query,
     }, .{ .size = 10, .mtime_ns = 99 }));
 
     const template_cp = LoadCheckpoint{

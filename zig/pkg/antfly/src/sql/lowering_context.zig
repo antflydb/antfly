@@ -286,10 +286,11 @@ fn lowerDocumentTargetParsedSqlForLoweringContextTestAlloc(
     const document_plan = @import("document_plan.zig");
     return switch (parsed_sql.statement.readKind() orelse return error.UnsupportedSqlShape) {
         .aggregate => .{
-            .document_aggregate = try document_plan.lowerDocumentAggregatePlanWithOptionalIndexesAndCapabilitiesParsedSqlAlloc(
+            .document_aggregate = try document_plan.lowerDocumentAggregatePlanWithOptionalIndexesAndVirtualSchemaCapabilitiesParsedSqlAlloc(
                 alloc,
                 parsed_sql,
                 document.schema,
+                document.virtual_schema,
                 document.indexes_json,
                 document.capabilities,
             ),
@@ -682,7 +683,7 @@ test "sql adapter lowering context classifies read sql into typed plan families"
     }
 }
 
-test "sql adapter lowering context derives document scalar capabilities from catalog indexes" {
+test "sql adapter lowering context derives document virtual fields from typed paths and full text fields" {
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"document","default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"body":{"type":"text"},"status":{"type":"keyword","x-antfly-index":false}},"additionalProperties":true}}}}
@@ -710,7 +711,7 @@ test "sql adapter lowering context derives document scalar capabilities from cat
                         .name = "docs",
                         .placement_role = "data",
                         .schema_json = schema_json,
-                        .indexes_json = "{\"body_fts\":{\"type\":\"full_text\",\"field\":\"body\"},\"category_idx\":{\"type\":\"scalar\",\"field\":\"category\"}}",
+                        .indexes_json = "{\"body_fts\":{\"type\":\"full_text\",\"field\":\"body\"},\"category_fts\":{\"type\":\"full_text\",\"field\":\"category\"},\"typed_paths\":{\"keyword\":[\"metadata.plan\"]}}",
                     },
                 })[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
@@ -749,13 +750,15 @@ test "sql adapter lowering context derives document scalar capabilities from cat
     defer star.deinit(alloc);
     switch (star) {
         .document_query => |document| {
-            try std.testing.expectEqual(@as(usize, 5), document.projection.len);
+            try std.testing.expectEqual(@as(usize, 6), document.projection.len);
             try std.testing.expectEqualStrings("_id", document.projection[0].output);
             try std.testing.expectEqualStrings("_doc", document.projection[1].output);
             try std.testing.expectEqualStrings("body", document.projection[2].output);
             try std.testing.expectEqualStrings("status", document.projection[3].output);
             try std.testing.expectEqualStrings("category", document.projection[4].output);
             try std.testing.expectEqualStrings("category", document.projection[4].field);
+            try std.testing.expectEqualStrings("metadata", document.projection[5].output);
+            try std.testing.expectEqualStrings("metadata", document.projection[5].field);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -773,6 +776,23 @@ test "sql adapter lowering context derives document scalar capabilities from cat
             try std.testing.expectEqual(@as(usize, 1), document.projection.len);
             try std.testing.expectEqualStrings("category", document.projection[0].field);
             try std.testing.expectEqualStrings("category", document.projection[0].output);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var full_text_virtual_filter = try lowerReadPlanWithCatalogForLoweringContextTestAlloc(
+        alloc,
+        "SELECT _id, category FROM docs WHERE category = 'release' LIMIT 10",
+        schema,
+        &.{},
+        Catalog.iface(),
+    );
+    defer full_text_virtual_filter.deinit(alloc);
+    switch (full_text_virtual_filter) {
+        .document_query => |document| {
+            try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/category\",\"value\":\"release\"}}", document.producer.indexed_query.filter_query_json.?);
+            try std.testing.expectEqualStrings("category", document.projection[1].field);
+            try std.testing.expectEqualStrings("category", document.projection[1].output);
         },
         else => return error.TestUnexpectedResult,
     }

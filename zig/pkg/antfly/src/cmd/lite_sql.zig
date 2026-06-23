@@ -27,7 +27,6 @@ const raft_reconciler = antfly.raft.reconciler;
 const relational_rows = antfly.public_api.relational_rows;
 const sql_adapter = antfly.public_api.sql_adapter;
 const sql_adapter_runtime = antfly.public_api.sql_adapter_runtime;
-const storage_db_types = antfly.db_types;
 const storage_schema = antfly.schema;
 const table_catalog = antfly.public_api.table_catalog;
 const table_reads = antfly.public_api.table_reads;
@@ -347,7 +346,7 @@ fn executeAntflyQueryFunctionReadAlloc(
     var query_response = (try read_source.source().query(allocator, lowered.table_name, lowered.request.req, .read_index)) orelse return error.TableNotFound;
     defer query_response.deinit(allocator);
 
-    var rows = try sqlQueryFunctionRowsFromQueryResponseAlloc(allocator, query_response.json);
+    var rows = try sqlQueryFunctionRowsFromQueryResponseAlloc(allocator, query_response.json, lowered.projection_columns);
     defer rows.deinit(allocator);
     return try encodeReadResultAlloc(
         allocator,
@@ -428,7 +427,8 @@ fn encodeRowsBatchResultAlloc(allocator: Allocator, session_id: u64, statement_k
 fn sqlQueryFunctionRowsFromQueryResponseAlloc(
     allocator: Allocator,
     response_json: []const u8,
-) !storage_db_types.RelationalRowsQueryResult {
+    projection_columns: []const []const u8,
+) !relational_rows.OwnedRowsQueryResult {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, response_json, .{ .allocate = .alloc_always }) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -455,13 +455,38 @@ fn sqlQueryFunctionRowsFromQueryResponseAlloc(
     }
     for (hit_items.array.items, 0..) |hit, i| {
         if (hit != .object) return error.InvalidQueryRequest;
-        rows[i] = try std.json.Stringify.valueAlloc(allocator, hit, .{});
+        rows[i] = try sqlQueryFunctionHitRowAlloc(allocator, hit, projection_columns);
         initialized += 1;
     }
     return .{
         .rows = rows,
         .total = total,
     };
+}
+
+fn sqlQueryFunctionHitRowAlloc(
+    allocator: Allocator,
+    hit: std.json.Value,
+    projection_columns: []const []const u8,
+) ![]const u8 {
+    if (projection_columns.len == 0) return try std.json.Stringify.valueAlloc(allocator, hit, .{});
+    if (hit != .object) return error.InvalidQueryRequest;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('{');
+    for (projection_columns, 0..) |column, i| {
+        if (i != 0) try writer.writeByte(',');
+        try std.json.Stringify.value(column, .{}, writer);
+        try writer.writeByte(':');
+        if (hit.object.get(column)) |value| {
+            try std.json.Stringify.value(value, .{}, writer);
+        } else {
+            try writer.writeAll("null");
+        }
+    }
+    try writer.writeByte('}');
+    return try out.toOwnedSlice();
 }
 
 const SingleTableCatalog = struct {
@@ -872,4 +897,188 @@ test "lite sql antfly query functions use native document query path" {
     const row = result.get("rows").?.array.items[0].object;
     try std.testing.expectEqualStrings("doc:a", row.get("_id").?.string);
     try std.testing.expectEqualStrings("alpha", row.get("_source").?.object.get("title").?.string);
+
+    const projected_body = try executeOneJsonAlloc(
+        allocator,
+        &db,
+        &session,
+        "SELECT _id, _score FROM antfly.full_text_search(table_name => 'docs', index => 'full_text_index_v0', field => 'title', query => 'alpha', limit => 5);",
+    );
+    defer allocator.free(projected_body);
+
+    var projected = try std.json.parseFromSlice(std.json.Value, allocator, projected_body, .{ .allocate = .alloc_always });
+    defer projected.deinit();
+    const projected_result = projected.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), projected_result.get("total").?.integer);
+    const projected_row = projected_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", projected_row.get("_id").?.string);
+    try std.testing.expect(projected_row.get("_score") != null);
+    try std.testing.expect(projected_row.get("_source") == null);
+}
+
+test "lite sql document table reads use typed document plan path" {
+    const allocator = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"note":{"type":"keyword"},"metadata":{"type":"json"},"tags":{"type":"array","items":{"type":"keyword"}}},"additionalProperties":true}}}}
+    ;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/lite-sql-document-table", .{tmp.sub_path});
+    defer allocator.free(path);
+
+    var db = try antfly.db.DB.open(allocator, path, .{});
+    defer db.close();
+
+    var session = try Session.init(allocator, .{});
+    defer session.deinit(allocator);
+
+    try db.applyLiteSqlTableRecord(allocator, .{
+        .table_id = 1,
+        .name = "docs",
+        .database_name = session.catalog.session().currentDatabase(),
+        .namespace_name = session.catalog.session().primarySearchPathNamespace(),
+        .placement_role = "data",
+        .desired_replica_count = 1,
+        .schema_json = schema_json,
+        .indexes_json = "{\"typed_paths\":{\"keyword\":[\"metadata.plan\"]}}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"status\":\"active\",\"amount\":10,\"note\":null,\"metadata\":{\"plan\":\"pro\"},\"tags\":[\"urgent\",\"vip\"]}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"status\":\"archived\",\"amount\":20,\"metadata\":{\"plan\":\"free\"},\"tags\":[\"stale\"]}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const lookup_body = try executeOneJsonAlloc(
+        allocator,
+        &db,
+        &session,
+        "SELECT _id, title, metadata->>'plan' AS plan FROM docs WHERE _id = 'doc:a';",
+    );
+    defer allocator.free(lookup_body);
+    var lookup = try std.json.parseFromSlice(std.json.Value, allocator, lookup_body, .{ .allocate = .alloc_always });
+    defer lookup.deinit();
+    try std.testing.expectEqualStrings("read", lookup.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", lookup.value.object.get("statement_kind").?.string);
+    const lookup_result = lookup.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), lookup_result.get("total").?.integer);
+    const lookup_row = lookup_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", lookup_row.get("_id").?.string);
+    try std.testing.expectEqualStrings("alpha", lookup_row.get("title").?.string);
+    try std.testing.expectEqualStrings("pro", lookup_row.get("plan").?.string);
+
+    const star_body = try executeOneJsonAlloc(
+        allocator,
+        &db,
+        &session,
+        "SELECT * FROM docs WHERE _id = 'doc:a';",
+    );
+    defer allocator.free(star_body);
+    var star = try std.json.parseFromSlice(std.json.Value, allocator, star_body, .{ .allocate = .alloc_always });
+    defer star.deinit();
+    const star_result = star.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), star_result.get("total").?.integer);
+    const star_row = star_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", star_row.get("_id").?.string);
+    try std.testing.expectEqualStrings("alpha", star_row.get("title").?.string);
+    try std.testing.expectEqualStrings("active", star_row.get("status").?.string);
+    const star_doc = star_row.get("_doc").?.object;
+    try std.testing.expectEqualStrings("alpha", star_doc.get("title").?.string);
+    try std.testing.expectEqualStrings("pro", star_doc.get("metadata").?.object.get("plan").?.string);
+
+    const bounded_body = try executeOneJsonAlloc(
+        allocator,
+        &db,
+        &session,
+        "SELECT _id, status FROM docs WHERE status = 'active' LIMIT 10;",
+    );
+    defer allocator.free(bounded_body);
+    var bounded = try std.json.parseFromSlice(std.json.Value, allocator, bounded_body, .{ .allocate = .alloc_always });
+    defer bounded.deinit();
+    const bounded_result = bounded.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), bounded_result.get("total").?.integer);
+    const bounded_row = bounded_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", bounded_row.get("_id").?.string);
+    try std.testing.expectEqualStrings("active", bounded_row.get("status").?.string);
+
+    const scalar_ops_body = try executeOneJsonAlloc(
+        allocator,
+        &db,
+        &session,
+        "SELECT _id, amount FROM docs WHERE status IN ('active', 'pending') AND title LIKE 'alp%' AND amount BETWEEN 5 AND 15 LIMIT 10;",
+    );
+    defer allocator.free(scalar_ops_body);
+    var scalar_ops = try std.json.parseFromSlice(std.json.Value, allocator, scalar_ops_body, .{ .allocate = .alloc_always });
+    defer scalar_ops.deinit();
+    const scalar_ops_result = scalar_ops.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), scalar_ops_result.get("total").?.integer);
+    const scalar_ops_row = scalar_ops_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", scalar_ops_row.get("_id").?.string);
+    try std.testing.expectEqual(@as(i64, 10), scalar_ops_row.get("amount").?.integer);
+
+    const null_predicate_body = try executeOneJsonAlloc(
+        allocator,
+        &db,
+        &session,
+        "SELECT _id FROM docs WHERE note IS NULL ORDER BY _id ASC LIMIT 10;",
+    );
+    defer allocator.free(null_predicate_body);
+    var null_predicate = try std.json.parseFromSlice(std.json.Value, allocator, null_predicate_body, .{ .allocate = .alloc_always });
+    defer null_predicate.deinit();
+    const null_predicate_rows = null_predicate.value.object.get("result").?.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), null_predicate_rows.len);
+    try std.testing.expectEqualStrings("doc:a", null_predicate_rows[0].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("doc:b", null_predicate_rows[1].object.get("_id").?.string);
+
+    const not_null_predicate_body = try executeOneJsonAlloc(
+        allocator,
+        &db,
+        &session,
+        "SELECT _id FROM docs WHERE status IS NOT NULL ORDER BY _id ASC LIMIT 10;",
+    );
+    defer allocator.free(not_null_predicate_body);
+    var not_null_predicate = try std.json.parseFromSlice(std.json.Value, allocator, not_null_predicate_body, .{ .allocate = .alloc_always });
+    defer not_null_predicate.deinit();
+    const not_null_predicate_rows = not_null_predicate.value.object.get("result").?.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), not_null_predicate_rows.len);
+    try std.testing.expectEqualStrings("doc:a", not_null_predicate_rows[0].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("doc:b", not_null_predicate_rows[1].object.get("_id").?.string);
+
+    const ordered_body = try executeOneJsonAlloc(
+        allocator,
+        &db,
+        &session,
+        "SELECT _id, title FROM docs ORDER BY title DESC LIMIT 2;",
+    );
+    defer allocator.free(ordered_body);
+    var ordered = try std.json.parseFromSlice(std.json.Value, allocator, ordered_body, .{ .allocate = .alloc_always });
+    defer ordered.deinit();
+    const ordered_rows = ordered.value.object.get("result").?.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), ordered_rows.len);
+    try std.testing.expectEqualStrings("doc:b", ordered_rows[0].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("beta", ordered_rows[0].object.get("title").?.string);
+    try std.testing.expectEqualStrings("doc:a", ordered_rows[1].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("alpha", ordered_rows[1].object.get("title").?.string);
+
+    const unnest_body = try executeOneJsonAlloc(
+        allocator,
+        &db,
+        &session,
+        "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag = 'urgent' LIMIT 10;",
+    );
+    defer allocator.free(unnest_body);
+    var unnest = try std.json.parseFromSlice(std.json.Value, allocator, unnest_body, .{ .allocate = .alloc_always });
+    defer unnest.deinit();
+    const unnest_result = unnest.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), unnest_result.get("total").?.integer);
+    const unnest_row = unnest_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", unnest_row.get("_id").?.string);
+    try std.testing.expectEqualStrings("urgent", unnest_row.get("tag").?.string);
+
+    try std.testing.expectError(
+        error.DocumentSqlWriteUnsupported,
+        executeOneJsonAlloc(allocator, &db, &session, "INSERT INTO docs (_id, _doc) VALUES ('doc:c', '{\"title\":\"gamma\"}');"),
+    );
 }

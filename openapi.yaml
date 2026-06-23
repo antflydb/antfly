@@ -2359,7 +2359,7 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
-  /db/v1/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}:
+  /db/v1/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}/actions/{action}:
     parameters:
       - name: tableName
         in: path
@@ -8165,6 +8165,11 @@ components:
           type: string
           nullable: true
           description: Optional single search-path namespace override for this request.
+        read_only:
+          type: boolean
+          default: false
+          description: Execute this statement under a server-enforced PostgreSQL-style read-only transaction
+            guard.
       required:
         - sql
     SqlStatementResponse:
@@ -9308,9 +9313,8 @@ components:
       enum:
         - propose
         - write
-        - full_text
+        - query
         - enrichments
-        - aknn
         - full_index
       default: propose
       description: >
@@ -9320,14 +9324,11 @@ components:
 
         - "write": Wait for Pebble KV write
 
-        - "full_text": Wait for full-text index WAL write
+        - "query": Wait until affected documents are visible to query paths such as full-text search
 
         - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation)
 
-        - "aknn": Wait for vector index write with best-effort synchronous embedding (falls back to async
-        on timeout, slowest, most durable)
-
-        - "full_index": Wait for all index writes to complete (full-text + enrichments + aknn)
+        - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
     ShardConfig:
       type: object
       required:
@@ -9424,6 +9425,30 @@ components:
               embedder:
                 provider: ollama
                 model: all-minilm
+        typed_paths:
+          type: object
+          description: >
+            Table-level typed document path metadata used by SQL planning for
+
+            JSON/path scalar comparison semantics. This is not a physical index
+
+            and does not imply indexed lookup, rebuild, catch-up, compaction, or
+
+            PostgreSQL `CREATE INDEX` behavior. Use real index definitions for
+
+            physical access paths.
+
+
+            Keys are scalar type names such as `keyword`, `numeric`, `boolean`,
+
+            or `datetime`; values are a path string or an array of path strings.
+          additionalProperties: true
+          example:
+            numeric:
+              - metrics.score
+            keyword:
+              - status
+              - metadata.plan
         schema:
           description: >
             Optional schema definition specifying field types, primary key, and TTL configuration.
@@ -12180,7 +12205,6 @@ components:
           enum:
             - asc
             - desc
-          default: asc
           description: Ordered-set sample direction for percentile_cont and percentile_disc; deterministic
             tie-break direction for mode.
         array_max_items:

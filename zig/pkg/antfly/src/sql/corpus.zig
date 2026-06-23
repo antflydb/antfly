@@ -4836,6 +4836,8 @@ pub fn readPlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredReadPl
             fingerprint = try appendCteAccessPathFingerprintAlloc(alloc, fingerprint, query.plan.ctes);
             break :blk try readFingerprintWithPrefixAlloc(alloc, fingerprint, "query");
         },
+        .document_query => try alloc.dupe(u8, "document_query"),
+        .document_aggregate => try alloc.dupe(u8, "document_aggregate"),
         .set_operation => |set_operation| blk: {
             const fingerprint = try setOperationFingerprintAlloc(alloc, set_operation);
             break :blk try readFingerprintWithPrefixAlloc(alloc, fingerprint, "set_operation");
@@ -6442,7 +6444,6 @@ test "sql adapter corpus fingerprints select all extra output labels from plan s
     query.limit = null;
     query.text_patterns = &.{.{
         .field = "status",
-        .op = .like,
         .pattern = "active%",
     }};
     const text_pattern = try queryFingerprintAlloc(alloc, "query", "usage_records", query, 0);
@@ -6542,21 +6543,29 @@ test "sql adapter corpus plan predicates are exact and structured" {
 
 test "sql adapter corpus detects create-table empty-catalog applicability with exact bool tokens" {
     try std.testing.expect(try corpusDdlFixtureAppliesFromEmptyCatalog(.{
+        .name = "create-table-empty-catalog-applies",
+        .sql = "CREATE TABLE usage_records (id TEXT PRIMARY KEY)",
         .family = .ddl,
         .summary = .{ .ddl_tag = .create_table },
         .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:pk=1",
     }));
     try std.testing.expect(!try corpusDdlFixtureAppliesFromEmptyCatalog(.{
+        .name = "create-table-if-not-exists-empty-catalog-skips",
+        .sql = "CREATE TABLE IF NOT EXISTS usage_records (id TEXT PRIMARY KEY)",
         .family = .ddl,
         .summary = .{ .ddl_tag = .create_table },
         .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=true:pk=1",
     }));
     try std.testing.expect(!try corpusDdlFixtureAppliesFromEmptyCatalog(.{
+        .name = "create-table-replace-empty-catalog-skips",
+        .sql = "CREATE OR REPLACE TABLE usage_records (id TEXT PRIMARY KEY)",
         .family = .ddl,
         .summary = .{ .ddl_tag = .create_table },
         .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:replace=true:pk=1",
     }));
     try std.testing.expect(try corpusDdlFixtureAppliesFromEmptyCatalog(.{
+        .name = "create-table-if-not-exists-extra-token-still-applies",
+        .sql = "CREATE TABLE IF NOT EXISTS usage_records (id TEXT PRIMARY KEY)",
         .family = .ddl,
         .summary = .{ .ddl_tag = .create_table },
         .plan = "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=true_extra:pk=1",

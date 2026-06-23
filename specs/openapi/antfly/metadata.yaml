@@ -18,7 +18,7 @@ info:
     - **Multi-Raft Design**: Separate consensus groups for metadata (single cluster) and storage (one per shard)
     - **Horizontal Sharding**: Data automatically partitioned across shards with configurable replication
     - **Distributed Transactions**: Atomic cross-shard writes using coordinator-based 2PC with intent-based locking
-    - **Fine-Grained Durability**: Control write consistency with sync levels (propose, write, full_text, enrichments, aknn)
+    - **Fine-Grained Durability**: Control write consistency with sync levels (propose, write, query, enrichments, full_index)
 
     ### AI-Native Features
     - **RAG**: Streaming retrieval-augmented generation with Server-Sent Events
@@ -1459,6 +1459,10 @@ components:
           type: string
           nullable: true
           description: Optional single search-path namespace override for this request.
+        read_only:
+          type: boolean
+          default: false
+          description: Execute this statement under a server-enforced PostgreSQL-style read-only transaction guard.
       required:
         - sql
     SqlStatementResponse:
@@ -2556,19 +2560,17 @@ components:
       enum:
         - propose
         - write
-        - full_text
+        - query
         - enrichments
-        - aknn
         - full_index
       default: propose
       description: |
         Synchronization level for batch operations:
         - "propose": Wait for Raft proposal acceptance (fastest, default)
         - "write": Wait for Pebble KV write
-        - "full_text": Wait for full-text index WAL write
+        - "query": Wait until affected documents are visible to query paths such as full-text search
         - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation)
-        - "aknn": Wait for vector index write with best-effort synchronous embedding (falls back to async on timeout, slowest, most durable)
-        - "full_index": Wait for all index writes to complete (full-text + enrichments + aknn)
+        - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
     ShardConfig: # Simplified from common.ShardInfo for brevity
       type: object
       required:
@@ -2640,6 +2642,24 @@ components:
               embedder:
                 provider: ollama
                 model: all-minilm
+        typed_paths:
+          type: object
+          description: |
+            Table-level typed document path metadata used by SQL planning for
+            JSON/path scalar comparison semantics. This is not a physical index
+            and does not imply indexed lookup, rebuild, catch-up, compaction, or
+            PostgreSQL `CREATE INDEX` behavior. Use real index definitions for
+            physical access paths.
+
+            Keys are scalar type names such as `keyword`, `numeric`, `boolean`,
+            or `datetime`; values are a path string or an array of path strings.
+          additionalProperties: true
+          example:
+            numeric:
+              - metrics.score
+            keyword:
+              - status
+              - metadata.plan
         schema: # Optional schema for the table
           description: |
             Optional schema definition specifying field types, primary key, and TTL configuration.
@@ -5166,7 +5186,6 @@ components:
           enum:
             - asc
             - desc
-          default: asc
           description: Ordered-set sample direction for percentile_cont and percentile_disc; deterministic tie-break direction for mode.
         array_max_items:
           type: integer
@@ -9132,7 +9151,7 @@ paths:
           $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalServerError"
-  /tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}:
+  /tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}/actions/{action}:
     parameters:
       - name: tableName
         in: path

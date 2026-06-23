@@ -21,7 +21,7 @@ def _get_kwargs(
 
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/db/v1/tables/{table_name}/indexes/{index_name}/graph-metrics/{metric_name}:{action}".format(
+        "url": "/db/v1/tables/{table_name}/indexes/{index_name}/graph-metrics/{metric_name}/actions/{action}".format(
             table_name=quote(str(table_name), safe=""),
             index_name=quote(str(index_name), safe=""),
             metric_name=quote(str(metric_name), safe=""),

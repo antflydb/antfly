@@ -1041,7 +1041,7 @@ pub const routes = [_]Route{
     .{ .method = "PUT", .path = "/secrets/{key}", .operation_id = "putSecret" },
     .{ .method = "DELETE", .path = "/secrets/{key}", .operation_id = "deleteSecret" },
     .{ .method = "POST", .path = "/batch", .operation_id = "multiBatchWrite" },
-    .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}", .operation_id = "executeGraphMetricAction" },
+    .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}/actions/{action}", .operation_id = "executeGraphMetricAction" },
     .{ .method = "POST", .path = "/transactions/commit", .operation_id = "commitTransaction" },
     .{ .method = "GET", .path = "/transactions", .operation_id = "listTransactionSessions" },
     .{ .method = "POST", .path = "/transactions/cleanup", .operation_id = "cleanupTransactionSessions" },

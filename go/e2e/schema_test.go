@@ -74,7 +74,7 @@ func TestE2E_SchemaMigration_FullTextIndexRebuild(t *testing.T) {
 		}
 		_, err := swarm.Client.Batch(ctx, tableName, antfly.BatchRequest{
 			Inserts:   inserts,
-			SyncLevel: antfly.SyncLevelFullText,
+			SyncLevel: antfly.SyncLevelQuery,
 		})
 		require.NoError(t, err, "Failed to insert batch starting at %d", i)
 	}

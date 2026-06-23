@@ -3307,6 +3307,14 @@ pub const TableWriteSource = struct {
             artifact_name: []const u8,
             req: db_mod.types.DocumentArtifactTableReprocessRequest,
         ) anyerror!?db_mod.types.DocumentArtifactTableReprocessResult = null,
+        reprocess_document_artifact_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            doc_key: []const u8,
+            artifact_name: []const u8,
+        ) anyerror!?bool = null,
         graph_metric_maintenance_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -4004,6 +4012,18 @@ pub const TableWriteSource = struct {
     ) !?db_mod.types.DocumentArtifactTableReprocessResult {
         const fn_ptr = self.vtable.reprocess_document_artifact_range orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name, artifact_name, req);
+    }
+
+    pub fn reprocessDocumentArtifactGroupLocal(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+    ) !?bool {
+        const fn_ptr = self.vtable.reprocess_document_artifact_group_local orelse return null;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, doc_key, artifact_name);
     }
 
     pub fn graphMetricMaintenanceGroupLocal(
@@ -8666,6 +8686,7 @@ pub const BoundTableWriteSource = struct {
 
         var it = object.iterator();
         while (it.next()) |entry| {
+            if (isReservedTableIndexMetadataEntry(entry.key_ptr.*)) continue;
             const kind = try parseIndexKind(entry.value_ptr.*);
             const config_json = try extractIndexConfigJson(alloc, entry.key_ptr.*, entry.value_ptr.*);
             defer alloc.free(config_json);
@@ -11779,6 +11800,9 @@ pub const ProvisionedTableWriteSource = struct {
                 .restore_catalog_table = restoreCatalogTableNative,
                 .batch = batch,
                 .batch_catalog = batchCatalogNative,
+                .reprocess_document_artifact = reprocessDocumentArtifact,
+                .reprocess_document_artifact_range = reprocessDocumentArtifactRange,
+                .reprocess_document_artifact_group_local = reprocessDocumentArtifactGroupLocal,
                 .begin_bulk_ingest = beginBulkIngest,
                 .finish_bulk_ingest = finishBulkIngest,
                 .abort_bulk_ingest = abortBulkIngest,
@@ -12038,9 +12062,10 @@ pub const ProvisionedTableWriteSource = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
         index_name: []const u8,
-        _: []const u8,
+        index_json: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try validateIndexConfig(alloc, index_name, index_json);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginLocalStructuralMutation(table_name);
         errdefer self.abortLocalStructuralMutation(table_name);
@@ -16137,9 +16162,10 @@ pub const HostedProvisionedTableWriteSource = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
         index_name: []const u8,
-        _: []const u8,
+        index_json: []const u8,
     ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try validateIndexConfig(alloc, index_name, index_json);
         self.invalidateManagedCache(table_name);
         try self.reconcileCachedIndexCreate(alloc, table_name, index_name);
     }
@@ -18803,6 +18829,7 @@ fn parseIndexKind(value: std.json.Value) !db_mod.types.IndexKind {
     if (value != .object) return .full_text;
     const type_value = value.object.get("type") orelse return .full_text;
     if (type_value != .string) return error.InvalidCreateTableRequest;
+    if (indexConfigTypeIsMetadataOnlyScalar(type_value.string)) return error.UnsupportedCreateTableRequest;
     if (std.mem.eql(u8, type_value.string, "full_text")) return .full_text;
     if (std.mem.eql(u8, type_value.string, "graph")) return .graph;
     if (std.mem.eql(u8, type_value.string, "algebraic")) return .algebraic;
@@ -18814,6 +18841,23 @@ fn parseIndexKind(value: std.json.Value) !db_mod.types.IndexKind {
         return if (sparse) .sparse_vector else .dense_vector;
     }
     return error.UnsupportedCreateTableRequest;
+}
+
+fn isReservedTableIndexMetadataEntry(name: []const u8) bool {
+    return std.mem.eql(u8, name, "resolvers") or
+        std.mem.eql(u8, name, "enrichments") or
+        std.mem.eql(u8, name, "typed_paths");
+}
+
+fn indexConfigTypeIsMetadataOnlyScalar(type_name: []const u8) bool {
+    return std.mem.eql(u8, type_name, "scalar") or
+        std.mem.eql(u8, type_name, "path") or
+        std.mem.eql(u8, type_name, "secondary") or
+        std.mem.eql(u8, type_name, "keyword") or
+        std.mem.eql(u8, type_name, "numeric") or
+        std.mem.eql(u8, type_name, "boolean") or
+        std.mem.eql(u8, type_name, "datetime") or
+        std.mem.eql(u8, type_name, "term");
 }
 
 fn parseIndexConfig(alloc: std.mem.Allocator, index_name: []const u8, index_json: []const u8) !db_mod.types.IndexConfig {
@@ -19026,6 +19070,19 @@ test "table write index parser keeps full text field metadata out of storage con
     try std.testing.expectEqual(db_mod.types.IndexKind.full_text, cfg.kind);
     try std.testing.expectEqualStrings("category_fts", cfg.name);
     try std.testing.expectEqualStrings("{\"analyzer\":\"standard\"}", cfg.config_json);
+}
+
+test "table write index validation rejects scalar path metadata as an index" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.UnsupportedCreateTableRequest, validateIndexConfig(alloc, "score_idx",
+        \\{"type":"numeric","path":"metrics.score"}
+    ));
+    try std.testing.expectError(error.UnsupportedCreateTableRequest, validateIndexConfig(alloc, "status_idx",
+        \\{"type":"keyword","fields":["status","metadata.plan"]}
+    ));
+    try std.testing.expectError(error.UnsupportedCreateTableRequest, parseIndexConfig(alloc, "score_idx",
+        \\{"type":"numeric","path":"metrics.score"}
+    ));
 }
 
 fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
@@ -20828,13 +20885,7 @@ fn parseStartupConfiguredIndexes(
         else => return error.InvalidCreateTableRequest,
     };
     const array_form = object.get("indexes");
-    const index_count: usize = if (array_form) |value|
-        switch (value) {
-            .array => value.array.items.len,
-            else => return error.InvalidCreateTableRequest,
-        }
-    else
-        object.count();
+    const index_count = try startupConfiguredStorageIndexCount(parsed.value);
     const items = try alloc.alloc(StartupConfiguredIndex, index_count);
     errdefer {
         for (items[0..index_count]) |*item| item.deinit(alloc);
@@ -20867,6 +20918,7 @@ fn parseStartupConfiguredIndexes(
 
     var it = object.iterator();
     while (it.next()) |entry| {
+        if (isReservedTableIndexMetadataEntry(entry.key_ptr.*)) continue;
         const kind = try parseIndexKind(entry.value_ptr.*);
         var configured = StartupConfiguredIndex{
             .name = try alloc.dupe(u8, entry.key_ptr.*),
@@ -20878,6 +20930,33 @@ fn parseStartupConfiguredIndexes(
         initialized += 1;
     }
     return .{ .items = items };
+}
+
+fn startupConfiguredStorageIndexCount(root: std.json.Value) !usize {
+    const object = switch (root) {
+        .object => |object| object,
+        else => return error.InvalidCreateTableRequest,
+    };
+    if (object.get("indexes")) |array_value| {
+        const array_items = switch (array_value) {
+            .array => array_value.array.items,
+            else => return error.InvalidCreateTableRequest,
+        };
+        var count: usize = 0;
+        for (array_items) |item| {
+            if (item != .object) return error.InvalidCreateTableRequest;
+            count += 1;
+        }
+        return count;
+    }
+
+    var count: usize = 0;
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        if (isReservedTableIndexMetadataEntry(entry.key_ptr.*)) continue;
+        count += 1;
+    }
+    return count;
 }
 
 fn startupAlgebraicField(value: std.json.Value, field: []const u8) ?std.json.Value {
@@ -22453,8 +22532,15 @@ test "schema rewrite worker pass treats unclaimed terminal jobs as terminal" {
         fn iface(self: *@This()) TableWriteSource {
             return .{
                 .ptr = self,
-                .vtable = &.{ .schema_rewrite_group_local = schemaRewriteGroupLocal },
+                .vtable = &.{
+                    .batch = batch,
+                    .schema_rewrite_group_local = schemaRewriteGroupLocal,
+                },
             };
+        }
+
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+            return error.UnsupportedOperation;
         }
 
         fn schemaRewriteGroupLocal(
@@ -29136,7 +29222,7 @@ test "provisioned table write source consistent visibility refreshes stale dense
         .writes = &.{.{ .key = "doc:b", .value = "{\"_embeddings\":{\"dense_idx\":[0,1]}}" }},
         .sync_level = .full_index,
     });
-    hook.notify(.publish_blocking);
+    hook.notify(.publish_consistent);
 
     var published = (try snapshot_cache.snapshot(alloc, "docs")).?;
     defer published.deinit(alloc);
@@ -31916,13 +32002,13 @@ test "bound table write source stages joined mutation from materialized source r
     });
 
     const txn_id = try db.beginTransaction(10_000);
-    const target_predicates = [_]schema_mod.RelationalCheck{.{
+    const target_predicates = [_]storage_schema.RelationalCheck{.{
         .name = "",
         .field = "status",
         .op = .eq,
         .value_json = "\"ready\"",
     }};
-    const source_predicates = [_]schema_mod.RelationalCheck{.{
+    const source_predicates = [_]storage_schema.RelationalCheck{.{
         .name = "",
         .field = "state",
         .op = .eq,

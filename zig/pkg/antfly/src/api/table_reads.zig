@@ -5785,12 +5785,24 @@ fn documentSqlAppendNativeFilterOperatorAlloc(
     if (object.count() != 1) return false;
     var it = object.iterator();
     const entry = it.next() orelse return false;
-    if (entry.value_ptr.* != .object) return false;
     const op = entry.key_ptr.*;
+    if (std.mem.eql(u8, op, "conjuncts")) {
+        try documentSqlAppendNativeBoolListOperatorAlloc(alloc, out, "must", entry.value_ptr.*);
+        return true;
+    }
+    if (std.mem.eql(u8, op, "disjuncts")) {
+        try documentSqlAppendNativeBoolListOperatorAlloc(alloc, out, "should", entry.value_ptr.*);
+        return true;
+    }
+    if (entry.value_ptr.* != .object) return false;
     const spec = entry.value_ptr.object;
 
     if (std.mem.eql(u8, op, "term")) {
-        const path_value = spec.get("path") orelse return false;
+        if (spec.get("path") == null and spec.get("field") == null) {
+            if (try documentSqlAppendNativeShorthandFieldValueOperatorAlloc(alloc, out, "term", spec)) return true;
+            return false;
+        }
+        const path_value = spec.get("path") orelse spec.get("field") orelse return false;
         const term_value = spec.get("value") orelse return false;
         if (path_value != .string) return false;
         const field = try documentSqlStorageFilterFieldAlloc(alloc, path_value.string);
@@ -5799,7 +5811,11 @@ fn documentSqlAppendNativeFilterOperatorAlloc(
         return true;
     }
     if (std.mem.eql(u8, op, "terms")) {
-        const path_value = spec.get("path") orelse return false;
+        if (spec.get("path") == null and spec.get("field") == null) {
+            if (try documentSqlAppendNativeShorthandFieldValueOperatorAlloc(alloc, out, "terms", spec)) return true;
+            return false;
+        }
+        const path_value = spec.get("path") orelse spec.get("field") orelse return false;
         const terms_value = spec.get("values") orelse return false;
         if (path_value != .string) return false;
         const field = try documentSqlStorageFilterFieldAlloc(alloc, path_value.string);
@@ -5808,7 +5824,7 @@ fn documentSqlAppendNativeFilterOperatorAlloc(
         return true;
     }
     if (std.mem.eql(u8, op, "prefix")) {
-        const path_value = spec.get("path") orelse return false;
+        const path_value = spec.get("path") orelse spec.get("field") orelse return false;
         const prefix_value = spec.get("value") orelse return false;
         if (path_value != .string) return false;
         const field = try documentSqlStorageFilterFieldAlloc(alloc, path_value.string);
@@ -5817,7 +5833,7 @@ fn documentSqlAppendNativeFilterOperatorAlloc(
         return true;
     }
     if (std.mem.eql(u8, op, "wildcard")) {
-        const path_value = spec.get("path") orelse return false;
+        const path_value = spec.get("path") orelse spec.get("field") orelse return false;
         const pattern_value = spec.get("pattern") orelse return false;
         if (path_value != .string) return false;
         const field = try documentSqlStorageFilterFieldAlloc(alloc, path_value.string);
@@ -5826,7 +5842,7 @@ fn documentSqlAppendNativeFilterOperatorAlloc(
         return true;
     }
     if (std.mem.eql(u8, op, "numeric_range") or std.mem.eql(u8, op, "date_range") or std.mem.eql(u8, op, "term_range")) {
-        const path_value = spec.get("path") orelse return false;
+        const path_value = spec.get("path") orelse spec.get("field") orelse return false;
         if (path_value != .string) return false;
         const field = try documentSqlStorageFilterFieldAlloc(alloc, path_value.string);
         defer alloc.free(field);
@@ -5835,6 +5851,45 @@ fn documentSqlAppendNativeFilterOperatorAlloc(
     }
 
     return false;
+}
+
+fn documentSqlAppendNativeShorthandFieldValueOperatorAlloc(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    op: []const u8,
+    spec: std.json.ObjectMap,
+) anyerror!bool {
+    if (spec.count() != 1) return false;
+    var it = spec.iterator();
+    const entry = it.next() orelse return false;
+    const field = try documentSqlStorageFilterFieldAlloc(alloc, entry.key_ptr.*);
+    defer alloc.free(field);
+    try documentSqlAppendNativeFieldValueOperatorAlloc(alloc, out, op, field, entry.value_ptr.*);
+    return true;
+}
+
+fn documentSqlAppendNativeBoolListOperatorAlloc(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    bool_field: []const u8,
+    value: std.json.Value,
+) anyerror!void {
+    try out.appendSlice(alloc, "{\"bool\":{");
+    try appendJsonString(alloc, out, bool_field);
+    try out.appendSlice(alloc, ":[");
+    if (value == .array) {
+        for (value.array.items, 0..) |item, i| {
+            if (i > 0) try out.append(alloc, ',');
+            try documentSqlAppendNativeFilterValueAlloc(alloc, out, item);
+        }
+    } else {
+        try documentSqlAppendNativeFilterValueAlloc(alloc, out, value);
+    }
+    try out.append(alloc, ']');
+    if (std.mem.eql(u8, bool_field, "should")) {
+        try out.appendSlice(alloc, ",\"minimum_should_match\":1");
+    }
+    try out.appendSlice(alloc, "}}");
 }
 
 fn documentSqlAppendNativeFieldValueOperatorAlloc(
@@ -8823,6 +8878,7 @@ pub const ExternalLakeRoutingTableReadSource = struct {
                 .lookup = lookup,
                 .scan = scan,
                 .query = query,
+                .query_catalog = queryCatalog,
                 .preflight_query = preflightQuery,
                 .preflight_query_group_local = preflightQueryGroupLocal,
                 .lookup_group_local = lookupGroupLocal,
@@ -8896,6 +8952,11 @@ pub const ExternalLakeRoutingTableReadSource = struct {
     fn query(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         return try self.base.query(alloc, table_name, req, consistency);
+    }
+
+    fn queryCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, target: catalog_resources.TableTarget, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.queryCatalog(alloc, target, req, consistency);
     }
 
     fn preflightQuery(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency, max_work: u32) !?db_mod.RuntimePreflightSummary {
@@ -24842,7 +24903,7 @@ test "lowered document sql read plans execute native lookup and bounded scan" {
     var virtual_schema = try sql_adapter.documentSqlSchemaForRuntimeSchemaAndIndexesJsonAlloc(
         alloc,
         schema,
-        "{\"category_idx\":{\"type\":\"scalar\",\"field\":\"category\"}}",
+        "{\"typed_paths\":{\"keyword\":[\"category\"]}}",
     );
     defer sql_adapter.deinitDocumentSqlSchema(alloc, &virtual_schema);
 
@@ -24912,12 +24973,12 @@ test "lowered document sql read plans execute native lookup and bounded scan" {
         else => return error.TestUnexpectedResult,
     }
 
-    var ordered_scan_sql = try sql_adapter_runtime.ParsedSql.initAlloc(
+    var ordered_scan_sql = try sql_adapter.ParsedSql.initAlloc(
         alloc,
         "SELECT _id, title FROM docs ORDER BY title DESC LIMIT 2",
     );
     defer ordered_scan_sql.deinit(alloc);
-    var ordered_document_plan = try sql_adapter_runtime.lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(
+    var ordered_document_plan = try sql_adapter.lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(
         alloc,
         &ordered_scan_sql,
         schema,
@@ -24945,7 +25006,7 @@ test "lowered document sql read plans execute native lookup and bounded scan" {
         else => return error.TestUnexpectedResult,
     }
 
-    var capped_ordered_document_plan = try sql_adapter_runtime.lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(
+    var capped_ordered_document_plan = try sql_adapter.lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(
         alloc,
         &ordered_scan_sql,
         schema,
@@ -24966,7 +25027,7 @@ test "lowered document sql read plans execute native lookup and bounded scan" {
         ),
     );
 
-    var byte_capped_ordered_document_plan = try sql_adapter_runtime.lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(
+    var byte_capped_ordered_document_plan = try sql_adapter.lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(
         alloc,
         &ordered_scan_sql,
         schema,
@@ -25013,12 +25074,12 @@ test "lowered document sql read plans execute native lookup and bounded scan" {
         else => return error.TestUnexpectedResult,
     }
 
-    var ordered_full_text_sql = try sql_adapter_runtime.ParsedSql.initAlloc(
+    var ordered_full_text_sql = try sql_adapter.ParsedSql.initAlloc(
         alloc,
         "SELECT _id, key FROM docs WHERE full_text_search('title:alpha') ORDER BY key DESC LIMIT 2",
     );
     defer ordered_full_text_sql.deinit(alloc);
-    var ordered_full_text_document_plan = try sql_adapter_runtime.lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(
+    var ordered_full_text_document_plan = try sql_adapter.lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(
         alloc,
         &ordered_full_text_sql,
         schema,
@@ -25049,7 +25110,7 @@ test "lowered document sql read plans execute native lookup and bounded scan" {
         else => return error.TestUnexpectedResult,
     }
 
-    var capped_ordered_full_text_document_plan = try sql_adapter_runtime.lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(
+    var capped_ordered_full_text_document_plan = try sql_adapter.lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(
         alloc,
         &ordered_full_text_sql,
         schema,
@@ -26947,6 +27008,31 @@ test "document sql native filter rewrite only maps field identifiers" {
     try std.testing.expectEqualStrings(
         "{\"bool\":{\"filter\":[{\"term\":{\"metadata.status\":\"/active\"}},{\"terms\":{\"tenant\":[\"/t1\"]}}]}}",
         native_filter,
+    );
+}
+
+test "document sql native filter rewrite canonicalizes row filter conjunctions" {
+    const alloc = std.testing.allocator;
+    const native_filter = try documentSqlNativeFilterQueryJsonAlloc(
+        alloc,
+        "{\"conjuncts\":[{\"term\":{\"path\":\"/status\",\"value\":\"active\"}},{\"term\":{\"tier\":\"gold\"}}]}",
+    );
+    defer alloc.free(native_filter);
+
+    try std.testing.expectEqualStrings(
+        "{\"bool\":{\"must\":[{\"term\":{\"status\":\"active\"}},{\"term\":{\"tier\":\"gold\"}}]}}",
+        native_filter,
+    );
+
+    const native_disjunction = try documentSqlNativeFilterQueryJsonAlloc(
+        alloc,
+        "{\"disjuncts\":[{\"term\":{\"path\":\"/tier\",\"value\":\"gold\"}},{\"terms\":{\"status\":[\"trial\",\"active\"]}}]}",
+    );
+    defer alloc.free(native_disjunction);
+
+    try std.testing.expectEqualStrings(
+        "{\"bool\":{\"should\":[{\"term\":{\"tier\":\"gold\"}},{\"terms\":{\"status\":[\"trial\",\"active\"]}}],\"minimum_should_match\":1}}",
+        native_disjunction,
     );
 }
 

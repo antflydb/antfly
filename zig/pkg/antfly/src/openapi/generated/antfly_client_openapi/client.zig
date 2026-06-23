@@ -222,9 +222,9 @@ pub const Client = struct {
     }
 
     /// Execute a graph metric operational action
-    /// POST /db/v1/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}
+    /// POST /db/v1/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}/actions/{action}
     pub fn executeGraphMetricAction(self: *@This(), table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !ApiResponse(types.GraphMetricActionResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/indexes/{s}/graph-metrics/{s}:{s}", .{ self.base_url, table_name, index_name, metric_name, action });
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/indexes/{s}/graph-metrics/{s}/actions/{s}", .{ self.base_url, table_name, index_name, metric_name, action });
         defer self.allocator.free(url);
         var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.GraphMetricActionResponse).fromResponse(self.allocator, &resp);

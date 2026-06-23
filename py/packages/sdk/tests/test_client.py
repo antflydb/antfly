@@ -113,6 +113,8 @@ from antfly.client_generated.models.rows_window_frame_end import RowsWindowFrame
 from antfly.client_generated.models.rows_window_frame_start import RowsWindowFrameStart  # noqa: E402
 from antfly.client_generated.models.rows_window_frame_unit import RowsWindowFrameUnit  # noqa: E402
 from antfly.client_generated.models.rows_window_spec import RowsWindowSpec  # noqa: E402
+from antfly.client_generated.models.sql_statement_response import SqlStatementResponse  # noqa: E402
+from antfly.client_generated.models.sql_statement_response_kind import SqlStatementResponseKind  # noqa: E402
 from antfly.client_generated.types import UNSET, Unset  # noqa: E402
 
 type RowsExpression = RowsExpressionField | RowsExpressionOperator | RowsExpressionValue
@@ -969,6 +971,47 @@ class TestAntflyClient:
             client.create_table(name="test_table")
 
         assert "table already exists" in str(exc_info.value)
+
+    @patch("antfly.client.Client")
+    def test_execute_sql(self, mock_client_class: MagicMock) -> None:
+        """Test executing a SQL statement."""
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "kind": "read",
+            "session_id": 42,
+            "statement_kind": "select",
+            "result": {"rows": [{"id": "doc-1"}]},
+        }
+
+        mock_httpx = MagicMock()
+        mock_httpx.request.return_value = mock_response
+        mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+
+        client = AntflyClient(base_url="http://localhost:8080")
+        result = client.execute_sql(
+            "select * from documents",
+            session_id=41,
+            database="main",
+            namespace="public",
+            read_only=True,
+        )
+
+        assert isinstance(result, SqlStatementResponse)
+        assert result.kind == SqlStatementResponseKind.READ
+        assert result.session_id == 42
+        assert result.statement_kind == "select"
+        mock_httpx.request.assert_called_once_with(
+            "POST",
+            "/db/v1/sql",
+            json={
+                "sql": "select * from documents",
+                "session_id": 41,
+                "database": "main",
+                "namespace": "public",
+                "read_only": True,
+            },
+        )
 
     @patch("antfly.client.Client")
     @patch("antfly.client.lookup_key")

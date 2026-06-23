@@ -155,6 +155,9 @@ pub const OwnedSqlCatalogSession = struct {
     transaction_local_settings_base: ?[]const catalog_resources.SqlSessionSetting = null,
     transaction_local_search_path: bool = false,
     transaction_local_settings: bool = false,
+    request_read_only: bool = false,
+    request_database_name_base: ?[]u8 = null,
+    request_search_path_base: ?[]const []const u8 = null,
     notification_session_id: u64 = 0,
 
     pub fn fromSessionAlloc(alloc: std.mem.Allocator, source_session: catalog_resources.SqlCatalogSession) !OwnedSqlCatalogSession {
@@ -196,6 +199,9 @@ pub const OwnedSqlCatalogSession = struct {
             .transaction_local_settings_base = null,
             .transaction_local_search_path = false,
             .transaction_local_settings = false,
+            .request_read_only = false,
+            .request_database_name_base = null,
+            .request_search_path_base = null,
             .notification_session_id = 0,
         };
     }
@@ -206,6 +212,65 @@ pub const OwnedSqlCatalogSession = struct {
             .search_path = self.search_path,
             .settings = self.settings,
         };
+    }
+
+    pub fn cloneAlloc(self: OwnedSqlCatalogSession, alloc: std.mem.Allocator) !OwnedSqlCatalogSession {
+        var cloned = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, self.session());
+        errdefer cloned.deinit(alloc);
+        if (self.transaction_local_search_path_base) |base| {
+            cloned.transaction_local_search_path_base = try cloneStringSlice(alloc, base);
+            cloned.transaction_local_search_path = self.transaction_local_search_path;
+        }
+        if (self.transaction_local_settings_base) |base| {
+            cloned.transaction_local_settings_base = try cloneSessionSettings(alloc, base);
+            cloned.transaction_local_settings = self.transaction_local_settings;
+        }
+        cloned.request_read_only = self.request_read_only;
+        if (self.request_database_name_base) |base| {
+            cloned.request_database_name_base = try alloc.dupe(u8, base);
+        }
+        if (self.request_search_path_base) |base| {
+            cloned.request_search_path_base = try cloneStringSlice(alloc, base);
+        }
+        cloned.notification_session_id = self.notification_session_id;
+        return cloned;
+    }
+
+    pub fn cloneSearchPathAlloc(self: OwnedSqlCatalogSession, alloc: std.mem.Allocator) ![]const []const u8 {
+        return try cloneStringSlice(alloc, self.search_path);
+    }
+
+    fn cloneRequestDatabaseBaseTo(self: OwnedSqlCatalogSession, alloc: std.mem.Allocator, target: *OwnedSqlCatalogSession) !void {
+        if (self.request_database_name_base) |base| {
+            target.request_database_name_base = try alloc.dupe(u8, base);
+        }
+    }
+
+    fn cloneRequestSearchPathBaseTo(self: OwnedSqlCatalogSession, alloc: std.mem.Allocator, target: *OwnedSqlCatalogSession) !void {
+        if (self.request_search_path_base) |base| {
+            target.request_search_path_base = try cloneStringSlice(alloc, base);
+        }
+    }
+
+    fn cloneRequestOverridesTo(self: OwnedSqlCatalogSession, alloc: std.mem.Allocator, target: *OwnedSqlCatalogSession) !void {
+        target.request_read_only = self.request_read_only;
+        try self.cloneRequestDatabaseBaseTo(alloc, target);
+        try self.cloneRequestSearchPathBaseTo(alloc, target);
+    }
+
+    pub fn restoreRequestOverridesForPersistence(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.request_database_name_base) |base| {
+            alloc.free(self.current_database_name);
+            self.current_database_name = base;
+            self.request_database_name_base = null;
+        }
+        if (self.request_search_path_base) |base| {
+            for (self.search_path) |name| alloc.free(@constCast(name));
+            if (self.search_path.len > 0) alloc.free(self.search_path);
+            self.search_path = base;
+            self.request_search_path_base = null;
+        }
+        self.request_read_only = false;
     }
 
     pub fn clearTransactionLocalState(self: *@This(), alloc: std.mem.Allocator) !void {
@@ -228,6 +293,16 @@ pub const OwnedSqlCatalogSession = struct {
         self.transaction_local_settings = false;
     }
 
+    pub fn setTransactionLocalSettingAlloc(self: *@This(), alloc: std.mem.Allocator, name: []const u8, value: []const u8) !void {
+        if (self.transaction_local_settings_base == null) {
+            self.transaction_local_settings_base = try cloneSessionSettings(alloc, self.settings);
+        }
+        const settings = try replaceSessionSettingAlloc(alloc, self.settings, name, value);
+        freeSessionSettings(alloc, self.settings);
+        self.settings = settings;
+        self.transaction_local_settings = true;
+    }
+
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.current_database_name);
         for (self.search_path) |name| alloc.free(@constCast(name));
@@ -248,6 +323,8 @@ pub const OwnedSqlCatalogSession = struct {
             }
             if (base.len > 0) alloc.free(base);
         }
+        if (self.request_database_name_base) |base| alloc.free(base);
+        if (self.request_search_path_base) |base| freeStringSlice(alloc, base);
         self.* = undefined;
     }
 };
@@ -339,6 +416,40 @@ pub fn sqlSyncLevelFromSession(session: catalog_resources.SqlCatalogSession) !db
     return db_mod.types.parsePublicSyncLevelText(raw) orelse error.InvalidRoleSetting;
 }
 
+pub fn parseSqlBoolSetting(value: []const u8) !bool {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(trimmed, "on") or
+        std.ascii.eqlIgnoreCase(trimmed, "true") or
+        std.ascii.eqlIgnoreCase(trimmed, "yes") or
+        std.mem.eql(u8, trimmed, "1"))
+    {
+        return true;
+    }
+    if (std.ascii.eqlIgnoreCase(trimmed, "off") or
+        std.ascii.eqlIgnoreCase(trimmed, "false") or
+        std.ascii.eqlIgnoreCase(trimmed, "no") or
+        std.mem.eql(u8, trimmed, "0"))
+    {
+        return false;
+    }
+    return error.InvalidRoleSetting;
+}
+
+pub fn sqlDefaultTransactionReadOnlyFromSession(session: catalog_resources.SqlCatalogSession) !bool {
+    const raw = session.settingValue("default_transaction_read_only") orelse return false;
+    return try parseSqlBoolSetting(raw);
+}
+
+pub fn sqlTransactionReadOnlyFromSession(session: catalog_resources.SqlCatalogSession) !?bool {
+    const raw = session.settingValue("transaction_read_only") orelse return null;
+    return try parseSqlBoolSetting(raw);
+}
+
+pub fn sqlEffectiveTransactionReadOnlyFromSession(session: catalog_resources.SqlCatalogSession) !bool {
+    if (try sqlTransactionReadOnlyFromSession(session)) |transaction_read_only| return transaction_read_only;
+    return try sqlDefaultTransactionReadOnlyFromSession(session);
+}
+
 pub fn sqlStatementTimeoutExpired(timeout_ns: ?u64, start_ns: u64, now_ns: u64) bool {
     const limit = timeout_ns orelse return false;
     return now_ns -| start_ns >= limit;
@@ -370,6 +481,12 @@ pub fn validateSqlRuntimeSettingValue(name: []const u8, value: []const u8) !void
     }
     if (std.ascii.eqlIgnoreCase(name, "statement_timeout")) {
         _ = try parseSqlStatementTimeoutNs(value);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(name, "default_transaction_read_only") or
+        std.ascii.eqlIgnoreCase(name, "transaction_read_only"))
+    {
+        _ = try parseSqlBoolSetting(value);
         return;
     }
     if (std.ascii.eqlIgnoreCase(name, "timezone")) {
@@ -498,8 +615,12 @@ pub fn applyOwnedSessionCatalogPlanAlloc(
         .set_search_path => |set| {
             var updated = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, session.session());
             errdefer updated.deinit(alloc);
+            updated.request_read_only = session.request_read_only;
+            try session.cloneRequestDatabaseBaseTo(alloc, &updated);
             if (set.local) {
                 if (session.transaction_local_search_path_base) |base| {
+                    updated.transaction_local_search_path_base = try cloneStringSlice(alloc, base);
+                } else if (session.request_search_path_base) |base| {
                     updated.transaction_local_search_path_base = try cloneStringSlice(alloc, base);
                 } else {
                     updated.transaction_local_search_path_base = try cloneStringSlice(alloc, session.search_path);
@@ -533,6 +654,7 @@ pub fn applyOwnedSessionCatalogPlanAlloc(
             }
             var updated = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, session.session());
             errdefer updated.deinit(alloc);
+            try session.cloneRequestOverridesTo(alloc, &updated);
             if (session.transaction_local_search_path_base) |base| {
                 updated.transaction_local_search_path_base = try cloneStringSlice(alloc, base);
                 updated.transaction_local_search_path = session.transaction_local_search_path;
@@ -561,6 +683,7 @@ pub fn applyOwnedSessionCatalogPlanAlloc(
         .reset_setting => |reset| {
             var updated = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, session.session());
             errdefer updated.deinit(alloc);
+            try session.cloneRequestOverridesTo(alloc, &updated);
             if (session.transaction_local_search_path_base) |base| {
                 updated.transaction_local_search_path_base = try cloneStringSlice(alloc, base);
                 updated.transaction_local_search_path = session.transaction_local_search_path;
@@ -578,15 +701,35 @@ pub fn applyOwnedSessionCatalogPlanAlloc(
             updated.settings = settings;
             return updated;
         },
-        .reset_search_path, .discard_all => {
-            return try OwnedSqlCatalogSession.fromSessionAlloc(alloc, .{
+        .reset_search_path => {
+            var updated = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, .{
+                .current_database_name = session.session().currentDatabase(),
+                .search_path = &.{catalog_resources.default_namespace_name},
+                .settings = session.settings,
+            });
+            errdefer updated.deinit(alloc);
+            updated.request_read_only = session.request_read_only;
+            try session.cloneRequestDatabaseBaseTo(alloc, &updated);
+            if (session.transaction_local_settings_base) |base| {
+                updated.transaction_local_settings_base = try cloneSessionSettings(alloc, base);
+                updated.transaction_local_settings = session.transaction_local_settings;
+            }
+            return updated;
+        },
+        .discard_all => {
+            var updated = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, .{
                 .current_database_name = session.session().currentDatabase(),
                 .search_path = &.{catalog_resources.default_namespace_name},
             });
+            errdefer updated.deinit(alloc);
+            updated.request_read_only = session.request_read_only;
+            try session.cloneRequestDatabaseBaseTo(alloc, &updated);
+            return updated;
         },
         .show_search_path => {
             var updated = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, session.session());
             errdefer updated.deinit(alloc);
+            try session.cloneRequestOverridesTo(alloc, &updated);
             if (session.transaction_local_search_path_base) |base| {
                 updated.transaction_local_search_path_base = try cloneStringSlice(alloc, base);
                 updated.transaction_local_search_path = session.transaction_local_search_path;

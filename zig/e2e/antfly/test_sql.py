@@ -67,8 +67,29 @@ DOCUMENT_SQL_SCHEMA = {
                     "title": {"type": "text"},
                     "body": {"type": "text"},
                     "status": {"type": "keyword"},
+                    "amount": {"type": "numeric"},
+                    "note": {"type": "keyword"},
                     "tags": {"type": "array", "items": {"type": "keyword"}},
                     "metadata": {"type": "json"},
+                },
+                "additionalProperties": True,
+            }
+        }
+    },
+}
+
+DOCUMENT_SQL_VIRTUAL_ROOT_SCHEMA = {
+    "version": 1,
+    "storage_mode": "document",
+    "default_type": "doc",
+    "document_schemas": {
+        "doc": {
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "text"},
+                    "body": {"type": "text"},
+                    "status": {"type": "keyword"},
                 },
                 "additionalProperties": True,
             }
@@ -133,6 +154,16 @@ def _create_document_sql_table(stateful_api, table_name: str) -> None:
     assert created["name"] == table_name
 
 
+def _create_document_sql_virtual_root_table(stateful_api, table_name: str) -> None:
+    created = stateful_api.create_table(
+        table_name,
+        num_shards=1,
+        schema=DOCUMENT_SQL_VIRTUAL_ROOT_SCHEMA,
+        typed_paths={"numeric": ["metrics.score"]},
+    )
+    assert created["name"] == table_name
+
+
 def _json_stream(stdout: str) -> list[dict[str, Any]]:
     cleaned = stdout.replace("antfly=> ", "").replace("antfly-> ", "")
     decoder = json.JSONDecoder()
@@ -157,6 +188,16 @@ def _first_sql_json(stdout: str) -> dict[str, Any]:
 
 def _select_rows(sql_cli, sql: str) -> list[dict[str, Any]] | None:
     result = sql_cli("sql", "-c", sql, check=False)
+    if os.environ.get("ANTFLY_DEBUG_SQL_E2E"):
+        print(
+            "SQL DEBUG",
+            {
+                "sql": sql,
+                "returncode": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            },
+        )
     if result.returncode != 0:
         return None
     response = _first_sql_json(result.stdout)
@@ -289,33 +330,39 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
                 "title": "alpha",
                 "body": "alpha search document",
                 "status": "active",
+                "amount": 10,
                 "category": "release",
                 "tags": ["urgent", "search"],
-                "metadata": {"plan": "pro"},
+                "metadata": {"plan": "pro", "billing": {"plan": "annual"}},
             },
             "doc:b": {
                 "title": "beta",
                 "body": "beta archive document",
                 "status": "archived",
+                "amount": 20,
                 "category": "archive",
                 "tags": ["archive"],
-                "metadata": {"plan": "free"},
+                "metadata": {"plan": "free", "billing": {"plan": "monthly"}},
             },
             "doc:c": {
                 "title": "alpha followup",
                 "body": "alpha search followup",
                 "status": "active",
+                "amount": 12,
+                "note": "followup",
                 "category": "release",
                 "tags": ["search"],
-                "metadata": {"plan": "team"},
+                "metadata": {"plan": "team", "billing": {"plan": "annual"}},
             },
             "doc:d": {
                 "title": "delta archived",
                 "body": "delta search archive",
                 "status": "archived",
+                "amount": 30,
+                "note": "closed",
                 "category": "archive",
                 "tags": ["archive", "search"],
-                "metadata": {"plan": "enterprise"},
+                "metadata": {"plan": "enterprise", "billing": {"plan": "annual"}},
             },
         },
         sync_level="full_index",
@@ -344,6 +391,19 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     assert write_response.status_code == 400
     assert write_response.text == "document_sql_write_unsupported"
 
+    view_response = stateful_api.s.post(
+        f"{stateful_api.url}/sql",
+        json={
+            "sql": (
+                f"CREATE VIEW {table}_view(doc_id, title) AS "
+                f"SELECT _id, title FROM {table};"
+            )
+        },
+        timeout=10,
+    )
+    assert view_response.status_code == 400
+    assert view_response.text == "document_sql_view_mapping_unsupported"
+
     array_response = stateful_api.s.post(
         f"{stateful_api.url}/sql",
         json={"sql": f"SELECT _id FROM {table} WHERE tags = 'urgent' LIMIT 10;"},
@@ -366,6 +426,19 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     assert sorted(row["_id"] for row in unnested_rows) == ["doc:a", "doc:c", "doc:d"]
     assert {row["tag"] for row in unnested_rows} == {"search"}
 
+    lookup_unnested_rows = wait_until(
+        lambda: _select_rows(
+            sql_cli,
+            (
+                f"SELECT d._id, tag FROM {table} AS d, UNNEST(d.tags) AS tag "
+                "WHERE d._id = 'doc:a' AND tag = 'urgent' LIMIT 10;"
+            ),
+        ),
+        timeout_s=15.0,
+        interval_s=0.5,
+    )
+    assert lookup_unnested_rows == [{"_id": "doc:a", "tag": "urgent"}]
+
     join_response = stateful_api.s.post(
         f"{stateful_api.url}/sql",
         json={
@@ -378,6 +451,62 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     )
     assert join_response.status_code == 400
     assert join_response.text == "document_sql_unsupported_join"
+
+    unsupported_shape_cases = [
+        (
+            f"SELECT DISTINCT _id FROM {table} WHERE _id = 'doc:a';",
+            "document_sql_projection_modifier_unsupported",
+        ),
+        (
+            f"SELECT DISTINCT ON (status) _id FROM {table} WHERE status = 'active' LIMIT 10;",
+            "document_sql_projection_modifier_unsupported",
+        ),
+        (
+            f"SELECT ALL _id FROM {table} WHERE _id = 'doc:a';",
+            "document_sql_projection_modifier_unsupported",
+        ),
+        (
+            f"SELECT _id FROM {table} WHERE status = 'active' OFFSET 1;",
+            "document_sql_pagination_unsupported",
+        ),
+        (
+            f"SELECT _id FROM {table} FETCH FIRST 10 ROWS ONLY;",
+            "document_sql_pagination_unsupported",
+        ),
+        (
+            f"SELECT _id FROM {table} WHERE _id = 'doc:a' FOR UPDATE;",
+            "document_sql_locking_unsupported",
+        ),
+        (
+            f"SELECT _id FROM {table} WINDOW w AS () LIMIT 10;",
+            "document_sql_window_unsupported",
+        ),
+    ]
+    for sql, expected_body in unsupported_shape_cases:
+        unsupported_response = stateful_api.s.post(
+            f"{stateful_api.url}/sql",
+            json={"sql": sql},
+            timeout=10,
+        )
+        assert unsupported_response.status_code == 400
+        assert unsupported_response.text == expected_body
+
+    native_search_predicate_response = stateful_api.s.post(
+        f"{stateful_api.url}/sql",
+        json={
+            "sql": (
+                f"SELECT _id FROM {table} "
+                "WHERE antfly.hybrid_search(table_name => '"
+                f"{table}', query => 'search', limit => 10) LIMIT 10;"
+            )
+        },
+        timeout=10,
+    )
+    assert native_search_predicate_response.status_code == 400
+    assert (
+        native_search_predicate_response.text
+        == "document_sql_native_search_requires_table_function"
+    )
 
     by_id = _first_sql_json(
         sql_cli(
@@ -414,6 +543,21 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     )
     assert by_json_path_filter == [{"_id": "doc:a", "plan": "pro"}]
 
+    by_nested_json_path_filter = wait_until(
+        lambda: _select_rows(
+            sql_cli,
+            (
+                f"SELECT _id, metadata#>>'{{billing,plan}}' AS billing_plan FROM {table} "
+                "WHERE metadata#>>'{billing,plan}' = 'monthly' LIMIT 10;"
+            ),
+        ),
+        timeout_s=15.0,
+        interval_s=0.5,
+    )
+    assert by_nested_json_path_filter == [
+        {"_id": "doc:b", "billing_plan": "monthly"}
+    ]
+
     active_rows = wait_until(
         lambda: _select_rows(
             sql_cli,
@@ -423,6 +567,64 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
         interval_s=0.5,
     )
     assert sorted(row["_id"] for row in active_rows) == ["doc:a", "doc:c"]
+
+    scalar_compat_rows = wait_until(
+        lambda: _select_rows(
+            sql_cli,
+            (
+                f"SELECT _id, amount FROM {table} "
+                "WHERE status IN ('active', 'pending') "
+                "AND title LIKE 'alpha%' "
+                "AND amount BETWEEN 5 AND 15 "
+                "ORDER BY _id ASC LIMIT 10;"
+            ),
+        ),
+        timeout_s=15.0,
+        interval_s=0.5,
+    )
+    assert scalar_compat_rows == [
+        {"_id": "doc:a", "amount": 10},
+        {"_id": "doc:c", "amount": 12},
+    ]
+
+    null_predicate_rows = wait_until(
+        lambda: _select_rows(
+            sql_cli,
+            f"SELECT _id FROM {table} WHERE note IS NULL ORDER BY _id ASC LIMIT 10;",
+        ),
+        timeout_s=15.0,
+        interval_s=0.5,
+    )
+    assert null_predicate_rows == [{"_id": "doc:a"}, {"_id": "doc:b"}]
+
+    not_null_predicate_rows = wait_until(
+        lambda: _select_rows(
+            sql_cli,
+            f"SELECT _id FROM {table} WHERE note IS NOT NULL ORDER BY _id ASC LIMIT 10;",
+        ),
+        timeout_s=15.0,
+        interval_s=0.5,
+    )
+    assert not_null_predicate_rows == [{"_id": "doc:c"}, {"_id": "doc:d"}]
+
+    category_rows = wait_until(
+        lambda: _select_rows(
+            sql_cli,
+            f"SELECT _id, category FROM {table} WHERE category = 'release' LIMIT 10;",
+        ),
+        timeout_s=15.0,
+        interval_s=0.5,
+    )
+    assert sorted(row["_id"] for row in category_rows) == ["doc:a", "doc:c"]
+    assert {row["category"] for row in category_rows} == {"release"}
+
+    unbounded_scan_response = stateful_api.s.post(
+        f"{stateful_api.url}/sql",
+        json={"sql": f"SELECT _id, status FROM {table} WHERE status = 'active';"},
+        timeout=10,
+    )
+    assert unbounded_scan_response.status_code == 400
+    assert unbounded_scan_response.text == "document_sql_requires_bounded_scan"
 
     ordered_rows = wait_until(
         lambda: _select_rows(
@@ -474,6 +676,21 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     assert all("_score" in row for row in function_full_text_rows)
     assert all("_source" in row for row in function_full_text_rows)
 
+    projected_function_rows = wait_until(
+        lambda: _select_rows(
+            sql_cli,
+            (
+                "SELECT _id, _score FROM antfly.full_text_search("
+                f"table_name => '{table}', query => 'body:search', limit => 10);"
+            ),
+        ),
+        timeout_s=15.0,
+        interval_s=0.5,
+    )
+    assert sorted(row["_id"] for row in projected_function_rows) == sorted(native_full_text_ids)
+    assert all("_score" in row for row in projected_function_rows)
+    assert all("_source" not in row for row in projected_function_rows)
+
     full_text_residual_rows = wait_until(
         lambda: _select_rows(
             sql_cli,
@@ -523,6 +740,19 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     assert residual_counted["statement_kind"] == "aggregate"
     assert residual_counted["result"]["rows"] == [{"row_count": 2}]
 
+    grouped_scan_counted = _first_sql_json(
+        sql_cli(
+            "sql",
+            "-c",
+            f"SELECT count(*) AS row_count FROM {table} WHERE status = 'archived' GROUP BY category LIMIT 10;",
+        ).stdout
+    )
+    assert grouped_scan_counted["kind"] == "read"
+    assert grouped_scan_counted["statement_kind"] == "aggregate"
+    assert grouped_scan_counted["result"]["rows"] == [
+        {"category": "archive", "row_count": 2}
+    ]
+
     virtual_field_by_id = stateful_api.post(
         "/sql",
         {"sql": f"SELECT _id, category FROM {table} WHERE _id = 'doc:a';"},
@@ -541,3 +771,109 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     assert virtual_star_by_id["statement_kind"] == "query"
     assert virtual_star_by_id["result"]["rows"][0]["category"] == "release"
     assert virtual_star_by_id["result"]["rows"][0]["_doc"]["category"] == "release"
+
+    virtual_root_table = _sql_table_name("sql_cli_docs_virtual_root")
+    _create_document_sql_virtual_root_table(stateful_api, virtual_root_table)
+    virtual_root_detail = stateful_api.get_table(virtual_root_table)
+    virtual_root_props = (
+        virtual_root_detail["schema"]["document_schemas"]["doc"]["schema"]["properties"]
+    )
+    assert "metadata" not in virtual_root_props
+
+    virtual_root_written = stateful_api.batch_write(
+        virtual_root_table,
+        inserts={
+            "doc:vr:a": {
+                "title": "virtual alpha",
+                "body": "virtual root alpha",
+                "status": "active",
+                "metadata": {"plan": "pro"},
+                "metrics": {"score": 9},
+            },
+            "doc:vr:b": {
+                "title": "virtual beta",
+                "body": "virtual root beta",
+                "status": "archived",
+                "metadata": {"plan": "free"},
+                "metrics": {"score": 3},
+            },
+            "doc:vr:c": {
+                "title": "virtual gamma",
+                "body": "virtual root gamma",
+                "status": "active",
+                "metadata": {"plan": "pro"},
+                "metrics": {"score": 12},
+            },
+        },
+        sync_level="full_index",
+    )
+    assert virtual_root_written["inserted"] == 3
+
+    stateful_api.create_index(
+        virtual_root_table,
+        "metadata_plan_fts",
+        {
+            "name": "metadata_plan_fts",
+            "type": "full_text",
+            "field": "metadata.plan",
+        },
+    )
+    virtual_root_projection = wait_until(
+        lambda: _select_rows(
+            sql_cli,
+            (
+                f"SELECT _id, metadata->>'plan' AS plan FROM {virtual_root_table} "
+                "WHERE _id = 'doc:vr:a';"
+            ),
+        ),
+        timeout_s=15.0,
+        interval_s=0.5,
+    )
+    assert virtual_root_projection == [{"_id": "doc:vr:a", "plan": "pro"}]
+
+    virtual_root_filter = wait_until(
+        lambda: _select_rows(
+            sql_cli,
+            (
+                f"SELECT _id, metadata->>'plan' AS plan FROM {virtual_root_table} "
+                "WHERE metadata->>'plan' = 'pro' LIMIT 10;"
+            ),
+        ),
+        timeout_s=15.0,
+        interval_s=0.5,
+    )
+    assert sorted(row["_id"] for row in virtual_root_filter) == [
+        "doc:vr:a",
+        "doc:vr:c",
+    ]
+    assert {row["plan"] for row in virtual_root_filter} == {"pro"}
+
+    virtual_root_numeric_filter = wait_until(
+        lambda: _select_rows(
+            sql_cli,
+            (
+                f"SELECT _id, metrics->>'score' AS score FROM {virtual_root_table} "
+                "WHERE metrics->>'score' >= 7 LIMIT 10;"
+            ),
+        ),
+        timeout_s=15.0,
+        interval_s=0.5,
+    )
+    assert sorted(row["_id"] for row in virtual_root_numeric_filter) == [
+        "doc:vr:a",
+        "doc:vr:c",
+    ]
+    assert {row["score"] for row in virtual_root_numeric_filter} == {9, 12}
+
+    virtual_root_ordered = _select_rows(
+        sql_cli,
+        (
+            f"SELECT _id, metadata->>'plan' AS plan FROM {virtual_root_table} "
+            "ORDER BY metadata->>'plan' ASC LIMIT 3;"
+        ),
+    )
+    assert virtual_root_ordered == [
+        {"_id": "doc:vr:b", "plan": "free"},
+        {"_id": "doc:vr:a", "plan": "pro"},
+        {"_id": "doc:vr:c", "plan": "pro"},
+    ]

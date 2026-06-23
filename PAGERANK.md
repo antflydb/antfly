@@ -1335,7 +1335,7 @@ Current implementation progress:
   refresh can still publish a fresh generation while background maintenance is
   paused.
 - The public table HTTP layer exposes local graph metric operational actions at
-  `/tables/{table}/indexes/{index}/graph-metrics/{metric}:{action}` for
+  `/tables/{table}/indexes/{index}/graph-metrics/{metric}/actions/{action}` for
   `refresh`, `rebuild`, `delete`, `pause`, and `resume`. Each action is
   idempotent at the API contract level and returns the updated graph metric
   status. `delete` clears materialized metric state and maintenance controls

@@ -553,14 +553,17 @@ Implementation note: `src/sql/source_binding.zig` now defines the public
 `SqlSourceBinding` union, `CatalogTableRef`, per-family binding structs, and the
 conservative runtime-schema classifier used to distinguish relational,
 document, and lake sources. Document bindings derive their
-`DocumentSqlCapabilities` from conservative catalog facts: full-text, scalar
-index, vector, algebraic-aggregate, and bounded-scan eligibility are binding
-facts rather than lowerer-local defaults. They also derive a catalog-owned
-`DocumentSqlSchema` from declared runtime-schema columns plus durable
-index-definition paths, so `SELECT *` and explicit projections can expose
-indexed top-level fields even when those fields are optional document fields
-rather than declared relational columns. A declared document field is not enough
-to prove native scalar-filter capability unless the binding can identify a
+`DocumentSqlCapabilities` from conservative catalog facts: full-text/default
+document query readiness, path-level filter readiness from real producers,
+vector/search/graph families, algebraic-aggregate eligibility, and bounded-scan
+policy are binding facts rather than lowerer-local defaults. They also derive a
+catalog-owned `DocumentSqlSchema` from declared runtime-schema columns plus
+durable virtual-field and `typed_paths` metadata, so `SELECT *` and explicit
+projections can expose top-level fields even when those fields are optional
+document fields rather than declared relational columns. `typed_paths` proves
+SQL comparison type semantics only; it is not a managed scalar index family and
+does not prove readiness. A declared or typed document field is not enough to
+prove native scalar-filter capability unless the binding can identify a
 compatible ready producer. `src/sql/document_plan.zig` defines the document
 read-plan family for `_id` lookup, indexed document query producers, and
 explicitly bounded scans. Public SQL execution can route simple document reads
@@ -568,14 +571,17 @@ through the document plan family, and later lowerers no longer need to invent
 this source-family boundary.
 
 Those capability bits are an access-path inventory, not the SQL language
-definition. Full-text, scalar, algebraic, vector, serverless, and bounded-scan
-paths are interchangeable only when they can prove the same logical result for
-the requested predicate, projection, grouping, or aggregate. Their presence
-should make a query cheaper, lower-latency, or admissible under policy; their
-absence should not change the meaning of the SQL statement. It should only make
-the statement fail closed until another exact producer is available, a bounded
-scan can preserve the same semantics, or the user opts into a policy that makes
-the work finite.
+definition. Full-text/default document query producers, future physical
+scalar/path indexes, algebraic sidecars, vector/search/graph producers,
+serverless segments, and bounded scans are interchangeable only when they can
+prove the same logical result for the requested predicate, projection, grouping,
+or aggregate. `typed_paths` is intentionally not in that inventory: it can be
+paired with an independent ready producer for the same path, but it is never the
+producer. A producer's presence should make a query cheaper, lower-latency, or
+admissible under policy; its absence should not change the meaning of the SQL
+statement. It should only make the statement fail closed until another exact
+producer is available, a bounded scan can preserve the same semantics, or the
+user opts into a policy that makes the work finite.
 
 The review rule is that no lowerer should probe another source family by
 trial-and-error. The binder selects the family once from catalog facts and every
@@ -617,8 +623,10 @@ Document SQL needs a virtual SQL schema. The minimum projection should expose:
 - `_id` as the document key;
 - `_doc` as the full JSON document;
 - declared document-schema fields when the table has a schema;
-- indexed or statistically observed top-level fields as optional projected
-  columns;
+- index-defined or statistically observed top-level fields as optional
+  projected columns;
+- typed-path metadata as type/shape-only proof for explicit field paths and
+  virtual roots, without implying any physical access path;
 - explicit JSON-path projections for nested fields.
 
 For example:
@@ -634,12 +642,17 @@ The virtual schema should be built from durable Antfly facts in priority order:
 
 1. declared document schema;
 2. index definitions and derived-index field paths;
-3. explicit SQL view definitions over document tables;
-4. observed field statistics as an advisory fallback.
+3. `typed_paths` metadata for field shape and comparison typing only;
+4. explicit SQL view definitions over document tables;
+5. observed field statistics as an advisory fallback.
 
 Sampling can help user experience, but it must not become the durable semantic
-contract. If a field needs stable BI or agent access, the table schema, an index
-definition, or a SQL view should record that mapping explicitly.
+contract. If a field needs stable BI or agent access, the table schema, an
+index definition, a SQL view, or `typed_paths` metadata for type/shape proof
+should record that mapping explicitly. `typed_paths` does not record a
+physical access path: it may make a path visible and type-checkable, but it
+must not satisfy index readiness, boundedness, freshness, or
+planner-admissibility checks by itself.
 
 Type mapping should stay conservative:
 
@@ -713,9 +726,11 @@ natively:
   non-null values, ordinary scalar comparisons/ranges/patterns with NULL lower
   to no-match filters, and `IN (...)` ignores NULL members with all-NULL lists
   lowering to no-match;
-- full-text predicates lower to full-text query plans;
-- vector or hybrid predicates can later lower to the existing vector, hybrid,
-  and reranking paths through explicit SQL functions;
+- full-text predicates lower to full-text query plans when they are used as
+  relational-style filters over a document table;
+- ranked semantic, vector, hybrid, graph, graph-metric, and reranking searches
+  use the existing `antfly.*` table functions as the canonical SQL surface
+  rather than a second document-specific predicate family;
 - projection, `LIMIT`, simple `ORDER BY`, and residual filters execute only over
   bounded result sets with explicit cost limits.
 
@@ -729,14 +744,15 @@ Document SQL should therefore separate semantics from access paths:
 | --- | --- | --- |
 | `_id` lookup | exact point producer | always exact for `_id` equality/`IN` |
 | full-text/default document index | exact native producer for indexed text, term, boolean, prefix, wildcard, range, and geo predicates; candidate producer for mixed predicates | attach residual filters whenever the index cannot prove the whole predicate |
-| scalar secondary index | exact native producer for compatible declared/indexed scalar paths; selective candidate producer for mixed predicates | push covered scalar clauses only when schema, type, and index readiness prove exact semantics; attach residual filters for uncovered clauses under a candidate bound |
+| future scalar secondary index | exact native producer for compatible declared/indexed scalar paths; selective candidate producer for mixed predicates | push covered scalar clauses only when schema, type, and index readiness prove exact semantics; attach residual filters for uncovered clauses under a candidate bound |
 | algebraic sidecar/index | exact aggregate producer or materialized helper | use only when the sidecar covers the requested aggregate, grouping, filters, snapshot, and freshness policy |
+| `antfly.*` ranked query functions | explicit SQL surface for full-text, semantic, vector, hybrid, graph, graph-metric, and rerank requests | lower to the native query request path with the same source binding, row filters, readiness, and freshness checks as REST/SDK/MCP/A2A callers |
 | bounded document/LSM scan | semantic fallback and residual executor | allowed only under explicit bounds or proven finite cost; fail closed if the bound is exhausted before the answer is complete |
 
 These access paths are optimizer choices, not separate user-visible query
 features. A SQL predicate or aggregate is logically supported when Antfly has a
 correct executor for its semantics; a ready full-text index, algebraic sidecar,
-scalar index, `_id` lookup, serverless segment, or scan path changes only which
+future scalar index, `_id` lookup, serverless segment, or scan path changes only which
 physical plan is admissible and cheap enough to run. The presence of a sidecar
 should never make the SQL mean something different, and the absence of a sidecar
 should not make a query syntactically invalid. It may make the query
@@ -746,7 +762,7 @@ a finite cost, or Antfly implements an equivalent residual evaluator.
 The planner invariant is producer independence: the SQL statement defines one
 logical predicate, projection, grouping, or aggregate, and each producer is only
 a physical way to obtain the same rows or the same exact answer. A ready
-full-text index, scalar index, algebraic sidecar, vector sidecar, or serverless
+full-text index, future scalar index, algebraic sidecar, vector sidecar, or serverless
 segment should make a plan cheaper or lower-latency; it should not change which
 SQL statements are meaningful. If multiple producers can prove the same
 semantics, the planner should choose the cheapest eligible producer and keep any
@@ -757,7 +773,7 @@ predicate semantics. Otherwise the planner fails closed.
 
 The practical rule is a producer ladder, not a feature gate. For a point lookup,
 use `_id`. For selective document predicates, prefer the default/full-text
-document index or a scalar/path index when either can prove the filter exactly.
+document index or a future scalar/path index when either can prove the filter exactly.
 For aggregate, facet, top-k, or summary shapes, prefer algebraic/materialized
 state when it covers the requested expression, grouping, filter, snapshot, and
 freshness policy. For small or explicitly bounded work, use the document/LSM
@@ -770,7 +786,7 @@ That creates two separate decisions. First, decide whether Antfly knows the
 logical SQL semantics for the document-table shape: predicate, projection,
 aggregate, grouping, ordering, and row filters. Second, choose an admissible
 physical producer for those semantics. Full-text/default indexes, algebraic
-sidecars, scalar/path indexes, serverless segments, and scans all participate in
+sidecars, future scalar/path indexes, serverless segments, and scans all participate in
 that second decision. Their presence should make a query cheaper, fresher, or
 lower-latency; it should not be the reason the SQL text itself becomes a
 different feature. A scan is the semantic backstop only when the residual
@@ -798,7 +814,7 @@ That means the optimizer can legitimately choose among:
   rows or an exact bounded candidate set;
 - an algebraic materialization when it can answer an aggregate/facet/top-k
   request at the same table snapshot and freshness level;
-- a scalar/path index when it proves the requested SQL comparison semantics for
+- a future scalar/path index when it proves the requested SQL comparison semantics for
   that field, including as a bounded candidate producer for mixed predicates
   with explicit residual filters;
 - an `_id` lookup when the predicate is point-like;
@@ -818,10 +834,10 @@ the only correct executor for that predicate, while ordinary scalar predicates
 can fall back to the bounded residual evaluator already used for term, range,
 prefix, and wildcard filters.
 
-Explicit Antfly query functions are the first SQL surface for derived-index
-search plans that do not naturally fit scalar `WHERE` clauses. The existing
-`antfly.*` table-function family should be source-family independent, not a
-parallel relational-only feature: `antfly.full_text_search(...)`,
+Explicit Antfly query functions are the canonical SQL surface for derived-index
+search plans, including the ones that already exist for relational SQL. They are
+not a parallel relational-only feature and document SQL should not invent a
+second spelling for the same native operations: `antfly.full_text_search(...)`,
 `antfly.semantic_search(...)`, `antfly.vector_search(...)`,
 `antfly.hybrid_search(...)`, `antfly.graph_traverse(...)`,
 `antfly.graph_neighbors(...)`, `antfly.graph_shortest_path(...)`,
@@ -831,9 +847,36 @@ the same native query request used by REST, SDK, MCP, A2A, and CLI callers.
 Public SQL execution routes these table functions through the native query
 service, including read-schema routing and row-filter injection, then returns
 one SQL row per native query hit with hit fields such as `_id`, `_score`, and
-`_source`. That keeps derived-index execution on the document-query path without
-teaching the relational row planner to emulate search, graph, vector, hybrid, or
-reranking behavior.
+`_source`. `SELECT *` returns the native hit object; a simple projected column
+list such as `SELECT _id, _score FROM antfly.full_text_search(...)` returns only
+those hit fields, with missing hit fields surfaced as `NULL`. That keeps
+derived-index execution on the document-query path without teaching the
+relational row planner to emulate search, graph, vector, hybrid, or reranking
+behavior.
+
+That means the planner has two distinct jobs. For explicit retrieval intent,
+such as semantic search, graph traversal, hybrid fusion, metric reranking, or
+full-text search with native analyzer semantics, SQL should bind an `antfly.*`
+table function and route it to the same typed native request used everywhere
+else. For compatibility predicates and aggregates, such as `WHERE status =
+'active'`, `WHERE price BETWEEN 10 AND 20`, or `COUNT(*) GROUP BY tenant_id`,
+SQL should produce a normal document table plan whose physical producer can be
+full-text, algebraic, a future physical scalar/path index, `_id` lookup, or
+scan. `typed_paths` metadata is type proof for SQL comparison semantics, not a
+physical producer. The presence of an index is therefore an optimization and
+proof obligation for compatible relational-looking operations, while the
+`antfly.*` function family remains the user-visible shape for Antfly-owned
+retrieval modes.
+
+Relational-looking predicates over document tables still matter, but they serve
+a different role. `WHERE status = 'active'` and bounded compatibility predicates
+such as `WHERE full_text_search('title:alpha')` describe filters that the
+document planner may implement through a full-text/default index, future scalar
+path index, algebraic sidecar, lookup, or bounded residual scan. They should
+not grow into separate spellings for `semantic_search`, `hybrid_search`, graph
+traversal, graph metrics, or reranking. Those remain `antfly.*` table functions
+so SQL, REST, SDK, MCP, A2A, CLI, and serverless execution all share the same
+native query request path.
 
 Current source binding records semantic, vector, hybrid, graph, and graph
 metric index families separately, even when the first SQL surface routes them
@@ -865,14 +908,33 @@ candidate paths are exact only while the candidate hit set fits under the bound;
 execution fails closed if the candidate set may extend beyond the bounded
 window.
 
+Path-level type proof is separate from path readiness. Table-level
+`typed_paths` metadata for `/metrics/score` can expose `metrics` as a JSON
+virtual root while recording `/metrics/score` as a numeric typed path. That lets
+`metrics->>'score' >= 7` lower to an exact numeric range filter without claiming
+the top-level `metrics` object is numeric. Readiness still comes from
+capabilities such as `indexed_scalar_filter_paths`; typed paths only prove SQL
+comparison semantics for nested JSON-path expressions.
+
+The public table contract accepts `typed_paths` for this proof without treating
+it as a storage-index builder. Metadata such as
+`{"numeric":["metrics.score"],"keyword":["status","metadata.plan"]}` is stored
+as a reserved table metadata section, omitted from table/index status maps,
+skipped by local DB index construction, and consumed by SQL source binding as
+path-level type proof. It does not imply PostgreSQL `CREATE INDEX` behavior,
+readiness, rebuild, catch-up, compaction, or lower latency. A future physical
+scalar secondary index should get its own explicit index family and lifecycle
+once build, catch-up, readiness, and compaction exist.
+
 The same producer-selection rule applies to aggregate-style SQL. Full-text,
-scalar, algebraic, vector, and future sidecar indexes are optimizations and
+algebraic, vector, and future physical scalar/path indexes are optimizations and
 native producers, not separate semantics. When an algebraic index can answer
 `COUNT`, grouped counts/facets, selected `DISTINCT`/top-k queries, or numeric
 summaries from indexed state, the document planner should prefer that
-index-backed aggregate producer. When a full-text or scalar index can first
-produce a selective candidate set, bounded local aggregate work can run over
-that candidate set. When no index helps, a scan is still a valid physical
+index-backed aggregate producer. When a full-text index or future physical
+scalar/path index can first produce a selective candidate set, bounded local
+aggregate work can run over that candidate set. When no index helps, a scan is
+still a valid physical
 producer only if the request carries an explicit bounded-scan policy or the
 planner can prove the scan cost is acceptable. It should not hydrate every
 matching document merely because the request is written as SQL.
@@ -912,6 +974,13 @@ bounded-scan policy as the input cap, and execution fails closed if the scan
 reaches that cap. Returning the best rows from only the first N scanned keys
 would make top-k results depend on physical key order, so that shape is not a
 valid optimization.
+
+Current implementation note: `ORDER BY` now resolves declared document fields,
+typed-path or index-definition virtual fields, `_id`, and JSON paths rooted in
+declared, typed-path, or index-derived virtual top-level fields. That remains a
+bounded local sort over an `_id` lookup, a capped native candidate producer, or
+a policy-capped scan; it does not claim that arbitrary document tables have a
+global sorted access path.
 
 Residual filters are allowed only after an explicit bounded producer. Current
 document read lowering can attach scalar residual filters after an `_id IN (...)`
@@ -1010,6 +1079,18 @@ native capability. Examples:
   explicit bounded scan policy;
 - `document_sql_array_requires_unnest` for scalar treatment of an array path;
 - `document_sql_unsupported_join` until there is a cross-source join plan;
+- `document_sql_native_search_requires_table_function` when ranked native
+  search functions such as `antfly.semantic_search`, `antfly.hybrid_search`, or
+  graph functions are used as scalar document predicates instead of table
+  functions;
+- `document_sql_projection_modifier_unsupported` for document-table
+  `DISTINCT`, `DISTINCT ON`, or explicit `SELECT ALL` until those shapes lower
+  to exact aggregate/materialized plans;
+- `document_sql_pagination_unsupported` for `OFFSET`/`FETCH` tails until
+  cursor-backed document pagination has a bounded native plan;
+- `document_sql_locking_unsupported` and `document_sql_window_unsupported` for
+  row-locking and window clauses until document reads have native semantics for
+  those features;
 - `document_sql_view_mapping_unsupported` until document-to-SQL views have
   durable catalog metadata and execution support;
 - `document_sql_write_unsupported` until document writes have shared native

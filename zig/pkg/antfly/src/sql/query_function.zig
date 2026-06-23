@@ -103,6 +103,28 @@ pub fn parseAntflyQueryFunctionCall(
     return function;
 }
 
+pub fn parseAntflyQueryFunctionReadCall(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    args: *std.ArrayListUnmanaged(SqlQueryFunctionArg),
+    projection_columns: *std.ArrayListUnmanaged([]const u8),
+) !AntflyQueryFunction {
+    try expectSqlKeyword(tokens, pos, .select);
+    if (matchSqlToken(tokens, pos, .star) == null) {
+        while (true) {
+            const column = try expectSqlToken(tokens, pos, .identifier);
+            try projection_columns.append(alloc, column.text);
+            if (matchSqlToken(tokens, pos, .comma) == null) break;
+        }
+    }
+    try expectSqlKeyword(tokens, pos, .from);
+    const function = try parseAntflyQueryFunctionExpressionAlloc(alloc, tokens, pos, args);
+    _ = matchSqlToken(tokens, pos, .semicolon);
+    if (pos.* != tokens.len) return error.UnsupportedSqlShape;
+    return function;
+}
+
 pub fn parseAntflyQueryFunctionExpressionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -394,10 +416,13 @@ pub fn lowerAntflyQueryFunctionParsedSqlAlloc(
 
 pub const LoweredAntflyQueryFunctionRead = struct {
     table_name: []const u8,
+    projection_columns: []const []const u8 = &.{},
     request: query_contract.OwnedQueryRequest,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.table_name));
+        for (self.projection_columns) |column| alloc.free(@constCast(column));
+        if (self.projection_columns.len > 0) alloc.free(@constCast(self.projection_columns));
         self.request.deinit(alloc);
         self.* = undefined;
     }
@@ -413,20 +438,51 @@ pub fn lowerAntflyQueryFunctionReadParsedSqlAlloc(
         deinitAntflyQueryFunctionArgs(alloc, args.items);
         args.deinit(alloc);
     }
+    var projection_columns = std.ArrayListUnmanaged([]const u8).empty;
+    defer projection_columns.deinit(alloc);
     var pos: usize = 0;
-    const function = try parseAntflyQueryFunctionCall(alloc, parsed_sql.items(), &pos, &args);
+    const function = try parseAntflyQueryFunctionReadCall(alloc, parsed_sql.items(), &pos, &args, &projection_columns);
     const table_name = antflyQueryFunctionStringArg(args.items, "table_name") orelse
         antflyQueryFunctionStringArg(args.items, "table") orelse return error.UnsupportedSqlShape;
     if (table_name.len == 0) return error.UnsupportedSqlShape;
 
     const owned_table_name = try alloc.dupe(u8, table_name);
     errdefer alloc.free(owned_table_name);
+    const owned_projection_columns = try ownAntflyQueryFunctionProjectionColumnsAlloc(alloc, projection_columns.items);
+    errdefer freeAntflyQueryFunctionProjectionColumns(alloc, owned_projection_columns);
     var request = try lowerParsedAntflyQueryFunctionAlloc(alloc, semantic_resolver, function, args.items);
     errdefer request.deinit(alloc);
     return .{
         .table_name = owned_table_name,
+        .projection_columns = owned_projection_columns,
         .request = request,
     };
+}
+
+fn ownAntflyQueryFunctionProjectionColumnsAlloc(
+    alloc: std.mem.Allocator,
+    columns: []const []const u8,
+) ![]const []const u8 {
+    if (columns.len == 0) return &.{};
+    const owned = try alloc.alloc([]const u8, columns.len);
+    errdefer alloc.free(owned);
+    var initialized: usize = 0;
+    errdefer {
+        for (owned[0..initialized]) |column| alloc.free(@constCast(column));
+    }
+    for (columns, 0..) |column, i| {
+        owned[i] = try alloc.dupe(u8, column);
+        initialized += 1;
+    }
+    return owned;
+}
+
+fn freeAntflyQueryFunctionProjectionColumns(
+    alloc: std.mem.Allocator,
+    columns: []const []const u8,
+) void {
+    for (columns) |column| alloc.free(@constCast(column));
+    if (columns.len > 0) alloc.free(@constCast(columns));
 }
 
 pub fn lowerAntflyQueryFunctionExpressionSqlAlloc(
@@ -1924,6 +1980,105 @@ test "sql adapter query function lowers antfly query functions into native searc
     try expectMergeWeight(helper_merge.weights, "full_text_search", 0.25);
     try expectMergeWeight(helper_merge.weights, "docs_body_semantic", 0.6);
     try expectMergeWeight(helper_merge.weights, "graph_metric_rerank", 0.15);
+}
+
+test "sql adapter query function read accepts projected hit columns" {
+    const alloc = std.testing.allocator;
+
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT _id, _score FROM antfly.full_text_search(table_name => 'docs', index => 'docs_body_fts', field => 'body', query => 'refund policy', limit => 5);",
+    );
+    defer parsed_sql.deinit(alloc);
+
+    var lowered = try lowerAntflyQueryFunctionReadParsedSqlAlloc(alloc, null, &parsed_sql);
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqualStrings("docs", lowered.table_name);
+    try std.testing.expectEqual(@as(usize, 2), lowered.projection_columns.len);
+    try std.testing.expectEqualStrings("_id", lowered.projection_columns[0]);
+    try std.testing.expectEqualStrings("_score", lowered.projection_columns[1]);
+    try std.testing.expectEqual(@as(u32, 5), lowered.request.req.limit);
+    try std.testing.expectEqualStrings("docs_body_fts", lowered.request.req.primary_text_index_name.?);
+}
+
+test "sql adapter query function read keeps projected columns for derived search functions" {
+    const alloc = std.testing.allocator;
+
+    const Resolver = struct {
+        fn resolve(
+            _: *anyopaque,
+            allocator: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            semantic_search: []const u8,
+            embedding_template: ?[]const u8,
+            limit: u32,
+        ) !db_mod.types.DenseKnnQuery {
+            _ = embedding_template;
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expect(index_name.len > 0);
+            try std.testing.expect(semantic_search.len > 0);
+            return .{
+                .vector = try allocator.dupe(f32, &[_]f32{ 0.25, 0.5, 0.75 }),
+                .k = limit,
+            };
+        }
+    };
+    var resolver_state: u8 = 0;
+    const resolver = query_contract.SemanticResolver{
+        .ptr = &resolver_state,
+        .vtable = &.{ .resolve_dense_query = Resolver.resolve },
+    };
+
+    var semantic_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT _id, _score, _source FROM antfly.semantic_search(table_name => 'docs', index => 'docs_body_semantic', query => 'automatic embeddings', limit => 7);",
+    );
+    defer semantic_sql.deinit(alloc);
+    var semantic = try lowerAntflyQueryFunctionReadParsedSqlAlloc(alloc, resolver, &semantic_sql);
+    defer semantic.deinit(alloc);
+    try std.testing.expectEqualStrings("docs", semantic.table_name);
+    try std.testing.expectEqual(@as(usize, 3), semantic.projection_columns.len);
+    try std.testing.expectEqualStrings("_id", semantic.projection_columns[0]);
+    try std.testing.expectEqualStrings("_score", semantic.projection_columns[1]);
+    try std.testing.expectEqualStrings("_source", semantic.projection_columns[2]);
+    try std.testing.expectEqual(@as(u32, 7), semantic.request.req.limit);
+    try std.testing.expectEqual(@as(usize, 1), semantic.request.req.dense_queries.len);
+    try std.testing.expectEqualStrings("docs_body_semantic", semantic.request.req.dense_queries[0].index_name);
+    try std.testing.expectEqual(@as(u32, 7), semantic.request.req.dense_queries[0].query.k);
+
+    var hybrid_sql = try tokenized.ParsedSql.initAlloc(alloc,
+        \\SELECT _id, _score FROM antfly.hybrid_search(table_name => 'docs', query => 'hybrid refund', fusion => 'rrf', window_size => 25, sources => ARRAY[antfly.source('docs_body_fts', field => 'body', weight => 0.25), antfly.source('docs_body_semantic', weight => 0.6), antfly.source('docs_edge_graph', metric => 'pagerank', weight => 0.15, base_weight => 0.5, missing_score => 0.1, freshness => 'fresh')], limit => 9);
+    );
+    defer hybrid_sql.deinit(alloc);
+    var hybrid = try lowerAntflyQueryFunctionReadParsedSqlAlloc(alloc, resolver, &hybrid_sql);
+    defer hybrid.deinit(alloc);
+    try std.testing.expectEqualStrings("docs", hybrid.table_name);
+    try std.testing.expectEqual(@as(usize, 2), hybrid.projection_columns.len);
+    try std.testing.expectEqualStrings("_id", hybrid.projection_columns[0]);
+    try std.testing.expectEqualStrings("_score", hybrid.projection_columns[1]);
+    try std.testing.expectEqual(@as(u32, 9), hybrid.request.req.limit);
+    try std.testing.expectEqualStrings("docs_body_fts", hybrid.request.req.primary_text_index_name.?);
+    try std.testing.expect(hybrid.request.req.full_text != null);
+    try std.testing.expectEqual(@as(usize, 1), hybrid.request.req.dense_queries.len);
+    try std.testing.expect(hybrid.request.req.graph_metric_rerank != null);
+    try std.testing.expect(hybrid.request.req.merge_config != null);
+
+    var graph_metric_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT _id, _score FROM antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 2, freshness => 'fresh', limit => 2);",
+    );
+    defer graph_metric_sql.deinit(alloc);
+    var graph_metric = try lowerAntflyQueryFunctionReadParsedSqlAlloc(alloc, null, &graph_metric_sql);
+    defer graph_metric.deinit(alloc);
+    try std.testing.expectEqualStrings("docs", graph_metric.table_name);
+    try std.testing.expectEqual(@as(usize, 2), graph_metric.projection_columns.len);
+    try std.testing.expectEqualStrings("_id", graph_metric.projection_columns[0]);
+    try std.testing.expectEqualStrings("_score", graph_metric.projection_columns[1]);
+    try std.testing.expectEqual(@as(u32, 2), graph_metric.request.req.limit);
+    try std.testing.expectEqual(@as(usize, 1), graph_metric.request.req.graph_metric_queries.len);
+    try std.testing.expectEqualStrings("docs_edge_graph", graph_metric.request.req.graph_metric_queries[0].query.index_name);
+    try std.testing.expectEqualStrings("pagerank", graph_metric.request.req.graph_metric_queries[0].query.metric_name);
 }
 
 fn expectMergeWeight(weights: []const @import("../search/fusion.zig").NamedWeight, name: []const u8, expected: f64) !void {

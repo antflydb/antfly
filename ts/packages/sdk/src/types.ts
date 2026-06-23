@@ -53,6 +53,8 @@ export type QueryRequest = Omit<
 export type QueryResult = components["schemas"]["QueryResult"];
 export type QueryHit = components["schemas"]["QueryHit"];
 export type QueryResponses = components["schemas"]["QueryResponses"];
+export type SqlStatementRequest = components["schemas"]["SqlStatementRequest"];
+export type SqlStatementResponse = components["schemas"]["SqlStatementResponse"];
 
 // Fix BatchRequest to allow any object for inserts
 export interface BatchRequest {
@@ -124,7 +126,8 @@ export type RowsExpressionValue = components["schemas"]["RowsExpressionValue"];
 export type RowsExpressionOperator = components["schemas"]["RowsExpressionOperator"];
 export type RowsExpressionCondition = components["schemas"]["RowsExpressionCondition"];
 export type RowsExpressionConditionGroup = components["schemas"]["RowsExpressionConditionGroup"];
-export type RowsExpressionArrayContainsPredicate = components["schemas"]["RowsExpressionArrayContainsPredicate"];
+export type RowsExpressionArrayContainsPredicate =
+  components["schemas"]["RowsExpressionArrayContainsPredicate"];
 export type RowsExpressionProjection = components["schemas"]["RowsExpressionProjection"];
 export type RowsAggregateRequest = components["schemas"]["RowsAggregateRequest"];
 export type RowsAggregateSpec = components["schemas"]["RowsAggregateSpec"];

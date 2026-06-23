@@ -6775,6 +6775,8 @@ test "distributed graph metric post processing applies max results after filter 
         .key = try alloc.dupe(u8, "B"),
         .depth = 1,
         .distance = 1,
+        .path = null,
+        .path_edges = null,
         .metrics = try alloc.dupe(graph_query_mod.GraphMetricValue, &.{
             .{ .name = try alloc.dupe(u8, "degree"), .score = 1.0 },
         }),
@@ -6783,6 +6785,8 @@ test "distributed graph metric post processing applies max results after filter 
         .key = try alloc.dupe(u8, "C"),
         .depth = 1,
         .distance = 1,
+        .path = null,
+        .path_edges = null,
         .metrics = try alloc.dupe(graph_query_mod.GraphMetricValue, &.{
             .{ .name = try alloc.dupe(u8, "degree"), .score = 3.0 },
         }),
@@ -6791,6 +6795,8 @@ test "distributed graph metric post processing applies max results after filter 
         .key = try alloc.dupe(u8, "D"),
         .depth = 1,
         .distance = 1,
+        .path = null,
+        .path_edges = null,
         .metrics = try alloc.dupe(graph_query_mod.GraphMetricValue, &.{
             .{ .name = try alloc.dupe(u8, "degree"), .score = 2.0 },
         }),

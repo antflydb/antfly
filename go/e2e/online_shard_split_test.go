@@ -1225,7 +1225,7 @@ func TestE2E_OnlineSplit_PreBuiltIndexes(t *testing.T) {
 
 		_, err := cluster.Client.Batch(ctx, tableName, antfly.BatchRequest{
 			Inserts:   map[string]any{key: record},
-			SyncLevel: antfly.SyncLevelFullText, // Wait for full-text index
+			SyncLevel: antfly.SyncLevelQuery, // Wait for full-text index
 		})
 		require.NoError(t, err)
 	}
@@ -1261,7 +1261,7 @@ func TestE2E_OnlineSplit_PreBuiltIndexes(t *testing.T) {
 
 		_, err := cluster.Client.Batch(ctx, tableName, antfly.BatchRequest{
 			Inserts:   map[string]any{key: largeRecord},
-			SyncLevel: antfly.SyncLevelFullText,
+			SyncLevel: antfly.SyncLevelQuery,
 		})
 		require.NoError(t, err)
 	}
@@ -1670,7 +1670,7 @@ func TestE2E_SplitAvailabilityIndexQueries(t *testing.T) {
 
 		_, err := cluster.Client.Batch(ctx, tableName, antfly.BatchRequest{
 			Inserts:   map[string]any{key: record},
-			SyncLevel: antfly.SyncLevelFullText,
+			SyncLevel: antfly.SyncLevelQuery,
 		})
 		require.NoError(t, err)
 	}
@@ -1748,7 +1748,7 @@ func TestE2E_SplitAvailabilityIndexQueries(t *testing.T) {
 
 		_, err := cluster.Client.Batch(ctx, tableName, antfly.BatchRequest{
 			Inserts:   map[string]any{key: largeRecord},
-			SyncLevel: antfly.SyncLevelFullText,
+			SyncLevel: antfly.SyncLevelQuery,
 		})
 		require.NoError(t, err)
 	}

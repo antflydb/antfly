@@ -103,12 +103,13 @@ def sync_detailed(
     Update/delete sources use either a typed base row query with a
     `row_claim` and transaction id, or a typed joined mutation-source plan
     whose target side carries the row claim. Insert-source requests expose
-    the native source-to-target insert plan shape and fail closed until the
-    runtime insert-source executor is available. The server claims selected
-    target rows for update/delete, records committed-version predicates,
-    stages intents into the existing transaction, and returns optional
-    projections from the planned final target image or deleted target row
-    image.
+    the native source-to-target insert plan shape: the server reads the
+    typed source query, applies target-column assignments and conflict
+    actions through the row-batch constraint path, and returns optional
+    projections from the planned final target image. Update/delete plans
+    claim selected target rows, record committed-version predicates, stage
+    intents into the existing transaction, and return optional projections
+    from the planned final target image or deleted target row image.
 
     Args:
         table_name (str):
@@ -147,12 +148,13 @@ def sync(
     Update/delete sources use either a typed base row query with a
     `row_claim` and transaction id, or a typed joined mutation-source plan
     whose target side carries the row claim. Insert-source requests expose
-    the native source-to-target insert plan shape and fail closed until the
-    runtime insert-source executor is available. The server claims selected
-    target rows for update/delete, records committed-version predicates,
-    stages intents into the existing transaction, and returns optional
-    projections from the planned final target image or deleted target row
-    image.
+    the native source-to-target insert plan shape: the server reads the
+    typed source query, applies target-column assignments and conflict
+    actions through the row-batch constraint path, and returns optional
+    projections from the planned final target image. Update/delete plans
+    claim selected target rows, record committed-version predicates, stage
+    intents into the existing transaction, and return optional projections
+    from the planned final target image or deleted target row image.
 
     Args:
         table_name (str):
@@ -186,12 +188,13 @@ async def asyncio_detailed(
     Update/delete sources use either a typed base row query with a
     `row_claim` and transaction id, or a typed joined mutation-source plan
     whose target side carries the row claim. Insert-source requests expose
-    the native source-to-target insert plan shape and fail closed until the
-    runtime insert-source executor is available. The server claims selected
-    target rows for update/delete, records committed-version predicates,
-    stages intents into the existing transaction, and returns optional
-    projections from the planned final target image or deleted target row
-    image.
+    the native source-to-target insert plan shape: the server reads the
+    typed source query, applies target-column assignments and conflict
+    actions through the row-batch constraint path, and returns optional
+    projections from the planned final target image. Update/delete plans
+    claim selected target rows, record committed-version predicates, stage
+    intents into the existing transaction, and return optional projections
+    from the planned final target image or deleted target row image.
 
     Args:
         table_name (str):
@@ -228,12 +231,13 @@ async def asyncio(
     Update/delete sources use either a typed base row query with a
     `row_claim` and transaction id, or a typed joined mutation-source plan
     whose target side carries the row claim. Insert-source requests expose
-    the native source-to-target insert plan shape and fail closed until the
-    runtime insert-source executor is available. The server claims selected
-    target rows for update/delete, records committed-version predicates,
-    stages intents into the existing transaction, and returns optional
-    projections from the planned final target image or deleted target row
-    image.
+    the native source-to-target insert plan shape: the server reads the
+    typed source query, applies target-column assignments and conflict
+    actions through the row-batch constraint path, and returns optional
+    projections from the planned final target image. Update/delete plans
+    claim selected target rows, record committed-version predicates, stage
+    intents into the existing transaction, and return optional projections
+    from the planned final target image or deleted target row image.
 
     Args:
         table_name (str):

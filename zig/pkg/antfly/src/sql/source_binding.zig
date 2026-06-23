@@ -44,12 +44,19 @@ pub const RelationalBinding = struct {
 pub const DocumentSqlVirtualFieldSource = enum {
     declared_schema,
     index_definition,
+    typed_path_metadata,
 };
 
 pub const DocumentSqlVirtualField = struct {
     name: []const u8,
     path: []const u8,
     source: DocumentSqlVirtualFieldSource,
+    field_type: ?runtime_schema.AntflyType = null,
+};
+
+pub const DocumentSqlTypedPath = struct {
+    path: []const u8,
+    field_type: runtime_schema.AntflyType,
 };
 
 pub const DocumentSqlSchema = struct {
@@ -57,6 +64,8 @@ pub const DocumentSqlSchema = struct {
     exposes_doc: bool = true,
     fields: []const DocumentSqlVirtualField = &.{},
     owns_fields: bool = false,
+    typed_paths: []const DocumentSqlTypedPath = &.{},
+    owns_typed_paths: bool = false,
 };
 
 pub const DocumentSqlFullTextIndex = struct {
@@ -224,23 +233,31 @@ pub fn documentSqlSchemaForRuntimeSchemaAndIndexesJsonAlloc(
     indexes_json: []const u8,
 ) !DocumentSqlSchema {
     var fields = std.ArrayListUnmanaged(DocumentSqlVirtualField).empty;
+    var typed_paths = std.ArrayListUnmanaged(DocumentSqlTypedPath).empty;
     errdefer deinitDocumentSqlVirtualFieldList(alloc, &fields);
+    errdefer deinitDocumentSqlTypedPathList(alloc, &typed_paths);
 
     for (schema.relational_columns) |column| {
-        try appendDocumentSqlVirtualFieldAlloc(alloc, &fields, column.name, column.path, .declared_schema);
+        try appendDocumentSqlVirtualFieldAlloc(alloc, &fields, column.name, column.path, .declared_schema, column.field_type);
     }
 
     if (indexes_json.len > 0) {
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidSqlCatalog;
-        try appendDocumentSqlVirtualFieldsFromIndexesJsonValue(alloc, &fields, parsed.value);
+        try appendDocumentSqlVirtualFieldsFromCatalogMetadataValue(alloc, &fields, parsed.value);
+        try appendDocumentSqlTypedPathsFromCatalogMetadataValue(alloc, &typed_paths, parsed.value);
     }
 
     var virtual_schema = DocumentSqlSchema{};
+    errdefer deinitDocumentSqlSchema(alloc, &virtual_schema);
     if (fields.items.len > 0) {
         virtual_schema.fields = try fields.toOwnedSlice(alloc);
         virtual_schema.owns_fields = true;
+    }
+    if (typed_paths.items.len > 0) {
+        virtual_schema.typed_paths = try typed_paths.toOwnedSlice(alloc);
+        virtual_schema.owns_typed_paths = true;
     }
     return virtual_schema;
 }
@@ -253,7 +270,20 @@ pub fn deinitDocumentSqlSchema(alloc: std.mem.Allocator, schema: *DocumentSqlSch
         }
         alloc.free(schema.fields);
     }
+    if (schema.owns_typed_paths) {
+        for (schema.typed_paths) |path| {
+            alloc.free(@constCast(path.path));
+        }
+        alloc.free(schema.typed_paths);
+    }
     schema.* = .{};
+}
+
+pub fn documentSqlTypedPathType(schema: DocumentSqlSchema, path: []const u8) ?runtime_schema.AntflyType {
+    for (schema.typed_paths) |candidate| {
+        if (documentScalarFilterPathEqual(candidate.path, path)) return candidate.field_type;
+    }
+    return null;
 }
 
 pub fn deinitDocumentSqlCapabilities(alloc: std.mem.Allocator, capabilities: *DocumentSqlCapabilities) void {
@@ -283,7 +313,7 @@ pub fn documentScalarFilterPathReady(capabilities: DocumentSqlCapabilities, path
     return false;
 }
 
-fn appendDocumentSqlVirtualFieldsFromIndexesJsonValue(
+fn appendDocumentSqlVirtualFieldsFromCatalogMetadataValue(
     alloc: std.mem.Allocator,
     fields: *std.ArrayListUnmanaged(DocumentSqlVirtualField),
     value: std.json.Value,
@@ -293,38 +323,40 @@ fn appendDocumentSqlVirtualFieldsFromIndexesJsonValue(
     if (value.object.get("indexes")) |indexes| {
         if (indexes != .array) return error.InvalidSqlCatalog;
         for (indexes.array.items) |index_value| {
-            try appendDocumentSqlVirtualFieldsFromIndexConfigValue(alloc, fields, index_value);
+            try appendDocumentSqlVirtualFieldsFromIndexDefinitionValue(alloc, fields, index_value);
         }
     }
 
     var it = value.object.iterator();
     while (it.next()) |entry| {
-        if (std.mem.eql(u8, entry.key_ptr.*, "indexes")) continue;
-        try appendDocumentSqlVirtualFieldsFromIndexConfigValue(alloc, fields, entry.value_ptr.*);
+        if (std.mem.eql(u8, entry.key_ptr.*, "indexes") or
+            std.mem.eql(u8, entry.key_ptr.*, "typed_paths") or
+            std.mem.eql(u8, entry.key_ptr.*, "resolvers") or
+            std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+        try appendDocumentSqlVirtualFieldsFromIndexDefinitionValue(alloc, fields, entry.value_ptr.*);
+    }
+
+    if (value.object.get("typed_paths")) |typed_paths| {
+        try appendDocumentSqlVirtualFieldsFromTypedPathsValue(alloc, fields, typed_paths);
     }
 }
 
-fn appendDocumentSqlVirtualFieldsFromIndexConfigValue(
+fn appendDocumentSqlVirtualFieldsFromIndexDefinitionValue(
     alloc: std.mem.Allocator,
     fields: *std.ArrayListUnmanaged(DocumentSqlVirtualField),
     value: std.json.Value,
 ) !void {
     if (value != .object) return;
-    try appendDocumentSqlVirtualFieldsFromNamedConfigValue(alloc, fields, value, "field");
-    try appendDocumentSqlVirtualFieldsFromNamedConfigValue(alloc, fields, value, "path");
-    try appendDocumentSqlVirtualFieldsFromNamedConfigValue(alloc, fields, value, "fields");
-    try appendDocumentSqlVirtualFieldsFromNamedConfigValue(alloc, fields, value, "paths");
-    try appendDocumentSqlVirtualFieldsFromNamedConfigValue(alloc, fields, value, "scalar_field");
-    try appendDocumentSqlVirtualFieldsFromNamedConfigValue(alloc, fields, value, "scalar_path");
-    try appendDocumentSqlVirtualFieldsFromNamedConfigValue(alloc, fields, value, "scalar_fields");
-    try appendDocumentSqlVirtualFieldsFromNamedConfigValue(alloc, fields, value, "scalar_paths");
-    try appendDocumentSqlVirtualFieldsFromNamedConfigValue(alloc, fields, value, "indexed_scalar_field");
-    try appendDocumentSqlVirtualFieldsFromNamedConfigValue(alloc, fields, value, "indexed_scalar_path");
-    try appendDocumentSqlVirtualFieldsFromNamedConfigValue(alloc, fields, value, "indexed_scalar_fields");
-    try appendDocumentSqlVirtualFieldsFromNamedConfigValue(alloc, fields, value, "indexed_scalar_paths");
+    const type_value = value.object.get("type") orelse value.object.get("kind") orelse return;
+    if (type_value != .string) return;
+    if (!std.mem.eql(u8, type_value.string, "full_text")) return;
+    try appendDocumentSqlIndexDefinitionVirtualFieldsFromNamedConfigValue(alloc, fields, value, "field");
+    try appendDocumentSqlIndexDefinitionVirtualFieldsFromNamedConfigValue(alloc, fields, value, "path");
+    try appendDocumentSqlIndexDefinitionVirtualFieldsFromNamedConfigValue(alloc, fields, value, "fields");
+    try appendDocumentSqlIndexDefinitionVirtualFieldsFromNamedConfigValue(alloc, fields, value, "paths");
 }
 
-fn appendDocumentSqlVirtualFieldsFromNamedConfigValue(
+fn appendDocumentSqlIndexDefinitionVirtualFieldsFromNamedConfigValue(
     alloc: std.mem.Allocator,
     fields: *std.ArrayListUnmanaged(DocumentSqlVirtualField),
     value: std.json.Value,
@@ -332,24 +364,233 @@ fn appendDocumentSqlVirtualFieldsFromNamedConfigValue(
 ) !void {
     const field_value = value.object.get(name) orelse return;
     switch (field_value) {
-        .string => |path| try appendDocumentSqlVirtualFieldFromIndexPathAlloc(alloc, fields, path),
+        .string => |path| try appendDocumentSqlVirtualFieldFromIndexDefinitionPathAlloc(alloc, fields, path),
         .array => |array| {
             for (array.items) |item| {
                 if (item != .string) return error.InvalidSqlCatalog;
-                try appendDocumentSqlVirtualFieldFromIndexPathAlloc(alloc, fields, item.string);
+                try appendDocumentSqlVirtualFieldFromIndexDefinitionPathAlloc(alloc, fields, item.string);
             }
         },
         else => return error.InvalidSqlCatalog,
     }
 }
 
-fn appendDocumentSqlVirtualFieldFromIndexPathAlloc(
+fn appendDocumentSqlVirtualFieldFromIndexDefinitionPathAlloc(
     alloc: std.mem.Allocator,
     fields: *std.ArrayListUnmanaged(DocumentSqlVirtualField),
     path: []const u8,
 ) !void {
     const top_level = documentSqlTopLevelPathSegment(path) orelse return error.InvalidSqlCatalog;
-    try appendDocumentSqlVirtualFieldAlloc(alloc, fields, top_level, top_level, .index_definition);
+    try appendDocumentSqlVirtualFieldAlloc(alloc, fields, top_level, top_level, .index_definition, null);
+}
+
+fn appendDocumentSqlVirtualFieldsFromTypedPathsValue(
+    alloc: std.mem.Allocator,
+    fields: *std.ArrayListUnmanaged(DocumentSqlVirtualField),
+    value: std.json.Value,
+) !void {
+    switch (value) {
+        .array => |array| {
+            for (array.items) |item| try appendDocumentSqlVirtualFieldsFromTypedPathConfigValue(alloc, fields, item);
+        },
+        .object => |object| {
+            if (object.get("type") != null or object.get("kind") != null) {
+                try appendDocumentSqlVirtualFieldsFromTypedPathConfigValue(alloc, fields, value);
+                return;
+            }
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                const field_type = documentSqlFieldTypeFromTypedPathTypeName(entry.key_ptr.*) orelse return error.InvalidSqlCatalog;
+                try appendDocumentSqlVirtualFieldsFromPathValue(alloc, fields, entry.value_ptr.*, field_type);
+            }
+        },
+        else => return error.InvalidSqlCatalog,
+    }
+}
+
+fn appendDocumentSqlVirtualFieldsFromPathValue(
+    alloc: std.mem.Allocator,
+    fields: *std.ArrayListUnmanaged(DocumentSqlVirtualField),
+    value: std.json.Value,
+    field_type: runtime_schema.AntflyType,
+) !void {
+    switch (value) {
+        .string => |path| try appendDocumentSqlVirtualFieldFromTypedPathAlloc(alloc, fields, path, field_type),
+        .array => |array| {
+            for (array.items) |item| {
+                if (item != .string) return error.InvalidSqlCatalog;
+                try appendDocumentSqlVirtualFieldFromTypedPathAlloc(alloc, fields, item.string, field_type);
+            }
+        },
+        else => return error.InvalidSqlCatalog,
+    }
+}
+
+fn appendDocumentSqlVirtualFieldsFromTypedPathConfigValue(
+    alloc: std.mem.Allocator,
+    fields: *std.ArrayListUnmanaged(DocumentSqlVirtualField),
+    value: std.json.Value,
+) !void {
+    if (value != .object) return;
+    const field_type = documentSqlFieldTypeFromTypedPathConfigValue(value);
+    try appendDocumentSqlVirtualFieldsFromNamedConfigValue(alloc, fields, value, "field", field_type);
+    try appendDocumentSqlVirtualFieldsFromNamedConfigValue(alloc, fields, value, "path", field_type);
+    try appendDocumentSqlVirtualFieldsFromNamedConfigValue(alloc, fields, value, "fields", field_type);
+    try appendDocumentSqlVirtualFieldsFromNamedConfigValue(alloc, fields, value, "paths", field_type);
+}
+
+fn appendDocumentSqlVirtualFieldsFromNamedConfigValue(
+    alloc: std.mem.Allocator,
+    fields: *std.ArrayListUnmanaged(DocumentSqlVirtualField),
+    value: std.json.Value,
+    name: []const u8,
+    field_type: ?runtime_schema.AntflyType,
+) !void {
+    const field_value = value.object.get(name) orelse return;
+    switch (field_value) {
+        .string => |path| try appendDocumentSqlVirtualFieldFromTypedPathAlloc(alloc, fields, path, field_type),
+        .array => |array| {
+            for (array.items) |item| {
+                if (item != .string) return error.InvalidSqlCatalog;
+                try appendDocumentSqlVirtualFieldFromTypedPathAlloc(alloc, fields, item.string, field_type);
+            }
+        },
+        else => return error.InvalidSqlCatalog,
+    }
+}
+
+fn documentSqlFieldTypeFromTypedPathConfigValue(value: std.json.Value) ?runtime_schema.AntflyType {
+    const type_value = value.object.get("type") orelse value.object.get("kind") orelse return null;
+    if (type_value != .string) return null;
+    return documentSqlFieldTypeFromTypedPathTypeName(type_value.string);
+}
+
+fn documentSqlFieldTypeFromTypedPathTypeName(type_name: []const u8) ?runtime_schema.AntflyType {
+    if (std.mem.eql(u8, type_name, "keyword") or std.mem.eql(u8, type_name, "term")) return .keyword;
+    if (std.mem.eql(u8, type_name, "numeric")) return .numeric;
+    if (std.mem.eql(u8, type_name, "boolean")) return .boolean;
+    if (std.mem.eql(u8, type_name, "datetime")) return .datetime;
+    return null;
+}
+
+fn appendDocumentSqlVirtualFieldFromTypedPathAlloc(
+    alloc: std.mem.Allocator,
+    fields: *std.ArrayListUnmanaged(DocumentSqlVirtualField),
+    path: []const u8,
+    field_type: ?runtime_schema.AntflyType,
+) !void {
+    const top_level = documentSqlTopLevelPathSegment(path) orelse return error.InvalidSqlCatalog;
+    try appendDocumentSqlVirtualFieldAlloc(alloc, fields, top_level, top_level, .typed_path_metadata, documentSqlVirtualFieldTypeForTypedPath(path, field_type));
+}
+
+fn appendDocumentSqlTypedPathsFromCatalogMetadataValue(
+    alloc: std.mem.Allocator,
+    typed_paths: *std.ArrayListUnmanaged(DocumentSqlTypedPath),
+    value: std.json.Value,
+) !void {
+    if (value != .object) return error.InvalidSqlCatalog;
+
+    if (value.object.get("typed_paths")) |typed_paths_value| {
+        try appendDocumentSqlTypedPathsFromTypedPathsValue(alloc, typed_paths, typed_paths_value);
+    }
+}
+
+fn appendDocumentSqlTypedPathsFromTypedPathsValue(
+    alloc: std.mem.Allocator,
+    typed_paths: *std.ArrayListUnmanaged(DocumentSqlTypedPath),
+    value: std.json.Value,
+) !void {
+    switch (value) {
+        .array => |array| {
+            for (array.items) |item| try appendDocumentSqlTypedPathsFromTypedPathConfigValue(alloc, typed_paths, item);
+        },
+        .object => |object| {
+            if (object.get("type") != null or object.get("kind") != null) {
+                try appendDocumentSqlTypedPathsFromTypedPathConfigValue(alloc, typed_paths, value);
+                return;
+            }
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                const field_type = documentSqlFieldTypeFromTypedPathTypeName(entry.key_ptr.*) orelse return error.InvalidSqlCatalog;
+                try appendDocumentSqlTypedPathsFromPathValue(alloc, typed_paths, entry.value_ptr.*, field_type);
+            }
+        },
+        else => return error.InvalidSqlCatalog,
+    }
+}
+
+fn appendDocumentSqlTypedPathsFromPathValue(
+    alloc: std.mem.Allocator,
+    typed_paths: *std.ArrayListUnmanaged(DocumentSqlTypedPath),
+    value: std.json.Value,
+    field_type: runtime_schema.AntflyType,
+) !void {
+    switch (value) {
+        .string => |path| try appendDocumentSqlTypedPathAlloc(alloc, typed_paths, path, field_type),
+        .array => |array| {
+            for (array.items) |item| {
+                if (item != .string) return error.InvalidSqlCatalog;
+                try appendDocumentSqlTypedPathAlloc(alloc, typed_paths, item.string, field_type);
+            }
+        },
+        else => return error.InvalidSqlCatalog,
+    }
+}
+
+fn appendDocumentSqlTypedPathsFromTypedPathConfigValue(
+    alloc: std.mem.Allocator,
+    typed_paths: *std.ArrayListUnmanaged(DocumentSqlTypedPath),
+    value: std.json.Value,
+) !void {
+    if (value != .object) return;
+    const field_type = documentSqlFieldTypeFromTypedPathConfigValue(value) orelse return;
+    try appendDocumentSqlTypedPathsFromNamedConfigValue(alloc, typed_paths, value, "field", field_type);
+    try appendDocumentSqlTypedPathsFromNamedConfigValue(alloc, typed_paths, value, "path", field_type);
+    try appendDocumentSqlTypedPathsFromNamedConfigValue(alloc, typed_paths, value, "fields", field_type);
+    try appendDocumentSqlTypedPathsFromNamedConfigValue(alloc, typed_paths, value, "paths", field_type);
+}
+
+fn appendDocumentSqlTypedPathsFromNamedConfigValue(
+    alloc: std.mem.Allocator,
+    typed_paths: *std.ArrayListUnmanaged(DocumentSqlTypedPath),
+    value: std.json.Value,
+    name: []const u8,
+    field_type: runtime_schema.AntflyType,
+) !void {
+    const field_value = value.object.get(name) orelse return;
+    switch (field_value) {
+        .string => |path| try appendDocumentSqlTypedPathAlloc(alloc, typed_paths, path, field_type),
+        .array => |array| {
+            for (array.items) |item| {
+                if (item != .string) return error.InvalidSqlCatalog;
+                try appendDocumentSqlTypedPathAlloc(alloc, typed_paths, item.string, field_type);
+            }
+        },
+        else => return error.InvalidSqlCatalog,
+    }
+}
+
+fn appendDocumentSqlTypedPathAlloc(
+    alloc: std.mem.Allocator,
+    typed_paths: *std.ArrayListUnmanaged(DocumentSqlTypedPath),
+    path: []const u8,
+    field_type: runtime_schema.AntflyType,
+) !void {
+    if (path.len == 0) return error.InvalidSqlCatalog;
+    for (typed_paths.items) |existing| {
+        if (documentScalarFilterPathEqual(existing.path, path)) return;
+    }
+    try typed_paths.append(alloc, .{
+        .path = try alloc.dupe(u8, path),
+        .field_type = field_type,
+    });
+}
+
+fn documentSqlVirtualFieldTypeForTypedPath(path: []const u8, field_type: ?runtime_schema.AntflyType) ?runtime_schema.AntflyType {
+    const top_level = documentSqlTopLevelPathSegment(path) orelse return null;
+    const normalized = if (path.len > 0 and path[0] == '/') path[1..] else path;
+    if (normalized.len != top_level.len) return null;
+    return field_type;
 }
 
 fn appendDocumentSqlVirtualFieldAlloc(
@@ -358,6 +599,7 @@ fn appendDocumentSqlVirtualFieldAlloc(
     name: []const u8,
     path: []const u8,
     source: DocumentSqlVirtualFieldSource,
+    field_type: ?runtime_schema.AntflyType,
 ) !void {
     if (name.len == 0 or path.len == 0) return error.InvalidSqlCatalog;
     for (fields.items) |existing| {
@@ -371,6 +613,7 @@ fn appendDocumentSqlVirtualFieldAlloc(
         .name = owned_name,
         .path = owned_path,
         .source = source,
+        .field_type = field_type,
     });
 }
 
@@ -383,6 +626,16 @@ fn deinitDocumentSqlVirtualFieldList(
         alloc.free(@constCast(field.path));
     }
     fields.deinit(alloc);
+}
+
+fn deinitDocumentSqlTypedPathList(
+    alloc: std.mem.Allocator,
+    paths: *std.ArrayListUnmanaged(DocumentSqlTypedPath),
+) void {
+    for (paths.items) |path| {
+        alloc.free(@constCast(path.path));
+    }
+    paths.deinit(alloc);
 }
 
 fn documentSqlTopLevelPathSegment(path: []const u8) ?[]const u8 {
@@ -413,7 +666,10 @@ fn mergeDocumentCapabilitiesFromIndexesJsonValue(
 
     var it = value.object.iterator();
     while (it.next()) |entry| {
-        if (std.mem.eql(u8, entry.key_ptr.*, "indexes")) continue;
+        if (std.mem.eql(u8, entry.key_ptr.*, "indexes") or
+            std.mem.eql(u8, entry.key_ptr.*, "typed_paths") or
+            std.mem.eql(u8, entry.key_ptr.*, "resolvers") or
+            std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
         try mergeDocumentCapabilitiesFromIndexConfigValue(alloc, capabilities, scalar_paths, full_text_indexes, entry.key_ptr.*, entry.value_ptr.*);
     }
 }
@@ -448,28 +704,7 @@ fn mergeDocumentCapabilitiesFromIndexConfigValue(
         capabilities.graph_metric_filters = true;
     } else if (std.mem.eql(u8, type_value.string, "algebraic")) {
         capabilities.algebraic_aggregates = true;
-    } else if (documentIndexConfigTypeIsScalar(type_value.string)) {
-        try appendDocumentScalarFilterPathsFromIndexConfigValue(alloc, scalar_paths, value);
     }
-    try appendDocumentScalarFilterPathsFromNamedConfigValue(alloc, scalar_paths, value, "scalar_field");
-    try appendDocumentScalarFilterPathsFromNamedConfigValue(alloc, scalar_paths, value, "scalar_path");
-    try appendDocumentScalarFilterPathsFromNamedConfigValue(alloc, scalar_paths, value, "scalar_fields");
-    try appendDocumentScalarFilterPathsFromNamedConfigValue(alloc, scalar_paths, value, "scalar_paths");
-    try appendDocumentScalarFilterPathsFromNamedConfigValue(alloc, scalar_paths, value, "indexed_scalar_field");
-    try appendDocumentScalarFilterPathsFromNamedConfigValue(alloc, scalar_paths, value, "indexed_scalar_path");
-    try appendDocumentScalarFilterPathsFromNamedConfigValue(alloc, scalar_paths, value, "indexed_scalar_fields");
-    try appendDocumentScalarFilterPathsFromNamedConfigValue(alloc, scalar_paths, value, "indexed_scalar_paths");
-}
-
-fn documentIndexConfigTypeIsScalar(type_name: []const u8) bool {
-    return std.mem.eql(u8, type_name, "scalar") or
-        std.mem.eql(u8, type_name, "path") or
-        std.mem.eql(u8, type_name, "secondary") or
-        std.mem.eql(u8, type_name, "keyword") or
-        std.mem.eql(u8, type_name, "numeric") or
-        std.mem.eql(u8, type_name, "boolean") or
-        std.mem.eql(u8, type_name, "datetime") or
-        std.mem.eql(u8, type_name, "term");
 }
 
 fn appendDocumentScalarFilterPathsFromIndexConfigValue(
@@ -481,6 +716,10 @@ fn appendDocumentScalarFilterPathsFromIndexConfigValue(
     try appendDocumentScalarFilterPathsFromNamedConfigValue(alloc, scalar_paths, value, "path");
     try appendDocumentScalarFilterPathsFromNamedConfigValue(alloc, scalar_paths, value, "fields");
     try appendDocumentScalarFilterPathsFromNamedConfigValue(alloc, scalar_paths, value, "paths");
+    try appendDocumentScalarFilterPathsFromNamedConfigValue(alloc, scalar_paths, value, "scalar_field");
+    try appendDocumentScalarFilterPathsFromNamedConfigValue(alloc, scalar_paths, value, "scalar_path");
+    try appendDocumentScalarFilterPathsFromNamedConfigValue(alloc, scalar_paths, value, "scalar_fields");
+    try appendDocumentScalarFilterPathsFromNamedConfigValue(alloc, scalar_paths, value, "scalar_paths");
 }
 
 fn appendDocumentScalarFilterPathsFromNamedConfigValue(
@@ -767,20 +1006,33 @@ test "source binding classifies relational document and lake schemas" {
     try std.testing.expect(derived_index_capabilities.graph_metric_filters);
     try std.testing.expect(!derived_index_capabilities.algebraic_aggregates);
 
-    var scalar_path_capabilities = try documentCapabilitiesForRuntimeSchemaAndIndexesJsonAlloc(
+    var typed_path_capabilities = try documentCapabilitiesForRuntimeSchemaAndIndexesJsonAlloc(
         alloc,
         unavailable_schema,
-        "{\"status_idx\":{\"type\":\"scalar\",\"field\":\"status\"},\"metadata_idx\":{\"type\":\"path\",\"paths\":[\"metadata.plan\",\"/metadata/score\"]},\"future_text\":{\"type\":\"full_text\",\"scalar_paths\":[\"tenant\"]}}",
+        "{\"typed_paths\":{\"keyword\":[\"status\",\"metadata.plan\"],\"numeric\":[\"/metadata/score\"]},\"future_text\":{\"type\":\"full_text\",\"scalar_paths\":[\"tenant\"]}}",
     );
-    defer deinitDocumentSqlCapabilities(alloc, &scalar_path_capabilities);
-    try std.testing.expect(!scalar_path_capabilities.indexed_scalar_filters);
-    try std.testing.expect(scalar_path_capabilities.full_text_filters);
-    try std.testing.expectEqual(@as(usize, 4), scalar_path_capabilities.indexed_scalar_filter_paths.len);
-    try std.testing.expect(documentScalarFilterPathReady(scalar_path_capabilities, "/status"));
-    try std.testing.expect(documentScalarFilterPathReady(scalar_path_capabilities, "/metadata/plan"));
-    try std.testing.expect(documentScalarFilterPathReady(scalar_path_capabilities, "metadata.score"));
-    try std.testing.expect(documentScalarFilterPathReady(scalar_path_capabilities, "/tenant"));
-    try std.testing.expect(!documentScalarFilterPathReady(scalar_path_capabilities, "/body"));
+    defer deinitDocumentSqlCapabilities(alloc, &typed_path_capabilities);
+    try std.testing.expect(!typed_path_capabilities.indexed_scalar_filters);
+    try std.testing.expect(typed_path_capabilities.full_text_filters);
+    try std.testing.expectEqual(@as(usize, 1), typed_path_capabilities.indexed_scalar_filter_paths.len);
+    try std.testing.expect(!documentScalarFilterPathReady(typed_path_capabilities, "/status"));
+    try std.testing.expect(!documentScalarFilterPathReady(typed_path_capabilities, "/metadata/plan"));
+    try std.testing.expect(!documentScalarFilterPathReady(typed_path_capabilities, "metadata.score"));
+    try std.testing.expect(documentScalarFilterPathReady(typed_path_capabilities, "/tenant"));
+    try std.testing.expect(!documentScalarFilterPathReady(typed_path_capabilities, "/body"));
+
+    var legacy_scalar_config_capabilities = try documentCapabilitiesForRuntimeSchemaAndIndexesJsonAlloc(
+        alloc,
+        unavailable_schema,
+        "{\"fts\":{\"type\":\"full_text\",\"indexed_scalar_paths\":[\"status\"],\"scalar_paths\":[\"tenant\"]},\"score_idx\":{\"type\":\"numeric\",\"path\":\"metrics.score\"}}",
+    );
+    defer deinitDocumentSqlCapabilities(alloc, &legacy_scalar_config_capabilities);
+    try std.testing.expect(legacy_scalar_config_capabilities.full_text_filters);
+    try std.testing.expect(!legacy_scalar_config_capabilities.indexed_scalar_filters);
+    try std.testing.expectEqual(@as(usize, 1), legacy_scalar_config_capabilities.indexed_scalar_filter_paths.len);
+    try std.testing.expect(documentScalarFilterPathReady(legacy_scalar_config_capabilities, "/tenant"));
+    try std.testing.expect(!documentScalarFilterPathReady(legacy_scalar_config_capabilities, "/status"));
+    try std.testing.expect(!documentScalarFilterPathReady(legacy_scalar_config_capabilities, "/metrics/score"));
 
     var full_text_field_capabilities = try documentCapabilitiesForRuntimeSchemaAndIndexesJsonAlloc(
         alloc,
@@ -796,22 +1048,91 @@ test "source binding classifies relational document and lake schemas" {
     try std.testing.expect(documentScalarFilterPathReady(full_text_field_capabilities, "/metadata/summary"));
     try std.testing.expect(!documentScalarFilterPathReady(full_text_field_capabilities, "/status"));
 
-    var index_backed_virtual_schema = try documentSqlSchemaForRuntimeSchemaAndIndexesJsonAlloc(
+    var full_text_virtual_schema = try documentSqlSchemaForRuntimeSchemaAndIndexesJsonAlloc(
         alloc,
         unavailable_schema,
-        "{\"body_fts\":{\"type\":\"full_text\",\"field\":\"body\"},\"metadata_idx\":{\"type\":\"path\",\"paths\":[\"metadata.plan\",\"/tenant/id\"]}}",
+        "{\"category_fts\":{\"type\":\"full_text\",\"field\":\"category\"},\"metadata_fts\":{\"type\":\"full_text\",\"fields\":[\"metadata.summary\"]}}",
     );
-    defer deinitDocumentSqlSchema(alloc, &index_backed_virtual_schema);
-    try std.testing.expect(index_backed_virtual_schema.exposes_doc_id);
-    try std.testing.expect(index_backed_virtual_schema.exposes_doc);
-    try std.testing.expectEqual(@as(usize, 4), index_backed_virtual_schema.fields.len);
-    try std.testing.expectEqualStrings("status", index_backed_virtual_schema.fields[0].name);
-    try std.testing.expectEqual(DocumentSqlVirtualFieldSource.declared_schema, index_backed_virtual_schema.fields[0].source);
-    try std.testing.expectEqualStrings("body", index_backed_virtual_schema.fields[1].name);
-    try std.testing.expectEqual(DocumentSqlVirtualFieldSource.declared_schema, index_backed_virtual_schema.fields[1].source);
-    try std.testing.expectEqualStrings("metadata", index_backed_virtual_schema.fields[2].name);
-    try std.testing.expectEqual(DocumentSqlVirtualFieldSource.index_definition, index_backed_virtual_schema.fields[2].source);
-    try std.testing.expectEqualStrings("tenant", index_backed_virtual_schema.fields[3].name);
+    defer deinitDocumentSqlSchema(alloc, &full_text_virtual_schema);
+    try std.testing.expectEqual(@as(usize, 4), full_text_virtual_schema.fields.len);
+    try std.testing.expectEqual(@as(usize, 0), full_text_virtual_schema.typed_paths.len);
+    var saw_category_index_field = false;
+    var saw_metadata_index_root = false;
+    for (full_text_virtual_schema.fields) |field| {
+        if (std.mem.eql(u8, field.name, "category")) {
+            saw_category_index_field = true;
+            try std.testing.expectEqual(DocumentSqlVirtualFieldSource.index_definition, field.source);
+            try std.testing.expect(field.field_type == null);
+        }
+        if (std.mem.eql(u8, field.name, "metadata")) {
+            saw_metadata_index_root = true;
+            try std.testing.expectEqual(DocumentSqlVirtualFieldSource.index_definition, field.source);
+            try std.testing.expect(field.field_type == null);
+        }
+    }
+    try std.testing.expect(saw_category_index_field);
+    try std.testing.expect(saw_metadata_index_root);
+    try std.testing.expect(documentSqlTypedPathType(full_text_virtual_schema, "/category") == null);
+    try std.testing.expect(documentSqlTypedPathType(full_text_virtual_schema, "/metadata/summary") == null);
+
+    var catalog_virtual_schema = try documentSqlSchemaForRuntimeSchemaAndIndexesJsonAlloc(
+        alloc,
+        unavailable_schema,
+        "{\"body_fts\":{\"type\":\"full_text\",\"field\":\"body\"},\"typed_paths\":{\"numeric\":[\"score\",\"/metrics/score\"],\"keyword\":[\"metadata.plan\",\"/tenant/id\"]}}",
+    );
+    defer deinitDocumentSqlSchema(alloc, &catalog_virtual_schema);
+    try std.testing.expect(catalog_virtual_schema.exposes_doc_id);
+    try std.testing.expect(catalog_virtual_schema.exposes_doc);
+    try std.testing.expectEqual(@as(usize, 6), catalog_virtual_schema.fields.len);
+    try std.testing.expectEqual(@as(usize, 4), catalog_virtual_schema.typed_paths.len);
+    try std.testing.expectEqual(runtime_schema.AntflyType.numeric, documentSqlTypedPathType(catalog_virtual_schema, "/score").?);
+    try std.testing.expectEqual(runtime_schema.AntflyType.numeric, documentSqlTypedPathType(catalog_virtual_schema, "/metrics/score").?);
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, documentSqlTypedPathType(catalog_virtual_schema, "/metadata/plan").?);
+    try std.testing.expectEqualStrings("status", catalog_virtual_schema.fields[0].name);
+    try std.testing.expectEqual(DocumentSqlVirtualFieldSource.declared_schema, catalog_virtual_schema.fields[0].source);
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, catalog_virtual_schema.fields[0].field_type.?);
+    try std.testing.expectEqualStrings("body", catalog_virtual_schema.fields[1].name);
+    try std.testing.expectEqual(DocumentSqlVirtualFieldSource.declared_schema, catalog_virtual_schema.fields[1].source);
+    try std.testing.expectEqual(runtime_schema.AntflyType.text, catalog_virtual_schema.fields[1].field_type.?);
+    try std.testing.expectEqualStrings("score", catalog_virtual_schema.fields[2].name);
+    try std.testing.expectEqual(DocumentSqlVirtualFieldSource.typed_path_metadata, catalog_virtual_schema.fields[2].source);
+    try std.testing.expectEqual(runtime_schema.AntflyType.numeric, catalog_virtual_schema.fields[2].field_type.?);
+    var saw_metadata = false;
+    var saw_metrics = false;
+    var saw_tenant = false;
+    for (catalog_virtual_schema.fields) |field| {
+        if (std.mem.eql(u8, field.name, "metadata")) {
+            saw_metadata = true;
+            try std.testing.expectEqual(DocumentSqlVirtualFieldSource.typed_path_metadata, field.source);
+            try std.testing.expect(field.field_type == null);
+        }
+        if (std.mem.eql(u8, field.name, "metrics")) {
+            saw_metrics = true;
+            try std.testing.expectEqual(DocumentSqlVirtualFieldSource.typed_path_metadata, field.source);
+            try std.testing.expect(field.field_type == null);
+        }
+        if (std.mem.eql(u8, field.name, "tenant")) {
+            saw_tenant = true;
+            try std.testing.expectEqual(DocumentSqlVirtualFieldSource.typed_path_metadata, field.source);
+            try std.testing.expect(field.field_type == null);
+        }
+    }
+    try std.testing.expect(saw_metadata);
+    try std.testing.expect(saw_metrics);
+    try std.testing.expect(saw_tenant);
+
+    var explicit_only_virtual_schema = try documentSqlSchemaForRuntimeSchemaAndIndexesJsonAlloc(
+        alloc,
+        unavailable_schema,
+        "{\"legacy_score_idx\":{\"type\":\"numeric\",\"path\":\"legacy.score\"},\"typed_paths\":{\"numeric\":[\"metrics.score\"]}}",
+    );
+    defer deinitDocumentSqlSchema(alloc, &explicit_only_virtual_schema);
+    try std.testing.expectEqual(@as(usize, 1), explicit_only_virtual_schema.typed_paths.len);
+    try std.testing.expectEqual(runtime_schema.AntflyType.numeric, documentSqlTypedPathType(explicit_only_virtual_schema, "/metrics/score").?);
+    try std.testing.expect(documentSqlTypedPathType(explicit_only_virtual_schema, "/legacy/score") == null);
+    for (explicit_only_virtual_schema.fields) |field| {
+        try std.testing.expect(!std.mem.eql(u8, field.name, "legacy"));
+    }
 
     var lake_parsed = try schema_api.parseValidatedTableSchema(alloc,
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"iceberg","uri":"s3://bucket/warehouse/events","snapshot":{"mode":"snapshot_id","id":"snap-1"},"schema_fingerprint":"schema-v1","write_policy":"read_only"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}

@@ -57,6 +57,16 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
     } else {
         req.indexes_json = try alloc.dupe(u8, tables_api.default_indexes_json);
     }
+    if (raw_root.get("typed_paths")) |typed_paths_value| {
+        if (typed_paths_value == .null) {
+            // Optional public metadata field; explicit null is equivalent to
+            // absence, matching the core table parser's optional-field rules.
+        } else {
+            const indexes_with_typed_paths = try tables_api.mergeTypedPathsIntoIndexesJsonAlloc(alloc, req.indexes_json.?, typed_paths_value);
+            alloc.free(req.indexes_json.?);
+            req.indexes_json = indexes_with_typed_paths;
+        }
+    }
 
     if (raw_root.get("schema")) |schema_value| {
         if (schema_value != .null) {
@@ -293,6 +303,7 @@ fn normalizeIndexConfigJson(
 
 fn validatePublicIndexObject(object: anytype) !void {
     const index_type = extractPublicIndexType(object) orelse "full_text";
+    if (isPublicScalarIndexType(index_type)) return error.InvalidCreateIndexRequest;
     if (std.mem.eql(u8, index_type, "full_text")) {
         try validatePublicFullTextIndexObject(object);
     }
@@ -372,6 +383,17 @@ fn extractPublicIndexType(object: anytype) ?[]const u8 {
         .string => |str| str,
         else => null,
     };
+}
+
+fn isPublicScalarIndexType(index_type: []const u8) bool {
+    return std.mem.eql(u8, index_type, "scalar") or
+        std.mem.eql(u8, index_type, "path") or
+        std.mem.eql(u8, index_type, "secondary") or
+        std.mem.eql(u8, index_type, "keyword") or
+        std.mem.eql(u8, index_type, "numeric") or
+        std.mem.eql(u8, index_type, "boolean") or
+        std.mem.eql(u8, index_type, "datetime") or
+        std.mem.eql(u8, index_type, "term");
 }
 
 fn validatePublicFullTextIndexObject(object: anytype) !void {
@@ -576,7 +598,7 @@ test "table contract encodes internal create table request back to public json" 
 test "table contract accepts create table with explicit null optional fields" {
     var req = try parseCreateTableRequest(
         std.testing.allocator,
-        "{\"num_shards\":1,\"description\":null,\"indexes\":null,\"schema\":null,\"replication_sources\":null}",
+        "{\"num_shards\":1,\"description\":null,\"indexes\":null,\"typed_paths\":null,\"schema\":null,\"replication_sources\":null}",
     );
     defer req.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?u32, 1), req.num_shards);
@@ -636,16 +658,17 @@ test "table contract rejects non-go full text fields" {
     );
 }
 
-test "table contract ignores create-table full text entries and preserves non-full-text indexes" {
+test "table contract ignores create-table full text entries and preserves typed path metadata" {
     var req = try parseCreateTableRequest(
         std.testing.allocator,
-        "{\"description\":\"docs\",\"indexes\":{\"default\":{},\"embed_idx\":{\"type\":\"embeddings\",\"dimension\":384}}}",
+        "{\"description\":\"docs\",\"indexes\":{\"default\":{},\"embed_idx\":{\"type\":\"embeddings\",\"dimension\":384}},\"typed_paths\":{\"numeric\":[\"metrics.score\"],\"keyword\":\"status\"}}",
     );
     defer req.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("docs", req.description.?);
     try std.testing.expect(std.mem.indexOf(u8, req.indexes_json.?, "\"full_text_index_v0\":{\"type\":\"full_text\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, req.indexes_json.?, "\"default\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, req.indexes_json.?, "\"embed_idx\":{\"type\":\"embeddings\",\"dimension\":384}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req.indexes_json.?, "\"typed_paths\":{\"numeric\":[\"metrics.score\"],\"keyword\":\"status\"}") != null);
 }
 
 test "table contract accepts public full text create index" {
@@ -678,6 +701,24 @@ test "table contract accepts public field scoped full text create index" {
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"name\":\"category_fts\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"field\":\"category\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"fields\":[\"title\",\"body\"]") != null);
+}
+
+test "table contract rejects scalar path metadata as a public index" {
+    try std.testing.expectError(
+        error.InvalidCreateIndexRequest,
+        parseCreateIndexRequest(
+            std.testing.allocator,
+            "score_idx",
+            "{\"type\":\"numeric\",\"path\":\"metrics.score\"}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidCreateTableRequest,
+        parseCreateTableRequest(
+            std.testing.allocator,
+            "{\"indexes\":{\"score_idx\":{\"type\":\"keyword\",\"fields\":[\"status\",\"metadata.plan\"]}}}",
+        ),
+    );
 }
 
 test "table contract rejects artifact-backed public full text create index" {

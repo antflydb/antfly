@@ -75,7 +75,7 @@ def test_bleve_query_string_full_text_and_filter(stateful_api):
                 "status": "draft",
             },
         },
-        sync_level="full_text",
+        sync_level="query",
     )
     assert batch["inserted"] == 3
 
@@ -201,7 +201,7 @@ def test_direct_full_text_match_and_prefix(stateful_api):
                 "body": "secondary text only",
             },
         },
-        sync_level="full_text",
+        sync_level="query",
     )
     assert batch["inserted"] == 3
 

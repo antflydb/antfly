@@ -96,7 +96,7 @@ def _seed_join_tables(stateful_api, prefix: str) -> tuple[str, str]:
     docs_batch = stateful_api.batch_write(
         docs_table,
         inserts=docs,
-        sync_level="full_text",
+        sync_level="query",
     )
     assert docs_batch["inserted"] == len(docs)
 

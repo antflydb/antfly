@@ -15,10 +15,12 @@ class RowsResultColumn:
     """Typed column metadata emitted by a native relational read plan.
 
     Attributes:
-        name (str): Public result-object field name.
+        name (str): Unique public result-object field name.
         path (str): Source path represented by this result field.
         type_ (str): Antfly scalar/container type for the result field.
         nullable (bool): Whether the result field may be null.
+        display_name (None | str | Unset): Optional SQL/display label for the result column. This value may be non-
+            unique; use `name` as the stable object key.
         array_item_type (None | str | Unset): Item type when `type` is `array`.
         collation (None | str | Unset): Optional source collation metadata for source-backed text or keyword result
             fields.
@@ -28,6 +30,7 @@ class RowsResultColumn:
     path: str
     type_: str
     nullable: bool
+    display_name: None | str | Unset = UNSET
     array_item_type: None | str | Unset = UNSET
     collation: None | str | Unset = UNSET
 
@@ -39,6 +42,12 @@ class RowsResultColumn:
         type_ = self.type_
 
         nullable = self.nullable
+
+        display_name: None | str | Unset
+        if isinstance(self.display_name, Unset):
+            display_name = UNSET
+        else:
+            display_name = self.display_name
 
         array_item_type: None | str | Unset
         if isinstance(self.array_item_type, Unset):
@@ -62,6 +71,8 @@ class RowsResultColumn:
                 "nullable": nullable,
             }
         )
+        if display_name is not UNSET:
+            field_dict["display_name"] = display_name
         if array_item_type is not UNSET:
             field_dict["array_item_type"] = array_item_type
         if collation is not UNSET:
@@ -79,6 +90,15 @@ class RowsResultColumn:
         type_ = d.pop("type")
 
         nullable = d.pop("nullable")
+
+        def _parse_display_name(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        display_name = _parse_display_name(d.pop("display_name", UNSET))
 
         def _parse_array_item_type(data: object) -> None | str | Unset:
             if data is None:
@@ -103,6 +123,7 @@ class RowsResultColumn:
             path=path,
             type_=type_,
             nullable=nullable,
+            display_name=display_name,
             array_item_type=array_item_type,
             collation=collation,
         )

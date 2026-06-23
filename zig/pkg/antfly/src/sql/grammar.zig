@@ -7804,7 +7804,13 @@ fn adapterNoopSetSessionSettingAllowed(setting: []const u8) bool {
 fn sessionSettingKindForName(setting: []const u8) ?ddl_plan.SessionSettingKind {
     if (std.mem.startsWith(u8, setting, "app.") and setting.len > "app.".len) return .app;
     if (std.ascii.eqlIgnoreCase(setting, "antfly.sync_level")) return .antfly;
-    if (std.mem.eql(u8, setting, "statement_timeout") or std.mem.eql(u8, setting, "timezone")) return .runtime;
+    if (std.ascii.eqlIgnoreCase(setting, "statement_timeout") or
+        std.ascii.eqlIgnoreCase(setting, "timezone") or
+        std.ascii.eqlIgnoreCase(setting, "default_transaction_read_only") or
+        std.ascii.eqlIgnoreCase(setting, "transaction_read_only"))
+    {
+        return .runtime;
+    }
     return null;
 }
 

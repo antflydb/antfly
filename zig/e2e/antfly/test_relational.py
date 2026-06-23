@@ -105,7 +105,7 @@ def test_relational_table_columns_reconstruct_and_route(stateful_api):
                 "meta": {"k": 3},
             },
         },
-        sync_level="full_text",
+        sync_level="query",
     )
     assert batch["inserted"] == 3
 

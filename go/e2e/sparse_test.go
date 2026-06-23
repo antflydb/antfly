@@ -153,7 +153,7 @@ func testSparseSearch(t *testing.T, ctx context.Context, swarm *SwarmInstance, i
 
 	_, err = swarm.Client.Batch(ctx, tableName, antfly.BatchRequest{
 		Inserts:   docs,
-		SyncLevel: antfly.SyncLevelAknn,
+		SyncLevel: antfly.SyncLevelFullIndex,
 	})
 	require.NoError(t, err, "Failed to insert documents")
 	t.Logf("Inserted %d documents", len(docs))
@@ -287,7 +287,7 @@ func testHybridSearch(t *testing.T, ctx context.Context, swarm *SwarmInstance, i
 
 	_, err = swarm.Client.Batch(ctx, tableName, antfly.BatchRequest{
 		Inserts:   docs,
-		SyncLevel: antfly.SyncLevelAknn,
+		SyncLevel: antfly.SyncLevelFullIndex,
 	})
 	require.NoError(t, err, "Failed to insert documents")
 	t.Logf("Inserted %d documents", len(docs))
@@ -398,7 +398,7 @@ func testSparseImport(t *testing.T, ctx context.Context, swarm *SwarmInstance, i
 
 	_, err = swarm.Client.Batch(ctx, tableName, antfly.BatchRequest{
 		Inserts:   docs,
-		SyncLevel: antfly.SyncLevelAknn,
+		SyncLevel: antfly.SyncLevelFullIndex,
 	})
 	require.NoError(t, err, "Failed to insert documents with pre-computed sparse embeddings")
 	t.Logf("Inserted %d documents with pre-computed sparse embeddings", len(docs))

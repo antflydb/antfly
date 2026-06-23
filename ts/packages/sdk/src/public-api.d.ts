@@ -152,7 +152,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/db/v1/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}": {
+    "/db/v1/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}/actions/{action}": {
         parameters: {
             query?: never;
             header?: never;
@@ -509,6 +509,32 @@ export interface paths {
         get: operations["listBackups"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/sql": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute SQL text in a logical SQL session
+         * @description Executes SQL through Antfly's psql-style HTTP ingress. The request is a
+         *     single synchronous statement and the response returns the logical
+         *     `session_id` that should be supplied on later requests when session
+         *     state such as prepared statements, LISTEN/NOTIFY subscriptions, or SQL
+         *     catalog defaults must be reused. Prepared statements and cursors are
+         *     SQL session state, not durable REST resources. Cursor-backed fetches and
+         *     asynchronous statement jobs are reserved for later extensions.
+         */
+        post: operations["executeSql"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1396,12 +1422,13 @@ export interface paths {
          *     Update/delete sources use either a typed base row query with a
          *     `row_claim` and transaction id, or a typed joined mutation-source plan
          *     whose target side carries the row claim. Insert-source requests expose
-         *     the native source-to-target insert plan shape and fail closed until the
-         *     runtime insert-source executor is available. The server claims selected
-         *     target rows for update/delete, records committed-version predicates,
-         *     stages intents into the existing transaction, and returns optional
-         *     projections from the planned final target image or deleted target row
-         *     image.
+         *     the native source-to-target insert plan shape: the server reads the
+         *     typed source query, applies target-column assignments and conflict
+         *     actions through the row-batch constraint path, and returns optional
+         *     projections from the planned final target image. Update/delete plans
+         *     claim selected target rows, record committed-version predicates, stage
+         *     intents into the existing transaction, and return optional projections
+         *     from the planned final target image or deleted target row image.
          */
         post: operations["rowsMutationSource"];
         delete?: never;
@@ -3014,6 +3041,51 @@ export interface components {
             /** @example An error message */
             error: string;
         };
+        /**
+         * @description Synchronous SQL statement request. `session_id` is optional on the first
+         *     request and should be reused from prior responses when SQL session state
+         *     must persist across requests.
+         */
+        SqlStatementRequest: {
+            /** @description SQL statement text to execute. */
+            sql: string;
+            /**
+             * Format: int64
+             * @description Logical SQL session id returned by an earlier SQL response.
+             */
+            session_id?: number | null;
+            /** @description Optional current database override for this request. */
+            database?: string | null;
+            /** @description Optional single search-path namespace override for this request. */
+            namespace?: string | null;
+            /** @description Execute this statement under a server-enforced PostgreSQL-style read-only transaction guard. */
+            read_only?: boolean;
+        };
+        /**
+         * @description Synchronous SQL statement result metadata. Catalog/session/control
+         *     statements route through the typed DDL/session execution path. Read
+         *     statements lower through the same typed row-plan executor used by the
+         *     JSON relational rows APIs. Point write statements lower through the
+         *     typed row-batch mutation path, and insert-from-source statements lower
+         *     through the typed row-read plus row-batch mutation path.
+         */
+        SqlStatementResponse: {
+            /** @enum {string} */
+            kind: "ddl" | "read" | "write";
+            /** Format: int64 */
+            session_id: number;
+            noop?: boolean;
+            /** @description Applied DDL/session result record. */
+            applied?: {
+                [key: string]: unknown;
+            };
+            /** @description Lowered read or write statement family for data responses. */
+            statement_kind?: string | null;
+            /** @description Typed relational row-plan, row-batch, or mutation-source response for data statements. */
+            result?: {
+                [key: string]: unknown;
+            } | null;
+        };
         /** @description Sort direction for a single field. true = descending, false = ascending. */
         SortDirection: boolean;
         /** @description A single sort field with direction. */
@@ -3661,14 +3733,13 @@ export interface components {
          * @description Synchronization level for batch operations:
          *     - "propose": Wait for Raft proposal acceptance (fastest, default)
          *     - "write": Wait for Pebble KV write
-         *     - "full_text": Wait for full-text index WAL write
+         *     - "query": Wait until affected documents are visible to query paths such as full-text search
          *     - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation)
-         *     - "aknn": Wait for vector index write with best-effort synchronous embedding (falls back to async on timeout, slowest, most durable)
-         *     - "full_index": Wait for all index writes to complete (full-text + enrichments + aknn)
+         *     - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
          * @default propose
          * @enum {string}
          */
-        SyncLevel: "propose" | "write" | "full_text" | "enrichments" | "aknn" | "full_index";
+        SyncLevel: "propose" | "write" | "query" | "enrichments" | "full_index";
         ShardConfig: {
             byte_range: components["schemas"]["ByteRange"];
         };
@@ -3735,6 +3806,28 @@ export interface components {
              */
             indexes?: {
                 [key: string]: components["schemas"]["IndexConfig"];
+            };
+            /**
+             * @description Table-level typed document path metadata used by SQL planning for
+             *     JSON/path scalar comparison semantics. This is not a physical index
+             *     and does not imply indexed lookup, rebuild, catch-up, compaction, or
+             *     PostgreSQL `CREATE INDEX` behavior. Use real index definitions for
+             *     physical access paths.
+             *
+             *     Keys are scalar type names such as `keyword`, `numeric`, `boolean`,
+             *     or `datetime`; values are a path string or an array of path strings.
+             * @example {
+             *       "numeric": [
+             *         "metrics.score"
+             *       ],
+             *       "keyword": [
+             *         "status",
+             *         "metadata.plan"
+             *       ]
+             *     }
+             */
+            typed_paths?: {
+                [key: string]: unknown;
             };
             /**
              * @description Optional schema definition specifying field types, primary key, and TTL configuration.
@@ -5459,8 +5552,10 @@ export interface components {
         };
         /** @description Typed column metadata emitted by a native relational read plan. */
         RowsResultColumn: {
-            /** @description Public result-object field name. */
+            /** @description Unique public result-object field name. */
             name: string;
+            /** @description Optional SQL/display label for the result column. This value may be non-unique; use `name` as the stable object key. */
+            display_name?: string | null;
             /** @description Source path represented by this result field. */
             path: string;
             /** @description Antfly scalar/container type for the result field. */
@@ -13809,6 +13904,45 @@ export interface operations {
             500: components["responses"]["InternalServerError"];
         };
     };
+    executeSql: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SqlStatementRequest"];
+            };
+        };
+        responses: {
+            /** @description SQL statement result metadata */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SqlStatementResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description SQL statement timeout */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description SQL statement shape is not supported by the HTTP SQL ingress yet */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     globalQuery: {
         parameters: {
             query?: never;
@@ -15154,7 +15288,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Rows staged into the claimed transaction */
+            /** @description Rows staged into the claimed transaction or inserted from a typed source */
             200: {
                 headers: {
                     [name: string]: unknown;

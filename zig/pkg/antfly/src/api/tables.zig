@@ -693,6 +693,13 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !Crea
     } else {
         req.indexes_json = try alloc.dupe(u8, default_indexes_json);
     }
+    if (root.get("typed_paths")) |value| {
+        if (value != .null) {
+            const indexes_with_typed_paths = try mergeTypedPathsIntoIndexesJsonAlloc(alloc, req.indexes_json.?, value);
+            alloc.free(req.indexes_json.?);
+            req.indexes_json = indexes_with_typed_paths;
+        }
+    }
     if (root.get("schema")) |value| {
         if (value != .null) {
             const encoded_schema = try stringifyJsonValue(alloc, value);
@@ -727,6 +734,50 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !Crea
         if (num_shards == 0) return error.InvalidCreateTableRequest;
     }
     return req;
+}
+
+pub fn mergeTypedPathsIntoIndexesJsonAlloc(
+    alloc: std.mem.Allocator,
+    indexes_json: []const u8,
+    typed_paths: std.json.Value,
+) ![]u8 {
+    try validateTypedPathsMetadataValue(typed_paths);
+    const typed_paths_json = try stringifyJsonValue(alloc, typed_paths);
+    defer alloc.free(typed_paths_json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, if (indexes_json.len > 0) indexes_json else default_indexes_json, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidCreateTableRequest,
+    };
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.append(alloc, '{');
+    var first = true;
+    var it = root.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "typed_paths")) continue;
+        if (!first) try out.append(alloc, ',');
+        first = false;
+        try appendJsonString(alloc, &out, entry.key_ptr.*);
+        try out.append(alloc, ':');
+        try appendJsonValue(alloc, &out, entry.value_ptr.*);
+    }
+    if (!first) try out.append(alloc, ',');
+    try appendJsonString(alloc, &out, "typed_paths");
+    try out.append(alloc, ':');
+    try out.appendSlice(alloc, typed_paths_json);
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn validateTypedPathsMetadataValue(value: std.json.Value) !void {
+    switch (value) {
+        .object, .array => {},
+        else => return error.InvalidCreateTableRequest,
+    }
 }
 
 pub fn expandSchemaDerivedAlgebraicIndexesAlloc(
@@ -2562,6 +2613,12 @@ fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), 
     try out.appendSlice(alloc, escaped);
 }
 
+fn appendJsonValue(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: std.json.Value) !void {
+    const encoded = try stringifyJsonValue(alloc, value);
+    defer alloc.free(encoded);
+    try out.appendSlice(alloc, encoded);
+}
+
 fn deinitJsonValue(alloc: std.mem.Allocator, value: *std.json.Value) void {
     json_helpers.deinitJsonValue(alloc, value);
     value.* = .null;
@@ -2588,7 +2645,7 @@ fn encodeTableIndexesObject(alloc: std.mem.Allocator, indexes_json: []const u8) 
     while (it.next()) |entry| {
         // Reserved metadata sections are not index configs; the provisioner
         // reads them from the stored indexes_json.
-        if (isReservedIndexMetadataEntry(entry.key_ptr.*)) continue;
+        if (isReservedIndexMetadataEntry(entry.key_ptr.*) or isLegacyTypedPathMetadataConfig(entry.value_ptr.*)) continue;
         if (!first) try out.append(alloc, ',');
         first = false;
         try appendJsonString(alloc, &out, entry.key_ptr.*);
@@ -2600,7 +2657,25 @@ fn encodeTableIndexesObject(alloc: std.mem.Allocator, indexes_json: []const u8) 
 }
 
 fn isReservedIndexMetadataEntry(name: []const u8) bool {
-    return std.mem.eql(u8, name, "resolvers") or std.mem.eql(u8, name, "enrichments");
+    return std.mem.eql(u8, name, "resolvers") or
+        std.mem.eql(u8, name, "enrichments") or
+        std.mem.eql(u8, name, "typed_paths");
+}
+
+fn isLegacyTypedPathMetadataConfig(value: std.json.Value) bool {
+    if (value != .object) return false;
+    const type_value = value.object.get("type") orelse return false;
+    if (type_value != .string) return false;
+    // Earlier branch builds accepted scalar-shaped entries under `indexes`.
+    // They are metadata only and must not be surfaced as public index configs.
+    return std.mem.eql(u8, type_value.string, "scalar") or
+        std.mem.eql(u8, type_value.string, "path") or
+        std.mem.eql(u8, type_value.string, "secondary") or
+        std.mem.eql(u8, type_value.string, "keyword") or
+        std.mem.eql(u8, type_value.string, "numeric") or
+        std.mem.eql(u8, type_value.string, "boolean") or
+        std.mem.eql(u8, type_value.string, "datetime") or
+        std.mem.eql(u8, type_value.string, "term");
 }
 
 fn encodeSingleTableIndex(
@@ -2627,6 +2702,7 @@ fn buildSingleTableIndexValue(
         else => return error.InvalidTableIndexMetadata,
     };
     const config = root.get(index_name) orelse return null;
+    if (isLegacyTypedPathMetadataConfig(config)) return null;
     return try buildCanonicalIndexConfigValue(alloc, index_name, config);
 }
 
@@ -2793,6 +2869,16 @@ fn inferIndexType(index_name: []const u8, config: std.json.Value) ?ApiIndexType 
     if (std.mem.startsWith(u8, index_name, "full_text_index_v")) return .full_text;
     if (std.mem.eql(u8, index_name, "default")) return .full_text;
     return null;
+}
+
+test "table index encoder omits typed path metadata" {
+    const encoded = try encodeTableIndexesObject(
+        std.testing.allocator,
+        "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"typed_paths\":{\"numeric\":[\"metrics.score\"]}}",
+    );
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"full_text_index_v0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "typed_paths") == null);
 }
 
 fn parseJsonValueAlloc(alloc: std.mem.Allocator, body: []const u8) !std.json.Value {
@@ -4653,12 +4739,13 @@ test "metadata.table debug encoder emits runtime schemas and index bindings" {
 }
 
 test "create table parser preserves supported metadata fields" {
-    var parsed = try parseCreateTableRequest(std.testing.allocator, "{\"num_shards\":1,\"description\":\"docs table\",\"schema\":{\"kind\":\"demo\"},\"indexes\":{\"default\":{}},\"replication_sources\":[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\"}]}");
+    var parsed = try parseCreateTableRequest(std.testing.allocator, "{\"num_shards\":1,\"description\":\"docs table\",\"schema\":{\"kind\":\"demo\"},\"indexes\":{\"default\":{}},\"typed_paths\":{\"numeric\":[\"metrics.score\"],\"keyword\":\"status\"},\"replication_sources\":[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\"}]}");
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(?u32, 1), parsed.num_shards);
     try std.testing.expectEqualStrings("docs table", parsed.description.?);
     try std.testing.expectEqualStrings("{\"version\":0,\"kind\":\"demo\"}", parsed.schema_json.?);
-    try std.testing.expectEqualStrings("{\"default\":{}}", parsed.indexes_json.?);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"default\":{}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.indexes_json.?, "\"typed_paths\":{\"numeric\":[\"metrics.score\"],\"keyword\":\"status\"}") != null);
     try std.testing.expectEqualStrings("[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\"}]", parsed.replication_sources_json.?);
 }
 

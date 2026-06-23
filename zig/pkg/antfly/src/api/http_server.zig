@@ -3301,6 +3301,7 @@ pub const ApiHttpServer = struct {
     join_job_store: distributed_join.JoinJobStore = .{ .alloc = undefined, .cfg = .{} },
     artifact_reprocess_job_store: artifact_reprocess_jobs.Store = .{ .alloc = undefined, .cfg = .{} },
     sql_notification_runtime: sql_notifications.Runtime = .{ .alloc = undefined },
+    sql_catalog_session_runtime: SqlCatalogSessionRuntime = .{ .alloc = undefined },
     sql_prepared_statement_runtime: SqlPreparedStatementRuntime = .{ .alloc = undefined },
     sql_routine_runtime: sql_routines.Runtime = .{ .alloc = undefined },
     schema_rewrite_wake_owner_id: u64 = 0,
@@ -3400,11 +3401,26 @@ pub const ApiHttpServer = struct {
             session_id: u64,
             plan: sql_adapter.ExecutePreparedStatementPlan,
         ) !void {
+            _ = try self.executeRecord(session_id, plan);
+        }
+
+        fn executeRecord(
+            self: *@This(),
+            session_id: u64,
+            plan: sql_adapter.ExecutePreparedStatementPlan,
+        ) !Record {
             const session = self.sessions.getPtr(session_id) orelse return error.PreparedStatementNotFound;
             const record = session.statements.get(plan.statement_name) orelse return error.PreparedStatementNotFound;
             if (record.parameter_count != plan.argument_count) return error.PreparedStatementArgumentMismatch;
-            _ = record.statement_kind;
-            _ = record.statement_family;
+            return record;
+        }
+
+        fn statementKindForExecute(
+            self: *@This(),
+            session_id: u64,
+            plan: sql_adapter.ExecutePreparedStatementPlan,
+        ) !sql_adapter.PreparedStatementSubjectKind {
+            return (try self.executeRecord(session_id, plan)).statement_kind;
         }
 
         fn deallocate(
@@ -3431,6 +3447,69 @@ pub const ApiHttpServer = struct {
         fn statementCountForTest(self: *@This(), session_id: u64) usize {
             const session = self.sessions.getPtr(session_id) orelse return 0;
             return session.statements.count();
+        }
+    };
+
+    const SqlCatalogSessionRuntime = struct {
+        alloc: std.mem.Allocator,
+        sessions: std.AutoHashMapUnmanaged(u64, sql_adapter.OwnedSqlCatalogSession) = .empty,
+
+        fn init(alloc: std.mem.Allocator) SqlCatalogSessionRuntime {
+            return .{ .alloc = alloc };
+        }
+
+        fn deinit(self: *@This()) void {
+            var it = self.sessions.iterator();
+            while (it.next()) |entry| entry.value_ptr.deinit(self.alloc);
+            self.sessions.deinit(self.alloc);
+            self.* = undefined;
+        }
+
+        fn loadAlloc(self: *@This(), session_id: ?u64) !sql_adapter.OwnedSqlCatalogSession {
+            if (session_id) |id| {
+                if (self.sessions.getPtr(id)) |stored| {
+                    var session = try stored.cloneAlloc(self.alloc);
+                    session.request_read_only = false;
+                    session.notification_session_id = id;
+                    return session;
+                }
+            }
+            var session = try sql_adapter.OwnedSqlCatalogSession.fromSessionAlloc(self.alloc, catalog_resources.SqlCatalogSession.default());
+            if (session_id) |id| session.notification_session_id = id;
+            return session;
+        }
+
+        fn save(self: *@This(), session: sql_adapter.OwnedSqlCatalogSession) !void {
+            if (session.notification_session_id == 0) return;
+            var stored = try session.cloneAlloc(self.alloc);
+            errdefer stored.deinit(self.alloc);
+            stored.notification_session_id = session.notification_session_id;
+            stored.restoreRequestOverridesForPersistence(self.alloc);
+            if (!self.sessionHasPersistentCatalogState(stored)) {
+                if (self.sessions.fetchRemove(session.notification_session_id)) |old| {
+                    var old_value = old.value;
+                    old_value.deinit(self.alloc);
+                }
+                stored.deinit(self.alloc);
+                return;
+            }
+            if (try self.sessions.fetchPut(self.alloc, session.notification_session_id, stored)) |old| {
+                var old_value = old.value;
+                old_value.deinit(self.alloc);
+            }
+        }
+
+        fn sessionHasPersistentCatalogState(_: *@This(), session: sql_adapter.OwnedSqlCatalogSession) bool {
+            if (session.settings.len > 0) return true;
+            if (session.transaction_local_settings_base != null) return true;
+            if (session.transaction_local_search_path_base != null) return true;
+            if (!std.ascii.eqlIgnoreCase(session.current_database_name, catalog_resources.default_database_name)) return true;
+            if (session.search_path.len != 1 or !std.ascii.eqlIgnoreCase(session.search_path[0], catalog_resources.default_namespace_name)) return true;
+            return false;
+        }
+
+        fn sessionCountForTest(self: *@This()) usize {
+            return self.sessions.count();
         }
     };
 
@@ -3468,6 +3547,7 @@ pub const ApiHttpServer = struct {
                 .artifact_reprocess_job_retention_ms = cfg.artifact_reprocess_job_retention_ms,
             }),
             .sql_notification_runtime = sql_notifications.Runtime.init(alloc),
+            .sql_catalog_session_runtime = SqlCatalogSessionRuntime.init(alloc),
             .sql_prepared_statement_runtime = SqlPreparedStatementRuntime.init(alloc),
             .sql_routine_runtime = sql_routines.Runtime.init(alloc),
             .connections_cache = connections_api.Cache.init(alloc),
@@ -3609,6 +3689,7 @@ pub const ApiHttpServer = struct {
         }
         self.artifact_reprocess_job_store.deinit();
         self.sql_notification_runtime.deinit();
+        self.sql_catalog_session_runtime.deinit();
         self.sql_prepared_statement_runtime.deinit();
         self.sql_routine_runtime.deinit();
         self.join_job_store.deinit();
@@ -4321,6 +4402,90 @@ pub const ApiHttpServer = struct {
         return false;
     }
 
+    fn publicSqlReadOnlyActive(_: *ApiHttpServer, session: *const sql_adapter.OwnedSqlCatalogSession) !bool {
+        return session.request_read_only or try sql_adapter.sqlEffectiveTransactionReadOnlyFromSession(session.session());
+    }
+
+    fn sessionCatalogPlanAllowedInReadOnly(_: *ApiHttpServer, session: *sql_adapter.OwnedSqlCatalogSession, plan: sql_adapter.SessionCatalogPlan) !bool {
+        return switch (plan) {
+            .set_search_path,
+            .reset_search_path,
+            .show_search_path,
+            => true,
+            .discard_all => false,
+            .set_setting => |set| blk: {
+                if (std.ascii.eqlIgnoreCase(set.name, "transaction_read_only") or
+                    std.ascii.eqlIgnoreCase(set.name, "default_transaction_read_only"))
+                {
+                    break :blk try sql_adapter.parseSqlBoolSetting(set.value);
+                }
+                break :blk true;
+            },
+            .reset_setting => |reset| blk: {
+                if (std.ascii.eqlIgnoreCase(reset.name, "default_transaction_read_only")) break :blk false;
+                if (std.ascii.eqlIgnoreCase(reset.name, "transaction_read_only")) {
+                    break :blk try sql_adapter.sqlDefaultTransactionReadOnlyFromSession(session.session());
+                }
+                break :blk true;
+            },
+        };
+    }
+
+    fn transactionControlPlanAllowedInReadOnly(_: *ApiHttpServer, plan: sql_adapter.TransactionControlPlan) !bool {
+        return switch (plan) {
+            .transaction_mode => |mode| switch (mode.access_mode orelse .read_only) {
+                .read_only => true,
+                .read_write => false,
+            },
+            .constraint_mode,
+            .advisory_lock,
+            => true,
+            .table_lock => false,
+        };
+    }
+
+    fn loweredDdlPlanAllowedInReadOnly(self: *ApiHttpServer, session: *sql_adapter.OwnedSqlCatalogSession, plan: sql_adapter.LoweredDdlPlan) !bool {
+        return switch (plan) {
+            .adapter_noop,
+            .savepoint_transaction,
+            => true,
+            .session_catalog => |session_plan| try self.sessionCatalogPlanAllowedInReadOnly(session, session_plan),
+            .transaction_control => |control| try self.transactionControlPlanAllowedInReadOnly(control),
+            .prepared_statement => |prepared| switch (prepared) {
+                .prepare => |prepare| prepare.statement_kind == .read,
+                .deallocate => true,
+                .execute => |execute_plan| blk: {
+                    const session_id = session.notification_session_id;
+                    if (session_id == 0) return error.PreparedStatementNotFound;
+                    break :blk (try self.sql_prepared_statement_runtime.statementKindForExecute(session_id, execute_plan)) == .read;
+                },
+            },
+            .cursor_portal => |cursor| switch (cursor) {
+                .declare => |declare| declare.statement_kind == .read,
+                .fetch,
+                .close,
+                => true,
+            },
+            .notification_channel => |notification| switch (notification) {
+                .listen,
+                .unlisten,
+                => true,
+                .notify => false,
+            },
+            else => false,
+        };
+    }
+
+    fn applyTransactionModePlanToSession(self: *ApiHttpServer, session: *sql_adapter.OwnedSqlCatalogSession, plan: sql_adapter.TransactionModePlan) !bool {
+        const access_mode = plan.access_mode orelse return false;
+        const value = switch (access_mode) {
+            .read_only => "on",
+            .read_write => "off",
+        };
+        try session.setTransactionLocalSettingAlloc(self.alloc, "transaction_read_only", value);
+        return true;
+    }
+
     pub fn applyRelationalSqlDdlWithSession(self: *ApiHttpServer, sql: []const u8, session: *sql_adapter.OwnedSqlCatalogSession) !tables_api.AppliedRelationalSqlDdlRecord {
         const statement_start_ns = platform_time.monotonicNs();
         const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session());
@@ -4334,6 +4499,7 @@ pub const ApiHttpServer = struct {
         defer parsed_sql.deinit(self.alloc);
         var plan = sql_adapter.lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(self.alloc, &parsed_sql, function_bindings) catch |err| switch (err) {
             error.UnsupportedSqlShape => {
+                if (try self.publicSqlReadOnlyActive(session)) return error.SqlReadOnlyTransaction;
                 if (try self.applySqlRoutineTriggerDdlParsedSqlAlloc(&parsed_sql, statement_timeout_ns, statement_start_ns)) |applied| return applied;
                 return err;
             },
@@ -4341,6 +4507,9 @@ pub const ApiHttpServer = struct {
         };
         defer plan.deinit(self.alloc);
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+        if (try self.publicSqlReadOnlyActive(session)) {
+            if (!try self.loweredDdlPlanAllowedInReadOnly(session, plan)) return error.SqlReadOnlyTransaction;
+        }
         switch (plan) {
             .adapter_noop => |noop| {
                 if (noop.reason == .transaction_control and parsedSqlTransactionBoundaryClearsLocalSession(&parsed_sql)) {
@@ -4363,6 +4532,7 @@ pub const ApiHttpServer = struct {
                 var updated = try sql_adapter.applyOwnedSessionCatalogPlanAlloc(self.alloc, session.*, session_plan);
                 errdefer updated.deinit(self.alloc);
                 updated.notification_session_id = notification_session_id;
+                updated.request_read_only = session.request_read_only;
                 if (clear_prepared_statements and notification_session_id != 0) {
                     try self.sql_prepared_statement_runtime.apply(.{ .deallocate = .{ .all = true } }, notification_session_id);
                 }
@@ -4372,6 +4542,16 @@ pub const ApiHttpServer = struct {
                 applied.noop = true;
                 try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
                 return applied;
+            },
+            .transaction_control => |transaction_plan| switch (transaction_plan) {
+                .transaction_mode => |transaction_mode| {
+                    const applied_mode = try self.applyTransactionModePlanToSession(session, transaction_mode);
+                    var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
+                    applied.noop = applied_mode;
+                    try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+                    return applied;
+                },
+                else => {},
             },
             .prepared_transaction => |prepared_plan| {
                 _ = try self.applyPreparedTransactionPlan(prepared_plan, sqlDdlTimestampNs());
@@ -4476,6 +4656,7 @@ pub const ApiHttpServer = struct {
         session_id: ?u64 = null,
         database: ?[]const u8 = null,
         namespace: ?[]const u8 = null,
+        read_only: bool = false,
     };
 
     const PublicSqlResponse = struct {
@@ -4486,16 +4667,21 @@ pub const ApiHttpServer = struct {
     };
 
     fn ownedSqlCatalogSessionForPublicRequestAlloc(self: *ApiHttpServer, request: PublicSqlRequest) !sql_adapter.OwnedSqlCatalogSession {
-        var session = try sql_adapter.OwnedSqlCatalogSession.fromSessionAlloc(self.alloc, catalog_resources.SqlCatalogSession.default());
+        var session = try self.sql_catalog_session_runtime.loadAlloc(request.session_id);
         errdefer session.deinit(self.alloc);
-        if (request.session_id) |session_id| session.notification_session_id = session_id;
         if (request.database) |database| {
             if (!catalogApiIdentifierValid(database)) return error.InvalidSqlRequest;
+            if (session.request_database_name_base == null) {
+                session.request_database_name_base = try self.alloc.dupe(u8, session.current_database_name);
+            }
             self.alloc.free(session.current_database_name);
             session.current_database_name = try self.alloc.dupe(u8, database);
         }
         if (request.namespace) |namespace| {
             if (!catalogApiIdentifierValid(namespace)) return error.InvalidSqlRequest;
+            if (session.request_search_path_base == null) {
+                session.request_search_path_base = try session.cloneSearchPathAlloc(self.alloc);
+            }
             for (session.search_path) |name| self.alloc.free(@constCast(name));
             if (session.search_path.len > 0) self.alloc.free(session.search_path);
             const search_path = try self.alloc.alloc([]const u8, 1);
@@ -4503,7 +4689,12 @@ pub const ApiHttpServer = struct {
             search_path[0] = try self.alloc.dupe(u8, namespace);
             session.search_path = search_path;
         }
+        session.request_read_only = request.read_only;
         return session;
+    }
+
+    fn savePublicSqlSession(self: *ApiHttpServer, session: sql_adapter.OwnedSqlCatalogSession) !void {
+        try self.sql_catalog_session_runtime.save(session);
     }
 
     fn encodePublicSqlReadResultAlloc(
@@ -5350,6 +5541,9 @@ pub const ApiHttpServer = struct {
         const statement_start_ns = platform_time.monotonicNs();
         const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session());
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+        if (try self.publicSqlReadOnlyActive(session)) {
+            return try textResponse(self.alloc, 400, "cannot execute write statement in a read-only transaction");
+        }
 
         var parsed_sql = sql_adapter.ParsedSql.initAlloc(self.alloc, sql) catch |err| switch (err) {
             error.UnsupportedSqlShape => return try textResponse(self.alloc, 501, "unsupported sql statement"),
@@ -5662,17 +5856,29 @@ pub const ApiHttpServer = struct {
     ) !void {
         switch (lowered.*) {
             .document_query => |*document_plan| {
-                const row_filter_json = try self.resolveEffectiveRowFilterJsonForDatabase(self.alloc, authenticated_identity, session.currentDatabase(), document_plan.table_name);
+                const row_filter_json = try self.resolvePublicSqlDocumentReadRowFilterJsonAlloc(session, authenticated_identity, document_plan.table_name);
                 defer if (row_filter_json) |value| self.alloc.free(value);
                 if (row_filter_json) |value| try sql_adapter.applyDocumentReadPlanFilterConstraintAlloc(self.alloc, document_plan, value);
             },
             .document_aggregate => |*aggregate_plan| {
-                const row_filter_json = try self.resolveEffectiveRowFilterJsonForDatabase(self.alloc, authenticated_identity, session.currentDatabase(), aggregate_plan.table_name);
+                const row_filter_json = try self.resolvePublicSqlDocumentReadRowFilterJsonAlloc(session, authenticated_identity, aggregate_plan.table_name);
                 defer if (row_filter_json) |value| self.alloc.free(value);
                 if (row_filter_json) |value| try sql_adapter.applyDocumentAggregatePlanFilterConstraintAlloc(self.alloc, aggregate_plan, value);
             },
             else => {},
         }
+    }
+
+    fn resolvePublicSqlDocumentReadRowFilterJsonAlloc(
+        self: *ApiHttpServer,
+        session: catalog_resources.SqlCatalogSession,
+        authenticated_identity: ?AuthenticatedIdentity,
+        table_name: []const u8,
+    ) !?[]const u8 {
+        const target = try session.tableTargetFromObjectName(table_name);
+        const resource_name = try catalog_resources.tableResourceNameAlloc(self.alloc, target.database_name, target.namespace_name, target.table_name);
+        defer self.alloc.free(resource_name);
+        return try self.resolveEffectiveRowFilterJsonForDatabase(self.alloc, authenticated_identity, target.database_name, resource_name);
     }
 
     fn handlePublicSqlQueryFunctionRead(
@@ -5697,10 +5903,15 @@ pub const ApiHttpServer = struct {
         defer lowered.deinit(self.alloc);
 
         const read_source = self.effectivePublicTableReads() orelse return try textResponse(self.alloc, 404, "not found");
-        const row_filter_json = try self.resolveEffectiveRowFilterJsonForDatabase(self.alloc, authenticated_identity, session.session().currentDatabase(), lowered.table_name);
+        const target = session.session().tableTargetFromObjectName(lowered.table_name) catch |err| switch (err) {
+            error.UnsupportedSqlShape => return try textResponse(self.alloc, 400, "invalid sql request"),
+        };
+        const resource_name = try catalog_resources.tableResourceNameAlloc(self.alloc, target.database_name, target.namespace_name, target.table_name);
+        defer self.alloc.free(resource_name);
+        const row_filter_json = try self.resolveEffectiveRowFilterJsonForDatabase(self.alloc, authenticated_identity, target.database_name, resource_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
 
-        self.maybeRouteQueryToReadSchema(lowered.table_name, &lowered.request.req) catch |err| switch (err) {
+        self.maybeRouteCatalogQueryToReadSchema(target, &lowered.request.req) catch |err| switch (err) {
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => return try textResponse(self.alloc, 400, "invalid sql request"),
             else => return err,
@@ -5709,16 +5920,30 @@ pub const ApiHttpServer = struct {
             injectRowFilterIntoSearchRequest(self.alloc, &lowered.request.req, value) catch return try textResponse(self.alloc, 400, "invalid sql request");
         }
 
-        var query_response = (read_source.query(self.alloc, lowered.table_name, lowered.request.req, .read_index) catch |err| switch (err) {
-            error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid sql request"),
-            error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
-            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
-            error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
-            else => return err,
-        }) orelse return try textResponse(self.alloc, 404, "not found");
+        var query_response = query_blk: {
+            if (read_source.queryCatalog(self.alloc, target, lowered.request.req, .read_index)) |result| {
+                break :query_blk result;
+            } else |err| switch (err) {
+                error.UnsupportedOperation => {},
+                error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid sql request"),
+                error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
+                error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
+                else => return err,
+            }
+            const native_table_name = try catalog_resources.storageTableNameForTargetAlloc(self.alloc, target);
+            defer self.alloc.free(native_table_name);
+            break :query_blk (read_source.query(self.alloc, native_table_name, lowered.request.req, .read_index) catch |err| switch (err) {
+                error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid sql request"),
+                error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
+                error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
+                else => return err,
+            });
+        } orelse return try textResponse(self.alloc, 404, "not found");
         defer query_response.deinit(self.alloc);
 
-        var rows_result = try sqlQueryFunctionRowsFromQueryResponseAlloc(self.alloc, query_response.json);
+        var rows_result = try sqlQueryFunctionRowsFromQueryResponseAlloc(self.alloc, query_response.json, lowered.projection_columns);
         defer rows_result.deinit(self.alloc);
         const response_body = try self.encodePublicSqlReadResultAlloc(
             self.ensureSqlProtocolSessionId(session),
@@ -5732,6 +5957,7 @@ pub const ApiHttpServer = struct {
     fn sqlQueryFunctionRowsFromQueryResponseAlloc(
         alloc: std.mem.Allocator,
         response_json: []const u8,
+        projection_columns: []const []const u8,
     ) !db_mod.types.RelationalRowsQueryResult {
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, response_json, .{ .allocate = .alloc_always }) catch return error.InvalidQueryRequest;
         defer parsed.deinit();
@@ -5759,7 +5985,7 @@ pub const ApiHttpServer = struct {
         }
         for (hit_items.array.items, 0..) |hit, i| {
             if (hit != .object) return error.InvalidQueryRequest;
-            rows[i] = try std.json.Stringify.valueAlloc(alloc, hit, .{});
+            rows[i] = try sqlQueryFunctionHitRowAlloc(alloc, hit, projection_columns);
             initialized += 1;
         }
         return .{
@@ -5768,12 +5994,42 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    fn sqlQueryFunctionHitRowAlloc(
+        alloc: std.mem.Allocator,
+        hit: std.json.Value,
+        projection_columns: []const []const u8,
+    ) ![]const u8 {
+        if (projection_columns.len == 0) return try std.json.Stringify.valueAlloc(alloc, hit, .{});
+        if (hit != .object) return error.InvalidQueryRequest;
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        try writer.writeByte('{');
+        for (projection_columns, 0..) |column, i| {
+            if (i != 0) try writer.writeByte(',');
+            try std.json.Stringify.value(column, .{}, writer);
+            try writer.writeByte(':');
+            if (hit.object.get(column)) |value| {
+                try std.json.Stringify.value(value, .{}, writer);
+            } else {
+                try writer.writeAll("null");
+            }
+        }
+        try writer.writeByte('}');
+        return try out.toOwnedSlice();
+    }
+
     fn documentSqlReadErrorMessage(err: anyerror) ?[]const u8 {
         return switch (err) {
             error.DocumentSqlIndexUnavailable => "document_sql_index_unavailable",
             error.DocumentSqlRequiresBoundedScan => "document_sql_requires_bounded_scan",
             error.DocumentSqlArrayRequiresUnnest => "document_sql_array_requires_unnest",
             error.DocumentSqlUnsupportedJoin => "document_sql_unsupported_join",
+            error.DocumentSqlNativeSearchRequiresTableFunction => "document_sql_native_search_requires_table_function",
+            error.DocumentSqlProjectionModifierUnsupported => "document_sql_projection_modifier_unsupported",
+            error.DocumentSqlPaginationUnsupported => "document_sql_pagination_unsupported",
+            error.DocumentSqlLockingUnsupported => "document_sql_locking_unsupported",
+            error.DocumentSqlWindowUnsupported => "document_sql_window_unsupported",
             else => null,
         };
     }
@@ -5797,11 +6053,22 @@ pub const ApiHttpServer = struct {
             else => return err,
         };
         defer parsed_sql.deinit(self.alloc);
-        if (parsed_sql.writeStatementKind() != null) return try self.handlePublicSqlWrite(parsed.value.sql, &session, authenticated_identity);
-        if (parsed_sql.readStatementKind() != null) return try self.handlePublicSqlRead(parsed.value.sql, &session, authenticated_identity);
+        if (parsed_sql.writeStatementKind() != null) {
+            var response = try self.handlePublicSqlWrite(parsed.value.sql, &session, authenticated_identity);
+            errdefer response.deinit(self.alloc);
+            try self.savePublicSqlSession(session);
+            return response;
+        }
+        if (parsed_sql.readStatementKind() != null) {
+            var response = try self.handlePublicSqlRead(parsed.value.sql, &session, authenticated_identity);
+            errdefer response.deinit(self.alloc);
+            try self.savePublicSqlSession(session);
+            return response;
+        }
 
         var applied = self.applyRelationalSqlDdlWithSession(parsed.value.sql, &session) catch |err| switch (err) {
             error.DocumentSqlViewMappingUnsupported => return try textResponse(self.alloc, 400, "document_sql_view_mapping_unsupported"),
+            error.SqlReadOnlyTransaction => return try textResponse(self.alloc, 400, "cannot execute statement in a read-only transaction"),
             error.UnsupportedSqlShape => return try textResponse(self.alloc, 501, "unsupported sql statement"),
             error.StatementTimeout => return try textResponse(self.alloc, 408, "sql statement timeout"),
             error.InvalidSqlSession,
@@ -5815,10 +6082,12 @@ pub const ApiHttpServer = struct {
             else => return err,
         };
         defer applied.deinit(self.alloc);
+        const session_id = self.ensureSqlProtocolSessionId(&session);
+        try self.savePublicSqlSession(session);
 
         return try jsonResponse(self.alloc, PublicSqlResponse{
             .kind = "ddl",
-            .session_id = self.ensureSqlProtocolSessionId(&session),
+            .session_id = session_id,
             .noop = applied.noop,
             .applied = applied,
         });
@@ -22884,6 +23153,70 @@ test "api http server resolves row filter role settings for target database" {
     );
 }
 
+test "api http server resolves document SQL row filters through catalog target resources" {
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{} };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+
+    var user = try auth.manager.createUser("alice", "secret", &.{});
+    defer user.deinit(alloc);
+    try auth.manager.createRoleSubject("role:tenant_reader");
+    try auth.manager.setRoleSetting("role:tenant_reader", "app.tenant_id", "global-acme");
+    try auth.manager.setRoleDatabaseSetting("role:tenant_reader", "tenant_ops", "app.tenant_id", "tenant-scoped-acme");
+    try auth.manager.addRoleToUser("alice", "role:tenant_reader");
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(
+        alloc,
+        .{ .user_manager = &auth.manager },
+        source.iface(),
+        null,
+        null,
+    );
+    defer server.deinit();
+
+    const role_settings = try auth.manager.getEffectiveRoleSettings("alice");
+    const row_filters = try alloc.alloc(usermgr.RowFilterEntry, 1);
+    row_filters[0] = try usermgr.RowFilterEntry.initOwned(alloc, "tenant_ops.public.docs", "{\"term\":{\"tenant_id\":{\"$auth\":\"settings.app.tenant_id\"}}}");
+    var identity = AuthenticatedIdentity{
+        .username = try alloc.dupe(u8, "alice"),
+        .row_filter = row_filters,
+        .role_settings = role_settings,
+    };
+    defer identity.deinit(alloc);
+
+    const tenant_session = catalog_resources.SqlCatalogSession{
+        .current_database_name = "tenant_ops",
+        .search_path = &.{catalog_resources.default_namespace_name},
+    };
+    const scoped = (try server.resolvePublicSqlDocumentReadRowFilterJsonAlloc(tenant_session, @as(?AuthenticatedIdentity, identity), "docs")) orelse return error.TestExpectedEqual;
+    defer alloc.free(scoped);
+    try std.testing.expectEqualStrings("{\"term\":{\"tenant_id\":\"tenant-scoped-acme\"}}", scoped);
+
+    const explicit_namespace = (try server.resolvePublicSqlDocumentReadRowFilterJsonAlloc(tenant_session, @as(?AuthenticatedIdentity, identity), "public.docs")) orelse return error.TestExpectedEqual;
+    defer alloc.free(explicit_namespace);
+    try std.testing.expectEqualStrings("{\"term\":{\"tenant_id\":\"tenant-scoped-acme\"}}", explicit_namespace);
+
+    const default_session = catalog_resources.SqlCatalogSession.default();
+    try std.testing.expect(try server.resolvePublicSqlDocumentReadRowFilterJsonAlloc(default_session, @as(?AuthenticatedIdentity, identity), "docs") == null);
+}
+
 test "api http server treats only exact extension prefixes as admin routes" {
     try std.testing.expect(requiresAdminPermission("/extensions/v1"));
     try std.testing.expect(requiresAdminPermission("/extensions/v1/packages"));
@@ -24900,6 +25233,25 @@ test "api http server exposes psql-style SQL session endpoint" {
         server.sql_prepared_statement_runtime.statementCountForTest(session_id),
     );
 
+    const prepare_write_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"session_id\":{d},\"sql\":\"PREPARE write_plan(text) AS INSERT INTO usage_records(id, status) VALUES ($1, 'prepared');\"}}",
+        .{session_id},
+    );
+    defer alloc.free(prepare_write_body);
+    var prepare_write_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = prepare_write_body,
+    });
+    defer prepare_write_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), prepare_write_resp.status);
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        server.sql_prepared_statement_runtime.statementCountForTest(session_id),
+    );
+
     const execute_body = try std.fmt.allocPrint(
         alloc,
         "{{\"session_id\":{d},\"sql\":\"EXECUTE usage_plan('open');\"}}",
@@ -24918,6 +25270,330 @@ test "api http server exposes psql-style SQL session endpoint" {
     defer parsed_execute.deinit();
     try std.testing.expectEqual(@as(i64, @intCast(session_id)), parsed_execute.value.object.get("session_id").?.integer);
 
+    const readonly_execute_read_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"read_only\":true,\"session_id\":{d},\"sql\":\"EXECUTE usage_plan('open');\"}}",
+        .{session_id},
+    );
+    defer alloc.free(readonly_execute_read_body);
+    var readonly_execute_read_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = readonly_execute_read_body,
+    });
+    defer readonly_execute_read_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), readonly_execute_read_resp.status);
+
+    const readonly_execute_write_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"read_only\":true,\"session_id\":{d},\"sql\":\"EXECUTE write_plan('blocked');\"}}",
+        .{session_id},
+    );
+    defer alloc.free(readonly_execute_write_body);
+    var readonly_execute_write_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = readonly_execute_write_body,
+    });
+    defer readonly_execute_write_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), readonly_execute_write_resp.status);
+    try std.testing.expectEqualStrings("cannot execute statement in a read-only transaction", readonly_execute_write_resp.body);
+
+    const set_transaction_readonly_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"session_id\":{d},\"sql\":\"SET TRANSACTION READ ONLY;\"}}",
+        .{session_id},
+    );
+    defer alloc.free(set_transaction_readonly_body);
+    var set_transaction_readonly_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = set_transaction_readonly_body,
+    });
+    defer set_transaction_readonly_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), set_transaction_readonly_resp.status);
+
+    const transaction_readonly_write_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"session_id\":{d},\"sql\":\"EXECUTE write_plan('blocked');\"}}",
+        .{session_id},
+    );
+    defer alloc.free(transaction_readonly_write_body);
+    var transaction_readonly_write_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = transaction_readonly_write_body,
+    });
+    defer transaction_readonly_write_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), transaction_readonly_write_resp.status);
+
+    const commit_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"session_id\":{d},\"sql\":\"COMMIT;\"}}",
+        .{session_id},
+    );
+    defer alloc.free(commit_body);
+    var commit_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = commit_body,
+    });
+    defer commit_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), commit_resp.status);
+    try std.testing.expectEqual(@as(usize, 0), server.sql_catalog_session_runtime.sessionCountForTest());
+
+    const transaction_cleared_write_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"session_id\":{d},\"sql\":\"EXECUTE write_plan('allowed');\"}}",
+        .{session_id},
+    );
+    defer alloc.free(transaction_cleared_write_body);
+    var transaction_cleared_write_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = transaction_cleared_write_body,
+    });
+    defer transaction_cleared_write_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), transaction_cleared_write_resp.status);
+
+    const request_readonly_set_readwrite_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"read_only\":true,\"session_id\":{d},\"sql\":\"SET TRANSACTION READ WRITE;\"}}",
+        .{session_id},
+    );
+    defer alloc.free(request_readonly_set_readwrite_body);
+    var request_readonly_set_readwrite_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = request_readonly_set_readwrite_body,
+    });
+    defer request_readonly_set_readwrite_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), request_readonly_set_readwrite_resp.status);
+    try std.testing.expectEqualStrings("cannot execute statement in a read-only transaction", request_readonly_set_readwrite_resp.body);
+
+    const request_readonly_not_persisted_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"session_id\":{d},\"sql\":\"EXECUTE write_plan('allowed');\"}}",
+        .{session_id},
+    );
+    defer alloc.free(request_readonly_not_persisted_body);
+    var request_readonly_not_persisted_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = request_readonly_not_persisted_body,
+    });
+    defer request_readonly_not_persisted_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), request_readonly_not_persisted_resp.status);
+
+    const set_default_readonly_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"session_id\":{d},\"sql\":\"SET default_transaction_read_only = on;\"}}",
+        .{session_id},
+    );
+    defer alloc.free(set_default_readonly_body);
+    var set_default_readonly_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = set_default_readonly_body,
+    });
+    defer set_default_readonly_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), set_default_readonly_resp.status);
+    try std.testing.expectEqual(@as(usize, 1), server.sql_catalog_session_runtime.sessionCountForTest());
+
+    const override_default_readonly_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"session_id\":{d},\"database\":\"tenant_db\",\"namespace\":\"tenant_schema\",\"sql\":\"SET default_transaction_read_only = on;\"}}",
+        .{session_id},
+    );
+    defer alloc.free(override_default_readonly_body);
+    var override_default_readonly_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = override_default_readonly_body,
+    });
+    defer override_default_readonly_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), override_default_readonly_resp.status);
+    const stored_session = server.sql_catalog_session_runtime.sessions.getPtr(session_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(catalog_resources.default_database_name, stored_session.current_database_name);
+    try std.testing.expectEqual(@as(usize, 1), stored_session.search_path.len);
+    try std.testing.expectEqualStrings(catalog_resources.default_namespace_name, stored_session.search_path[0]);
+
+    const set_search_path_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"session_id\":{d},\"sql\":\"SET search_path TO analytics, public;\"}}",
+        .{session_id},
+    );
+    defer alloc.free(set_search_path_body);
+    var set_search_path_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = set_search_path_body,
+    });
+    defer set_search_path_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), set_search_path_resp.status);
+    const stored_after_set_path = server.sql_catalog_session_runtime.sessions.getPtr(session_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), stored_after_set_path.search_path.len);
+    try std.testing.expectEqualStrings("analytics", stored_after_set_path.search_path[0]);
+    try std.testing.expectEqualStrings(catalog_resources.default_namespace_name, stored_after_set_path.search_path[1]);
+
+    const override_set_search_path_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"session_id\":{d},\"namespace\":\"tenant_schema\",\"sql\":\"SET search_path TO reports, public;\"}}",
+        .{session_id},
+    );
+    defer alloc.free(override_set_search_path_body);
+    var override_set_search_path_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = override_set_search_path_body,
+    });
+    defer override_set_search_path_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), override_set_search_path_resp.status);
+    const stored_after_override_set_path = server.sql_catalog_session_runtime.sessions.getPtr(session_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), stored_after_override_set_path.search_path.len);
+    try std.testing.expectEqualStrings("reports", stored_after_override_set_path.search_path[0]);
+    try std.testing.expectEqualStrings(catalog_resources.default_namespace_name, stored_after_override_set_path.search_path[1]);
+
+    const override_reset_search_path_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"session_id\":{d},\"namespace\":\"tenant_schema\",\"sql\":\"RESET search_path;\"}}",
+        .{session_id},
+    );
+    defer alloc.free(override_reset_search_path_body);
+    var override_reset_search_path_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = override_reset_search_path_body,
+    });
+    defer override_reset_search_path_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), override_reset_search_path_resp.status);
+    const stored_after_override_reset_path = server.sql_catalog_session_runtime.sessions.getPtr(session_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), stored_after_override_reset_path.search_path.len);
+    try std.testing.expectEqualStrings(catalog_resources.default_namespace_name, stored_after_override_reset_path.search_path[0]);
+    try std.testing.expectEqualStrings(
+        "on",
+        stored_after_override_reset_path.session().settingValue("default_transaction_read_only") orelse return error.TestUnexpectedResult,
+    );
+
+    const reset_base_search_path_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"session_id\":{d},\"sql\":\"SET search_path TO analytics, public;\"}}",
+        .{session_id},
+    );
+    defer alloc.free(reset_base_search_path_body);
+    var reset_base_search_path_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = reset_base_search_path_body,
+    });
+    defer reset_base_search_path_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), reset_base_search_path_resp.status);
+
+    const override_set_local_search_path_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"session_id\":{d},\"namespace\":\"tenant_schema\",\"sql\":\"SET LOCAL search_path TO reports;\"}}",
+        .{session_id},
+    );
+    defer alloc.free(override_set_local_search_path_body);
+    var override_set_local_search_path_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = override_set_local_search_path_body,
+    });
+    defer override_set_local_search_path_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), override_set_local_search_path_resp.status);
+    const stored_after_override_set_local_path = server.sql_catalog_session_runtime.sessions.getPtr(session_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), stored_after_override_set_local_path.search_path.len);
+    try std.testing.expectEqualStrings("reports", stored_after_override_set_local_path.search_path[0]);
+    try std.testing.expect(stored_after_override_set_local_path.transaction_local_search_path);
+    try std.testing.expect(stored_after_override_set_local_path.transaction_local_search_path_base != null);
+    try std.testing.expectEqual(@as(usize, 2), stored_after_override_set_local_path.transaction_local_search_path_base.?.len);
+    try std.testing.expectEqualStrings("analytics", stored_after_override_set_local_path.transaction_local_search_path_base.?[0]);
+    try std.testing.expectEqualStrings(catalog_resources.default_namespace_name, stored_after_override_set_local_path.transaction_local_search_path_base.?[1]);
+
+    const commit_local_search_path_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"session_id\":{d},\"sql\":\"COMMIT;\"}}",
+        .{session_id},
+    );
+    defer alloc.free(commit_local_search_path_body);
+    var commit_local_search_path_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = commit_local_search_path_body,
+    });
+    defer commit_local_search_path_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), commit_local_search_path_resp.status);
+    const stored_after_local_commit = server.sql_catalog_session_runtime.sessions.getPtr(session_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), stored_after_local_commit.search_path.len);
+    try std.testing.expectEqualStrings("analytics", stored_after_local_commit.search_path[0]);
+    try std.testing.expectEqualStrings(catalog_resources.default_namespace_name, stored_after_local_commit.search_path[1]);
+    try std.testing.expect(!stored_after_local_commit.transaction_local_search_path);
+
+    const default_readonly_write_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"session_id\":{d},\"sql\":\"EXECUTE write_plan('blocked');\"}}",
+        .{session_id},
+    );
+    defer alloc.free(default_readonly_write_body);
+    var default_readonly_write_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = default_readonly_write_body,
+    });
+    defer default_readonly_write_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), default_readonly_write_resp.status);
+    try std.testing.expectEqualStrings("cannot execute statement in a read-only transaction", default_readonly_write_resp.body);
+
+    const set_transaction_readwrite_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"session_id\":{d},\"sql\":\"SET transaction_read_only = off;\"}}",
+        .{session_id},
+    );
+    defer alloc.free(set_transaction_readwrite_body);
+    var set_transaction_readwrite_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = set_transaction_readwrite_body,
+    });
+    defer set_transaction_readwrite_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), set_transaction_readwrite_resp.status);
+    try std.testing.expectEqualStrings("cannot execute statement in a read-only transaction", set_transaction_readwrite_resp.body);
+
+    const set_default_readwrite_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"session_id\":{d},\"sql\":\"SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE;\"}}",
+        .{session_id},
+    );
+    defer alloc.free(set_default_readwrite_body);
+    var set_default_readwrite_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = set_default_readwrite_body,
+    });
+    defer set_default_readwrite_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), set_default_readwrite_resp.status);
+    try std.testing.expectEqualStrings("cannot execute statement in a read-only transaction", set_default_readwrite_resp.body);
+
     var missing_session_resp = try server.handle(.{
         .method = .POST,
         .uri = "/db/v1/sql",
@@ -24935,6 +25611,47 @@ test "api http server exposes psql-style SQL session endpoint" {
     });
     defer unsupported_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 501), unsupported_resp.status);
+    try std.testing.expectEqual(@as(usize, 1), server.sql_catalog_session_runtime.sessionCountForTest());
+
+    var readonly_write_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"read_only\":true,\"sql\":\"INSERT INTO usage_records(id, status) VALUES ('row-1', 'open');\"}",
+    });
+    defer readonly_write_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), readonly_write_resp.status);
+    try std.testing.expectEqualStrings("cannot execute write statement in a read-only transaction", readonly_write_resp.body);
+
+    var readonly_ddl_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"read_only\":true,\"sql\":\"CREATE TABLE blocked (id text);\"}",
+    });
+    defer readonly_ddl_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), readonly_ddl_resp.status);
+    try std.testing.expectEqualStrings("cannot execute statement in a read-only transaction", readonly_ddl_resp.body);
+
+    var trigger_function_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';\"}",
+    });
+    defer trigger_function_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), trigger_function_resp.status);
+
+    var readonly_trigger_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"read_only\":true,\"sql\":\"CREATE TRIGGER audit_insert BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_body();\"}",
+    });
+    defer readonly_trigger_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), readonly_trigger_resp.status);
+    try std.testing.expectEqualStrings("cannot execute statement in a read-only transaction", readonly_trigger_resp.body);
+    try std.testing.expectEqual(@as(usize, 0), server.sql_routine_runtime.triggerCountForTest());
 }
 
 test "api http server executes Antfly SQL query functions through native query path" {
@@ -24942,9 +25659,10 @@ test "api http server executes Antfly SQL query functions through native query p
     const schema_json =
         \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"}},"additionalProperties":true}}}}
     ;
+    const indexes_json = "{\"docs_body_fts\":{\"type\":\"full_text\"},\"full_text_index_v0\":{\"type\":\"full_text\"},\"docs_embedding_hnsw\":{\"type\":\"embeddings\",\"dimension\":3},\"docs_body_semantic\":{\"type\":\"embeddings\",\"dimension\":3},\"docs_edge_graph\":{\"type\":\"graph\",\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\"}}}}";
 
     const FakeSource = struct {
-        tables: [1]metadata_table_manager.TableRecord,
+        tables: [2]metadata_table_manager.TableRecord,
 
         fn iface(self: *@This()) StatusSource {
             return .{
@@ -24987,6 +25705,7 @@ test "api http server executes Antfly SQL query functions through native query p
                     .lookup = lookup,
                     .scan = scan,
                     .query = query,
+                    .query_catalog = queryCatalog,
                 },
             };
         }
@@ -25012,6 +25731,25 @@ test "api http server executes Antfly SQL query functions through native query p
             _: raft_mod.ReadConsistency,
         ) !?table_reads.ScanResponse {
             return error.TestUnexpectedResult;
+        }
+
+        fn queryCatalog(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            req: db_mod.types.SearchRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const next_call = self.query_calls + 1;
+            switch (next_call) {
+                1...7, 9...11 => try std.testing.expectEqualStrings(tables_api.default_database_name, target.database_name),
+                8 => try std.testing.expectEqualStrings("tenant_ops", target.database_name),
+                else => return error.TestUnexpectedResult,
+            }
+            try std.testing.expectEqualStrings(tables_api.default_namespace_name, target.namespace_name);
+            try std.testing.expectEqualStrings("docs", target.table_name);
+            return try query(ptr, allocator, target.table_name, req, consistency);
         }
 
         fn query(
@@ -25150,6 +25888,44 @@ test "api http server executes Antfly SQL query functions through native query p
                         \\{"responses":[{"hits":{"total":1,"hits":[{"_id":"doc:tenant","_score":1.5,"_source":{"title":"tenant","status":"active","tenant_id":"tenant-scoped-acme"}}]}}]}
                     ) };
                 },
+                9 => {
+                    try std.testing.expectEqual(@as(u32, 2), req.limit);
+                    try std.testing.expectEqualStrings("full_text_index_v0", req.index_name.?);
+                    try std.testing.expectEqualStrings("full_text_index_v0", req.primary_text_index_name.?);
+                    try std.testing.expect(req.full_text != null);
+                    try std.testing.expect(req.full_text.? == .match);
+                    try std.testing.expectEqualStrings("title", req.full_text.?.match.field);
+                    try std.testing.expectEqualStrings("alpha", req.full_text.?.match.text);
+                    return .{ .json = try allocator.dupe(u8,
+                        \\{"responses":[{"hits":{"total":1,"hits":[{"_id":"doc:default","_score":1.1,"_source":{"title":"default","status":"active"}}]}}]}
+                    ) };
+                },
+                10 => {
+                    try std.testing.expectEqual(@as(u32, 2), req.limit);
+                    try std.testing.expectEqualStrings("docs_body_fts", req.primary_text_index_name.?);
+                    try std.testing.expect(req.full_text != null);
+                    try std.testing.expect(req.full_text.? == .match);
+                    try std.testing.expectEqualStrings("title", req.full_text.?.match.field);
+                    try std.testing.expectEqualStrings("alpha", req.full_text.?.match.text);
+                    return .{ .json = try allocator.dupe(u8,
+                        \\{"responses":[{"hits":{"total":1,"hits":[{"_id":"doc:projected","_score":1.9,"_source":{"title":"projected","status":"active"}}]}}]}
+                    ) };
+                },
+                11 => {
+                    try std.testing.expect(req.full_text == null);
+                    try std.testing.expect(req.full_text_queries.len == 0);
+                    try std.testing.expectEqual(@as(usize, 1), req.dense_queries.len);
+                    try std.testing.expectEqualStrings("docs_body_semantic", req.dense_queries[0].index_name);
+                    try std.testing.expectEqual(@as(u32, 6), req.dense_queries[0].query.k);
+                    try std.testing.expectEqual(@as(usize, 3), req.dense_queries[0].query.vector.len);
+                    try std.testing.expectApproxEqAbs(@as(f32, 0.4), req.dense_queries[0].query.vector[0], 0.0001);
+                    try std.testing.expectApproxEqAbs(@as(f32, 0.5), req.dense_queries[0].query.vector[1], 0.0001);
+                    try std.testing.expectApproxEqAbs(@as(f32, 0.6), req.dense_queries[0].query.vector[2], 0.0001);
+                    try std.testing.expectEqual(@as(u32, 6), req.limit);
+                    return .{ .json = try allocator.dupe(u8,
+                        \\{"responses":[{"hits":{"total":1,"hits":[{"_id":"doc:semantic_projected","_score":0.91,"_source":{"title":"semantic projected","status":"active"}}]}}]}
+                    ) };
+                },
                 else => return error.TestUnexpectedResult,
             }
         }
@@ -25188,13 +25964,23 @@ test "api http server executes Antfly SQL query functions through native query p
         }
     };
 
-    var source = FakeSource{ .tables = .{.{
+    var source = FakeSource{ .tables = .{ .{
         .table_id = 1,
         .name = "docs",
         .schema_json = schema_json,
-        .indexes_json = "{\"docs_body_fts\":{\"type\":\"full_text\"},\"docs_embedding_hnsw\":{\"type\":\"embeddings\",\"dimension\":3},\"docs_body_semantic\":{\"type\":\"embeddings\",\"dimension\":3},\"docs_edge_graph\":{\"type\":\"graph\",\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\"}}}}",
+        .read_schema_json = "{\"version\":0}",
+        .indexes_json = indexes_json,
         .desired_replica_count = 1,
-    }} };
+    }, .{
+        .table_id = 2,
+        .database_name = "tenant_ops",
+        .namespace_name = tables_api.default_namespace_name,
+        .name = "docs",
+        .schema_json = schema_json,
+        .read_schema_json = "{\"version\":0}",
+        .indexes_json = indexes_json,
+        .desired_replica_count = 1,
+    } } };
     var reads = FakeReads{};
     var semantic = FakeSemanticResolver{};
     var auth = try initTestAuthManager(alloc);
@@ -25362,7 +26148,7 @@ test "api http server executes Antfly SQL query functions through native query p
 
     const role_settings = try auth.manager.getEffectiveRoleSettings("alice");
     const row_filters = try alloc.alloc(usermgr.RowFilterEntry, 1);
-    row_filters[0] = try usermgr.RowFilterEntry.initOwned(alloc, "*", "{\"term\":{\"tenant_id\":{\"$auth\":\"settings.app.tenant_id\"}}}");
+    row_filters[0] = try usermgr.RowFilterEntry.initOwned(alloc, "tenant_ops.public.docs", "{\"term\":{\"tenant_id\":{\"$auth\":\"settings.app.tenant_id\"}}}");
     var identity = AuthenticatedIdentity{
         .username = try alloc.dupe(u8, "alice"),
         .row_filter = row_filters,
@@ -25377,6 +26163,43 @@ test "api http server executes Antfly SQL query functions through native query p
     defer tenant_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), tenant_resp.status);
     try std.testing.expectEqual(@as(usize, 8), reads.query_calls);
+
+    var default_index_resp = try server.handlePublicSql(
+        "{\"sql\":\"SELECT * FROM antfly.full_text_search(table_name => 'docs', field => 'title', query => 'alpha', limit => 2);\"}",
+        null,
+    );
+    defer default_index_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), default_index_resp.status);
+    try std.testing.expectEqual(@as(usize, 9), reads.query_calls);
+
+    var projected_resp = try server.handlePublicSql(
+        "{\"sql\":\"SELECT _id, _score FROM antfly.full_text_search(table_name => 'docs', index => 'docs_body_fts', field => 'title', query => 'alpha', limit => 2);\"}",
+        null,
+    );
+    defer projected_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), projected_resp.status);
+    try std.testing.expectEqual(@as(usize, 10), reads.query_calls);
+    var parsed_projected = try std.json.parseFromSlice(std.json.Value, alloc, projected_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_projected.deinit();
+    const projected_row = parsed_projected.value.object.get("result").?.object.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:projected", projected_row.get("_id").?.string);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.9), projected_row.get("_score").?.float, 0.0001);
+    try std.testing.expect(projected_row.get("_source") == null);
+
+    var projected_semantic_resp = try server.handlePublicSql(
+        "{\"sql\":\"SELECT _id, _score FROM antfly.semantic_search(table_name => 'docs', index => 'docs_body_semantic', query => 'automatic embeddings', limit => 6);\"}",
+        null,
+    );
+    defer projected_semantic_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), projected_semantic_resp.status);
+    try std.testing.expectEqual(@as(usize, 11), reads.query_calls);
+    try std.testing.expectEqual(@as(usize, 2), semantic.calls);
+    var parsed_projected_semantic = try std.json.parseFromSlice(std.json.Value, alloc, projected_semantic_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_projected_semantic.deinit();
+    const projected_semantic_row = parsed_projected_semantic.value.object.get("result").?.object.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:semantic_projected", projected_semantic_row.get("_id").?.string);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.91), projected_semantic_row.get("_score").?.float, 0.0001);
+    try std.testing.expect(projected_semantic_row.get("_source") == null);
 }
 
 test "api http server executes SQL reads through typed row plan ingress" {
@@ -25477,7 +26300,7 @@ test "api http server executes SQL reads through typed row plan ingress" {
 test "api http server executes document SQL reads through typed document plan ingress" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"},"metadata":{"type":"json"},"tags":{"type":"array","items":{"type":"keyword"}}},"additionalProperties":true}}}}
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"note":{"type":"keyword"},"metadata":{"type":"json"},"tags":{"type":"array","items":{"type":"keyword"}}},"additionalProperties":true}}}}
     ;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -25491,8 +26314,8 @@ test "api http server executes document SQL reads through typed document plan in
     try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
     try db.batch(.{
         .writes = &.{
-            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"status\":\"active\",\"metadata\":{\"plan\":\"pro\"},\"tags\":[\"urgent\",\"vip\"]}" },
-            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"status\":\"archived\",\"metadata\":{\"plan\":\"free\"},\"tags\":[\"stale\"]}" },
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"status\":\"active\",\"amount\":10,\"note\":null,\"metadata\":{\"plan\":\"pro\"},\"tags\":[\"urgent\",\"vip\"]}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"status\":\"archived\",\"amount\":20,\"metadata\":{\"plan\":\"free\"},\"tags\":[\"stale\"]}" },
         },
         .sync_level = .full_index,
     });
@@ -25649,6 +26472,27 @@ test "api http server executes document SQL reads through typed document plan in
     try std.testing.expectEqualStrings("pro", alias_star_row.get("metadata").?.object.get("plan").?.string);
     try std.testing.expectEqualStrings("active", alias_star_row.get("_doc").?.object.get("status").?.string);
 
+    var alias_project_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, d.title, d.metadata->>'plan' AS plan FROM docs AS d WHERE d.status = 'active' LIMIT 10;\"}",
+    });
+    defer alias_project_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), alias_project_resp.status);
+    try std.testing.expectEqualStrings("application/json", alias_project_resp.content_type.?);
+
+    var alias_project_parsed = try std.json.parseFromSlice(std.json.Value, alloc, alias_project_resp.body, .{ .allocate = .alloc_always });
+    defer alias_project_parsed.deinit();
+    try std.testing.expectEqualStrings("read", alias_project_parsed.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", alias_project_parsed.value.object.get("statement_kind").?.string);
+    const alias_project_result = alias_project_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), alias_project_result.get("total").?.integer);
+    const alias_project_row = alias_project_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", alias_project_row.get("_id").?.string);
+    try std.testing.expectEqualStrings("alpha", alias_project_row.get("title").?.string);
+    try std.testing.expectEqualStrings("pro", alias_project_row.get("plan").?.string);
+
     var full_text_resp = try server.handle(.{
         .method = .POST,
         .uri = "/db/v1/sql",
@@ -25724,6 +26568,64 @@ test "api http server executes document SQL reads through typed document plan in
     const bounded_scalar_row = bounded_scalar_result.get("rows").?.array.items[0].object;
     try std.testing.expectEqualStrings("doc:a", bounded_scalar_row.get("_id").?.string);
     try std.testing.expectEqualStrings("active", bounded_scalar_row.get("status").?.string);
+
+    var scalar_ops_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT _id, amount FROM docs WHERE status IN ('active', 'pending') AND title LIKE 'alp%' AND amount BETWEEN 5 AND 15 LIMIT 10;\"}",
+    });
+    defer scalar_ops_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), scalar_ops_resp.status);
+    try std.testing.expectEqualStrings("application/json", scalar_ops_resp.content_type.?);
+
+    var scalar_ops_parsed = try std.json.parseFromSlice(std.json.Value, alloc, scalar_ops_resp.body, .{ .allocate = .alloc_always });
+    defer scalar_ops_parsed.deinit();
+    try std.testing.expectEqualStrings("read", scalar_ops_parsed.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", scalar_ops_parsed.value.object.get("statement_kind").?.string);
+    const scalar_ops_result = scalar_ops_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), scalar_ops_result.get("total").?.integer);
+    const scalar_ops_row = scalar_ops_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", scalar_ops_row.get("_id").?.string);
+    try std.testing.expectEqual(@as(i64, 10), scalar_ops_row.get("amount").?.integer);
+
+    var null_predicate_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT _id FROM docs WHERE note IS NULL ORDER BY _id ASC LIMIT 10;\"}",
+    });
+    defer null_predicate_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), null_predicate_resp.status);
+    try std.testing.expectEqualStrings("application/json", null_predicate_resp.content_type.?);
+
+    var null_predicate_parsed = try std.json.parseFromSlice(std.json.Value, alloc, null_predicate_resp.body, .{ .allocate = .alloc_always });
+    defer null_predicate_parsed.deinit();
+    try std.testing.expectEqualStrings("read", null_predicate_parsed.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", null_predicate_parsed.value.object.get("statement_kind").?.string);
+    const null_predicate_rows = null_predicate_parsed.value.object.get("result").?.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), null_predicate_rows.len);
+    try std.testing.expectEqualStrings("doc:a", null_predicate_rows[0].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("doc:b", null_predicate_rows[1].object.get("_id").?.string);
+
+    var not_null_predicate_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT _id FROM docs WHERE status IS NOT NULL ORDER BY _id ASC LIMIT 10;\"}",
+    });
+    defer not_null_predicate_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), not_null_predicate_resp.status);
+    try std.testing.expectEqualStrings("application/json", not_null_predicate_resp.content_type.?);
+
+    var not_null_predicate_parsed = try std.json.parseFromSlice(std.json.Value, alloc, not_null_predicate_resp.body, .{ .allocate = .alloc_always });
+    defer not_null_predicate_parsed.deinit();
+    try std.testing.expectEqualStrings("read", not_null_predicate_parsed.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", not_null_predicate_parsed.value.object.get("statement_kind").?.string);
+    const not_null_predicate_rows = not_null_predicate_parsed.value.object.get("result").?.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), not_null_predicate_rows.len);
+    try std.testing.expectEqualStrings("doc:a", not_null_predicate_rows[0].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("doc:b", not_null_predicate_rows[1].object.get("_id").?.string);
 
     var json_path_resp = try server.handle(.{
         .method = .POST,
@@ -25830,6 +26732,64 @@ test "api http server executes document SQL reads through typed document plan in
     try std.testing.expectEqualStrings("archived", grouped_count_rows[1].object.get("status").?.string);
     try std.testing.expectEqual(@as(i64, 1), grouped_count_rows[1].object.get("row_count").?.integer);
 
+    var row_filters = try alloc.alloc(usermgr.RowFilterEntry, 1);
+    row_filters[0] = try usermgr.RowFilterEntry.initOwned(alloc, "docs", "{\"term\":{\"status\":\"active\"}}");
+    var identity = AuthenticatedIdentity{
+        .username = try alloc.dupe(u8, "document_sql_reader"),
+        .row_filter = row_filters,
+    };
+    defer identity.deinit(alloc);
+
+    var filtered_lookup_resp = try server.handlePublicSql("{\"sql\":\"SELECT _id, status FROM docs WHERE _id IN ('doc:a', 'doc:b') LIMIT 10;\"}", identity);
+    defer filtered_lookup_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), filtered_lookup_resp.status);
+    var filtered_lookup_parsed = try std.json.parseFromSlice(std.json.Value, alloc, filtered_lookup_resp.body, .{ .allocate = .alloc_always });
+    defer filtered_lookup_parsed.deinit();
+    const filtered_lookup_result = filtered_lookup_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), filtered_lookup_result.get("total").?.integer);
+    const filtered_lookup_row = filtered_lookup_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", filtered_lookup_row.get("_id").?.string);
+    try std.testing.expectEqualStrings("active", filtered_lookup_row.get("status").?.string);
+
+    var filtered_ordered_resp = try server.handlePublicSql("{\"sql\":\"SELECT _id, title FROM docs ORDER BY title DESC LIMIT 10;\"}", identity);
+    defer filtered_ordered_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), filtered_ordered_resp.status);
+    var filtered_ordered_parsed = try std.json.parseFromSlice(std.json.Value, alloc, filtered_ordered_resp.body, .{ .allocate = .alloc_always });
+    defer filtered_ordered_parsed.deinit();
+    const filtered_ordered_result = filtered_ordered_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), filtered_ordered_result.get("total").?.integer);
+    const filtered_ordered_row = filtered_ordered_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", filtered_ordered_row.get("_id").?.string);
+    try std.testing.expectEqualStrings("alpha", filtered_ordered_row.get("title").?.string);
+
+    var filtered_full_text_resp = try server.handlePublicSql("{\"sql\":\"SELECT _id, title FROM docs WHERE full_text_search('title:beta') LIMIT 10;\"}", identity);
+    defer filtered_full_text_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), filtered_full_text_resp.status);
+    var filtered_full_text_parsed = try std.json.parseFromSlice(std.json.Value, alloc, filtered_full_text_resp.body, .{ .allocate = .alloc_always });
+    defer filtered_full_text_parsed.deinit();
+    const filtered_full_text_result = filtered_full_text_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 0), filtered_full_text_result.get("total").?.integer);
+    try std.testing.expectEqual(@as(usize, 0), filtered_full_text_result.get("rows").?.array.items.len);
+
+    var filtered_count_resp = try server.handlePublicSql("{\"sql\":\"SELECT count(*) AS row_count FROM docs;\"}", identity);
+    defer filtered_count_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), filtered_count_resp.status);
+    var filtered_count_parsed = try std.json.parseFromSlice(std.json.Value, alloc, filtered_count_resp.body, .{ .allocate = .alloc_always });
+    defer filtered_count_parsed.deinit();
+    const filtered_count_result = filtered_count_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), filtered_count_result.get("total_groups").?.integer);
+    const filtered_count_row = filtered_count_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqual(@as(i64, 1), filtered_count_row.get("row_count").?.integer);
+
+    var filtered_unnest_resp = try server.handlePublicSql("{\"sql\":\"SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag = 'stale' LIMIT 10;\"}", identity);
+    defer filtered_unnest_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), filtered_unnest_resp.status);
+    var filtered_unnest_parsed = try std.json.parseFromSlice(std.json.Value, alloc, filtered_unnest_resp.body, .{ .allocate = .alloc_always });
+    defer filtered_unnest_parsed.deinit();
+    const filtered_unnest_result = filtered_unnest_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 0), filtered_unnest_result.get("total").?.integer);
+    try std.testing.expectEqual(@as(usize, 0), filtered_unnest_result.get("rows").?.array.items.len);
+
     var bounded_scan_resp = try server.handle(.{
         .method = .POST,
         .uri = "/db/v1/sql",
@@ -25859,6 +26819,46 @@ test "api http server executes document SQL reads through typed document plan in
     defer join_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), join_resp.status);
     try std.testing.expectEqualStrings("document_sql_unsupported_join", join_resp.body);
+
+    var distinct_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT DISTINCT _id FROM docs WHERE _id = 'doc:a';\"}",
+    });
+    defer distinct_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), distinct_resp.status);
+    try std.testing.expectEqualStrings("document_sql_projection_modifier_unsupported", distinct_resp.body);
+
+    var offset_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT _id FROM docs WHERE status = 'active' OFFSET 1;\"}",
+    });
+    defer offset_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), offset_resp.status);
+    try std.testing.expectEqualStrings("document_sql_pagination_unsupported", offset_resp.body);
+
+    var locking_tail_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT _id FROM docs WHERE _id = 'doc:a' FOR UPDATE;\"}",
+    });
+    defer locking_tail_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), locking_tail_resp.status);
+    try std.testing.expectEqualStrings("document_sql_locking_unsupported", locking_tail_resp.body);
+
+    var native_search_predicate_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT _id FROM docs WHERE antfly.hybrid_search(table_name => 'docs', query => 'alpha', limit => 10) LIMIT 10;\"}",
+    });
+    defer native_search_predicate_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), native_search_predicate_resp.status);
+    try std.testing.expectEqualStrings("document_sql_native_search_requires_table_function", native_search_predicate_resp.body);
 
     var write_resp = try server.handle(.{
         .method = .POST,
@@ -27120,8 +28120,25 @@ test "api http server maps relational CTE spill admission to rows backpressure" 
         fn source(self: *@This()) table_reads.TableReadSource {
             return .{
                 .ptr = self,
-                .vtable = &.{ .rows_query_plan = rowsQueryPlan },
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .rows_query_plan = rowsQueryPlan,
+                },
             };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.UnsupportedOperation;
         }
 
         fn rowsQueryPlan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: runtime_schema_mod.TableSchema, _: db_mod.types.RelationalRowsQueryPlan, _: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsQueryResult {
@@ -35906,7 +36923,7 @@ test "api http server graph metric action endpoint returns updated status" {
 
     var pause_resp = try server.handle(.{
         .method = .POST,
-        .uri = "/tables/docs/indexes/graph_idx/graph-metrics/degree:pause",
+        .uri = "/tables/docs/indexes/graph_idx/graph-metrics/degree/actions/pause",
         .body = "",
     });
     defer pause_resp.deinit(std.testing.allocator);
@@ -35936,7 +36953,7 @@ test "api http server graph metric action endpoint returns updated status" {
 
     var resume_resp = try server.handle(.{
         .method = .POST,
-        .uri = "/tables/docs/indexes/graph_idx/graph-metrics/degree:resume",
+        .uri = "/tables/docs/indexes/graph_idx/graph-metrics/degree/actions/resume",
         .body = "",
     });
     defer resume_resp.deinit(std.testing.allocator);
@@ -35951,7 +36968,7 @@ test "api http server graph metric action endpoint returns updated status" {
 
     var delete_resp = try server.handle(.{
         .method = .POST,
-        .uri = "/tables/docs/indexes/graph_idx/graph-metrics/degree:delete",
+        .uri = "/tables/docs/indexes/graph_idx/graph-metrics/degree/actions/delete",
         .body = "",
     });
     defer delete_resp.deinit(std.testing.allocator);
@@ -35979,7 +36996,7 @@ test "api http server graph metric action endpoint returns updated status" {
 
     var invalid_resp = try server.handle(.{
         .method = .POST,
-        .uri = "/tables/docs/indexes/graph_idx/graph-metrics/degree:compact",
+        .uri = "/tables/docs/indexes/graph_idx/graph-metrics/degree/actions/compact",
         .body = "",
     });
     defer invalid_resp.deinit(std.testing.allocator);

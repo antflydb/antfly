@@ -654,6 +654,11 @@ from .shard_config import ShardConfig
 from .shards_profile import ShardsProfile
 from .significance_algorithm import SignificanceAlgorithm
 from .sort_field import SortField
+from .sql_statement_request import SqlStatementRequest
+from .sql_statement_response import SqlStatementResponse
+from .sql_statement_response_applied import SqlStatementResponseApplied
+from .sql_statement_response_kind import SqlStatementResponseKind
+from .sql_statement_response_result_type_0 import SqlStatementResponseResultType0
 from .sse_error import SSEError
 from .sse_event import SSEEvent
 from .sse_step_completed import SSEStepCompleted
@@ -1393,6 +1398,11 @@ __all__ = (
     "ShardsProfile",
     "SignificanceAlgorithm",
     "SortField",
+    "SqlStatementRequest",
+    "SqlStatementResponse",
+    "SqlStatementResponseApplied",
+    "SqlStatementResponseKind",
+    "SqlStatementResponseResultType0",
     "SSEError",
     "SSEEvent",
     "SSEStepCompleted",

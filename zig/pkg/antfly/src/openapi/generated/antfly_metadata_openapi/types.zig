@@ -22,6 +22,8 @@ pub const SqlStatementRequest = struct {
     database: ?[]const u8 = null,
     /// Optional single search-path namespace override for this request.
     namespace: ?[]const u8 = null,
+    /// Execute this statement under a server-enforced PostgreSQL-style read-only transaction guard.
+    read_only: ?bool = null,
 };
 
 /// Synchronous SQL statement result metadata. Catalog/session/control statements route through the typed DDL/session execution path. Read statements lower through the same typed row-plan executor used by the JSON relational rows APIs. Point write statements lower through the typed row-batch mutation path, and insert-from-source statements lower through the typed row-read plus row-batch mutation path.
@@ -526,22 +528,20 @@ pub const SecretWriteRequest = struct {
 
 pub const ByteRange = []const []const u8;
 
-/// Synchronization level for batch operations: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for Pebble KV write - "full_text": Wait for full-text index WAL write - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation) - "aknn": Wait for vector index write with best-effort synchronous embedding (falls back to async on timeout, slowest, most durable) - "full_index": Wait for all index writes to complete (full-text + enrichments + aknn)
+/// Synchronization level for batch operations: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for Pebble KV write - "query": Wait until affected documents are visible to query paths such as full-text search - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation) - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
 pub const SyncLevel = enum {
     propose,
     write,
-    full_text,
+    query,
     enrichments,
-    aknn,
     full_index,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .propose => "propose",
             .write => "write",
-            .full_text => "full_text",
+            .query => "query",
             .enrichments => "enrichments",
-            .aknn => "aknn",
             .full_index => "full_index",
         };
         try jw.write(s);
@@ -555,9 +555,8 @@ pub const SyncLevel = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "propose", .propose },
             .{ "write", .write },
-            .{ "full_text", .full_text },
+            .{ "query", .query },
             .{ "enrichments", .enrichments },
-            .{ "aknn", .aknn },
             .{ "full_index", .full_index },
         });
         return map.get(s) orelse error.UnexpectedToken;
@@ -3167,6 +3166,8 @@ pub const CreateTableRequest = struct {
     description: ?[]const u8 = null,
     /// Map of index name to index configuration. Indexes enable different query capabilities: - Full-text indexes for BM25 search - Vector indexes for semantic similarity - Multimodal indexes for images/audio/video You can add multiple indexes to support different query patterns.
     indexes: ?std.json.ArrayHashMap(antfly_indexes_openapi.IndexConfig) = null,
+    /// Table-level typed document path metadata used by SQL planning for JSON/path scalar comparison semantics. This is not a physical index and does not imply indexed lookup, rebuild, catch-up, compaction, or PostgreSQL `CREATE INDEX` behavior. Use real index definitions for physical access paths. Keys are scalar type names such as `keyword`, `numeric`, `boolean`, or `datetime`; values are a path string or an array of path strings.
+    typed_paths: ?std.json.Value = null,
     /// Optional schema definition specifying field types, primary key, and TTL configuration. While optional, defining a schema provides type safety, optimized indexing, and better search performance. **Schema Features:** - **Field Types**: Define document structure using JSON Schema with `x-antfly-types` extensions - **Document TTL**: Configure automatic expiration via `ttl_duration` and optional `ttl_field` - **Primary Keys**: Specify unique identifier fields - **Validation**: Enforce schema constraints on writes **TTL Example:** ```json { "ttl_duration": "7d", "ttl_field": "_timestamp", "document_schemas": {...} } ``` See the Table Management documentation for comprehensive TTL configuration and use cases.
     schema: ?antfly_schema_openapi.TableSchema = null,
     /// PostgreSQL CDC replication sources. Streams INSERT/UPDATE/DELETE changes from PostgreSQL tables into this Antfly table via logical replication. Multiple sources can feed into a single table (e.g., `users` + `scores` → Antfly `users`). Each source uses `on_update`/`on_delete` transforms to control how PG events map to Antfly document operations. Requires `wal_level=logical` on the PostgreSQL source.

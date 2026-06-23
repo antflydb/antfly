@@ -142,7 +142,7 @@ impl AntflyClient {
 
     /// Insert a single document via the batch API.
     ///
-    /// Uses `sync_level: "full_text"` so the document is immediately searchable.
+    /// Uses `sync_level: "query"` so the document is immediately searchable.
     pub fn sync_document(&self, table: &str, doc_id: &str, doc: &Value) -> Result<(), ClientError> {
         let path = format!("tables/{}/batch", table);
         let url = self
@@ -152,7 +152,7 @@ impl AntflyClient {
 
         let body = serde_json::json!({
             "inserts": { doc_id: doc },
-            "sync_level": "full_text",
+            "sync_level": "query",
         });
 
         self.http

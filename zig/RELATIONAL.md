@@ -370,12 +370,11 @@ version, and optional `physical_key`.
 
 Relational row writes use the same public `sync_level` contract as the document
 batch API. `rows/batch` accepts top-level `sync_level` with the public values
-`propose`, `write`, `full_text`, `enrichments`, `aknn`, and `full_index`;
-`aknn` is accepted as a compatibility alias for `full_index` at the API/parser
-boundary. The value is a write-completion requirement, not table schema
-metadata. It controls how far the write path must advance before returning:
-Raft proposal acceptance, durable base-row write, full-text visibility,
-synchronous enrichment generation, or complete derived-index visibility.
+`propose`, `write`, `query`, `enrichments`, and `full_index`. The value is
+a write-completion requirement, not table schema metadata. It controls how far
+the write path must advance before returning: Raft proposal acceptance, durable
+base-row write, query visibility, synchronous enrichment generation, or
+complete derived-index visibility.
 
 REST/SDK `rows/batch` keeps the existing batch default of `propose` when the
 field is omitted:
@@ -6222,6 +6221,14 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    can additionally project as CTE-backed row sources or inline join row
    sources, so `antfly.graph_match` can participate in ordinary SQL reads and
    joins while execution still routes through the native graph query path. The
+   document-table SQL adapter should reuse this same function family for
+   explicit Antfly retrieval modes instead of adding document-only spellings:
+   compatibility predicates and aggregates can still be optimized through
+   full-text/default document query producers, algebraic sidecars, future
+   physical scalar/path producers, lookup, or scan producers, with `typed_paths`
+   used only as type proof. Semantic, vector, hybrid, graph, graph metric,
+   rerank, and native full-text retrieval intent remains visible as `antfly.*`
+   table functions. The
    parity corpus treats Antfly query functions as a first-class
    `query_function` family and gates full-text, dense, graph-search,
    graph traversal/path, graph-metric, graph-rerank, simple hybrid, and
@@ -7868,7 +7875,7 @@ Current implementation status:
   replay, so graph index builds no longer depend on clients writing `_edges`
   rows directly.
 - Managed AKNN lifecycle is wired through generated enrichment precompute,
-  `full_index`/`aknn` sync-level maintenance, published dense-index visibility,
+  `full_index` sync-level maintenance, published dense-index visibility,
   and readiness/status encoding for replay completion.
 - Remaining long-term production work is distributed orchestration: remote
   worker lease/retry accounting, cross-node recovery evidence, and operational

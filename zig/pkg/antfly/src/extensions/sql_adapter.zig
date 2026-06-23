@@ -17,6 +17,7 @@ const extension_domain = @import("mod.zig");
 const sql_adapter = @import("../sql/mod.zig");
 const tables_api = @import("../api/tables.zig");
 const metadata_api = @import("../metadata/api.zig");
+const metadata_storage = @import("../metadata/storage/raft_apply_store.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 
 pub fn executeRelationalSqlDdlOnService(
@@ -206,19 +207,19 @@ const TestService = struct {
 
     pub fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
 
-    pub fn proposeTransitionCommand(self: *@This(), command: anytype) !void {
+    pub fn proposeTransitionCommand(self: *@This(), command: metadata_storage.TransitionCommand) !void {
         self.proposed += 1;
         const delta = command.apply_extension_lifecycle;
         const Delta = @TypeOf(delta);
         if (@hasField(Delta, "upsert_installed_extensions")) {
             self.installed_upserts += delta.upsert_installed_extensions.len;
-            inline for (delta.upsert_installed_extensions) |installed| {
+            for (delta.upsert_installed_extensions) |installed| {
                 if (std.mem.eql(u8, installed.package_name, "uuid_ossp")) self.saw_uuid_ossp_package = true;
             }
         }
         if (@hasField(Delta, "upsert_extension_members")) {
             self.extension_member_upserts += delta.upsert_extension_members.len;
-            inline for (delta.upsert_extension_members) |member| {
+            for (delta.upsert_extension_members) |member| {
                 if (member.object_kind == .query_function and std.mem.eql(u8, member.object_name, "gen_random_uuid")) {
                     self.saw_gen_random_uuid_function = true;
                 }

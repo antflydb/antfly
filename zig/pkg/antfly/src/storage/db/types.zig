@@ -50,9 +50,8 @@ pub const SyncLevel = enum {
 pub fn parsePublicSyncLevelText(text: []const u8) ?SyncLevel {
     if (std.mem.eql(u8, text, "propose")) return .propose;
     if (std.mem.eql(u8, text, "write")) return .write;
-    if (std.mem.eql(u8, text, "full_text")) return .full_text;
+    if (std.mem.eql(u8, text, "query")) return .full_text;
     if (std.mem.eql(u8, text, "enrichments")) return .enrichments;
-    if (std.mem.eql(u8, text, "aknn")) return .full_index;
     if (std.mem.eql(u8, text, "full_index")) return .full_index;
     return null;
 }
@@ -68,15 +67,18 @@ pub fn publicSyncLevelText(level: SyncLevel) []const u8 {
     return switch (level) {
         .propose => "propose",
         .write => "write",
-        .full_text => "full_text",
+        .full_text => "query",
         .enrichments => "enrichments",
         .aknn, .full_index => "full_index",
     };
 }
 
-test "public sync level text treats aknn as deprecated alias for full_index" {
-    try std.testing.expectEqual(SyncLevel.full_index, parsePublicSyncLevelText("aknn").?);
+test "public sync level text maps query and rejects deprecated spellings" {
+    try std.testing.expectEqual(SyncLevel.full_text, parsePublicSyncLevelText("query").?);
+    try std.testing.expect(parsePublicSyncLevelText("full_text") == null);
+    try std.testing.expect(parsePublicSyncLevelText("aknn") == null);
     try std.testing.expectEqual(SyncLevel.full_index, parsePublicSyncLevelText("full_index").?);
+    try std.testing.expectEqualStrings("query", publicSyncLevelText(.full_text));
     try std.testing.expectEqualStrings("full_index", publicSyncLevelText(.aknn));
     try std.testing.expectEqualStrings("full_index", publicSyncLevelText(.full_index));
 }

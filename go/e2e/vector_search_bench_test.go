@@ -115,7 +115,7 @@ func TestE2E_VectorSearchLatency(t *testing.T) {
 		}
 		_, batchErr := swarm.Client.Batch(ctx, tableName, antfly.BatchRequest{
 			Inserts:   inserts,
-			SyncLevel: antfly.SyncLevelAknn,
+			SyncLevel: antfly.SyncLevelFullIndex,
 		})
 		require.NoError(t, batchErr)
 	}

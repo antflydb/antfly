@@ -855,7 +855,7 @@ pub const routes = [_]Route{
     .{ .method = "PUT", .path = "/secrets/{key}", .operation_id = "putSecret" },
     .{ .method = "DELETE", .path = "/secrets/{key}", .operation_id = "deleteSecret" },
     .{ .method = "POST", .path = "/batch", .operation_id = "multiBatchWrite" },
-    .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}", .operation_id = "executeGraphMetricAction" },
+    .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}/actions/{action}", .operation_id = "executeGraphMetricAction" },
     .{ .method = "POST", .path = "/transactions/commit", .operation_id = "commitTransaction" },
     .{ .method = "GET", .path = "/transactions", .operation_id = "listTransactionSessions" },
     .{ .method = "POST", .path = "/transactions/cleanup", .operation_id = "cleanupTransactionSessions" },
@@ -1068,7 +1068,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.put("/secrets/:key", putSecret);
             try server.delete("/secrets/:key", deleteSecret);
             try server.post("/batch", multiBatchWrite);
-            try server.post("/tables/:tableName/indexes/:indexName/graph-metrics/:metricName::action", executeGraphMetricAction);
+            try server.post("/tables/:tableName/indexes/:indexName/graph-metrics/:metricName/actions/:action", executeGraphMetricAction);
             try server.post("/transactions/commit", commitTransaction);
             try server.get("/transactions", listTransactionSessions);
             try server.post("/transactions/cleanup", cleanupTransactionSessions);
@@ -1213,7 +1213,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         }
 
         /// Execute a graph metric operational action
-        /// POST /tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}
+        /// POST /tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}/actions/{action}
         fn executeGraphMetricAction(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });

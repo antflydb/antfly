@@ -191,6 +191,7 @@ pub fn expectAppParityReadSummary(summary: corpus.AppParityPlanSummary, lowered:
             try expectOptionalUsize(summary.ctes, query.plan.ctes.len);
             try expectQuerySummary(summary, query.plan.query);
         },
+        .document_query, .document_aggregate => if (summary.table_name != null) return error.TestUnexpectedResult,
         .set_operation => |set_operation| {
             try expectOptionalTableName(summary.table_name, set_operation.left.table_name);
             try expectOptionalUsize(summary.ctes, set_operation.left.plan.ctes.len + set_operation.right.plan.ctes.len);

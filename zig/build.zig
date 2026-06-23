@@ -4051,6 +4051,7 @@ pub fn build(b: *std.Build) void {
             "api http server serves mcp and a2a protocol surfaces",
             "api http server hydrates trusted principal role settings from antfly user manager",
             "api http server resolves row filter role settings for target database",
+            "api http server resolves document SQL row filters through catalog target resources",
             "explicit catalog routes declare qualified namespace and table permissions",
             "api http server serves ARD catalogs with public bootstrap and authenticated tenant entries",
             "api http server requires auth for ARD tenant catalog when auth is enabled",
@@ -4306,12 +4307,14 @@ pub fn build(b: *std.Build) void {
             "document SQL capability-aware aggregate keeps full text candidate with scalar residual",
             "document SQL capability-aware aggregate keeps scalar candidate with scalar residual",
             "document SQL keeps catalog aggregate plan without algebraic materialization",
+            "document SQL aggregate group by accepts index-backed virtual fields",
             "document SQL prefers algebraic materialization over bounded aggregate scan fallback",
             "document SQL lowers aggregate to policy bounded scan when no index can answer",
             "document SQL rejects algebraic group by without indexed facts",
             "document SQL lowers json path projection",
             "document SQL lowers full text producer",
             "document SQL lowers qualified full text producer",
+            "document SQL rejects ranked antfly functions as scalar predicates",
             "document SQL capability-aware lowering requires full text producer",
             "document SQL capability-aware lowering keeps full text candidate with scalar residual",
             "document SQL lowers scalar equality to indexed filter producer",
@@ -4336,8 +4339,11 @@ pub fn build(b: *std.Build) void {
             "document SQL lowers null equality comparisons to policy bounded residual scan",
             "document SQL lowers null range and pattern predicates to policy bounded residual scan",
             "document SQL keeps indexed scalar producer when bounded scan policy is present",
+            "document SQL requires explicit limit for policy-backed indexed reads",
             "document SQL capability-aware lowering scans when scalar index capability is absent",
             "document SQL capability-aware lowering pushes only proven scalar paths",
+            "document SQL filters on index-backed virtual scalar fields",
+            "document SQL combines typed virtual scalar fields with independent index readiness",
             "document SQL lowers explicit array unnest over bounded scan",
             "document SQL treats field-scoped full text index as scalar-capable for that path",
             "document SQL selects compatible full text producer by query field",
@@ -4355,6 +4361,8 @@ pub fn build(b: *std.Build) void {
             "sql adapter ddl plan lowers create index ddl",
             "sql adapter query function dispatch uses token keyword metadata",
             "sql adapter query function lowers antfly query functions into native search requests",
+            "sql adapter query function read accepts projected hit columns",
+            "sql adapter query function read keeps projected columns for derived search functions",
             "sql adapter ddl plan lowers alter table ddl",
             "sql adapter ddl plan lowers alter table constraint validation ddl",
             "sql adapter ddl plan lowers additive inline foreign key column ddl",
@@ -5795,27 +5803,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     transcribing_db_test_stub_mod.addImport("httpx", httpx_mod);
-    addSnowballModule(b, db_test_mod);
-    db_test_mod.addImport("bloom", bloom_mod);
-    db_test_mod.addImport("handlebars", handlebars_mod);
-    db_test_mod.addImport("antfly_vellum", vellum_mod);
-    db_test_mod.addImport("antfly_vector", vector_mod);
-    db_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
-    db_test_mod.addImport("antfly_matcher", matcher_mod);
-    db_test_mod.addImport("antfly_resolver", resolver_mod);
-    db_test_mod.addImport("antfly_chunking", chunking_mod);
-    db_test_mod.addImport("antfly_regex", regex_mod);
-    db_test_mod.addImport("raft_engine", raft_engine_mod);
-    db_test_mod.addImport("inference_chunker", inference_chunker_mod);
-    db_test_mod.addImport("inference_api", inference_api_mod);
-    db_test_mod.addImport("antfly_reranking", reranking_mod);
-    db_test_mod.addImport("antfly_scraping", scraping_mod);
+    antfly_imports.configure(b, db_test_mod, false, link_libc);
     db_test_mod.addImport("antfly_transcribing", transcribing_db_test_stub_mod);
-    db_test_mod.addImport("httpx", httpx_mod);
-    db_test_mod.addImport("antfly_pdf", pdf_mod);
-    db_test_mod.addImport("antfly_image", image_mod);
-    db_test_mod.addImport("antfly_font", font_mod);
-    db_test_mod.addImport("structlog", structlog_mod);
+    const usermgr_storage_db_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    usermgr_storage_db_test_mod.addImport("antfly_root", db_test_mod);
+    usermgr_storage_db_test_mod.addImport("antfly_platform", platform_mod);
+    db_test_mod.addImport("usermgr_storage", usermgr_storage_db_test_mod);
 
     const db_split_sim_default_filters = [_][]const u8{
         "db split sim default workload stays green",

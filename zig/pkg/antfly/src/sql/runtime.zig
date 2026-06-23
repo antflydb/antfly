@@ -1053,10 +1053,11 @@ fn lowerDocumentReadPlanFromBindingParsedSqlAlloc(
     _ = function_bindings;
     return switch (parsed_sql.statement.readKind() orelse return error.UnsupportedSqlShape) {
         .aggregate => .{
-            .document_aggregate = try sql_adapter.lowerDocumentAggregatePlanWithOptionalIndexesAndCapabilitiesParsedSqlAlloc(
+            .document_aggregate = try sql_adapter.lowerDocumentAggregatePlanWithOptionalIndexesAndVirtualSchemaCapabilitiesParsedSqlAlloc(
                 alloc,
                 parsed_sql,
                 document.schema,
+                document.virtual_schema,
                 document.indexes_json,
                 document.capabilities,
             ),

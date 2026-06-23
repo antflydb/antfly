@@ -1414,8 +1414,8 @@ Status as of 2026-05-19:
   reached the exhausted sentinel, lifecycle planning fails closed until repair,
   reassignment, or rebuild establishes a safe identity boundary.
   Focused coverage exercises that
-  fail-closed behavior for `propose`, `write`, `full_text`, `enrichments`,
-  `aknn`, and `full_index` sync levels plus direct and request-shaped
+  fail-closed behavior for `propose`, `write`, `query`, `enrichments`, and
+  `full_index` sync levels plus direct and request-shaped
   transaction intent writes. The focused DOCID gate now includes both the
   all-sync-level batch exhaustion regression and the transaction-intent
   exhaustion regression. Diagnostic scans also publish min/max

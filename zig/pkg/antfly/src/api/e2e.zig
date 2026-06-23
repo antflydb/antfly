@@ -199,6 +199,30 @@ const GraphMetricEdgeFilterSummary = struct {
     types: ?[]const []const u8 = null,
 };
 
+fn dynamicJsonNumber(value: std.json.Value) !f64 {
+    return switch (value) {
+        .integer => |integer| @floatFromInt(integer),
+        .float => |float| float,
+        .number_string => |number_string| try std.fmt.parseFloat(f64, number_string),
+        else => error.TestUnexpectedResult,
+    };
+}
+
+fn dynamicJsonUnsigned(value: std.json.Value) !u64 {
+    return switch (value) {
+        .integer => |integer| if (integer >= 0) @intCast(integer) else error.TestUnexpectedResult,
+        .number_string => |number_string| try std.fmt.parseInt(u64, number_string, 10),
+        else => error.TestUnexpectedResult,
+    };
+}
+
+fn dynamicJsonString(value: std.json.Value) ![]const u8 {
+    return switch (value) {
+        .string => |string| string,
+        else => error.TestUnexpectedResult,
+    };
+}
+
 fn startMetadataAdminListener(
     alloc: std.mem.Allocator,
     svc: *metadata_service.MetadataService,
@@ -1984,7 +2008,7 @@ test "public api e2e backs up drops and restores a table" {
         .method = .POST,
         .uri = batch_uri,
         .content_type = "application/json",
-        .body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\",\"body\":\"restored\"}},\"sync_level\":\"full_text\"}",
+        .body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\",\"body\":\"restored\"}},\"sync_level\":\"query\"}",
     });
     defer batch_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 201), batch_resp.status);
@@ -2118,7 +2142,7 @@ test "public api split e2e backs up drops and restores a table" {
         .method = .POST,
         .uri = batch_uri,
         .content_type = "application/json",
-        .body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\",\"body\":\"restored\"}},\"sync_level\":\"full_text\"}",
+        .body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\",\"body\":\"restored\"}},\"sync_level\":\"query\"}",
     });
     defer batch_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 201), batch_resp.status);
@@ -2268,7 +2292,7 @@ test "public api swarm-like e2e backs up drops and restores a table" {
         .method = .POST,
         .uri = batch_uri,
         .content_type = "application/json",
-        .body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\",\"body\":\"restored\"}},\"sync_level\":\"full_text\"}",
+        .body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\",\"body\":\"restored\"}},\"sync_level\":\"query\"}",
     });
     defer batch_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 201), batch_resp.status);
@@ -2443,7 +2467,7 @@ test "split data runtime registers a store with metadata" {
         .method = .POST,
         .uri = batch_uri,
         .content_type = "application/json",
-        .body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\"}},\"sync_level\":\"full_text\"}",
+        .body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\"}},\"sync_level\":\"query\"}",
     });
     defer batch_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 201), batch_resp.status);
@@ -2538,7 +2562,7 @@ test "split data runtime serves retrieval agent pipeline queries" {
         .method = .POST,
         .uri = batch_uri,
         .content_type = "application/json",
-        .body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\",\"body\":\"hello retrieval\"},\"doc:b\":{\"title\":\"beta\",\"body\":\"secondary\"}},\"sync_level\":\"full_text\"}",
+        .body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\",\"body\":\"hello retrieval\"},\"doc:b\":{\"title\":\"beta\",\"body\":\"secondary\"}},\"sync_level\":\"query\"}",
     });
     defer batch_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 201), batch_resp.status);
@@ -5849,7 +5873,7 @@ test "public api e2e supports graph queries" {
     const not_ready_metric_status = parsed_not_ready_index_status.value.status.metric_status orelse return error.TestUnexpectedResult;
     const not_ready_pagerank_status = not_ready_metric_status.map.get("pagerank") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("not_ready", not_ready_pagerank_status.state);
-    try std.testing.expectEqual(@as(i64, 0), not_ready_pagerank_status.published_generation);
+    try std.testing.expectEqual(@as(u64, 0), not_ready_pagerank_status.published_generation);
     try std.testing.expect(not_ready_pagerank_status.edge_generation > 0);
 
     try std.testing.expectError(
@@ -5883,8 +5907,8 @@ test "public api e2e supports graph queries" {
     const not_ready_projected_nodes = not_ready_projected_neighbors.nodes orelse return error.TestUnexpectedResult;
     try std.testing.expect(not_ready_projected_nodes.len > 0);
     const not_ready_projected_metrics = not_ready_projected_nodes[0].metrics orelse return error.TestUnexpectedResult;
-    const not_ready_projected_score = not_ready_projected_metrics.map.get("pagerank") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(not_ready_projected_score.* == null);
+    const not_ready_projected_score = not_ready_projected_metrics.object.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(not_ready_projected_score == .null);
 
     try std.testing.expectError(
         error.UnexpectedHttpStatus,
@@ -5939,7 +5963,7 @@ test "public api e2e supports graph queries" {
     try std.testing.expectEqualStrings("cites", pagerank_types[0]);
     const degree_status = metric_status.map.get("degree") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("fresh", degree_status.state);
-    try std.testing.expectEqual(@as(i64, 1), degree_status.iterations_completed);
+    try std.testing.expectEqual(@as(u64, 1), degree_status.iterations_completed);
     const degree_scope = degree_status.edge_filter orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("types", degree_scope.mode);
     const degree_types = degree_scope.types orelse return error.TestUnexpectedResult;
@@ -6011,8 +6035,8 @@ test "public api e2e supports graph queries" {
     const projected_nodes = projected_neighbors.nodes orelse return error.TestUnexpectedResult;
     try std.testing.expect(projected_nodes.len > 0);
     const projected_metrics = projected_nodes[0].metrics orelse return error.TestUnexpectedResult;
-    const projected_score = projected_metrics.map.get("pagerank") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(projected_score.* != null);
+    const projected_score = projected_metrics.object.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(projected_score != .null);
 
     var ordered_metric_query = try client.fetchQuery(base_uri, "docs",
         \\{"graph_searches":{"traverse_metric_order":{"type":"traverse","index_name":"graph_idx","start_nodes":{"keys":["doc-a"]},"params":{"edge_types":["cites"],"max_depth":2,"max_results":10},"metrics":["pagerank"],"order_by":[{"metric":"pagerank","direction":"desc","nulls":"last"}],"metric_freshness":"fresh"}}}
@@ -6025,8 +6049,8 @@ test "public api e2e supports graph queries" {
     try std.testing.expectEqual(@as(usize, 2), ordered_nodes.len);
     const first_ordered_metrics = ordered_nodes[0].metrics orelse return error.TestUnexpectedResult;
     const second_ordered_metrics = ordered_nodes[1].metrics orelse return error.TestUnexpectedResult;
-    const first_ordered_score = (first_ordered_metrics.map.get("pagerank") orelse return error.TestUnexpectedResult).* orelse return error.TestUnexpectedResult;
-    const second_ordered_score = (second_ordered_metrics.map.get("pagerank") orelse return error.TestUnexpectedResult).* orelse return error.TestUnexpectedResult;
+    const first_ordered_score = try dynamicJsonNumber(first_ordered_metrics.object.get("pagerank") orelse return error.TestUnexpectedResult);
+    const second_ordered_score = try dynamicJsonNumber(second_ordered_metrics.object.get("pagerank") orelse return error.TestUnexpectedResult);
     try std.testing.expect(first_ordered_score >= second_ordered_score);
 
     const metric_filter_threshold = (pagerank_result.scores[0].score + pagerank_result.scores[1].score) / 2.0;
@@ -6042,7 +6066,7 @@ test "public api e2e supports graph queries" {
     const filtered_nodes = filtered_traverse.nodes orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 1), filtered_nodes.len);
     const filtered_metrics = filtered_nodes[0].metrics orelse return error.TestUnexpectedResult;
-    const filtered_score = (filtered_metrics.map.get("pagerank") orelse return error.TestUnexpectedResult).* orelse return error.TestUnexpectedResult;
+    const filtered_score = try dynamicJsonNumber(filtered_metrics.object.get("pagerank") orelse return error.TestUnexpectedResult);
     try std.testing.expect(filtered_score >= metric_filter_threshold);
 
     const stale_batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator,
@@ -6118,18 +6142,22 @@ test "public api e2e supports graph queries" {
         stale_rerank_details.published_generation,
     );
     const stale_rerank_profile = stale_rerank_responses[0].profile orelse return error.TestUnexpectedResult;
-    const stale_rerank_metric_profiles = stale_rerank_profile.graph_metrics orelse return error.TestUnexpectedResult;
+    const stale_rerank_metric_profiles = (stale_rerank_profile.object.get("graph_metrics") orelse return error.TestUnexpectedResult).array.items;
     var found_stale_rerank_profile = false;
-    for (stale_rerank_metric_profiles) |profile| {
-        if (!std.mem.eql(u8, profile.source, "graph_metric_rerank")) continue;
+    for (stale_rerank_metric_profiles) |profile_value| {
+        const profile = profile_value.object;
+        if (!std.mem.eql(u8, try dynamicJsonString(profile.get("source") orelse return error.TestUnexpectedResult), "graph_metric_rerank")) continue;
+        const status = (profile.get("status") orelse return error.TestUnexpectedResult).object;
+        const published_generation = try dynamicJsonUnsigned(status.get("published_generation") orelse return error.TestUnexpectedResult);
+        const edge_generation = try dynamicJsonUnsigned(status.get("edge_generation") orelse return error.TestUnexpectedResult);
         found_stale_rerank_profile = true;
-        try std.testing.expectEqualStrings("graph_metric_rerank", profile.query_name);
-        try std.testing.expectEqualStrings("graph_idx", profile.index_name);
-        try std.testing.expectEqualStrings("pagerank", profile.metric_name);
-        try std.testing.expectEqualStrings("published", profile.freshness);
-        try std.testing.expectEqualStrings("stale", profile.status.state);
-        try std.testing.expectEqual(pagerank_result.status.published_generation, profile.status.published_generation);
-        try std.testing.expect(profile.status.edge_generation > profile.status.published_generation);
+        try std.testing.expectEqualStrings("graph_metric_rerank", try dynamicJsonString(profile.get("query_name") orelse return error.TestUnexpectedResult));
+        try std.testing.expectEqualStrings("graph_idx", try dynamicJsonString(profile.get("index_name") orelse return error.TestUnexpectedResult));
+        try std.testing.expectEqualStrings("pagerank", try dynamicJsonString(profile.get("metric_name") orelse return error.TestUnexpectedResult));
+        try std.testing.expectEqualStrings("published", try dynamicJsonString(profile.get("freshness") orelse return error.TestUnexpectedResult));
+        try std.testing.expectEqualStrings("stale", try dynamicJsonString(status.get("state") orelse return error.TestUnexpectedResult));
+        try std.testing.expectEqual(pagerank_result.status.published_generation, @as(i64, @intCast(published_generation)));
+        try std.testing.expect(edge_generation > published_generation);
     }
     try std.testing.expect(found_stale_rerank_profile);
 
@@ -6159,7 +6187,7 @@ test "public api e2e supports graph queries" {
         );
         defer active_status.deinit(std.testing.allocator);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, active_status.state);
-        try std.testing.expectEqual(pagerank_result.status.published_generation, active_status.published_generation);
+        try std.testing.expectEqual(@as(u64, @intCast(pagerank_result.status.published_generation)), active_status.published_generation);
         try std.testing.expectEqual(@as(u64, @intCast(stale_pagerank_result.status.edge_generation)), active_status.building_generation);
     }
 
@@ -6219,13 +6247,15 @@ test "public api e2e supports graph queries" {
     const active_rerank_details = active_rerank_score_details.graph_metric_rerank orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(i64, @intCast(pagerank_result.status.published_generation)), active_rerank_details.published_generation);
     const active_rerank_profile = active_rerank_responses[0].profile orelse return error.TestUnexpectedResult;
-    const active_rerank_metric_profiles = active_rerank_profile.graph_metrics orelse return error.TestUnexpectedResult;
+    const active_rerank_metric_profiles = (active_rerank_profile.object.get("graph_metrics") orelse return error.TestUnexpectedResult).array.items;
     var found_active_rerank_profile = false;
-    for (active_rerank_metric_profiles) |profile| {
-        if (!std.mem.eql(u8, profile.source, "graph_metric_rerank")) continue;
+    for (active_rerank_metric_profiles) |profile_value| {
+        const profile = profile_value.object;
+        if (!std.mem.eql(u8, try dynamicJsonString(profile.get("source") orelse return error.TestUnexpectedResult), "graph_metric_rerank")) continue;
+        const status = (profile.get("status") orelse return error.TestUnexpectedResult).object;
         found_active_rerank_profile = true;
-        try std.testing.expectEqualStrings("building", profile.status.state);
-        try std.testing.expectEqual(pagerank_result.status.published_generation, profile.status.published_generation);
+        try std.testing.expectEqualStrings("building", try dynamicJsonString(status.get("state") orelse return error.TestUnexpectedResult));
+        try std.testing.expectEqual(pagerank_result.status.published_generation, @as(i64, @intCast(try dynamicJsonUnsigned(status.get("published_generation") orelse return error.TestUnexpectedResult))));
     }
     try std.testing.expect(found_active_rerank_profile);
 
@@ -6249,7 +6279,7 @@ test "public api e2e supports graph queries" {
         );
         defer failed_status.deinit(std.testing.allocator);
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, failed_status.state);
-        try std.testing.expectEqual(pagerank_result.status.published_generation, failed_status.published_generation);
+        try std.testing.expectEqual(@as(u64, @intCast(pagerank_result.status.published_generation)), failed_status.published_generation);
     }
 
     var failed_metric_query = try client.fetchQuery(base_uri, "docs",
@@ -6303,13 +6333,15 @@ test "public api e2e supports graph queries" {
     defer parsed_failed_rerank.deinit();
     const failed_rerank_responses = parsed_failed_rerank.value.responses orelse return error.TestUnexpectedResult;
     const failed_rerank_profile = failed_rerank_responses[0].profile orelse return error.TestUnexpectedResult;
-    const failed_rerank_metric_profiles = failed_rerank_profile.graph_metrics orelse return error.TestUnexpectedResult;
+    const failed_rerank_metric_profiles = (failed_rerank_profile.object.get("graph_metrics") orelse return error.TestUnexpectedResult).array.items;
     var found_failed_rerank_profile = false;
-    for (failed_rerank_metric_profiles) |profile| {
-        if (!std.mem.eql(u8, profile.source, "graph_metric_rerank")) continue;
+    for (failed_rerank_metric_profiles) |profile_value| {
+        const profile = profile_value.object;
+        if (!std.mem.eql(u8, try dynamicJsonString(profile.get("source") orelse return error.TestUnexpectedResult), "graph_metric_rerank")) continue;
+        const status = (profile.get("status") orelse return error.TestUnexpectedResult).object;
         found_failed_rerank_profile = true;
-        try std.testing.expectEqualStrings("failed", profile.status.state);
-        try std.testing.expectEqual(pagerank_result.status.published_generation, profile.status.published_generation);
+        try std.testing.expectEqualStrings("failed", try dynamicJsonString(status.get("state") orelse return error.TestUnexpectedResult));
+        try std.testing.expectEqual(pagerank_result.status.published_generation, @as(i64, @intCast(try dynamicJsonUnsigned(status.get("published_generation") orelse return error.TestUnexpectedResult))));
     }
     try std.testing.expect(found_failed_rerank_profile);
 

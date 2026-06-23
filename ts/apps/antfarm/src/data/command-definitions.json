@@ -22,6 +22,17 @@
     "semantic": true
   },
   {
+    "id": "nav-sql-workbench",
+    "type": "navigation",
+    "group": "navigation",
+    "label": "SQL Workbench",
+    "description": "Run SQL statements against Antfly data",
+    "href": "/sql",
+    "icon": "Database",
+    "product": "antfly",
+    "semantic": false
+  },
+  {
     "id": "nav-search",
     "type": "navigation",
     "group": "navigation",
