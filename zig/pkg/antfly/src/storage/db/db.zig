@@ -24,6 +24,7 @@ const fs_paths = @import("../../common/fs_paths.zig");
 const common_secrets = @import("../../common/secrets.zig");
 const backend_types = @import("../backend_types.zig");
 const docstore_mod = @import("../docstore.zig");
+const backend_erased_mod = @import("../backend_erased.zig");
 const db_config = @import("config.zig");
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
 const db_core = @import("core.zig");
@@ -83,6 +84,7 @@ const mem_backend_mod = @import("../mem_backend.zig");
 const lsm_backend_mod = @import("../lsm_backend/mod.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const schema_mod = @import("../schema.zig");
+const public_table_schema = @import("../../schema/mod.zig");
 const ttl_mod = @import("../ttl.zig");
 const transactions_mod = @import("../transactions.zig");
 const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
@@ -124,6 +126,7 @@ const zig_lmdb = if (builtin.is_test) @import("lmdb_engine") else struct {
 };
 const platform_clock = @import("../../platform/clock.zig");
 const platform_time = @import("../../platform/time.zig");
+const public_schema_json_key = "\x00\x00__metadata__:schema_json";
 
 fn getenv(name: [*:0]const u8) ?[]const u8 {
     return platform.env.getenv(name);
@@ -238,6 +241,7 @@ pub const OpenOptions = struct {
     map_size: usize = 256 * 1024 * 1024,
     no_sync: bool = false,
     primary_backend: PrimaryBackend = .{ .lsm = db_config.primary_lsm_options_default },
+    primary_runtime_store: ?*backend_erased_mod.Store = null,
     storage: ?lsm_backend_mod.Storage = null,
     lsm_cache: ?*lsm_backend_mod.Cache = null,
     hbc_cache: ?*hbc_mod.Cache = null,
@@ -246,6 +250,7 @@ pub const OpenOptions = struct {
     change_journal_backend: ?change_journal_mod.StorageBackend = null,
     change_journal_storage: ?lsm_backend_mod.Storage = null,
     index_backends: db_config.IndexBackendOptions = .{},
+    index_base_path: ?[]const u8 = null,
     index_open_parallelism: ?usize = null,
     identity_namespace: ?doc_identity.Namespace = null,
     prefer_existing_identity_namespace: bool = false,
@@ -255,6 +260,7 @@ pub const OpenOptions = struct {
     remote_content: ?*const scraping.RemoteContentConfig = null,
     start_index_workers: bool = true,
     start_optional_runtimes: bool = true,
+    external_derived_checkpoints: bool = true,
     enrichment: ?enrichment_runtime_mod.Config = null,
     ttl_cleanup: ttl_runtime_mod.Config = .{},
     transaction_recovery: transaction_runtime_mod.Config = .{},
@@ -2511,6 +2517,7 @@ const PrimaryStoreOpenPlan = union(enum) {
     lmdb: struct {
         map_size: usize,
         no_sync: bool,
+        read_only: bool,
     },
     mem: mem_backend_mod.Options,
     lsm_memory: lsm_backend_mod.Options,
@@ -2529,6 +2536,7 @@ fn primaryStoreOpenPlan(opts: db_config.CoreOpenOptions) PrimaryStoreOpenPlan {
             .lmdb = .{
                 .map_size = opts.map_size,
                 .no_sync = opts.no_sync,
+                .read_only = opts.read_only,
             },
         },
         .mem => |mem_opts| .{ .mem = mem_opts },
@@ -2589,6 +2597,12 @@ fn installIndexLsmReadRuntime(index_backends: anytype, runtime: *background_runt
 }
 
 fn openPrimaryStore(alloc: Allocator, path: []const u8, opts: db_config.CoreOpenOptions) !db_core.OpenedPrimaryStore {
+    if (opts.primary_runtime_store) |runtime_store| {
+        return .{
+            .store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store),
+        };
+    }
+
     const zpath = try alloc.dupeZ(u8, path);
     defer alloc.free(zpath);
 
@@ -2597,6 +2611,7 @@ fn openPrimaryStore(alloc: Allocator, path: []const u8, opts: db_config.CoreOpen
             .store = try docstore_mod.DocStore.open(alloc, zpath, .{
                 .map_size = lmdb_opts.map_size,
                 .no_sync = lmdb_opts.no_sync,
+                .read_only = lmdb_opts.read_only,
             }),
         },
         .mem => |mem_opts| mem_blk: {
@@ -2865,7 +2880,9 @@ pub const DB = struct {
             const core_opts: db_config.CoreOpenOptions = .{
                 .map_size = opts.map_size,
                 .no_sync = opts.no_sync,
+                .read_only = openModeRequiresReadOnlyBackends(opts.open_mode),
                 .primary_backend = effective_primary_backend,
+                .primary_runtime_store = opts.primary_runtime_store,
                 .storage = opts.storage,
                 .lsm_cache = opts.lsm_cache,
                 .hbc_cache = opts.hbc_cache,
@@ -2889,6 +2906,7 @@ pub const DB = struct {
             const core = try db_core.openCoreResourcesFromPrimaryStore(
                 alloc,
                 path,
+                opts.index_base_path orelse path,
                 opts.map_size,
                 opts.no_sync,
                 resolved_config.primary_backend_kind,
@@ -2900,6 +2918,7 @@ pub const DB = struct {
                 opts.identity_namespace,
                 false,
                 if (opts.prefer_existing_identity_namespace) .use_existing else .reject,
+                opts.external_derived_checkpoints,
             );
             profile.core_resources_ns = elapsedSince(core_resources_started_ns);
             const async_context = try runtime_alloc.create(AsyncContext);
@@ -6160,12 +6179,19 @@ pub const DB = struct {
         try self.core.syncStore(full);
     }
 
+    pub fn syncIndexes(self: *DB, force: bool) !void {
+        lockApply(self);
+        defer self.core.unlockApply();
+        try self.core.index_manager.syncAll(force);
+    }
+
     fn restoreSnapshotStoreTo(alloc: Allocator, snapshot_root: []const u8, path: []const u8, opts: OpenOptions, restore_identity: ?RestoreIdentity) !void {
         if (restore_identity) |identity| try beginRestoreImport(alloc, path, snapshot_root, identity);
         var opened_primary = try openPrimaryStore(alloc, path, .{
             .map_size = opts.map_size,
             .no_sync = opts.no_sync,
             .primary_backend = opts.primary_backend,
+            .primary_runtime_store = opts.primary_runtime_store,
             .storage = opts.storage,
             .index_backends = opts.index_backends,
         });
@@ -6461,6 +6487,23 @@ pub const DB = struct {
         try self.preflightHAMetadataSyncCommit();
         try self.core.setSchema(table_schema);
         try self.mirrorHASchemaMetadataCommit(table_schema);
+    }
+
+    pub fn setSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
+        var parsed_schema = try public_table_schema.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+
+        try self.setSchema(runtime_schema);
+        try self.core.putStoreBatch(&.{.{
+            .key = public_schema_json_key,
+            .value = schema_json,
+        }}, &.{});
+    }
+
+    pub fn getSchemaJson(self: *DB, alloc: Allocator) !?[]u8 {
+        return try self.core.getStoreValue(alloc, public_schema_json_key);
     }
 
     pub fn beginTransaction(self: *DB, timestamp_ns: u64) !transactions_mod.TxnId {
@@ -8266,6 +8309,7 @@ pub const DB = struct {
     fn drainReplayStagesUntilStable(self: *DB) !void {
         var rounds: usize = 0;
         while (rounds < run_until_idle_max_replay_rounds) : (rounds += 1) {
+            const starting_sequence = self.core.nextDerivedSequence();
             try self.runMaintenanceUntil(self.currentMaintenanceTargetSequence(), .{});
             const drained_sequence = self.core.nextDerivedSequence();
 
@@ -8282,7 +8326,7 @@ pub const DB = struct {
                 }
             }
 
-            if (self.core.nextDerivedSequence() <= drained_sequence) return;
+            if (self.core.nextDerivedSequence() <= starting_sequence) return;
         }
         return error.RunUntilIdleDidNotConverge;
     }
@@ -8358,6 +8402,52 @@ pub const DB = struct {
         _ = try self.runLsmMaintenanceUntilIdle();
     }
 
+    pub fn rebuildDenseIndexesForTargetCoverage(self: *DB, alloc: Allocator) !usize {
+        var names = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (names.items) |name| alloc.free(name);
+            names.deinit(alloc);
+        }
+
+        for (self.core.index_manager.dense_indexes.items) |*entry| {
+            try names.append(alloc, try alloc.dupe(u8, entry.config.name));
+        }
+
+        var rebuilt: usize = 0;
+        for (names.items) |name| {
+            rebuilt += try rebuildDenseIndexForTargetCoverageContext(self.async_context, name, 2048);
+        }
+        return rebuilt;
+    }
+
+    pub fn rebuildSparseIndexesForTargetCoverage(self: *DB, alloc: Allocator) !usize {
+        var names = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (names.items) |name| alloc.free(name);
+            names.deinit(alloc);
+        }
+
+        for (self.core.index_manager.sparse_indexes.items) |*entry| {
+            try names.append(alloc, try alloc.dupe(u8, entry.config.name));
+        }
+
+        var rebuilt: usize = 0;
+        for (names.items) |name| {
+            rebuilt += try rebuildSparseIndexFromStoredEmbeddingArtifactsContext(self.async_context, name, 2048);
+        }
+        return rebuilt;
+    }
+
+    pub fn rebuildGraphIndexesForTargetCoverage(self: *DB, alloc: Allocator) !void {
+        try applySplitGraphArtifactsInRange(
+            alloc,
+            "",
+            "",
+            self.core.store,
+            self.core.index_manager,
+        );
+    }
+
     pub fn runDensePostingMaintenanceForIdle(self: *DB) !usize {
         lockApply(self);
         defer self.core.unlockApply();
@@ -8398,6 +8488,14 @@ pub const DB = struct {
             if (write.parent_doc_key) |parent_doc_key| alloc.free(@constCast(parent_doc_key));
             if (write.artifact_key) |artifact_key| alloc.free(artifact_key);
             if (write.vector.len > 0) alloc.free(write.vector);
+        }
+        writes.clearRetainingCapacity();
+    }
+
+    fn freeSparseArtifactRebuildWrites(alloc: Allocator, writes: *std.ArrayListUnmanaged(mapper.SparseEmbeddingWrite)) void {
+        for (writes.items) |write| {
+            alloc.free(write.doc_key);
+            if (write.artifact_key) |artifact_key| alloc.free(artifact_key);
         }
         writes.clearRetainingCapacity();
     }
@@ -13544,6 +13642,7 @@ fn encodeThinReplayRecordPayload(
 
     for (changed_artifact_keys) |key| {
         try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, key);
+        if (internal_keys.isChunkArtifactRecordKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .full_text);
         if (internal_keys.isGraphEdgeArtifactKey(key) or internal_keys.isAssetArtifactKey(key) or internal_keys.isChunkArtifactRecordKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
         if (internal_keys.isAssetArtifactKey(key)) {
             try appendUniqueReplayRecordHint(alloc, &target_hints, .resolution);
@@ -13573,6 +13672,7 @@ fn encodeThinReplayRecordPayload(
         try appendUniqueReplayRecordKeyWithSet(alloc, &deleted_doc_keys, &deleted_doc_key_set, key);
         if (internal_keys.isAssetArtifactKey(key) or internal_keys.isChunkArtifactRecordKey(key) or internal_keys.isGraphEdgeArtifactKey(key)) {
             try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, key);
+            if (internal_keys.isChunkArtifactRecordKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .full_text);
             try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
             if (internal_keys.isAssetArtifactKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .resolution);
         }
@@ -16871,7 +16971,10 @@ fn prepareGeneratedEnrichments(
         sparse_embeddings = .empty;
     }
     var planned = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef).empty;
-    errdefer enrichment_types.deinitGeneratedRefs(self.alloc, planned.items);
+    errdefer {
+        for (planned.items) |request| enrichment_types.freeGeneratedRef(self.alloc, request);
+        planned.deinit(self.alloc);
+    }
 
     for (req.writes, 0..) |write, i| {
         const cleaned = extracted[i].cleaned_value orelse continue;
@@ -18331,7 +18434,10 @@ fn appendGeneratedEnrichments(
     extracted: []const mapper.ExtractedWrite,
 ) !void {
     var planned = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef).empty;
-    errdefer enrichment_types.deinitGeneratedRefs(self.alloc, planned.items);
+    errdefer {
+        for (planned.items) |request| enrichment_types.freeGeneratedRef(self.alloc, request);
+        planned.deinit(self.alloc);
+    }
 
     for (req.writes, 0..) |write, i| {
         const cleaned = extracted[i].cleaned_value orelse continue;
@@ -23835,7 +23941,10 @@ fn rebuildDenseIndexFromStoredEmbeddingArtifactsContext(
             const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
             if (!internal_keys.isInternalUserKey(key)) return .@"continue";
 
-            var identity = (try artifact_ids.decodeEmbeddingArtifactIdentityAlloc(state.ctx.alloc, key)) orelse return .@"continue";
+            var identity = (artifact_ids.decodeEmbeddingArtifactIdentityAlloc(state.ctx.alloc, key) catch |err| switch (err) {
+                error.InvalidInternalUserKey => return .@"continue",
+                else => return err,
+            }) orelse return .@"continue";
             defer identity.deinit(state.ctx.alloc);
             if (!std.mem.eql(u8, identity.embedding_name, state.expected_name)) return .@"continue";
 
@@ -23886,6 +23995,88 @@ fn rebuildDenseIndexForTargetCoverageContext(
         return try rebuildDenseIndexFromPrimaryVectorsContext(ctx, index_name, rebuild_chunk_size);
     }
     return try rebuildDenseIndexFromStoredEmbeddingArtifactsContext(ctx, index_name, rebuild_chunk_size);
+}
+
+fn flushSparseArtifactRebuildChunkContext(
+    ctx: *AsyncContext,
+    index_name: []const u8,
+    writes: *std.ArrayListUnmanaged(mapper.SparseEmbeddingWrite),
+) !void {
+    defer DB.freeSparseArtifactRebuildWrites(ctx.alloc, writes);
+    if (writes.items.len == 0) return;
+    try ctx.index_manager.applySparseEmbeddingWritesByNameWithOptions(
+        ctx.store,
+        index_name,
+        writes.items,
+        .{ .mode = .bulk_ingest },
+    );
+}
+
+fn rebuildSparseIndexFromStoredEmbeddingArtifactsContext(
+    ctx: *AsyncContext,
+    index_name: []const u8,
+    rebuild_chunk_size: usize,
+) !usize {
+    const expected_name = ctx.index_manager.sparseEmbeddingName(index_name) orelse index_name;
+
+    const lower = try documentRangeLowerAlloc(ctx.alloc, "");
+    defer ctx.alloc.free(lower);
+
+    const ScanState = struct {
+        ctx: *AsyncContext,
+        index_name: []const u8,
+        expected_name: []const u8,
+        rebuild_chunk_size: usize,
+        writes: std.ArrayListUnmanaged(mapper.SparseEmbeddingWrite) = .empty,
+        rebuilt: usize = 0,
+
+        fn deinit(state: *@This()) void {
+            DB.freeSparseArtifactRebuildWrites(state.ctx.alloc, &state.writes);
+            state.writes.deinit(state.ctx.alloc);
+        }
+
+        fn flush(state: *@This()) !void {
+            try flushSparseArtifactRebuildChunkContext(state.ctx, state.index_name, &state.writes);
+        }
+
+        fn scanEntry(scan_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
+            if (!internal_keys.isInternalUserKey(key)) return .@"continue";
+
+            const identity = (try internal_keys.parseEmbeddingArtifactKeyView(key)) orelse return .@"continue";
+            if (!std.mem.eql(u8, identity.artifact_name, state.expected_name)) return .@"continue";
+
+            var sparse = enrichment_artifact_codec.decodeSparseEmbeddingAlloc(state.ctx.alloc, value) catch |err| {
+                if (DB.isRecoverableEmbeddingArtifactError(err)) return .@"continue";
+                return err;
+            };
+            sparse.deinit(state.ctx.alloc);
+
+            try state.writes.append(state.ctx.alloc, .{
+                .index_name = @constCast(state.index_name),
+                .doc_key = try state.ctx.alloc.dupe(u8, identity.doc_key),
+                .artifact_key = try state.ctx.alloc.dupe(u8, key),
+                .indices = &.{},
+                .values = &.{},
+            });
+            state.rebuilt += 1;
+
+            if (state.writes.items.len >= state.rebuild_chunk_size) try state.flush();
+            return .@"continue";
+        }
+    };
+
+    var state = ScanState{
+        .ctx = ctx,
+        .index_name = index_name,
+        .expected_name = expected_name,
+        .rebuild_chunk_size = rebuild_chunk_size,
+    };
+    defer state.deinit();
+
+    try ctx.store.scanWithContext(lower, "", .{}, &state, ScanState.scanEntry);
+    if (state.writes.items.len > 0) try state.flush();
+    return state.rebuilt;
 }
 
 fn persistAppliedSequenceAsync(ctx_ptr: *anyopaque, index_name: []const u8, sequence: u64, force: bool) !bool {
@@ -39158,6 +39349,66 @@ test "db query_readonly lsm primary opens physical backend read-only" {
     }));
 }
 
+test "db query_readonly lmdb primary does not create missing database" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var readonly = DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .lmdb,
+        .open_mode = .query_readonly,
+        .ttl_cleanup = .{ .enabled = false },
+    }) catch |err| switch (err) {
+        error.UnsupportedPlatform => return,
+        error.FileNotFound, error.NotFound, error.LmdbUnexpected => return,
+        else => return err,
+    };
+    readonly.close();
+    return error.ExpectedReadonlyLmdbMissingOpenFailure;
+}
+
+test "db query_readonly lmdb primary rejects writes after readonly open" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .lmdb,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        }) catch |err| switch (err) {
+            error.UnsupportedPlatform => return,
+            else => return err,
+        };
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+            .sync_level = .write,
+        });
+    }
+
+    var readonly = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .lmdb,
+        .open_mode = .query_readonly,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer readonly.close();
+
+    var result = (try readonly.lookup(alloc, "doc:a", .{})) orelse return error.MissingReadonlyLmdbDocument;
+    defer result.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, result.json, "\"alpha\"") != null);
+    try std.testing.expectError(error.ReadOnly, readonly.batch(.{
+        .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }},
+        .sync_level = .write,
+    }));
+}
+
 test "db writer_no_replay open defers pending derived replay until runUntilIdle" {
     const alloc = std.testing.allocator;
 
@@ -40074,11 +40325,13 @@ test "db encodeThinReplayRecordPayload treats embedding-only writes as artifact 
     try std.testing.expect(journalRecordHasHint(decoded.record, .dense_vector));
 }
 
-test "db thin replay marks deleted asset and graph artifacts for graph apply" {
+test "db thin replay marks artifact-derived target hints" {
     const alloc = std.testing.allocator;
 
     const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
     defer alloc.free(asset_key);
+    const chunk_key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    defer alloc.free(chunk_key);
     const graph_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
     defer alloc.free(graph_key);
 
@@ -40086,7 +40339,7 @@ test "db thin replay marks deleted asset and graph artifacts for graph apply" {
         alloc,
         .{},
         &.{},
-        &.{ asset_key, graph_key },
+        &.{ asset_key, chunk_key, graph_key },
         &.{},
         &.{},
         44,
@@ -40098,9 +40351,11 @@ test "db thin replay marks deleted asset and graph artifacts for graph apply" {
     defer decoded.deinit();
 
     try std.testing.expectEqual(@as(u64, 44), decoded.record.sequence);
-    try std.testing.expectEqual(@as(usize, 2), decoded.record.changed_artifact_keys.len);
+    try std.testing.expectEqual(@as(usize, 3), decoded.record.changed_artifact_keys.len);
     try std.testing.expectEqualStrings(asset_key, decoded.record.changed_artifact_keys[0]);
-    try std.testing.expectEqualStrings(graph_key, decoded.record.changed_artifact_keys[1]);
+    try std.testing.expectEqualStrings(chunk_key, decoded.record.changed_artifact_keys[1]);
+    try std.testing.expectEqualStrings(graph_key, decoded.record.changed_artifact_keys[2]);
+    try std.testing.expect(journalRecordHasHint(decoded.record, .full_text));
     try std.testing.expect(journalRecordHasHint(decoded.record, .graph));
 }
 

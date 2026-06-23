@@ -5043,7 +5043,13 @@ pub const ApiHttpServer = struct {
         return json_helpers.jsonValuesEqual(lhs, rhs);
     }
 
-    fn backupOwnedTable(self: *ApiHttpServer, table_name: []const u8, backup_location: *backups_api.BackupLocation, backup_id: []const u8) !void {
+    fn backupOwnedTable(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        backup_location: *backups_api.BackupLocation,
+        backup_id: []const u8,
+        format: backups_api.BackupFormat,
+    ) !void {
         const table = (try self.loadOwnedTableRecord(table_name)) orelse return error.TableNotFound;
         defer metadata_table_manager.freeTable(self.alloc, table);
         if (table.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
@@ -5061,6 +5067,7 @@ pub const ApiHttpServer = struct {
         const shards = (try table_writes_source.backupTable(self.alloc, table_name, .{
             .backup_root = local_backup_root,
             .backup_id = backup_id,
+            .format = format,
         })) orelse return error.TableNotFound;
         defer freeBackupShards(self.alloc, shards);
 
@@ -5071,7 +5078,16 @@ pub const ApiHttpServer = struct {
             for (shards) |shard| {
                 const snapshot_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ local_backup_root, shard.snapshot_path });
                 defer self.alloc.free(snapshot_root);
-                try backups_api.copyDirectoryToLocation(self.alloc, backup_location, backup_id, shard.group_id, snapshot_root);
+                if (std.mem.endsWith(u8, shard.snapshot_path, ".afb"))
+                    try backups_api.copyFileToLocation(
+                        self.alloc,
+                        backup_location,
+                        shard.snapshot_path,
+                        snapshot_root,
+                        "application/vnd.antfly.backup",
+                    )
+                else
+                    try backups_api.copyDirectoryToLocation(self.alloc, backup_location, backup_id, shard.group_id, snapshot_root);
             }
         }
 
@@ -6072,10 +6088,11 @@ pub const ApiHttpServer = struct {
         _: std.mem.Allocator,
         table_name: []const u8,
         backup_id: []const u8,
+        format: backups_api.BackupFormat,
         location: *backups_api.BackupLocation,
     ) public_table_http.TableApi.ExecuteBackupError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        self.backupOwnedTable(table_name, location, backup_id) catch |err| switch (err) {
+        self.backupOwnedTable(table_name, location, backup_id, format) catch |err| switch (err) {
             error.TableNotFound => return error.NotFound,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.UnsupportedBackupMigrationState => return error.UnsupportedBackupMigrationState,
@@ -6477,7 +6494,7 @@ pub const ApiHttpServer = struct {
         for (table_names, 0..) |table_name, i| {
             statuses[i] = .{ .name = table_name, .status = "failed", .@"error" = null };
             const table_backup_id = backups_api.clusterTableBackupId(alloc, req.backup_id, table_name) catch return error.InternalFailure;
-            self.backupOwnedTable(table_name, location, table_backup_id) catch |err| {
+            self.backupOwnedTable(table_name, location, table_backup_id, .native) catch |err| {
                 statuses[i].@"error" = switch (err) {
                     error.TableNotFound => "not found",
                     error.UnsupportedOperation => "method not allowed",

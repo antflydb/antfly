@@ -77,6 +77,12 @@ def archive_name(version: str, platform: Platform) -> str:
     return f"antfly_{version}_{platform.release_os}_{platform.release_arch}.tar.gz"
 
 
+def lite_library_name(platform: Platform) -> str:
+    if platform.release_os == "Darwin":
+        return "libantfly.dylib"
+    return "libantfly.so"
+
+
 def is_packaging_noise(path: Path) -> bool:
     return any(part == "__MACOSX" or part.startswith("._") for part in path.parts)
 
@@ -103,6 +109,12 @@ def extract_archive(archive_dir: Path, version: str, platform: Platform, dest: P
     binary = dest / "antfly"
     if not binary.exists():
         raise SystemExit(f"release archive does not contain antfly binary: {archive}")
+    header = dest / "include" / "antfly.h"
+    if not header.exists():
+        raise SystemExit(f"release archive does not contain antfly.h: {archive}")
+    lite_lib = dest / "lib" / lite_library_name(platform)
+    if not lite_lib.exists():
+        raise SystemExit(f"release archive does not contain {lite_lib.name}: {archive}")
     binary.chmod(binary.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
@@ -143,9 +155,13 @@ def update_pyproject_version(path: Path, version: str) -> None:
 def populate_npm_package(repo_root: Path, platform: Platform, extracted: Path) -> None:
     package_dir = repo_root / "ts" / "packages" / platform.key.replace("darwin", "cli-darwin").replace("linux", "cli-linux")
     clean_path(package_dir / "bin")
+    clean_path(package_dir / "include")
+    clean_path(package_dir / "lib")
     clean_path(package_dir / "share")
     (package_dir / "bin").mkdir(parents=True)
     shutil.copy2(extracted / "antfly", package_dir / "bin" / "antfly")
+    shutil.copytree(extracted / "include", package_dir / "include", ignore=ignore_packaging_noise)
+    shutil.copytree(extracted / "lib", package_dir / "lib", ignore=ignore_packaging_noise)
     shutil.copytree(extracted / "share", package_dir / "share", ignore=ignore_packaging_noise)
 
 
@@ -202,10 +218,11 @@ def package_python_wheel(
         for path in sorted(source_dir.glob("*.py")):
             write_file(zf, f"{package_name}/{path.name}", path)
         write_file(zf, f"{package_name}/bin/antfly", extracted / "antfly", 0o755)
-        for path in sorted((extracted / "share").rglob("*")):
-            if path.is_file() and not is_packaging_noise(path.relative_to(extracted)):
-                rel = path.relative_to(extracted)
-                write_file(zf, f"{package_name}/{rel.as_posix()}", path)
+        for dirname in ("include", "lib", "share"):
+            for path in sorted((extracted / dirname).rglob("*")):
+                if path.is_file() and not is_packaging_noise(path.relative_to(extracted)):
+                    rel = path.relative_to(extracted)
+                    write_file(zf, f"{package_name}/{rel.as_posix()}", path)
         write_bytes(zf, f"{dist_info}/METADATA", metadata.as_bytes())
         write_bytes(zf, f"{dist_info}/WHEEL", wheel.encode())
         write_bytes(zf, f"{dist_info}/entry_points.txt", entry_points.encode())

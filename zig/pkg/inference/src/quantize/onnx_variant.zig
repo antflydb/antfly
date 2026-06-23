@@ -24,7 +24,6 @@ const constants = @import("constants.zig");
 const options = @import("options.zig");
 const variants_manifest = @import("variants_manifest.zig");
 
-const print = std.debug.print;
 const Allocator = std.mem.Allocator;
 
 pub const default_min_elements: usize = constants.default_min_elements;
@@ -74,8 +73,8 @@ pub fn run(allocator: Allocator, io: std.Io, opts: options.Options) !void {
     try writeManifest(allocator, io, opts, output_dir, stats);
     try variants_manifest.writeClipclapVariantsManifest(allocator, io, output_dir);
 
-    print(
-        "quantized model format={s} source={s} output={s} onnx_files={d} copied_files={d} skipped_external_data={d}\n",
+    std.log.info(
+        "quantized model format={s} source={s} output={s} onnx_files={d} copied_files={d} skipped_external_data={d}",
         .{
             opts.format,
             opts.model_dir,

@@ -355,6 +355,7 @@ pub const DocStoreOptions = struct {
     map_size: usize = 256 * 1024 * 1024,
     no_sync: bool = false,
     no_meta_sync: bool = false,
+    read_only: bool = false,
 };
 
 pub const DocStore = struct {
@@ -698,26 +699,34 @@ pub const DocStore = struct {
         if (!supports_lmdb) return error.UnsupportedPlatform;
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
-        try fs_paths.createDirPathPortable(io_impl.io(), std.mem.span(path));
+        if (!opts.read_only) {
+            try fs_paths.createDirPathPortable(io_impl.io(), std.mem.span(path));
+        }
 
         var env = try lmdb.Environment.open(path, .{
             .map_size = opts.map_size,
             .no_sync = opts.no_sync,
             .no_meta_sync = opts.no_meta_sync,
+            .read_only = opts.read_only,
             .no_tls = true,
         });
         errdefer env.close();
 
-        var txn = try env.begin(.{});
+        var txn = try env.begin(.{ .read_only = opts.read_only });
         errdefer txn.abort();
         const resolved = openExistingLmdbUserDbTxn(alloc, &txn) catch |err| switch (err) {
             lmdb.Error.NotFound => blk: {
+                if (opts.read_only) return err;
                 const dbi = try openLmdbUserDbTxn(alloc, &txn, true);
                 break :blk ResolvedLmdbUserDb{ .dbi = dbi, .kind = .named };
             },
             else => return err,
         };
-        try txn.commit();
+        if (opts.read_only) {
+            txn.abort();
+        } else {
+            try txn.commit();
+        }
 
         return .{
             .alloc = alloc,
