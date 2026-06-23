@@ -36,6 +36,8 @@ SERVER_TOKENS="${ANTFLY_INFERENCE_GEMMA4_BENCH_SERVER_TOKENS:-4 64}"
 SERVER_PORT="${ANTFLY_INFERENCE_GEMMA4_BENCH_SERVER_PORT:-$((18090 + RANDOM % 1000))}"
 MIN_DECODE_TOK_S="${ANTFLY_INFERENCE_GEMMA4_MIN_DECODE_TOK_S:-0}"
 MIN_HOT_DECODE_TOK_S="${ANTFLY_INFERENCE_GEMMA4_MIN_HOT_DECODE_TOK_S:-0}"
+MIN_Q4_PAIR_ACT_REDUCE_OUT_F16="${ANTFLY_INFERENCE_GEMMA4_MIN_Q4_PAIR_ACT_REDUCE_OUT_F16:-0}"
+MIN_Q6_REDUCE_IN_F16="${ANTFLY_INFERENCE_GEMMA4_MIN_Q6_REDUCE_IN_F16:-0}"
 MIN_SERVER_TOK_S="${ANTFLY_INFERENCE_GEMMA4_MIN_SERVER_TOK_S:-0}"
 MAX_SERVER_WARM_MS="${ANTFLY_INFERENCE_GEMMA4_MAX_SERVER_WARM_MS:-0}"
 CACHE_DTYPE="${ANTFLY_INFERENCE_GEMMA4_CACHE_DTYPE:-}"
@@ -235,7 +237,7 @@ for i in $(seq 1 "$RUNS"); do
   run_case "run-$i" "$MAX_TOKENS"
 done
 
-python3 - "$OUT_DIR" "$MIN_DECODE_TOK_S" "$MIN_HOT_DECODE_TOK_S" <<'PY'
+python3 - "$OUT_DIR" "$MIN_DECODE_TOK_S" "$MIN_HOT_DECODE_TOK_S" "$MIN_Q4_PAIR_ACT_REDUCE_OUT_F16" "$MIN_Q6_REDUCE_IN_F16" <<'PY'
 import json
 import re
 import statistics
@@ -245,6 +247,8 @@ from pathlib import Path
 out_dir = Path(sys.argv[1])
 min_decode = float(sys.argv[2])
 min_hot_decode = float(sys.argv[3])
+min_q4_pair_act_f16 = int(sys.argv[4])
+min_q6_f16 = int(sys.argv[5])
 rows = []
 
 def grab(pattern, text, default=None, cast=int):
@@ -273,6 +277,13 @@ for path in sorted(out_dir.glob("*.txt")):
     frame_gpu_ms = grab(r"metal_decoder_frame:.*\bgpu_ms=(\d+)", text, default=0)
     q8_mmv = grab(r"metal_q8_0_dispatch:.*\bmmv=(\d+)", text, default=0)
     q8_mm = grab(r"metal_q8_0_dispatch:.*\bmm=(\d+)", text, default=0)
+    q4_linear_reduce = grab(r"metal_q4_q6_k_dispatch:.*\bq4_linear_reduce=(\d+)", text, default=0)
+    q4_pair_reduce = grab(r"metal_q4_q6_k_dispatch:.*\bq4_pair_reduce=(\d+)", text, default=0)
+    q4_pair_act_reduce = grab(r"metal_q4_q6_k_dispatch:.*\bq4_pair_act_reduce=(\d+)", text, default=0)
+    q4_pair_act_reduce_out_f16 = grab(r"metal_q4_q6_k_dispatch:.*\bq4_pair_act_reduce_out_f16=(\d+)", text, default=0)
+    q4_activation_rhs_reduce = grab(r"metal_q4_q6_k_dispatch:.*\bq4_activation_rhs_reduce=(\d+)", text, default=0)
+    q6_linear_reduce = grab(r"metal_q4_q6_k_dispatch:.*\bq6_linear_reduce=(\d+)", text, default=0)
+    q6_linear_reduce_in_f16 = grab(r"metal_q4_q6_k_dispatch:.*\bq6_linear_reduce_in_f16=(\d+)", text, default=0)
     command_ops = grab(r"metal_runtime_command_ops:\s+total=(\d+)", text, default=0)
     greedy_calls = grab(r"metal_executor_ms:.*\bgreedy_calls=(\d+)", text, default=0)
     greedy_direct_ms = grab(r"metal_executor_ms:.*\bgreedy_direct=(\d+)", text, default=0)
@@ -312,6 +323,13 @@ for path in sorted(out_dir.glob("*.txt")):
         "frame_gpu_ms": frame_gpu_ms,
         "q8_mmv": q8_mmv,
         "q8_mm": q8_mm,
+        "q4_linear_reduce": q4_linear_reduce,
+        "q4_pair_reduce": q4_pair_reduce,
+        "q4_pair_act_reduce": q4_pair_act_reduce,
+        "q4_pair_act_reduce_out_f16": q4_pair_act_reduce_out_f16,
+        "q4_activation_rhs_reduce": q4_activation_rhs_reduce,
+        "q6_linear_reduce": q6_linear_reduce,
+        "q6_linear_reduce_in_f16": q6_linear_reduce_in_f16,
         "command_ops": command_ops,
         "greedy_calls": greedy_calls,
         "greedy_direct_ms": greedy_direct_ms,
@@ -344,11 +362,13 @@ summary = {
     "mean_hot_decode_tok_s": mean_hot_decode,
     "min_decode_tok_s": min_decode,
     "min_hot_decode_tok_s": min_hot_decode,
+    "min_q4_pair_act_reduce_out_f16": min_q4_pair_act_f16,
+    "min_q6_reduce_in_f16": min_q6_f16,
     "rows": rows,
 }
 (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 with (out_dir / "summary.tsv").open("w", encoding="utf-8") as f:
-    f.write("label\ttokens\tgenerate_ms\ttotal_ms\truntime_prewarm_ms\tfirst_token_request_ms\tfirst_token_service_ms\tfirst_token_prefill_ms\tfirst_token_sample_ms\treuse_first_token_service_ms\treuse_first_token_prefill_ms\treuse_first_token_sample_ms\tdecode_tok_s\te2e_tok_s\thot_decode_tok_s\tprefill_tokens\tprefill_tok_s\tbackend\tdecode_fallback\tframe_begins\tframe_wait_ms\tframe_gpu_ms\tq8_mmv\tq8_mm\tcommand_ops\tgreedy_calls\tgreedy_direct_ms\tgreedy_layer_specs_ms\tprefill_direct_family_ms\tple_prepare_ms\tquant_private_ms\tquant_private_slots\tquant_mapped_slots\tquant_mapped_failures\tfile\n")
+    f.write("label\ttokens\tgenerate_ms\ttotal_ms\truntime_prewarm_ms\tfirst_token_request_ms\tfirst_token_service_ms\tfirst_token_prefill_ms\tfirst_token_sample_ms\treuse_first_token_service_ms\treuse_first_token_prefill_ms\treuse_first_token_sample_ms\tdecode_tok_s\te2e_tok_s\thot_decode_tok_s\tprefill_tokens\tprefill_tok_s\tbackend\tdecode_fallback\tframe_begins\tframe_wait_ms\tframe_gpu_ms\tq8_mmv\tq8_mm\tq4_linear_reduce\tq4_pair_reduce\tq4_pair_act_reduce\tq4_pair_act_reduce_out_f16\tq4_activation_rhs_reduce\tq6_linear_reduce\tq6_linear_reduce_in_f16\tcommand_ops\tgreedy_calls\tgreedy_direct_ms\tgreedy_layer_specs_ms\tprefill_direct_family_ms\tple_prepare_ms\tquant_private_ms\tquant_private_slots\tquant_mapped_slots\tquant_mapped_failures\tfile\n")
     for r in rows:
         f.write(
             f"{r['label']}\t{r['tokens']}\t{r['generate_ms']}\t{r['total_ms']}\t{r['runtime_prewarm_ms']}\t"
@@ -358,7 +378,11 @@ with (out_dir / "summary.tsv").open("w", encoding="utf-8") as f:
             f"{r['decode_tok_s']:.3f}\t{r['e2e_tok_s']:.3f}\t{r['hot_decode_tok_s']:.3f}\t"
             f"{r['prefill_tokens']}\t{r['prefill_tok_s']:.3f}\t{r['backend']}\t"
             f"{r['decode_fallback']}\t{r['frame_begins']}\t{r['frame_wait_ms']}\t"
-            f"{r['frame_gpu_ms']}\t{r['q8_mmv']}\t{r['q8_mm']}\t{r['command_ops']}\t"
+            f"{r['frame_gpu_ms']}\t{r['q8_mmv']}\t{r['q8_mm']}\t"
+            f"{r['q4_linear_reduce']}\t{r['q4_pair_reduce']}\t"
+            f"{r['q4_pair_act_reduce']}\t{r['q4_pair_act_reduce_out_f16']}\t"
+            f"{r['q4_activation_rhs_reduce']}\t{r['q6_linear_reduce']}\t"
+            f"{r['q6_linear_reduce_in_f16']}\t{r['command_ops']}\t"
             f"{r['greedy_calls']}\t{r['greedy_direct_ms']}\t{r['greedy_layer_specs_ms']}\t"
             f"{r['prefill_direct_family_ms']}\t{r['ple_prepare_ms']}\t{r['quant_private_ms']}\t"
             f"{r['quant_private_slots']}\t{r['quant_mapped_slots']}\t{r['quant_mapped_failures']}\t"
@@ -368,6 +392,8 @@ with (out_dir / "summary.tsv").open("w", encoding="utf-8") as f:
 bad_backend = [r for r in measured if r["backend"] != "metal"]
 fallbacks = [r for r in measured if r["decode_fallback"] != 0]
 mapped_failures = [r for r in measured if r["quant_mapped_failures"] != 0]
+missing_q4_f16 = [r for r in measured if r["q4_pair_act_reduce_out_f16"] < min_q4_pair_act_f16]
+missing_q6_f16 = [r for r in measured if r["q6_linear_reduce_in_f16"] < min_q6_f16]
 print(f"summary: {out_dir / 'summary.tsv'}")
 print(f"median_decode_tok_s={median_decode:.3f} mean_decode_tok_s={mean_decode:.3f} median_e2e_tok_s={median_e2e:.3f}")
 print(f"median_hot_decode_tok_s={median_hot_decode:.3f} mean_hot_decode_tok_s={mean_hot_decode:.3f}")
@@ -377,6 +403,10 @@ if fallbacks:
     raise SystemExit(f"decode fallback in measured runs: {[r['label'] for r in fallbacks]}")
 if mapped_failures:
     raise SystemExit(f"mapped weight residency failures in measured runs: {[r['label'] for r in mapped_failures]}")
+if min_q4_pair_act_f16 and missing_q4_f16:
+    raise SystemExit(f"Q4_K pair activation f16-output dispatch below gate in measured runs: {[r['label'] for r in missing_q4_f16]}")
+if min_q6_f16 and missing_q6_f16:
+    raise SystemExit(f"Q6_K f16-input reduce dispatch below gate in measured runs: {[r['label'] for r in missing_q6_f16]}")
 if median_decode < min_decode:
     raise SystemExit(f"median decode tok/s {median_decode:.3f} below gate {min_decode:.3f}")
 if median_hot_decode < min_hot_decode:

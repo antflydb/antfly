@@ -17013,6 +17013,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_runtime_q8_0_pair_activation_rms_scale_mmv_f16_output = runtime_stats.q8_0_pair_activation_rms_scale_mmv_f16_output;
         stats.metal_runtime_q8_0_linear_mmv_f16_input = runtime_stats.q8_0_linear_mmv_f16_input;
         stats.metal_runtime_q8_0_linear_family_dispatch_counts = runtime_stats.q8_0_linear_family_dispatch_counts;
+        stats.metal_runtime_q4_k_linear_reduce = runtime_stats.q4_k_linear_reduce;
+        stats.metal_runtime_q4_k_pair_reduce = runtime_stats.q4_k_pair_reduce;
+        stats.metal_runtime_q4_k_pair_activation_reduce = runtime_stats.q4_k_pair_activation_reduce;
+        stats.metal_runtime_q4_k_pair_activation_reduce_f16_output = runtime_stats.q4_k_pair_activation_reduce_f16_output;
+        stats.metal_runtime_q4_k_activation_rhs_reduce = runtime_stats.q4_k_activation_rhs_reduce;
+        stats.metal_runtime_q6_k_linear_reduce = runtime_stats.q6_k_linear_reduce;
+        stats.metal_runtime_q6_k_linear_reduce_f16_input = runtime_stats.q6_k_linear_reduce_f16_input;
 
         const provider = self.provider_impl;
         stats.metal_provider_quantized_runtime_private_nanos = provider.raw_quant_runtime_private_prepare_nanos;

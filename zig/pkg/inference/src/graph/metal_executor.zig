@@ -580,6 +580,18 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
             provider_stats.metal_runtime_q8_0_linear_mmv_f16_input,
         },
     );
+    std.debug.print(
+        "metal_q4_q6_k_dispatch: q4_linear_reduce={d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_in_f16={d}\n",
+        .{
+            provider_stats.metal_runtime_q4_k_linear_reduce,
+            provider_stats.metal_runtime_q4_k_pair_reduce,
+            provider_stats.metal_runtime_q4_k_pair_activation_reduce,
+            provider_stats.metal_runtime_q4_k_pair_activation_reduce_f16_output,
+            provider_stats.metal_runtime_q4_k_activation_rhs_reduce,
+            provider_stats.metal_runtime_q6_k_linear_reduce,
+            provider_stats.metal_runtime_q6_k_linear_reduce_f16_input,
+        },
+    );
     const q8_family_dispatch = provider_stats.metal_runtime_q8_0_linear_family_dispatch_counts;
     std.debug.print(
         "metal_q8_0_dispatch_families: none={d}/{d}/{d}/{d} pair_act={d}/{d}/{d}/{d} pair_act_rms={d}/{d}/{d}/{d} act_rhs={d}/{d}/{d}/{d} pair={d}/{d}/{d}/{d} qkv={d}/{d}/{d}/{d}\n",
