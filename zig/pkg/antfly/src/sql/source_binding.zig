@@ -34,6 +34,8 @@ pub const BoundedScanPolicy = struct {
     max_bytes: ?u64 = null,
 };
 
+pub const default_document_sql_bounded_scan_rows: u32 = 10_000;
+
 pub const RelationalBinding = struct {
     target: CatalogTableRef,
     schema: runtime_schema.TableSchema,
@@ -56,6 +58,7 @@ pub const DocumentSqlCapabilities = struct {
 pub const DocumentBinding = struct {
     target: CatalogTableRef,
     schema: runtime_schema.TableSchema,
+    indexes_json: ?[]const u8 = null,
     virtual_schema: DocumentSqlSchema = .{},
     capabilities: DocumentSqlCapabilities = .{},
 };
@@ -122,13 +125,16 @@ pub fn bindingForRuntimeSchema(target: CatalogTableRef, schema: runtime_schema.T
 }
 
 pub fn documentCapabilitiesForRuntimeSchema(schema: runtime_schema.TableSchema) DocumentSqlCapabilities {
-    var capabilities = DocumentSqlCapabilities{};
+    var capabilities = DocumentSqlCapabilities{
+        .bounded_scan = .{ .max_rows = default_document_sql_bounded_scan_rows },
+    };
+    const schema_driven_text = documentSchemaHasSchemaDrivenText(schema);
     for (schema.relational_columns) |column| {
         if (!column.indexed or column.index_lifecycle != .ready) continue;
         switch (column.field_type) {
             .text, .html, .search_as_you_type => {
                 capabilities.full_text_filters = true;
-                capabilities.indexed_scalar_filters = true;
+                if (!schema_driven_text) capabilities.indexed_scalar_filters = true;
             },
             .embedding => capabilities.vector_filters = true,
             .blob => {},
@@ -141,13 +147,26 @@ pub fn documentCapabilitiesForRuntimeSchema(schema: runtime_schema.TableSchema) 
             .geoshape,
             .json,
             .array,
-            => capabilities.indexed_scalar_filters = true,
+            => {
+                if (!schema_driven_text) capabilities.indexed_scalar_filters = true;
+            },
         }
         if (documentColumnSupportsAlgebraicAggregate(column)) {
             capabilities.algebraic_aggregates = true;
         }
     }
     return capabilities;
+}
+
+fn documentSchemaHasSchemaDrivenText(schema: runtime_schema.TableSchema) bool {
+    if (schema.dynamic_templates.len > 0) return true;
+    for (schema.full_text_documents) |document| {
+        if (document.fields.len > 0) return true;
+        if (document.dynamic_rules.len > 0) return true;
+        if (document.open_dynamic_paths.len > 0) return true;
+        if (document.infer_type_dynamic_paths.len > 0) return true;
+    }
+    return false;
 }
 
 fn documentColumnSupportsAlgebraicAggregate(column: runtime_schema.RelationalColumn) bool {
@@ -188,9 +207,10 @@ test "source binding classifies relational document and lake schemas" {
             try std.testing.expect(binding.capabilities.doc_id_lookup);
             try std.testing.expect(binding.virtual_schema.exposes_doc);
             try std.testing.expect(binding.capabilities.full_text_filters);
-            try std.testing.expect(binding.capabilities.indexed_scalar_filters);
+            try std.testing.expect(!binding.capabilities.indexed_scalar_filters);
             try std.testing.expect(!binding.capabilities.vector_filters);
             try std.testing.expect(!binding.capabilities.algebraic_aggregates);
+            try std.testing.expectEqual(default_document_sql_bounded_scan_rows, binding.capabilities.bounded_scan.?.max_rows.?);
         },
         else => return error.TestExpectedEqual,
     }
@@ -210,6 +230,7 @@ test "source binding classifies relational document and lake schemas" {
             try std.testing.expect(binding.capabilities.indexed_scalar_filters);
             try std.testing.expect(binding.capabilities.vector_filters);
             try std.testing.expect(binding.capabilities.algebraic_aggregates);
+            try std.testing.expectEqual(default_document_sql_bounded_scan_rows, binding.capabilities.bounded_scan.?.max_rows.?);
         },
         else => return error.TestExpectedEqual,
     }
@@ -228,6 +249,7 @@ test "source binding classifies relational document and lake schemas" {
             try std.testing.expect(!binding.capabilities.indexed_scalar_filters);
             try std.testing.expect(!binding.capabilities.vector_filters);
             try std.testing.expect(!binding.capabilities.algebraic_aggregates);
+            try std.testing.expectEqual(default_document_sql_bounded_scan_rows, binding.capabilities.bounded_scan.?.max_rows.?);
         },
         else => return error.TestExpectedEqual,
     }

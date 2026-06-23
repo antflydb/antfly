@@ -525,13 +525,15 @@ Implementation note: `src/sql/source_binding.zig` now defines the public
 `SqlSourceBinding` union, `CatalogTableRef`, per-family binding structs, and the
 conservative runtime-schema classifier used to distinguish relational,
 document, and lake sources. Document bindings derive their
-`DocumentSqlCapabilities` from ready indexed runtime columns, so full-text,
-scalar-index, vector, and algebraic-aggregate eligibility are facts from the
-catalog schema rather than lowerer-local defaults. `src/sql/document_plan.zig`
-defines the document read-plan family for `_id` lookup, indexed document query
-producers, and explicitly bounded scans. Public SQL execution can route simple
-document reads through the document plan family, and later lowerers no longer
-need to invent this source-family boundary.
+`DocumentSqlCapabilities` from conservative catalog facts: full-text, scalar
+index, vector, algebraic-aggregate, and bounded-scan eligibility are binding
+facts rather than lowerer-local defaults. A declared document field is not
+enough to prove native scalar-filter capability unless the binding can identify
+a compatible ready producer. `src/sql/document_plan.zig` defines the document
+read-plan family for `_id` lookup, indexed document query producers, and
+explicitly bounded scans. Public SQL execution can route simple document reads
+through the document plan family, and later lowerers no longer need to invent
+this source-family boundary.
 
 The review rule is that no lowerer should probe another source family by
 trial-and-error. The binder selects the family once from catalog facts and every
@@ -654,6 +656,18 @@ Anything not safely pushdown-capable should fail closed or require an explicit
 bounded scan contract. The adapter should not silently run broad document scans
 because a SQL BI client submitted a relational-looking query.
 
+The planner invariant is producer independence: the SQL statement defines one
+logical predicate, projection, grouping, or aggregate, and each producer is only
+a physical way to obtain the same rows or the same exact answer. A ready
+full-text index, scalar index, algebraic sidecar, vector sidecar, or serverless
+segment should make a plan cheaper or lower-latency; it should not change which
+SQL statements are meaningful. If multiple producers can prove the same
+semantics, the planner should choose the cheapest eligible producer and keep any
+remaining predicate as an explicit residual filter. If no producer can prove the
+semantics, Antfly can still use a scan only when the scan is bounded by policy
+or by a proven finite cost and the residual evaluator can implement the same
+predicate semantics. Otherwise the planner fails closed.
+
 Antfly's default document index should be treated as more than a literal
 full-text search feature. It is the native document query surface for indexed
 term, boolean, prefix, wildcard, range, geo, and text predicates. SQL lowering
@@ -664,18 +678,64 @@ SELECT _id, status FROM docs WHERE status = 'active' LIMIT 100;
 ```
 
 to the same native indexed query/filter contract used by REST, SDK, MCP, A2A,
-and CLI callers, not to residual document scans. `_id` equality remains a direct
-lookup. A declared document field predicate should lower only when the field's
-index is available and ready; otherwise the planner should fail closed or
-require an explicit bounded scan policy.
+and CLI callers when a compatible ready producer is present, not because the
+field is merely declared. `_id` equality remains a direct lookup. A declared
+document field predicate should lower to a native scalar producer only when the
+field's index is available and ready; otherwise the planner should fail closed
+or require an explicit bounded scan policy with residual evaluation.
 
-The same rule applies to aggregate-style SQL. When an algebraic index can answer
+Full-text predicates follow the same rule, but the scan fallback has a higher
+bar. `full_text_search(...)` is producer-independent only after the scan path
+can evaluate the same analyzer, query parser, tokenization, language, and match
+semantics as the full-text index. Until then, the ready full-text producer is
+the only correct executor for that predicate, while ordinary scalar predicates
+can fall back to the bounded residual evaluator already used for term, range,
+prefix, and wildcard filters.
+
+The same producer-selection rule applies to aggregate-style SQL. Full-text,
+scalar, algebraic, vector, and future sidecar indexes are optimizations and
+native producers, not separate semantics. When an algebraic index can answer
 `COUNT`, grouped counts/facets, selected `DISTINCT`/top-k queries, or numeric
-summaries from indexed state, the document planner should use an index-backed
-aggregate producer. It should not hydrate every matching document merely because
-the request is written as SQL. Residual aggregate work is acceptable only after a
-selective native producer has established a bounded candidate set, or after the
-caller opted into an explicit bounded scan.
+summaries from indexed state, the document planner should prefer that
+index-backed aggregate producer. When a full-text or scalar index can first
+produce a selective candidate set, bounded local aggregate work can run over
+that candidate set. When no index helps, a scan is still a valid physical
+producer only if the request carries an explicit bounded-scan policy or the
+planner can prove the scan cost is acceptable. It should not hydrate every
+matching document merely because the request is written as SQL.
+
+Current implementation note: document SQL now has a distinct document aggregate
+plan for narrow `COUNT(*)` shapes with optional indexed scalar filters and
+optional single indexed grouping paths. Catalog-backed lowering annotates that
+plan with an algebraic index and materialization name when catalog metadata
+proves a matching unfiltered materialization exists; filtered aggregates remain
+attached to their native candidate producer until algebraic materialized-filter
+proof exists. Execution currently supports ungrouped `COUNT(*)` over `_id`
+lookup and indexed/full-text query producers through the native document query
+path, plus grouped `COUNT(*)` when a native candidate producer can enumerate the
+matching documents. When no algebraic materialization or native candidate
+producer can answer exactly, catalog-backed lowering can choose an explicit
+bounded-scan aggregate producer from `DocumentSqlCapabilities.bounded_scan`;
+execution fails closed if the scan reaches its cap, so counts are not returned
+from partial samples. Algebraic partial/result execution still fails closed
+until its producer-specific executor is implemented.
+
+Read execution now also has a policy-gated bounded residual scan path for simple
+scalar document predicates. If an indexed predicate cannot use a ready index but
+the catalog binding supplies a bounded-scan policy and the SQL has an output
+`LIMIT`, the lowerer can use a capped document scan plus a residual evaluator for
+the same structured filter subset emitted to native index queries. That keeps
+the semantics independent of index presence while still refusing hidden broad
+scans.
+
+Ordered bounded scans are stricter than unordered `LIMIT` scans. An unordered
+document `LIMIT` can stop after the requested number of scanned rows because the
+SQL result is intentionally an arbitrary bounded prefix. `ORDER BY ... LIMIT`
+must sort over a bounded input domain instead: catalog-backed lowering uses the
+bounded-scan policy as the input cap, and execution fails closed if the scan
+reaches that cap. Returning the best rows from only the first N scanned keys
+would make top-k results depend on physical key order, so that shape is not a
+valid optimization.
 
 Residual filters are allowed only after an explicit bounded producer. For
 example, residual JSON expression evaluation can run after an `_id IN (...)`
@@ -694,6 +754,12 @@ WHERE tag = 'urgent';
 
 This gives agents and BI tools predictable cardinality and cost behavior while
 still allowing Mongo-style flatten/unwind workflows over document data.
+
+Current implementation note: document SQL projection can still expose array
+fields as JSON values, but scalar predicates over array paths fail closed with
+`DocumentSqlArrayRequiresUnnest`. That prevents `tags = 'urgent'` or
+`tags->>'0' = 'urgent'` from pretending an array has scalar cardinality before
+there is an explicit `UNNEST`/array-expansion plan.
 
 ### Execution Contract
 

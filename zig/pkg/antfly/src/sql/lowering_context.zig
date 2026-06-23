@@ -285,8 +285,23 @@ fn lowerDocumentTargetParsedSqlForLoweringContextTestAlloc(
     _ = function_bindings;
     const document_plan = @import("document_plan.zig");
     return switch (parsed_sql.statement.readKind() orelse return error.UnsupportedSqlShape) {
-        .aggregate => .{ .document_aggregate = try document_plan.lowerDocumentAlgebraicAggregatePlanParsedSqlAlloc(alloc, parsed_sql, document.schema) },
-        .query => .{ .document_query = try document_plan.lowerDocumentReadPlanParsedSqlAlloc(alloc, parsed_sql, document.schema) },
+        .aggregate => .{
+            .document_aggregate = try document_plan.lowerDocumentAggregatePlanWithOptionalIndexesAndBoundedScanPolicyParsedSqlAlloc(
+                alloc,
+                parsed_sql,
+                document.schema,
+                document.indexes_json,
+                document.capabilities.bounded_scan,
+            ),
+        },
+        .query => .{
+            .document_query = try document_plan.lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(
+                alloc,
+                parsed_sql,
+                document.schema,
+                document.capabilities,
+            ),
+        },
         else => error.UnsupportedSqlShape,
     };
 }

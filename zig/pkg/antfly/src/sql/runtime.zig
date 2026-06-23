@@ -32,6 +32,7 @@ const usermgr = @import("../usermgr/mod.zig");
 
 pub const default_array_agg_max_items: u32 = db_mod.types.default_relational_rows_array_agg_max_items;
 pub const DocumentAlgebraicAggregatePlan = sql_adapter.DocumentAlgebraicAggregatePlan;
+pub const DocumentAggregateGroupBy = sql_adapter.DocumentAggregateGroupBy;
 pub const DocumentIndexQuery = sql_adapter.DocumentIndexQuery;
 pub const DocumentOrderBy = sql_adapter.DocumentOrderBy;
 pub const DocumentOrderDirection = sql_adapter.DocumentOrderDirection;
@@ -1047,8 +1048,23 @@ fn lowerDocumentReadPlanFromBindingParsedSqlAlloc(
     _ = params;
     _ = function_bindings;
     return switch (parsed_sql.statement.readKind() orelse return error.UnsupportedSqlShape) {
-        .aggregate => .{ .document_aggregate = try sql_adapter.lowerDocumentAlgebraicAggregatePlanParsedSqlAlloc(alloc, parsed_sql, document.schema) },
-        .query => .{ .document_query = try sql_adapter.lowerDocumentReadPlanParsedSqlAlloc(alloc, parsed_sql, document.schema) },
+        .aggregate => .{
+            .document_aggregate = try sql_adapter.lowerDocumentAggregatePlanWithOptionalIndexesAndBoundedScanPolicyParsedSqlAlloc(
+                alloc,
+                parsed_sql,
+                document.schema,
+                document.indexes_json,
+                document.capabilities.bounded_scan,
+            ),
+        },
+        .query => .{
+            .document_query = try sql_adapter.lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(
+                alloc,
+                parsed_sql,
+                document.schema,
+                document.capabilities,
+            ),
+        },
         else => error.UnsupportedSqlShape,
     };
 }

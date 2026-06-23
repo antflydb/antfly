@@ -5603,16 +5603,16 @@ pub const ApiHttpServer = struct {
         };
         defer session.deinit(self.alloc);
 
+        var parsed_sql = sql_adapter.ParsedSql.initAlloc(self.alloc, parsed.value.sql) catch |err| switch (err) {
+            error.UnsupportedSqlShape => return try textResponse(self.alloc, 501, "unsupported sql statement"),
+            else => return err,
+        };
+        defer parsed_sql.deinit(self.alloc);
+        if (parsed_sql.writeStatementKind() != null) return try self.handlePublicSqlWrite(parsed.value.sql, &session, authenticated_identity);
+        if (parsed_sql.readStatementKind() != null) return try self.handlePublicSqlRead(parsed.value.sql, &session);
+
         var applied = self.applyRelationalSqlDdlWithSession(parsed.value.sql, &session) catch |err| switch (err) {
-            error.UnsupportedSqlShape => {
-                var parsed_sql = sql_adapter.ParsedSql.initAlloc(self.alloc, parsed.value.sql) catch |parse_err| switch (parse_err) {
-                    error.UnsupportedSqlShape => return try textResponse(self.alloc, 501, "unsupported sql statement"),
-                    else => return parse_err,
-                };
-                defer parsed_sql.deinit(self.alloc);
-                if (parsed_sql.writeStatementKind() != null) return try self.handlePublicSqlWrite(parsed.value.sql, &session, authenticated_identity);
-                return try self.handlePublicSqlRead(parsed.value.sql, &session);
-            },
+            error.UnsupportedSqlShape => return try textResponse(self.alloc, 501, "unsupported sql statement"),
             error.StatementTimeout => return try textResponse(self.alloc, 408, "sql statement timeout"),
             error.InvalidSqlSession,
             error.PreparedStatementAlreadyExists,

@@ -701,15 +701,22 @@ fn sourceBindingForCatalogTableWithSessionAlloc(
 ) !source_binding.SqlSourceBinding {
     const target = try ownedCatalogTableRefForObjectNameAlloc(alloc, table_name, session);
     errdefer deinitCatalogTableRef(alloc, target);
-    const schema = try runtimeSchemaForQualifiedCatalogTableAlloc(
-        alloc,
-        catalog,
-        target.database_name,
-        target.namespace_name,
-        target.table_name,
-    );
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = qualifiedTableRecord(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse return error.InvalidSqlCatalog;
+    if (table.schema_json.len == 0) return error.InvalidSqlCatalog;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, table.schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
     errdefer runtime_schema.freeSchema(alloc, schema);
-    return source_binding.bindingForRuntimeSchema(target, schema);
+    var binding = source_binding.bindingForRuntimeSchema(target, schema);
+    switch (binding) {
+        .document => |*document| {
+            document.indexes_json = try alloc.dupe(u8, table.indexes_json);
+        },
+        else => {},
+    }
+    return binding;
 }
 
 fn deinitSqlSourceBinding(alloc: std.mem.Allocator, binding: *source_binding.SqlSourceBinding) void {
@@ -721,6 +728,7 @@ fn deinitSqlSourceBinding(alloc: std.mem.Allocator, binding: *source_binding.Sql
         .document => |document| {
             deinitCatalogTableRef(alloc, document.target);
             runtime_schema.freeSchema(alloc, document.schema);
+            if (document.indexes_json) |indexes_json| alloc.free(@constCast(indexes_json));
         },
         .lake => |lake| {
             deinitCatalogTableRef(alloc, lake.target);
@@ -765,6 +773,20 @@ pub fn qualifiedTableSchemaJson(
         if (!std.mem.eql(u8, table.database_name, database_name)) continue;
         if (!std.mem.eql(u8, table.namespace_name, namespace_name)) continue;
         if (std.mem.eql(u8, table.name, table_name)) return table.schema_json;
+    }
+    return null;
+}
+
+pub fn qualifiedTableRecord(
+    snapshot: *const metadata_api.AdminSnapshot,
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+) ?metadata_table_manager.TableRecord {
+    for (snapshot.tables) |table| {
+        if (!std.mem.eql(u8, table.database_name, database_name)) continue;
+        if (!std.mem.eql(u8, table.namespace_name, namespace_name)) continue;
+        if (std.mem.eql(u8, table.name, table_name)) return table;
     }
     return null;
 }

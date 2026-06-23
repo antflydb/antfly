@@ -55,6 +55,26 @@ RELATIONAL_SQL_SCHEMA = {
     "primary_key": {"columns": ["id"]},
 }
 
+DOCUMENT_SQL_SCHEMA = {
+    "version": 1,
+    "storage_mode": "document",
+    "default_type": "doc",
+    "document_schemas": {
+        "doc": {
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "text"},
+                    "body": {"type": "text"},
+                    "status": {"type": "keyword"},
+                    "metadata": {"type": "json"},
+                },
+                "additionalProperties": True,
+            }
+        }
+    },
+}
+
 
 @pytest.fixture(scope="function")
 def sql_cli(stateful_api):
@@ -100,6 +120,11 @@ def _sql_table_name(prefix: str) -> str:
 
 def _create_relational_sql_table(stateful_api, table_name: str) -> None:
     created = stateful_api.create_table(table_name, num_shards=1, schema=RELATIONAL_SQL_SCHEMA)
+    assert created["name"] == table_name
+
+
+def _create_document_sql_table(stateful_api, table_name: str) -> None:
+    created = stateful_api.create_table(table_name, num_shards=1, schema=DOCUMENT_SQL_SCHEMA)
     assert created["name"] == table_name
 
 
@@ -226,3 +251,107 @@ def test_sql_cli_repl_reads_stdin_and_reuses_session(stateful_api, sql_cli):
     assert responses[0]["statement_kind"] == "insert"
     assert responses[1]["statement_kind"] == "query"
     assert responses[1]["result"]["rows"] == [{"id": "repl:a", "amount": 7}]
+
+
+def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
+    table = _sql_table_name("sql_cli_docs")
+    _create_document_sql_table(stateful_api, table)
+    table_detail = stateful_api.get_table(table)
+    assert table_detail["schema"]["storage_mode"] == "document"
+
+    written = stateful_api.batch_write(
+        table,
+        inserts={
+            "doc:a": {
+                "title": "alpha",
+                "body": "alpha search document",
+                "status": "active",
+                "metadata": {"plan": "pro"},
+            },
+            "doc:b": {
+                "title": "beta",
+                "body": "beta archive document",
+                "status": "archived",
+                "metadata": {"plan": "free"},
+            },
+            "doc:c": {
+                "title": "alpha followup",
+                "body": "alpha search followup",
+                "status": "active",
+                "metadata": {"plan": "team"},
+            },
+        },
+        sync_level="full_index",
+    )
+    assert written["inserted"] == 3
+
+    direct_by_id = stateful_api.post(
+        "/sql",
+        {"sql": f"SELECT _id, title FROM {table} WHERE _id = 'doc:a';"},
+    )
+    assert direct_by_id["kind"] == "read"
+    assert direct_by_id["statement_kind"] == "query"
+    assert direct_by_id["result"]["rows"] == [{"_id": "doc:a", "title": "alpha"}]
+
+    by_id = _first_sql_json(
+        sql_cli(
+            "sql",
+            "-c",
+            f"SELECT _id, title FROM {table} WHERE _id = 'doc:a';",
+        ).stdout
+    )
+    assert by_id["kind"] == "read"
+    assert by_id["statement_kind"] == "query"
+    assert by_id["result"]["rows"] == [{"_id": "doc:a", "title": "alpha"}]
+
+    by_json_path = _first_sql_json(
+        sql_cli(
+            "sql",
+            "-c",
+            f"SELECT _id, metadata->>'plan' AS plan FROM {table} WHERE _id = 'doc:a';",
+        ).stdout
+    )
+    assert by_json_path["kind"] == "read"
+    assert by_json_path["statement_kind"] == "query"
+    assert by_json_path["result"]["rows"] == [{"_id": "doc:a", "plan": "pro"}]
+
+    active_rows = wait_until(
+        lambda: _select_rows(
+            sql_cli,
+            f"SELECT _id, status FROM {table} WHERE status = 'active' LIMIT 10;",
+        ),
+        timeout_s=15.0,
+        interval_s=0.5,
+    )
+    assert sorted(row["_id"] for row in active_rows) == ["doc:a", "doc:c"]
+
+    ordered_rows = wait_until(
+        lambda: _select_rows(
+            sql_cli,
+            f"SELECT _id, title FROM {table} WHERE status = 'active' ORDER BY title DESC LIMIT 2;",
+        ),
+        timeout_s=15.0,
+        interval_s=0.5,
+    )
+    assert [row["_id"] for row in ordered_rows] == ["doc:c", "doc:a"]
+
+    full_text_rows = wait_until(
+        lambda: _select_rows(
+            sql_cli,
+            f"SELECT _id, title FROM {table} WHERE full_text_search('body:search') LIMIT 10;",
+        ),
+        timeout_s=15.0,
+        interval_s=0.5,
+    )
+    assert sorted(row["_id"] for row in full_text_rows) == ["doc:a", "doc:c"]
+
+    counted = _first_sql_json(
+        sql_cli(
+            "sql",
+            "-c",
+            f"SELECT count(*) AS row_count FROM {table} WHERE full_text_search('body:search');",
+        ).stdout
+    )
+    assert counted["kind"] == "read"
+    assert counted["statement_kind"] == "aggregate"
+    assert counted["result"]["rows"] == [{"row_count": 2}]
