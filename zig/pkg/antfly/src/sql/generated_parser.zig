@@ -140,6 +140,8 @@ pub const GeneratedSqlExpressionKind = enum {
     is_false,
     is_not_true,
     is_not_false,
+    is_distinct_from,
+    is_not_distinct_from,
     logical_or,
     logical_and,
     logical_not,
@@ -374,6 +376,8 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT id FROM usage_records WHERE deleted_at IS NOT NULL", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE active IS TRUE", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE active IS NOT FALSE", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE status IS DISTINCT FROM previous_status", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE status IS NOT DISTINCT FROM previous_status", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status = 'open' OR deleted_at IS NULL", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status = 'open' AND deleted_at IS NULL", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE NOT deleted_at IS NULL", .kind = .read },
@@ -1220,7 +1224,10 @@ fn buildGeneratedExpressionAst(tokens: []const token_mod.Token, range: Generated
     ast.kind = operator.kind;
     if (!operator.prefix) {
         if (range.start >= operator.index or operator.index + 1 >= range.end) return ast;
-        const left_end = operator.negation_index orelse operator.index;
+        const left_end = if (operator.negation_index) |negation_index|
+            if (negation_index < operator.index) negation_index else operator.index
+        else
+            operator.index;
         if (range.start >= left_end) return ast;
         ast.left_tokens = .{ .start = range.start, .end = left_end };
         ast.left_expression_kind = generatedExpressionKindForRange(tokens, ast.left_tokens.?);
@@ -1228,11 +1235,12 @@ fn buildGeneratedExpressionAst(tokens: []const token_mod.Token, range: Generated
         return ast;
     }
     if (operator.negation_index) |negation_index| ast.negation_tokens = .{ .start = negation_index, .end = negation_index + 1 };
-    ast.operator_tokens = .{ .start = operator.index, .end = operator.index + 1 };
+    const operator_end = operator.operator_end_index orelse operator.index + 1;
+    ast.operator_tokens = .{ .start = operator.index, .end = operator_end };
     const right_start = if (operator.quantifier_index) |quantifier_index| blk: {
         ast.quantifier_tokens = .{ .start = quantifier_index, .end = quantifier_index + 1 };
         break :blk quantifier_index + 1;
-    } else operator.index + 1;
+    } else operator_end;
     if (right_start >= range.end) return ast;
     ast.right_tokens = .{ .start = right_start, .end = range.end };
     ast.right_expression_kind = generatedExpressionKindForRange(tokens, ast.right_tokens.?);
@@ -1322,6 +1330,7 @@ fn generatedWrappedExpressionInnerRange(tokens: []const token_mod.Token, range: 
 const GeneratedSqlExpressionOperator = struct {
     kind: GeneratedSqlExpressionKind,
     index: usize,
+    operator_end_index: ?usize = null,
     negation_index: ?usize = null,
     quantifier_index: ?usize = null,
     prefix: bool = false,
@@ -1395,6 +1404,9 @@ fn findTopLevelExpressionOperator(tokens: []const token_mod.Token, range: Genera
                     if (tokens[index + 1].matchesKeywordTag(.null)) return .{ .kind = .is_null, .index = index };
                     if (tokens[index + 1].matchesKeywordTag(.true)) return .{ .kind = .is_true, .index = index };
                     if (tokens[index + 1].matchesKeywordTag(.false)) return .{ .kind = .is_false, .index = index };
+                    if (index + 3 < range.end and tokens[index + 1].matchesKeywordTag(.distinct) and tokens[index + 2].matchesKeywordTag(.from)) {
+                        return .{ .kind = .is_distinct_from, .index = index, .operator_end_index = index + 3 };
+                    }
                     if (index + 2 < range.end and tokens[index + 1].matchesKeywordTag(.not) and tokens[index + 2].matchesKeywordTag(.null)) {
                         return .{ .kind = .is_not_null, .index = index };
                     }
@@ -1403,6 +1415,9 @@ fn findTopLevelExpressionOperator(tokens: []const token_mod.Token, range: Genera
                     }
                     if (index + 2 < range.end and tokens[index + 1].matchesKeywordTag(.not) and tokens[index + 2].matchesKeywordTag(.false)) {
                         return .{ .kind = .is_not_false, .index = index };
+                    }
+                    if (index + 4 < range.end and tokens[index + 1].matchesKeywordTag(.not) and tokens[index + 2].matchesKeywordTag(.distinct) and tokens[index + 3].matchesKeywordTag(.from)) {
+                        return .{ .kind = .is_not_distinct_from, .index = index, .operator_end_index = index + 4, .negation_index = index + 1 };
                     }
                 }
             },
@@ -1985,6 +2000,35 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.where_expression.left_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.where_expression.operator_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 9 }, read.where_expression.right_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const is_distinct_read_sql = "SELECT id FROM usage_records WHERE status IS DISTINCT FROM previous_status";
+    const is_distinct_read_result = try parseSqlAlloc(alloc, is_distinct_read_sql);
+    switch (is_distinct_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 10 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.is_distinct_from, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 9 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.where_expression.right_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const is_not_distinct_read_sql = "SELECT id FROM usage_records WHERE status IS NOT DISTINCT FROM previous_status";
+    const is_not_distinct_read_result = try parseSqlAlloc(alloc, is_not_distinct_read_sql);
+    switch (is_not_distinct_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 11 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.is_not_distinct_from, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.where_expression.negation_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 10 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.where_expression.right_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

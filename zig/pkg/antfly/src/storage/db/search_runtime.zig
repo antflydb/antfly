@@ -25,6 +25,7 @@ const planning_adapter_mod = @import("planning_adapter.zig");
 const planning_bindings_mod = @import("planning_bindings.zig");
 const planning_stats_mod = @import("planning_stats.zig");
 const schema_mod = @import("../schema.zig");
+const graph_mod = @import("../../graph/graph.zig");
 const graph_query_mod = @import("../../graph/query.zig");
 const graph_pattern_mod = @import("../../graph/pattern.zig");
 const search_mod = @import("../../search/search.zig");
@@ -42,6 +43,123 @@ const NamedResultSet = db_query_graph.NamedResultSet;
 
 fn benchQueryProfileEnabled() bool {
     return platform.env.getenv("ANTFLY_BENCH_QUERY_PROFILE") != null;
+}
+
+fn cloneGraphMetricStatusFromGraph(
+    alloc: Allocator,
+    source: graph_mod.GraphIndex.GraphMetricStatus,
+) !types.GraphMetricStatus {
+    const name = try alloc.dupe(u8, source.name);
+    var name_moved = false;
+    errdefer if (!name_moved) alloc.free(name);
+    var edge_filter = try source.edge_filter.cloneAlloc(alloc);
+    var edge_filter_moved = false;
+    errdefer if (!edge_filter_moved) edge_filter.deinit(alloc);
+    const recent_events = if (source.recent_events.len > 0)
+        try alloc.dupe(graph_mod.GraphIndex.GraphMetricEvent, source.recent_events)
+    else
+        @constCast((&[_]graph_mod.GraphIndex.GraphMetricEvent{})[0..]);
+    var recent_events_moved = false;
+    errdefer if (!recent_events_moved and recent_events.len > 0) alloc.free(recent_events);
+    const last_error = if (source.last_error.len > 0) try alloc.dupe(u8, source.last_error) else "";
+    var last_error_moved = false;
+    errdefer if (!last_error_moved and last_error.len > 0) alloc.free(last_error);
+    const build_worker_id = if (source.build_worker_id.len > 0) try alloc.dupe(u8, source.build_worker_id) else "";
+    var build_worker_id_moved = false;
+    errdefer if (!build_worker_id_moved and build_worker_id.len > 0) alloc.free(build_worker_id);
+    const build_cursor = if (source.build_cursor.len > 0) try alloc.dupe(u8, source.build_cursor) else "";
+    var build_cursor_moved = false;
+    errdefer if (!build_cursor_moved and build_cursor.len > 0) alloc.free(build_cursor);
+    const build_pages = try cloneGraphMetricBuildPageStatusesFromGraph(alloc, source.build_pages);
+    var build_pages_moved = false;
+    errdefer if (!build_pages_moved) {
+        for (build_pages) |*page| page.deinit(alloc);
+        if (build_pages.len > 0) alloc.free(build_pages);
+    };
+    const out = types.GraphMetricStatus{
+        .name = name,
+        .state = source.state,
+        .phase = source.phase,
+        .edge_filter = edge_filter,
+        .metadata_version = source.metadata_version,
+        .maintenance_paused = source.maintenance_paused,
+        .build_queued = source.build_queued,
+        .published_generation = source.published_generation,
+        .edge_generation = source.edge_generation,
+        .target_edge_generation = source.target_edge_generation,
+        .queued_generation = source.queued_generation,
+        .building_generation = source.building_generation,
+        .build_job_id = source.build_job_id,
+        .build_started_at_ms = source.build_started_at_ms,
+        .build_iteration = source.build_iteration,
+        .build_lease_expires_at_ms = source.build_lease_expires_at_ms,
+        .build_worker_id = build_worker_id,
+        .build_cursor = build_cursor,
+        .build_completed_units = source.build_completed_units,
+        .build_total_units = source.build_total_units,
+        .build_pages = build_pages,
+        .build_pages_truncated = source.build_pages_truncated,
+        .retry_count = source.retry_count,
+        .last_error = last_error,
+        .progress = source.progress,
+        .converged = source.converged,
+        .iterations_completed = source.iterations_completed,
+        .delta = source.delta,
+        .computed_at_ms = source.computed_at_ms,
+        .last_event = source.last_event,
+        .recent_events = recent_events,
+    };
+    name_moved = true;
+    edge_filter_moved = true;
+    recent_events_moved = true;
+    last_error_moved = true;
+    build_worker_id_moved = true;
+    build_cursor_moved = true;
+    build_pages_moved = true;
+    return out;
+}
+
+fn cloneGraphMetricBuildPageStatusesFromGraph(
+    alloc: Allocator,
+    source: []const graph_mod.GraphIndex.GraphMetricBuildPageStatus,
+) ![]types.GraphMetricBuildPageStatus {
+    if (source.len == 0) return @constCast((&[_]types.GraphMetricBuildPageStatus{})[0..]);
+    const out = try alloc.alloc(types.GraphMetricBuildPageStatus, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*page| page.deinit(alloc);
+        alloc.free(out);
+    }
+    for (source, 0..) |page, i| {
+        const worker_id = if (page.worker_id.len > 0) try alloc.dupe(u8, page.worker_id) else "";
+        var worker_id_moved = false;
+        errdefer if (!worker_id_moved and worker_id.len > 0) alloc.free(worker_id);
+        const cursor = if (page.cursor.len > 0) try alloc.dupe(u8, page.cursor) else "";
+        var cursor_moved = false;
+        errdefer if (!cursor_moved and cursor.len > 0) alloc.free(cursor);
+        const last_error = if (page.last_error.len > 0) try alloc.dupe(u8, page.last_error) else "";
+        var last_error_moved = false;
+        errdefer if (!last_error_moved and last_error.len > 0) alloc.free(last_error);
+        out[i] = .{
+            .phase = page.phase,
+            .iteration = page.iteration,
+            .page_id = page.page_id,
+            .state = page.state,
+            .range_kind = page.range_kind,
+            .worker_id = worker_id,
+            .lease_expires_at_ms = page.lease_expires_at_ms,
+            .attempt = page.attempt,
+            .cursor = cursor,
+            .completed_units = page.completed_units,
+            .total_units = page.total_units,
+            .last_error = last_error,
+        };
+        worker_id_moved = true;
+        cursor_moved = true;
+        last_error_moved = true;
+        initialized += 1;
+    }
+    return out;
 }
 
 pub fn Impl(comptime DB: type) type {
@@ -136,7 +254,7 @@ pub fn Impl(comptime DB: type) type {
             if (execution_req.full_text_queries.len > 0 or execution_req.dense_queries.len > 0 or execution_req.sparse_queries.len > 0 or execution_req.merge_config != null) {
                 var composed = try Self.searchComposed(self, alloc, execution_req, exec_ctx);
                 errdefer composed.deinit();
-                try self.searchRuntimeApplyGraphMetricRerank(&composed, execution_req);
+                try Self.applyGraphMetricRerank(self, &composed, execution_req);
                 try db_query_result_shape.externalizeSearchResultArtifactIds(alloc, &composed);
                 return composed;
             }
@@ -180,10 +298,10 @@ pub fn Impl(comptime DB: type) type {
             errdefer base.deinit();
 
             if (execution_req.graph_metric_queries.len > 0) {
-                base.graph_metric_results = try self.searchRuntimeExecuteGraphMetricQueries(alloc, execution_req.graph_metric_queries);
+                base.graph_metric_results = try Self.executeGraphMetricQueries(self, alloc, execution_req.graph_metric_queries);
             }
 
-            try self.searchRuntimeApplyGraphMetricRerank(&base, execution_req);
+            try Self.applyGraphMetricRerank(self, &base, execution_req);
 
             if (execution_req.graph_queries.len == 0) {
                 try db_query_result_shape.externalizeSearchResultArtifactIds(alloc, &base);
@@ -223,6 +341,138 @@ pub fn Impl(comptime DB: type) type {
                 return next;
             }
             return null;
+        }
+
+        fn executeGraphMetricQueries(
+            self: *DB,
+            alloc: Allocator,
+            queries: []const types.NamedGraphMetricQuery,
+        ) ![]types.GraphMetricResult {
+            if (queries.len == 0) return &.{};
+            const results = try alloc.alloc(types.GraphMetricResult, queries.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (results[0..initialized]) |*result| result.deinit(alloc);
+                alloc.free(results);
+            }
+
+            for (queries, 0..) |named, i| {
+                results[i] = try executeGraphMetricQuery(self, alloc, named);
+                initialized += 1;
+            }
+            return results;
+        }
+
+        fn applyGraphMetricRerank(
+            self: *DB,
+            result: *types.SearchResult,
+            req: types.SearchRequest,
+        ) !void {
+            const rerank = req.graph_metric_rerank orelse return;
+            if (req.count_only) return error.UnsupportedQueryRequest;
+
+            const entry = self.core.graphIndex(rerank.index_name) orelse return error.IndexNotFound;
+            var status = try entry.index.graphMetricStatus(rerank.metric_name);
+            defer status.deinit(entry.index.alloc);
+
+            if (status.published_generation == 0) return error.MetricNotReady;
+            if (rerank.freshness == .fresh and status.state != .fresh) return error.MetricStale;
+
+            var result_status = try cloneGraphMetricStatusFromGraph(result.alloc, status);
+            var result_status_moved = false;
+            errdefer if (!result_status_moved) result_status.deinit(result.alloc);
+
+            for (result.hits) |*hit| {
+                const metric_score_opt = try entry.index.graphMetricScore(rerank.metric_name, hit.id);
+                const metric_score = metric_score_opt orelse rerank.missing_score;
+                const base_score: f64 = if (hit.score) |score| @floatCast(score) else 0.0;
+                const final_score = rerank.base_weight * base_score + rerank.weight * metric_score;
+                const clamped_final_score = clampF64ToF32(final_score);
+                const detail_index_name = try result.alloc.dupe(u8, rerank.index_name);
+                errdefer result.alloc.free(detail_index_name);
+                const detail_metric_name = try result.alloc.dupe(u8, rerank.metric_name);
+                errdefer result.alloc.free(detail_metric_name);
+                var score_details = types.GraphMetricRerankScoreDetails{
+                    .index_name = detail_index_name,
+                    .metric_name = detail_metric_name,
+                    .base_score = base_score,
+                    .base_weight = rerank.base_weight,
+                    .metric_score = metric_score_opt,
+                    .metric_score_used = metric_score,
+                    .metric_weight = rerank.weight,
+                    .missing_score_used = metric_score_opt == null,
+                    .final_score = clamped_final_score,
+                    .published_generation = status.published_generation,
+                };
+                var score_details_moved = false;
+                errdefer if (!score_details_moved) score_details.deinit(result.alloc);
+
+                if (hit.score_details) |*old_details| old_details.deinit(result.alloc);
+                hit.score_details = score_details;
+                score_details_moved = true;
+                hit.score = clamped_final_score;
+            }
+
+            std.mem.sort(types.SearchHit, result.hits, {}, struct {
+                fn lessThan(_: void, a: types.SearchHit, b: types.SearchHit) bool {
+                    const a_score = a.score orelse 0.0;
+                    const b_score = b.score orelse 0.0;
+                    if (a_score == b_score) return std.mem.lessThan(u8, a.id, b.id);
+                    return a_score > b_score;
+                }
+            }.lessThan);
+
+            if (result.graph_metric_rerank_status) |*old_status| old_status.deinit(result.alloc);
+            result.graph_metric_rerank_status = result_status;
+            result_status_moved = true;
+        }
+
+        fn clampF64ToF32(value: f64) f32 {
+            const max = std.math.floatMax(f32);
+            if (value > max) return max;
+            if (value < -max) return -max;
+            return @floatCast(value);
+        }
+
+        fn executeGraphMetricQuery(
+            self: *DB,
+            alloc: Allocator,
+            named: types.NamedGraphMetricQuery,
+        ) !types.GraphMetricResult {
+            const entry = self.core.graphIndex(named.query.index_name) orelse return error.IndexNotFound;
+            var status = try entry.index.graphMetricStatus(named.query.metric_name);
+            defer status.deinit(entry.index.alloc);
+
+            if (status.published_generation == 0) return error.MetricNotReady;
+            if (named.query.freshness == .fresh and status.state != .fresh) return error.MetricStale;
+
+            const raw_scores = try entry.index.graphMetricTopK(named.query.metric_name, named.query.top_k);
+            defer {
+                for (raw_scores) |*score| score.deinit(entry.index.alloc);
+                if (raw_scores.len > 0) entry.index.alloc.free(raw_scores);
+            }
+
+            const scores = try alloc.alloc(types.GraphMetricScore, raw_scores.len);
+            var initialized_scores: usize = 0;
+            errdefer {
+                for (scores[0..initialized_scores]) |*score| score.deinit(alloc);
+                alloc.free(scores);
+            }
+            for (raw_scores, 0..) |score, i| {
+                scores[i] = .{
+                    .node = try alloc.dupe(u8, score.node),
+                    .score = score.score,
+                };
+                initialized_scores += 1;
+            }
+
+            return .{
+                .name = try alloc.dupe(u8, named.name),
+                .index_name = try alloc.dupe(u8, named.query.index_name),
+                .metric_name = try alloc.dupe(u8, named.query.metric_name),
+                .scores = scores,
+                .status = try cloneGraphMetricStatusFromGraph(alloc, status),
+            };
         }
 
         fn searchComposed(

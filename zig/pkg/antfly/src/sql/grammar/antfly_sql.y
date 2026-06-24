@@ -598,6 +598,8 @@ comparison_expression:
   | additive_expression IS FALSE
   | additive_expression IS NOT TRUE
   | additive_expression IS NOT FALSE
+  | additive_expression IS DISTINCT FROM additive_expression
+  | additive_expression IS NOT DISTINCT FROM additive_expression
   ;
 
 comparison_operator:
