@@ -3691,7 +3691,7 @@ fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, qu
     }
 }
 
-fn generateBackendOverrideForChoice(choice: BackendChoice) ?api.GenerateBackendOverride {
+fn generateBackendOverrideForChoice(choice: BackendChoice) ?api.ModelBackend {
     return switch (choice) {
         .auto => null,
         .onnx => .onnx,
