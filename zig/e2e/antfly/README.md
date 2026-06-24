@@ -88,7 +88,7 @@ Use product-area names for test files. Do not use migration labels like `*_parit
   - cluster `/backup`, `/backups`, and `/restore` round-trip for local `file://` backups
   - backend-gated remote cluster round-trip coverage for `s3://` and `gs://`
 - `test_extensions.py`
-  - full-suite MemoryAF extension package projection from `extensions/memoryaf/0.0.1`
+  - full-suite MemoryAF extension package projection from `extensions/memoryaf`
   - swarm and distributed extension lifecycle dry-run coverage
   - swarm install plus scoped `/mcp/v1/extensions/memoryaf` tool listing coverage
 ## Harnesses

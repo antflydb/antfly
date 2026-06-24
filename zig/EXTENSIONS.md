@@ -80,15 +80,12 @@ Use an Antfly package manifest rather than PostgreSQL `.control` files:
 ```json
 {
   "name": "antfly_text_extras",
-  "default_version": "1.0.0",
+  "version": "1.0.0",
   "description": "Extra analyzers and query helpers",
-  "requires": ["antfly_core"],
+  "dependencies": [{ "name": "antfly_core", "version_requirement": ">=1.0.0" }],
   "trusted": true,
   "relocatable": false,
-  "entrypoints": {
-    "manifest": "extension.json",
-    "wasm": "extension.wasm"
-  }
+  "artifacts": [{ "kind": "wasm", "path": "runtime/extension.wasm" }]
 }
 ```
 
@@ -111,17 +108,23 @@ available package = files/artifacts Antfly can resolve
 installed extension = metadata/catalog state Antfly reconciles
 ```
 
-For embedded and local development, a configured extension directory is enough:
+The package name, version, and digest are declared by `extension.json`. The
+filesystem path is not part of package identity and must not be used as the
+version authority. This mirrors the useful part of PostgreSQL's extension model:
+stable extension names plus versioned metadata/update artifacts, without making
+the source tree layout the lifecycle contract.
+
+For embedded and local development, a configured extension source directory is
+enough. The canonical source layout is flat by package name:
 
 ```text
 $ANTFLY_HOME/extensions/
   memoryaf/
-    1.0.0/
-      extension.json
-      updates/
-        1.0.0--1.1.0.json
-      runtime/
-        extension.wasm
+    extension.json
+    updates/
+      1.0.0--1.1.0.json
+    runtime/
+      extension.wasm
 ```
 
 For hosted deployments, use an operator-controlled, read-only,
@@ -139,11 +142,10 @@ means resolve the package from configured trusted sources, verify its manifest,
 digest/signature, version, and capabilities, then write installed-extension
 metadata. Metadata remains the source of truth for installed extensions.
 
-The v1 scanner may still accept loose nested `extension.json` manifests for
-local development, but it should classify each discovered manifest as canonical
-`<name>/<version>`, content-addressed `sha256/<digest>`, or loose. Hosted and
-registry-backed profiles should require canonical or content-addressed layouts
-before exposing a package as trusted.
+The v1 scanner accepts only canonical `<name>/extension.json` source packages or
+content-addressed `sha256/<digest>/extension.json` packages. Other nested
+`extension.json` files are ignored rather than treated as alternate package
+layouts.
 
 ### 2. Extension Catalog
 
