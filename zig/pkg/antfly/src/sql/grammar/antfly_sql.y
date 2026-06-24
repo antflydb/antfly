@@ -66,7 +66,7 @@ transaction_statement:
 
 prepared_statement:
     PREPARE IDENT prepare_parameter_types_opt AS statement
-  | EXECUTE IDENT argument_list_opt
+  | EXECUTE IDENT execute_argument_list_opt
   | DEALLOCATE IDENT
   ;
 
@@ -292,8 +292,8 @@ select_item:
   ;
 
 window_function_expression:
-    qualified_name LPAREN argument_list_opt RPAREN OVER LPAREN window_definition RPAREN
-  | qualified_name LPAREN argument_list_opt RPAREN OVER IDENT
+    qualified_name LPAREN function_argument_list_opt RPAREN OVER LPAREN window_definition RPAREN
+  | qualified_name LPAREN function_argument_list_opt RPAREN OVER IDENT
   ;
 
 window_definition:
@@ -540,10 +540,15 @@ if_exists_opt:
   | IF EXISTS
   ;
 
-argument_list_opt:
+execute_argument_list_opt:
     /* empty */
   | LPAREN RPAREN
   | LPAREN expression_list RPAREN
+  ;
+
+function_argument_list_opt:
+    /* empty */
+  | expression_list
   ;
 
 expression_list:
@@ -602,7 +607,7 @@ primary_expression:
   | qualified_name
   | PLACEHOLDER
   | LPAREN expression RPAREN
-  | qualified_name LPAREN argument_list_opt RPAREN
+  | qualified_name LPAREN function_argument_list_opt RPAREN
   ;
 
 literal:

@@ -850,6 +850,7 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
         read: classifier.SqlReadStatementKind,
     }{
         .{ .sql = "SELECT id, status FROM usage_records WHERE status = 'open' ORDER BY id LIMIT 10", .generated = .query, .read = .query },
+        .{ .sql = "SELECT concat_ws(',', status), id FROM usage_records ORDER BY status, id", .generated = .query, .read = .query },
         .{ .sql = "SELECT id, row_number() OVER (PARTITION BY tenant, account ORDER BY id) AS rn FROM usage_records ORDER BY id, tenant", .generated = .window, .read = .window },
         .{ .sql = "SELECT DISTINCT status FROM usage_records ORDER BY status", .generated = .aggregate, .read = .aggregate },
         .{ .sql = "SELECT DISTINCT ON (organization_id) organization_id, id FROM usage_records ORDER BY organization_id ASC, created_at DESC", .generated = .query, .read = .query },
@@ -893,6 +894,13 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 14, .end = 15 }, read_ast.limit_tokens.?);
                     try std.testing.expectEqual(@as(usize, 2), read_ast.projection_items.count);
                     try std.testing.expectEqual(@as(usize, 1), read_ast.order_items.count);
+                } else if (std.mem.eql(u8, case.sql, "SELECT concat_ws(',', status), id FROM usage_records ORDER BY status, id")) {
+                    try std.testing.expectEqual(@as(usize, 2), read_ast.projection_items.count);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = 7 }, read_ast.projection_items.first_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read_ast.projection_items.last_tokens.?);
+                    try std.testing.expectEqual(@as(usize, 2), read_ast.order_items.count);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 13, .end = 14 }, read_ast.order_items.first_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 15, .end = 16 }, read_ast.order_items.last_tokens.?);
                 } else if (std.mem.eql(u8, case.sql, "SELECT id, row_number() OVER (PARTITION BY tenant, account ORDER BY id) AS rn FROM usage_records ORDER BY id, tenant")) {
                     try std.testing.expectEqual(@as(usize, 2), read_ast.projection_items.count);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read_ast.projection_items.first_tokens.?);

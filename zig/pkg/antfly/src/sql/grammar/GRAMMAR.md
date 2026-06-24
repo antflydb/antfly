@@ -90,7 +90,9 @@ window clauses, ordering, pagination, set-operation tails, and CTE prefixes,
 list-level generated metadata for top-level projection, grouping, and ordering
 items, and first-join generated metadata for left input, right input, and join
 predicate ranges, plus simple top-level comparison expression metadata for
-covered `WHERE`, `HAVING`, and join predicates,
+covered `WHERE`, `HAVING`, and join predicates. Normal function-call argument
+lists are accepted in generated expression grammar, including top-level
+projection functions with comma-separated arguments,
 and an initial generated AST-to-plan wrapper that validates those ranges and
 fails closed if the generated read family is incompatible with the existing
 read classifier. Simple query, aggregate, join, and lateral reads now validate
@@ -226,7 +228,8 @@ Suggested migration order:
    grouping, and ordering items and first-join metadata for left input, right
    input, and join predicate ranges, plus simple top-level comparison
    expression metadata for covered `WHERE`, `HAVING`, and join predicates; and
-   generated read ASTs now have a validated wrapper
+   normal function-call argument lists are accepted by the generated expression
+   grammar for covered read projections. Generated read ASTs now have a validated wrapper
    into the current typed read lowerer for representative covered read plans
    that rejects malformed generated range payloads. Simple query reads now have
    a direct generated AST-to-query-plan lowering boundary after clause-range
@@ -250,9 +253,9 @@ Suggested migration order:
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, expression-level and
    full join-tree generated query-body ASTs, full expression AST nodes beyond
-   list-level and simple-comparison metadata, per-CTE generated body arrays,
-   recursive CTE planning, direct generated read-plan lowering, and
-   unsupported-shape diagnostics.
+   list-level and simple-comparison metadata, broader function/operator
+   expression coverage, per-CTE generated body arrays, recursive CTE planning,
+   direct generated read-plan lowering, and unsupported-shape diagnostics.
 5. Advanced DML: `INSERT ... SELECT`, `UPDATE ... FROM`, `DELETE ... USING`,
    `TRUNCATE`, and `MERGE`.
 6. Antfly extensions: graph traversal DSL, graph metric query surfaces,
