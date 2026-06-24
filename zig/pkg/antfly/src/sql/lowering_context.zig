@@ -35,6 +35,8 @@ const token_mod = @import("token.zig");
 const tokenized = @import("tokenized.zig");
 const value_mod = @import("value.zig");
 
+const GeneratedReadValidationError = error{UnsupportedSqlShape};
+
 pub const ReadPlanLoweringCallbacks = struct {
     lower_lateral_with_schemas: *const fn (
         std.mem.Allocator,
@@ -104,6 +106,13 @@ pub const ReadPlanLoweringContext = struct {
     }
 
     pub fn lowerParsed(self: *@This(), parsed_sql: *const tokenized.ParsedSql) !plan.LoweredReadPlan {
+        if (generatedReadAstForParsedSql(parsed_sql)) |read_ast| {
+            return try lowerReadPlanFromGeneratedReadAstAlloc(self, parsed_sql, read_ast.*);
+        }
+        return try self.lowerParsedWithClassifier(parsed_sql);
+    }
+
+    fn lowerParsedWithClassifier(self: *@This(), parsed_sql: *const tokenized.ParsedSql) !plan.LoweredReadPlan {
         const old_statement_kind = self.statement_kind;
         const old_parsed_sql = self.parsed_sql;
         self.statement_kind = parsed_sql.readStatementKind();
@@ -166,6 +175,18 @@ pub const ReadPlanLoweringContext = struct {
         return try self.callbacks.lower_set_operation_optional_source_schema(self.alloc, self.parsed_sql.?, self.schema, self.source_schema, self.params, self.function_bindings);
     }
 };
+
+fn generatedReadAstForParsedSql(parsed_sql: *const tokenized.ParsedSql) ?*const generated_parser.GeneratedSqlReadAst {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            return switch (generated_ast.*) {
+                .read => |*read| read,
+                else => null,
+            };
+        }
+    }
+    return null;
+}
 
 pub fn lowerReadPlanFromGeneratedReadAstAlloc(
     context: *ReadPlanLoweringContext,
@@ -239,8 +260,7 @@ pub fn lowerReadPlanFromGeneratedReadAstAlloc(
             if (validateGeneratedCteReadAst(parsed_sql.items(), read_ast)) |_| {
                 break :blk try lowerGeneratedCteReadPlanAlloc(context, parsed_sql, read_kind);
             } else |err| switch (err) {
-                error.UnsupportedSqlShape => break :blk try context.lowerParsed(parsed_sql),
-                else => return err,
+                error.UnsupportedSqlShape => break :blk try context.lowerParsedWithClassifier(parsed_sql),
             }
         },
     };
@@ -389,6 +409,9 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: gen
         .window => {
             if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return error.UnsupportedSqlShape;
             try validateGeneratedReadRangeContainsKeyword(tokens, read_ast.projection_tokens.?, .over);
+        },
+        .set_operation => {
+            if (read_ast.projection_tokens == null or read_ast.source_tokens == null or read_ast.set_operation_tokens == null) return error.UnsupportedSqlShape;
         },
         .cte => {
             if (read_ast.cte_tokens == null or read_ast.projection_tokens == null) return error.UnsupportedSqlShape;
@@ -1257,7 +1280,7 @@ fn validateGeneratedExpressionAstRanges(
     tokens: []const tokenized.Token,
     read_ast: generated_parser.GeneratedSqlReadAst,
     expression: generated_parser.GeneratedSqlExpressionAst,
-) !void {
+) GeneratedReadValidationError!void {
     try validateGeneratedExpressionAstStructure(expression);
     const ranges = [_]?generated_parser.GeneratedSqlTokenRange{
         expression.tokens,
@@ -1556,7 +1579,7 @@ fn validateGeneratedReadListAstRanges(
     tokens: []const tokenized.Token,
     read_ast: generated_parser.GeneratedSqlReadAst,
     list: generated_parser.GeneratedSqlListAst,
-) !void {
+) GeneratedReadValidationError!void {
     if (list.count == 0) {
         if (list.items.len != 0 or
             list.expression_items.len != 0 or

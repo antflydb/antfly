@@ -357,8 +357,10 @@ Suggested migration order:
    predicate, and ordering expressions, range-bound helper metadata for
    `lower`/`upper`-style projection, predicate, and ordering expressions, and
    searched `CASE WHEN ... THEN ... ELSE ... END` branch metadata.
-   Generated read ASTs now have a validated wrapper
-   into the current typed read lowerer for representative covered read plans
+   The read-plan lowering context now dispatches through retained generated
+   read ASTs when the generated parser covers the statement, and generated read
+   ASTs have a validated wrapper into the current typed read lowerer for
+   representative covered read plans
    that rejects malformed generated range payloads, including owned
    projection/group/order list item metadata and nested generated expression
    range metadata, and malformed structural metadata for covered generated
@@ -541,7 +543,8 @@ variants for:
   and `TRUNCATE`, and an initial AST-to-plan wrapper for the other
   generated-covered write statements
 - read statement, including a generated AST payload for command spans and an
-  initial AST-to-plan wrapper for generated-covered read statements
+  generated-first AST-to-plan dispatch for generated-covered read statements,
+  backed by validated wrappers into the current typed read lowerers
 - graph statement, including a generated AST payload for command spans and
   graph-specific AST-to-plan wrappers for seed graph index and graph metric DDL
 - unsupported statement, including generated AST payloads for seed `ANALYZE`,
@@ -605,9 +608,10 @@ Generated grammar work needs evidence at multiple levels:
   coverage for non-CTE merge plans, and initial generated AST-to-plan parity
   through a generated-family validation wrapper over other representative write
   plans. Read plans have initial
-  generated AST-to-plan parity through a generated-family validation wrapper
-  over representative query, aggregate, join, lateral, and non-recursive CTE
-  plans, AST-shape coverage for generated-ranged multi-CTE and recursive CTE
+  generated AST-to-plan parity through generated-first read lowering context
+  dispatch and generated-family validation wrappers over representative query,
+  aggregate, join, lateral, and non-recursive CTE plans, AST-shape coverage for
+  generated-ranged multi-CTE and recursive CTE
   prefixes, single- and multi-join component range/tree coverage with
   fail-closed single-join lowerer validation, and simple comparison plus
   positive/negated predicate expression-shape coverage for read predicates,
