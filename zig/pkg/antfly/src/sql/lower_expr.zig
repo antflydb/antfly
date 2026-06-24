@@ -186,6 +186,19 @@ fn validateGeneratedSingleJoinForClause(
     if (join.tokens.end > tokens.len) return error.UnsupportedSqlShape;
 }
 
+fn validateGeneratedJoinExecutableContract(
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+    expected_read_kind: generated_parser.GeneratedSqlReadKind,
+) !void {
+    const read = generated_read_ast orelse return;
+    if (read.kind != expected_read_kind and read.kind != .cte) return error.UnsupportedSqlShape;
+    const root_index = read.join_tree_root_index orelse return error.UnsupportedSqlShape;
+    if (read.join_items.len != 1 or root_index != 0 or read.join_tree_depth != 1) return error.UnsupportedSqlShape;
+    const join = read.join_items[0];
+    if (join.tree_index != 0 or join.tree_depth != 1 or join.left_child_index != null) return error.UnsupportedSqlShape;
+    if (join.condition_kind != .on or join.predicate_tokens == null) return error.UnsupportedSqlShape;
+}
+
 pub const WindowParserOptions = struct {
     params: []const value_mod.SqlValue = &.{},
     available_ctes: []const db_mod.types.RelationalRowsCte = &.{},
@@ -16654,6 +16667,7 @@ pub fn parseJoinAlloc(
     pos: *usize,
     options: JoinParserOptions,
 ) !plan_mod.LoweredJoin {
+    try validateGeneratedJoinExecutableContract(options.generated_read_ast, .join);
     try parser.expectKeyword(tokens, pos, "select");
 
     const raw_select = try plan_mod.parseJoinProjectionListAlloc(alloc, tokens, pos);
@@ -34355,6 +34369,18 @@ test "sql adapter lower expr lowers equality join queries" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedJoinForLowerExprTestAlloc(
         alloc,
         &malformed_generated_join,
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id FROM usage_records AS o JOIN usage_records AS c ON o.customer_id = c.id JOIN usage_records AS s ON c.scope = s.scope",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id FROM usage_records AS o JOIN usage_records AS c USING (tenant)",
         schema,
         &.{},
     ));

@@ -161,7 +161,11 @@ generated clause ranges before calling their typed read-plan lowerers directly;
 single binary join reads also validate generated join-tree metadata against the
 typed join lowerer before producing a join plan, and generated join reads now
 fail closed on malformed left-associative tree metadata, first-join
-compatibility metadata, and `ON`/`USING` condition payloads;
+compatibility metadata, and `ON`/`USING` condition payloads. The executable
+join contract is intentionally limited to one generated binary `ON` join until
+the row-plan API grows an N-way join representation; generated multi-join and
+`USING` join ASTs fail closed before the typed lowerer can partially parse
+them;
 basic `OVER (PARTITION BY ... ORDER BY ...)` window reads now classify as a
 generated window family, inline function-call `OVER` clauses carry generated
 name/definition, partition-list, order-list, and frame-tail expression
@@ -753,7 +757,8 @@ Generated grammar work needs evidence at multiple levels:
   aggregate, join, lateral, and non-recursive CTE plans, AST-shape coverage for
   generated-ranged multi-CTE and recursive CTE
   prefixes, single- and multi-join component range/tree coverage with
-  fail-closed single-join lowerer validation, and simple comparison plus
+  fail-closed executable-contract validation for unsupported generated
+  multi-join and `USING` join ASTs, and simple comparison plus
   positive/negated predicate expression-shape coverage for read predicates,
   including escaped `LIKE`/`ILIKE` pattern metadata and fail-closed
   expression-owned token range containment plus operator/kind token
