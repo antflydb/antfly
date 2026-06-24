@@ -335,6 +335,8 @@ pub const GeneratedSqlExpressionAst = struct {
     current_timestamp_precision_tokens: ?GeneratedSqlTokenRange = null,
     extract_field_tokens: ?GeneratedSqlTokenRange = null,
     extract_source_tokens: ?GeneratedSqlTokenRange = null,
+    extract_source_expression_kind: ?GeneratedSqlExpressionKind = null,
+    extract_source_expression: ?*GeneratedSqlExpressionAst = null,
     left_tokens: ?GeneratedSqlTokenRange = null,
     left_expression_kind: ?GeneratedSqlExpressionKind = null,
     left_expression: ?*GeneratedSqlExpressionAst = null,
@@ -396,6 +398,10 @@ pub const GeneratedSqlExpressionAst = struct {
         if (self.boolean_last_condition) |boolean_last_condition| {
             boolean_last_condition.deinit(alloc);
             alloc.destroy(boolean_last_condition);
+        }
+        if (self.extract_source_expression) |extract_source_expression| {
+            extract_source_expression.deinit(alloc);
+            alloc.destroy(extract_source_expression);
         }
         self.subquery_projection_items.deinit(alloc);
         if (self.subquery_where_expression) |subquery_where_expression| {
@@ -2991,6 +2997,8 @@ fn buildGeneratedExpressionAst(alloc: std.mem.Allocator, tokens: []const token_m
         ast.kind = .extract_expression;
         ast.extract_field_tokens = extract_expression.field_tokens;
         ast.extract_source_tokens = extract_expression.source_tokens;
+        ast.extract_source_expression_kind = generatedExpressionKindForRange(tokens, extract_expression.source_tokens);
+        ast.extract_source_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, extract_expression.source_tokens);
         return ast;
     }
     if (findTopLevelExpressionOperator(tokens, range)) |operator| {
@@ -7080,12 +7088,18 @@ test "generated SQL parser exposes extract expression AST metadata" {
             try std.testing.expectEqual(GeneratedSqlExpressionKind.extract_expression, read.projection_first_expression.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read.projection_first_expression.extract_field_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.projection_first_expression.extract_source_tokens.?);
+            try std.testing.expect(read.projection_first_expression.extract_source_expression_kind == null);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.projection_first_expression.extract_source_expression.?.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.projection_first_expression.extract_source_expression.?.tokens.?);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.kind);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.extract_expression, read.where_expression.left_expression_kind.?);
             const predicate_extract = read.where_expression.left_expression orelse return error.TestUnexpectedResult;
             try std.testing.expectEqual(GeneratedSqlExpressionKind.extract_expression, predicate_extract.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 14, .end = 15 }, predicate_extract.extract_field_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 16, .end = 17 }, predicate_extract.extract_source_tokens.?);
+            try std.testing.expect(predicate_extract.extract_source_expression_kind == null);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, predicate_extract.extract_source_expression.?.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 16, .end = 17 }, predicate_extract.extract_source_expression.?.tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 18, .end = 19 }, read.where_expression.operator_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 19, .end = 20 }, read.where_expression.right_tokens.?);
         },

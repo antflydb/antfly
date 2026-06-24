@@ -383,7 +383,8 @@ Unsupported DDL remains on the existing parser until
    lowerer-backed date/time functions such as `date_bin`, generated `TIMESTAMP
    '...'` / `TIMESTAMPTZ '...'` literal type/value ranges, generated
    `CURRENT_DATE` and `CURRENT_TIMESTAMP(...)` temporal keyword ranges,
-   generated `EXTRACT(field FROM expression)` field/source ranges, lowerer-backed
+   generated `EXTRACT(field FROM expression)` field/source ranges with owned
+   source expression payloads, lowerer-backed
    temporal function metadata for `date_part`/`date_trunc`-style projection,
    predicate, and ordering expressions, range-bound helper metadata for
    `lower`/`upper`-style projection, predicate, and ordering expressions, and

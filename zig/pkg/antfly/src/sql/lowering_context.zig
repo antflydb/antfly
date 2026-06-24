@@ -980,6 +980,7 @@ fn generatedExpressionAstHasMetadata(expression: generated_parser.GeneratedSqlEx
         expression.current_timestamp_precision_tokens != null or
         expression.extract_field_tokens != null or
         expression.extract_source_tokens != null or
+        expression.extract_source_expression != null or
         expression.left_tokens != null or
         expression.negation_tokens != null or
         expression.operator_tokens != null or
@@ -1247,6 +1248,7 @@ fn validateGeneratedExpressionAstStructure(expression: generated_parser.Generate
             if (expression.tokens == null or expression.extract_field_tokens == null or expression.extract_source_tokens == null) {
                 return error.UnsupportedSqlShape;
             }
+            try requireGeneratedExpressionAstChild(expression.extract_source_expression_kind, expression.extract_source_tokens, expression.extract_source_expression);
         },
         .function_call => {
             if (expression.tokens == null or expression.function_name_tokens == null) return error.UnsupportedSqlShape;
@@ -1418,6 +1420,7 @@ fn validateGeneratedExpressionAstRanges(
     if (expression.case_else_expression) |case_else_expression| try validateGeneratedExpressionAstRanges(tokens, read_ast, case_else_expression.*);
     if (expression.boolean_first_condition) |boolean_first_condition| try validateGeneratedExpressionAstRanges(tokens, read_ast, boolean_first_condition.*);
     if (expression.boolean_last_condition) |boolean_last_condition| try validateGeneratedExpressionAstRanges(tokens, read_ast, boolean_last_condition.*);
+    if (expression.extract_source_expression) |extract_source_expression| try validateGeneratedExpressionAstRanges(tokens, read_ast, extract_source_expression.*);
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.argument_items);
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.argument_order_items);
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.within_group_order_items);
@@ -2584,6 +2587,22 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_case_expression_parsed_sql, malformed_case_expression_read_ast),
+    );
+
+    var malformed_extract_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT EXTRACT(dow FROM amount) AS amount_dow FROM usage_records WHERE id = 'u1'",
+    );
+    defer malformed_extract_expression_parsed_sql.deinit(alloc);
+    const malformed_extract_expression_generated_raw = malformed_extract_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_extract_expression_read_ast = switch (malformed_extract_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_extract_expression_read_ast.projection_items.expressions[0].extract_source_expression = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_extract_expression_parsed_sql, malformed_extract_expression_read_ast),
     );
 
     var malformed_join_tree_parsed_sql = try tokenized.ParsedSql.initAlloc(
