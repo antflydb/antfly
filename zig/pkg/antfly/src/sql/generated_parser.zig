@@ -206,6 +206,7 @@ pub const GeneratedSqlExpressionKind = enum {
     function_call,
     array_constructor,
     cast,
+    case_expression,
 };
 
 pub const GeneratedSqlBetweenModifier = enum {
@@ -239,6 +240,19 @@ pub const GeneratedSqlExpressionAst = struct {
     cast_expression_kind: ?GeneratedSqlExpressionKind = null,
     cast_expression: ?*GeneratedSqlExpressionAst = null,
     cast_type_tokens: ?GeneratedSqlTokenRange = null,
+    case_branch_count: usize = 0,
+    case_first_when_tokens: ?GeneratedSqlTokenRange = null,
+    case_last_when_tokens: ?GeneratedSqlTokenRange = null,
+    case_first_condition_tokens: ?GeneratedSqlTokenRange = null,
+    case_first_condition_kind: ?GeneratedSqlExpressionKind = null,
+    case_first_condition: ?*GeneratedSqlExpressionAst = null,
+    case_first_result_tokens: ?GeneratedSqlTokenRange = null,
+    case_first_result_kind: ?GeneratedSqlExpressionKind = null,
+    case_first_result: ?*GeneratedSqlExpressionAst = null,
+    case_else_tokens: ?GeneratedSqlTokenRange = null,
+    case_else_expression_tokens: ?GeneratedSqlTokenRange = null,
+    case_else_expression_kind: ?GeneratedSqlExpressionKind = null,
+    case_else_expression: ?*GeneratedSqlExpressionAst = null,
     left_tokens: ?GeneratedSqlTokenRange = null,
     left_expression_kind: ?GeneratedSqlExpressionKind = null,
     left_expression: ?*GeneratedSqlExpressionAst = null,
@@ -278,6 +292,18 @@ pub const GeneratedSqlExpressionAst = struct {
         if (self.cast_expression) |cast_expression| {
             cast_expression.deinit(alloc);
             alloc.destroy(cast_expression);
+        }
+        if (self.case_first_condition) |case_first_condition| {
+            case_first_condition.deinit(alloc);
+            alloc.destroy(case_first_condition);
+        }
+        if (self.case_first_result) |case_first_result| {
+            case_first_result.deinit(alloc);
+            alloc.destroy(case_first_result);
+        }
+        if (self.case_else_expression) |case_else_expression| {
+            case_else_expression.deinit(alloc);
+            alloc.destroy(case_else_expression);
         }
         self.argument_items.deinit(alloc);
         self.argument_order_items.deinit(alloc);
@@ -581,6 +607,8 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT status state, id FROM usage_records", .kind = .read },
     .{ .sql = "SELECT CAST(id AS text) AS id_text FROM usage_records WHERE id = 'u1'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE CAST(amount + 1 AS text) = '2'", .kind = .read },
+    .{ .sql = "SELECT CASE WHEN email IS NULL THEN 'missing' WHEN email = 'blocked@example.test' THEN 'blocked' ELSE lower(status) END AS email_bucket FROM usage_records WHERE id = 'u1'", .kind = .read },
+    .{ .sql = "SELECT CASE WHEN email IS NULL THEN NULL ELSE email END AS maybe_email FROM usage_records WHERE id = 'u1'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status LIKE 'open%'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status ILIKE 'open%'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status LIKE 'op!_%' ESCAPE '!'", .kind = .read },
@@ -1956,6 +1984,25 @@ fn buildGeneratedExpressionAst(alloc: std.mem.Allocator, tokens: []const token_m
         ast.cast_type_tokens = cast_expression.type_tokens;
         return ast;
     }
+    if (generatedCaseExpression(tokens, range)) |case_expression| {
+        ast.kind = .case_expression;
+        ast.case_branch_count = case_expression.branch_count;
+        ast.case_first_when_tokens = case_expression.first_when_tokens;
+        ast.case_last_when_tokens = case_expression.last_when_tokens;
+        ast.case_first_condition_tokens = case_expression.first_condition_tokens;
+        ast.case_first_condition_kind = generatedExpressionKindForRange(tokens, case_expression.first_condition_tokens);
+        ast.case_first_condition = try buildGeneratedExpressionNodeAlloc(alloc, tokens, case_expression.first_condition_tokens);
+        ast.case_first_result_tokens = case_expression.first_result_tokens;
+        ast.case_first_result_kind = generatedExpressionKindForRange(tokens, case_expression.first_result_tokens);
+        ast.case_first_result = try buildGeneratedExpressionNodeAlloc(alloc, tokens, case_expression.first_result_tokens);
+        ast.case_else_tokens = case_expression.else_tokens;
+        ast.case_else_expression_tokens = case_expression.else_expression_tokens;
+        if (case_expression.else_expression_tokens) |else_expression_tokens| {
+            ast.case_else_expression_kind = generatedExpressionKindForRange(tokens, else_expression_tokens);
+            ast.case_else_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, else_expression_tokens);
+        }
+        return ast;
+    }
     if (generatedFunctionCallExpression(tokens, range)) |function_call| {
         ast.kind = .function_call;
         ast.function_name_tokens = function_call.name_tokens;
@@ -2055,6 +2102,7 @@ fn generatedExpressionKindForRange(tokens: []const token_mod.Token, range: Gener
     if (generatedSubqueryExpressionInnerRange(tokens, range) != null) return .subquery;
     if (generatedWrappedExpressionInnerRange(tokens, range) != null) return .grouped;
     if (generatedCastExpression(tokens, range) != null) return .cast;
+    if (generatedCaseExpression(tokens, range) != null) return .case_expression;
     if (generatedFunctionCallExpression(tokens, range) != null) return .function_call;
     if (generatedArrayConstructorExpression(tokens, range) != null) return .array_constructor;
     return if (findTopLevelExpressionOperator(tokens, range)) |operator| operator.kind else null;
@@ -2258,6 +2306,117 @@ fn isGeneratedTypeNameRange(tokens: []const token_mod.Token, range: GeneratedSql
         name_end = range.end - 2;
     }
     return isGeneratedQualifiedNameRange(tokens, .{ .start = range.start, .end = name_end });
+}
+
+const GeneratedCaseExpression = struct {
+    branch_count: usize,
+    first_when_tokens: GeneratedSqlTokenRange,
+    last_when_tokens: GeneratedSqlTokenRange,
+    first_condition_tokens: GeneratedSqlTokenRange,
+    first_result_tokens: GeneratedSqlTokenRange,
+    else_tokens: ?GeneratedSqlTokenRange = null,
+    else_expression_tokens: ?GeneratedSqlTokenRange = null,
+};
+
+fn generatedCaseExpression(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?GeneratedCaseExpression {
+    if (range.start + 5 > range.end or range.end > tokens.len) return null;
+    if (!tokens[range.start].matchesKeywordTag(.case)) return null;
+    if (!tokens[range.end - 1].matchesKeywordTag(.end)) return null;
+    var cursor = range.start + 1;
+    var branch_count: usize = 0;
+    var first_when_tokens: ?GeneratedSqlTokenRange = null;
+    var last_when_tokens: ?GeneratedSqlTokenRange = null;
+    var first_condition_tokens: ?GeneratedSqlTokenRange = null;
+    var first_result_tokens: ?GeneratedSqlTokenRange = null;
+    var else_tokens: ?GeneratedSqlTokenRange = null;
+    var else_expression_tokens: ?GeneratedSqlTokenRange = null;
+    const body_end = range.end - 1;
+    while (cursor < body_end) {
+        if (tokens[cursor].matchesKeywordTag(.@"else")) {
+            const expression_tokens = GeneratedSqlTokenRange{ .start = cursor + 1, .end = body_end };
+            if (expression_tokens.start >= expression_tokens.end) return null;
+            else_tokens = .{ .start = cursor, .end = body_end };
+            else_expression_tokens = expression_tokens;
+            cursor = body_end;
+            break;
+        }
+        if (!tokens[cursor].matchesKeywordTag(.when)) return null;
+        const then_index = findTopLevelCaseKeyword(tokens, cursor + 1, body_end, .then) orelse return null;
+        if (cursor + 1 >= then_index) return null;
+        const next_index = findNextTopLevelCaseBoundary(tokens, then_index + 1, body_end) orelse body_end;
+        if (then_index + 1 >= next_index) return null;
+        const when_tokens = GeneratedSqlTokenRange{ .start = cursor, .end = next_index };
+        if (branch_count == 0) {
+            first_when_tokens = when_tokens;
+            first_condition_tokens = .{ .start = cursor + 1, .end = then_index };
+            first_result_tokens = .{ .start = then_index + 1, .end = next_index };
+        }
+        last_when_tokens = when_tokens;
+        branch_count += 1;
+        cursor = next_index;
+    }
+    if (branch_count == 0 or cursor != body_end) return null;
+    return .{
+        .branch_count = branch_count,
+        .first_when_tokens = first_when_tokens.?,
+        .last_when_tokens = last_when_tokens.?,
+        .first_condition_tokens = first_condition_tokens.?,
+        .first_result_tokens = first_result_tokens.?,
+        .else_tokens = else_tokens,
+        .else_expression_tokens = else_expression_tokens,
+    };
+}
+
+fn findNextTopLevelCaseBoundary(tokens: []const token_mod.Token, start: usize, end: usize) ?usize {
+    var depth: usize = 0;
+    var case_depth: usize = 0;
+    var index = start;
+    while (index < end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth == 0) return null;
+                depth -= 1;
+            },
+            else => if (depth == 0) {
+                if (tokens[index].matchesKeywordTag(.case)) {
+                    case_depth += 1;
+                } else if (tokens[index].matchesKeywordTag(.end)) {
+                    if (case_depth == 0) return null;
+                    case_depth -= 1;
+                } else if (case_depth == 0 and (tokens[index].matchesKeywordTag(.when) or tokens[index].matchesKeywordTag(.@"else"))) {
+                    return index;
+                }
+            },
+        }
+    }
+    return null;
+}
+
+fn findTopLevelCaseKeyword(tokens: []const token_mod.Token, start: usize, end: usize, keyword: token_mod.TokenKeyword) ?usize {
+    var depth: usize = 0;
+    var case_depth: usize = 0;
+    var index = start;
+    while (index < end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth == 0) return null;
+                depth -= 1;
+            },
+            else => if (depth == 0) {
+                if (tokens[index].matchesKeywordTag(.case)) {
+                    case_depth += 1;
+                } else if (tokens[index].matchesKeywordTag(.end)) {
+                    if (case_depth == 0) return null;
+                    case_depth -= 1;
+                } else if (case_depth == 0 and tokens[index].matchesKeywordTag(keyword)) {
+                    return index;
+                }
+            },
+        }
+    }
+    return null;
 }
 
 fn generatedWrappedExpressionInnerRange(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?GeneratedSqlTokenRange {
@@ -2927,6 +3086,50 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 12 }, cast_expression.cast_type_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 14 }, read.where_expression.operator_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 14, .end = 15 }, read.where_expression.right_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const case_projection_read_sql = "SELECT CASE WHEN email IS NULL THEN 'missing' WHEN email = 'blocked@example.test' THEN 'blocked' ELSE lower(status) END AS email_bucket FROM usage_records WHERE id = 'u1'";
+    const case_projection_read_result = try parseSqlAlloc(alloc, case_projection_read_sql);
+    switch (case_projection_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 22 }, read.projection_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), read.projection_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 22 }, read.projection_items.items[0]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 20 }, read.projection_items.expression_items[0]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 20, .end = 22 }, read.projection_items.alias_items[0].?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 21, .end = 22 }, read.projection_items.alias_name_items[0].?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.case_expression, read.projection_items.expressions[0].kind);
+            try std.testing.expectEqual(@as(usize, 2), read.projection_items.expressions[0].case_branch_count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 8 }, read.projection_items.expressions[0].case_first_when_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 14 }, read.projection_items.expressions[0].case_last_when_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 6 }, read.projection_items.expressions[0].case_first_condition_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.is_null, read.projection_items.expressions[0].case_first_condition_kind.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.projection_items.expressions[0].case_first_result_tokens.?);
+            try std.testing.expect(read.projection_items.expressions[0].case_first_result_kind == null);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.projection_items.expressions[0].case_first_result.?.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 14, .end = 19 }, read.projection_items.expressions[0].case_else_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 15, .end = 19 }, read.projection_items.expressions[0].case_else_expression_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.function_call, read.projection_items.expressions[0].case_else_expression_kind.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.function_call, read.projection_items.expressions[0].case_else_expression.?.kind);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const null_case_projection_read_sql = "SELECT CASE WHEN email IS NULL THEN NULL ELSE email END AS maybe_email FROM usage_records WHERE id = 'u1'";
+    const null_case_projection_read_result = try parseSqlAlloc(alloc, null_case_projection_read_sql);
+    switch (null_case_projection_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.case_expression, read.projection_items.expressions[0].kind);
+            try std.testing.expectEqual(@as(usize, 1), read.projection_items.expressions[0].case_branch_count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 8 }, read.projection_items.expressions[0].case_first_when_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 6 }, read.projection_items.expressions[0].case_first_condition_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.projection_items.expressions[0].case_first_result_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 10 }, read.projection_items.expressions[0].case_else_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.projection_items.expressions[0].case_else_expression_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
