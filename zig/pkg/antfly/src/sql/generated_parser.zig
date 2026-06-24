@@ -368,6 +368,17 @@ pub const GeneratedSqlCteAst = struct {
     materialization_tokens: ?GeneratedSqlTokenRange = null,
     materialization: ?GeneratedSqlCteMaterialization = null,
     body_tokens: ?GeneratedSqlTokenRange = null,
+    body_kind: ?GeneratedSqlReadKind = null,
+    body_select_tokens: ?GeneratedSqlTokenRange = null,
+    body_distinct_tokens: ?GeneratedSqlTokenRange = null,
+    body_projection_tokens: ?GeneratedSqlTokenRange = null,
+    body_source_tokens: ?GeneratedSqlTokenRange = null,
+    body_where_tokens: ?GeneratedSqlTokenRange = null,
+    body_group_tokens: ?GeneratedSqlTokenRange = null,
+    body_having_tokens: ?GeneratedSqlTokenRange = null,
+    body_order_tokens: ?GeneratedSqlTokenRange = null,
+    body_limit_tokens: ?GeneratedSqlTokenRange = null,
+    body_set_operation_tokens: ?GeneratedSqlTokenRange = null,
 
     pub fn deinit(self: *GeneratedSqlCteAst, alloc: std.mem.Allocator) void {
         self.column_names.deinit(alloc);
@@ -1408,6 +1419,7 @@ fn buildReadCteAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, fi
             .{ .start = cursor + 1, .end = close }
         else
             null;
+        if (cte.body_tokens) |body_tokens| buildReadCteBodyMetadata(tokens, body_tokens, &cte);
 
         try items.append(alloc, cte);
         cte_owned = true;
@@ -1427,6 +1439,100 @@ fn buildReadCteAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, fi
     ast.cte_items = try items.toOwnedSlice(alloc);
     items_owned = true;
     ast.cte_count = count;
+}
+
+fn buildReadCteBodyMetadata(tokens: []const token_mod.Token, body_tokens: GeneratedSqlTokenRange, cte: *GeneratedSqlCteAst) void {
+    const select_index = findTopLevelKeyword(tokens, body_tokens.start, body_tokens.end, .select) orelse return;
+    if (select_index != body_tokens.start) return;
+    cte.body_kind = classifyReadKindInRange(tokens, body_tokens);
+    cte.body_select_tokens = .{ .start = select_index, .end = select_index + 1 };
+
+    const body_end = firstTopLevelSetOperation(tokens, select_index + 1, body_tokens.end) orelse body_tokens.end;
+    if (body_end < body_tokens.end) cte.body_set_operation_tokens = .{ .start = body_end, .end = body_tokens.end };
+
+    const projection_start = generatedReadProjectionStartInRange(tokens, select_index, body_end, &cte.body_distinct_tokens);
+    const from_index = findTopLevelKeyword(tokens, projection_start, body_end, .from);
+    const where_index = findTopLevelKeyword(tokens, projection_start, body_end, .where);
+    const group_index = findTopLevelKeywordSequence(tokens, projection_start, body_end, .group, .by);
+    const having_index = findTopLevelKeyword(tokens, projection_start, body_end, .having);
+    const window_index = findTopLevelKeyword(tokens, projection_start, body_end, .window);
+    const order_index = findTopLevelKeyword(tokens, projection_start, body_end, .order);
+    const limit_index = findTopLevelKeyword(tokens, projection_start, body_end, .limit);
+    const offset_index = findTopLevelKeyword(tokens, projection_start, body_end, .offset);
+    const fetch_index = findTopLevelKeyword(tokens, projection_start, body_end, .fetch);
+
+    const projection_end = firstOptionalIndex(&[_]?usize{ from_index, where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
+    if (projection_start < projection_end) cte.body_projection_tokens = .{ .start = projection_start, .end = projection_end };
+    if (from_index) |idx| {
+        const source_end = firstOptionalIndex(&[_]?usize{ where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
+        if (idx + 1 < source_end) cte.body_source_tokens = .{ .start = idx + 1, .end = source_end };
+    }
+    if (where_index) |idx| {
+        const where_end = firstOptionalIndex(&[_]?usize{ group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
+        if (idx + 1 < where_end) cte.body_where_tokens = .{ .start = idx + 1, .end = where_end };
+    }
+    if (group_index) |idx| {
+        const group_start = if (idx + 1 < body_end and tokens[idx + 1].matchesKeywordTag(.by)) idx + 2 else idx + 1;
+        const group_end = firstOptionalIndex(&[_]?usize{ having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
+        if (group_start < group_end) cte.body_group_tokens = .{ .start = group_start, .end = group_end };
+    }
+    if (having_index) |idx| {
+        const having_end = firstOptionalIndex(&[_]?usize{ window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
+        if (idx + 1 < having_end) cte.body_having_tokens = .{ .start = idx + 1, .end = having_end };
+    }
+    if (order_index) |idx| {
+        const order_start = if (idx + 1 < body_end and tokens[idx + 1].matchesKeywordTag(.by)) idx + 2 else idx + 1;
+        const order_end = firstOptionalIndex(&[_]?usize{ limit_index, offset_index, fetch_index }) orelse body_end;
+        if (order_start < order_end) cte.body_order_tokens = .{ .start = order_start, .end = order_end };
+    }
+    if (limit_index) |idx| {
+        const limit_end = firstOptionalIndex(&[_]?usize{ offset_index, fetch_index }) orelse body_end;
+        if (idx + 1 < limit_end) cte.body_limit_tokens = .{ .start = idx + 1, .end = limit_end };
+    }
+}
+
+fn generatedReadProjectionStartInRange(
+    tokens: []const token_mod.Token,
+    select_index: usize,
+    body_end: usize,
+    distinct_tokens: *?GeneratedSqlTokenRange,
+) usize {
+    const distinct_index = select_index + 1;
+    if (distinct_index >= body_end or !tokens[distinct_index].matchesKeywordTag(.distinct)) return distinct_index;
+    if (distinct_index + 2 < body_end and tokens[distinct_index + 1].matchesKeywordTag(.on) and tokens[distinct_index + 2].kind == .lparen) {
+        if (findMatchingParen(tokens, distinct_index + 2, body_end)) |close| {
+            distinct_tokens.* = .{ .start = distinct_index, .end = close + 1 };
+            return close + 1;
+        }
+    }
+    distinct_tokens.* = .{ .start = distinct_index, .end = distinct_index + 1 };
+    return distinct_index + 1;
+}
+
+fn classifyReadKindInRange(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) GeneratedSqlReadKind {
+    if (range.start < range.end and tokens[range.start].matchesKeywordTag(.with)) return .cte;
+    if (firstTopLevelSetOperation(tokens, range.start + 1, range.end) != null) return .set_operation;
+    var index = range.start;
+    while (index < range.end) : (index += 1) {
+        if (tokens[index].matchesKeywordTag(.lateral)) return .lateral;
+    }
+    index = range.start;
+    while (index < range.end) : (index += 1) {
+        if (tokens[index].matchesKeywordTag(.over)) return .window;
+    }
+    if (range.start + 1 < range.end and tokens[range.start].matchesKeywordTag(.select) and tokens[range.start + 1].matchesKeywordTag(.distinct)) {
+        if (range.start + 2 < range.end and tokens[range.start + 2].matchesKeywordTag(.on)) return .query;
+        return .aggregate;
+    }
+    index = range.start;
+    while (index < range.end) : (index += 1) {
+        if (tokens[index].matchesKeywordTag(.join)) return .join;
+    }
+    index = range.start;
+    while (index < range.end) : (index += 1) {
+        if (tokens[index].matchesKeywordTag(.group) or tokens[index].matchesKeywordTag(.having)) return .aggregate;
+    }
+    return .query;
 }
 
 fn buildReadJoinAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, source_tokens: GeneratedSqlTokenRange, ast: *GeneratedSqlReadAst) !void {
@@ -4765,6 +4871,10 @@ test "generated SQL parser facade builds read AST spans" {
             try std.testing.expectEqual(@as(usize, 1), read.cte_items.len);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.cte_items[0].name_tokens);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 8 }, read.cte_items[0].body_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.cte_items[0].body_kind.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, read.cte_items[0].body_select_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.cte_items[0].body_projection_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.cte_items[0].body_source_tokens.?);
             try std.testing.expect(!read.cte_recursive);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.projection_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read.source_tokens.?);
@@ -4827,6 +4937,10 @@ test "generated SQL parser facade builds read AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 8 }, read.cte_items[0].body_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.cte_items[1].name_tokens);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 17 }, read.cte_items[1].body_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.cte_items[1].body_kind.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 14 }, read.cte_items[1].body_select_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 14, .end = 15 }, read.cte_items[1].body_projection_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 16, .end = 17 }, read.cte_items[1].body_source_tokens.?);
             try std.testing.expect(!read.cte_recursive);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 19, .end = 20 }, read.projection_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 21, .end = 22 }, read.source_tokens.?);
@@ -4849,9 +4963,28 @@ test "generated SQL parser facade builds read AST spans" {
             try std.testing.expectEqual(@as(usize, 1), read.cte_items.len);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, read.cte_items[0].name_tokens);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 9 }, read.cte_items[0].body_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.cte_items[0].body_kind.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.cte_items[0].body_select_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.cte_items[0].body_projection_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.cte_items[0].body_source_tokens.?);
             try std.testing.expect(read.cte_recursive);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 12 }, read.projection_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 14 }, read.source_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const cte_set_operation_read_sql = "WITH source_rows AS (SELECT id FROM usage_records UNION SELECT id FROM usage_archive) SELECT id FROM source_rows";
+    const cte_set_operation_read_result = try parseSqlAlloc(alloc, cte_set_operation_read_sql);
+    switch (cte_set_operation_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.cte, read.kind);
+            try std.testing.expectEqual(GeneratedSqlReadKind.set_operation, read.cte_items[0].body_kind.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 12 }, read.cte_items[0].body_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, read.cte_items[0].body_select_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.cte_items[0].body_projection_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.cte_items[0].body_source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 12 }, read.cte_items[0].body_set_operation_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

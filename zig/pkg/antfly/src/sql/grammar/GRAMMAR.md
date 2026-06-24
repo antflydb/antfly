@@ -148,10 +148,13 @@ last-CTE name/body ranges plus owned per-CTE name/body item arrays, optional
 column-alias lists, and `MATERIALIZED` / `NOT MATERIALIZED` hint metadata;
 generated CTE reads now fail closed on malformed list counts, first/last
 compatibility fields, column-alias lists, materialization hints, and body
-enclosure metadata; recursive CTE reads carry an explicit generated recursive
-flag, and simple non-recursive CTE reads dispatch directly when those ranges
-validate; recursive CTE reads now validate generated recursive CTE metadata
-before dispatching to the typed recursive CTE lowerer; generated pagination
+enclosure metadata; each generated CTE item also carries body read-kind and
+body clause-span metadata for the first body query, including set-operation
+tails, and the lowerer validates those body payloads before dispatch; recursive
+CTE reads carry an explicit generated recursive flag, and simple
+non-recursive CTE reads dispatch directly when those ranges validate;
+recursive CTE reads now validate generated recursive CTE metadata before
+dispatching to the typed recursive CTE lowerer; generated pagination
 grammar now covers `LIMIT`, `OFFSET`, and `FETCH FIRST`/`FETCH NEXT` query
 tails with count expression metadata, and simple query, aggregate, join, and
 window pagination use generated range-validated lowering when generated read
@@ -368,11 +371,14 @@ Suggested migration order:
    ranges, optional column-alias lists, and `MATERIALIZED` / `NOT MATERIALIZED`
    hint metadata; generated CTE reads reject malformed CTE-list counts,
    first/last compatibility fields, column-alias list payloads,
-   materialization hint payloads, and parenthesized body spans; recursive CTE
-   reads carry an explicit recursive flag; and simple non-recursive CTE reads
-   dispatch to the typed read lowerer after validating those ranges. Recursive
-   CTE reads now validate generated recursive CTE ranges and the recursive flag
-   before dispatching to the typed recursive CTE lowerer.
+   materialization hint payloads, and parenthesized body spans; each generated
+   CTE item now carries body read-kind and first-query clause-span metadata,
+   including set-operation tails, and generated CTE lowering validates those
+   body payloads. Recursive CTE reads carry an explicit recursive flag; and
+   simple non-recursive CTE reads dispatch to the typed read lowerer after
+   validating those ranges. Recursive CTE reads now validate generated
+   recursive CTE ranges and the recursive flag before dispatching to the typed
+   recursive CTE lowerer.
    Generated pagination coverage now accepts and ranges expression and
    PostgreSQL-compatible `ALL`/`NULL` `LIMIT` tails, `OFFSET` with optional
    `ROW`/`ROWS`, and `FETCH FIRST`/`FETCH NEXT` tails with optional fetch
@@ -392,7 +398,8 @@ Suggested migration order:
    predicate/operator metadata and structural checks, broader function
    coverage, broader boolean expression-tree coverage, quantified subquery
    planning/lowering, remaining specialized expression operators, recursive
-   CTE body AST construction and planning, direct generated read-plan lowering, and
+   full CTE body AST construction and planning beyond the current body-kind
+   and clause-span metadata, direct generated read-plan lowering, and
    unsupported-shape diagnostics.
 5. Advanced DML: `INSERT ... SELECT`, `UPDATE ... FROM`, `DELETE ... USING`,
    `TRUNCATE`, and `MERGE`.
