@@ -105,7 +105,7 @@ remains classified as a range predicate. Prefix `NOT` predicates are accepted
 and classified with right-side expression-kind summaries. Parenthesized
 expression groups carry inner token ranges and inner expression-kind summaries,
 and comparison operands can expose additive and multiplicative child
-expression-kind summaries,
+expression-kind summaries, including JSON/path postfix operator summaries,
 and an initial generated AST-to-plan wrapper that validates those ranges and
 fails closed if the generated read family is incompatible with the existing
 read classifier. Simple query, aggregate, join, and lateral reads now validate
@@ -255,7 +255,8 @@ Suggested migration order:
    accepted and classified with right-side expression-kind summaries.
    Parenthesized expression groups carry inner token ranges and inner
    expression-kind summaries, and comparison operands can expose additive and
-   multiplicative child expression-kind summaries.
+   multiplicative child expression-kind summaries, including JSON/path postfix
+   operator summaries.
    Generated read ASTs now have a validated wrapper
    into the current typed read lowerer for representative covered read plans
    that rejects malformed generated range payloads. Simple query reads now have

@@ -145,6 +145,10 @@ pub const GeneratedSqlExpressionKind = enum {
     multiplicative,
     divisive,
     modulo,
+    json_access,
+    json_text_access,
+    json_path_access,
+    json_path_text_access,
 };
 
 pub const GeneratedSqlExpressionAst = struct {
@@ -367,6 +371,7 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT id FROM usage_records WHERE NOT (deleted_at IS NULL)", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE score + bonus > 10", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE score * weight > 10", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE payload ->> 'status' = 'open'", .kind = .read },
     .{ .sql = "SELECT concat_ws(',', status), id FROM usage_records ORDER BY status, id", .kind = .read },
     .{ .sql = "SELECT id, row_number() OVER (PARTITION BY tenant, account ORDER BY id) AS rn FROM usage_records ORDER BY id, tenant", .kind = .read },
     .{ .sql = "SELECT DISTINCT status FROM usage_records ORDER BY status", .kind = .read },
@@ -1349,6 +1354,22 @@ fn findTopLevelExpressionOperator(tokens: []const token_mod.Token, range: Genera
             else => {},
         }
     }
+    depth = 0;
+    index = range.start;
+    while (index < range.end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth == 0) return null;
+                depth -= 1;
+            },
+            .arrow_json => if (depth == 0 and index > range.start) return .{ .kind = .json_access, .index = index },
+            .arrow_text => if (depth == 0 and index > range.start) return .{ .kind = .json_text_access, .index = index },
+            .path_arrow_json => if (depth == 0 and index > range.start) return .{ .kind = .json_path_access, .index = index },
+            .path_arrow_text => if (depth == 0 and index > range.start) return .{ .kind = .json_path_text_access, .index = index },
+            else => {},
+        }
+    }
     return null;
 }
 
@@ -1956,6 +1977,21 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 8 }, read.where_expression.left_tokens.?);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.multiplicative, read.where_expression.left_expression_kind.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.where_expression.right_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const json_text_comparison_read_sql = "SELECT id FROM usage_records WHERE payload ->> 'status' = 'open'";
+    const json_text_comparison_read_result = try parseSqlAlloc(alloc, json_text_comparison_read_sql);
+    switch (json_text_comparison_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 10 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 8 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.json_text_access, read.where_expression.left_expression_kind.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.where_expression.operator_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.where_expression.right_tokens.?);
         },
