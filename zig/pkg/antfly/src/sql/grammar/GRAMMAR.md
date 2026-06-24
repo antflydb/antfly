@@ -101,14 +101,17 @@ ranges and match the production aggregate/query-family split;
 generated set-operation reads now classify as a distinct read family and
 validate the left query and set-operation tail before calling the set-operation
 lowerer directly;
-simple non-recursive CTE reads now expose generated CTE name and body ranges
-and dispatch directly when those ranges validate; generated pagination grammar
-now covers `LIMIT`, `OFFSET`, and `FETCH FIRST`/`FETCH NEXT` query tails.
+single- and multi-CTE reads now expose generated CTE-list, first-CTE, and
+last-CTE name/body ranges, recursive CTE reads carry an explicit generated
+recursive flag, and simple non-recursive CTE reads dispatch directly when those
+ranges validate; generated pagination grammar now covers `LIMIT`, `OFFSET`,
+and `FETCH FIRST`/`FETCH NEXT` query tails.
 Unsupported read shapes
 still fall back, and deeper read cutover still requires full generated
 query-body AST payloads for expression-level projections and predicates,
-structured joins, complete multi-CTE and recursive CTE bodies, aggregates,
-windows, ordering, pagination, and direct generated read-plan lowering. The generated parser now also treats seed
+structured joins, complete per-CTE body AST arrays, recursive CTE planning,
+aggregates, windows, ordering, pagination, and direct generated read-plan
+lowering. The generated parser now also treats seed
 graph DDL as a distinct graph statement family and `ParsedSql` retains those
 generated raw and AST nodes. Seed graph index and graph metric statements now
 have graph-specific generated AST-to-plan wrappers that lower to typed index
@@ -229,14 +232,17 @@ Suggested migration order:
    ranges and preserve the production aggregate/query-family split.
    Set-operation reads now classify as their own generated read family and
    dispatch to the native set-operation lowerer after validating the generated
-   left-query and set-operation-tail ranges. Simple non-recursive CTE reads now
-   carry generated CTE name and body ranges and dispatch to the typed read
-   lowerer after validating those ranges. Generated pagination coverage now
-   accepts and ranges `LIMIT`, `OFFSET`, and `FETCH FIRST`/`FETCH NEXT` tails.
+   left-query and set-operation-tail ranges. Single- and multi-CTE reads now
+   carry generated CTE-list, first-CTE, and last-CTE name/body ranges; recursive
+   CTE reads carry an explicit recursive flag; and simple non-recursive CTE
+   reads dispatch to the typed read lowerer after validating those ranges.
+   Generated pagination coverage now accepts and ranges `LIMIT`, `OFFSET`, and
+   `FETCH FIRST`/`FETCH NEXT` tails.
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, expression-level and
-   join-level generated query-body ASTs, direct generated read-plan lowering,
-   and unsupported-shape diagnostics.
+   join-level generated query-body ASTs, per-CTE generated body arrays,
+   recursive CTE planning, direct generated read-plan lowering, and
+   unsupported-shape diagnostics.
 5. Advanced DML: `INSERT ... SELECT`, `UPDATE ... FROM`, `DELETE ... USING`,
    `TRUNCATE`, and `MERGE`.
 6. Antfly extensions: graph traversal DSL, graph metric query surfaces,
@@ -402,8 +408,9 @@ Generated grammar work needs evidence at multiple levels:
   plans. Read plans have initial
   generated AST-to-plan parity through a generated-family validation wrapper
   over representative query, aggregate, join, lateral, and non-recursive CTE
-  plans. Seed graph DDL has generated AST-to-plan parity for graph index and
-  graph metric index plans.
+  plans, plus AST-shape coverage for generated-ranged multi-CTE and recursive
+  CTE prefixes. Seed graph DDL has generated AST-to-plan parity for graph index
+  and graph metric index plans.
 - SQL/API parity tests showing SQL and native API requests reach the same
   service contracts.
 - Fuzz or mutation tests for scanner/parser crash resistance and bounded error

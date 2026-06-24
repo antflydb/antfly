@@ -854,6 +854,8 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
         .{ .sql = "SELECT id, row_number() OVER usage_window AS rn FROM usage_records WINDOW usage_window AS (ORDER BY id RANGE BETWEEN 1 PRECEDING AND CURRENT ROW)", .generated = .window, .read = .window },
         .{ .sql = "SELECT id FROM usage_records UNION SELECT id FROM usage_archive", .generated = .set_operation, .read = .set_operation },
         .{ .sql = "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows", .generated = .cte, .read = .query },
+        .{ .sql = "WITH first_rows AS (SELECT id FROM usage_records), second_rows AS (SELECT id FROM first_rows) SELECT id FROM second_rows", .generated = .cte, .read = .query },
+        .{ .sql = "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows", .generated = .cte, .read = .recursive_cte },
     };
 
     for (cases) |case| {
@@ -895,8 +897,18 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                     }
                 } else if (case.generated == .cte) {
                     try std.testing.expect(read_ast.cte_tokens != null);
+                    try std.testing.expect(read_ast.cte_list_tokens != null);
                     try std.testing.expect(read_ast.cte_name_tokens != null);
                     try std.testing.expect(read_ast.cte_body_tokens != null);
+                    try std.testing.expect(read_ast.cte_count > 0);
+                    if (std.mem.indexOf(u8, case.sql, " second_rows ")) |_| {
+                        try std.testing.expectEqual(@as(usize, 2), read_ast.cte_count);
+                        try std.testing.expect(read_ast.cte_last_name_tokens != null);
+                        try std.testing.expect(read_ast.cte_last_body_tokens != null);
+                    }
+                    if (std.mem.indexOf(u8, case.sql, "WITH RECURSIVE")) |_| {
+                        try std.testing.expect(read_ast.cte_recursive);
+                    }
                     try std.testing.expect(read_ast.projection_tokens != null);
                 } else if (case.generated == .set_operation) {
                     try std.testing.expect(read_ast.set_operation_tokens != null);
