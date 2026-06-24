@@ -193,6 +193,10 @@ pub const GeneratedSqlReadAst = struct {
     projection_tokens: ?GeneratedSqlTokenRange = null,
     projection_items: GeneratedSqlListAst = .{},
     source_tokens: ?GeneratedSqlTokenRange = null,
+    join_tokens: ?GeneratedSqlTokenRange = null,
+    join_left_tokens: ?GeneratedSqlTokenRange = null,
+    join_right_tokens: ?GeneratedSqlTokenRange = null,
+    join_predicate_tokens: ?GeneratedSqlTokenRange = null,
     where_tokens: ?GeneratedSqlTokenRange = null,
     group_tokens: ?GeneratedSqlTokenRange = null,
     group_items: GeneratedSqlListAst = .{},
@@ -791,7 +795,11 @@ fn buildReadAst(
 
     if (from_index) |idx| {
         const source_end = firstOptionalIndex(&[_]?usize{ where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
-        if (idx + 1 < source_end) ast.source_tokens = .{ .start = idx + 1, .end = source_end };
+        if (idx + 1 < source_end) {
+            const source_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = source_end };
+            ast.source_tokens = source_tokens;
+            buildReadJoinAst(tokens, source_tokens, &ast);
+        }
     }
     if (where_index) |idx| {
         const where_end = firstOptionalIndex(&[_]?usize{ group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
@@ -894,6 +902,16 @@ fn buildReadCteAst(tokens: []const token_mod.Token, final_select_index: usize, a
         index += 1;
     }
     ast.cte_count = count;
+}
+
+fn buildReadJoinAst(tokens: []const token_mod.Token, source_tokens: GeneratedSqlTokenRange, ast: *GeneratedSqlReadAst) void {
+    const join_index = findTopLevelKeyword(tokens, source_tokens.start, source_tokens.end, .join) orelse return;
+    const on_index = findTopLevelKeyword(tokens, join_index + 1, source_tokens.end, .on) orelse return;
+    if (source_tokens.start >= join_index or join_index + 1 >= on_index or on_index + 1 >= source_tokens.end) return;
+    ast.join_tokens = source_tokens;
+    ast.join_left_tokens = .{ .start = source_tokens.start, .end = join_index };
+    ast.join_right_tokens = .{ .start = join_index + 1, .end = on_index };
+    ast.join_predicate_tokens = .{ .start = on_index + 1, .end = source_tokens.end };
 }
 
 fn buildInsertDmlAst(tokens: []const token_mod.Token, end: usize, ast: *GeneratedSqlDmlAst) void {
@@ -1430,6 +1448,20 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.group_items.last_tokens.?);
             try std.testing.expectEqual(@as(usize, 1), read.group_items.count);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 11 }, read.having_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const joined_read_sql = "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id";
+    const joined_read_result = try parseSqlAlloc(alloc, joined_read_sql);
+    switch (joined_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.join, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 10 }, read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 10 }, read.join_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read.join_left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.join_right_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 10 }, read.join_predicate_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

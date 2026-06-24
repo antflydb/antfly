@@ -902,6 +902,11 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                 } else if (std.mem.eql(u8, case.sql, "SELECT DISTINCT ON (organization_id) organization_id, id FROM usage_records ORDER BY organization_id ASC, created_at DESC")) {
                     try std.testing.expect(read_ast.distinct_tokens != null);
                     try std.testing.expect(read_ast.projection_tokens != null);
+                } else if (case.generated == .join) {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 10 }, read_ast.join_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read_ast.join_left_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read_ast.join_right_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 10 }, read_ast.join_predicate_tokens.?);
                 } else if (case.generated == .aggregate) {
                     if (std.mem.indexOf(u8, case.sql, "DISTINCT")) |_| {
                         try std.testing.expect(read_ast.distinct_tokens != null);

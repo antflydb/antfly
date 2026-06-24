@@ -88,7 +88,8 @@ and AST nodes for covered read statements, top-level generated AST ranges for
 covered `SELECT` projections, sources, predicates, grouping, having filters,
 window clauses, ordering, pagination, set-operation tails, and CTE prefixes,
 list-level generated metadata for top-level projection, grouping, and ordering
-items,
+items, and first-join generated metadata for left input, right input, and join
+predicate ranges,
 and an initial generated AST-to-plan wrapper that validates those ranges and
 fails closed if the generated read family is incompatible with the existing
 read classifier. Simple query, aggregate, join, and lateral reads now validate
@@ -111,7 +112,7 @@ and `FETCH FIRST`/`FETCH NEXT` query tails.
 Unsupported read shapes
 still fall back, and deeper read cutover still requires full generated
 query-body AST payloads for expression-level projections and predicates,
-structured joins, complete expression AST nodes, complete per-CTE body AST
+complete join trees, complete expression AST nodes, complete per-CTE body AST
 arrays, recursive CTE planning, aggregates, windows, ordering, pagination, and
 direct generated read-plan lowering. The generated parser now also treats seed
 graph DDL as a distinct graph statement family and `ParsedSql` retains those
@@ -221,7 +222,8 @@ Suggested migration order:
    ranges for covered `SELECT` projection, source, `WHERE`, `GROUP BY`,
    `HAVING`, `WINDOW`, `ORDER BY`, `LIMIT`, `OFFSET`, `FETCH`, set-operation,
    and CTE-prefix bodies, plus list-level metadata for top-level projection,
-   grouping, and ordering items; and generated read ASTs now have a validated wrapper
+   grouping, and ordering items and first-join metadata for left input, right
+   input, and join predicate ranges; and generated read ASTs now have a validated wrapper
    into the current typed read lowerer for representative covered read plans
    that rejects malformed generated range payloads. Simple query reads now have
    a direct generated AST-to-query-plan lowering boundary after clause-range
@@ -244,7 +246,7 @@ Suggested migration order:
    `FETCH FIRST`/`FETCH NEXT` tails.
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, expression-level and
-   join-level generated query-body ASTs, full expression AST nodes beyond
+   full join-tree generated query-body ASTs, full expression AST nodes beyond
    list-level metadata, per-CTE generated body arrays, recursive CTE planning,
    direct generated read-plan lowering, and unsupported-shape diagnostics.
 5. Advanced DML: `INSERT ... SELECT`, `UPDATE ... FROM`, `DELETE ... USING`,
@@ -418,9 +420,9 @@ Generated grammar work needs evidence at multiple levels:
   plans. Read plans have initial
   generated AST-to-plan parity through a generated-family validation wrapper
   over representative query, aggregate, join, lateral, and non-recursive CTE
-  plans, plus AST-shape coverage for generated-ranged multi-CTE and recursive
-  CTE prefixes. Seed graph DDL has generated AST-to-plan parity for graph index
-  and graph metric index plans.
+  plans, AST-shape coverage for generated-ranged multi-CTE and recursive CTE
+  prefixes, and first-join component range coverage. Seed graph DDL has
+  generated AST-to-plan parity for graph index and graph metric index plans.
 - SQL/API parity tests showing SQL and native API requests reach the same
   service contracts.
 - Fuzz or mutation tests for scanner/parser crash resistance and bounded error
