@@ -40,6 +40,29 @@ const vectorindex_mod = @import("antfly_vectorindex");
 
 const Allocator = std.mem.Allocator;
 const NamedResultSet = db_query_graph.NamedResultSet;
+const AlgebraicIndex = @import("algebraic/index.zig").Index;
+
+pub const AlgebraicDocFilterRequest = struct {
+    req: types.SearchRequest,
+    index: ?*AlgebraicIndex = null,
+    filter_doc_ids: [][]u8 = &.{},
+    exclude_doc_ids: [][]u8 = &.{},
+    resolved_doc_filter: ?*doc_set.ResolvedDocFilter = null,
+    resolved_doc_filter_alloc: ?Allocator = null,
+
+    pub fn deinit(self: *@This()) void {
+        if (self.index) |index| {
+            index.freeDocIds(self.filter_doc_ids);
+            index.freeDocIds(self.exclude_doc_ids);
+        }
+        if (self.resolved_doc_filter) |filter| {
+            const alloc = self.resolved_doc_filter_alloc.?;
+            filter.deinit(alloc);
+            alloc.destroy(filter);
+        }
+        self.* = undefined;
+    }
+};
 
 fn benchQueryProfileEnabled() bool {
     return platform.env.getenv("ANTFLY_BENCH_QUERY_PROFILE") != null;
@@ -473,6 +496,526 @@ pub fn Impl(comptime DB: type) type {
                 .scores = scores,
                 .status = try cloneGraphMetricStatusFromGraph(alloc, status),
             };
+        }
+
+        pub fn searchRequestWithTextAlgebraicDocFilterAlloc(self: *DB, req: types.SearchRequest) !AlgebraicDocFilterRequest {
+            const needs_algebraic_doc_filter = req.doc_filter_bindings.len > 0 or req.require_algebraic_filter_resolution;
+            return if (needs_algebraic_doc_filter)
+                try Self.searchRequestWithAlgebraicDocFilterAlloc(self, req)
+            else
+                AlgebraicDocFilterRequest{ .req = req };
+        }
+
+        pub fn searchRequestWithAlgebraicDocFilterAlloc(self: *DB, req: types.SearchRequest) !AlgebraicDocFilterRequest {
+            if (req.filter_query_json.len == 0 and req.exclusion_query_json.len == 0) return .{ .req = req };
+            if (!req.require_algebraic_filter_resolution and req.doc_filter_bindings.len == 0) {
+                if (try Self.searchRequestWithDynamicStructuredDocFilterAlloc(self, req)) |direct| return direct;
+            }
+            const entry = self.core.index_manager.algebraicIndex(null) orelse {
+                self.searchRuntimeRecordUnsupportedDocSetFilterShape();
+                if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
+                return .{ .req = req };
+            };
+            entry.index.recordVectorFilterAttempt();
+            if (entry.index.hasErrors() or !entry.index.plannerLifecycleReady()) {
+                entry.index.recordVectorFilterUnsupported(req.require_algebraic_filter_resolution);
+                self.searchRuntimeRecordUnsupportedDocSetFilterShape();
+                if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
+                return .{ .req = req };
+            }
+            if (try Self.searchRequestWithDirectAlgebraicDocFilterAlloc(self, req, &entry.index)) |direct| return direct;
+            var filter_doc_ids: [][]u8 = &.{};
+            errdefer entry.index.freeDocIds(filter_doc_ids);
+            var exclude_doc_ids: [][]u8 = &.{};
+            errdefer entry.index.freeDocIds(exclude_doc_ids);
+            var changed = false;
+            var filter_json_resolved = false;
+            var exclusion_json_resolved = false;
+            var filter_supported = req.filter_doc_ids_positive or req.filter_doc_ids.len > 0;
+            var filter_bindings = std.ArrayListUnmanaged(AlgebraicIndex.FilterBinding).empty;
+            defer {
+                for (filter_bindings.items) |*binding| binding.set.deinit(&entry.index);
+                filter_bindings.deinit(entry.index.alloc);
+            }
+
+            if (filter_supported) filter_doc_ids = try dupeAlgebraicDocIds(entry.index.alloc, req.filter_doc_ids);
+            if (req.exclude_doc_ids.len > 0) exclude_doc_ids = try dupeAlgebraicDocIds(entry.index.alloc, req.exclude_doc_ids);
+
+            for (req.doc_filter_bindings) |binding| {
+                if (binding.name.len == 0 or binding.filter_query_json.len == 0) return error.InvalidArgument;
+                for (filter_bindings.items) |existing| {
+                    if (std.mem.eql(u8, existing.name, binding.name)) return error.InvalidArgument;
+                }
+                var set = (try entry.index.docIdSetForFilterJsonWithBindingsAlloc(
+                    self.core.store,
+                    binding.filter_query_json,
+                    filter_bindings.items,
+                )) orelse {
+                    entry.index.recordVectorFilterUnsupported(req.require_algebraic_filter_resolution);
+                    self.searchRuntimeRecordUnsupportedDocSetFilterShape();
+                    if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
+                    return .{ .req = req };
+                };
+                errdefer set.deinit(&entry.index);
+                try filter_bindings.append(entry.index.alloc, .{
+                    .name = binding.name,
+                    .set = set,
+                });
+                set = .{};
+            }
+
+            if (req.filter_query_json.len > 0) {
+                if (try entry.index.docIdSetForFilterJsonWithBindingsAlloc(self.core.store, req.filter_query_json, filter_bindings.items)) |set| {
+                    var owned_set = set;
+                    defer owned_set.deinit(&entry.index);
+                    if (owned_set.include) |ids| {
+                        if (filter_supported) {
+                            const intersected = try intersectAlgebraicDocIds(entry.index.alloc, filter_doc_ids, ids);
+                            entry.index.freeDocIds(filter_doc_ids);
+                            filter_doc_ids = intersected;
+                        } else {
+                            filter_doc_ids = try dupeAlgebraicDocIds(entry.index.alloc, ids);
+                        }
+                        filter_supported = true;
+                        changed = true;
+                    }
+                    if (owned_set.exclude.len > 0) {
+                        const merged = try unionAlgebraicDocIds(entry.index.alloc, exclude_doc_ids, owned_set.exclude);
+                        entry.index.freeDocIds(exclude_doc_ids);
+                        exclude_doc_ids = merged;
+                        changed = true;
+                    }
+                    filter_json_resolved = true;
+                }
+            }
+            if (req.exclusion_query_json.len > 0) {
+                if (try entry.index.docIdSetForFilterJsonWithBindingsAlloc(self.core.store, req.exclusion_query_json, filter_bindings.items)) |set| {
+                    var owned_set = set;
+                    defer owned_set.deinit(&entry.index);
+                    if (owned_set.include) |ids| {
+                        const merged = try unionAlgebraicDocIds(entry.index.alloc, exclude_doc_ids, ids);
+                        entry.index.freeDocIds(exclude_doc_ids);
+                        exclude_doc_ids = merged;
+                        changed = true;
+                    }
+                    if (owned_set.exclude.len > 0) {
+                        const merged = try unionAlgebraicDocIds(entry.index.alloc, exclude_doc_ids, owned_set.exclude);
+                        entry.index.freeDocIds(exclude_doc_ids);
+                        exclude_doc_ids = merged;
+                        changed = true;
+                    }
+                    exclusion_json_resolved = true;
+                }
+            }
+            if (!changed) {
+                entry.index.recordVectorFilterUnsupported(req.require_algebraic_filter_resolution);
+                self.searchRuntimeRecordUnsupportedDocSetFilterShape();
+                if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
+                return .{ .req = req };
+            }
+
+            var next = req;
+            if (filter_supported) {
+                next.filter_doc_ids = filter_doc_ids;
+                next.filter_doc_ids_positive = true;
+            }
+            if (exclude_doc_ids.len > 0) next.exclude_doc_ids = exclude_doc_ids;
+            if (filter_json_resolved) next.filter_query_json = "";
+            if (exclusion_json_resolved) next.exclusion_query_json = "";
+            if (filter_bindings.items.len > 0) next.doc_filter_bindings = &.{};
+            if (next.require_algebraic_filter_resolution and (next.filter_query_json.len > 0 or next.exclusion_query_json.len > 0)) {
+                entry.index.recordVectorFilterUnsupported(true);
+                self.searchRuntimeRecordUnsupportedDocSetFilterShape();
+                return error.UnsupportedQueryRequest;
+            }
+            const resolved_filter = try self.alloc.create(doc_set.ResolvedDocFilter);
+            errdefer self.alloc.destroy(resolved_filter);
+            resolved_filter.* = try self.searchRuntimeResolvedDocFilterForIdsAlloc(filter_supported, filter_doc_ids, exclude_doc_ids, req.identity_read_generation);
+            errdefer resolved_filter.deinit(self.alloc);
+            next.resolved_doc_filter = resolved_filter;
+            entry.index.recordVectorFilterResolved(filter_doc_ids.len, exclude_doc_ids.len);
+            return .{
+                .req = next,
+                .index = &entry.index,
+                .filter_doc_ids = filter_doc_ids,
+                .exclude_doc_ids = exclude_doc_ids,
+                .resolved_doc_filter = resolved_filter,
+                .resolved_doc_filter_alloc = self.alloc,
+            };
+        }
+
+        fn searchRequestWithDynamicStructuredDocFilterAlloc(self: *DB, req: types.SearchRequest) !?AlgebraicDocFilterRequest {
+            var resolved = (try db_query_search.resolveStructuredDocFilterForComposedAlloc(self.alloc, req, .{
+                .ctx = self,
+                .text_index_entry = Self.textIndexEntryCallback,
+                .resolve_doc_set_doc_ids = Self.resolveDocSetDocIdsCallback,
+                .resolve_doc_ids_to_doc_set = Self.resolveDocIdsToDocSetCallback,
+                .resolve_relational_filter_doc_set = Self.resolveRelationalFilterDocSetCallback,
+                .live_filter_doc_set = Self.liveFilterDocSetCallback,
+                .project_ordinals_to_doc_ids = false,
+                .identity_read_generation = req.identity_read_generation,
+            })) orelse return null;
+            errdefer resolved.deinit(self.alloc);
+
+            const resolved_filter = try self.alloc.create(doc_set.ResolvedDocFilter);
+            errdefer self.alloc.destroy(resolved_filter);
+            resolved_filter.* = resolved;
+            resolved = .{};
+
+            var next = req;
+            next.resolved_doc_filter = resolved_filter;
+            next.filter_query_json = "";
+            next.exclusion_query_json = "";
+            return .{
+                .req = next,
+                .resolved_doc_filter = resolved_filter,
+                .resolved_doc_filter_alloc = self.alloc,
+            };
+        }
+
+        fn searchRequestWithDirectAlgebraicDocFilterAlloc(self: *DB, req: types.SearchRequest, index: *AlgebraicIndex) !?AlgebraicDocFilterRequest {
+            const algebraic_filter_rows_are_visible = true;
+            var resolved_bindings = std.ArrayListUnmanaged(AlgebraicIndex.ResolvedFilterBinding).empty;
+            defer {
+                for (resolved_bindings.items) |*binding| binding.filter.deinit(index.alloc);
+                resolved_bindings.deinit(index.alloc);
+            }
+            for (req.doc_filter_bindings) |binding| {
+                if (binding.name.len == 0 or binding.filter_query_json.len == 0) return error.InvalidArgument;
+                for (resolved_bindings.items) |existing| {
+                    if (std.mem.eql(u8, existing.name, binding.name)) return error.InvalidArgument;
+                }
+                var binding_filter = (if (algebraic_filter_rows_are_visible)
+                    try index.resolvedDocFilterForFilterJsonUncheckedAlloc(
+                        self.core.store,
+                        binding.filter_query_json,
+                        resolved_bindings.items,
+                    )
+                else
+                    try index.resolvedDocFilterForFilterJsonWithBindingsAtGenerationAlloc(
+                        self.core.store,
+                        binding.filter_query_json,
+                        req.identity_read_generation,
+                        resolved_bindings.items,
+                    )) orelse return null;
+                errdefer binding_filter.deinit(index.alloc);
+                try resolved_bindings.append(index.alloc, .{
+                    .name = binding.name,
+                    .filter = binding_filter,
+                });
+                binding_filter = .{};
+            }
+
+            var filter = doc_set.ResolvedDocFilter{};
+            errdefer filter.deinit(index.alloc);
+            var changed = false;
+            var request_constraints_resolved = false;
+            var filter_json_resolved = false;
+            var exclusion_json_resolved = false;
+
+            if (try Self.resolvedDocFilterForRequestNativeConstraintsAlloc(self, index.alloc, req)) |initial| {
+                filter = initial;
+                changed = true;
+                request_constraints_resolved = true;
+            }
+
+            if (req.filter_query_json.len > 0) {
+                var query_filter = (if (algebraic_filter_rows_are_visible)
+                    try index.resolvedDocFilterForFilterJsonUncheckedAlloc(
+                        self.core.store,
+                        req.filter_query_json,
+                        resolved_bindings.items,
+                    )
+                else if (resolved_bindings.items.len > 0)
+                    try index.resolvedDocFilterForFilterJsonWithBindingsAtGenerationAlloc(
+                        self.core.store,
+                        req.filter_query_json,
+                        req.identity_read_generation,
+                        resolved_bindings.items,
+                    )
+                else
+                    try index.resolvedDocFilterForFilterJsonAtGenerationAlloc(self.core.store, req.filter_query_json, req.identity_read_generation)) orelse {
+                    filter.deinit(index.alloc);
+                    return null;
+                };
+                defer query_filter.deinit(index.alloc);
+                if (!(try applyResolvedFilterIncludeAlloc(index.alloc, &filter, &query_filter))) {
+                    filter.deinit(index.alloc);
+                    return null;
+                }
+                changed = true;
+                filter_json_resolved = true;
+            }
+            if (req.exclusion_query_json.len > 0) {
+                var exclusion = (if (algebraic_filter_rows_are_visible)
+                    try index.resolvedDocFilterForFilterJsonUncheckedAlloc(
+                        self.core.store,
+                        req.exclusion_query_json,
+                        resolved_bindings.items,
+                    )
+                else if (resolved_bindings.items.len > 0)
+                    try index.resolvedDocFilterForFilterJsonWithBindingsAtGenerationAlloc(
+                        self.core.store,
+                        req.exclusion_query_json,
+                        req.identity_read_generation,
+                        resolved_bindings.items,
+                    )
+                else
+                    try index.resolvedDocFilterForFilterJsonAtGenerationAlloc(self.core.store, req.exclusion_query_json, req.identity_read_generation)) orelse {
+                    filter.deinit(index.alloc);
+                    return null;
+                };
+                defer exclusion.deinit(index.alloc);
+
+                if (!(try unionResolvedFilterExcludeAlloc(index.alloc, &filter, &exclusion.include))) {
+                    filter.deinit(index.alloc);
+                    return null;
+                }
+                if (!(try unionResolvedFilterExcludeAlloc(index.alloc, &filter, &exclusion.exclude))) {
+                    filter.deinit(index.alloc);
+                    return null;
+                }
+                changed = true;
+                exclusion_json_resolved = true;
+            }
+            if (!changed) return null;
+
+            const resolved_filter = try index.alloc.create(doc_set.ResolvedDocFilter);
+            errdefer index.alloc.destroy(resolved_filter);
+            resolved_filter.* = filter;
+            filter = .{};
+
+            var next = req;
+            if (request_constraints_resolved) {
+                next.filter_doc_ids = &.{};
+                next.filter_doc_ids_positive = false;
+                next.exclude_doc_ids = &.{};
+            }
+            if (filter_json_resolved) next.filter_query_json = "";
+            if (exclusion_json_resolved) next.exclusion_query_json = "";
+            if (resolved_bindings.items.len > 0) next.doc_filter_bindings = &.{};
+            next.resolved_doc_filter = resolved_filter;
+
+            index.recordVectorFilterResolved(
+                resolvedDocSetStatCount(&resolved_filter.include),
+                resolvedDocSetStatCount(&resolved_filter.exclude),
+            );
+            return .{
+                .req = next,
+                .resolved_doc_filter = resolved_filter,
+                .resolved_doc_filter_alloc = index.alloc,
+            };
+        }
+
+        pub fn resolvedDocFilterForRequestNativeConstraintsAlloc(
+            self: *DB,
+            alloc: Allocator,
+            req: types.SearchRequest,
+        ) !?doc_set.ResolvedDocFilter {
+            var filter = doc_set.ResolvedDocFilter{};
+            errdefer filter.deinit(alloc);
+            var changed = false;
+
+            if (req.resolved_doc_filter) |ptr| {
+                const existing: *const doc_set.ResolvedDocFilter = @ptrCast(@alignCast(ptr));
+                filter = try Self.normalizeResolvedDocFilterDocKeysNoLockAtGenerationAlloc(self, alloc, existing, req.identity_read_generation);
+                changed = true;
+            }
+
+            if (req.filter_doc_ids_positive or req.filter_doc_ids.len != 0) {
+                var include = if (req.filter_doc_ids.len == 0)
+                    doc_set.ResolvedDocSet.none
+                else
+                    try self.searchRuntimeResolveDocIdsToDocSet(alloc, req.filter_doc_ids, req.identity_read_generation);
+                defer include.deinit(alloc);
+                if (!(try intersectResolvedFilterIncludeAlloc(alloc, &filter, &include))) {
+                    filter.deinit(alloc);
+                    return null;
+                }
+                changed = true;
+            }
+
+            if (req.exclude_doc_ids.len != 0) {
+                var exclude = try self.searchRuntimeResolveDocIdsToDocSet(alloc, req.exclude_doc_ids, req.identity_read_generation);
+                defer exclude.deinit(alloc);
+                if (!(try unionResolvedFilterExcludeAlloc(alloc, &filter, &exclude))) {
+                    filter.deinit(alloc);
+                    return null;
+                }
+                changed = true;
+            }
+
+            if (!changed) return null;
+            return filter;
+        }
+
+        fn normalizeResolvedDocFilterDocKeysNoLockAtGenerationAlloc(
+            self: *DB,
+            alloc: Allocator,
+            filter: *const doc_set.ResolvedDocFilter,
+            generation: ?u64,
+        ) !doc_set.ResolvedDocFilter {
+            var out = doc_set.ResolvedDocFilter{
+                .include = try Self.normalizeResolvedDocSetDocKeysNoLockAtGenerationAlloc(self, alloc, &filter.include, generation),
+            };
+            errdefer out.deinit(alloc);
+            out.exclude = try Self.normalizeResolvedDocSetDocKeysNoLockAtGenerationAlloc(self, alloc, &filter.exclude, generation);
+            return out;
+        }
+
+        fn normalizeResolvedDocSetDocKeysNoLockAtGenerationAlloc(
+            self: *DB,
+            alloc: Allocator,
+            set: *const doc_set.ResolvedDocSet,
+            generation: ?u64,
+        ) !doc_set.ResolvedDocSet {
+            return switch (set.*) {
+                .doc_keys => |keys| try self.searchRuntimeResolveDocIdsToDocSet(alloc, keys, generation),
+                else => try doc_set.cloneAlloc(alloc, set),
+            };
+        }
+
+        fn applyResolvedFilterIncludeAlloc(
+            alloc: Allocator,
+            target: *doc_set.ResolvedDocFilter,
+            include_filter: *const doc_set.ResolvedDocFilter,
+        ) !bool {
+            var merged_include = (try doc_set.intersectAlloc(alloc, &target.include, &include_filter.include)) orelse return false;
+            errdefer merged_include.deinit(alloc);
+            var merged_exclude = (try doc_set.unionAlloc(alloc, &target.exclude, &include_filter.exclude)) orelse return false;
+            errdefer merged_exclude.deinit(alloc);
+
+            target.include.deinit(alloc);
+            target.exclude.deinit(alloc);
+            target.include = merged_include;
+            target.exclude = merged_exclude;
+            return true;
+        }
+
+        fn intersectResolvedFilterIncludeAlloc(
+            alloc: Allocator,
+            target: *doc_set.ResolvedDocFilter,
+            include: *const doc_set.ResolvedDocSet,
+        ) !bool {
+            var merged = (try doc_set.intersectAlloc(alloc, &target.include, include)) orelse return false;
+            errdefer merged.deinit(alloc);
+            target.include.deinit(alloc);
+            target.include = merged;
+            return true;
+        }
+
+        fn unionResolvedFilterExcludeAlloc(
+            alloc: Allocator,
+            target: *doc_set.ResolvedDocFilter,
+            exclude: *const doc_set.ResolvedDocSet,
+        ) !bool {
+            var merged = (try doc_set.unionAlloc(alloc, &target.exclude, exclude)) orelse return false;
+            errdefer merged.deinit(alloc);
+            target.exclude.deinit(alloc);
+            target.exclude = merged;
+            return true;
+        }
+
+        fn resolvedDocSetStatCount(set: *const doc_set.ResolvedDocSet) usize {
+            return set.estimatedCardinality() orelse 0;
+        }
+
+        fn unionResolvedDocSetsAlloc(
+            alloc: Allocator,
+            left: *const doc_set.ResolvedDocSet,
+            right: *const doc_set.ResolvedDocSet,
+        ) !?doc_set.ResolvedDocSet {
+            return switch (left.*) {
+                .all => .all,
+                .none => try doc_set.cloneAlloc(alloc, right),
+                .doc_keys => |left_keys| switch (right.*) {
+                    .all => .all,
+                    .none => try doc_set.cloneAlloc(alloc, left),
+                    .doc_keys => |right_keys| .{ .doc_keys = try unionAlgebraicDocIds(alloc, left_keys, right_keys) },
+                    .ordinals, .ordinal_bitmap => null,
+                },
+                .ordinals, .ordinal_bitmap => switch (right.*) {
+                    .all => .all,
+                    .none => try doc_set.cloneAlloc(alloc, left),
+                    .doc_keys => null,
+                    .ordinals, .ordinal_bitmap => try unionOrdinalDocSetsAlloc(alloc, left, right),
+                },
+            };
+        }
+
+        fn unionOrdinalDocSetsAlloc(
+            alloc: Allocator,
+            left: *const doc_set.ResolvedDocSet,
+            right: *const doc_set.ResolvedDocSet,
+        ) !doc_set.ResolvedDocSet {
+            var ordinals = std.ArrayListUnmanaged(doc_set.DocOrdinal).empty;
+            defer ordinals.deinit(alloc);
+            try appendResolvedDocSetOrdinalsAlloc(alloc, &ordinals, left);
+            try appendResolvedDocSetOrdinalsAlloc(alloc, &ordinals, right);
+            return try doc_set.fromOrdinalsAlloc(alloc, ordinals.items);
+        }
+
+        fn appendResolvedDocSetOrdinalsAlloc(
+            alloc: Allocator,
+            out: *std.ArrayListUnmanaged(doc_set.DocOrdinal),
+            set: *const doc_set.ResolvedDocSet,
+        ) !void {
+            switch (set.*) {
+                .ordinals => |ordinals| try out.appendSlice(alloc, ordinals),
+                .ordinal_bitmap => |*bitmap| {
+                    var iter = bitmap.iterator();
+                    while (iter.next()) |ordinal| try out.append(alloc, ordinal);
+                },
+                .all, .none, .doc_keys => {},
+            }
+        }
+
+        fn dupeAlgebraicDocIds(alloc: Allocator, doc_ids: []const []const u8) ![][]u8 {
+            var out = try alloc.alloc([]u8, doc_ids.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (out[0..initialized]) |item| alloc.free(item);
+                if (out.len > 0) alloc.free(out);
+            }
+            for (doc_ids, 0..) |doc_id, i| {
+                out[i] = try alloc.dupe(u8, doc_id);
+                initialized += 1;
+            }
+            return out;
+        }
+
+        fn containsAlgebraicDocId(doc_ids: []const []const u8, candidate: []const u8) bool {
+            for (doc_ids) |doc_id| {
+                if (std.mem.eql(u8, doc_id, candidate)) return true;
+            }
+            return false;
+        }
+
+        fn intersectAlgebraicDocIds(alloc: Allocator, left: []const []const u8, right: []const []const u8) ![][]u8 {
+            var out = std.ArrayListUnmanaged([]u8).empty;
+            errdefer {
+                for (out.items) |item| alloc.free(item);
+                out.deinit(alloc);
+            }
+            for (left) |doc_id| {
+                if (!containsAlgebraicDocId(right, doc_id)) continue;
+                try out.append(alloc, try alloc.dupe(u8, doc_id));
+            }
+            return try out.toOwnedSlice(alloc);
+        }
+
+        fn unionAlgebraicDocIds(alloc: Allocator, left: []const []const u8, right: []const []const u8) ![][]u8 {
+            var out = std.ArrayListUnmanaged([]u8).empty;
+            errdefer {
+                for (out.items) |item| alloc.free(item);
+                out.deinit(alloc);
+            }
+            for (left) |doc_id| try out.append(alloc, try alloc.dupe(u8, doc_id));
+            for (right) |doc_id| {
+                if (containsAlgebraicDocId(out.items, doc_id)) continue;
+                try out.append(alloc, try alloc.dupe(u8, doc_id));
+            }
+            return try out.toOwnedSlice(alloc);
         }
 
         fn searchComposed(

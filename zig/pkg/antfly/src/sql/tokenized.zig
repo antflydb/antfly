@@ -865,6 +865,8 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
         .{ .sql = "SELECT id FROM usage_records WHERE deleted_at IS NOT NULL", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE active IS TRUE", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE active IS NOT FALSE", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records WHERE active IS UNKNOWN", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records WHERE active IS NOT UNKNOWN", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE status IS DISTINCT FROM previous_status", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE status IS NOT DISTINCT FROM previous_status", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE status = 'open' OR deleted_at IS NULL", .generated = .query, .read = .query },
@@ -993,6 +995,16 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read_ast.where_expression.right_tokens.?);
                 } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records WHERE active IS NOT FALSE")) {
                     try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.is_not_false, read_ast.where_expression.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read_ast.where_expression.left_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read_ast.where_expression.operator_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 9 }, read_ast.where_expression.right_tokens.?);
+                } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records WHERE active IS UNKNOWN")) {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.is_unknown, read_ast.where_expression.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read_ast.where_expression.left_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read_ast.where_expression.operator_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read_ast.where_expression.right_tokens.?);
+                } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records WHERE active IS NOT UNKNOWN")) {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.is_not_unknown, read_ast.where_expression.kind);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read_ast.where_expression.left_tokens.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read_ast.where_expression.operator_tokens.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 9 }, read_ast.where_expression.right_tokens.?);
