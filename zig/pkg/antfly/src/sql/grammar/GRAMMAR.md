@@ -93,7 +93,8 @@ projection expression/alias token splits for explicit `AS` aliases and
 PostgreSQL-style bare aliases, generated ordering direction, `USING` operator,
 and `NULLS` ordering token splits, and first-join generated metadata for
 join operator/type, left input, right input, `ON` predicate ranges, and
-`USING` column-list ranges, plus simple top-level
+`USING` column-list ranges, explicit generated join-tree root/depth metadata
+for left-associative generated join nodes, plus simple top-level
 comparison expression metadata for covered `WHERE`, `HAVING`, and join
 predicates. Normal function-call argument
 lists are accepted in generated expression grammar, including top-level
@@ -126,6 +127,8 @@ and an initial generated AST-to-plan wrapper that validates those ranges and
 fails closed if the generated read family is incompatible with the existing
 read classifier. Simple query, aggregate, join, and lateral reads now validate
 generated clause ranges before calling their typed read-plan lowerers directly;
+single binary join reads also validate generated join-tree metadata against the
+typed join lowerer before producing a join plan;
 basic `OVER (PARTITION BY ... ORDER BY ...)` window reads now classify as a
 generated window family, minimal named `WINDOW ... AS (PARTITION BY ... ORDER
 BY ...)` clauses are accepted and ranged, seed `ROWS`/`RANGE` frame tails are
@@ -142,12 +145,16 @@ column-alias lists, and `MATERIALIZED` / `NOT MATERIALIZED` hint metadata;
 recursive CTE reads carry an explicit generated recursive flag, and simple
 non-recursive CTE reads dispatch directly when those ranges validate; generated pagination
 grammar now covers `LIMIT`, `OFFSET`, and `FETCH FIRST`/`FETCH NEXT` query
-tails with count expression metadata.
+tails with count expression metadata, and simple query, aggregate, join, and
+window pagination use generated range-validated lowering when generated read
+metadata is available.
 Unsupported read shapes
 still fall back, and deeper read cutover still requires full generated
 query-body AST payloads for expression-level projections and predicates,
-complete join trees, complete expression AST nodes, complete per-CTE body AST
-arrays, recursive CTE planning, aggregates, windows, ordering, pagination, and
+complete multi-join planning and richer join-tree semantics beyond the current
+validated left-associative generated join nodes, complete expression AST nodes,
+complete per-CTE body AST arrays, recursive CTE planning, aggregates, windows,
+ordering, remaining pagination cutover, and
 direct generated read-plan lowering. The generated parser now also treats seed
 graph DDL as a distinct graph statement family and `ParsedSql` retains those
 generated raw and AST nodes. Seed graph index and graph metric statements now
@@ -262,7 +269,9 @@ Suggested migration order:
    PostgreSQL-style bare aliases, generated ordering direction, `USING`
    operator, and `NULLS` ordering token splits, and owned join item arrays
    with first-join compatibility metadata for join operator/type, left input,
-   right input, `ON` predicate ranges, and `USING` column-list ranges, plus simple top-level comparison
+   right input, `ON` predicate ranges, and `USING` column-list ranges, plus
+   explicit join-tree root/depth metadata for generated left-associative join
+   nodes, plus simple top-level comparison
    expression metadata for covered `WHERE`, `HAVING`, and join predicates; and
    normal function-call argument lists are accepted by the generated expression
    grammar for covered read projections, including `*` aggregate arguments and
@@ -323,6 +332,8 @@ Suggested migration order:
    a direct generated AST-to-query-plan lowering boundary after clause-range
    validation, and aggregate, join, and lateral reads now have direct generated
    AST-to-read-family dispatch boundaries after clause-range validation.
+   Single binary join reads now validate generated join-tree metadata against
+   the typed join lowerer before producing a join plan.
    Basic `OVER (PARTITION BY ... ORDER BY ...)` and named
    `WINDOW ... AS (PARTITION BY ... ORDER BY ...)` reads now classify as
    generated window reads, seed `ROWS`/`RANGE` frame tails are accepted in
@@ -343,14 +354,14 @@ Suggested migration order:
    `ROW`/`ROWS`, and `FETCH FIRST`/`FETCH NEXT` tails with optional fetch
    counts; generated metadata records limit expressions, the `LIMIT ALL`
    marker, offset expressions, and explicit fetch-count expressions, and
-   simple query, aggregate, and window pagination now use generated
+   simple query, aggregate, join, and window pagination now use generated
    range-validated lowering when generated read metadata is available.
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression AST semantics beyond the current owned
-   expression item arrays, full join planning/lowering and richer join-tree
-   semantics beyond the current left-associative item arrays, pagination
-   lowering/cutover beyond the current generated AST metadata, broader expression AST
+   expression item arrays, full multi-join planning/lowering and richer
+   join-tree semantics beyond the current validated left-associative generated
+   join nodes, pagination cutover for the remaining read families, broader expression AST
    nodes beyond the current recursive predicate/operator metadata, broader function
    coverage, broader boolean expression-tree coverage, quantified subquery
    planning/lowering, remaining specialized expression operators, recursive
@@ -528,7 +539,8 @@ Generated grammar work needs evidence at multiple levels:
   generated AST-to-plan parity through a generated-family validation wrapper
   over representative query, aggregate, join, lateral, and non-recursive CTE
   plans, AST-shape coverage for generated-ranged multi-CTE and recursive CTE
-  prefixes, single- and multi-join component range coverage, and simple comparison plus
+  prefixes, single- and multi-join component range/tree coverage with
+  fail-closed single-join lowerer validation, and simple comparison plus
   positive/negated predicate expression-shape coverage for read predicates,
   including escaped `LIKE`/`ILIKE` pattern metadata.
   Seed graph DDL has generated AST-to-plan parity for graph index and graph

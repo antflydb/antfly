@@ -2297,6 +2297,7 @@ fn lowerJoinWithSchemasParsedSqlAlloc(
         .schema = schema,
         .joined_source_schema = source_schema,
         .params = params,
+        .generated_read_ast = generatedReadAstForParsedSql(parsed_sql, .join),
     };
     var lowered = sql_adapter.parseJoinPlanAlloc(
         alloc,

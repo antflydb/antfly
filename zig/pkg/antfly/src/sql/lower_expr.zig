@@ -153,6 +153,38 @@ fn parseGeneratedFetchLimitValueForClause(
     return .{ .value = limit };
 }
 
+fn validateGeneratedSingleJoinForClause(
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+    tokens: []const Token,
+    left_tokens: generated_parser.GeneratedSqlTokenRange,
+    operator_tokens: generated_parser.GeneratedSqlTokenRange,
+    join_type: db_mod.types.RelationalRowsJoinType,
+    right_tokens: generated_parser.GeneratedSqlTokenRange,
+    condition_tokens: generated_parser.GeneratedSqlTokenRange,
+    predicate_tokens: generated_parser.GeneratedSqlTokenRange,
+) !void {
+    const read = generated_read_ast orelse return;
+    if (read.kind != .join) return error.UnsupportedSqlShape;
+    const root_index = read.join_tree_root_index orelse return error.UnsupportedSqlShape;
+    if (read.join_items.len != 1 or root_index != 0 or read.join_tree_depth != 1) return error.UnsupportedSqlShape;
+    const join = read.join_items[0];
+    if (join.tree_index != 0 or join.tree_depth != 1 or join.left_child_index != null) return error.UnsupportedSqlShape;
+    if (join.condition_kind != .on) return error.UnsupportedSqlShape;
+    if (join.tokens.start != left_tokens.start or join.tokens.end != predicate_tokens.end) return error.UnsupportedSqlShape;
+    if (join.left_tokens.start != left_tokens.start or join.left_tokens.end != left_tokens.end) return error.UnsupportedSqlShape;
+    if (join.operator_tokens.start != operator_tokens.start or join.operator_tokens.end != operator_tokens.end) return error.UnsupportedSqlShape;
+    if (join.right_tokens.start != right_tokens.start or join.right_tokens.end != right_tokens.end) return error.UnsupportedSqlShape;
+    if (join.condition_tokens.start != condition_tokens.start or join.condition_tokens.end != condition_tokens.end) return error.UnsupportedSqlShape;
+    const join_predicate_tokens = join.predicate_tokens orelse return error.UnsupportedSqlShape;
+    if (join_predicate_tokens.start != predicate_tokens.start or join_predicate_tokens.end != predicate_tokens.end) return error.UnsupportedSqlShape;
+    const expected_kind: generated_parser.GeneratedSqlJoinKind = switch (join_type) {
+        .inner => .inner,
+        .left => .left,
+    };
+    if (join.kind != expected_kind) return error.UnsupportedSqlShape;
+    if (join.tokens.end > tokens.len) return error.UnsupportedSqlShape;
+}
+
 pub const WindowParserOptions = struct {
     params: []const value_mod.SqlValue = &.{},
     available_ctes: []const db_mod.types.RelationalRowsCte = &.{},
@@ -173,6 +205,7 @@ pub const WindowParserOptions = struct {
 pub const JoinParserOptions = struct {
     params: []const value_mod.SqlValue = &.{},
     available_ctes: []const db_mod.types.RelationalRowsCte = &.{},
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst = null,
     context_hooks: JoinParserContextHooks,
     expression_where_options: JoinedMutationExpressionWhereConditionParserOptions,
     output_order_expression_options: OutputOrderExpressionParserOptions,
@@ -16625,6 +16658,7 @@ pub fn parseJoinAlloc(
     defer plan_mod.freeQualifiedProjections(alloc, raw_select);
 
     try parser.expectKeyword(tokens, pos, "from");
+    const left_tokens_start = pos.*;
     var left_graph_source = try parseGraphTableFunctionSourceAtAlloc(alloc, tokens, pos.*, "__antfly_graph_join_left", options.available_ctes);
     var left_graph_source_transferred = false;
     defer if (!left_graph_source_transferred) {
@@ -16635,6 +16669,7 @@ pub fn parseJoinAlloc(
         break :table_ref try cloneTableAliasAlloc(alloc, source.table_ref);
     } else try plan_mod.parseTableAliasAlloc(alloc, tokens, pos);
     defer plan_mod.freeTableAlias(alloc, left_table);
+    const operator_tokens_start = pos.*;
 
     const join_type: db_mod.types.RelationalRowsJoinType = if (parser.matchKeyword(tokens, pos, "left")) blk: {
         _ = parser.matchKeyword(tokens, pos, "outer");
@@ -16645,6 +16680,7 @@ pub fn parseJoinAlloc(
         try parser.expectKeyword(tokens, pos, "join");
         break :blk .inner;
     };
+    const right_tokens_start = pos.*;
 
     var right_graph_source = try parseGraphTableFunctionSourceAtAlloc(alloc, tokens, pos.*, "__antfly_graph_join", options.available_ctes);
     var right_graph_source_transferred = false;
@@ -16656,6 +16692,7 @@ pub fn parseJoinAlloc(
         break :table_ref try cloneTableAliasAlloc(alloc, source.table_ref);
     } else try plan_mod.parseTableAliasAlloc(alloc, tokens, pos);
     defer plan_mod.freeTableAlias(alloc, right_table);
+    const condition_tokens_start = pos.*;
     if (std.mem.eql(u8, left_table.alias, right_table.alias)) return error.UnsupportedSqlShape;
 
     const left_table_name_source = if (left_graph_source) |source| switch (source.cte.table_function.?) {
@@ -16861,6 +16898,7 @@ pub fn parseJoinAlloc(
     }
 
     try parser.expectKeyword(tokens, pos, "on");
+    const predicate_tokens_start = pos.*;
     var on_targets = JoinOnPredicateTargets{
         .on = &on,
         .left_predicates = &left_predicates,
@@ -16884,6 +16922,16 @@ pub fn parseJoinAlloc(
         &on_targets,
         options.expression_where_options,
         options.realtime_ns,
+    );
+    try validateGeneratedSingleJoinForClause(
+        options.generated_read_ast,
+        tokens,
+        .{ .start = left_tokens_start, .end = operator_tokens_start },
+        .{ .start = operator_tokens_start, .end = right_tokens_start },
+        join_type,
+        .{ .start = right_tokens_start, .end = condition_tokens_start },
+        .{ .start = condition_tokens_start, .end = pos.* },
+        .{ .start = predicate_tokens_start, .end = pos.* },
     );
 
     var select = std.ArrayListUnmanaged(db_mod.types.RelationalRowsJoinProjection).empty;
@@ -16957,11 +17005,25 @@ pub fn parseJoinAlloc(
                 options.output_order_expression_options,
             );
         } else if (parser.matchKeyword(tokens, pos, "limit")) {
-            limit = try value_mod.parseLimitValue(tokens, pos, options.params);
+            const keyword_index = pos.* - 1;
+            if (try parseGeneratedLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_limit| {
+                limit = generated_limit.value;
+            } else {
+                limit = try value_mod.parseLimitValue(tokens, pos, options.params);
+            }
         } else if (parser.matchKeyword(tokens, pos, "offset")) {
-            offset = try value_mod.parseOffsetValue(tokens, pos, options.params);
+            const keyword_index = pos.* - 1;
+            offset = if (try parseGeneratedOffsetValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_offset|
+                generated_offset
+            else
+                try value_mod.parseOffsetValue(tokens, pos, options.params);
         } else if (parser.matchKeyword(tokens, pos, "fetch")) {
-            limit = try value_mod.parseFetchLimitValue(tokens, pos, options.params);
+            const keyword_index = pos.* - 1;
+            if (try parseGeneratedFetchLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_limit| {
+                limit = generated_limit.value;
+            } else {
+                limit = try value_mod.parseFetchLimitValue(tokens, pos, options.params);
+            }
         } else if (parser.matchToken(tokens, pos, .semicolon) != null) {
             if (!parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
         } else if (nextIsUnsupportedQueryKeyword(tokens, pos.*)) {
@@ -25088,11 +25150,20 @@ fn lowerJoinForLowerExprTestAlloc(
     schema: runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
 ) !plan_mod.LoweredJoin {
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerParsedJoinForLowerExprTestAlloc(alloc, &parsed_sql, schema, params);
+}
+
+fn lowerParsedJoinForLowerExprTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+) !plan_mod.LoweredJoin {
     const parser_context = @import("parser_context.zig");
 
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
-    defer parsed_sql.deinit(alloc);
     const tokens = parsed_sql.items();
     const cte_adapter_shape = parser.tokensStartWithKeywordTag(tokens, .with);
 
@@ -25102,6 +25173,7 @@ fn lowerJoinForLowerExprTestAlloc(
         .schema = schema,
         .joined_source_schema = schema,
         .params = params,
+        .generated_read_ast = generatedReadAstForParsedSql(parsed_sql, .join),
     };
     var lowered = plan_mod.parseJoinPlanAlloc(
         alloc,
@@ -34102,6 +34174,24 @@ test "sql adapter lower expr lowers equality join queries" {
     try std.testing.expectEqualStrings("amount", lowered.join.order_by[0].field);
     try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.join.order_by[0].direction);
     try std.testing.expectEqual(@as(u32, 5), lowered.join.limit.?);
+
+    var malformed_generated_join = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant = c.tenant AND o.customer_id = c.id",
+    );
+    defer malformed_generated_join.deinit(alloc);
+    if (malformed_generated_join.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |*read| read.join_tree_depth = 2,
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedJoinForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_join,
+        schema,
+        &.{},
+    ));
 
     var graph_cte_join = try lowerJoinForLowerExprTestAlloc(
         alloc,
