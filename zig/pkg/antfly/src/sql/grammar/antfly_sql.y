@@ -614,7 +614,7 @@ comparison_expression:
   | concat_expression NOT ILIKE concat_expression
   | concat_expression NOT IN LPAREN expression_list RPAREN
   | concat_expression NOT BETWEEN concat_expression AND concat_expression
-  | concat_expression comparison_operator quantified_operator LPAREN expression_list RPAREN
+  | concat_expression comparison_operator quantified_operator quantified_rhs
   | concat_expression IS NULL
   | concat_expression IS NOT NULL
   | concat_expression IS TRUE
@@ -640,6 +640,11 @@ quantified_operator:
     ANY
   | ALL
   | SOME
+  ;
+
+quantified_rhs:
+    LPAREN expression_list RPAREN
+  | LPAREN read_statement RPAREN
   ;
 
 concat_expression:

@@ -97,8 +97,9 @@ projection functions with comma-separated arguments, and positive `LIKE`,
 `ILIKE`, `IN (...)`, and `BETWEEN ... AND ...` predicates are accepted and
 classified in generated expression metadata along with their `NOT` negated
 forms. `ANY`/`ALL`/`SOME` quantified comparison predicates over parenthesized
-expression lists are also accepted and classified with explicit quantifier
-token ranges. `IS NULL` and `IS NOT NULL` predicates are accepted and
+expression lists and parenthesized read subqueries are also accepted and
+classified with explicit quantifier token ranges and subquery token spans.
+`IS NULL` and `IS NOT NULL` predicates are accepted and
 classified as explicit null-test expression kinds, `IS TRUE`/`IS FALSE`/
 `IS UNKNOWN` boolean-test predicates are accepted with their `IS NOT` variants,
 and
@@ -257,8 +258,9 @@ Suggested migration order:
    `IN (...)`, and `BETWEEN ... AND ...` predicates are accepted and classified
    in generated expression metadata along with their `NOT` negated forms.
    `ANY`/`ALL`/`SOME` quantified comparison predicates over parenthesized
-   expression lists are accepted and classified with explicit quantifier token
-   ranges, and quantified predicates over typed array constructors such as
+   expression lists and parenthesized read subqueries are accepted and
+   classified with explicit quantifier token ranges and subquery token spans,
+   and quantified predicates over typed array constructors such as
    `= ANY(ARRAY[...]::text[])` carry generated array-constructor metadata after
    public tokenization normalizes cast suffixes. Array/range containment and
    overlap predicates using `@>` and `&&` are accepted and classified with
@@ -317,7 +319,7 @@ Suggested migration order:
    lowering/cutover beyond the current generated AST metadata, broader expression AST
    nodes beyond the current recursive predicate/operator metadata, broader function
    coverage, broader boolean expression-tree coverage, quantified subquery
-   predicate coverage, remaining specialized expression operators, recursive
+   planning/lowering, remaining specialized expression operators, recursive
    CTE planning, direct generated read-plan lowering, and
    unsupported-shape diagnostics.
 5. Advanced DML: `INSERT ... SELECT`, `UPDATE ... FROM`, `DELETE ... USING`,

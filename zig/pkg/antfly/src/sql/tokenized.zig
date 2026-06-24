@@ -868,6 +868,8 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
         .{ .sql = "SELECT id FROM usage_records WHERE score <> ALL (1, 2)", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE score > SOME (1, 2)", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE status = ANY(ARRAY['active','pending']::text[])", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records WHERE score = ANY (SELECT score FROM thresholds WHERE active IS TRUE)", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records WHERE score <> ALL (SELECT score FROM archived_thresholds)", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE tags @> ARRAY['hot','new']", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE tags && ARRAY['hot','new']", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE metadata ? 'flags'", .generated = .query, .read = .query },
@@ -1028,6 +1030,26 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                     try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.array_constructor, array_constructor.kind);
                     try std.testing.expectEqual(@as(usize, 2), array_constructor.array_items.count);
                     try std.testing.expectEqual(@as(usize, 2), array_constructor.array_items.expressions.len);
+                } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records WHERE score = ANY (SELECT score FROM thresholds WHERE active IS TRUE)")) {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.quantified_comparison, read_ast.where_expression.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read_ast.where_expression.left_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read_ast.where_expression.operator_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read_ast.where_expression.quantifier_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 8, .end = 18 }, read_ast.where_expression.right_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.subquery, read_ast.where_expression.right_expression_kind.?);
+                    const subquery = read_ast.where_expression.right_expression orelse return error.TestUnexpectedResult;
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.subquery, subquery.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 9, .end = 17 }, subquery.inner_tokens.?);
+                } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records WHERE score <> ALL (SELECT score FROM archived_thresholds)")) {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.quantified_comparison, read_ast.where_expression.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read_ast.where_expression.left_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read_ast.where_expression.operator_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read_ast.where_expression.quantifier_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 8, .end = 14 }, read_ast.where_expression.right_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.subquery, read_ast.where_expression.right_expression_kind.?);
+                    const subquery = read_ast.where_expression.right_expression orelse return error.TestUnexpectedResult;
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.subquery, subquery.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 9, .end = 13 }, subquery.inner_tokens.?);
                 } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records WHERE tags @> ARRAY['hot','new']")) {
                     try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.contains, read_ast.where_expression.kind);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read_ast.where_expression.left_tokens.?);
