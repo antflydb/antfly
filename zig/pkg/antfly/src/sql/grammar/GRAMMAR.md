@@ -35,11 +35,14 @@ states, indexed action/goto tables, source-aware syntax diagnostics, and
 structured conflict reporting. The current broad Antfly SQL seed grammar
 generates conflict-free parser metadata. The first runtime integration observes
 the generated parser on the `ParsedSql` path but does not require grammar parity
-before the existing parser can handle a statement. Dedicated generated-parser
-tests enforce session, transaction, prepared statement, and simple DDL corpus
-coverage. The generated facade now returns closed statement-family nodes for
-the covered families; full production AST construction remains the next
-migration boundary for larger DDL, query, and DML families.
+before the existing parser can handle a statement. When the generated parser
+accepts a statement, `ParsedSql` retains a source-span-bearing generated raw
+node and uses it for the first migrated statement variants. Dedicated
+generated-parser tests enforce session, transaction, prepared statement, and
+simple DDL corpus coverage. The generated facade now returns closed
+statement-family nodes for the covered families; full production AST
+construction remains the next migration boundary for larger DDL, query, and DML
+families.
 
 ## Compatibility Policy
 
@@ -180,7 +183,8 @@ This avoids mixing syntax migration with execution changes. If a statement
 family currently performs ad hoc token inspection, migrate that inspection into
 an AST node before switching the family to the generated parser.
 
-The generated parser facade currently produces closed variants for:
+The generated parser facade currently produces source-span-bearing closed
+variants for:
 
 - session statement
 - transaction statement

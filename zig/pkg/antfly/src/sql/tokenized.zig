@@ -56,6 +56,10 @@ pub const ParsedDdlStatement = struct {
     raw: RawSqlStatement,
 };
 
+pub const ParsedPreparedStatement = struct {
+    raw: RawSqlStatement,
+};
+
 pub const ParsedExplainStatement = struct {
     raw: RawSqlStatement,
     analyze: bool = false,
@@ -79,12 +83,22 @@ pub const ParsedSessionStatement = struct {
     raw: RawSqlStatement,
 };
 
+pub const GeneratedRawSqlStatement = struct {
+    raw: RawSqlStatement,
+    statement: generated_parser.GeneratedSqlStatement,
+
+    pub fn kind(self: GeneratedRawSqlStatement) generated_parser.GeneratedSqlStatementKind {
+        return std.meta.activeTag(self.statement);
+    }
+};
+
 pub const ParsedStatement = union(enum) {
     read: ParsedReadStatement,
     write: ParsedWriteStatement,
     ddl: ParsedDdlStatement,
     explain: ParsedExplainStatement,
     transaction: ParsedTransactionStatement,
+    prepared: ParsedPreparedStatement,
     session: ParsedSessionStatement,
     unknown: RawSqlStatement,
 
@@ -95,6 +109,7 @@ pub const ParsedStatement = union(enum) {
             .ddl => |statement| statement.raw,
             .explain => |statement| statement.raw,
             .transaction => |statement| statement.raw,
+            .prepared => |statement| statement.raw,
             .session => |statement| statement.raw,
             .unknown => |statement| statement,
         };
@@ -183,29 +198,32 @@ pub const TokenizedSql = struct {
 pub const ParsedSql = struct {
     tokenized_sql: TokenizedSql,
     raw_statement: RawSqlStatement,
+    generated_statement: ?GeneratedRawSqlStatement = null,
     statement: ParsedStatement,
 
     pub fn initAlloc(alloc: std.mem.Allocator, source_sql: []const u8) !ParsedSql {
         var tokenized_sql = try TokenizedSql.initAlloc(alloc, source_sql);
         errdefer tokenized_sql.deinit(alloc);
-        try observeGeneratedParserGateAlloc(alloc, tokenized_sql.items());
         const raw_statement = try parseRawStatement(tokenized_sql.items(), tokenized_sql.statement_family);
+        const generated_statement = try parseGeneratedRawStatementAlloc(alloc, tokenized_sql.items(), raw_statement);
         return .{
             .tokenized_sql = tokenized_sql,
             .raw_statement = raw_statement,
-            .statement = parseStatement(raw_statement, &tokenized_sql),
+            .generated_statement = generated_statement,
+            .statement = parseStatement(raw_statement, generated_statement, &tokenized_sql),
         };
     }
 
     pub fn initFromTokenSliceAlloc(alloc: std.mem.Allocator, source_sql: []const u8, source_tokens: []const Token) !ParsedSql {
         var tokenized_sql = try TokenizedSql.initFromTokenSliceAlloc(alloc, source_sql, source_tokens);
         errdefer tokenized_sql.deinit(alloc);
-        try observeGeneratedParserGateAlloc(alloc, tokenized_sql.items());
         const raw_statement = try parseRawStatement(tokenized_sql.items(), tokenized_sql.statement_family);
+        const generated_statement = try parseGeneratedRawStatementAlloc(alloc, tokenized_sql.items(), raw_statement);
         return .{
             .tokenized_sql = tokenized_sql,
             .raw_statement = raw_statement,
-            .statement = parseStatement(raw_statement, &tokenized_sql),
+            .generated_statement = generated_statement,
+            .statement = parseStatement(raw_statement, generated_statement, &tokenized_sql),
         };
     }
 
@@ -227,10 +245,12 @@ pub const ParsedSql = struct {
         var tokenized_sql = try TokenizedSql.initFromTokenRangesAlloc(alloc, parent.sql(), parent.items(), ranges);
         errdefer tokenized_sql.deinit(alloc);
         const raw_statement = try parseRawStatement(tokenized_sql.items(), tokenized_sql.statement_family);
+        const generated_statement = try parseGeneratedRawStatementAlloc(alloc, tokenized_sql.items(), raw_statement);
         return .{
             .tokenized_sql = tokenized_sql,
             .raw_statement = raw_statement,
-            .statement = parseStatement(raw_statement, &tokenized_sql),
+            .generated_statement = generated_statement,
+            .statement = parseStatement(raw_statement, generated_statement, &tokenized_sql),
         };
     }
 
@@ -262,16 +282,42 @@ pub const ParsedSql = struct {
     pub fn isRecursiveWriteStatement(self: *const ParsedSql) bool {
         return self.statement.isRecursiveWrite();
     }
+
+    pub fn generatedStatementKind(self: *const ParsedSql) ?generated_parser.GeneratedSqlStatementKind {
+        if (self.generated_statement) |statement| return statement.kind();
+        return null;
+    }
 };
 
-fn observeGeneratedParserGateAlloc(alloc: std.mem.Allocator, tokens: []const Token) !void {
-    _ = generated_parser.parseGeneratedGateTokensAlloc(alloc, tokens) catch |err| switch (err) {
+fn parseGeneratedRawStatementAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    raw_statement: RawSqlStatement,
+) !?GeneratedRawSqlStatement {
+    const result = generated_parser.parseGeneratedGateTokensAlloc(alloc, tokens) catch |err| switch (err) {
         error.UnsupportedSqlShape, error.UnexpectedToken => null,
         else => return err,
     };
+    if (result) |parsed| {
+        return .{ .raw = raw_statement, .statement = parsed.statement };
+    }
+    return null;
 }
 
-fn parseStatement(raw_statement: RawSqlStatement, tokenized_sql: *const TokenizedSql) ParsedStatement {
+fn parseStatement(
+    raw_statement: RawSqlStatement,
+    generated_statement: ?GeneratedRawSqlStatement,
+    tokenized_sql: *const TokenizedSql,
+) ParsedStatement {
+    if (generated_statement) |generated_raw| {
+        switch (generated_raw.statement) {
+            .session => return .{ .session = .{ .raw = raw_statement } },
+            .transaction => return .{ .transaction = .{ .raw = raw_statement } },
+            .prepared => return .{ .prepared = .{ .raw = raw_statement } },
+            .ddl => return .{ .ddl = .{ .raw = raw_statement } },
+            .other => {},
+        }
+    }
     if (tokenized_sql.read_statement_kind) |kind| {
         return .{ .read = .{ .kind = kind, .raw = raw_statement } };
     }
@@ -297,7 +343,7 @@ fn classifyDdlLikeStatement(raw_statement: RawSqlStatement, tokens: []const Toke
         return .{ .session = .{ .raw = raw_statement } };
     }
     if (tokens[0].isKeyword(.prepare) or tokens[0].isKeyword(.execute) or tokens[0].isKeyword(.deallocate)) {
-        return .{ .session = .{ .raw = raw_statement } };
+        return .{ .prepared = .{ .raw = raw_statement } };
     }
     return .{ .ddl = .{ .raw = raw_statement } };
 }
@@ -663,15 +709,29 @@ test "sql adapter parsed sql owns typed statement variants" {
 
     var session = try ParsedSql.initAlloc(alloc, "SET search_path TO public");
     defer session.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.session, session.generatedStatementKind().?);
     switch (session.statement) {
         .session => {},
         else => return error.TestUnexpectedResult,
     }
 
+    var prepared = try ParsedSql.initAlloc(alloc, "PREPARE read_stmt AS SELECT id FROM usage_records");
+    defer prepared.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.prepared, prepared.generatedStatementKind().?);
+    switch (prepared.statement) {
+        .prepared => |statement| try std.testing.expectEqualStrings("PREPARE read_stmt AS SELECT id FROM usage_records", statement.raw.sql(prepared.sql())),
+        else => return error.TestUnexpectedResult,
+    }
+
     var ddl = try ParsedSql.initAlloc(alloc, "CREATE TABLE usage_records (id text)");
     defer ddl.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, ddl.generatedStatementKind().?);
     switch (ddl.statement) {
         .ddl => {},
         else => return error.TestUnexpectedResult,
     }
+
+    var unsupported_generated = try ParsedSql.initAlloc(alloc, "SELECT id FROM docs WHERE status = 'active' LIMIT 5");
+    defer unsupported_generated.deinit(alloc);
+    try std.testing.expect(unsupported_generated.generated_statement == null);
 }
