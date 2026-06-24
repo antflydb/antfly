@@ -2928,9 +2928,13 @@ pub fn prepareStatementPlanFromGeneratedAstAlloc(
     const statement_name = try generatedSingleIdentifierText(tokens, ast.name_tokens orelse return error.UnsupportedSqlShape);
     const inner = ast.inner_statement_tokens orelse return error.UnsupportedSqlShape;
     const statement_family = classifier.classifyPreparedStatementStatementKind(tokens, inner.start) orelse return error.UnsupportedSqlShape;
+    const parameter_count = if (ast.parameter_tokens) |parameter_tokens|
+        try countGeneratedParenthesizedList(tokens, parameter_tokens)
+    else
+        0;
     return .{
         .statement_name = try alloc.dupe(u8, statement_name),
-        .parameter_count = 0,
+        .parameter_count = parameter_count,
         .statement_kind = preparedStatementSubjectKindFromSyntax(classifier.preparedStatementSubjectKindFromStatementKind(statement_family)),
         .statement_family = preparedStatementStatementKindFromSyntax(statement_family),
     };
@@ -2943,7 +2947,7 @@ pub fn executePreparedStatementPlanFromGeneratedAstAlloc(
 ) !ExecutePreparedStatementPlan {
     const statement_name = try generatedSingleIdentifierText(tokens, ast.name_tokens orelse return error.UnsupportedSqlShape);
     const argument_count = if (ast.argument_tokens) |argument_tokens|
-        try countGeneratedPreparedArguments(tokens, argument_tokens)
+        try countGeneratedParenthesizedList(tokens, argument_tokens)
     else
         0;
     return .{
@@ -2967,7 +2971,7 @@ fn generatedSingleIdentifierText(tokens: []const grammar.Token, range: generated
     return tokens[range.start].text;
 }
 
-fn countGeneratedPreparedArguments(tokens: []const grammar.Token, range: generated_parser.GeneratedSqlTokenRange) !usize {
+fn countGeneratedParenthesizedList(tokens: []const grammar.Token, range: generated_parser.GeneratedSqlTokenRange) !usize {
     if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
     if (tokens[range.start].kind != .lparen or tokens[range.end - 1].kind != .rparen) return error.UnsupportedSqlShape;
     if (range.start + 1 == range.end - 1) return 0;
@@ -11887,9 +11891,9 @@ test "sql adapter ddl plan lowers prepared statement cursor and savepoint ddl pl
 test "sql adapter generated prepared AST lowers to prepared statement plans" {
     const alloc = std.testing.allocator;
 
-    var generated_prepare = try generatedPreparedStatementPlanForTestAlloc(alloc, "PREPARE usage_plan AS SELECT id FROM usage_records;");
+    var generated_prepare = try generatedPreparedStatementPlanForTestAlloc(alloc, "PREPARE usage_plan(text) AS SELECT id FROM usage_records WHERE status = $1;");
     defer generated_prepare.deinit(alloc);
-    var legacy_prepare = try lowerDdlPlanForTestAlloc(alloc, "PREPARE usage_plan AS SELECT id FROM usage_records;");
+    var legacy_prepare = try lowerDdlPlanForTestAlloc(alloc, "PREPARE usage_plan(text) AS SELECT id FROM usage_records WHERE status = $1;");
     defer legacy_prepare.deinit(alloc);
     switch (generated_prepare) {
         .prepare => |generated| switch (legacy_prepare) {

@@ -64,9 +64,19 @@ transaction_statement:
   ;
 
 prepared_statement:
-    PREPARE IDENT AS statement
+    PREPARE IDENT prepare_parameter_types_opt AS statement
   | EXECUTE IDENT argument_list_opt
   | DEALLOCATE IDENT
+  ;
+
+prepare_parameter_types_opt:
+    /* empty */
+  | LPAREN type_name_list RPAREN
+  ;
+
+type_name_list:
+    type_name
+  | type_name_list COMMA type_name
   ;
 
 ddl_statement:

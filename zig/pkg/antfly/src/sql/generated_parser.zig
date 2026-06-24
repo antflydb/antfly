@@ -121,6 +121,7 @@ pub const GeneratedSqlPreparedAst = struct {
     statement_span: token_mod.SourceSpan,
     command_span: token_mod.SourceSpan,
     name_tokens: ?GeneratedSqlTokenRange = null,
+    parameter_tokens: ?GeneratedSqlTokenRange = null,
     argument_tokens: ?GeneratedSqlTokenRange = null,
     inner_statement_tokens: ?GeneratedSqlTokenRange = null,
 };
@@ -169,6 +170,7 @@ pub const first_family_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "COMMIT", .kind = .transaction },
     .{ .sql = "ROLLBACK", .kind = .transaction },
     .{ .sql = "PREPARE read_stmt AS SELECT id FROM usage_records", .kind = .prepared },
+    .{ .sql = "PREPARE read_stmt(text) AS SELECT id FROM usage_records WHERE status = $1", .kind = .prepared },
     .{ .sql = "EXECUTE read_stmt()", .kind = .prepared },
     .{ .sql = "DEALLOCATE read_stmt", .kind = .prepared },
 };
@@ -500,6 +502,7 @@ fn buildPreparedAst(
         .prepare => {
             if (end > 1) ast.name_tokens = .{ .start = 1, .end = 2 };
             if (findKeyword(tokens, 2, end, .as)) |as_index| {
+                if (as_index > 2) ast.parameter_tokens = .{ .start = 2, .end = as_index };
                 if (as_index + 1 < end) ast.inner_statement_tokens = .{ .start = as_index + 1, .end = end };
             }
         },
@@ -594,7 +597,7 @@ test "generated SQL parser facade builds control AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
-    const prepare_sql = "PREPARE read_stmt AS SELECT id FROM usage_records";
+    const prepare_sql = "PREPARE read_stmt(text) AS SELECT id FROM usage_records WHERE status = $1";
     var prepare_tokens = try lexer.tokenizeAlloc(alloc, prepare_sql);
     defer lexer.freeTokens(alloc, &prepare_tokens);
     const prepare_result = try parseTokensAlloc(alloc, prepare_tokens.items);
@@ -603,7 +606,8 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlPreparedKind.prepare, prepared.kind);
             try std.testing.expectEqualStrings("PREPARE", spanText(prepare_sql, prepared.command_span));
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, prepared.name_tokens.?);
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 7 }, prepared.inner_statement_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 5 }, prepared.parameter_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 14 }, prepared.inner_statement_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
