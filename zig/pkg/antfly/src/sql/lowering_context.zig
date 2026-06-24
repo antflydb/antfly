@@ -4307,6 +4307,54 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_comparison_expression_parsed_sql, malformed_comparison_expression_read_ast),
     );
 
+    var malformed_json_operator_kind_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE metadata->>'source' = 'api'",
+    );
+    defer malformed_json_operator_kind_parsed_sql.deinit(alloc);
+    const malformed_json_operator_kind_generated_raw = malformed_json_operator_kind_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_json_operator_kind_read_ast = switch (malformed_json_operator_kind_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_json_operator_kind_read_ast.where_expression.left_expression.?.kind = .json_access;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_json_operator_kind_parsed_sql, malformed_json_operator_kind_read_ast),
+    );
+
+    var malformed_concat_operator_kind_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status || ':' || id = 'open:u1'",
+    );
+    defer malformed_concat_operator_kind_parsed_sql.deinit(alloc);
+    const malformed_concat_operator_kind_generated_raw = malformed_concat_operator_kind_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_concat_operator_kind_read_ast = switch (malformed_concat_operator_kind_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_concat_operator_kind_read_ast.where_expression.left_expression.?.kind = .additive;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_concat_operator_kind_parsed_sql, malformed_concat_operator_kind_read_ast),
+    );
+
+    var malformed_regex_operator_kind_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status ~ 'op.*'",
+    );
+    defer malformed_regex_operator_kind_parsed_sql.deinit(alloc);
+    const malformed_regex_operator_kind_generated_raw = malformed_regex_operator_kind_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_regex_operator_kind_read_ast = switch (malformed_regex_operator_kind_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_regex_operator_kind_read_ast.where_expression.kind = .regex_imatch;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_regex_operator_kind_parsed_sql, malformed_regex_operator_kind_read_ast),
+    );
+
     var malformed_not_like_payload_parsed_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
         "SELECT id FROM usage_records WHERE status NOT LIKE 'op%'",

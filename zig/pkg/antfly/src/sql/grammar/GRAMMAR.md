@@ -473,6 +473,10 @@ Unsupported DDL remains on the existing parser until
    Binary/operator expression validation now rejects stray unrelated payloads
    while preserving the legitimate extra metadata for negation, quantified
    predicates, `BETWEEN` bounds, `LIKE` escapes, and boolean condition chains.
+   Generated operator validation also checks expression kind against concrete
+   operator tokens for comparison, quantified comparison, pattern, membership,
+   range, boolean, `EXISTS`, arithmetic, containment, overlap, JSON, regex,
+   concatenation, `IS`, and null-safe distinct operator families.
    Prefix, `IS`, and `EXISTS` expression validation now similarly rejects
    unrelated generated payload fields while preserving each shape's required
    child and negation metadata.
@@ -521,9 +525,7 @@ Unsupported DDL remains on the existing parser until
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current
-   validated owned expression item arrays, expression operator/kind token
-   consistency checks for remaining specialized operators beyond the current
-   validated binary/operator families, full multi-join
+   validated owned expression item arrays, full multi-join
    planning/lowering and richer join-tree semantics beyond the current
    validated left-associative generated join nodes, expression AST
    planning/lowering beyond the current recursive
