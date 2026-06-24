@@ -26,6 +26,7 @@ const schema_mod = @import("../schema/mod.zig");
 const storage_schema = @import("../storage/schema.zig");
 const relational_store = @import("../storage/db/relational_store.zig");
 const document_mapper = @import("../storage/db/document_mapper.zig");
+const platform_clock = @import("../platform/clock.zig");
 
 const table_participant_v2_prefix = "table2:";
 
@@ -236,6 +237,7 @@ pub const RecoveryResolver = struct {
     lease_owned: bool = false,
     interval_ms: u64 = 10,
     cutoff_ns: u64 = 5 * std.time.ns_per_min,
+    clock: platform_clock.Clock = platform_clock.Clock.real(),
 
     pub fn config(self: *const RecoveryResolver) db_mod.transaction_runtime.Config {
         return .{
@@ -244,6 +246,7 @@ pub const RecoveryResolver = struct {
             .owner_id = self.owner_id,
             .interval_ms = self.interval_ms,
             .cutoff_ns = self.cutoff_ns,
+            .clock = self.clock,
             .resolver_ctx = @constCast(self),
             .resolve_participant_fn = resolve,
         };
@@ -12705,12 +12708,16 @@ test "db transaction recovery runtime resolves table-group participants through 
         }
     };
 
+    var manual_clock = platform_clock.ManualClock{};
+    manual_clock.setRealtimeNs(5 * std.time.ns_per_min);
+
     var recorder = Recorder{};
     var resolver = RecoveryResolver{
         .alloc = alloc,
         .worker = recorder.worker(),
         .lease_owned = true,
         .interval_ms = 250,
+        .clock = manual_clock.clock(),
     };
     var db = try db_mod.DB.open(alloc, path, .{
         .transaction_recovery = resolver.config(),
@@ -12724,6 +12731,7 @@ test "db transaction recovery runtime resolves table-group participants through 
         .writes = &.{.{ .key = "doc:recover", .value = "{\"title\":\"value\"}" }},
     });
     try db.resolveTransactionIntents(txn_id, .committed, 2_000);
+    manual_clock.setRealtimeNs(5 * std.time.ns_per_min + 10_000);
 
     var attempts: usize = 0;
     while (attempts < 200) : (attempts += 1) {
@@ -12853,11 +12861,15 @@ test "db one-shot transaction recovery does not auto-abort fresh pending transac
         }
     };
 
+    var manual_clock = platform_clock.ManualClock{};
+    manual_clock.setRealtimeNs(5 * std.time.ns_per_min);
+
     var recorder = Recorder{};
     var resolver = RecoveryResolver{
         .alloc = alloc,
         .worker = recorder.worker(),
         .lease_owned = true,
+        .clock = manual_clock.clock(),
     };
     var db = try db_mod.DB.open(alloc, path, .{});
     defer db.close();

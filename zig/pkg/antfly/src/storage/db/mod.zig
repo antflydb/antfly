@@ -22,6 +22,7 @@ const planning_stats = @import("planning_stats.zig");
 const doc_identity_mod = @import("doc_identity.zig");
 const query_graph = @import("query/graph_exec.zig");
 const query_result_shape = @import("query/result_shape.zig");
+const db_derived_async = @import("derived_async.zig");
 
 pub const types = @import("types.zig");
 pub const docstore = @import("../docstore.zig");
@@ -187,6 +188,7 @@ test {
     _ = query_metrics;
     _ = query_graph;
     _ = query_result_shape;
+    _ = db_derived_async;
     _ = TextIndexEstimate;
     _ = EmbeddingIndexEstimate;
     _ = GraphIndexEstimate;

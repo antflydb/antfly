@@ -1453,6 +1453,7 @@ pub fn parseSimpleSelectSetResultTailAlloc(
     tokens: []const Token,
     pos: *usize,
     params: []const value_mod.SqlValue,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
     lowered: *LoweredSelect,
     hooks: SimpleSelectSetTailHooks,
 ) !void {
@@ -1479,13 +1480,27 @@ pub fn parseSimpleSelectSetResultTailAlloc(
             try hooks.parse_order_by(hooks.ptr, &order_by, select);
         } else if (parser.matchKeywordTag(tokens, pos, .limit)) {
             if (lowered.query.limit != null) return error.UnsupportedSqlShape;
-            lowered.query.limit = try value_mod.parseLimitValue(tokens, pos, params);
+            const keyword_index = pos.* - 1;
+            if (try parseGeneratedLimitValueForClause(tokens, keyword_index, pos, params, generated_read_ast)) |generated_limit| {
+                lowered.query.limit = generated_limit.value;
+            } else {
+                lowered.query.limit = try value_mod.parseLimitValue(tokens, pos, params);
+            }
         } else if (parser.matchKeywordTag(tokens, pos, .offset)) {
             if (lowered.query.offset != 0) return error.UnsupportedSqlShape;
-            lowered.query.offset = try value_mod.parseOffsetValue(tokens, pos, params);
+            const keyword_index = pos.* - 1;
+            lowered.query.offset = if (try parseGeneratedOffsetValueForClause(tokens, keyword_index, pos, params, generated_read_ast)) |generated_offset|
+                generated_offset
+            else
+                try value_mod.parseOffsetValue(tokens, pos, params);
         } else if (parser.matchKeywordTag(tokens, pos, .fetch)) {
             if (lowered.query.limit != null) return error.UnsupportedSqlShape;
-            lowered.query.limit = try value_mod.parseFetchLimitValue(tokens, pos, params);
+            const keyword_index = pos.* - 1;
+            if (try parseGeneratedFetchLimitValueForClause(tokens, keyword_index, pos, params, generated_read_ast)) |generated_limit| {
+                lowered.query.limit = generated_limit.value;
+            } else {
+                lowered.query.limit = try value_mod.parseFetchLimitValue(tokens, pos, params);
+            }
         } else if (parser.matchToken(tokens, pos, .semicolon) != null) {
             if (!parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
         } else {

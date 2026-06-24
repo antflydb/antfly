@@ -15,6 +15,7 @@
 const std = @import("std");
 
 const runtime_schema = @import("../storage/schema.zig");
+const schema_api = @import("../schema/mod.zig");
 const source_binding = @import("source_binding.zig");
 const token_mod = @import("token.zig");
 const tokenized = @import("tokenized.zig");
@@ -3328,6 +3329,27 @@ test "document SQL matches numeric algebraic aggregate materializations" {
     var wrong_measure = try tokenized.ParsedSql.initAlloc(alloc, "SELECT min(amount) AS min_amount FROM docs GROUP BY status LIMIT 5");
     defer wrong_measure.deinit(alloc);
     try std.testing.expectError(error.DocumentSqlRequiresBoundedScan, lowerDocumentAggregatePlanWithOptionalIndexesJsonParsedSqlAlloc(alloc, &wrong_measure, schema, indexes_json));
+}
+
+test "document SQL matches schema-derived algebraic aggregate materializations" {
+    const alloc = std.testing.allocator;
+    var parsed_schema = try schema_api.parseValidatedTableSchema(alloc,
+        \\{"version":0,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"body":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"note":{"type":"keyword"},"tags":{"type":"array","items":{"type":"keyword"}},"metadata":{"type":"json"}},"additionalProperties":true}}}}
+    );
+    defer parsed_schema.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    const indexes_json =
+        \\{"full_text_index_v0":{"name":"full_text_index_v0","type":"full_text"},"amount_alg":{"version":2,"table":"docs","schema_version":0,"capability_fingerprint":"8a6d29a74f129f6b","capability_lifecycle_status":"current","group_fields":[{"name":"status","path":"status","type":"string"},{"name":"amount","path":"amount","type":"number"},{"name":"note","path":"note","type":"string"}],"measure_fields":[{"name":"amount","path":"amount","type":"number"}],"time_fields":[],"dynamic_field_rules":[],"laws":[{"name":"count","id":"count","structure":"group","invertible":true},{"name":"sum","id":"sum","structure":"group","invertible":true},{"name":"avg","id":"avg","structure":"group","invertible":true},{"name":"min","id":"min","structure":"lattice","invertible":false},{"name":"max","id":"max","structure":"lattice","invertible":false}],"joins":[],"adaptive":{"observe":true,"lazy_materialization":true,"dematerialization":false,"min_observations":3},"materializations":[{"name":"auto_count_0","op":"count","group_by":["status"]},{"name":"auto_sum_3","op":"sum","group_by":["status"],"measure":"amount"},{"name":"auto_avg_4","op":"avg","group_by":["status"],"measure":"amount"}],"type":"algebraic","name":"amount_alg"}}
+    ;
+
+    var avg_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT avg(amount) AS avg_amount FROM docs GROUP BY status LIMIT 10");
+    defer avg_sql.deinit(alloc);
+    var avg_lowered = try lowerDocumentAggregatePlanWithOptionalIndexesJsonParsedSqlAlloc(alloc, &avg_sql, schema, indexes_json);
+    defer avg_lowered.deinit(alloc);
+    try std.testing.expectEqualStrings("amount_alg", avg_lowered.index_name.?);
+    try std.testing.expectEqualStrings("auto_avg_4", avg_lowered.materialization_name.?);
 }
 
 test "document SQL keeps filtered aggregate as native candidate producer" {

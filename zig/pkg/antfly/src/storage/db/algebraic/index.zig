@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const platform = @import("antfly_platform");
 const Allocator = std.mem.Allocator;
 const adaptive_mod = @import("adaptive.zig");
 const algebra = @import("algebra.zig");
@@ -3165,11 +3166,9 @@ pub const Index = struct {
         self.hll_maintenance_owner_id = owner_id;
     }
 
-    // Acquires the index write lock, spinning/yielding (the codebase's pattern
-    // for std.atomic.Mutex, which has no blocking lock()). Held only around a
-    // write transaction, so contention is brief.
+    // Held only around a write transaction, so contention is brief.
     fn lockWrites(self: *Index) void {
-        while (!self.write_mutex.tryLock()) std.Thread.yield() catch {};
+        platform.sync.lockYielding(&self.write_mutex);
     }
 
     fn unlockWrites(self: *Index) void {

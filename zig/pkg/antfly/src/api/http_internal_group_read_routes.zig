@@ -25,6 +25,7 @@ const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const table_reads = @import("table_reads.zig");
 const tables_api = @import("tables.zig");
+const document_sql_runtime = @import("../sql/document_runtime.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const routes = @import("http_routes.zig");
 
@@ -723,6 +724,35 @@ pub fn handle(ctx: Context, req: http_common.HttpRequest, path: []const u8, quer
             defer partials_result.deinit(alloc);
             return try http_route_helpers.jsonResponse(alloc, partials_result);
         }
+        if (routes.Routes.matchGroupDocumentAlgebraicAggregate(path)) |aggregate_route| {
+            const reads = source orelse return try http_route_helpers.textResponse(alloc, 404, "TableNotFound");
+            var parsed = std.json.parseFromSlice(document_sql_runtime.AlgebraicAggregateRequest, alloc, req.body, .{
+                .allocate = .alloc_always,
+                .ignore_unknown_fields = true,
+            }) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return try http_route_helpers.textResponse(alloc, 400, "InvalidQueryRequest"),
+            };
+            defer parsed.deinit();
+            var aggregate_result = (reads.documentAlgebraicAggregateGroupLocal(
+                alloc,
+                aggregate_route.group_id,
+                aggregate_route.table_name,
+                parsed.value,
+                .read_index,
+            ) catch |err| switch (err) {
+                error.InvalidQueryRequest => return try http_route_helpers.textResponse(alloc, 400, "InvalidQueryRequest"),
+                error.UnsupportedQueryRequest => return try http_route_helpers.textResponse(alloc, 400, "UnsupportedQueryRequest"),
+                error.DocumentSqlIndexUnavailable => return try http_route_helpers.textResponse(alloc, 424, "DocumentSqlIndexUnavailable"),
+                error.TableNotFound => return try http_route_helpers.textResponse(alloc, 404, "TableNotFound"),
+                error.UnknownGroup => return try http_route_helpers.textResponse(alloc, 404, "UnknownGroup"),
+                error.TopologyChanged => return try http_route_helpers.textResponse(alloc, 409, "TopologyChanged"),
+                error.DocIdentityNamespaceMismatch => return try http_route_helpers.textResponse(alloc, 409, "doc identity namespace mismatch"),
+                else => return err,
+            }) orelse return try http_route_helpers.textResponse(alloc, 404, "TableNotFound");
+            defer aggregate_result.deinit(alloc);
+            return try http_route_helpers.jsonResponse(alloc, aggregate_result);
+        }
     }
 
     return null;
@@ -1362,4 +1392,142 @@ test "internal group read routes handle query preflight" {
     try std.testing.expectEqual(@as(?u64, 5), parsed.value.effective_stored_projection_doc_estimate_total);
     try std.testing.expectEqual(@as(?u32, 4), parsed.value.effective_rerank_doc_upper_bound);
     try std.testing.expectEqual(@as(?u32, 5), parsed.value.aggregation_second_pass_doc_estimate);
+}
+
+test "internal group document algebraic aggregate route preserves typed errors" {
+    const alloc = std.testing.allocator;
+    const valid_body =
+        \\{
+        \\  "index_name": "amount_alg",
+        \\  "materialization_name": "avg_by_status",
+        \\  "aggregate_op": "avg",
+        \\  "group_by": null,
+        \\  "limit": null
+        \\}
+    ;
+    const path = "/internal/v1/groups/7/tables/docs/document-algebraic-aggregate";
+
+    const FakeReads = struct {
+        mode: enum { ok, unavailable, invalid, unsupported, table_missing, group_missing },
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .document_algebraic_aggregate_group_local = documentAlgebraicAggregateGroupLocal,
+                },
+            };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: @import("../raft/mod.zig").ReadConsistency) !?table_reads.LookupResponse {
+            return error.UnexpectedLookup;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: @import("../raft/mod.zig").ReadConsistency) !?table_reads.ScanResponse {
+            return error.UnexpectedScan;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: @import("../raft/mod.zig").ReadConsistency) !?query_api.QueryResponse {
+            return error.UnexpectedQuery;
+        }
+
+        fn documentAlgebraicAggregateGroupLocal(
+            ptr: *anyopaque,
+            aggregate_alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: document_sql_runtime.AlgebraicAggregateRequest,
+            consistency: @import("../raft/mod.zig").ReadConsistency,
+        ) !?document_sql_runtime.AlgebraicAggregateResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u64, 7), group_id);
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("amount_alg", req.index_name);
+            try std.testing.expectEqualStrings("avg_by_status", req.materialization_name);
+            try std.testing.expectEqual(@import("../raft/mod.zig").ReadConsistency.read_index, consistency);
+            switch (self.mode) {
+                .unavailable => return error.DocumentSqlIndexUnavailable,
+                .invalid => return error.InvalidQueryRequest,
+                .unsupported => return error.UnsupportedQueryRequest,
+                .table_missing => return error.TableNotFound,
+                .group_missing => return error.UnknownGroup,
+                .ok => {},
+            }
+            var rows = try aggregate_alloc.alloc(document_sql_runtime.AlgebraicAggregateRow, 1);
+            errdefer aggregate_alloc.free(rows);
+            rows[0] = .{
+                .group_json = null,
+                .value_json = try aggregate_alloc.dupe(u8, "11"),
+                .raw_value = try @import("../storage/db/mod.zig").algebraic.algebra.encodeAvgAlloc(aggregate_alloc, .{ .sum = 11, .count = 1 }),
+            };
+            return .{ .rows = rows, .total_groups = 1 };
+        }
+    };
+
+    const Mode = @TypeOf((FakeReads{ .mode = .ok }).mode);
+    const TestCase = struct {
+        mode: Mode,
+        body: []const u8 = valid_body,
+        status: u16,
+        response_body: []const u8,
+    };
+    const cases = [_]TestCase{
+        .{ .mode = .unavailable, .status = 424, .response_body = "DocumentSqlIndexUnavailable" },
+        .{ .mode = .invalid, .status = 400, .response_body = "InvalidQueryRequest" },
+        .{ .mode = .unsupported, .status = 400, .response_body = "UnsupportedQueryRequest" },
+        .{ .mode = .table_missing, .status = 404, .response_body = "TableNotFound" },
+        .{ .mode = .group_missing, .status = 404, .response_body = "UnknownGroup" },
+        .{ .mode = .ok, .body = "not-json", .status = 400, .response_body = "InvalidQueryRequest" },
+    };
+
+    for (cases) |case| {
+        var fake = FakeReads{ .mode = case.mode };
+        var resp = (try handle(.{
+            .alloc = alloc,
+            .reads = fake.source(),
+            .catalog = .{ .ptr = undefined },
+            .query_router = .{
+                .ptr = undefined,
+                .route_query_to_read_schema = struct {
+                    fn route(_: *anyopaque, _: []const u8, _: *db_mod.types.SearchRequest) !void {}
+                }.route,
+            },
+        }, .{
+            .method = .POST,
+            .uri = path,
+            .content_type = "application/json",
+            .body = case.body,
+        }, path, "")).?;
+        defer resp.deinit(alloc);
+        try std.testing.expectEqual(case.status, resp.status);
+        try std.testing.expectEqualStrings(case.response_body, resp.body);
+    }
+
+    var fake_ok = FakeReads{ .mode = .ok };
+    var ok_resp = (try handle(.{
+        .alloc = alloc,
+        .reads = fake_ok.source(),
+        .catalog = .{ .ptr = undefined },
+        .query_router = .{
+            .ptr = undefined,
+            .route_query_to_read_schema = struct {
+                fn route(_: *anyopaque, _: []const u8, _: *db_mod.types.SearchRequest) !void {}
+            }.route,
+        },
+    }, .{
+        .method = .POST,
+        .uri = path,
+        .content_type = "application/json",
+        .body = valid_body,
+    }, path, "")).?;
+    defer ok_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), ok_resp.status);
+    var parsed = try std.json.parseFromSlice(document_sql_runtime.AlgebraicAggregateResponse, alloc, ok_resp.body, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u32, 1), parsed.value.total_groups);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.rows.len);
+    try std.testing.expectEqualStrings("11", parsed.value.rows[0].value_json);
 }

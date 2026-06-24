@@ -116,6 +116,15 @@ pub fn storageTableNameForTargetAlloc(alloc: std.mem.Allocator, target: TableTar
     return try tableResourceNameAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
 }
 
+pub fn tableIdStorageResourceNameAlloc(alloc: std.mem.Allocator, table_id: u64) ![]u8 {
+    if (table_id == 0) return error.UnsupportedSqlShape;
+    return try std.fmt.allocPrint(alloc, "table:{d}", .{table_id});
+}
+
+pub fn storageTableNameForRecordAlloc(alloc: std.mem.Allocator, record: metadata_table_manager.TableRecord) ![]u8 {
+    return try tableIdStorageResourceNameAlloc(alloc, record.table_id);
+}
+
 pub const SqlCatalogSession = struct {
     current_database_name: []const u8 = default_database_name,
     search_path: []const []const u8 = &.{default_namespace_name},
@@ -242,6 +251,29 @@ test "catalog resource names and migration table matching" {
     try std.testing.expectEqualStrings("default", default_target.database_name);
     try std.testing.expectEqualStrings("public", default_target.namespace_name);
     try std.testing.expectEqualStrings("docs", default_target.table_name);
+
+    const default_storage = try storageTableNameForTargetAlloc(alloc, default_target);
+    defer alloc.free(default_storage);
+    try std.testing.expectEqualStrings("docs", default_storage);
+
+    const qualified_target = try tableTargetFromOptional("tenant_ops", "analytics", "events");
+    const qualified_storage = try storageTableNameForTargetAlloc(alloc, qualified_target);
+    defer alloc.free(qualified_storage);
+    try std.testing.expectEqualStrings("tenant_ops.analytics.events", qualified_storage);
+
+    const stable_storage = try tableIdStorageResourceNameAlloc(alloc, 42);
+    defer alloc.free(stable_storage);
+    try std.testing.expectEqualStrings("table:42", stable_storage);
+
+    const record_storage = try storageTableNameForRecordAlloc(alloc, .{
+        .table_id = 42,
+        .name = "events",
+        .database_name = "tenant_ops",
+        .namespace_name = "analytics",
+    });
+    defer alloc.free(record_storage);
+    try std.testing.expectEqualStrings("table:42", record_storage);
+    try std.testing.expectError(error.UnsupportedSqlShape, tableIdStorageResourceNameAlloc(alloc, 0));
 }
 
 test "sql catalog session maps current database and search path" {

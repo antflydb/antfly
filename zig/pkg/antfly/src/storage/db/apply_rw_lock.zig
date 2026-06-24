@@ -112,9 +112,7 @@ pub const ApplyRwLock = struct {
     pub fn unlockExclusive(self: *@This()) void {
         self.resource_mutex.unlock();
         self.reader_gate.unlock();
-        if (builtin.os.tag != .freestanding and !builtin.single_threaded) {
-            std.Thread.yield() catch {};
-        }
+        platform.time.yieldBriefly();
     }
 
     pub fn snapshot(self: *const @This()) Stats {
@@ -132,30 +130,15 @@ pub const ApplyRwLock = struct {
 };
 
 fn lockAtomic(mutex: *std.atomic.Mutex) bool {
-    var attempts: usize = 0;
-    while (!mutex.tryLock()) : (attempts += 1) {
-        if (builtin.os.tag == .freestanding or builtin.single_threaded) {
-            std.atomic.spinLoopHint();
-            continue;
-        }
-        if (attempts < 64) {
-            std.atomic.spinLoopHint();
-            continue;
-        }
-        if (attempts < 128) {
-            std.Thread.yield() catch {};
-            continue;
-        }
-        std.Thread.yield() catch {};
-    }
-    return attempts == 0;
+    if (mutex.tryLock()) return true;
+    platform.sync.lockYielding(mutex);
+    return false;
 }
 
 fn yieldToQueuedReaders(lock: *const ApplyRwLock) void {
-    if (builtin.os.tag == .freestanding or builtin.single_threaded) return;
     var attempts: usize = 0;
     while (attempts < 64 and lock.shared_waiters.load(.monotonic) > 0) : (attempts += 1) {
-        std.Thread.yield() catch {};
+        platform.time.yieldBriefly();
     }
 }
 
@@ -260,7 +243,7 @@ test "apply rw lock lets queued readers through sustained exclusive loop" {
 
     var spins: usize = 0;
     while (!ctx.reader_done.load(.acquire) and spins < 100_000) : (spins += 1) {
-        std.Thread.yield() catch {};
+        platform.time.yieldBriefly();
     }
     try std.testing.expect(ctx.reader_ready.load(.acquire));
     try std.testing.expect(ctx.reader_done.load(.acquire));

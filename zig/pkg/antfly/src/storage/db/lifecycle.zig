@@ -1,0 +1,3919 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+const std = @import("std");
+
+const builtin = @import("builtin");
+const build_options = @import("build_options");
+const platform = @import("antfly_platform");
+
+const apply_rw_lock_mod = @import("apply_rw_lock.zig");
+const apply_state = @import("derived/apply_state.zig");
+const backfill_state_mod = @import("backfill_state.zig");
+const backend_erased_mod = @import("../backend_erased.zig");
+const background_runtime_mod = @import("../background_runtime.zig");
+const change_journal_mod = @import("derived/change_journal.zig");
+const common_secrets = @import("../../common/secrets.zig");
+const db_config = @import("config.zig");
+const db_core = @import("core.zig");
+const db_internal = @import("internal.zig");
+const doc_identity = @import("doc_identity.zig");
+const docstore_mod = @import("../docstore.zig");
+const derived_executor_mod = @import("derived/derived_executor.zig");
+const enrichment_runtime_mod = @import("enrichment/enrichment_runtime.zig");
+const enrichment_state = @import("enrichment/enrichment_state.zig");
+const enrichment_worker = @import("enrichment/enrichment_worker.zig");
+const embedder_mod = @import("enrichment/embedder.zig");
+const graph_metric_runtime_mod = @import("maintenance/graph_metric_runtime.zig");
+const graph_mod = @import("../../graph/graph.zig");
+const ha_replication = @import("ha_replication.zig");
+const hbc_mod = @import("../hbc_adapter.zig");
+const internal_keys = @import("../internal_keys.zig");
+const index_manager_mod = @import("catalog/index_manager.zig");
+const lsm_backend_mod = @import("../lsm_backend/mod.zig");
+const mem_backend_mod = @import("../mem_backend.zig");
+const platform_time = @import("../../platform/time.zig");
+const promotion_runtime_mod = @import("promotion_runtime.zig");
+const resource_manager_mod = @import("../resource_manager.zig");
+const resolution_runtime_mod = @import("resolution_runtime.zig");
+const resolver_lib = @import("antfly_resolver");
+const schema_mod = @import("../schema.zig");
+const scraping = if (builtin.os.tag == .freestanding or build_options.bench_minimal_deps)
+    @import("scraping_stub.zig")
+else
+    @import("antfly_scraping");
+const sparse_compaction_runtime_mod = @import("maintenance/sparse_compaction_runtime.zig");
+const text_merge_runtime_mod = @import("maintenance/text_merge_runtime.zig");
+const transaction_runtime_mod = @import("maintenance/transaction_runtime.zig");
+const ttl_runtime_mod = @import("maintenance/ttl_runtime.zig");
+const types = @import("types.zig");
+
+const Allocator = std.mem.Allocator;
+const ManagedSyncTargets = db_internal.ManagedSyncTargets;
+
+const run_until_idle_max_replay_rounds: usize = 16;
+
+pub const DerivedReplayDebtStatus = struct {
+    index_name: []const u8,
+    kind: types.IndexKind,
+    applied_sequence: u64,
+    target_sequence: u64,
+    catch_up_required: bool,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(@constCast(self.index_name));
+        self.* = undefined;
+    }
+};
+
+pub const ResolverUpsertOptions = struct {
+    /// When false, persist the catalog mutation and mark the resolver backlog
+    /// dirty, but leave the actual re-resolution drain to the caller. Managed
+    /// table opens use this so DB runtime hooks are installed before
+    /// cross-shard candidate blocking or promotion can run.
+    drain_backfill: bool = true,
+};
+
+fn appendUniqueOwnedName(
+    alloc: Allocator,
+    items: *std.ArrayListUnmanaged([]const u8),
+    value: []const u8,
+) !void {
+    for (items.items) |existing| {
+        if (std.mem.eql(u8, existing, value)) return;
+    }
+    try items.append(alloc, try alloc.dupe(u8, value));
+}
+
+pub fn managedIndexReplayHint(kind: types.IndexKind) change_journal_mod.TargetHint {
+    return switch (kind) {
+        .full_text => .full_text,
+        .dense_vector => .dense_vector,
+        .sparse_vector => .sparse_vector,
+        .graph => .graph,
+        .algebraic => .algebraic,
+    };
+}
+
+pub fn probeDerivedReplayTargetSequence(
+    _: anytype,
+    alloc: Allocator,
+    replay_source: anytype,
+    index_ref: index_manager_mod.ManagedIndexRef,
+    applied_sequence: u64,
+) !u64 {
+    return try replay_source.latestMatchingSequence(
+        alloc,
+        applied_sequence,
+        managedIndexReplayHint(index_ref.kind),
+    );
+}
+
+pub const IndexStatusSnapshot = struct {
+    kind: types.IndexKind,
+    doc_count: u64 = 0,
+    term_count: u64 = 0,
+    edge_count: u64 = 0,
+    node_count: u64 = 0,
+    root_node: u64 = 0,
+    updated_at_ns: u64 = 0,
+};
+
+pub const DocIdentityCoverage = struct {
+    scanned_primary_docs: u64 = 0,
+    primary_docs_missing_ordinals: u64 = 0,
+    primary_docs_missing_identity_state: u64 = 0,
+    primary_docs_with_tombstone_ordinals: u64 = 0,
+};
+
+pub const OpenOptions = struct {
+    pub const OpenMode = enum {
+        writer,
+        writer_no_replay,
+        query_readonly,
+        status_only,
+
+        fn allowsReplay(self: @This()) bool {
+            return self == .writer;
+        }
+
+        fn allowsIndexWorkers(self: @This()) bool {
+            return self == .writer or self == .writer_no_replay;
+        }
+
+        fn allowsOptionalRuntimes(self: @This()) bool {
+            return self == .writer or self == .writer_no_replay;
+        }
+    };
+
+    pub const GraphMetricIdleMaintenanceMode = enum {
+        legacy,
+        planned,
+        auto,
+        degree_canary,
+    };
+
+    open_mode: OpenOptions.OpenMode = .writer,
+    map_size: usize = 256 * 1024 * 1024,
+    no_sync: bool = false,
+    primary_backend: db_config.PrimaryBackend = .{ .lsm = db_config.primary_lsm_options_default },
+    primary_runtime_store: ?*backend_erased_mod.Store = null,
+    storage: ?lsm_backend_mod.Storage = null,
+    lsm_cache: ?*lsm_backend_mod.Cache = null,
+    hbc_cache: ?*hbc_mod.Cache = null,
+    lsm_root_generation: u64 = 0,
+    resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    change_journal_backend: ?change_journal_mod.StorageBackend = null,
+    change_journal_storage: ?lsm_backend_mod.Storage = null,
+    index_backends: db_config.IndexBackendOptions = .{},
+    index_base_path: ?[]const u8 = null,
+    index_open_parallelism: ?usize = null,
+    identity_namespace: ?doc_identity.Namespace = null,
+    prefer_existing_identity_namespace: bool = false,
+    executor: derived_executor_mod.Config = .{},
+    backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
+    secret_store: ?*common_secrets.FileStore = null,
+    remote_content: ?*const scraping.RemoteContentConfig = null,
+    start_index_workers: bool = true,
+    start_optional_runtimes: bool = true,
+    external_derived_checkpoints: bool = true,
+    enrichment: ?enrichment_runtime_mod.Config = null,
+    ttl_cleanup: ttl_runtime_mod.Config = .{},
+    transaction_recovery: transaction_runtime_mod.Config = .{},
+    text_merge: text_merge_runtime_mod.Config = .{},
+    sparse_compaction: sparse_compaction_runtime_mod.Config = .{},
+    graph_metric_maintenance: graph_metric_runtime_mod.Config = .{},
+    graph_metric_idle_maintenance: GraphMetricIdleMaintenanceMode = .auto,
+    graph_metric_idle_planned_options: index_manager_mod.IndexManager.GraphMetricPlannedMaintenanceOptions = .{},
+    graph_metric_idle_auto_options: index_manager_mod.IndexManager.GraphMetricPlannedAutoIdleOptions = .{},
+    graph_metric_idle_degree_canary_options: index_manager_mod.IndexManager.GraphMetricDegreeCanaryOptions = .{},
+    /// Optional cross-shard candidate source for entity resolution blocking,
+    /// injected by the serving layer (see `api/distributed_candidate_source.zig`).
+    /// Null means local-only blocking against the worker's own store. Must
+    /// outlive the DB.
+    resolution_candidate_source: ?resolution_runtime_mod.CandidateSource = null,
+    /// Optional cross-shard entity sink for the promoter, injected by the serving
+    /// layer (see `api/distributed_entity_sink.zig`). Must outlive the DB.
+    entity_sink: ?promotion_runtime_mod.EntitySink = null,
+    /// Optional ownership guard for promotion. Raft apply-side DBs set this so
+    /// only the source shard leader emits entity writes; standalone DBs leave it
+    /// null and are treated as local owners.
+    promotion_owner: ?promotion_runtime_mod.PromotionOwner = null,
+    /// What the promoter does when no sink is currently available. The safe
+    /// default holds replay so a later sink injection or routing repair can retry.
+    entity_sink_missing_policy: promotion_runtime_mod.MissingSinkPolicy = .wait,
+    /// Optional name embedder for resolution: backfills a mention's name
+    /// embedding (for cosine/ann blocking) when a resolver declares a
+    /// `name_embedding` model and the extraction artifact carries no vector.
+    /// Caller-owned; must outlive the DB. Null disables backfill.
+    resolution_embedder: ?embedder_mod.DenseEmbedder = null,
+    /// Optional mirror for committed derived/change-journal effects into the HA
+    /// replication stream. The default policy is async/best-effort; configuring
+    /// a non-async sync_policy makes normal DB writes evaluate the HA commit
+    /// gate for the appended replication record.
+    ha_async_effect_mirror: ?ha_replication.AsyncEffectMirror = null,
+    /// Optional mirror for committed user batch mutations into the HA
+    /// replication stream. This emits versioned `batch_mutation` envelopes for
+    /// catch-up/read-replica apply and can be paired with sync_policy for
+    /// remote-write/remote-apply gate decisions.
+    ha_async_batch_mirror: ?ha_replication.AsyncBatchMirror = null,
+    /// Optional mirror for committed metadata/catalog changes into the HA
+    /// replication stream. The initial metadata mutation payload covers table
+    /// schema changes; additional catalog mutation kinds should be nested under
+    /// the stable HA `metadata_mutation` envelope.
+    ha_async_metadata_mirror: ?ha_replication.AsyncMetadataMirror = null,
+    /// Optional HA write ownership gate. Client/API writes are allowed only
+    /// when this DB is attached to the current HA primary. Standby apply paths
+    /// must use replicated-apply entry points that explicitly bypass this
+    /// client-write guard. A standby gate also suppresses mutating background
+    /// runtimes at open, even if the generic runtime defaults are enabled.
+    ha_write_gate: ?ha_replication.WriteGate = null,
+};
+
+const index_status_prefix = "\x00\x00__metadata__:index_status:";
+const index_status_magic: u64 = 0x3153544154584449; // "IDXTATS1" little-endian
+const index_status_encoded_len = 8 * 8;
+
+fn groupCreatedAtMetadataKeyAlloc(alloc: std.mem.Allocator, group_id: u64) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "\x00\x00__metadata__:data_group_created_at:{d}", .{group_id});
+}
+
+pub const OpenProfile = struct {
+    primary_store_ns: u64 = 0,
+    core_resources_ns: u64 = 0,
+    init_async_infrastructure_ns: u64 = 0,
+    init_optional_runtimes_ns: u64 = 0,
+    load_indexes_ns: u64 = 0,
+    replay_pending_derived_ns: u64 = 0,
+    start_index_workers_ns: u64 = 0,
+    start_optional_runtimes_ns: u64 = 0,
+    total_ns: u64 = 0,
+};
+
+fn monotonicTimeNs() u64 {
+    return platform_time.monotonicNs();
+}
+
+fn elapsedSince(start_ns: u64) u64 {
+    return monotonicTimeNs() - start_ns;
+}
+
+var open_profile_enabled_cache: std.atomic.Value(u8) = .init(0);
+
+pub fn backgroundRuntimeAllocator(fallback: std.mem.Allocator) std.mem.Allocator {
+    if (comptime builtin.os.tag == .freestanding) return fallback;
+    if (comptime builtin.link_libc) return std.heap.c_allocator;
+    if (comptime builtin.single_threaded) return fallback;
+    return std.heap.smp_allocator;
+}
+
+pub fn openProfileEnabled() bool {
+    const cached = open_profile_enabled_cache.load(.monotonic);
+    if (cached == 1 or cached == 2) return cached == 2;
+    if (cached == 3) return db_internal.waitForCachedBool(&open_profile_enabled_cache);
+    if (open_profile_enabled_cache.cmpxchgStrong(0, 3, .acq_rel, .monotonic) != null) {
+        return db_internal.waitForCachedBool(&open_profile_enabled_cache);
+    }
+    if (comptime builtin.os.tag == .freestanding) {
+        open_profile_enabled_cache.store(1, .release);
+        return false;
+    }
+    const raw_z = platform.env.getenv("ANTFLY_DB_OPEN_PROFILE") orelse
+        platform.env.getenv("ANTFLY_BENCH_METRICS") orelse {
+        open_profile_enabled_cache.store(1, .release);
+        return false;
+    };
+    const enabled = db_internal.envBoolEnabled(raw_z);
+    open_profile_enabled_cache.store(if (enabled) 2 else 1, .release);
+    return enabled;
+}
+
+pub fn logOpenProfile(path: []const u8, open_mode: anytype, start_index_workers: bool, profile: OpenProfile) void {
+    std.log.info(
+        "db_open_profile path={s} mode={s} start_index_workers={} primary_store_ns={} core_resources_ns={} init_async_infrastructure_ns={} init_optional_runtimes_ns={} load_indexes_ns={} replay_pending_derived_ns={} start_index_workers_ns={} start_optional_runtimes_ns={} total_ns={}",
+        .{
+            path,
+            @tagName(open_mode),
+            start_index_workers,
+            profile.primary_store_ns,
+            profile.core_resources_ns,
+            profile.init_async_infrastructure_ns,
+            profile.init_optional_runtimes_ns,
+            profile.load_indexes_ns,
+            profile.replay_pending_derived_ns,
+            profile.start_index_workers_ns,
+            profile.start_optional_runtimes_ns,
+            profile.total_ns,
+        },
+    );
+}
+
+const PrimaryStoreOpenPlan = union(enum) {
+    lmdb: struct {
+        map_size: usize,
+        no_sync: bool,
+        read_only: bool,
+    },
+    mem: mem_backend_mod.Options,
+    lsm_memory: lsm_backend_mod.Options,
+    lsm: lsm_backend_mod.Options,
+};
+
+fn primaryStoreOpenPlan(opts: db_config.CoreOpenOptions) PrimaryStoreOpenPlan {
+    return switch (opts.primary_backend) {
+        .lmdb => .{
+            .lmdb = .{
+                .map_size = opts.map_size,
+                .no_sync = opts.no_sync,
+                .read_only = opts.read_only,
+            },
+        },
+        .mem => |mem_opts| .{ .mem = mem_opts },
+        .lsm_memory => |lsm_opts| .{ .lsm_memory = db_config.mergedLsmOptions(opts.storage, opts.lsm_cache, opts.resource_manager, opts.no_sync, lsm_opts) },
+        .lsm => |lsm_opts| .{ .lsm = db_config.mergedLsmOptions(opts.storage, opts.lsm_cache, opts.resource_manager, opts.no_sync, lsm_opts) },
+    };
+}
+
+pub fn openModeRequiresReadOnlyBackends(open_mode: anytype) bool {
+    return open_mode == .query_readonly or open_mode == .status_only;
+}
+
+pub fn openModeAllowsReplay(open_mode: anytype) bool {
+    return open_mode == .writer;
+}
+
+pub fn openModeAllowsIndexWorkers(open_mode: anytype) bool {
+    return open_mode == .writer or open_mode == .writer_no_replay;
+}
+
+pub fn openModeAllowsOptionalRuntimes(open_mode: anytype) bool {
+    return open_mode == .writer or open_mode == .writer_no_replay;
+}
+
+pub fn makeLsmOptionsReadOnly(options: *lsm_backend_mod.Options) void {
+    options.backend.read_only = true;
+    options.backend.create_if_missing = false;
+    options.background_executor = null;
+}
+
+pub fn applyReadOnlyToPrimaryBackend(primary_backend: *db_config.PrimaryBackend) void {
+    switch (primary_backend.*) {
+        .lsm => |*lsm_opts| makeLsmOptionsReadOnly(lsm_opts),
+        .lsm_memory => |*lsm_opts| makeLsmOptionsReadOnly(lsm_opts),
+        .lmdb, .mem => {},
+    }
+}
+
+pub fn applyReadOnlyToIndexBackends(index_backends: *db_config.IndexBackendOptions) void {
+    makeLsmOptionsReadOnly(&index_backends.text_main_lsm_options);
+    makeLsmOptionsReadOnly(&index_backends.text_wal_lsm_options);
+    makeLsmOptionsReadOnly(&index_backends.dense_lsm_options);
+    makeLsmOptionsReadOnly(&index_backends.sparse_lsm_options);
+    makeLsmOptionsReadOnly(&index_backends.graph_reverse_lsm_options);
+}
+
+pub fn makeLsmBackgroundExecutor(runtime: *background_runtime_mod.BackendRuntime, owner_id: u64) lsm_backend_mod.BackgroundExecutor {
+    return lsm_backend_mod.BackgroundExecutor.init(runtime, owner_id);
+}
+
+pub fn installLsmReadRuntime(options: *lsm_backend_mod.Options, runtime: *background_runtime_mod.BackendRuntime) void {
+    if (options.read_runtime != null) return;
+    if (runtime.io()) |io| options.read_runtime = lsm_backend_mod.storage_io.ReadRuntime.init(io);
+}
+
+pub fn installIndexLsmReadRuntime(index_backends: anytype, runtime: *background_runtime_mod.BackendRuntime) void {
+    installLsmReadRuntime(&index_backends.text_main_lsm_options, runtime);
+    installLsmReadRuntime(&index_backends.text_wal_lsm_options, runtime);
+    installLsmReadRuntime(&index_backends.dense_lsm_options, runtime);
+    installLsmReadRuntime(&index_backends.sparse_lsm_options, runtime);
+    installLsmReadRuntime(&index_backends.graph_reverse_lsm_options, runtime);
+}
+
+pub fn openPrimaryStore(alloc: std.mem.Allocator, path: []const u8, opts: db_config.CoreOpenOptions) !db_core.OpenedPrimaryStore {
+    if (opts.primary_runtime_store) |runtime_store| {
+        return .{
+            .store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store),
+        };
+    }
+
+    const zpath = try alloc.dupeZ(u8, path);
+    defer alloc.free(zpath);
+
+    return switch (primaryStoreOpenPlan(opts)) {
+        .lmdb => |lmdb_opts| .{
+            .store = try docstore_mod.DocStore.open(alloc, zpath, .{
+                .map_size = lmdb_opts.map_size,
+                .no_sync = lmdb_opts.no_sync,
+                .read_only = lmdb_opts.read_only,
+            }),
+        },
+        .mem => |mem_opts| mem_blk: {
+            const backend = try alloc.create(mem_backend_mod.Backend);
+            errdefer alloc.destroy(backend);
+            backend.* = mem_backend_mod.Backend.init(alloc, mem_opts);
+            errdefer backend.close();
+
+            var runtime_store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+            errdefer runtime_store.deinit();
+
+            break :mem_blk .{
+                .store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store),
+                .owner = .{ .mem = backend },
+            };
+        },
+        .lsm_memory => |lsm_opts| lsm_mem_blk: {
+            var handle = try lsm_backend_mod.BackendHandle.init(alloc, lsm_opts);
+            errdefer handle.close();
+
+            var runtime_store = try handle.backend.runtimeStore(alloc, .{ .name = "docs" });
+            errdefer runtime_store.deinit();
+
+            break :lsm_mem_blk .{
+                .store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store),
+                .owner = .{ .lsm = .{
+                    .handle = handle,
+                    .split_options = null,
+                } },
+            };
+        },
+        .lsm => |lsm_opts| lsm_blk: {
+            var handle = try lsm_backend_mod.BackendHandle.open(alloc, path, lsm_opts);
+            errdefer handle.close();
+
+            var runtime_store = try handle.backend.runtimeStore(alloc, .{ .name = "docs" });
+            errdefer runtime_store.deinit();
+
+            break :lsm_blk .{
+                .store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store),
+                .owner = .{ .lsm = .{
+                    .handle = handle,
+                    .split_options = db_config.splitLsmOptions(opts.primary_backend, opts.storage, opts.lsm_cache),
+                } },
+            };
+        },
+    };
+}
+
+pub fn indexStatusKeyAlloc(alloc: std.mem.Allocator, index_name: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ index_status_prefix, index_name });
+}
+
+pub fn encodeIndexStatusSnapshot(status_snapshot: IndexStatusSnapshot, out: *[index_status_encoded_len]u8) void {
+    var offset: usize = 0;
+    inline for (.{
+        index_status_magic,
+        @as(u64, @intFromEnum(status_snapshot.kind)),
+        status_snapshot.doc_count,
+        status_snapshot.term_count,
+        status_snapshot.edge_count,
+        status_snapshot.node_count,
+        status_snapshot.root_node,
+        status_snapshot.updated_at_ns,
+    }) |value| {
+        std.mem.writeInt(u64, out[offset..][0..8], value, .little);
+        offset += 8;
+    }
+}
+
+pub fn decodeIndexStatusSnapshot(raw: []const u8) !IndexStatusSnapshot {
+    if (raw.len != index_status_encoded_len) return error.InvalidIndexStatusSnapshot;
+    var offset: usize = 0;
+    const magic = std.mem.readInt(u64, raw[offset..][0..8], .little);
+    offset += 8;
+    if (magic != index_status_magic) return error.InvalidIndexStatusSnapshot;
+    const kind_raw = std.mem.readInt(u64, raw[offset..][0..8], .little);
+    offset += 8;
+    const kind: types.IndexKind = switch (kind_raw) {
+        @intFromEnum(types.IndexKind.full_text) => .full_text,
+        @intFromEnum(types.IndexKind.dense_vector) => .dense_vector,
+        @intFromEnum(types.IndexKind.sparse_vector) => .sparse_vector,
+        @intFromEnum(types.IndexKind.graph) => .graph,
+        @intFromEnum(types.IndexKind.algebraic) => .algebraic,
+        else => return error.InvalidIndexStatusSnapshot,
+    };
+    return .{
+        .kind = kind,
+        .doc_count = blk: {
+            const value = std.mem.readInt(u64, raw[offset..][0..8], .little);
+            offset += 8;
+            break :blk value;
+        },
+        .term_count = blk: {
+            const value = std.mem.readInt(u64, raw[offset..][0..8], .little);
+            offset += 8;
+            break :blk value;
+        },
+        .edge_count = blk: {
+            const value = std.mem.readInt(u64, raw[offset..][0..8], .little);
+            offset += 8;
+            break :blk value;
+        },
+        .node_count = blk: {
+            const value = std.mem.readInt(u64, raw[offset..][0..8], .little);
+            offset += 8;
+            break :blk value;
+        },
+        .root_node = blk: {
+            const value = std.mem.readInt(u64, raw[offset..][0..8], .little);
+            offset += 8;
+            break :blk value;
+        },
+        .updated_at_ns = std.mem.readInt(u64, raw[offset..][0..8], .little),
+    };
+}
+
+pub fn collectLiveIndexStatusSnapshot(index_manager: *index_manager_mod.IndexManager, index_name: []const u8) ?IndexStatusSnapshot {
+    if (index_manager.textIndex(index_name)) |entry| {
+        const text_snapshot = entry.snapshot();
+        const term_count = textIndexTermCount(entry);
+        return .{
+            .kind = .full_text,
+            .doc_count = text_snapshot.global_doc_count,
+            .term_count = term_count,
+            .updated_at_ns = platform_time.monotonicNs(),
+        };
+    }
+    if (index_manager.denseIndex(index_name)) |entry| {
+        const dense_stats = entry.index.stats();
+        return .{
+            .kind = .dense_vector,
+            .doc_count = dense_stats.active_count,
+            .node_count = dense_stats.node_count,
+            .root_node = dense_stats.root_node,
+            .updated_at_ns = platform_time.monotonicNs(),
+        };
+    }
+    if (index_manager.sparseIndex(index_name)) |entry| {
+        const sparse_stats = entry.index.stats();
+        return .{
+            .kind = .sparse_vector,
+            .doc_count = sparse_stats.doc_count,
+            .term_count = sparse_stats.term_count,
+            .updated_at_ns = platform_time.monotonicNs(),
+        };
+    }
+    if (index_manager.graphIndex(index_name)) |entry| {
+        const graph_stats = entry.index.stats(index_manager.alloc) catch return null;
+        return .{
+            .kind = .graph,
+            .doc_count = graph_stats.node_count,
+            .edge_count = graph_stats.edge_count,
+            .node_count = graph_stats.node_count,
+            .updated_at_ns = platform_time.monotonicNs(),
+        };
+    }
+    return null;
+}
+
+pub fn textIndexTermCount(entry: anytype) u64 {
+    const snap = entry.acquireSnapshot();
+    defer snap.release();
+    var terms: u64 = 0;
+    for (snap.segments) |*seg| {
+        const layout = seg.layoutStats(true);
+        terms +|= layout.inverted_one_hit_terms +| layout.inverted_postings_terms;
+    }
+    return terms;
+}
+
+pub fn saveIndexStatusSnapshots(
+    alloc: std.mem.Allocator,
+    store: *docstore_mod.DocStore,
+    index_manager: *index_manager_mod.IndexManager,
+    updates: []const apply_state.AppliedSequenceUpdate,
+) !void {
+    if (updates.len == 0) return;
+
+    const PendingStatusWrite = struct {
+        key: []u8,
+        value: [index_status_encoded_len]u8,
+    };
+    var pending = std.ArrayListUnmanaged(PendingStatusWrite).empty;
+    defer {
+        for (pending.items) |item| alloc.free(item.key);
+        pending.deinit(alloc);
+    }
+
+    for (updates) |update| {
+        const status_snapshot = collectLiveIndexStatusSnapshot(index_manager, update.index_name) orelse continue;
+        const key = try indexStatusKeyAlloc(alloc, update.index_name);
+        var encoded: [index_status_encoded_len]u8 = undefined;
+        encodeIndexStatusSnapshot(status_snapshot, &encoded);
+        errdefer alloc.free(key);
+        try pending.append(alloc, .{
+            .key = key,
+            .value = encoded,
+        });
+    }
+
+    if (pending.items.len == 0) return;
+    var status_batch = try store.beginWriteBatch();
+    errdefer status_batch.abort();
+    for (pending.items) |item| try status_batch.put(item.key, &item.value);
+    try status_batch.commit();
+}
+
+pub fn loadIndexStatusSnapshot(
+    alloc: std.mem.Allocator,
+    store: *docstore_mod.DocStore,
+    index_name: []const u8,
+) !?IndexStatusSnapshot {
+    const key = try indexStatusKeyAlloc(alloc, index_name);
+    defer alloc.free(key);
+    const raw = store.get(alloc, key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(raw);
+    return decodeIndexStatusSnapshot(raw) catch null;
+}
+
+pub fn applyIndexStatusSnapshot(item: *types.DBIndexStats, status_snapshot: IndexStatusSnapshot) void {
+    if (status_snapshot.kind != item.kind) return;
+    item.doc_count = status_snapshot.doc_count;
+    item.term_count = status_snapshot.term_count;
+    item.edge_count = status_snapshot.edge_count;
+    item.node_count = status_snapshot.node_count;
+    item.root_node = status_snapshot.root_node;
+}
+
+fn finalizeDocIdentityRebuildRequired(identity_stats: *types.DocIdentityStats) void {
+    identity_stats.rebuild_required = identity_stats.rebuild_required or
+        identity_stats.ordinal_capacity_exhausted or
+        identity_stats.primary_docs_missing_ordinals != 0 or
+        identity_stats.primary_docs_missing_identity_state != 0 or
+        identity_stats.primary_docs_with_tombstone_ordinals != 0;
+}
+
+pub fn freeDBIndexStatsItem(alloc: Allocator, item: types.DBIndexStats) void {
+    alloc.free(item.name);
+    if (item.algebraic_last_error_doc_key) |value| alloc.free(value);
+    if (item.algebraic_last_error_reason) |value| alloc.free(value);
+    if (item.algebraic_capability_fingerprint) |value| alloc.free(value);
+    if (item.algebraic_capability_lifecycle_status) |value| alloc.free(value);
+    if (item.algebraic_planner_last_decision) |value| alloc.free(value);
+    if (item.algebraic_planner_last_fallback_reason) |value| alloc.free(value);
+    if (item.algebraic_planner_lifecycle_blocking_reason) |value| alloc.free(value);
+    if (item.algebraic_last_observed_query_shape) |value| alloc.free(value);
+    if (item.algebraic_last_recommended_materialization) |value| alloc.free(value);
+    types.freeGraphMetricStatuses(alloc, @constCast(item.graph_metric_status));
+    if (item.algebraic_top_candidate) |candidate| {
+        alloc.free(candidate.recommendation);
+        alloc.free(candidate.materialization_id);
+        alloc.free(candidate.lifecycle);
+        alloc.free(candidate.decision);
+    }
+    if (item.algebraic_active_progress) |progress| {
+        alloc.free(progress.recommendation);
+        alloc.free(progress.materialization_id);
+        alloc.free(progress.lifecycle);
+    }
+    for (item.algebraic_candidates) |candidate| {
+        alloc.free(candidate.recommendation);
+        alloc.free(candidate.materialization_id);
+        alloc.free(candidate.lifecycle);
+        alloc.free(candidate.decision);
+    }
+    if (item.algebraic_candidates.len > 0) alloc.free(item.algebraic_candidates);
+    for (item.algebraic_candidate_decision_history) |entry| {
+        alloc.free(entry.recommendation);
+        alloc.free(entry.materialization_id);
+        alloc.free(entry.lifecycle);
+        alloc.free(entry.previous_decision);
+        alloc.free(entry.decision);
+    }
+    if (item.algebraic_candidate_decision_history.len > 0) alloc.free(item.algebraic_candidate_decision_history);
+    for (item.algebraic_progress) |progress| {
+        alloc.free(progress.recommendation);
+        alloc.free(progress.materialization_id);
+        alloc.free(progress.lifecycle);
+    }
+    if (item.algebraic_progress.len > 0) alloc.free(item.algebraic_progress);
+}
+
+pub fn Impl(comptime DB: type) type {
+    return struct {
+        const Self = @This();
+
+        const engine_vtable = db_core.Engine.VTable{
+            .batch = engineBatch,
+            .lookup = engineLookup,
+            .scan = engineScan,
+            .search = engineSearch,
+            .stats = engineStats,
+            .list_indexes = engineListIndexes,
+            .list_enrichments = engineListEnrichments,
+        };
+        const maintenance_driver_vtable = db_core.MaintenanceDriver.VTable{
+            .pending_work_stats = maintenanceDriverPendingWorkStats,
+            .run_derived_until = maintenanceDriverRunDerivedUntil,
+            .run_enrichment_until = maintenanceDriverRunEnrichmentUntil,
+            .run_maintenance_until = maintenanceDriverRunMaintenanceUntil,
+            .run_until_idle = maintenanceDriverRunUntilIdle,
+        };
+
+        pub fn sync(self: *DB, full: bool) !void {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            try self.core.syncStore(full);
+        }
+
+        pub fn syncIndexes(self: *DB, force: bool) !void {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            try self.core.index_manager.syncAll(force);
+        }
+
+        pub fn lsmMaintenanceScore(self: *DB) u64 {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+            return @max(
+                self.core.primary_store_owner.lsmMaintenanceScore(),
+                self.core.index_manager.lsmMaintenanceScore(),
+            );
+        }
+
+        pub fn lsmMaintenanceDebtHint(self: *DB) u64 {
+            return @max(
+                self.core.primary_store_owner.lsmMaintenanceDebtHint(),
+                self.core.index_manager.lsmMaintenanceDebtHint(),
+            );
+        }
+
+        pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *DB) ?u64 {
+            if (!self.core.tryLockApplyShared()) return null;
+            defer self.core.unlockApplyShared();
+            var best: ?u64 = null;
+            if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |candidate| {
+                best = candidate;
+            }
+            if (self.core.index_manager.nextLsmMaintenanceWakeDelayNsBestEffort()) |candidate| {
+                best = if (best) |current| @min(current, candidate) else candidate;
+            }
+            return best;
+        }
+
+        pub fn snapshotAsyncIndexingStats(self: *DB) types.AsyncIndexingStats {
+            var async_stats = self.async_context.stats.snapshot();
+            async_stats.bulk_coalescing = self.bulk_ingest_coalescer.stats.snapshot();
+            return async_stats;
+        }
+
+        pub fn snapshotApplyLockStats(self: *DB) apply_rw_lock_mod.ApplyRwLock.Stats {
+            return self.core.apply_mutex.snapshot();
+        }
+
+        pub fn startAsyncWorkers(self: *DB) !void {
+            const managed_indexes = try self.core.managedIndexes(self.alloc);
+            defer {
+                for (managed_indexes) |index_ref| self.alloc.free(@constCast(index_ref.name));
+                self.alloc.free(managed_indexes);
+            }
+
+            for (managed_indexes) |index_ref| {
+                const applied = try self.core.loadAppliedSequence(self.alloc, index_ref.name);
+                try self.executor.addWorker(index_ref.name, index_ref, applied);
+            }
+        }
+
+        pub fn open(alloc: std.mem.Allocator, path: []const u8, opts: anytype) !DB {
+            return blk: {
+                const open_started_ns = monotonicTimeNs();
+                var profile = OpenProfile{};
+                const runtime_alloc = backgroundRuntimeAllocator(alloc);
+                var owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle = null;
+                errdefer if (owned_backend_runtime) |*handle| handle.deinit();
+
+                const backend_runtime = opts.backend_runtime orelse blk_runtime: {
+                    owned_backend_runtime = try background_runtime_mod.BackendRuntimeHandle.init(runtime_alloc, .{
+                        .backend = opts.executor.backend,
+                    });
+                    break :blk_runtime owned_backend_runtime.?.runtime;
+                };
+                var effective_executor = opts.executor;
+                if (backend_runtime.io_impl == null and effective_executor.backend == .io_threaded) {
+                    effective_executor.backend = .manual;
+                }
+                const backend_owner_id = backend_runtime.allocOwnerId();
+                var primary_lsm_background_executor: lsm_backend_mod.BackgroundExecutor = undefined;
+                var effective_primary_backend = opts.primary_backend;
+                var effective_index_backends = opts.index_backends;
+                if (openModeRequiresReadOnlyBackends(opts.open_mode)) {
+                    applyReadOnlyToPrimaryBackend(&effective_primary_backend);
+                    applyReadOnlyToIndexBackends(&effective_index_backends);
+                }
+                switch (effective_primary_backend) {
+                    .lsm => |*lsm_opts| {
+                        lsm_opts.cache = opts.lsm_cache orelse lsm_opts.cache;
+                        lsm_opts.root_generation = opts.lsm_root_generation;
+                        installLsmReadRuntime(lsm_opts, backend_runtime);
+                        primary_lsm_background_executor = makeLsmBackgroundExecutor(backend_runtime, backend_owner_id);
+                        lsm_opts.background_executor = &primary_lsm_background_executor;
+                    },
+                    .lsm_memory => |*lsm_opts| {
+                        lsm_opts.cache = opts.lsm_cache orelse lsm_opts.cache;
+                        lsm_opts.root_generation = opts.lsm_root_generation;
+                        installLsmReadRuntime(lsm_opts, backend_runtime);
+                        primary_lsm_background_executor = makeLsmBackgroundExecutor(backend_runtime, backend_owner_id);
+                        lsm_opts.background_executor = &primary_lsm_background_executor;
+                    },
+                    .lmdb, .mem => {},
+                }
+                installIndexLsmReadRuntime(&effective_index_backends, backend_runtime);
+
+                const core_opts: db_config.CoreOpenOptions = .{
+                    .map_size = opts.map_size,
+                    .no_sync = opts.no_sync,
+                    .read_only = openModeRequiresReadOnlyBackends(opts.open_mode),
+                    .primary_backend = effective_primary_backend,
+                    .primary_runtime_store = opts.primary_runtime_store,
+                    .storage = opts.storage,
+                    .lsm_cache = opts.lsm_cache,
+                    .hbc_cache = opts.hbc_cache,
+                    .lsm_root_generation = opts.lsm_root_generation,
+                    .resource_manager = opts.resource_manager,
+                    .index_backends = effective_index_backends,
+                };
+                const resolved_config = db_config.ResolvedOpenConfig.init(
+                    effective_primary_backend,
+                    opts.storage,
+                    opts.lsm_cache,
+                    opts.hbc_cache,
+                    opts.lsm_root_generation,
+                    opts.resource_manager,
+                    effective_index_backends,
+                );
+                const open_primary_started_ns = monotonicTimeNs();
+                const opened_primary = try openPrimaryStore(alloc, path, core_opts);
+                profile.primary_store_ns = elapsedSince(open_primary_started_ns);
+
+                const core_resources_started_ns = monotonicTimeNs();
+                const core = try db_core.openCoreResourcesFromPrimaryStore(
+                    alloc,
+                    path,
+                    opts.index_base_path orelse path,
+                    opts.map_size,
+                    opts.no_sync,
+                    resolved_config.primary_backend_kind,
+                    resolved_config.primary_lsm_storage,
+                    opts.change_journal_backend,
+                    opts.change_journal_storage,
+                    resolved_config.index_backends,
+                    opened_primary,
+                    opts.identity_namespace,
+                    false,
+                    if (opts.prefer_existing_identity_namespace) .use_existing else .reject,
+                    opts.external_derived_checkpoints,
+                );
+                profile.core_resources_ns = elapsedSince(core_resources_started_ns);
+
+                const async_context = try runtime_alloc.create(db_internal.AsyncContext(DB));
+                var async_context_owned = true;
+                errdefer if (async_context_owned) runtime_alloc.destroy(async_context);
+                const executor = try runtime_alloc.create(derived_executor_mod.Executor);
+                var executor_owned = true;
+                errdefer if (executor_owned) runtime_alloc.destroy(executor);
+
+                var stored_primary_backend = effective_primary_backend;
+                switch (stored_primary_backend) {
+                    .lsm => |*lsm_opts| lsm_opts.background_executor = null,
+                    .lsm_memory => |*lsm_opts| lsm_opts.background_executor = null,
+                    .lmdb, .mem => {},
+                }
+                const ha_standby_role = ha_replication.writeGateIsStandby(opts.ha_write_gate);
+                const start_index_workers = openModeAllowsIndexWorkers(opts.open_mode) and opts.start_index_workers and !ha_standby_role;
+
+                var db = DB{
+                    .alloc = alloc,
+                    .runtime_alloc = runtime_alloc,
+                    .open_mode = opts.open_mode,
+                    .primary_backend = stored_primary_backend,
+                    .primary_lsm_storage = resolved_config.primary_lsm_storage,
+                    .index_backends = resolved_config.index_backends,
+                    .core = db_core.DBCore.fromOpened(alloc, core),
+                    .async_context = async_context,
+                    .backend_runtime = backend_runtime,
+                    .backend_owner_id = backend_owner_id,
+                    .owned_backend_runtime = owned_backend_runtime,
+                    .executor = executor,
+                    .start_index_workers = start_index_workers,
+                    .graph_metric_idle_maintenance = opts.graph_metric_idle_maintenance,
+                    .graph_metric_idle_planned_options = opts.graph_metric_idle_planned_options,
+                    .graph_metric_idle_auto_options = opts.graph_metric_idle_auto_options,
+                    .graph_metric_idle_degree_canary_options = opts.graph_metric_idle_degree_canary_options,
+                    .secret_store = opts.secret_store,
+                    .remote_content = opts.remote_content,
+                    .enrichment_append_context = null,
+                    .enrichment_runtime = null,
+                    .resolution_candidate_source = opts.resolution_candidate_source,
+                    .resolution_embedder = opts.resolution_embedder,
+                    .entity_sink = opts.entity_sink,
+                    .promotion_owner = opts.promotion_owner,
+                    .entity_sink_missing_policy = opts.entity_sink_missing_policy,
+                    .ha_async_effect_mirror = opts.ha_async_effect_mirror,
+                    .ha_async_batch_mirror = opts.ha_async_batch_mirror,
+                    .ha_async_metadata_mirror = opts.ha_async_metadata_mirror,
+                    .ha_write_gate = opts.ha_write_gate,
+                    .ttl_cleanup_context = null,
+                    .ttl_runtime = null,
+                    .transaction_recovery_identity_context = null,
+                    .transaction_runtime = null,
+                    .text_merge_runtime = null,
+                    .sparse_compaction_runtime = null,
+                    .graph_metric_runtime = null,
+                    .shadow = null,
+                };
+                var executor_ready = false;
+                owned_backend_runtime = null;
+                async_context_owned = false;
+                executor_owned = false;
+                errdefer Self.deinitWrapperState(&db, executor_ready);
+
+                db.core.setIndexOpenParallelism(opts.index_open_parallelism);
+                const init_async_started_ns = monotonicTimeNs();
+                try Self.initAsyncInfrastructure(&db, effective_executor, opts.resource_manager);
+                profile.init_async_infrastructure_ns = elapsedSince(init_async_started_ns);
+                executor_ready = true;
+
+                const optional_runtimes_enabled = openModeAllowsOptionalRuntimes(opts.open_mode) and opts.start_optional_runtimes and !ha_standby_role;
+                if (optional_runtimes_enabled) {
+                    const init_optional_started_ns = monotonicTimeNs();
+                    try Self.initOptionalRuntimes(&db, opts);
+                    profile.init_optional_runtimes_ns = elapsedSince(init_optional_started_ns);
+                }
+
+                Self.attachAlgebraicHllMaintenanceLane(&db);
+                if (opts.open_mode == .status_only) {
+                    try db.core.loadIndexCatalogOnly();
+                } else if (opts.open_mode == .query_readonly) {
+                    const load_indexes_started_ns = monotonicTimeNs();
+                    try db.core.loadIndexesNoBackfill();
+                    profile.load_indexes_ns = elapsedSince(load_indexes_started_ns);
+                } else {
+                    const load_indexes_started_ns = monotonicTimeNs();
+                    try db.core.loadIndexes();
+                    profile.load_indexes_ns = elapsedSince(load_indexes_started_ns);
+                }
+                if (opts.open_mode != .status_only) {
+                    Self.hydrateAlgebraicObservationStatusBestEffort(&db);
+                }
+                if (opts.open_mode != .status_only) {
+                    try Self.rebaseManagedIndexAppliedSequencesIfNeeded(&db);
+                }
+                Self.recordStartupOpenStats(&db, profile);
+                if (openModeAllowsReplay(opts.open_mode)) {
+                    const replay_started_ns = monotonicTimeNs();
+                    try DB.LifecycleCallbacks.replay_pending_derived_batches(&db, null, null);
+                    profile.replay_pending_derived_ns = elapsedSince(replay_started_ns);
+                }
+                if (optional_runtimes_enabled) {
+                    try Self.resumeGeneratedReplayFromJournalIfNeeded(&db);
+                }
+                if (db.start_index_workers) {
+                    const start_workers_started_ns = monotonicTimeNs();
+                    try DB.LifecycleCallbacks.start_async_workers(&db);
+                    if (openModeAllowsReplay(opts.open_mode)) {
+                        Self.resumeAsyncReplayFromJournalIfNeeded(&db);
+                    }
+                    profile.start_index_workers_ns = elapsedSince(start_workers_started_ns);
+                }
+                if (optional_runtimes_enabled) {
+                    const start_optional_started_ns = monotonicTimeNs();
+                    try Self.startOptionalRuntimes(&db);
+                    profile.start_optional_runtimes_ns = elapsedSince(start_optional_started_ns);
+                }
+                profile.total_ns = monotonicTimeNs() - open_started_ns;
+                if (openProfileEnabled()) {
+                    logOpenProfile(path, opts.open_mode, db.start_index_workers, profile);
+                }
+                break :blk db;
+            };
+        }
+
+        pub fn close(self: *DB) void {
+            Self.deinitWrapperState(self, true);
+        }
+
+        pub fn maintenanceDriver(self: *DB) db_core.MaintenanceDriver {
+            return .{
+                .ptr = self,
+                .vtable = &maintenance_driver_vtable,
+            };
+        }
+
+        pub fn engine(self: *DB) db_core.Engine {
+            return .{
+                .ptr = self,
+                .vtable = &engine_vtable,
+            };
+        }
+
+        pub fn services(self: *DB) db_core.Services {
+            return self.core.services(Self.engine(self), Self.maintenanceDriver(self));
+        }
+
+        pub fn runTransactionRecoveryOnce(self: *DB, config: transaction_runtime_mod.Config) !types.TransactionRecoveryStats {
+            return try self.core.runTransactionRecoveryOnce(self.alloc, config);
+        }
+
+        pub fn recordStartupOpenStats(self: *DB, profile: anytype) void {
+            self.async_context.stats.startup.configured_indexes.store(self.core.index_manager.count(), .monotonic);
+            self.async_context.stats.startup.configured_dense_indexes.store(@intCast(self.core.index_manager.dense_indexes.items.len), .monotonic);
+            self.async_context.stats.startup.configured_sparse_indexes.store(@intCast(self.core.index_manager.sparse_indexes.items.len), .monotonic);
+            self.async_context.stats.startup.configured_full_text_indexes.store(@intCast(self.core.index_manager.text_indexes.items.len), .monotonic);
+            self.async_context.stats.startup.configured_graph_indexes.store(@intCast(self.core.index_manager.graph_indexes.items.len), .monotonic);
+            self.async_context.stats.startup.opened_indexes.store(self.core.index_manager.count(), .monotonic);
+            self.async_context.stats.startup.db_open_ns.store(profile.total_ns, .monotonic);
+            self.async_context.stats.startup.load_indexes_ns.store(profile.load_indexes_ns, .monotonic);
+
+            var lsm_open_stats = lsm_backend_mod.Backend.OpenStats{};
+            if (self.core.primary_store_owner.snapshotLsmOpenStats()) |primary_open_stats| {
+                lsm_backend_mod.Backend.accumulateOpenStats(&lsm_open_stats, primary_open_stats);
+            }
+            lsm_backend_mod.Backend.accumulateOpenStats(&lsm_open_stats, self.core.index_manager.snapshotLsmOpenStats());
+            self.async_context.stats.startup.lsm_open_stores.store(lsm_open_stats.started, .monotonic);
+            self.async_context.stats.startup.lsm_open_completed.store(lsm_open_stats.completed, .monotonic);
+            self.async_context.stats.startup.lsm_open_failed.store(lsm_open_stats.failed, .monotonic);
+            self.async_context.stats.startup.lsm_open_total_ns.store(lsm_open_stats.total_ns, .monotonic);
+            self.async_context.stats.startup.lsm_open_initializing_storage_ns.store(lsm_open_stats.initializing_storage_ns, .monotonic);
+            self.async_context.stats.startup.lsm_open_manifest_ns.store(lsm_open_stats.opening_manifest_ns, .monotonic);
+            self.async_context.stats.startup.lsm_open_ensuring_dirs_ns.store(lsm_open_stats.ensuring_dirs_ns, .monotonic);
+            self.async_context.stats.startup.lsm_open_wal_replay_ns.store(lsm_open_stats.replaying_wal_ns, .monotonic);
+            self.async_context.stats.startup.lsm_open_mounting_runs_ns.store(lsm_open_stats.mounting_runs_ns, .monotonic);
+            self.async_context.stats.startup.lsm_open_loaded_runs.store(lsm_open_stats.loaded_runs, .monotonic);
+            self.async_context.stats.startup.lsm_open_obsolete_paths.store(lsm_open_stats.obsolete_paths, .monotonic);
+            self.async_context.stats.startup.lsm_open_mutable_entries_after_replay.store(lsm_open_stats.mutable_entries_after_replay, .monotonic);
+            self.async_context.stats.startup.lsm_open_immutable_memtables_after_replay.store(lsm_open_stats.immutable_memtables_after_replay, .monotonic);
+            self.async_context.stats.startup.wal_replay_records.store(lsm_open_stats.wal_replay_records, .monotonic);
+            self.async_context.stats.startup.wal_replay_entries.store(lsm_open_stats.wal_replay_entries, .monotonic);
+            self.async_context.stats.startup.wal_replay_bytes.store(lsm_open_stats.wal_replay_bytes, .monotonic);
+            self.async_context.stats.startup.wal_replay_ns.store(lsm_open_stats.wal_replay_ns, .monotonic);
+            self.async_context.stats.startup.wal_replay_truncated_tail_bytes.store(lsm_open_stats.wal_replay_truncated_tail_bytes, .monotonic);
+
+            const lsm_maintenance_stats = Self.snapshotLsmMaintenanceStatsLocked(self);
+            self.async_context.stats.startup.wal_retention_known.store(true, .monotonic);
+            self.async_context.stats.startup.wal_retained_segments.store(lsm_maintenance_stats.wal_retained_segments, .monotonic);
+            self.async_context.stats.startup.wal_retained_bytes.store(lsm_maintenance_stats.wal_retained_bytes, .monotonic);
+            self.async_context.stats.startup.wal_checkpoint_oldest_retained_segment.store(lsm_maintenance_stats.wal_checkpoint_oldest_retained_segment, .monotonic);
+            self.async_context.stats.startup.wal_checkpoint_covered_through_segment.store(lsm_maintenance_stats.wal_checkpoint_covered_through_segment, .monotonic);
+            self.async_context.stats.startup.wal_checkpoint_current_segment.store(lsm_maintenance_stats.wal_checkpoint_current_segment, .monotonic);
+            self.async_context.stats.startup.wal_checkpoint_lag_segments.store(lsm_maintenance_stats.wal_checkpoint_lag_segments, .monotonic);
+            self.async_context.stats.startup.wal_replay_retained_segments.store(lsm_maintenance_stats.wal_replay_retained_segments, .monotonic);
+            self.async_context.stats.startup.wal_replay_retained_bytes.store(lsm_maintenance_stats.wal_replay_retained_bytes, .monotonic);
+            self.async_context.stats.startup.wal_replay_current_segment.store(lsm_maintenance_stats.wal_replay_current_segment, .monotonic);
+        }
+
+        pub fn attachAlgebraicHllMaintenanceLane(self: *DB) void {
+            const runtime = self.backend_runtime;
+            self.core.index_manager.attachHllMaintenance(runtime.durable_jobs, runtime.allocOwnerId());
+        }
+
+        pub fn hydrateAlgebraicObservationStatusBestEffort(self: *DB) void {
+            for (self.core.index_manager.algebraic_indexes.items) |*entry| {
+                entry.index.loadPersistedObservations(self.core.store) catch {};
+            }
+        }
+
+        pub fn hydrateAlgebraicObservationStatusForIndexBestEffort(self: *DB, index_name: []const u8) void {
+            const entry = self.core.index_manager.algebraicIndex(index_name) orelse return;
+            entry.index.loadPersistedObservations(self.core.store) catch {};
+        }
+
+        pub fn resumeGeneratedReplayFromJournalIfNeeded(self: *DB) !void {
+            const runtime = self.enrichment_runtime orelse return;
+            if (!self.core.hasGeneratedEnrichmentTargets()) return;
+
+            const target_sequence = self.core.nextEnrichmentSequence();
+            if (target_sequence == 0) return;
+            try runtime.resumeFrom(target_sequence, target_sequence);
+        }
+
+        pub fn resumeAsyncReplayFromJournalIfNeeded(self: *DB) void {
+            const target_sequence = self.core.nextDerivedSequence();
+            if (target_sequence == 0) return;
+            self.executor.notifySequence(target_sequence);
+        }
+
+        pub fn initAsyncInfrastructure(
+            self: *DB,
+            executor_config: derived_executor_mod.Config,
+            resource_manager: ?*resource_manager_mod.ResourceManager,
+        ) !void {
+            const async_resources = self.core.asyncResources();
+            self.async_context.* = .{
+                .alloc = self.runtime_alloc,
+                .store = async_resources.store,
+                .applied_sequence_checkpoint_path = async_resources.applied_sequence_checkpoint_path,
+                .index_manager = async_resources.index_manager,
+                .apply_mutex = async_resources.apply_mutex,
+                .io = self.backend_runtime.io(),
+                .require_graph_resolution_contract = true,
+                .query_visibility_hook = null,
+                .text_merge_runtime = null,
+                .relational_base_rows = self.relationalColumnsForStore() != null,
+            };
+            self.executor.* = try derived_executor_mod.init(
+                self.runtime_alloc,
+                executor_config,
+                self.core.replaySource(),
+                self.async_context,
+                DB.LifecycleCallbacks.apply_derived_batch_to_index_async,
+                DB.LifecycleCallbacks.persist_applied_sequence_async,
+                DB.LifecycleCallbacks.truncate_replay_sequence_async,
+                DB.LifecycleCallbacks.begin_derived_catch_up_session_async,
+                DB.LifecycleCallbacks.finish_derived_catch_up_session_async,
+                DB.LifecycleCallbacks.can_advance_derived_to_target_async,
+                resource_manager,
+                self.backend_runtime,
+            );
+        }
+
+        pub fn setQueryVisibilityHook(self: *DB, hook: anytype) void {
+            self.async_context.query_visibility_hook = hook;
+            if (self.enrichment_runtime) |runtime| {
+                runtime.setStatusHook(if (hook == null) null else .{
+                    .ptr = self.async_context,
+                    .on_change = DB.LifecycleCallbacks.notify_async_context_visibility_hook,
+                });
+            }
+        }
+
+        pub fn getGroupCreatedAtMillis(self: *DB, alloc: std.mem.Allocator, group_id: u64) !?u64 {
+            const key = try groupCreatedAtMetadataKeyAlloc(alloc, group_id);
+            defer alloc.free(key);
+            const raw = try self.get(alloc, key) orelse return null;
+            defer alloc.free(raw);
+            return try std.fmt.parseInt(u64, raw, 10);
+        }
+
+        pub fn ensureGroupCreatedAtMillis(self: *DB, alloc: std.mem.Allocator, group_id: u64, now_ms: u64) !u64 {
+            if (try Self.getGroupCreatedAtMillis(self, alloc, group_id)) |created_at_millis| return created_at_millis;
+
+            const key = try groupCreatedAtMetadataKeyAlloc(alloc, group_id);
+            defer alloc.free(key);
+            const encoded = try std.fmt.allocPrint(alloc, "{d}", .{now_ms});
+            defer alloc.free(encoded);
+
+            try self.batch(.{
+                .writes = &.{
+                    .{
+                        .key = key,
+                        .value = encoded,
+                    },
+                },
+            });
+            return now_ms;
+        }
+
+        pub fn initOptionalEnrichmentRuntime(self: *DB, enrichment_cfg: enrichment_runtime_mod.Config) !void {
+            if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null and !enrichment_cfg.enable_without_producers) return;
+            var runtime_enrichment_cfg = enrichment_cfg;
+            runtime_enrichment_cfg.relational_base_rows = self.relationalColumnsForStore() != null;
+
+            const append_ctx = try self.runtime_alloc.create(@TypeOf(self.enrichment_append_context.?.*));
+            errdefer self.runtime_alloc.destroy(append_ctx);
+            const resources = self.core.batchExecutionResources();
+            append_ctx.* = .{
+                .alloc = self.runtime_alloc,
+                .store = resources.store,
+                .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
+                .shard_manager = resources.shard_manager,
+                .index_manager = resources.index_manager,
+                .apply_mutex = resources.apply_mutex,
+                .change_journal = resources.change_journal,
+                .replay_source = resources.replay_source,
+                .executor = self.executor,
+                .async_context = self.async_context,
+                .log_mutex = resources.log_mutex,
+                .ha_async_effect_mirror = self.ha_async_effect_mirror,
+                .ha_async_batch_mirror = self.ha_async_batch_mirror,
+                .ha_async_metadata_mirror = self.ha_async_metadata_mirror,
+                .ha_write_gate = self.ha_write_gate,
+                .resolution_runtime = self.resolution_runtime,
+                .promotion_runtime = self.promotion_runtime,
+            };
+
+            const runtime = try self.runtime_alloc.create(enrichment_runtime_mod.EnrichmentRuntime);
+            errdefer self.runtime_alloc.destroy(runtime);
+            runtime.* = try enrichment_runtime_mod.EnrichmentRuntime.init(
+                self.runtime_alloc,
+                self.core.batchExecutionResources().store,
+                self.core.batchExecutionResources().change_journal,
+                self.core.replaySource(),
+                self.core.batchExecutionResources().index_manager,
+                append_ctx,
+                DB.LifecycleCallbacks.append_derived_batch_from_enrichment,
+                self.executor,
+                DB.LifecycleCallbacks.notify_derived_executor_sequence,
+                self.backend_runtime,
+                runtime_enrichment_cfg,
+            );
+            errdefer runtime.deinit();
+            self.enrichment_append_context = append_ctx;
+            self.enrichment_runtime = runtime;
+        }
+
+        pub fn initResolutionRuntime(self: *DB) !void {
+            // Always constructed so catalog/status/runUntilIdle APIs can observe
+            // and drain replay. The background worker is started lazily only while
+            // the resolver catalog is non-empty.
+            const append_ctx = try self.runtime_alloc.create(@TypeOf(self.resolution_append_context.?.*));
+            errdefer self.runtime_alloc.destroy(append_ctx);
+            const resources = self.core.batchExecutionResources();
+            append_ctx.* = .{
+                .alloc = self.runtime_alloc,
+                .store = resources.store,
+                .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
+                .shard_manager = resources.shard_manager,
+                .index_manager = resources.index_manager,
+                .apply_mutex = resources.apply_mutex,
+                .change_journal = resources.change_journal,
+                .replay_source = resources.replay_source,
+                .executor = self.executor,
+                .async_context = self.async_context,
+                .log_mutex = resources.log_mutex,
+                .ha_async_effect_mirror = self.ha_async_effect_mirror,
+                .ha_async_batch_mirror = self.ha_async_batch_mirror,
+                .ha_async_metadata_mirror = self.ha_async_metadata_mirror,
+                .ha_write_gate = self.ha_write_gate,
+            };
+
+            const runtime = try self.runtime_alloc.create(resolution_runtime_mod.ResolutionRuntime);
+            errdefer self.runtime_alloc.destroy(runtime);
+            runtime.* = try resolution_runtime_mod.ResolutionRuntime.init(
+                self.runtime_alloc,
+                self.core.batchExecutionResources().store,
+                self.core.replaySource(),
+                self.core.batchExecutionResources().index_manager,
+                append_ctx,
+                DB.LifecycleCallbacks.append_derived_batch_from_enrichment,
+                self.backend_runtime,
+                // Cross-shard blocking source when the serving layer injected one
+                // (via OpenOptions); null means local-only blocking against this
+                // worker's own store.
+                self.resolution_candidate_source,
+                // Optional name embedder for mention-embedding backfill.
+                self.resolution_embedder,
+            );
+            errdefer runtime.deinit();
+            append_ctx.resolution_runtime = runtime;
+            self.resolution_append_context = append_ctx;
+            self.resolution_runtime = runtime;
+            self.async_context.resolution_runtime = runtime;
+            if (self.enrichment_append_context) |ctx| ctx.resolution_runtime = runtime;
+        }
+
+        pub fn initPromotionRuntime(self: *DB) !void {
+            // Always constructed (like the resolution runtime) so synchronous
+            // drains and status APIs remain available. The background worker is
+            // started lazily only while resolver replay can produce promotion work.
+            const runtime = try self.runtime_alloc.create(promotion_runtime_mod.PromotionRuntime);
+            errdefer self.runtime_alloc.destroy(runtime);
+            runtime.* = try promotion_runtime_mod.PromotionRuntime.init(
+                self.runtime_alloc,
+                self.core.batchExecutionResources().store,
+                self.core.replaySource(),
+                self.backend_runtime,
+                self.promotion_owner,
+                // Cross-shard entity sink when the serving layer injected one (via
+                // OpenOptions or setEntitySink); the missing-sink policy decides
+                // whether null means wait or explicit no-op.
+                self.entity_sink,
+                self.entity_sink_missing_policy,
+            );
+            errdefer runtime.deinit();
+            self.promotion_runtime = runtime;
+            self.async_context.promotion_runtime = runtime;
+            // Patch the resolution stage's append context so journaling a resolution
+            // artifact (tagged with the promotion hint) wakes the promoter.
+            if (self.resolution_append_context) |ctx| ctx.promotion_runtime = runtime;
+        }
+
+        /// Inject (or clear) the cross-shard entity-resolution candidate source
+        /// on an already-open DB. The serving layer (managed write cache) calls
+        /// this right after a DB is opened, since managed DBs open lazily and
+        /// cannot thread the source through `OpenOptions`. No-op when this DB has
+        /// no resolution runtime (e.g. read-only / status opens).
+        pub fn setResolutionCandidateSource(self: *DB, src: ?resolution_runtime_mod.CandidateSource) void {
+            self.resolution_candidate_source = src;
+            if (self.resolution_runtime) |runtime| runtime.setCandidateSource(src);
+        }
+
+        /// Inject (or clear) the cross-shard entity sink on an already-open DB.
+        /// The serving layer (managed write cache) calls this right after a DB is
+        /// opened, since managed DBs open lazily and cannot thread the sink
+        /// through `OpenOptions`. No-op when this DB has no promotion runtime.
+        pub fn setEntitySink(self: *DB, sink: ?promotion_runtime_mod.EntitySink) void {
+            self.entity_sink = sink;
+            if (self.promotion_runtime) |runtime| runtime.setSink(sink);
+        }
+
+        /// Inject (or clear) the source-shard promotion owner on an already-open
+        /// DB. Serving-layer managed DBs use this to keep follower raft apply
+        /// from turning replay into public entity-table writes.
+        pub fn setPromotionOwner(self: *DB, owner: ?promotion_runtime_mod.PromotionOwner) void {
+            self.promotion_owner = owner;
+            if (self.promotion_runtime) |runtime| runtime.setOwner(owner);
+        }
+
+        pub fn initOptionalTtlRuntime(self: *DB, cfg: ttl_runtime_mod.Config) !void {
+            const ttl_ctx = try self.runtime_alloc.create(@TypeOf(self.ttl_cleanup_context.?.*));
+            errdefer self.runtime_alloc.destroy(ttl_ctx);
+            const batch_resources = self.core.batchExecutionResources();
+            ttl_ctx.* = .{
+                .batch = .{
+                    .alloc = self.runtime_alloc,
+                    .store = batch_resources.store,
+                    .applied_sequence_checkpoint_path = batch_resources.applied_sequence_checkpoint_path,
+                    .shard_manager = batch_resources.shard_manager,
+                    .change_journal = batch_resources.change_journal,
+                    .replay_source = batch_resources.replay_source,
+                    .index_manager = batch_resources.index_manager,
+                    .apply_mutex = batch_resources.apply_mutex,
+                    .log_mutex = batch_resources.log_mutex,
+                    .identity_namespace = batch_resources.identity_namespace,
+                    .executor = self.executor,
+                    .enrichment_runtime = self.enrichment_runtime,
+                    .relational_base_rows = self.relationalColumnsForStore() != null,
+                    .resolution_runtime = self.resolution_runtime,
+                    .promotion_runtime = self.promotion_runtime,
+                    .ha_async_effect_mirror = self.ha_async_effect_mirror,
+                    .ha_async_batch_mirror = self.ha_async_batch_mirror,
+                    .ha_async_metadata_mirror = self.ha_async_metadata_mirror,
+                    .ha_write_gate = self.ha_write_gate,
+                },
+                .grace_period_ns = cfg.grace_period_ns,
+            };
+            const runtime = try self.runtime_alloc.create(ttl_runtime_mod.TtlRuntime);
+            errdefer self.runtime_alloc.destroy(runtime);
+            runtime.* = try ttl_runtime_mod.TtlRuntime.init(
+                self.runtime_alloc,
+                self.core.batchExecutionResources().store,
+                ttl_ctx,
+                DB.LifecycleCallbacks.delete_expired_documents_from_candidates,
+                &self.async_context.text_merge_deferred,
+                self.backend_runtime,
+                cfg,
+            );
+            errdefer runtime.deinit();
+            self.ttl_cleanup_context = ttl_ctx;
+            self.ttl_runtime = runtime;
+        }
+
+        pub fn initOptionalTransactionRuntime(self: *DB, cfg: transaction_runtime_mod.Config) !void {
+            const identity_ctx = try self.runtime_alloc.create(db_core.TransactionRecoveryIdentityContext);
+            errdefer self.runtime_alloc.destroy(identity_ctx);
+            identity_ctx.* = .{
+                .store = self.core.store,
+                .identity_namespace = self.core.identity_namespace,
+                .alloc = self.runtime_alloc,
+                .relational_base_rows = self.relationalColumnsForStore() != null,
+                .relational_columns = self.relationalColumnsForStore() orelse &.{},
+            };
+            var effective_cfg = cfg;
+            effective_cfg.resolution_extra_hooks = db_core.transactionRecoveryIdentityHooks(identity_ctx);
+
+            const runtime = try self.runtime_alloc.create(transaction_runtime_mod.Runtime);
+            errdefer self.runtime_alloc.destroy(runtime);
+            runtime.* = try transaction_runtime_mod.Runtime.init(
+                self.runtime_alloc,
+                self.core.batchExecutionResources().store,
+                self.backend_runtime,
+                effective_cfg,
+            );
+            errdefer runtime.deinit();
+            self.transaction_recovery_identity_context = identity_ctx;
+            self.transaction_runtime = runtime;
+        }
+
+        pub fn initOptionalTextMergeRuntime(self: *DB, cfg: text_merge_runtime_mod.Config) !void {
+            if (!self.start_index_workers) return;
+            if (!cfg.enabled) return;
+            const resources = self.core.asyncResources();
+            const runtime = try self.runtime_alloc.create(text_merge_runtime_mod.TextMergeRuntime);
+            errdefer self.runtime_alloc.destroy(runtime);
+            runtime.* = try text_merge_runtime_mod.TextMergeRuntime.init(
+                self.runtime_alloc,
+                resources.index_manager,
+                resources.apply_mutex,
+                &self.async_context.text_merge_deferred,
+                self.backend_runtime,
+                cfg,
+            );
+            errdefer runtime.deinit();
+            self.text_merge_runtime = runtime;
+            self.async_context.text_merge_runtime = runtime;
+        }
+
+        pub fn initOptionalSparseCompactionRuntime(self: *DB, cfg: sparse_compaction_runtime_mod.Config) !void {
+            if (!self.start_index_workers) return;
+            if (!cfg.enabled) return;
+            const resources = self.core.asyncResources();
+            const runtime = try self.runtime_alloc.create(sparse_compaction_runtime_mod.SparseCompactionRuntime);
+            errdefer self.runtime_alloc.destroy(runtime);
+            runtime.* = try sparse_compaction_runtime_mod.SparseCompactionRuntime.init(
+                self.runtime_alloc,
+                resources.index_manager,
+                resources.apply_mutex,
+                self.backend_runtime,
+                cfg,
+            );
+            errdefer runtime.deinit();
+            self.sparse_compaction_runtime = runtime;
+            self.async_context.sparse_compaction_runtime = runtime;
+        }
+
+        pub fn initOptionalGraphMetricRuntime(self: *DB, cfg: graph_metric_runtime_mod.Config) !void {
+            if (!self.start_index_workers) return;
+            if (!cfg.enabled) return;
+            const resources = self.core.asyncResources();
+            const runtime = try self.runtime_alloc.create(graph_metric_runtime_mod.GraphMetricRuntime);
+            errdefer self.runtime_alloc.destroy(runtime);
+            runtime.* = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+                self.runtime_alloc,
+                resources.store,
+                resources.index_manager,
+                resources.apply_mutex,
+                self.backend_runtime,
+                cfg,
+            );
+            errdefer runtime.deinit();
+            self.graph_metric_runtime = runtime;
+        }
+
+        pub fn initOptionalRuntimes(self: *DB, opts: anytype) !void {
+            // Created before enrichment so the enrichment append context can notify
+            // it when extraction artifacts land.
+            try Self.initResolutionRuntime(self);
+            // Created after the resolution runtime so it can patch the resolution
+            // append context to wake the promoter when resolution artifacts land.
+            try Self.initPromotionRuntime(self);
+            if (opts.enrichment) |raw_enrichment_cfg| {
+                var enrichment_cfg = raw_enrichment_cfg;
+                if (enrichment_cfg.secret_store == null) enrichment_cfg.secret_store = opts.secret_store;
+                if (enrichment_cfg.remote_content == null) enrichment_cfg.remote_content = opts.remote_content;
+                if (enrichment_cfg.resource_manager == null) enrichment_cfg.resource_manager = opts.resource_manager;
+                try Self.initOptionalEnrichmentRuntime(self, enrichment_cfg);
+            }
+            if (opts.ttl_cleanup.enabled) {
+                try Self.initOptionalTtlRuntime(self, opts.ttl_cleanup);
+            }
+            if (opts.transaction_recovery.enabled) {
+                try Self.initOptionalTransactionRuntime(self, opts.transaction_recovery);
+            }
+            try Self.initOptionalTextMergeRuntime(self, opts.text_merge);
+            try Self.initOptionalSparseCompactionRuntime(self, opts.sparse_compaction);
+            try Self.initOptionalGraphMetricRuntime(self, opts.graph_metric_maintenance);
+        }
+
+        pub fn startOptionalRuntimes(self: *DB) !void {
+            try Self.startResolverReplayRuntimesIfConfigured(self);
+            if (self.enrichment_runtime) |runtime| try runtime.start();
+            if (self.ttl_runtime) |runtime| try runtime.start();
+            if (self.transaction_runtime) |runtime| try runtime.start();
+            if (self.text_merge_runtime) |runtime| try runtime.start();
+            if (self.sparse_compaction_runtime) |runtime| try runtime.start();
+            if (self.graph_metric_runtime) |runtime| try runtime.start();
+        }
+
+        pub fn hasConfiguredResolvers(self: *const DB) bool {
+            return self.core.index_manager.resolvers.items.len > 0;
+        }
+
+        pub fn resolverReplayNeedsDrain(self: *DB) bool {
+            if (Self.hasConfiguredResolvers(self)) return true;
+            if (self.resolution_runtime) |runtime| {
+                const replay_stats = runtime.stats();
+                if (replay_stats.catch_up_required or replay_stats.blocked) return true;
+            }
+            if (self.promotion_runtime) |runtime| {
+                const replay_stats = runtime.stats();
+                if (replay_stats.catch_up_required or replay_stats.blocked) return true;
+            }
+            return false;
+        }
+
+        pub fn notifyResolverReplayRuntimes(self: *DB, sequence: u64) void {
+            if (!Self.hasConfiguredResolvers(self)) return;
+            Self.notifyResolverReplayRuntimesForced(self, sequence);
+        }
+
+        pub fn notifyResolverReplayRuntimesForced(self: *DB, sequence: u64) void {
+            if (self.resolution_runtime) |runtime| runtime.notifySequence(sequence);
+            if (self.promotion_runtime) |runtime| runtime.notifySequence(sequence);
+        }
+
+        pub fn startResolverReplayRuntimesIfConfigured(self: *DB) !void {
+            if (!Self.hasConfiguredResolvers(self)) return;
+            try Self.startResolverReplayRuntimes(self);
+        }
+
+        pub fn startResolverReplayRuntimes(self: *DB) !void {
+            if (self.resolution_runtime) |runtime| try runtime.start();
+            if (self.promotion_runtime) |runtime| try runtime.start();
+        }
+
+        pub fn stopResolverReplayRuntimesIfUnconfigured(self: *DB) void {
+            if (Self.hasConfiguredResolvers(self)) return;
+            if (self.resolution_runtime) |runtime| runtime.stop();
+            if (self.promotion_runtime) |runtime| runtime.stop();
+        }
+
+        pub fn addResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
+            {
+                self.core.lockApply();
+                defer self.core.unlockApply();
+                try self.core.addResolver(cfg);
+            }
+            try Self.startResolverReplayRuntimes(self);
+            try Self.backfillResolverCorpus(self);
+        }
+
+        /// Add or replace a resolver. Inserts and material config changes re-resolve
+        /// the existing corpus so the new resolver/scorer behavior applies to
+        /// documents already ingested (the extraction artifacts did not change, so
+        /// the incremental hint would not fire on its own).
+        pub fn upsertResolverWithResultOptions(
+            self: *DB,
+            cfg: index_manager_mod.ResolverConfig,
+            options: ResolverUpsertOptions,
+        ) !index_manager_mod.IndexManager.ResolverUpsertResult {
+            const upsert_result = blk: {
+                self.core.lockApply();
+                defer self.core.unlockApply();
+                break :blk try self.core.upsertResolver(cfg);
+            };
+            switch (upsert_result) {
+                .inserted, .updated_backfill_required => {
+                    try Self.startResolverReplayRuntimes(self);
+                    if (options.drain_backfill) {
+                        try Self.backfillResolverCorpus(self);
+                    } else if (self.resolution_runtime) |runtime| {
+                        try runtime.requestReresolveBacklog();
+                    }
+                },
+                .updated_no_backfill => {
+                    try Self.startResolverReplayRuntimesIfConfigured(self);
+                    if (options.drain_backfill and self.resolution_runtime != null) {
+                        const runtime = self.resolution_runtime.?;
+                        if (try runtime.hasReresolveBacklog()) {
+                            try Self.backfillResolverCorpus(self);
+                        }
+                    }
+                },
+            }
+            return upsert_result;
+        }
+
+        pub fn upsertResolverWithResult(self: *DB, cfg: index_manager_mod.ResolverConfig) !index_manager_mod.IndexManager.ResolverUpsertResult {
+            return try Self.upsertResolverWithResultOptions(self, cfg, .{});
+        }
+
+        pub fn upsertResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
+            _ = try Self.upsertResolverWithResult(self, cfg);
+        }
+
+        pub fn drainResolverBackfill(self: *DB) !void {
+            try Self.startResolverReplayRuntimesIfConfigured(self);
+            try Self.backfillResolverCorpus(self);
+        }
+
+        pub fn listResolvers(self: *DB, alloc: Allocator) ![]index_manager_mod.ResolverConfig {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+            return try self.core.listResolvers(alloc);
+        }
+
+        pub fn removeResolver(self: *DB, name: []const u8) !bool {
+            try Self.retireResolverReplayBeforeCatalogRemoval(self);
+
+            const retirement_sequence = blk: {
+                self.core.lockApply();
+                defer self.core.unlockApply();
+
+                const cfg = (try Self.resolverConfigByNameAlloc(self, name)) orelse return false;
+                defer {
+                    var owned = cfg;
+                    owned.deinit(self.alloc);
+                }
+
+                break :blk try Self.retireResolverArtifactsLocked(self, cfg);
+            };
+
+            if (retirement_sequence) |sequence| {
+                self.executor.notifySequence(sequence);
+                Self.notifyResolverReplayRuntimesForced(self, sequence);
+                try Self.runUntilIdle(self);
+            }
+
+            {
+                self.core.lockApply();
+                defer self.core.unlockApply();
+                if (!try self.core.removeResolver(name)) return false;
+            }
+
+            Self.stopResolverReplayRuntimesIfUnconfigured(self);
+            return true;
+        }
+
+        fn resolverConfigByNameAlloc(self: *DB, name: []const u8) !?index_manager_mod.ResolverConfig {
+            const resolvers = try self.core.listResolvers(self.alloc);
+            defer {
+                for (resolvers) |*cfg| cfg.deinit(self.alloc);
+                if (resolvers.len > 0) self.alloc.free(resolvers);
+            }
+            for (resolvers) |cfg| {
+                if (std.mem.eql(u8, cfg.name, name)) {
+                    return try index_manager_mod.ResolverConfig.clone(self.alloc, cfg);
+                }
+            }
+            return null;
+        }
+
+        fn retireResolverArtifactsLocked(self: *DB, cfg: index_manager_mod.ResolverConfig) !?u64 {
+            var deletes = std.ArrayListUnmanaged([]const u8).empty;
+            defer {
+                for (deletes.items) |key| self.alloc.free(@constCast(key));
+                deletes.deinit(self.alloc);
+            }
+            var changed = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (changed.items) |key| self.alloc.free(key);
+                changed.deinit(self.alloc);
+            }
+
+            const marker_prefix = try internal_keys.assetArtifactSourceIndexPrefixAlloc(self.alloc, cfg.source_artifact);
+            defer self.alloc.free(marker_prefix);
+            const markers = try self.core.store.scanPrefix(self.alloc, marker_prefix);
+            defer docstore_mod.DocStore.freeResults(self.alloc, markers);
+
+            for (markers) |marker| {
+                const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(self.alloc, marker.value)) orelse continue;
+                defer {
+                    self.alloc.free(parsed.doc_key);
+                    self.alloc.free(parsed.artifact_name);
+                }
+                if (!std.mem.eql(u8, parsed.artifact_name, cfg.source_artifact)) continue;
+
+                const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(self.alloc, parsed.doc_key, cfg.resolution_artifact);
+                var resolution_key_owned = true;
+                errdefer if (resolution_key_owned) self.alloc.free(resolution_key);
+                if (!db_internal.containsKey(deletes.items, resolution_key)) {
+                    try deletes.append(self.alloc, resolution_key);
+                    resolution_key_owned = false;
+                    try db_internal.appendUniqueOwnedKey(self.alloc, &changed, resolution_key);
+                } else {
+                    self.alloc.free(resolution_key);
+                    resolution_key_owned = false;
+                }
+
+                try Self.collectResolverMentionArtifactsForDocLocked(self, cfg, parsed.doc_key, &deletes, &changed);
+            }
+
+            if (deletes.items.len == 0 and changed.items.len == 0) return null;
+
+            const sequence = self.core.reserveDerivedAppendSequence();
+            const replay_payload = try DB.WritePathCallbacks.encode_change_record_payload(self, .{
+                .sequence = sequence,
+                .changed_artifact_keys = changed.items,
+            }, sequence);
+            defer self.alloc.free(replay_payload);
+
+            try self.core.store.putBatchWithReplay(self.backend_runtime.io(), &.{}, deletes.items, .{
+                .sequence = sequence,
+                .payload = replay_payload,
+            });
+            DB.WritePathCallbacks.mirror_ha_replay_payload_best_effort(self, replay_payload);
+            self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
+            return sequence;
+        }
+
+        fn collectResolverMentionArtifactsForDocLocked(
+            self: *DB,
+            cfg: index_manager_mod.ResolverConfig,
+            doc_key: []const u8,
+            deletes: *std.ArrayListUnmanaged([]const u8),
+            changed: *std.ArrayListUnmanaged([]u8),
+        ) !void {
+            for (self.core.graphIndexes()) |graph_entry| {
+                const source = graph_entry.artifact_source orelse continue;
+                if (source.mention_edge_type.len == 0) continue;
+                if (!std.mem.eql(u8, source.artifact_name, cfg.source_artifact)) continue;
+
+                const state_name = try db_internal.mentionGraphStateNameAlloc(self.alloc, cfg.source_artifact, cfg.resolution_artifact);
+                defer self.alloc.free(state_name);
+                const state_key = try db_internal.graphAssetStateKeyAlloc(self.alloc, doc_key, graph_entry.config.name, state_name);
+                var state_key_owned = true;
+                errdefer if (state_key_owned) self.alloc.free(state_key);
+
+                if (try db_internal.loadGraphAssetStateKeysAlloc(self.alloc, self.core.store, state_key)) |previous_keys| {
+                    defer db_internal.freeOwnedConstKeySlice(self.alloc, previous_keys);
+                    for (previous_keys) |previous_key| {
+                        if (db_internal.containsKey(deletes.items, previous_key)) continue;
+                        const owned_key = try self.alloc.dupe(u8, previous_key);
+                        try deletes.append(self.alloc, owned_key);
+                        try db_internal.appendUniqueOwnedKey(self.alloc, changed, previous_key);
+                    }
+                }
+
+                if (!db_internal.containsKey(deletes.items, state_key)) {
+                    try deletes.append(self.alloc, state_key);
+                    state_key_owned = false;
+                } else {
+                    self.alloc.free(state_key);
+                    state_key_owned = false;
+                }
+            }
+        }
+
+        fn retireResolverReplayBeforeCatalogRemoval(self: *DB) !void {
+            try Self.runUntilIdle(self);
+            const resolution_stats = Self.resolutionStageStats(self);
+            if (resolution_stats.catch_up_required or resolution_stats.blocked) return error.ResolverReplayPending;
+            const promotion_stats = Self.promotionStageStats(self);
+            if (promotion_stats.catch_up_required or promotion_stats.blocked) return error.ResolverReplayPending;
+        }
+
+        /// The review queue: review-band mentions awaiting human curation. Empty
+        /// when no resolution runtime is active. Caller owns the result
+        /// (`resolution_runtime_mod.freePendingReviews`).
+        pub fn listPendingReviews(self: *DB, alloc: Allocator) ![]resolution_runtime_mod.PendingReview {
+            const runtime = self.resolution_runtime orelse return try alloc.alloc(resolution_runtime_mod.PendingReview, 0);
+            return try runtime.pendingReviews(alloc);
+        }
+
+        /// Persist a human curation decision for one review-band mention and enqueue
+        /// the document for ordinary replay-driven resolution/promotion.
+        pub fn recordReviewDecision(
+            self: *DB,
+            doc_key: []const u8,
+            source_artifact: []const u8,
+            resolution_artifact: []const u8,
+            local_id: []const u8,
+            decision: resolver_lib.Decision,
+            table: []const u8,
+            key: []const u8,
+        ) !u64 {
+            if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+            try ha_replication.enforceWriteGateOptional(self.ha_write_gate);
+            try self.executor.failIfUnhealthy();
+
+            self.core.lockApply();
+            var apply_mutex_held = true;
+            errdefer if (apply_mutex_held) self.core.unlockApply();
+
+            const resolvers = try self.core.listResolvers(self.alloc);
+            defer {
+                for (resolvers) |*cfg| cfg.deinit(self.alloc);
+                if (resolvers.len > 0) self.alloc.free(resolvers);
+            }
+            for (resolvers) |cfg| {
+                if (std.mem.eql(u8, cfg.source_artifact, source_artifact) and
+                    std.mem.eql(u8, cfg.resolution_artifact, resolution_artifact))
+                {
+                    break;
+                }
+            } else return error.ResolverNotFound;
+
+            const override_key = try resolution_runtime_mod.reviewOverrideArtifactKeyAlloc(self.alloc, doc_key, source_artifact, resolution_artifact);
+            defer self.alloc.free(override_key);
+            const existing = self.core.store.get(self.alloc, override_key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            defer if (existing) |raw| self.alloc.free(raw);
+            const override_bytes = try resolution_runtime_mod.buildReviewDecisionBytesAlloc(self.alloc, existing, local_id, decision, table, key);
+            defer self.alloc.free(override_bytes);
+
+            const source_key = try internal_keys.artifactNamedPrefixAlloc(self.alloc, doc_key, "asset", source_artifact);
+            defer self.alloc.free(source_key);
+            const sequence = self.core.reserveDerivedAppendSequence();
+            const changed_artifact_keys = [_][]const u8{source_key};
+            const replay_payload = try DB.WritePathCallbacks.encode_change_record_payload(self, .{
+                .sequence = sequence,
+                .changed_artifact_keys = changed_artifact_keys[0..],
+            }, sequence);
+            defer self.alloc.free(replay_payload);
+
+            const writes = [_]docstore_mod.KVPair{.{
+                .key = override_key,
+                .value = override_bytes,
+            }};
+            try self.core.store.putBatchWithReplay(self.backend_runtime.io(), writes[0..], &.{}, .{
+                .sequence = sequence,
+                .payload = replay_payload,
+            });
+            DB.WritePathCallbacks.mirror_ha_replay_payload_best_effort(self, replay_payload);
+            self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
+            self.core.unlockApply();
+            apply_mutex_held = false;
+
+            if (self.executor.hasWorkers()) {
+                self.executor.forceSequence(sequence);
+            } else {
+                self.executor.notifySequence(sequence);
+            }
+            Self.notifyResolverReplayRuntimes(self, sequence);
+            return sequence;
+        }
+
+        fn backfillResolverCorpus(self: *DB) !void {
+            if (!Self.hasConfiguredResolvers(self)) return;
+            if (self.resolution_runtime) |runtime| {
+                try runtime.requestReresolveBacklog();
+                while (true) {
+                    var tick = try runtime.runReresolveBacklogWindow();
+                    const queued = tick.queued;
+                    const complete = tick.complete;
+                    tick.deinit(self.runtime_alloc);
+                    // Drive the enqueued extraction artifacts through resolution,
+                    // promotion, and graph materialization before queuing more.
+                    if (queued > 0) try Self.runUntilIdle(self);
+                    if (complete) break;
+                }
+            }
+        }
+
+        pub fn deinitWrapperState(self: *DB, executor_ready: bool) void {
+            // Close may flush/coalesce derived watermarks while workers are
+            // stopping. That must not call back into the write/status cache after
+            // optional runtimes or index state have started tearing down.
+            Self.setQueryVisibilityHook(self, null);
+            DB.LifecycleCallbacks.deinit_bulk_ingest_coalescer(self);
+            DB.LifecycleCallbacks.clear_bulk_ingest_seen_doc_keys_locked(self);
+            self.bulk_ingest_seen_doc_keys.deinit(self.alloc);
+            self.closeShadowIndexManager() catch {};
+            if (self.transaction_runtime) |runtime| {
+                runtime.deinit();
+                self.runtime_alloc.destroy(runtime);
+            }
+            if (self.transaction_recovery_identity_context) |ctx| self.runtime_alloc.destroy(ctx);
+            if (self.ttl_runtime) |runtime| {
+                runtime.deinit();
+                self.runtime_alloc.destroy(runtime);
+            }
+            if (self.ttl_cleanup_context) |ctx| self.runtime_alloc.destroy(ctx);
+            if (self.enrichment_runtime) |runtime| {
+                runtime.deinit();
+                self.runtime_alloc.destroy(runtime);
+            }
+            if (self.enrichment_append_context) |ctx| self.runtime_alloc.destroy(ctx);
+            if (self.resolution_runtime) |runtime| {
+                runtime.deinit();
+                self.runtime_alloc.destroy(runtime);
+            }
+            self.async_context.resolution_runtime = null;
+            // After the resolution runtime (its final catch-up may journal
+            // resolution artifacts that notify the promoter) but before the
+            // resolution append context the promoter is wired into is destroyed.
+            if (self.promotion_runtime) |runtime| {
+                runtime.deinit();
+                self.runtime_alloc.destroy(runtime);
+            }
+            self.async_context.promotion_runtime = null;
+            if (self.resolution_append_context) |ctx| self.runtime_alloc.destroy(ctx);
+            if (executor_ready) self.executor.deinit(self.runtime_alloc);
+            self.runtime_alloc.destroy(self.executor);
+            if (self.text_merge_runtime) |runtime| {
+                self.async_context.text_merge_runtime = null;
+                runtime.deinit();
+                self.runtime_alloc.destroy(runtime);
+            }
+            if (self.sparse_compaction_runtime) |runtime| {
+                self.async_context.sparse_compaction_runtime = null;
+                runtime.deinit();
+                self.runtime_alloc.destroy(runtime);
+            }
+            if (self.graph_metric_runtime) |runtime| {
+                runtime.deinit();
+                self.runtime_alloc.destroy(runtime);
+            }
+            self.core.deinit();
+            if (self.owned_backend_runtime) |*runtime| runtime.deinit();
+            self.async_context.deinit(self.runtime_alloc);
+            self.runtime_alloc.destroy(self.async_context);
+            self.* = undefined;
+        }
+
+        pub fn refreshManagedIndexWorkersLocked(self: *DB) !void {
+            if (!self.start_index_workers) return;
+
+            const managed_indexes = try self.core.managedIndexes(self.alloc);
+            defer {
+                for (managed_indexes) |index_ref| self.alloc.free(@constCast(index_ref.name));
+                self.alloc.free(managed_indexes);
+            }
+
+            for (managed_indexes) |index_ref| {
+                self.executor.removeWorker(index_ref.name);
+            }
+            for (managed_indexes) |index_ref| {
+                const applied = try self.core.loadAppliedSequence(self.alloc, index_ref.name);
+                try self.executor.addWorker(index_ref.name, index_ref, applied);
+            }
+        }
+
+        pub fn resetManagedIndexAppliedSequences(self: *DB) !void {
+            const managed_indexes = try self.core.managedIndexes(self.alloc);
+            defer {
+                for (managed_indexes) |index_ref| self.alloc.free(@constCast(index_ref.name));
+                self.alloc.free(managed_indexes);
+            }
+
+            for (managed_indexes) |index_ref| {
+                try self.core.saveAppliedSequence(index_ref.name, 0);
+            }
+        }
+
+        pub fn rebaseManagedIndexAppliedSequencesIfNeeded(self: *DB) !void {
+            const managed_indexes = try self.core.managedIndexes(self.alloc);
+            defer {
+                for (managed_indexes) |index_ref| self.alloc.free(@constCast(index_ref.name));
+                self.alloc.free(managed_indexes);
+            }
+
+            var max_applied: u64 = 0;
+            for (managed_indexes) |index_ref| {
+                const applied = try self.core.loadAppliedSequence(self.alloc, index_ref.name);
+                max_applied = @max(max_applied, applied);
+            }
+            if (max_applied == 0) return;
+
+            // Applied watermarks are independent of the retained replay log.
+            // Once replay entries are truncated, a valid applied watermark can
+            // be above the current append floor recovered from replay metadata.
+            // Preserve the watermark and advance the floor so future replay
+            // sequence allocation cannot reuse already-applied sequence numbers.
+            try ensureReplayFloor(self.core.store, max_applied + 1);
+        }
+
+        pub fn pendingWorkStats(self: *DB) db_core.PendingWorkStats {
+            return .{
+                .derived_target_sequence = self.core.nextDerivedSequence(),
+                .has_async_indexes = self.executor.hasWorkers(),
+                .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
+                .resolution = Self.resolutionStageStats(self),
+                .promotion = Self.promotionStageStats(self),
+                .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStats(),
+                .graph_metric = self.core.index_manager.graphMetricPlannedWorkStats() catch .{},
+            };
+        }
+
+        pub fn persistedReplayStageStats(self: *DB, scope_name: []const u8, force_enabled: bool) !types.ReplayStageStats {
+            const resources = self.core.batchExecutionResources();
+            const applied = try enrichment_state.loadAppliedSequence(self.alloc, resources.store, scope_name);
+            const target = @max(applied, self.core.nextDerivedSequence());
+            return .{
+                .enabled = force_enabled or target > 0 or applied < target,
+                .target_sequence = target,
+                .applied_sequence = applied,
+                .catch_up_required = applied < target,
+            };
+        }
+
+        pub fn resolutionStageStats(self: *DB) types.ReplayStageStats {
+            if (self.resolution_runtime) |runtime| return runtime.stats();
+            return Self.persistedReplayStageStats(self, resolution_runtime_mod.scope_name, false) catch .{};
+        }
+
+        pub fn promotionStageStats(self: *DB) types.ReplayStageStats {
+            if (self.promotion_runtime) |runtime| return runtime.stats();
+            return Self.persistedReplayStageStats(self, promotion_runtime_mod.scope_name, false) catch .{};
+        }
+
+        pub fn persistedEnrichmentStats(self: *DB) !types.EnrichmentStats {
+            if (!self.core.hasGeneratedEnrichmentTargets()) return .{};
+            const resources = self.core.batchExecutionResources();
+            const applied = try enrichment_state.loadAppliedSequence(self.alloc, resources.store, enrichment_runtime_mod.scope_name);
+            const status = try enrichment_state.loadRuntimeStatus(self.alloc, resources.store, enrichment_runtime_mod.scope_name);
+            const target = @max(applied, status.target_sequence);
+            return .{
+                .enabled = target > 0 or status.error_count > 0 or status.retrying or status.worker_failed,
+                .target_sequence = target,
+                .applied_sequence = applied,
+                .error_count = status.error_count,
+                .retryable_error_count = status.retryable_error_count,
+                .fatal_error_count = status.fatal_error_count,
+                .retrying = status.retrying,
+                .worker_failed = status.worker_failed,
+            };
+        }
+
+        pub fn runDerivedUntil(self: *DB, sequence: u64) !void {
+            if (sequence == 0) return;
+            if (!self.executor.hasWorkers()) {
+                try self.catchUpPendingDerivedReplay();
+                return;
+            }
+            self.executor.notifySequence(sequence);
+            try self.executor.waitForAll(sequence);
+        }
+
+        pub fn runDerivedUntilTargets(self: *DB, sequence: u64, index_names: []const []const u8) !void {
+            if (sequence == 0 or index_names.len == 0) return;
+            if (!self.executor.hasWorkers()) return;
+            self.executor.notifyIndexes(sequence, index_names);
+            try self.executor.waitForIndexes(sequence, index_names);
+        }
+
+        pub fn runEnrichmentUntil(self: *DB, sequence: u64) !void {
+            if (sequence == 0) return;
+            if (self.enrichment_runtime) |runtime| {
+                runtime.notifySequence(sequence);
+                try runtime.waitForApplied(sequence);
+            }
+        }
+
+        pub fn markPrecomputedEnrichmentAppliedForSync(self: *DB, sync_level: types.SyncLevel, sequence: u64) !void {
+            if (sync_level != .enrichments or sequence == 0) return;
+            const runtime = self.enrichment_runtime orelse return;
+            const runtime_stats = runtime.stats();
+            if (runtime_stats.applied_sequence >= sequence -| 1 or
+                try Self.noPendingEnrichmentReplayThrough(self, runtime_stats.applied_sequence, sequence))
+            {
+                try runtime.markAppliedThrough(sequence);
+            }
+        }
+
+        pub fn noPendingEnrichmentReplayThrough(self: *DB, applied_sequence: u64, sequence: u64) !bool {
+            const pending = try enrichment_worker.collectPendingDocumentGroups(self.alloc, self.core.replaySource(), applied_sequence);
+            defer enrichment_worker.freePendingDocumentGroups(self.alloc, pending);
+            for (pending) |group| {
+                if (group.sequence <= sequence) return false;
+            }
+            return true;
+        }
+
+        pub fn runMaintenanceUntil(self: *DB, sequence: u64, sync_targets: ManagedSyncTargets) !void {
+            var stable_target = sequence;
+            while (true) {
+                try Self.runEnrichmentUntil(self, stable_target);
+                const enriched_target = self.core.nextDerivedSequence();
+                if (enriched_target > stable_target) {
+                    stable_target = enriched_target;
+                    continue;
+                }
+                try Self.runDerivedUntil(self, stable_target);
+
+                const next_target = self.core.nextDerivedSequence();
+                if (next_target <= stable_target) {
+                    if (Self.syncTargetsIncludeGraph(self, sync_targets.all_indexes)) _ = try self.runGraphMetricMaintenanceForIdle();
+                    return;
+                }
+                stable_target = next_target;
+            }
+        }
+
+        pub fn runMaintenanceUntilTargets(self: *DB, sequence: u64, index_names: []const []const u8) !void {
+            if (index_names.len == 0) return;
+            var stable_target = sequence;
+            while (true) {
+                try Self.runEnrichmentUntil(self, stable_target);
+                const enriched_target = self.core.nextDerivedSequence();
+                if (enriched_target > stable_target) {
+                    stable_target = enriched_target;
+                    continue;
+                }
+                try Self.runDerivedUntilTargets(self, stable_target, index_names);
+
+                const next_target = self.core.nextDerivedSequence();
+                if (next_target <= stable_target) {
+                    if (Self.syncTargetsIncludeGraph(self, index_names)) _ = try self.runGraphMetricMaintenanceForIdle();
+                    return;
+                }
+                stable_target = next_target;
+            }
+        }
+
+        pub fn syncTargetsIncludeGraph(self: *DB, index_names: []const []const u8) bool {
+            for (index_names) |index_name| {
+                if (self.core.graphIndex(index_name) != null) return true;
+            }
+            return false;
+        }
+
+        pub fn waitForCurrentSyncLevel(self: *DB, sync_level: types.SyncLevel) !void {
+            try self.executor.failIfUnhealthy();
+            const sequence = self.core.nextDerivedSequence();
+            try Self.markPrecomputedEnrichmentAppliedForSync(self, sync_level, sequence);
+            var sync_targets = try Self.currentManagedSyncTargets(self, sync_level);
+            defer sync_targets.deinit(self.alloc);
+            if (self.executor.hasWorkers()) {
+                db_internal.notifyExecutorForSyncLevelWithDenseBulkDeferral(self.async_context, self.executor, sync_level, sequence, sync_targets);
+            }
+            try DB.LifecycleCallbacks.wait_for_sync_level(self, sync_level, sequence, sync_targets);
+        }
+
+        pub fn currentManagedSyncTargets(self: *DB, sync_level: types.SyncLevel) !ManagedSyncTargets {
+            const managed_indexes = try self.core.managedIndexes(self.alloc);
+            defer {
+                for (managed_indexes) |index_ref| self.alloc.free(@constCast(index_ref.name));
+                self.alloc.free(managed_indexes);
+            }
+
+            var full_text_indexes = std.ArrayListUnmanaged([]const u8).empty;
+            errdefer {
+                for (full_text_indexes.items) |name| self.alloc.free(@constCast(name));
+                full_text_indexes.deinit(self.alloc);
+            }
+            var all_indexes = std.ArrayListUnmanaged([]const u8).empty;
+            errdefer {
+                for (all_indexes.items) |name| self.alloc.free(@constCast(name));
+                all_indexes.deinit(self.alloc);
+            }
+
+            for (managed_indexes) |index_ref| {
+                switch (sync_level) {
+                    .propose, .write => {},
+                    .enrichments => {},
+                    .full_text => {
+                        if (index_ref.kind == .full_text) {
+                            try appendUniqueOwnedName(self.alloc, &full_text_indexes, index_ref.name);
+                            try appendUniqueOwnedName(self.alloc, &all_indexes, index_ref.name);
+                        }
+                    },
+                    .aknn, .full_index => {
+                        try appendUniqueOwnedName(self.alloc, &all_indexes, index_ref.name);
+                        if (index_ref.kind == .full_text) {
+                            try appendUniqueOwnedName(self.alloc, &full_text_indexes, index_ref.name);
+                        }
+                    },
+                }
+            }
+
+            return .{
+                .full_text_indexes = try full_text_indexes.toOwnedSlice(self.alloc),
+                .all_indexes = try all_indexes.toOwnedSlice(self.alloc),
+            };
+        }
+
+        pub fn runUntilIdle(self: *DB) !void {
+            try Self.drainReplayStagesUntilStable(self);
+            _ = try self.evaluateAlgebraicAdaptiveCandidates();
+            while (try self.runAlgebraicAdaptiveWork() != 0) {}
+            try DB.LifecycleCallbacks.flush_applied_sequences_for_idle(self);
+            try Self.drainScheduledTextMerges(self);
+            _ = try self.runDensePostingMaintenanceForIdle();
+            _ = try self.runGraphMetricMaintenanceForIdle();
+            _ = try Self.runLsmMaintenanceUntilIdle(self);
+        }
+
+        pub fn compactTextIndexes(self: *DB) !void {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            try self.core.compactTextIndexes();
+        }
+
+        pub fn drainScheduledTextMerges(self: *DB) !void {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            try self.core.drainScheduledTextMerges();
+        }
+
+        pub fn forceCompactTextIndexes(self: *DB) !void {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            try self.core.forceCompactTextIndexes();
+        }
+
+        pub fn bestEffortForceCompactTextIndexes(self: *DB) !void {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            try self.core.bestEffortForceCompactTextIndexes();
+        }
+
+        fn currentMaintenanceTargetSequence(self: *DB) u64 {
+            var target_sequence = self.core.nextDerivedSequence();
+            if (self.enrichment_runtime) |runtime| {
+                target_sequence = @max(target_sequence, runtime.stats().target_sequence);
+            }
+            return target_sequence;
+        }
+
+        fn drainReplayStagesUntilStable(self: *DB) !void {
+            var rounds: usize = 0;
+            while (rounds < run_until_idle_max_replay_rounds) : (rounds += 1) {
+                const starting_sequence = self.core.nextDerivedSequence();
+                try Self.runMaintenanceUntil(self, Self.currentMaintenanceTargetSequence(self), .{});
+                const drained_sequence = self.core.nextDerivedSequence();
+
+                if (Self.resolverReplayNeedsDrain(self)) {
+                    if (self.resolution_runtime) |runtime| {
+                        if (drained_sequence > 0) runtime.notifySequence(drained_sequence - 1);
+                        try runtime.catchUp();
+                    }
+
+                    if (self.promotion_runtime) |runtime| {
+                        const latest = self.core.nextDerivedSequence();
+                        if (latest > 0) runtime.notifySequence(latest - 1);
+                        try runtime.catchUp();
+                    }
+                }
+
+                if (self.core.nextDerivedSequence() <= starting_sequence) return;
+            }
+            return error.RunUntilIdleDidNotConverge;
+        }
+
+        pub fn snapshotForeignKeyStats(self: *DB) types.ForeignKeyStats {
+            return self.foreign_key_stats.snapshot();
+        }
+
+        pub fn reassignIdentityNamespaceForInternalTransition(self: *DB, namespace: doc_identity.Namespace) !void {
+            if (self.open_mode == .status_only) return error.UnsupportedOperation;
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            try doc_identity.reassignNamespaceAlloc(self.alloc, self.core.store, namespace);
+            self.core.identity_namespace = namespace;
+            if (self.transaction_recovery_identity_context) |ctx| {
+                ctx.identity_namespace = namespace;
+                ctx.relational_base_rows = self.relationalColumnsForStore() != null;
+                ctx.relational_columns = self.relationalColumnsForStore() orelse &.{};
+            }
+        }
+
+        pub fn currentIdentityReadGenerationForRequest(self: *DB, requested: ?u64) !u64 {
+            const current_generation = self.core.nextDerivedSequence();
+            if (requested) |generation| {
+                if (generation != current_generation) {
+                    self.doc_set_planning_stats.recordStaleIdentityGenerationRejection();
+                    return error.UnsupportedQueryRequest;
+                }
+                return generation;
+            }
+            return current_generation;
+        }
+
+        pub fn dbDocIdentityStats(raw: doc_identity.Stats, namespace: doc_identity.Namespace) types.DocIdentityStats {
+            const max_doc_ordinal = std.math.maxInt(doc_identity.DocOrdinal);
+            const remaining = if (raw.next_ordinal >= max_doc_ordinal)
+                0
+            else
+                @as(u64, max_doc_ordinal) - raw.next_ordinal;
+            return .{
+                .namespace_table_id = namespace.table_id,
+                .namespace_shard_id = namespace.shard_id,
+                .namespace_range_id = namespace.range_id,
+                .next_ordinal = raw.next_ordinal,
+                .allocated_ordinals = raw.allocated_ordinals,
+                .ordinal_capacity_remaining = remaining,
+                .ordinal_capacity_exhausted = raw.next_ordinal >= max_doc_ordinal,
+                .rebuild_required = raw.next_ordinal >= max_doc_ordinal,
+                .state_rows = raw.state_rows,
+                .live_ordinals = raw.live_ordinals,
+                .tombstone_ordinals = raw.tombstone_ordinals,
+                .min_created_generation = raw.min_created_generation,
+                .max_created_generation = raw.max_created_generation,
+                .min_deleted_generation = raw.min_deleted_generation,
+                .max_deleted_generation = raw.max_deleted_generation,
+                .complete = raw.complete,
+            };
+        }
+
+        pub fn diagnosticDocIdentityStats(self: *DB, byte_range: types.ByteRange) !types.DocIdentityStats {
+            var identity_stats = Self.dbDocIdentityStats(try doc_identity.fullStatsFromStore(self.core.store), self.core.identity_namespace);
+            const coverage = try Self.scanPrimaryDocIdentityCoverage(self, byte_range);
+            identity_stats.scanned_primary_docs = coverage.scanned_primary_docs;
+            identity_stats.primary_docs_missing_ordinals = coverage.primary_docs_missing_ordinals;
+            identity_stats.primary_docs_missing_identity_state = coverage.primary_docs_missing_identity_state;
+            identity_stats.primary_docs_with_tombstone_ordinals = coverage.primary_docs_with_tombstone_ordinals;
+            finalizeDocIdentityRebuildRequired(&identity_stats);
+            return identity_stats;
+        }
+
+        pub fn snapshotDocSetPlanningStats(self: *DB) types.DocSetPlanningStats {
+            return self.doc_set_planning_stats.snapshot();
+        }
+
+        pub fn scanPrimaryDocCount(self: *DB, byte_range: types.ByteRange) !u64 {
+            const lower = try self.core.documentRangeLowerAlloc(byte_range.start);
+            defer self.core.alloc.free(lower);
+            const upper = if (byte_range.end.len > 0) try self.core.documentRangeUpperAlloc(byte_range.end) else null;
+            defer if (upper) |buf| self.core.alloc.free(buf);
+
+            var doc_count: u64 = 0;
+            const CountState = struct {
+                relational_base_rows: bool,
+                doc_count: *u64,
+
+                fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                    _ = value;
+                    const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                    if (db_internal.isBaseDocumentStoreKeyForMode(state.relational_base_rows, key)) state.doc_count.* += 1;
+                    return .@"continue";
+                }
+            };
+
+            var state = CountState{
+                .relational_base_rows = self.relationalColumnsForStore() != null,
+                .doc_count = &doc_count,
+            };
+            try self.core.store.scanWithContext(lower, if (upper) |buf| buf else "", .{}, &state, CountState.scanEntry);
+            return doc_count;
+        }
+
+        pub fn primaryDocCount(self: *DB) !u64 {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+            return try Self.scanPrimaryDocCount(self, self.core.byteRange());
+        }
+
+        pub fn scanPrimaryDocIdentityCoverage(self: *DB, byte_range: types.ByteRange) !DocIdentityCoverage {
+            const lower = try self.core.documentRangeLowerAlloc(byte_range.start);
+            defer self.core.alloc.free(lower);
+            const upper = if (byte_range.end.len > 0) try self.core.documentRangeUpperAlloc(byte_range.end) else null;
+            defer if (upper) |buf| self.core.alloc.free(buf);
+
+            var doc_ids = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (doc_ids.items) |doc_id| self.core.alloc.free(doc_id);
+                doc_ids.deinit(self.core.alloc);
+            }
+
+            var coverage = DocIdentityCoverage{};
+            const ScanState = struct {
+                alloc: std.mem.Allocator,
+                relational_base_rows: bool,
+                doc_ids: *std.ArrayListUnmanaged([]u8),
+                coverage: *DocIdentityCoverage,
+
+                fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+                    _ = value;
+                    const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+                    if (!db_internal.isBaseDocumentStoreKeyForMode(state.relational_base_rows, key)) return .@"continue";
+                    const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(state.alloc, key)) orelse return .@"continue";
+                    errdefer state.alloc.free(raw_key);
+                    try state.doc_ids.append(state.alloc, raw_key);
+                    state.coverage.scanned_primary_docs += 1;
+                    return .@"continue";
+                }
+            };
+
+            var scan_state = ScanState{
+                .alloc = self.core.alloc,
+                .relational_base_rows = self.relationalColumnsForStore() != null,
+                .doc_ids = &doc_ids,
+                .coverage = &coverage,
+            };
+            try self.core.store.scanWithContext(lower, if (upper) |buf| buf else "", .{}, &scan_state, ScanState.scanEntry);
+
+            var txn = try self.core.store.beginProbeTxn();
+            defer txn.abort();
+            for (doc_ids.items) |doc_id| {
+                const ordinal = (try doc_identity.lookupOrdinalTxn(self.core.alloc, &txn, doc_id)) orelse {
+                    coverage.primary_docs_missing_ordinals += 1;
+                    continue;
+                };
+                const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse {
+                    coverage.primary_docs_missing_identity_state += 1;
+                    continue;
+                };
+                if (!state.isLive()) coverage.primary_docs_with_tombstone_ordinals += 1;
+            }
+            return coverage;
+        }
+
+        pub fn overlayRuntimeStatusBestEffort(self: *DB, stats_alloc: std.mem.Allocator, runtime_stats: *types.DBStats) void {
+            Self.overlayRuntimeStatusRuntimeOnly(self, runtime_stats);
+            Self.overlayRuntimeStatusIndexesAssumeApplyLockHeld(self, stats_alloc, runtime_stats);
+        }
+
+        pub fn overlayRuntimeStatusConsistent(self: *DB, stats_alloc: std.mem.Allocator, runtime_stats: *types.DBStats) void {
+            Self.overlayRuntimeStatusRuntimeOnly(self, runtime_stats);
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+            Self.overlayRuntimeStatusIndexesLocked(self, stats_alloc, runtime_stats);
+        }
+
+        pub fn stats(self: *DB, alloc: Allocator) !types.DBStats {
+            if (self.open_mode == .status_only) {
+                return try Self.statusOnlyStats(self, alloc);
+            }
+
+            // Operational stats must stay bounded and avoid maintenance/scan work.
+            // See STATUS.md for the status-plane contract.
+            if (!self.core.tryLockApplyShared()) {
+                return .{
+                    .async_indexing = Self.snapshotAsyncIndexingStats(self),
+                    .doc_set_planning = Self.snapshotDocSetPlanningStats(self),
+                    .foreign_keys = Self.snapshotForeignKeyStats(self),
+                    .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
+                    .resolution = Self.resolutionStageStats(self),
+                    .promotion = Self.promotionStageStats(self),
+                    .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
+                    .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
+                    .graph_metric_runtime = Self.graphMetricRuntimeStats(self),
+                };
+            }
+            defer self.core.unlockApplyShared();
+
+            return try Self.statsLocked(self, alloc);
+        }
+
+        pub fn runtimeStatusStatsConsistent(self: *DB, alloc: Allocator) !types.DBStats {
+            if (self.open_mode == .status_only) {
+                return try Self.statusOnlyStats(self, alloc);
+            }
+
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+
+            return try Self.statsLocked(self, alloc);
+        }
+
+        pub fn populateAlgebraicIndexStats(
+            self: *DB,
+            alloc: Allocator,
+            index_name: []const u8,
+            item: *types.DBIndexStats,
+            include_adaptive_scans: bool,
+        ) !void {
+            const entry = self.core.index_manager.algebraicIndex(index_name) orelse return;
+            const status_value = entry.index.status();
+            const cfg = entry.index.config();
+            item.algebraic_parse_error_count = status_value.parse_error_count;
+            item.algebraic_schema_version = cfg.schema_version;
+            if (cfg.capability_fingerprint.len > 0) {
+                item.algebraic_capability_fingerprint = try alloc.dupe(u8, cfg.capability_fingerprint);
+            }
+            if (cfg.capability_lifecycle_status.len > 0) {
+                item.algebraic_capability_lifecycle_status = try alloc.dupe(u8, cfg.capability_lifecycle_status);
+            }
+            item.algebraic_capability_change_added_fields = cfg.capability_change_added_fields;
+            item.algebraic_capability_change_removed_fields = cfg.capability_change_removed_fields;
+            item.algebraic_capability_change_changed_type_fields = cfg.capability_change_changed_type_fields;
+            item.algebraic_skipped_dynamic_fields = cfg.skipped_dynamic_fields;
+            item.algebraic_skipped_complex_fields = cfg.skipped_complex_fields;
+            item.algebraic_skipped_unbounded_fields = cfg.skipped_unbounded_fields;
+            item.algebraic_minmax_cache_hits = status_value.minmax_cache_hits;
+            item.algebraic_minmax_cache_misses = status_value.minmax_cache_misses;
+            item.algebraic_minmax_support_scans = status_value.minmax_support_scans;
+            item.algebraic_planner_selected = status_value.planner_algebraic_selected;
+            item.algebraic_planner_fallback_count = status_value.planner_fallback_count;
+            if (status_value.planner_last_decision) |value| {
+                item.algebraic_planner_last_decision = try alloc.dupe(u8, value);
+            }
+            if (status_value.planner_last_fallback_reason) |value| {
+                item.algebraic_planner_last_fallback_reason = try alloc.dupe(u8, value);
+            }
+            item.algebraic_planner_last_estimated_scan_rows = if (status_value.planner_last_estimated_scan_rows) |value| @intCast(value) else null;
+            item.algebraic_planner_last_estimated_result_buckets = if (status_value.planner_last_estimated_result_buckets) |value| @intCast(value) else null;
+            item.algebraic_planner_lifecycle_ready = status_value.planner_lifecycle_ready;
+            if (status_value.planner_lifecycle_blocking_reason) |value| {
+                item.algebraic_planner_lifecycle_blocking_reason = try alloc.dupe(u8, value);
+            }
+            item.algebraic_dictionary_registry_claimed_count = status_value.dictionary_registry_claimed_count;
+            item.algebraic_dictionary_registry_already_owned_count = status_value.dictionary_registry_already_owned_count;
+            item.algebraic_dictionary_registry_owned_by_other_count = status_value.dictionary_registry_owned_by_other_count;
+            item.algebraic_dictionary_registry_ready_hit_count = status_value.dictionary_registry_ready_hit_count;
+            item.algebraic_dictionary_registry_ready_miss_count = status_value.dictionary_registry_ready_miss_count;
+            item.algebraic_distributed_partial_validation_proven_count = status_value.distributed_partial_validation_proven_count;
+            item.algebraic_distributed_partial_validation_rejected_count = status_value.distributed_partial_validation_rejected_count;
+            item.algebraic_distributed_partial_rows_exported_count = status_value.distributed_partial_rows_exported_count;
+            item.algebraic_vector_filter_attempt_count = status_value.vector_filter_attempt_count;
+            item.algebraic_vector_filter_resolved_count = status_value.vector_filter_resolved_count;
+            item.algebraic_vector_filter_unsupported_count = status_value.vector_filter_unsupported_count;
+            item.algebraic_vector_filter_fail_closed_count = status_value.vector_filter_fail_closed_count;
+            item.algebraic_vector_filter_include_doc_id_count = status_value.vector_filter_include_doc_id_count;
+            item.algebraic_vector_filter_exclude_doc_id_count = status_value.vector_filter_exclude_doc_id_count;
+            item.algebraic_observed_query_shape_count = status_value.observed_query_shape_count;
+            item.algebraic_recommendation_count = status_value.recommendation_count;
+            if (include_adaptive_scans) {
+                const adaptive_candidates = try entry.index.scanPersistedAdaptiveCandidates(self.core.store);
+                defer {
+                    for (adaptive_candidates) |*candidate| candidate.deinit(entry.index.alloc);
+                    if (adaptive_candidates.len > 0) entry.index.alloc.free(adaptive_candidates);
+                }
+                item.algebraic_adaptive_candidate_count = @intCast(adaptive_candidates.len);
+                var top_candidate_index: ?usize = null;
+                for (adaptive_candidates) |candidate| switch (candidate.lifecycle) {
+                    .backfilling => item.algebraic_adaptive_backfilling_count += 1,
+                    .ready => item.algebraic_adaptive_ready_count += 1,
+                    .stale => item.algebraic_adaptive_stale_count += 1,
+                    .dematerialize_recommended => item.algebraic_adaptive_dematerialize_recommended_count += 1,
+                    else => {},
+                };
+                for (adaptive_candidates, 0..) |candidate, i| {
+                    const selected_index = top_candidate_index orelse {
+                        top_candidate_index = i;
+                        continue;
+                    };
+                    const selected = adaptive_candidates[selected_index];
+                    if (candidate.score > selected.score or
+                        (candidate.score == selected.score and candidate.observation_count > selected.observation_count))
+                    {
+                        top_candidate_index = i;
+                    }
+                }
+                if (adaptive_candidates.len > 0) {
+                    const status_candidates = try alloc.alloc(types.AlgebraicCandidateStatus, adaptive_candidates.len);
+                    var initialized_candidates: usize = 0;
+                    errdefer {
+                        for (status_candidates[0..initialized_candidates]) |candidate| {
+                            alloc.free(candidate.recommendation);
+                            alloc.free(candidate.materialization_id);
+                            alloc.free(candidate.lifecycle);
+                            alloc.free(candidate.decision);
+                        }
+                        alloc.free(status_candidates);
+                    }
+                    for (adaptive_candidates, 0..) |candidate, i| {
+                        status_candidates[i] = try cloneAlgebraicCandidateStatusAlloc(
+                            alloc,
+                            candidate.recommendation,
+                            candidate.materialization_id,
+                            @tagName(candidate.lifecycle),
+                            candidate.decision,
+                            candidate.observation_count,
+                            candidate.estimated_scan_rows_saved,
+                            candidate.estimated_write_cost,
+                            candidate.estimated_tensor_rows,
+                            candidate.estimated_storage_bytes,
+                            candidate.estimated_write_amplification,
+                            candidate.score,
+                            candidate.idle_miss_count,
+                            candidate.generation,
+                        );
+                        initialized_candidates += 1;
+                    }
+                    item.algebraic_candidates = status_candidates;
+                }
+                if (top_candidate_index) |i| {
+                    const candidate = adaptive_candidates[i];
+                    item.algebraic_top_candidate = try cloneAlgebraicCandidateStatusAlloc(
+                        alloc,
+                        candidate.recommendation,
+                        candidate.materialization_id,
+                        @tagName(candidate.lifecycle),
+                        candidate.decision,
+                        candidate.observation_count,
+                        candidate.estimated_scan_rows_saved,
+                        candidate.estimated_write_cost,
+                        candidate.estimated_tensor_rows,
+                        candidate.estimated_storage_bytes,
+                        candidate.estimated_write_amplification,
+                        candidate.score,
+                        candidate.idle_miss_count,
+                        candidate.generation,
+                    );
+                }
+                const adaptive_decisions = try entry.index.scanPersistedAdaptiveDecisions(self.core.store, 16);
+                defer {
+                    for (adaptive_decisions) |*decision| decision.deinit(entry.index.alloc);
+                    if (adaptive_decisions.len > 0) entry.index.alloc.free(adaptive_decisions);
+                }
+                item.algebraic_adaptive_decision_history_count = @intCast(adaptive_decisions.len);
+                for (adaptive_decisions) |decision| {
+                    if (!std.mem.eql(u8, decision.previous_decision, decision.decision) or decision.score_delta != 0) {
+                        item.algebraic_adaptive_policy_drift_count += 1;
+                    }
+                }
+                if (adaptive_decisions.len > 0) {
+                    const status_decisions = try alloc.alloc(types.AlgebraicCandidateDecisionStatus, adaptive_decisions.len);
+                    var initialized_decisions: usize = 0;
+                    errdefer {
+                        for (status_decisions[0..initialized_decisions]) |decision| {
+                            alloc.free(decision.recommendation);
+                            alloc.free(decision.materialization_id);
+                            alloc.free(decision.lifecycle);
+                            alloc.free(decision.previous_decision);
+                            alloc.free(decision.decision);
+                        }
+                        alloc.free(status_decisions);
+                    }
+                    for (adaptive_decisions, 0..) |decision, i| {
+                        status_decisions[i] = try cloneAlgebraicCandidateDecisionStatusAlloc(
+                            alloc,
+                            decision.recommendation,
+                            decision.materialization_id,
+                            @tagName(decision.lifecycle),
+                            decision.previous_decision,
+                            decision.decision,
+                            decision.observation_count,
+                            decision.estimated_scan_rows_saved,
+                            decision.estimated_write_cost,
+                            decision.score,
+                            decision.score_delta,
+                            decision.idle_miss_count,
+                            decision.generation,
+                        );
+                        initialized_decisions += 1;
+                    }
+                    item.algebraic_candidate_decision_history = status_decisions;
+                }
+                const adaptive_progress = try entry.index.scanPersistedAdaptiveProgress(self.core.store);
+                defer {
+                    for (adaptive_progress) |*progress| progress.deinit(entry.index.alloc);
+                    if (adaptive_progress.len > 0) entry.index.alloc.free(adaptive_progress);
+                }
+                item.algebraic_adaptive_progress_count = @intCast(adaptive_progress.len);
+                var active_progress_index: ?usize = null;
+                if (adaptive_candidates.len == 0) {
+                    for (adaptive_progress) |progress| switch (progress.lifecycle) {
+                        .backfilling => item.algebraic_adaptive_backfilling_count += 1,
+                        .ready => item.algebraic_adaptive_ready_count += 1,
+                        .stale => item.algebraic_adaptive_stale_count += 1,
+                        .dematerialize_recommended => item.algebraic_adaptive_dematerialize_recommended_count += 1,
+                        else => {},
+                    };
+                }
+                for (adaptive_progress, 0..) |progress, i| {
+                    const selected_index = active_progress_index orelse {
+                        active_progress_index = i;
+                        continue;
+                    };
+                    const selected = adaptive_progress[selected_index];
+                    if ((progress.lifecycle == .backfilling and selected.lifecycle != .backfilling) or
+                        (progress.lifecycle == selected.lifecycle and progress.target_sequence > selected.target_sequence) or
+                        (progress.lifecycle == selected.lifecycle and progress.target_sequence == selected.target_sequence and progress.rows_processed > selected.rows_processed))
+                    {
+                        active_progress_index = i;
+                    }
+                }
+                if (adaptive_progress.len > 0) {
+                    const status_progress = try alloc.alloc(types.AlgebraicProgressStatus, adaptive_progress.len);
+                    var initialized_progress: usize = 0;
+                    errdefer {
+                        for (status_progress[0..initialized_progress]) |progress| {
+                            alloc.free(progress.recommendation);
+                            alloc.free(progress.materialization_id);
+                            alloc.free(progress.lifecycle);
+                        }
+                        alloc.free(status_progress);
+                    }
+                    for (adaptive_progress, 0..) |progress, i| {
+                        status_progress[i] = try cloneAlgebraicProgressStatusAlloc(
+                            alloc,
+                            progress.recommendation,
+                            progress.materialization_id,
+                            @tagName(progress.lifecycle),
+                            progress.target_sequence,
+                            progress.applied_sequence,
+                            progress.rows_processed,
+                            progress.target_rows,
+                        );
+                        initialized_progress += 1;
+                    }
+                    item.algebraic_progress = status_progress;
+                }
+                if (active_progress_index) |i| {
+                    const progress = adaptive_progress[i];
+                    item.algebraic_active_progress = try cloneAlgebraicProgressStatusAlloc(
+                        alloc,
+                        progress.recommendation,
+                        progress.materialization_id,
+                        @tagName(progress.lifecycle),
+                        progress.target_sequence,
+                        progress.applied_sequence,
+                        progress.rows_processed,
+                        progress.target_rows,
+                    );
+                }
+            }
+            if (status_value.last_error_doc_key) |value| {
+                item.algebraic_last_error_doc_key = try alloc.dupe(u8, value);
+            }
+            errdefer if (item.algebraic_last_error_doc_key) |value| {
+                alloc.free(value);
+                item.algebraic_last_error_doc_key = null;
+            };
+            if (status_value.last_error_reason) |value| {
+                item.algebraic_last_error_reason = try alloc.dupe(u8, value);
+            }
+            errdefer if (item.algebraic_last_error_reason) |value| {
+                alloc.free(value);
+                item.algebraic_last_error_reason = null;
+            };
+            if (status_value.last_observed_query_shape) |value| {
+                item.algebraic_last_observed_query_shape = try alloc.dupe(u8, value);
+            }
+            errdefer if (item.algebraic_last_observed_query_shape) |value| {
+                alloc.free(value);
+                item.algebraic_last_observed_query_shape = null;
+            };
+            if (status_value.last_recommended_materialization) |value| {
+                item.algebraic_last_recommended_materialization = try alloc.dupe(u8, value);
+            }
+        }
+
+        pub fn statsLocked(self: *DB, alloc: Allocator) !types.DBStats {
+            const configs = try self.core.listIndexes(alloc);
+            defer types.freeIndexConfigs(alloc, configs);
+            const target_sequence = self.core.nextDerivedSequence();
+            const async_indexing = Self.snapshotAsyncIndexingStats(self);
+            const identity_stats = Self.dbDocIdentityStats(try doc_identity.fastStatsFromStore(self.core.store), self.core.identity_namespace);
+            const primary_doc_count = Self.scanPrimaryDocCount(self, self.core.byteRange()) catch 0;
+
+            var index_stats = try alloc.alloc(types.DBIndexStats, configs.len);
+            var index_count: usize = 0;
+            errdefer {
+                for (index_stats[0..index_count]) |item| freeDBIndexStatsItem(alloc, item);
+                alloc.free(index_stats);
+            }
+
+            var visible_doc_count: u64 = 0;
+            var term_doc_freq_cache_hits: u64 = 0;
+            var term_doc_freq_cache_misses: u64 = 0;
+            for (configs) |cfg| {
+                const applied_sequence = try Self.managedIndexAppliedSequence(self, alloc, cfg.name);
+                var item = types.DBIndexStats{
+                    .name = try alloc.dupe(u8, cfg.name),
+                    .kind = cfg.kind,
+                    .replay_applied_sequence = applied_sequence,
+                    .replay_target_sequence = target_sequence,
+                    .replay_catch_up_required = applied_sequence < target_sequence,
+                    .catch_up_active = false,
+                    .catch_up_applied_sequence = applied_sequence,
+                    .catch_up_target_sequence = target_sequence,
+                };
+                errdefer freeDBIndexStatsItem(alloc, item);
+                if (target_sequence > 0) {
+                    item.backfill_progress = @min(
+                        1.0,
+                        @as(f64, @floatFromInt(applied_sequence)) / @as(f64, @floatFromInt(target_sequence)),
+                    );
+                    item.backfill_active = applied_sequence < target_sequence;
+                }
+                if (self.core.index_manager.loadFailure(cfg.name)) |load_error| {
+                    item.load_error = try alloc.dupe(u8, load_error);
+                    item.backfill_active = false;
+                    item.catch_up_active = false;
+                }
+
+                switch (cfg.kind) {
+                    .full_text => {
+                        if (self.core.textIndex(cfg.name)) |entry| {
+                            const text_snapshot = entry.snapshot();
+                            item.doc_count = text_snapshot.global_doc_count;
+                            item.term_count = textIndexTermCount(entry);
+                            visible_doc_count = @max(visible_doc_count, item.doc_count);
+                            term_doc_freq_cache_hits += text_snapshot.term_doc_freq_cache_hits;
+                            term_doc_freq_cache_misses += text_snapshot.term_doc_freq_cache_misses;
+                        }
+                        item.text_merge = self.core.index_manager.textMergeStatsSnapshotForIndex(cfg.name);
+                    },
+                    .dense_vector => {
+                        if (self.core.denseIndex(cfg.name)) |entry| {
+                            const hbc_stats = entry.index.stats();
+                            item.doc_count = hbc_stats.active_count;
+                            item.node_count = hbc_stats.node_count;
+                            item.root_node = hbc_stats.root_node;
+                            item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
+                            visible_doc_count = @max(visible_doc_count, item.doc_count);
+                        }
+                        if (async_indexing.dense_catch_up.active) {
+                            item.catch_up_active = true;
+                            item.backfill_active = true;
+                        }
+                        item.catch_up_phase = async_indexing.dense_catch_up.phase;
+                    },
+                    .sparse_vector => {
+                        if (self.core.sparseIndex(cfg.name)) |entry| {
+                            const sparse_snapshot = entry.index.stats();
+                            const sparse_doc_cap = if (identity_stats.live_ordinals > 0)
+                                identity_stats.live_ordinals
+                            else if (primary_doc_count > 0)
+                                primary_doc_count
+                            else
+                                visible_doc_count;
+                            item.doc_count = if (entry.chunk_name == null and sparse_doc_cap > 0)
+                                @min(sparse_snapshot.doc_count, sparse_doc_cap)
+                            else
+                                sparse_snapshot.doc_count;
+                            item.term_count = sparse_snapshot.term_count;
+                            visible_doc_count = @max(visible_doc_count, item.doc_count);
+                        }
+                    },
+                    .graph => {
+                        if (self.core.graphIndex(cfg.name)) |entry| {
+                            graph_stats: {
+                                const graph_snapshot = entry.index.stats(alloc) catch break :graph_stats;
+                                item.edge_count = graph_snapshot.edge_count;
+                                item.node_count = graph_snapshot.node_count;
+                                item.doc_count = graph_snapshot.node_count;
+                                visible_doc_count = @max(visible_doc_count, item.doc_count);
+                            }
+                            applyGraphAlgebraicRuntimeStats(&item, &entry.index);
+                            try populateGraphMetricStatusStats(alloc, &item, &entry.index);
+                        }
+                    },
+                    .algebraic => try DB.LifecycleCallbacks.populate_algebraic_index_stats(self, alloc, cfg.name, &item, false),
+                }
+                index_stats[index_count] = item;
+                index_count += 1;
+            }
+
+            return .{
+                .doc_count = visible_doc_count,
+                .index_count = @intCast(self.core.indexCount()),
+                .indexes = index_stats[0..index_count],
+                .doc_identity = identity_stats,
+                .doc_set_planning = Self.snapshotDocSetPlanningStats(self),
+                .foreign_keys = Self.snapshotForeignKeyStats(self),
+                .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else .{},
+                .resolution = Self.resolutionStageStats(self),
+                .promotion = Self.promotionStageStats(self),
+                .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
+                .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
+                .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStatsSnapshot(),
+                .graph_metric_runtime = Self.graphMetricRuntimeStats(self),
+                .term_doc_freq_cache_hits = term_doc_freq_cache_hits,
+                .term_doc_freq_cache_misses = term_doc_freq_cache_misses,
+                .async_indexing = async_indexing,
+            };
+        }
+
+        pub fn diagnosticStats(self: *DB, alloc: Allocator) !types.DBStats {
+            if (self.open_mode == .status_only) {
+                return try Self.statusOnlyStats(self, alloc);
+            }
+
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+
+            const byte_range = self.core.byteRange();
+            const configs = try self.core.listIndexes(alloc);
+            defer types.freeIndexConfigs(alloc, configs);
+            const replay_debt = try Self.listDerivedReplayDebt(self, alloc);
+            defer {
+                for (replay_debt) |*status| status.deinit(alloc);
+                alloc.free(replay_debt);
+            }
+            var indexed_doc_count: ?u64 = null;
+            for (configs) |cfg| {
+                if (cfg.kind != .full_text) continue;
+                if (self.core.textIndex(cfg.name)) |entry| {
+                    indexed_doc_count = @max(indexed_doc_count orelse 0, entry.snapshot().global_doc_count);
+                }
+            }
+            const visible_doc_count = indexed_doc_count orelse try Self.scanPrimaryDocCount(self, byte_range);
+            const async_indexing = self.async_context.stats.snapshot();
+            const identity_stats = try Self.diagnosticDocIdentityStats(self, byte_range);
+
+            var index_stats = try alloc.alloc(types.DBIndexStats, configs.len);
+            var index_count: usize = 0;
+            errdefer {
+                for (index_stats[0..index_count]) |item| freeDBIndexStatsItem(alloc, item);
+                alloc.free(index_stats);
+            }
+
+            for (configs) |cfg| {
+                var item = types.DBIndexStats{
+                    .name = try alloc.dupe(u8, cfg.name),
+                    .kind = cfg.kind,
+                };
+                errdefer freeDBIndexStatsItem(alloc, item);
+                for (replay_debt) |status| {
+                    if (!std.mem.eql(u8, status.index_name, cfg.name)) continue;
+                    item.replay_applied_sequence = status.applied_sequence;
+                    item.replay_target_sequence = status.target_sequence;
+                    item.replay_catch_up_required = status.catch_up_required;
+                    item.catch_up_applied_sequence = status.applied_sequence;
+                    item.catch_up_target_sequence = status.target_sequence;
+                    item.catch_up_active = false;
+                    break;
+                }
+                switch (cfg.kind) {
+                    .full_text => {
+                        if (self.core.textIndex(cfg.name)) |entry| {
+                            item.doc_count = entry.snapshot().global_doc_count;
+                            indexed_doc_count = @max(indexed_doc_count orelse 0, item.doc_count);
+                        }
+                        item.text_merge = self.core.index_manager.textMergeStatsForIndex(cfg.name);
+                        if (self.core.textIndexEntry(cfg.name)) |entry| {
+                            const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+                            if (try rebuild_state.estimateProgress(byte_range.start, byte_range.end, alloc)) |progress| {
+                                item.backfill_active = true;
+                                item.backfill_progress = progress;
+                            }
+                        }
+                    },
+                    .dense_vector => {
+                        if (self.core.denseIndex(cfg.name)) |entry| {
+                            const hbc_stats = entry.index.stats();
+                            item.doc_count = hbc_stats.active_count;
+                            item.node_count = hbc_stats.node_count;
+                            item.root_node = hbc_stats.root_node;
+                            item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
+                            item.hbc_posting = dbHbcPostingStats(try entry.index.postingBacklogStats(), entry.index.getWriteProfile());
+                            if (async_indexing.dense_catch_up.active) {
+                                item.catch_up_active = true;
+                                item.backfill_active = true;
+                            }
+                            const rebuild_root_path = try DB.LifecycleCallbacks.dense_index_rebuild_state_path_alloc(self, alloc, entry.config.name);
+                            defer alloc.free(rebuild_root_path);
+                            const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
+                            if (item.doc_count < visible_doc_count) {
+                                if (try rebuild_state.estimateProgress(byte_range.start, byte_range.end, alloc)) |progress| {
+                                    item.backfill_active = true;
+                                    item.backfill_progress = progress;
+                                }
+                            }
+                        }
+                        if (!item.backfill_active and item.replay_target_sequence > 0 and item.doc_count < visible_doc_count) {
+                            item.backfill_progress = @min(
+                                1.0,
+                                @as(f64, @floatFromInt(item.replay_applied_sequence)) / @as(f64, @floatFromInt(item.replay_target_sequence)),
+                            );
+                            item.backfill_active = item.replay_applied_sequence < item.replay_target_sequence;
+                        }
+                    },
+                    .sparse_vector => {
+                        if (self.core.sparseIndex(cfg.name)) |entry| {
+                            const sparse_stats = entry.index.stats();
+                            const raw_identity_stats = doc_identity.fastStatsFromStore(self.core.store) catch null;
+                            const sparse_doc_cap = if (identity_stats.live_ordinals > 0)
+                                identity_stats.live_ordinals
+                            else if (raw_identity_stats) |raw|
+                                raw.live_ordinals
+                            else
+                                visible_doc_count;
+                            item.doc_count = if (entry.chunk_name == null and sparse_doc_cap > 0)
+                                @min(sparse_stats.doc_count, sparse_doc_cap)
+                            else
+                                sparse_stats.doc_count;
+                            item.term_count = sparse_stats.term_count;
+                            const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+                            if (try rebuild_state.estimateProgress(byte_range.start, byte_range.end, alloc)) |progress| {
+                                item.backfill_active = true;
+                                item.backfill_progress = progress;
+                            }
+                        }
+                        if (!item.backfill_active and item.replay_target_sequence > 0) {
+                            item.backfill_progress = @min(
+                                1.0,
+                                @as(f64, @floatFromInt(item.replay_applied_sequence)) / @as(f64, @floatFromInt(item.replay_target_sequence)),
+                            );
+                            item.backfill_active = item.replay_applied_sequence < item.replay_target_sequence;
+                        }
+                    },
+                    .graph => {
+                        if (self.core.graphIndex(cfg.name)) |entry| {
+                            const graph_stats = try entry.index.stats(alloc);
+                            item.edge_count = graph_stats.edge_count;
+                            item.node_count = graph_stats.node_count;
+                            item.doc_count = graph_stats.node_count;
+                            applyGraphAlgebraicRuntimeStats(&item, &entry.index);
+                            try populateGraphMetricStatusStats(alloc, &item, &entry.index);
+                            const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+                            if (try rebuild_state.estimateProgress(byte_range.start, byte_range.end, alloc)) |progress| {
+                                item.backfill_active = true;
+                                item.backfill_progress = progress;
+                            }
+                        }
+                    },
+                    .algebraic => try DB.LifecycleCallbacks.populate_algebraic_index_stats(self, alloc, cfg.name, &item, true),
+                }
+                index_stats[index_count] = item;
+                index_count += 1;
+            }
+
+            // This is a v1 query-visible count, not a canonical primary-store
+            // cardinality. Do not add a second public stats count backed by a
+            // docstore scan for managed-index coverage; the long-term replacement
+            // is a durable table cardinality counter updated on writes/deletes.
+            // The full-text index count is the current efficient proxy when
+            // present; tables without full-text still fall back to the docstore.
+            return .{
+                .doc_count = visible_doc_count,
+                .index_count = @intCast(self.core.indexCount()),
+                .indexes = index_stats[0..index_count],
+                .doc_identity = identity_stats,
+                .doc_set_planning = Self.snapshotDocSetPlanningStats(self),
+                .foreign_keys = Self.snapshotForeignKeyStats(self),
+                .enrichment = if (self.enrichment_runtime) |runtime| runtime.stats() else try Self.persistedEnrichmentStats(self),
+                .resolution = Self.resolutionStageStats(self),
+                .promotion = Self.promotionStageStats(self),
+                .ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else .{},
+                .transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else .{},
+                .text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStats(),
+                .graph_metric_runtime = Self.graphMetricRuntimeStats(self),
+                .term_doc_freq_cache_hits = blk: {
+                    var total: u64 = 0;
+                    for (configs) |cfg| {
+                        if (cfg.kind != .full_text) continue;
+                        if (self.core.textIndex(cfg.name)) |entry| {
+                            const text_snapshot = entry.snapshot();
+                            total += text_snapshot.term_doc_freq_cache_hits;
+                        }
+                    }
+                    break :blk total;
+                },
+                .term_doc_freq_cache_misses = blk: {
+                    var total: u64 = 0;
+                    for (configs) |cfg| {
+                        if (cfg.kind != .full_text) continue;
+                        if (self.core.textIndex(cfg.name)) |entry| {
+                            const text_snapshot = entry.snapshot();
+                            total += text_snapshot.term_doc_freq_cache_misses;
+                        }
+                    }
+                    break :blk total;
+                },
+                .async_indexing = async_indexing,
+            };
+        }
+
+        pub fn statusOnlyStats(self: *DB, alloc: Allocator) !types.DBStats {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+
+            const configs = try self.core.listIndexes(alloc);
+            defer types.freeIndexConfigs(alloc, configs);
+            const target_sequence = self.core.nextDerivedSequence();
+            var visible_doc_count: u64 = 0;
+            const identity_stats = Self.dbDocIdentityStats(try doc_identity.fastStatsFromStore(self.core.store), self.core.identity_namespace);
+
+            var index_stats = try alloc.alloc(types.DBIndexStats, configs.len);
+            var index_count: usize = 0;
+            errdefer {
+                for (index_stats[0..index_count]) |item| freeDBIndexStatsItem(alloc, item);
+                alloc.free(index_stats);
+            }
+
+            for (configs) |cfg| {
+                const applied_sequence = try self.core.loadAppliedSequence(alloc, cfg.name);
+                var item = types.DBIndexStats{
+                    .name = try alloc.dupe(u8, cfg.name),
+                    .kind = cfg.kind,
+                    .replay_applied_sequence = applied_sequence,
+                    .replay_target_sequence = target_sequence,
+                    .replay_catch_up_required = applied_sequence < target_sequence,
+                    .catch_up_active = false,
+                    .catch_up_applied_sequence = applied_sequence,
+                    .catch_up_target_sequence = target_sequence,
+                };
+                errdefer freeDBIndexStatsItem(alloc, item);
+                if (target_sequence > 0) {
+                    item.backfill_progress = @min(
+                        1.0,
+                        @as(f64, @floatFromInt(applied_sequence)) / @as(f64, @floatFromInt(target_sequence)),
+                    );
+                    item.backfill_active = applied_sequence < target_sequence;
+                }
+                if (self.core.index_manager.loadFailure(cfg.name)) |load_error| {
+                    item.load_error = try alloc.dupe(u8, load_error);
+                    item.backfill_active = false;
+                    item.catch_up_active = false;
+                }
+                if (try loadIndexStatusSnapshot(alloc, self.core.store, cfg.name)) |status_snapshot| {
+                    applyIndexStatusSnapshot(&item, status_snapshot);
+                    visible_doc_count = @max(visible_doc_count, item.doc_count);
+                }
+                if (cfg.kind == .full_text) {
+                    item.text_merge = self.core.index_manager.textMergeStatsSnapshotForIndex(cfg.name);
+                } else if (cfg.kind == .graph) {
+                    if (self.core.graphIndex(cfg.name)) |entry| {
+                        try populateGraphMetricStatusStats(alloc, &item, &entry.index);
+                    }
+                }
+                index_stats[index_count] = item;
+                index_count += 1;
+            }
+
+            return .{
+                .doc_count = visible_doc_count,
+                .index_count = @intCast(self.core.indexCount()),
+                .indexes = index_stats[0..index_count],
+                .doc_identity = identity_stats,
+                .doc_set_planning = Self.snapshotDocSetPlanningStats(self),
+                .foreign_keys = Self.snapshotForeignKeyStats(self),
+                .resolution = Self.resolutionStageStats(self),
+                .promotion = Self.promotionStageStats(self),
+                .graph_metric_runtime = Self.graphMetricRuntimeStats(self),
+                .async_indexing = self.async_context.stats.snapshot(),
+            };
+        }
+
+        fn managedIndexAppliedSequence(self: *DB, alloc: Allocator, index_name: []const u8) !u64 {
+            var applied_sequence = try self.core.loadAppliedSequence(alloc, index_name);
+            if (self.executor.appliedSequence(index_name)) |live_applied| {
+                applied_sequence = @max(applied_sequence, live_applied);
+            }
+            return applied_sequence;
+        }
+
+        fn probeDerivedReplayTargetSequence(
+            self: *DB,
+            alloc: Allocator,
+            index_ref: index_manager_mod.ManagedIndexRef,
+            applied_sequence: u64,
+        ) !u64 {
+            return try self.core.replaySource().latestMatchingSequence(
+                alloc,
+                applied_sequence,
+                managedIndexReplayHint(index_ref.kind),
+            );
+        }
+
+        pub fn listDerivedReplayDebt(self: *DB, alloc: Allocator) ![]DerivedReplayDebtStatus {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+
+            const managed_indexes = try self.core.managedIndexes(alloc);
+            var transferred_names: usize = 0;
+            errdefer {
+                for (managed_indexes[transferred_names..]) |index_ref| alloc.free(@constCast(index_ref.name));
+                alloc.free(managed_indexes);
+            }
+
+            const out = try alloc.alloc(DerivedReplayDebtStatus, managed_indexes.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (out[0..initialized]) |*status| status.deinit(alloc);
+                alloc.free(out);
+            }
+
+            for (managed_indexes) |index_ref| {
+                const applied_sequence = try Self.managedIndexAppliedSequence(self, alloc, index_ref.name);
+                const target_sequence = try Self.probeDerivedReplayTargetSequence(
+                    self,
+                    alloc,
+                    index_ref,
+                    applied_sequence,
+                );
+                out[initialized] = .{
+                    .index_name = index_ref.name,
+                    .kind = index_ref.kind,
+                    .applied_sequence = applied_sequence,
+                    .target_sequence = target_sequence,
+                    .catch_up_required = applied_sequence < target_sequence,
+                };
+                initialized += 1;
+                transferred_names += 1;
+            }
+            alloc.free(managed_indexes);
+            return out;
+        }
+
+        pub fn graphMetricRuntimeStats(self: *DB) types.GraphMetricRuntimeStats {
+            const runtime = self.graph_metric_runtime orelse return .{};
+            const runtime_snapshot = runtime.stats();
+            const total = runtime_snapshot.total_result;
+            const last = runtime_snapshot.last_result;
+            return .{
+                .enabled = runtime_snapshot.enabled,
+                .role = Self.graphMetricRuntimeRoleToStats(runtime_snapshot.role),
+                .runtime_id_hash = runtime_snapshot.runtime_id_hash,
+                .owner_id_hash = runtime_snapshot.owner_id_hash,
+                .lease_key_hash = runtime_snapshot.lease_key_hash,
+                .worker_id_hash = runtime_snapshot.worker_id_hash,
+                .worker_count = @intCast(runtime_snapshot.worker_count),
+                .lease_owned = runtime_snapshot.lease_owned,
+                .has_lease = runtime_snapshot.has_lease,
+                .acquisition_count = runtime_snapshot.acquisition_count,
+                .takeover_count = runtime_snapshot.takeover_count,
+                .lease_acquire_failures = runtime_snapshot.lease_acquire_failures,
+                .lost_leases = runtime_snapshot.lost_leases,
+                .last_acquired_ms = runtime_snapshot.last_acquired_ms,
+                .started = runtime_snapshot.started,
+                .shutdown = runtime_snapshot.shutdown,
+                .notified = runtime_snapshot.notified,
+                .ticks_started = runtime_snapshot.ticks_started,
+                .ticks_completed = runtime_snapshot.ticks_completed,
+                .durable_progress_ticks = runtime_snapshot.durable_progress_ticks,
+                .idle_ticks = runtime_snapshot.idle_ticks,
+                .error_ticks = runtime_snapshot.error_ticks,
+                .last_error_name = runtime_snapshot.last_error_name,
+                .total_metrics_scanned = @intCast(total.metrics_scanned),
+                .total_active_builds = @intCast(total.active_builds),
+                .total_builds_started = @intCast(total.builds_started),
+                .total_worker_steps = @intCast(total.worker_steps),
+                .total_coordinator_steps = @intCast(total.coordinator_steps),
+                .total_pages_claimed = @intCast(total.pages_claimed),
+                .total_pages_completed = @intCast(total.pages_completed),
+                .total_phases_advanced = @intCast(total.phases_advanced),
+                .total_published = @intCast(total.published),
+                .total_failed_builds = @intCast(total.failed_builds),
+                .last_metrics_scanned = @intCast(last.metrics_scanned),
+                .last_active_builds = @intCast(last.active_builds),
+                .last_builds_started = @intCast(last.builds_started),
+                .last_worker_steps = @intCast(last.worker_steps),
+                .last_coordinator_steps = @intCast(last.coordinator_steps),
+                .last_pages_claimed = @intCast(last.pages_claimed),
+                .last_pages_completed = @intCast(last.pages_completed),
+                .last_phases_advanced = @intCast(last.phases_advanced),
+                .last_published = @intCast(last.published),
+                .last_failed_builds = @intCast(last.failed_builds),
+                .last_budget_exhausted = last.budget_exhausted,
+            };
+        }
+
+        fn graphMetricRuntimeRoleToStats(role: graph_metric_runtime_mod.Role) types.GraphMetricRuntimeRole {
+            return switch (role) {
+                .combined => .combined,
+                .coordinator => .coordinator,
+                .worker => .worker,
+                .worker_pool => .worker_pool,
+            };
+        }
+
+        fn overlayRuntimeStatusRuntimeOnly(self: *DB, runtime_stats: *types.DBStats) void {
+            runtime_stats.async_indexing = Self.snapshotAsyncIndexingStats(self);
+            runtime_stats.foreign_keys = Self.snapshotForeignKeyStats(self);
+            runtime_stats.enrichment = if (self.enrichment_runtime) |runtime|
+                runtime.stats()
+            else
+                Self.persistedEnrichmentStats(self) catch runtime_stats.enrichment;
+            runtime_stats.resolution = Self.resolutionStageStats(self);
+            runtime_stats.promotion = Self.promotionStageStats(self);
+            runtime_stats.ttl_cleanup = if (self.ttl_runtime) |runtime| runtime.stats() else runtime_stats.ttl_cleanup;
+            runtime_stats.transaction_recovery = if (self.transaction_runtime) |runtime| runtime.stats() else runtime_stats.transaction_recovery;
+            runtime_stats.graph_metric_runtime = Self.graphMetricRuntimeStats(self);
+
+            const target_sequence = self.core.nextDerivedSequence();
+            for (runtime_stats.indexes) |*item| {
+                const dense_catch_up = item.kind == .dense_vector and runtime_stats.async_indexing.dense_catch_up.active;
+                if (!dense_catch_up) if (self.executor.appliedSequence(item.name)) |live_applied| {
+                    item.replay_applied_sequence = @max(item.replay_applied_sequence, live_applied);
+                };
+                item.replay_target_sequence = @max(item.replay_target_sequence, target_sequence);
+                item.catch_up_active = dense_catch_up;
+                if (item.kind == .dense_vector) {
+                    const progress = runtime_stats.async_indexing.dense_catch_up;
+                    if (dense_catch_up) {
+                        if (progress.current_sequence != 0) {
+                            item.replay_applied_sequence = if (item.replay_applied_sequence == 0)
+                                progress.current_sequence
+                            else
+                                @min(item.replay_applied_sequence, progress.current_sequence);
+                            item.catch_up_applied_sequence = progress.current_sequence;
+                        } else {
+                            item.catch_up_applied_sequence = item.replay_applied_sequence;
+                        }
+                        item.catch_up_target_sequence = @max(item.replay_target_sequence, progress.current_target_sequence);
+                        item.replay_target_sequence = item.catch_up_target_sequence;
+                        item.replay_catch_up_required = true;
+                        item.backfill_active = true;
+                    } else {
+                        item.replay_catch_up_required = item.replay_applied_sequence < item.replay_target_sequence;
+                        item.catch_up_applied_sequence = item.replay_applied_sequence;
+                        item.catch_up_target_sequence = item.replay_target_sequence;
+                    }
+                    item.catch_up_phase = progress.phase;
+                } else {
+                    item.replay_catch_up_required = item.replay_applied_sequence < item.replay_target_sequence;
+                    item.catch_up_applied_sequence = item.replay_applied_sequence;
+                    item.catch_up_target_sequence = item.replay_target_sequence;
+                    item.catch_up_phase = .idle;
+                }
+                if (item.catch_up_active or item.replay_catch_up_required) {
+                    item.backfill_active = true;
+                    if (item.replay_target_sequence > 0) {
+                        item.backfill_progress = @min(
+                            1.0,
+                            @as(f64, @floatFromInt(item.replay_applied_sequence)) /
+                                @as(f64, @floatFromInt(item.replay_target_sequence)),
+                        );
+                    }
+                } else {
+                    item.backfill_active = false;
+                    if (item.replay_target_sequence > 0) item.backfill_progress = 1.0;
+                }
+            }
+        }
+
+        fn overlayRuntimeStatusIndexesAssumeApplyLockHeld(self: *DB, stats_alloc: std.mem.Allocator, runtime_stats: *types.DBStats) void {
+            if (!self.core.tryLockApplyShared()) return;
+            defer self.core.unlockApplyShared();
+            Self.overlayRuntimeStatusIndexesLocked(self, stats_alloc, runtime_stats);
+        }
+
+        fn overlayRuntimeStatusIndexesLocked(self: *DB, stats_alloc: std.mem.Allocator, runtime_stats: *types.DBStats) void {
+            var visible_doc_count = runtime_stats.doc_count;
+            for (runtime_stats.indexes) |*item| {
+                switch (item.kind) {
+                    .full_text => {
+                        if (self.core.textIndex(item.name)) |entry| {
+                            const text_snapshot = entry.snapshot();
+                            item.doc_count = text_snapshot.global_doc_count;
+                            visible_doc_count = @max(visible_doc_count, item.doc_count);
+                        }
+                        item.text_merge = self.core.index_manager.textMergeStatsSnapshotForIndex(item.name);
+                    },
+                    .dense_vector => {
+                        if (self.core.denseIndex(item.name)) |entry| {
+                            const hbc_stats = entry.index.stats();
+                            item.doc_count = hbc_stats.active_count;
+                            item.node_count = hbc_stats.node_count;
+                            item.root_node = hbc_stats.root_node;
+                            item.hbc_cache = dbHbcCacheStats(entry.index.hbcCacheStats());
+                        }
+                        visible_doc_count = @max(visible_doc_count, item.doc_count);
+                    },
+                    .sparse_vector => {
+                        if (self.core.sparseIndex(item.name)) |entry| {
+                            const sparse_stats = entry.index.stats();
+                            item.doc_count = if (entry.chunk_name == null and runtime_stats.doc_count > 0)
+                                @min(sparse_stats.doc_count, runtime_stats.doc_count)
+                            else
+                                sparse_stats.doc_count;
+                            item.term_count = sparse_stats.term_count;
+                        }
+                        visible_doc_count = @max(visible_doc_count, item.doc_count);
+                    },
+                    .graph => {
+                        if (self.core.graphIndex(item.name)) |entry| {
+                            if (entry.index.stats(self.alloc)) |graph_stats| {
+                                item.edge_count = graph_stats.edge_count;
+                                item.node_count = graph_stats.node_count;
+                                item.doc_count = graph_stats.node_count;
+                            } else |_| {}
+                            applyGraphAlgebraicRuntimeStats(item, &entry.index);
+                        }
+                        visible_doc_count = @max(visible_doc_count, item.doc_count);
+                    },
+                    .algebraic => {
+                        if (self.core.index_manager.algebraicIndex(item.name)) |entry| {
+                            const status_value = entry.index.status();
+                            item.algebraic_parse_error_count = status_value.parse_error_count;
+                            item.algebraic_minmax_cache_hits = status_value.minmax_cache_hits;
+                            item.algebraic_minmax_cache_misses = status_value.minmax_cache_misses;
+                            item.algebraic_minmax_support_scans = status_value.minmax_support_scans;
+                            item.algebraic_planner_selected = status_value.planner_algebraic_selected;
+                            item.algebraic_planner_fallback_count = status_value.planner_fallback_count;
+                            replaceOptionalOwnedStringBestEffort(
+                                stats_alloc,
+                                &item.algebraic_planner_last_decision,
+                                status_value.planner_last_decision,
+                            );
+                            replaceOptionalOwnedStringBestEffort(
+                                stats_alloc,
+                                &item.algebraic_planner_last_fallback_reason,
+                                status_value.planner_last_fallback_reason,
+                            );
+                            item.algebraic_planner_last_estimated_scan_rows = if (status_value.planner_last_estimated_scan_rows) |value| @intCast(value) else null;
+                            item.algebraic_planner_last_estimated_result_buckets = if (status_value.planner_last_estimated_result_buckets) |value| @intCast(value) else null;
+                            item.algebraic_planner_lifecycle_ready = status_value.planner_lifecycle_ready;
+                            replaceOptionalOwnedStringBestEffort(
+                                stats_alloc,
+                                &item.algebraic_planner_lifecycle_blocking_reason,
+                                status_value.planner_lifecycle_blocking_reason,
+                            );
+                            item.algebraic_dictionary_registry_claimed_count = status_value.dictionary_registry_claimed_count;
+                            item.algebraic_dictionary_registry_already_owned_count = status_value.dictionary_registry_already_owned_count;
+                            item.algebraic_dictionary_registry_owned_by_other_count = status_value.dictionary_registry_owned_by_other_count;
+                            item.algebraic_dictionary_registry_ready_hit_count = status_value.dictionary_registry_ready_hit_count;
+                            item.algebraic_dictionary_registry_ready_miss_count = status_value.dictionary_registry_ready_miss_count;
+                            item.algebraic_distributed_partial_validation_proven_count = status_value.distributed_partial_validation_proven_count;
+                            item.algebraic_distributed_partial_validation_rejected_count = status_value.distributed_partial_validation_rejected_count;
+                            item.algebraic_distributed_partial_rows_exported_count = status_value.distributed_partial_rows_exported_count;
+                            item.algebraic_vector_filter_attempt_count = status_value.vector_filter_attempt_count;
+                            item.algebraic_vector_filter_resolved_count = status_value.vector_filter_resolved_count;
+                            item.algebraic_vector_filter_unsupported_count = status_value.vector_filter_unsupported_count;
+                            item.algebraic_vector_filter_fail_closed_count = status_value.vector_filter_fail_closed_count;
+                            item.algebraic_vector_filter_include_doc_id_count = status_value.vector_filter_include_doc_id_count;
+                            item.algebraic_vector_filter_exclude_doc_id_count = status_value.vector_filter_exclude_doc_id_count;
+                            item.algebraic_observed_query_shape_count = status_value.observed_query_shape_count;
+                            item.algebraic_recommendation_count = status_value.recommendation_count;
+                        }
+                    },
+                }
+            }
+            runtime_stats.doc_count = visible_doc_count;
+            runtime_stats.text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStatsSnapshot();
+        }
+
+        pub fn snapshotLsmMaintenanceStats(self: *DB) lsm_backend_mod.Backend.MaintenanceStats {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+            return Self.snapshotLsmMaintenanceStatsLocked(self);
+        }
+
+        pub fn trySnapshotLsmMaintenanceStats(self: *DB) ?lsm_backend_mod.Backend.MaintenanceStats {
+            if (!self.core.tryLockApplyShared()) return null;
+            defer self.core.unlockApplyShared();
+            return Self.snapshotLsmMaintenanceStatsLocked(self);
+        }
+
+        pub fn snapshotLsmMaintenanceStatsLocked(self: *DB) lsm_backend_mod.Backend.MaintenanceStats {
+            var maintenance_stats = lsm_backend_mod.Backend.MaintenanceStats{};
+            if (self.core.primary_store_owner.snapshotLsmMaintenanceStats()) |primary_stats| {
+                lsm_backend_mod.Backend.accumulateMaintenanceStats(&maintenance_stats, primary_stats);
+            }
+            lsm_backend_mod.Backend.accumulateMaintenanceStats(&maintenance_stats, self.core.index_manager.snapshotLsmMaintenanceStats());
+            return maintenance_stats;
+        }
+
+        pub fn snapshotLsmWriteStats(self: *DB) lsm_backend_mod.Backend.WriteStats {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+            return Self.snapshotLsmWriteStatsLocked(self);
+        }
+
+        pub fn trySnapshotLsmWriteStats(self: *DB) ?lsm_backend_mod.Backend.WriteStats {
+            if (!self.core.tryLockApplyShared()) return null;
+            defer self.core.unlockApplyShared();
+            return Self.snapshotLsmWriteStatsLocked(self);
+        }
+
+        pub fn snapshotLsmWriteStatsLocked(self: *DB) lsm_backend_mod.Backend.WriteStats {
+            var write_stats = lsm_backend_mod.Backend.WriteStats{};
+            if (self.core.primary_store_owner.snapshotLsmWriteStats()) |primary_stats| {
+                lsm_backend_mod.Backend.accumulateWriteStats(&write_stats, primary_stats);
+            }
+            lsm_backend_mod.Backend.accumulateWriteStats(&write_stats, self.core.index_manager.snapshotLsmWriteStats());
+            return write_stats;
+        }
+
+        pub fn snapshotTextMemoryAttributionStats(self: *DB) index_manager_mod.TextMemoryAttributionStats {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+            return self.core.index_manager.snapshotTextMemoryAttribution();
+        }
+
+        pub fn trySnapshotTextMemoryAttributionStats(self: *DB) ?index_manager_mod.TextMemoryAttributionStats {
+            if (!self.core.tryLockApplyShared()) return null;
+            defer self.core.unlockApplyShared();
+            return self.core.index_manager.snapshotTextMemoryAttribution();
+        }
+
+        pub fn snapshotTextMergeStats(self: *DB) types.TextMergeStats {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+            return self.core.index_manager.textMergeStatsSnapshot();
+        }
+
+        pub fn trySnapshotTextMergeStats(self: *DB) ?types.TextMergeStats {
+            if (!self.core.tryLockApplyShared()) return null;
+            defer self.core.unlockApplyShared();
+            return self.core.index_manager.textMergeStatsSnapshot();
+        }
+
+        pub fn snapshotPrimaryLsmWriteStatsForTest(self: *DB) ?lsm_backend_mod.Backend.WriteStats {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+            return self.core.primary_store_owner.snapshotLsmWriteStats();
+        }
+
+        pub fn snapshotLsmNativeStorageStats(self: *DB) lsm_backend_mod.NativeStorageStats {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+            return Self.snapshotLsmNativeStorageStatsLocked(self);
+        }
+
+        pub fn trySnapshotLsmNativeStorageStats(self: *DB) ?lsm_backend_mod.NativeStorageStats {
+            if (!self.core.tryLockApplyShared()) return null;
+            defer self.core.unlockApplyShared();
+            return Self.snapshotLsmNativeStorageStatsLocked(self);
+        }
+
+        pub fn snapshotLsmNativeStorageStatsLocked(self: *DB) lsm_backend_mod.NativeStorageStats {
+            var native_storage_stats = lsm_backend_mod.NativeStorageStats{};
+            if (self.core.primary_store_owner.snapshotLsmNativeStorageStats()) |primary_stats| {
+                native_storage_stats.fd_cache_entries +|= primary_stats.fd_cache_entries;
+                native_storage_stats.fd_cache_capacity +|= primary_stats.fd_cache_capacity;
+            }
+            const index_stats = self.core.index_manager.snapshotLsmNativeStorageStats();
+            native_storage_stats.fd_cache_entries +|= index_stats.fd_cache_entries;
+            native_storage_stats.fd_cache_capacity +|= index_stats.fd_cache_capacity;
+            return native_storage_stats;
+        }
+
+        pub fn runLsmMaintenanceStep(self: *DB) !bool {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+
+            const primary_score = self.core.primary_store_owner.lsmMaintenanceScore();
+            const index_score = self.core.index_manager.lsmMaintenanceScore();
+            if (primary_score == 0 and index_score == 0) {
+                self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
+                self.core.index_manager.refreshLsmMaintenanceDebtHint();
+                return false;
+            }
+            if (primary_score >= index_score) {
+                return try self.core.primary_store_owner.runLsmMaintenanceStep();
+            }
+            return try self.core.index_manager.runLsmMaintenanceStep();
+        }
+
+        pub fn runPrimaryLsmMaintenanceStep(self: *DB) !bool {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            return try self.core.primary_store_owner.runLsmMaintenanceStep();
+        }
+
+        pub fn runLsmMaintenanceStepBestEffort(self: *DB) !bool {
+            if (!self.core.tryLockApplyExclusive()) return false;
+            defer self.core.unlockApply();
+
+            const primary_score = self.core.primary_store_owner.lsmMaintenanceDebtHint();
+            if (primary_score > 0) {
+                if (try self.core.primary_store_owner.runLsmMaintenanceStepBestEffort()) return true;
+            }
+            if (try self.core.index_manager.runLsmMaintenanceStepBestEffort()) return true;
+            if (primary_score > 0) {
+                self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
+            }
+            return false;
+        }
+
+        pub fn runLsmMaintenanceUntilIdle(self: *DB) !usize {
+            var steps: usize = 0;
+            while (try Self.runLsmMaintenanceStep(self)) {
+                steps += 1;
+            }
+            return steps;
+        }
+
+        pub fn retryQuarantinedIndexLoads(self: *DB, force: bool) !index_manager_mod.IndexManager.QuarantineRetryResult {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            return try self.core.index_manager.retryFailedIndexLoads(self.core.store, platform_time.monotonicNs(), force);
+        }
+
+        pub fn runDueLsmObsoleteReclaimUntilIdle(self: *DB, max_steps: usize) !usize {
+            var steps: usize = 0;
+            while (steps < max_steps) : (steps += 1) {
+                var progressed = false;
+                if (try self.core.primary_store_owner.runDueLsmObsoleteReclaim()) progressed = true;
+                if (try self.core.index_manager.runLsmObsoleteReclaimDue()) progressed = true;
+
+                if (!progressed) {
+                    const wake_due = if (Self.nextLsmMaintenanceWakeDelayNsBestEffort(self)) |delay_ns| delay_ns == 0 else false;
+                    if (!wake_due) break;
+                    if (!try Self.runLsmMaintenanceStep(self)) break;
+                }
+            }
+            return steps;
+        }
+
+        fn engineBatch(ptr: *anyopaque, req: types.BatchRequest) !void {
+            const self: *DB = @ptrCast(@alignCast(ptr));
+            return try self.batch(req);
+        }
+
+        fn engineLookup(ptr: *anyopaque, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
+            const self: *DB = @ptrCast(@alignCast(ptr));
+            return try self.lookup(alloc, key, opts);
+        }
+
+        fn engineScan(ptr: *anyopaque, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) !types.ScanResult {
+            const self: *DB = @ptrCast(@alignCast(ptr));
+            return try self.scan(alloc, from_key, to_key, opts);
+        }
+
+        fn engineSearch(ptr: *anyopaque, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
+            const self: *DB = @ptrCast(@alignCast(ptr));
+            return try self.search(alloc, req);
+        }
+
+        fn engineStats(ptr: *anyopaque, alloc: Allocator) !types.DBStats {
+            const self: *DB = @ptrCast(@alignCast(ptr));
+            return try self.stats(alloc);
+        }
+
+        fn engineListIndexes(ptr: *anyopaque, alloc: Allocator) ![]types.IndexConfig {
+            const self: *DB = @ptrCast(@alignCast(ptr));
+            return try self.listIndexes(alloc);
+        }
+
+        fn engineListEnrichments(ptr: *anyopaque, alloc: Allocator) ![]types.EnrichmentConfig {
+            const self: *DB = @ptrCast(@alignCast(ptr));
+            return try self.listEnrichments(alloc);
+        }
+
+        fn maintenanceDriverPendingWorkStats(ptr: *anyopaque) db_core.PendingWorkStats {
+            const self: *DB = @ptrCast(@alignCast(ptr));
+            return self.pendingWorkStats();
+        }
+
+        fn maintenanceDriverRunDerivedUntil(ptr: *anyopaque, sequence: u64) !void {
+            const self: *DB = @ptrCast(@alignCast(ptr));
+            return try self.runDerivedUntil(sequence);
+        }
+
+        fn maintenanceDriverRunEnrichmentUntil(ptr: *anyopaque, sequence: u64) !void {
+            const self: *DB = @ptrCast(@alignCast(ptr));
+            return try self.runEnrichmentUntil(sequence);
+        }
+
+        fn maintenanceDriverRunMaintenanceUntil(ptr: *anyopaque, sequence: u64) !void {
+            const self: *DB = @ptrCast(@alignCast(ptr));
+            return try self.runMaintenanceUntil(sequence, .{});
+        }
+
+        fn maintenanceDriverRunUntilIdle(ptr: *anyopaque) !void {
+            const self: *DB = @ptrCast(@alignCast(ptr));
+            return try self.runUntilIdle();
+        }
+    };
+}
+
+fn ensureReplayFloor(store: anytype, next_sequence: u64) !void {
+    try store.ensureReplayNextSequenceAtLeast(next_sequence);
+}
+
+fn dbHbcCacheKindStats(cache_stats: anytype) types.HbcCacheKindStats {
+    return .{
+        .used_bytes = cache_stats.used_bytes,
+        .peak_bytes = cache_stats.peak_bytes,
+        .insertions = cache_stats.insertions,
+        .admission_skips = cache_stats.admission_skips,
+        .evictions = cache_stats.evictions,
+    };
+}
+
+fn dbHbcCacheStats(cache_stats: anytype) types.HbcCacheStats {
+    return .{
+        .total_bytes = cache_stats.total_bytes,
+        .accounted_bytes = cache_stats.accounted_bytes,
+        .node = dbHbcCacheKindStats(cache_stats.node),
+        .quantized = dbHbcCacheKindStats(cache_stats.quantized),
+        .vector = dbHbcCacheKindStats(cache_stats.vector),
+        .metadata = dbHbcCacheKindStats(cache_stats.metadata),
+    };
+}
+
+fn dbHbcPostingStats(backlog: hbc_mod.PostingBacklogStats, profile: hbc_mod.WriteProfile) types.HbcPostingStats {
+    return .{
+        .scanned_nodes = backlog.scanned_nodes,
+        .scanned_postings = backlog.scanned_postings,
+        .dirty_postings = backlog.dirty_postings,
+        .centroid_dirty_postings = backlog.centroid_dirty_postings,
+        .payload_dirty_postings = backlog.payload_dirty_postings,
+        .max_centroid_version_lag = backlog.max_centroid_version_lag,
+        .max_payload_version_lag = backlog.max_payload_version_lag,
+        .max_mutation_version = backlog.max_mutation_version,
+        .skipped_missing = backlog.skipped_missing,
+        .maintenance_scanned_nodes = profile.posting_maintenance_scanned_nodes,
+        .maintenance_scanned_postings = profile.posting_maintenance_scanned_postings,
+        .maintenance_dirty_postings = profile.posting_maintenance_dirty_postings,
+        .maintenance_repaired_postings = profile.posting_maintenance_repaired_postings,
+        .maintenance_centroid_refreshed = profile.posting_maintenance_centroid_refreshed,
+        .maintenance_payload_refreshed = profile.posting_maintenance_payload_refreshed,
+        .maintenance_ancestor_refresh_roots = profile.posting_maintenance_ancestor_refresh_roots,
+        .maintenance_split_postings = profile.posting_maintenance_split_postings,
+        .maintenance_merged_postings = profile.posting_maintenance_merged_postings,
+        .maintenance_boundary_reassigned_vectors = profile.posting_maintenance_boundary_reassigned_vectors,
+        .lazy_centroid_deferrals = profile.posting_lazy_centroid_deferrals,
+        .lazy_payload_deferrals = profile.posting_lazy_payload_deferrals,
+        .lazy_ancestor_deferrals = profile.posting_lazy_ancestor_deferrals,
+    };
+}
+
+pub fn cloneAlgebraicCandidateStatusAlloc(
+    alloc: Allocator,
+    recommendation: []const u8,
+    materialization_id: []const u8,
+    lifecycle: []const u8,
+    decision: []const u8,
+    observation_count: u64,
+    estimated_scan_rows_saved: u64,
+    estimated_write_cost: u64,
+    estimated_tensor_rows: u64,
+    estimated_storage_bytes: u64,
+    estimated_write_amplification: u64,
+    score: i128,
+    idle_miss_count: u64,
+    generation: u64,
+) !types.AlgebraicCandidateStatus {
+    const owned_recommendation = try alloc.dupe(u8, recommendation);
+    errdefer alloc.free(owned_recommendation);
+    const owned_materialization_id = try alloc.dupe(u8, materialization_id);
+    errdefer alloc.free(owned_materialization_id);
+    const owned_lifecycle = try alloc.dupe(u8, lifecycle);
+    errdefer alloc.free(owned_lifecycle);
+    const owned_decision = try alloc.dupe(u8, decision);
+    errdefer alloc.free(owned_decision);
+    return .{
+        .recommendation = owned_recommendation,
+        .materialization_id = owned_materialization_id,
+        .lifecycle = owned_lifecycle,
+        .decision = owned_decision,
+        .observation_count = observation_count,
+        .estimated_scan_rows_saved = estimated_scan_rows_saved,
+        .estimated_write_cost = estimated_write_cost,
+        .estimated_tensor_rows = estimated_tensor_rows,
+        .estimated_storage_bytes = estimated_storage_bytes,
+        .estimated_write_amplification = estimated_write_amplification,
+        .score = score,
+        .idle_miss_count = idle_miss_count,
+        .generation = generation,
+    };
+}
+
+pub fn cloneAlgebraicCandidateDecisionStatusAlloc(
+    alloc: Allocator,
+    recommendation: []const u8,
+    materialization_id: []const u8,
+    lifecycle: []const u8,
+    previous_decision: []const u8,
+    decision: []const u8,
+    observation_count: u64,
+    estimated_scan_rows_saved: u64,
+    estimated_write_cost: u64,
+    score: i128,
+    score_delta: i128,
+    idle_miss_count: u64,
+    generation: u64,
+) !types.AlgebraicCandidateDecisionStatus {
+    const owned_recommendation = try alloc.dupe(u8, recommendation);
+    errdefer alloc.free(owned_recommendation);
+    const owned_materialization_id = try alloc.dupe(u8, materialization_id);
+    errdefer alloc.free(owned_materialization_id);
+    const owned_lifecycle = try alloc.dupe(u8, lifecycle);
+    errdefer alloc.free(owned_lifecycle);
+    const owned_previous_decision = try alloc.dupe(u8, previous_decision);
+    errdefer alloc.free(owned_previous_decision);
+    const owned_decision = try alloc.dupe(u8, decision);
+    errdefer alloc.free(owned_decision);
+    return .{
+        .recommendation = owned_recommendation,
+        .materialization_id = owned_materialization_id,
+        .lifecycle = owned_lifecycle,
+        .previous_decision = owned_previous_decision,
+        .decision = owned_decision,
+        .observation_count = observation_count,
+        .estimated_scan_rows_saved = estimated_scan_rows_saved,
+        .estimated_write_cost = estimated_write_cost,
+        .score = score,
+        .score_delta = score_delta,
+        .idle_miss_count = idle_miss_count,
+        .generation = generation,
+    };
+}
+
+pub fn cloneAlgebraicProgressStatusAlloc(
+    alloc: Allocator,
+    recommendation: []const u8,
+    materialization_id: []const u8,
+    lifecycle: []const u8,
+    target_sequence: u64,
+    applied_sequence: u64,
+    rows_processed: u64,
+    target_rows: u64,
+) !types.AlgebraicProgressStatus {
+    const owned_recommendation = try alloc.dupe(u8, recommendation);
+    errdefer alloc.free(owned_recommendation);
+    const owned_materialization_id = try alloc.dupe(u8, materialization_id);
+    errdefer alloc.free(owned_materialization_id);
+    const owned_lifecycle = try alloc.dupe(u8, lifecycle);
+    errdefer alloc.free(owned_lifecycle);
+    return .{
+        .recommendation = owned_recommendation,
+        .materialization_id = owned_materialization_id,
+        .lifecycle = owned_lifecycle,
+        .target_sequence = target_sequence,
+        .applied_sequence = applied_sequence,
+        .rows_processed = rows_processed,
+        .target_rows = target_rows,
+    };
+}
+
+pub fn cloneGraphMetricBuildPageStatusesFromGraph(
+    alloc: Allocator,
+    source: []const graph_mod.GraphIndex.GraphMetricBuildPageStatus,
+) ![]types.GraphMetricBuildPageStatus {
+    if (source.len == 0) return @constCast((&[_]types.GraphMetricBuildPageStatus{})[0..]);
+    const out = try alloc.alloc(types.GraphMetricBuildPageStatus, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*page| page.deinit(alloc);
+        alloc.free(out);
+    }
+    for (source, 0..) |page, i| {
+        const worker_id = if (page.worker_id.len > 0) try alloc.dupe(u8, page.worker_id) else "";
+        var worker_id_moved = false;
+        errdefer if (!worker_id_moved and worker_id.len > 0) alloc.free(worker_id);
+        const cursor = if (page.cursor.len > 0) try alloc.dupe(u8, page.cursor) else "";
+        var cursor_moved = false;
+        errdefer if (!cursor_moved and cursor.len > 0) alloc.free(cursor);
+        const last_error = if (page.last_error.len > 0) try alloc.dupe(u8, page.last_error) else "";
+        var last_error_moved = false;
+        errdefer if (!last_error_moved and last_error.len > 0) alloc.free(last_error);
+        out[i] = .{
+            .phase = page.phase,
+            .iteration = page.iteration,
+            .page_id = page.page_id,
+            .state = page.state,
+            .range_kind = page.range_kind,
+            .worker_id = worker_id,
+            .lease_expires_at_ms = page.lease_expires_at_ms,
+            .attempt = page.attempt,
+            .cursor = cursor,
+            .completed_units = page.completed_units,
+            .total_units = page.total_units,
+            .last_error = last_error,
+        };
+        worker_id_moved = true;
+        cursor_moved = true;
+        last_error_moved = true;
+        initialized += 1;
+    }
+    return out;
+}
+
+fn applyGraphAlgebraicRuntimeStats(item: *types.DBIndexStats, graph_index: *const graph_mod.GraphIndex) void {
+    const algebraic_graph = graph_index.algebraicTraversalRuntimeStats();
+    item.algebraic_graph_traversal_attempt_count = algebraic_graph.attempt_count;
+    item.algebraic_graph_traversal_proven_count = algebraic_graph.proven_count;
+    item.algebraic_graph_traversal_rejected_count = algebraic_graph.rejected_count;
+    item.algebraic_graph_traversal_fallback_count = algebraic_graph.fallback_count;
+    item.algebraic_graph_traversal_result_node_count = algebraic_graph.result_node_count;
+}
+
+fn populateGraphMetricStatusStats(alloc: Allocator, item: *types.DBIndexStats, graph_index: *graph_mod.GraphIndex) !void {
+    if (graph_index.metric_configs.len == 0) return;
+    const statuses = try alloc.alloc(types.GraphMetricStatus, graph_index.metric_configs.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (statuses[0..initialized]) |*status| status.deinit(alloc);
+        alloc.free(statuses);
+    }
+    for (graph_index.metric_configs, 0..) |cfg, i| {
+        var status = try graph_index.graphMetricStatus(cfg.name);
+        defer status.deinit(graph_index.alloc);
+        const name = try alloc.dupe(u8, status.name);
+        var name_moved = false;
+        errdefer if (!name_moved) alloc.free(name);
+        var edge_filter = try status.edge_filter.cloneAlloc(alloc);
+        var edge_filter_moved = false;
+        errdefer if (!edge_filter_moved) edge_filter.deinit(alloc);
+        const recent_events = if (status.recent_events.len > 0)
+            try alloc.dupe(graph_mod.GraphIndex.GraphMetricEvent, status.recent_events)
+        else
+            @constCast((&[_]graph_mod.GraphIndex.GraphMetricEvent{})[0..]);
+        var recent_events_moved = false;
+        errdefer if (!recent_events_moved and recent_events.len > 0) alloc.free(recent_events);
+        const last_error = if (status.last_error.len > 0) try alloc.dupe(u8, status.last_error) else "";
+        var last_error_moved = false;
+        errdefer if (!last_error_moved and last_error.len > 0) alloc.free(last_error);
+        const build_worker_id = if (status.build_worker_id.len > 0) try alloc.dupe(u8, status.build_worker_id) else "";
+        var build_worker_id_moved = false;
+        errdefer if (!build_worker_id_moved and build_worker_id.len > 0) alloc.free(build_worker_id);
+        const build_cursor = if (status.build_cursor.len > 0) try alloc.dupe(u8, status.build_cursor) else "";
+        var build_cursor_moved = false;
+        errdefer if (!build_cursor_moved and build_cursor.len > 0) alloc.free(build_cursor);
+        const build_pages = try cloneGraphMetricBuildPageStatusesFromGraph(alloc, status.build_pages);
+        var build_pages_moved = false;
+        errdefer if (!build_pages_moved) {
+            for (build_pages) |*page| page.deinit(alloc);
+            if (build_pages.len > 0) alloc.free(build_pages);
+        };
+        statuses[i] = .{
+            .name = name,
+            .state = status.state,
+            .phase = status.phase,
+            .edge_filter = edge_filter,
+            .metadata_version = status.metadata_version,
+            .maintenance_paused = status.maintenance_paused,
+            .build_queued = status.build_queued,
+            .published_generation = status.published_generation,
+            .edge_generation = status.edge_generation,
+            .target_edge_generation = status.target_edge_generation,
+            .queued_generation = status.queued_generation,
+            .building_generation = status.building_generation,
+            .build_job_id = status.build_job_id,
+            .build_started_at_ms = status.build_started_at_ms,
+            .build_iteration = status.build_iteration,
+            .build_lease_expires_at_ms = status.build_lease_expires_at_ms,
+            .build_worker_id = build_worker_id,
+            .build_cursor = build_cursor,
+            .build_completed_units = status.build_completed_units,
+            .build_total_units = status.build_total_units,
+            .build_pages = build_pages,
+            .build_pages_truncated = status.build_pages_truncated,
+            .retry_count = status.retry_count,
+            .last_error = last_error,
+            .progress = status.progress,
+            .converged = status.converged,
+            .iterations_completed = status.iterations_completed,
+            .delta = status.delta,
+            .computed_at_ms = status.computed_at_ms,
+            .last_event = status.last_event,
+            .recent_events = recent_events,
+        };
+        name_moved = true;
+        edge_filter_moved = true;
+        recent_events_moved = true;
+        last_error_moved = true;
+        build_worker_id_moved = true;
+        build_cursor_moved = true;
+        build_pages_moved = true;
+        initialized += 1;
+    }
+    item.graph_metric_status = statuses;
+}
+
+fn replaceOptionalOwnedStringBestEffort(alloc: std.mem.Allocator, slot: *?[]const u8, value: ?[]const u8) void {
+    if (value) |raw| {
+        const owned = alloc.dupe(u8, raw) catch return;
+        if (slot.*) |previous| alloc.free(previous);
+        slot.* = owned;
+    } else {
+        if (slot.*) |previous| alloc.free(previous);
+        slot.* = null;
+    }
+}

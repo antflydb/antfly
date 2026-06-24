@@ -1254,6 +1254,15 @@ pub const TableReadSource = struct {
             opts: db_mod.types.ScanOptions,
             consistency: raft_mod.ReadConsistency,
         ) anyerror!?ScanResponse,
+        scan_catalog: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: db_mod.types.ScanOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?ScanResponse = null,
         query: *const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1271,6 +1280,21 @@ pub const TableReadSource = struct {
         document_algebraic_aggregate: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: document_sql_runtime.AlgebraicAggregateRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?document_sql_runtime.AlgebraicAggregateResponse = null,
+        document_algebraic_aggregate_catalog: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            req: document_sql_runtime.AlgebraicAggregateRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?document_sql_runtime.AlgebraicAggregateResponse = null,
+        document_algebraic_aggregate_group_local: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
             table_name: []const u8,
             req: document_sql_runtime.AlgebraicAggregateRequest,
             consistency: raft_mod.ReadConsistency,
@@ -1640,6 +1664,19 @@ pub const TableReadSource = struct {
         return try self.vtable.scan(self.ptr, alloc, table_name, from_key, to_key, opts, consistency);
     }
 
+    pub fn scanCatalog(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        from_key: []const u8,
+        to_key: []const u8,
+        opts: db_mod.types.ScanOptions,
+        consistency: raft_mod.ReadConsistency,
+    ) !?ScanResponse {
+        const fn_ptr = self.vtable.scan_catalog orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, target, from_key, to_key, opts, consistency);
+    }
+
     pub fn documentArtifactManifest(
         self: TableReadSource,
         alloc: std.mem.Allocator,
@@ -1706,6 +1743,29 @@ pub const TableReadSource = struct {
     ) !?document_sql_runtime.AlgebraicAggregateResponse {
         const fn_ptr = self.vtable.document_algebraic_aggregate orelse return error.DocumentSqlIndexUnavailable;
         return try fn_ptr(self.ptr, alloc, table_name, req, consistency);
+    }
+
+    pub fn documentAlgebraicAggregateCatalog(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        req: document_sql_runtime.AlgebraicAggregateRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?document_sql_runtime.AlgebraicAggregateResponse {
+        const fn_ptr = self.vtable.document_algebraic_aggregate_catalog orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, target, req, consistency);
+    }
+
+    pub fn documentAlgebraicAggregateGroupLocal(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: document_sql_runtime.AlgebraicAggregateRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?document_sql_runtime.AlgebraicAggregateResponse {
+        const fn_ptr = self.vtable.document_algebraic_aggregate_group_local orelse return error.DocumentSqlIndexUnavailable;
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, req, consistency);
     }
 
     pub fn preflightQuery(
@@ -2423,6 +2483,7 @@ pub const BoundTableReadSource = struct {
                 .scan = scan,
                 .query = query,
                 .document_algebraic_aggregate = BoundTableReadSource.documentAlgebraicAggregate,
+                .document_algebraic_aggregate_group_local = BoundTableReadSource.documentAlgebraicAggregateGroupLocal,
                 .preflight_query = preflightQuery,
                 .preflight_query_group_local = preflightQueryGroupLocal,
                 .lookup_group_local = lookupGroupLocal,
@@ -2817,6 +2878,17 @@ pub const BoundTableReadSource = struct {
         return try documentAlgebraicAggregateFromDbAlloc(alloc, self.db, req);
     }
 
+    fn documentAlgebraicAggregateGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        _: u64,
+        table_name: []const u8,
+        req: document_sql_runtime.AlgebraicAggregateRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?document_sql_runtime.AlgebraicAggregateResponse {
+        return try documentAlgebraicAggregate(ptr, alloc, table_name, req, consistency);
+    }
+
     fn rowsWindowPlan(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -3032,6 +3104,7 @@ fn documentAlgebraicAggregateFromDbAlloc(
             rows[i] = .{
                 .group_json = try documentAlgebraicSingleGroupJsonAlloc(alloc, &entry.index, fold.group_key),
                 .value_json = try documentAlgebraicAggregateValueJsonAlloc(alloc, req.aggregate_op, fold.value),
+                .raw_value = try alloc.dupe(u8, fold.value),
             };
             initialized += 1;
         }
@@ -3052,6 +3125,7 @@ fn documentAlgebraicAggregateFromDbAlloc(
             try documentAlgebraicAggregateValueJsonAlloc(alloc, req.aggregate_op, value)
         else
             try documentAlgebraicAggregateMissingValueJsonAlloc(alloc, req.aggregate_op),
+        .raw_value = if (raw) |value| try alloc.dupe(u8, value) else null,
     };
     return .{
         .rows = rows,
@@ -3100,6 +3174,144 @@ fn documentAlgebraicAggregateValueJsonAlloc(
         },
     }
     return try out.toOwnedSlice();
+}
+
+const DocumentAlgebraicMergedGroup = struct {
+    group_json: ?[]u8 = null,
+    raw_value: ?[]u8 = null,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.group_json) |value| alloc.free(value);
+        if (self.raw_value) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+fn documentAlgebraicAggregateMergeResponsesAlloc(
+    alloc: std.mem.Allocator,
+    req: document_sql_runtime.AlgebraicAggregateRequest,
+    responses: []const document_sql_runtime.AlgebraicAggregateResponse,
+) !document_sql_runtime.AlgebraicAggregateResponse {
+    var groups = std.ArrayListUnmanaged(DocumentAlgebraicMergedGroup).empty;
+    defer {
+        for (groups.items) |*group| group.deinit(alloc);
+        groups.deinit(alloc);
+    }
+
+    for (responses) |response| {
+        for (response.rows) |row| {
+            if (row.raw_value == null and !documentAlgebraicMissingRawValueAllowed(req, row.value_json)) {
+                return error.UnsupportedQueryRequest;
+            }
+            try documentAlgebraicMergeRowAlloc(alloc, &groups, req.aggregate_op, row.group_json, row.raw_value);
+        }
+    }
+
+    const output_count = if (req.limit) |limit| @min(groups.items.len, limit) else groups.items.len;
+    const rows = try alloc.alloc(document_sql_runtime.AlgebraicAggregateRow, output_count);
+    errdefer alloc.free(rows);
+    var initialized: usize = 0;
+    errdefer {
+        for (rows[0..initialized]) |*row| row.deinit(alloc);
+    }
+
+    for (groups.items[0..output_count], 0..) |group, i| {
+        rows[i] = .{
+            .group_json = if (group.group_json) |value| try alloc.dupe(u8, value) else null,
+            .value_json = if (group.raw_value) |value|
+                try documentAlgebraicAggregateValueJsonAlloc(alloc, req.aggregate_op, value)
+            else
+                try documentAlgebraicAggregateMissingValueJsonAlloc(alloc, req.aggregate_op),
+            .raw_value = if (group.raw_value) |value| try alloc.dupe(u8, value) else null,
+        };
+        initialized += 1;
+    }
+
+    return .{
+        .rows = rows,
+        .total_groups = @intCast(groups.items.len),
+    };
+}
+
+fn documentAlgebraicMissingRawValueAllowed(req: document_sql_runtime.AlgebraicAggregateRequest, value_json: []const u8) bool {
+    if (req.group_by != null) return false;
+    return switch (req.aggregate_op) {
+        .count => std.mem.eql(u8, value_json, "0"),
+        .sum, .avg, .min, .max => std.mem.eql(u8, value_json, "null"),
+    };
+}
+
+fn documentAlgebraicMergeRowAlloc(
+    alloc: std.mem.Allocator,
+    groups: *std.ArrayListUnmanaged(DocumentAlgebraicMergedGroup),
+    op: sql_adapter_runtime.DocumentAggregateOp,
+    group_json: ?[]const u8,
+    raw_value: ?[]const u8,
+) !void {
+    for (groups.items) |*group| {
+        if (optionalStringsEqual(group.group_json, group_json)) {
+            if (raw_value) |right| {
+                if (group.raw_value) |left| {
+                    const merged = try documentAlgebraicMergeRawValueAlloc(alloc, op, left, right);
+                    alloc.free(left);
+                    group.raw_value = merged;
+                } else {
+                    group.raw_value = try alloc.dupe(u8, right);
+                }
+            } else if (op == .count and group.raw_value == null) {
+                group.raw_value = try db_mod.algebraic.algebra.encodeI64Alloc(alloc, 0);
+            }
+            return;
+        }
+    }
+
+    try groups.append(alloc, .{
+        .group_json = if (group_json) |value| try alloc.dupe(u8, value) else null,
+        .raw_value = if (raw_value) |value| try alloc.dupe(u8, value) else if (op == .count)
+            try db_mod.algebraic.algebra.encodeI64Alloc(alloc, 0)
+        else
+            null,
+    });
+}
+
+fn optionalStringsEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null and right == null) return true;
+    if (left == null or right == null) return false;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
+fn documentAlgebraicMergeRawValueAlloc(
+    alloc: std.mem.Allocator,
+    op: sql_adapter_runtime.DocumentAggregateOp,
+    left: []const u8,
+    right: []const u8,
+) ![]u8 {
+    return switch (op) {
+        .count => try db_mod.algebraic.algebra.encodeI64Alloc(
+            alloc,
+            try db_mod.algebraic.algebra.parseI64(left) + try db_mod.algebraic.algebra.parseI64(right),
+        ),
+        .sum => try db_mod.algebraic.algebra.encodeF64Alloc(
+            alloc,
+            try db_mod.algebraic.algebra.parseF64(left) + try db_mod.algebraic.algebra.parseF64(right),
+        ),
+        .min => try db_mod.algebraic.algebra.encodeF64Alloc(
+            alloc,
+            @min(try db_mod.algebraic.algebra.parseF64(left), try db_mod.algebraic.algebra.parseF64(right)),
+        ),
+        .max => try db_mod.algebraic.algebra.encodeF64Alloc(
+            alloc,
+            @max(try db_mod.algebraic.algebra.parseF64(left), try db_mod.algebraic.algebra.parseF64(right)),
+        ),
+        .avg => blk: {
+            const left_avg = try db_mod.algebraic.algebra.parseAvg(left);
+            const right_avg = try db_mod.algebraic.algebra.parseAvg(right);
+            break :blk try db_mod.algebraic.algebra.encodeAvgAlloc(alloc, .{
+                .sum = left_avg.sum + right_avg.sum,
+                .count = left_avg.count + right_avg.count,
+            });
+        },
+    };
 }
 
 fn documentAlgebraicAggregateProvisionedHostedLocal(
@@ -3163,6 +3375,43 @@ fn documentAlgebraicAggregateLocal(
     defer db.close();
 
     return try documentAlgebraicAggregateFromDbAlloc(alloc, &db, req);
+}
+
+fn documentAlgebraicAggregateProvisionedGroups(
+    self: *ProvisionedTableReadSource,
+    alloc: std.mem.Allocator,
+    group_ids: []const u64,
+    table_name: []const u8,
+    req: document_sql_runtime.AlgebraicAggregateRequest,
+    consistency: raft_mod.ReadConsistency,
+) !?document_sql_runtime.AlgebraicAggregateResponse {
+    var shard_responses = std.ArrayListUnmanaged(document_sql_runtime.AlgebraicAggregateResponse).empty;
+    defer {
+        for (shard_responses.items) |*response| response.deinit(alloc);
+        shard_responses.deinit(alloc);
+    }
+
+    var local_req = req;
+    if (req.group_by != null) local_req.limit = null;
+
+    for (group_ids) |group_id| {
+        var response = (try documentAlgebraicAggregateProvisionedHostedLocal(
+            self.replica_root_dir,
+            self.catalog,
+            self.requester,
+            alloc,
+            group_id,
+            self.visibleRootGeneration(group_id),
+            self.backend_runtime,
+            table_name,
+            local_req,
+            consistency,
+        )) orelse return error.DocumentSqlIndexUnavailable;
+        errdefer response.deinit(alloc);
+        try shard_responses.append(alloc, response);
+    }
+    if (shard_responses.items.len == 0) return null;
+    return try documentAlgebraicAggregateMergeResponsesAlloc(alloc, req, shard_responses.items);
 }
 
 pub const ProvisionedTableReadSource = struct {
@@ -3252,9 +3501,12 @@ pub const ProvisionedTableReadSource = struct {
                 .lookup = lookup,
                 .lookup_catalog = lookupCatalogNative,
                 .scan = scan,
+                .scan_catalog = scanCatalogNative,
                 .query = query,
                 .query_catalog = queryCatalogNative,
                 .document_algebraic_aggregate = ProvisionedTableReadSource.documentAlgebraicAggregate,
+                .document_algebraic_aggregate_catalog = ProvisionedTableReadSource.documentAlgebraicAggregateCatalog,
+                .document_algebraic_aggregate_group_local = ProvisionedTableReadSource.documentAlgebraicAggregateGroupLocal,
                 .preflight_query = preflightQuery,
                 .preflight_query_group_local = preflightQueryGroupLocal,
                 .lookup_group_local = lookupGroupLocal,
@@ -3372,6 +3624,21 @@ pub const ProvisionedTableReadSource = struct {
         if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
         const group_id = (try table_catalog.resolveGroupForKey(alloc, self.catalog, table_name, doc_key)) orelse return null;
         return try documentArtifactManifestsProvisionedHostedLocal(self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, doc_key, consistency);
+    }
+
+    fn scanCatalogNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        from_key: []const u8,
+        to_key: []const u8,
+        opts: db_mod.types.ScanOptions,
+        consistency: raft_mod.ReadConsistency,
+    ) !?ScanResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try scan(ptr, alloc, table_name, from_key, to_key, opts, consistency);
     }
 
     fn scan(
@@ -3503,14 +3770,40 @@ pub const ProvisionedTableReadSource = struct {
         defer alloc.free(group_ids);
         if (group_ids.len == 0) return null;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
-        if (group_ids.len != 1) return error.DocumentSqlIndexUnavailable;
+        return try documentAlgebraicAggregateProvisionedGroups(self, alloc, group_ids, table_name, req, consistency);
+    }
+
+    fn documentAlgebraicAggregateCatalog(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        req: document_sql_runtime.AlgebraicAggregateRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?document_sql_runtime.AlgebraicAggregateResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try documentAlgebraicAggregate(ptr, alloc, table_name, req, consistency);
+    }
+
+    fn documentAlgebraicAggregateGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: document_sql_runtime.AlgebraicAggregateRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?document_sql_runtime.AlgebraicAggregateResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
+        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
         return try documentAlgebraicAggregateProvisionedHostedLocal(
             self.replica_root_dir,
             self.catalog,
             self.requester,
             alloc,
-            group_ids[0],
-            self.visibleRootGeneration(group_ids[0]),
+            group_id,
+            self.visibleRootGeneration(group_id),
             self.backend_runtime,
             table_name,
             req,
@@ -4117,9 +4410,12 @@ pub const HostedProvisionedTableReadSource = struct {
                 .lookup = lookup,
                 .lookup_catalog = lookupCatalogNative,
                 .scan = scan,
+                .scan_catalog = scanCatalogNative,
                 .query = query,
                 .query_catalog = queryCatalogNative,
                 .document_algebraic_aggregate = documentAlgebraicAggregate,
+                .document_algebraic_aggregate_catalog = documentAlgebraicAggregateCatalog,
+                .document_algebraic_aggregate_group_local = documentAlgebraicAggregateGroupLocal,
                 .preflight_query = preflightQuery,
                 .preflight_query_group_local = preflightQueryGroupLocal,
                 .lookup_group_local = lookupGroupLocal,
@@ -4205,6 +4501,34 @@ pub const HostedProvisionedTableReadSource = struct {
         return try query(ptr, alloc, table_name, req, consistency);
     }
 
+    fn scanCatalogNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        from_key: []const u8,
+        to_key: []const u8,
+        opts: db_mod.types.ScanOptions,
+        consistency: raft_mod.ReadConsistency,
+    ) !?ScanResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try scan(ptr, alloc, table_name, from_key, to_key, opts, consistency);
+    }
+
+    fn documentAlgebraicAggregateCatalog(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        req: document_sql_runtime.AlgebraicAggregateRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?document_sql_runtime.AlgebraicAggregateResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try documentAlgebraicAggregate(ptr, alloc, table_name, req, consistency);
+    }
+
     fn documentAlgebraicAggregate(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -4217,24 +4541,45 @@ pub const HostedProvisionedTableReadSource = struct {
         defer alloc.free(group_ids);
         if (group_ids.len == 0) return null;
         try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
-        if (group_ids.len != 1) return error.DocumentSqlIndexUnavailable;
-        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_ids[0], routePolicyForConsistency(consistency))) orelse return null;
-        defer route.deinit(alloc);
-        return switch (route) {
-            .local => try documentAlgebraicAggregateProvisionedHostedLocal(
-                self.replica_root_dir,
-                self.catalog,
-                self.requester,
-                alloc,
-                group_ids[0],
-                self.visibleRootGeneration(group_ids[0]),
-                self.backend_runtime,
-                table_name,
-                req,
-                consistency,
-            ),
-            .remote => error.DocumentSqlIndexUnavailable,
-        };
+        var shard_responses = std.ArrayListUnmanaged(document_sql_runtime.AlgebraicAggregateResponse).empty;
+        defer {
+            for (shard_responses.items) |*response| response.deinit(alloc);
+            shard_responses.deinit(alloc);
+        }
+
+        var local_req = req;
+        if (req.group_by != null) local_req.limit = null;
+
+        for (group_ids) |group_id| {
+            var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return error.TopologyChanged;
+            defer route.deinit(alloc);
+            var response = switch (route) {
+                .local => try documentAlgebraicAggregateProvisionedHostedLocal(
+                    self.replica_root_dir,
+                    self.catalog,
+                    self.requester,
+                    alloc,
+                    group_id,
+                    self.visibleRootGeneration(group_id),
+                    self.backend_runtime,
+                    table_name,
+                    local_req,
+                    consistency,
+                ) orelse return error.DocumentSqlIndexUnavailable,
+                .remote => |remote| try documentAlgebraicAggregateRemote(
+                    self.executor,
+                    alloc,
+                    remote.base_uri,
+                    group_id,
+                    table_name,
+                    local_req,
+                ),
+            };
+            errdefer response.deinit(alloc);
+            try shard_responses.append(alloc, response);
+        }
+        if (shard_responses.items.len == 0) return null;
+        return try documentAlgebraicAggregateMergeResponsesAlloc(alloc, req, shard_responses.items);
     }
 
     fn lookupViaRoute(
@@ -4902,6 +5247,29 @@ pub const HostedProvisionedTableReadSource = struct {
         return try collectProvisionedHostedLocalAlgebraicPartials(null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body);
     }
 
+    fn documentAlgebraicAggregateGroupLocal(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: document_sql_runtime.AlgebraicAggregateRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?document_sql_runtime.AlgebraicAggregateResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        return try documentAlgebraicAggregateProvisionedHostedLocal(
+            self.replica_root_dir,
+            self.catalog,
+            self.requester,
+            alloc,
+            group_id,
+            self.visibleRootGeneration(group_id),
+            self.backend_runtime,
+            table_name,
+            req,
+            consistency,
+        );
+    }
+
     fn joinPartitionGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -5136,9 +5504,11 @@ const DocumentSqlRuntimeSourceAdapter = struct {
                 .lookup = lookup,
                 .lookup_catalog = lookupCatalog,
                 .scan = scan,
+                .scan_catalog = scanCatalog,
                 .query = query,
                 .query_catalog = queryCatalog,
                 .algebraic_aggregate = algebraicAggregate,
+                .algebraic_aggregate_catalog = algebraicAggregateCatalog,
             },
             .native_table_name = self.native_table_name,
             .public_table_name = self.public_table_name,
@@ -5181,6 +5551,18 @@ const DocumentSqlRuntimeSourceAdapter = struct {
         return try self.source.scan(alloc, table_name, from_key, to_key, dbScanOptions(opts), consistency);
     }
 
+    fn scanCatalog(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        from_key: []const u8,
+        to_key: []const u8,
+        opts: document_sql_runtime.ScanOptions,
+        consistency: raft_mod.ReadConsistency,
+    ) !?document_sql_runtime.ScanResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.source.scanCatalog(alloc, self.target, from_key, to_key, dbScanOptions(opts), consistency);
+    }
+
     fn query(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -5221,6 +5603,16 @@ const DocumentSqlRuntimeSourceAdapter = struct {
     ) !?document_sql_runtime.AlgebraicAggregateResponse {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         return try self.source.documentAlgebraicAggregate(alloc, table_name, req, consistency);
+    }
+
+    fn algebraicAggregateCatalog(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        req: document_sql_runtime.AlgebraicAggregateRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?document_sql_runtime.AlgebraicAggregateResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.source.documentAlgebraicAggregateCatalog(alloc, self.target, req, consistency);
     }
 
     fn dbLookupOptions(_: document_sql_runtime.LookupOptions) db_mod.types.LookupOptions {
@@ -7558,9 +7950,14 @@ pub const ExternalLakeRoutingTableReadSource = struct {
             .ptr = self,
             .vtable = &.{
                 .lookup = lookup,
+                .lookup_catalog = lookupCatalog,
                 .scan = scan,
+                .scan_catalog = scanCatalog,
                 .query = query,
                 .query_catalog = queryCatalog,
+                .document_algebraic_aggregate = documentAlgebraicAggregate,
+                .document_algebraic_aggregate_catalog = documentAlgebraicAggregateCatalog,
+                .document_algebraic_aggregate_group_local = documentAlgebraicAggregateGroupLocal,
                 .preflight_query = preflightQuery,
                 .preflight_query_group_local = preflightQueryGroupLocal,
                 .lookup_group_local = lookupGroupLocal,
@@ -7626,9 +8023,19 @@ pub const ExternalLakeRoutingTableReadSource = struct {
         return try self.base.lookup(alloc, table_name, key, opts, consistency);
     }
 
+    fn lookupCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, target: catalog_resources.TableTarget, key: []const u8, opts: db_mod.types.LookupOptions, consistency: raft_mod.ReadConsistency) !?LookupResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.lookupCatalog(alloc, target, key, opts, consistency);
+    }
+
     fn scan(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, from_key: []const u8, to_key: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?ScanResponse {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         return try self.base.scan(alloc, table_name, from_key, to_key, opts, consistency);
+    }
+
+    fn scanCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, target: catalog_resources.TableTarget, from_key: []const u8, to_key: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?ScanResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.scanCatalog(alloc, target, from_key, to_key, opts, consistency);
     }
 
     fn query(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
@@ -7639,6 +8046,21 @@ pub const ExternalLakeRoutingTableReadSource = struct {
     fn queryCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, target: catalog_resources.TableTarget, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         return try self.base.queryCatalog(alloc, target, req, consistency);
+    }
+
+    fn documentAlgebraicAggregate(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: document_sql_runtime.AlgebraicAggregateRequest, consistency: raft_mod.ReadConsistency) !?document_sql_runtime.AlgebraicAggregateResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.documentAlgebraicAggregate(alloc, table_name, req, consistency);
+    }
+
+    fn documentAlgebraicAggregateCatalog(ptr: *anyopaque, alloc: std.mem.Allocator, target: catalog_resources.TableTarget, req: document_sql_runtime.AlgebraicAggregateRequest, consistency: raft_mod.ReadConsistency) !?document_sql_runtime.AlgebraicAggregateResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.documentAlgebraicAggregateCatalog(alloc, target, req, consistency);
+    }
+
+    fn documentAlgebraicAggregateGroupLocal(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: document_sql_runtime.AlgebraicAggregateRequest, consistency: raft_mod.ReadConsistency) !?document_sql_runtime.AlgebraicAggregateResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.base.documentAlgebraicAggregateGroupLocal(alloc, group_id, table_name, req, consistency);
     }
 
     fn preflightQuery(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency, max_work: u32) !?db_mod.RuntimePreflightSummary {
@@ -17515,6 +17937,63 @@ fn algebraicPartialsRemote(
     return .{ .json = try alloc.dupe(u8, result.body) };
 }
 
+const DocumentAlgebraicAggregateResponseWire = struct {
+    const Row = struct {
+        group_json: ?[]const u8 = null,
+        value_json: []const u8,
+        raw_value: ?[]const u8 = null,
+    };
+
+    rows: []const Row,
+    total_groups: u32,
+};
+
+fn parseDocumentAlgebraicAggregateResponseAlloc(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+) !document_sql_runtime.AlgebraicAggregateResponse {
+    var parsed = try std.json.parseFromSlice(DocumentAlgebraicAggregateResponseWire, alloc, body, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const rows = try alloc.alloc(document_sql_runtime.AlgebraicAggregateRow, parsed.value.rows.len);
+    errdefer alloc.free(rows);
+    var initialized: usize = 0;
+    errdefer {
+        for (rows[0..initialized]) |*row| row.deinit(alloc);
+    }
+    for (parsed.value.rows, rows) |row, *out| {
+        out.* = .{
+            .group_json = if (row.group_json) |value| try alloc.dupe(u8, value) else null,
+            .value_json = try alloc.dupe(u8, row.value_json),
+            .raw_value = if (row.raw_value) |value| try alloc.dupe(u8, value) else null,
+        };
+        initialized += 1;
+    }
+    return .{
+        .rows = rows,
+        .total_groups = parsed.value.total_groups,
+    };
+}
+
+fn documentAlgebraicAggregateRemote(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    req: document_sql_runtime.AlgebraicAggregateRequest,
+) !document_sql_runtime.AlgebraicAggregateResponse {
+    const body = try std.json.Stringify.valueAlloc(alloc, req, .{});
+    defer alloc.free(body);
+    var client = http_client.ApiHttpClient.init(alloc, executor);
+    var result = try client.fetchGroupDocumentAlgebraicAggregate(base_uri, group_id, table_name, body);
+    defer result.deinit(alloc);
+    return try parseDocumentAlgebraicAggregateResponseAlloc(alloc, result.body);
+}
+
 fn joinPartitionRemote(
     executor: http_common.RequestExecutor,
     alloc: std.mem.Allocator,
@@ -20973,6 +21452,7 @@ test "external lake routing source resolves object store for external row plans"
 
     const FakeBase = struct {
         rows_query_count: u32 = 0,
+        document_algebraic_aggregate_count: u32 = 0,
 
         fn source(self: *@This()) TableReadSource {
             return .{
@@ -20981,6 +21461,7 @@ test "external lake routing source resolves object store for external row plans"
                     .lookup = lookup,
                     .scan = scan,
                     .query = query,
+                    .document_algebraic_aggregate = documentAlgebraicAggregate,
                     .rows_query_plan = rowsQueryPlan,
                 },
             };
@@ -21002,6 +21483,28 @@ test "external lake routing source resolves object store for external row plans"
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.rows_query_count += 1;
             return error.BaseRowsQueryReached;
+        }
+
+        fn documentAlgebraicAggregate(
+            ptr: *anyopaque,
+            aggregate_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: document_sql_runtime.AlgebraicAggregateRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) !?document_sql_runtime.AlgebraicAggregateResponse {
+            _ = consistency;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.document_algebraic_aggregate_count += 1;
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("amount_alg", req.index_name);
+            try std.testing.expectEqualStrings("avg_by_status", req.materialization_name);
+            var rows = try aggregate_alloc.alloc(document_sql_runtime.AlgebraicAggregateRow, 1);
+            errdefer aggregate_alloc.free(rows);
+            rows[0] = .{
+                .value_json = try aggregate_alloc.dupe(u8, "11"),
+                .raw_value = try db_mod.algebraic.algebra.encodeAvgAlloc(aggregate_alloc, .{ .sum = 11, .count = 1 }),
+            };
+            return .{ .rows = rows, .total_groups = 1 };
         }
     };
 
@@ -21063,6 +21566,20 @@ test "external lake routing source resolves object store for external row plans"
     try std.testing.expectError(error.BaseRowsQueryReached, source.rowsQueryPlan(alloc, "events", local_schema, plan, .read_index));
     try std.testing.expectEqual(@as(u32, 1), resolver.open_count);
     try std.testing.expectEqual(@as(u32, 1), base.rows_query_count);
+
+    var aggregate = (try source.documentAlgebraicAggregate(alloc, "docs", .{
+        .index_name = "amount_alg",
+        .materialization_name = "avg_by_status",
+        .aggregate_op = .avg,
+        .group_by = null,
+        .limit = null,
+    }, .read_index)).?;
+    defer aggregate.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), base.document_algebraic_aggregate_count);
+    try std.testing.expectEqual(@as(u32, 1), aggregate.total_groups);
+    try std.testing.expectEqual(@as(usize, 1), aggregate.rows.len);
+    try std.testing.expect(aggregate.rows[0].group_json == null);
+    try std.testing.expectEqualStrings("11", aggregate.rows[0].value_json);
 }
 
 fn icebergRoutingMetadataJson() []const u8 {
@@ -22048,7 +22565,11 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
     );
     defer lowered_distinct.deinit(alloc);
     switch (lowered_distinct) {
-        .query => |query| try std.testing.expectEqual(@as(usize, 2), query.plan.query.or_predicates.len),
+        .set_operation => |set_operation| {
+            try std.testing.expectEqual(@as(sql_adapter_runtime.SelectSetOperation, .union_distinct), set_operation.operation);
+            try std.testing.expectEqualStrings("usage_records", set_operation.left.table_name);
+            try std.testing.expectEqualStrings("usage_records", set_operation.right.table_name);
+        },
         else => return error.TestUnexpectedResult,
     }
 
@@ -22064,9 +22585,9 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
     )).?;
     defer distinct_result.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 1), fake_distinct.scan_calls);
+    try std.testing.expectEqual(@as(usize, 2), fake_distinct.scan_calls);
     switch (distinct_result) {
-        .query => |query_result| {
+        .set_operation => |query_result| {
             try std.testing.expectEqual(@as(u32, 3), query_result.total);
             try std.testing.expectEqual(@as(usize, 3), query_result.rows.len);
             try std.testing.expectEqualStrings("{\"id\":\"u1\"}", query_result.rows[0]);
@@ -22084,7 +22605,11 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
     );
     defer lowered_intersect.deinit(alloc);
     switch (lowered_intersect) {
-        .query => |query| try std.testing.expectEqual(@as(usize, 2), query.plan.query.predicates.len),
+        .set_operation => |set_operation| {
+            try std.testing.expectEqual(@as(sql_adapter_runtime.SelectSetOperation, .intersect), set_operation.operation);
+            try std.testing.expectEqualStrings("usage_records", set_operation.left.table_name);
+            try std.testing.expectEqualStrings("usage_records", set_operation.right.table_name);
+        },
         else => return error.TestUnexpectedResult,
     }
 
@@ -22100,9 +22625,9 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
     )).?;
     defer intersect_result.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 1), fake_intersect.scan_calls);
+    try std.testing.expectEqual(@as(usize, 2), fake_intersect.scan_calls);
     switch (intersect_result) {
-        .query => |query_result| {
+        .set_operation => |query_result| {
             try std.testing.expectEqual(@as(u32, 1), query_result.total);
             try std.testing.expectEqual(@as(usize, 1), query_result.rows.len);
             try std.testing.expectEqualStrings("{\"id\":\"u1\"}", query_result.rows[0]);
@@ -23473,9 +23998,7 @@ test "lowered document sql read plans execute native lookup and bounded scan" {
     };
 
     var catalog = FakeCatalog{};
-    const native_table_name = try catalog_resources.defaultPublicTableResourceNameAlloc(alloc, "docs");
-    defer alloc.free(native_table_name);
-    var source = BoundTableReadSource.init(native_table_name, 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var source = BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
 
     var lookup_plan = try sql_adapter_runtime.lowerReadPlanAlloc(
         alloc,
@@ -23683,7 +24206,8 @@ test "lowered document sql read plans execute native lookup and bounded scan" {
             try std.testing.expectEqual(@as(u32, 2), query.total);
             try std.testing.expectEqual(@as(usize, 2), query.rows.len);
             try std.testing.expectEqualStrings("{\"_id\":\"doc:b\",\"title\":\"beta\"}", query.rows[0]);
-            try std.testing.expectEqualStrings("{\"_id\":\"doc:a\",\"title\":\"alpha\"}", query.rows[1]);
+            try std.testing.expect(std.mem.eql(u8, query.rows[1], "{\"_id\":\"doc:a\",\"title\":\"alpha\"}") or
+                std.mem.eql(u8, query.rows[1], "{\"_id\":\"doc:c\",\"title\":\"alpha\"}"));
         },
         else => return error.TestUnexpectedResult,
     }
@@ -23921,6 +24445,679 @@ test "lowered document sql read plans execute native lookup and bounded scan" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "document sql catalog read producers treat catalog misses as terminal" {
+    const alloc = std.testing.allocator;
+    var parsed_schema = try schema_api.parseValidatedTableSchema(alloc,
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"}},"additionalProperties":true}}}}
+    );
+    defer parsed_schema.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, schema);
+
+    const FakeCatalog = struct {
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 99,
+                    .database_name = "tenant_ops",
+                    .namespace_name = "analytics",
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeSource = struct {
+        lookup_catalog_calls: usize = 0,
+        scan_catalog_calls: usize = 0,
+        query_catalog_calls: usize = 0,
+        legacy_lookup_calls: usize = 0,
+        legacy_scan_calls: usize = 0,
+        legacy_query_calls: usize = 0,
+
+        fn source(self: *@This()) TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .lookup_catalog = lookupCatalog,
+                    .scan = scan,
+                    .scan_catalog = scanCatalog,
+                    .query = query,
+                    .query_catalog = queryCatalog,
+                },
+            };
+        }
+
+        fn expectTenantTarget(target: catalog_resources.TableTarget) !void {
+            try std.testing.expectEqualStrings("tenant_ops", target.database_name);
+            try std.testing.expectEqualStrings("analytics", target.namespace_name);
+            try std.testing.expectEqualStrings("docs", target.table_name);
+        }
+
+        fn lookup(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.legacy_lookup_calls += 1;
+            return error.UnexpectedLegacyLookup;
+        }
+
+        fn lookupCatalog(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            key: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.lookup_catalog_calls += 1;
+            try expectTenantTarget(target);
+            try std.testing.expectEqualStrings("doc:missing", key);
+            return null;
+        }
+
+        fn scan(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.legacy_scan_calls += 1;
+            return error.UnexpectedLegacyScan;
+        }
+
+        fn scanCatalog(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.scan_catalog_calls += 1;
+            try expectTenantTarget(target);
+            try std.testing.expectEqualStrings("", from_key);
+            try std.testing.expectEqualStrings("", to_key);
+            try std.testing.expectEqual(@as(u32, 5), opts.limit);
+            return null;
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.legacy_query_calls += 1;
+            return error.UnexpectedLegacyQuery;
+        }
+
+        fn queryCatalog(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            req: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.query_catalog_calls += 1;
+            try expectTenantTarget(target);
+            try std.testing.expect(req.primary_text_index_name != null);
+            try std.testing.expectEqualStrings("full_text_index_v0", req.primary_text_index_name.?);
+            return null;
+        }
+    };
+
+    const tenant_session: catalog_resources.SqlCatalogSession = .{
+        .current_database_name = "tenant_ops",
+        .search_path = &.{"analytics"},
+    };
+    var catalog = FakeCatalog{};
+
+    var lookup_projection = try alloc.alloc(sql_adapter_runtime.DocumentProjection, 1);
+    lookup_projection[0] = .{ .kind = .id, .output = try alloc.dupe(u8, "_id") };
+    var lookup_ids = try alloc.alloc([]const u8, 1);
+    lookup_ids[0] = try alloc.dupe(u8, "doc:missing");
+    var lookup_plan = sql_adapter_runtime.LoweredReadPlan{ .document_query = .{
+        .table_name = try alloc.dupe(u8, "docs"),
+        .projection = lookup_projection,
+        .producer = .{ .id_lookup = .{ .ids = lookup_ids } },
+        .limit = 1,
+    } };
+    defer lookup_plan.deinit(alloc);
+
+    var lookup_source = FakeSource{};
+    var lookup_result = (try executeLoweredSqlReadPlanWithSessionAlloc(
+        alloc,
+        lookup_source.source(),
+        catalog.iface(),
+        tenant_session,
+        "docs",
+        schema,
+        lookup_plan,
+        .read_index,
+    )).?;
+    defer lookup_result.deinit(alloc);
+    switch (lookup_result) {
+        .document_query => |query_result| try std.testing.expectEqual(@as(usize, 0), query_result.rows.len),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(usize, 1), lookup_source.lookup_catalog_calls);
+    try std.testing.expectEqual(@as(usize, 0), lookup_source.legacy_lookup_calls);
+
+    var query_projection = try alloc.alloc(sql_adapter_runtime.DocumentProjection, 1);
+    query_projection[0] = .{ .kind = .id, .output = try alloc.dupe(u8, "_id") };
+    var query_plan = sql_adapter_runtime.LoweredReadPlan{ .document_query = .{
+        .table_name = try alloc.dupe(u8, "docs"),
+        .projection = query_projection,
+        .producer = .{ .indexed_query = .{
+            .index_name = try alloc.dupe(u8, "full_text_index_v0"),
+            .full_text_query = try alloc.dupe(u8, "alpha"),
+        } },
+        .limit = 5,
+    } };
+    defer query_plan.deinit(alloc);
+
+    var query_source = FakeSource{};
+    try std.testing.expect((try executeLoweredSqlReadPlanWithSessionAlloc(
+        alloc,
+        query_source.source(),
+        catalog.iface(),
+        tenant_session,
+        "docs",
+        schema,
+        query_plan,
+        .read_index,
+    )) == null);
+    try std.testing.expectEqual(@as(usize, 1), query_source.query_catalog_calls);
+    try std.testing.expectEqual(@as(usize, 0), query_source.legacy_query_calls);
+
+    var scan_projection = try alloc.alloc(sql_adapter_runtime.DocumentProjection, 1);
+    scan_projection[0] = .{ .kind = .id, .output = try alloc.dupe(u8, "_id") };
+    var scan_plan = sql_adapter_runtime.LoweredReadPlan{ .document_query = .{
+        .table_name = try alloc.dupe(u8, "docs"),
+        .projection = scan_projection,
+        .producer = .{ .bounded_scan = .{ .max_rows = 5 } },
+        .limit = 5,
+    } };
+    defer scan_plan.deinit(alloc);
+
+    var scan_source = FakeSource{};
+    try std.testing.expect((try executeLoweredSqlReadPlanWithSessionAlloc(
+        alloc,
+        scan_source.source(),
+        catalog.iface(),
+        tenant_session,
+        "docs",
+        schema,
+        scan_plan,
+        .read_index,
+    )) == null);
+    try std.testing.expectEqual(@as(usize, 1), scan_source.scan_catalog_calls);
+    try std.testing.expectEqual(@as(usize, 0), scan_source.legacy_scan_calls);
+}
+
+test "lowered document sql aggregate executes native grouped avg materialization" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-document-sql-grouped-avg";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    const alg_config =
+        \\{
+        \\  "version": 1,
+        \\  "table": "docs",
+        \\  "group_fields": [{"name":"status","path":"status","type":"string"}],
+        \\  "measure_fields": [{"name":"amount","path":"amount","type":"number"}],
+        \\  "materializations": [
+        \\    {"name":"avg_by_status","op":"avg","group_by":["status"],"measure":"amount"}
+        \\  ]
+        \\}
+    ;
+    try db.addIndex(.{ .name = "amount_alg", .kind = .algebraic, .config_json = alg_config });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"status\":\"active\",\"amount\":10}" },
+            .{ .key = "doc:b", .value = "{\"status\":\"archived\",\"amount\":20}" },
+            .{ .key = "doc:c", .value = "{\"status\":\"active\",\"amount\":12}" },
+            .{ .key = "doc:d", .value = "{\"status\":\"archived\",\"amount\":30}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var parsed_schema = try schema_api.parseValidatedTableSchema(alloc,
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"status":{"type":"keyword"},"amount":{"type":"numeric"}},"additionalProperties":true}}}}
+    );
+    defer parsed_schema.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, schema);
+
+    const FakeCatalog = struct {
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .database_name = catalog_resources.default_database_name,
+                    .namespace_name = catalog_resources.default_namespace_name,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var catalog = FakeCatalog{};
+    var source = BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    const indexes_json =
+        \\{"amount_alg":{"type":"algebraic","materializations":[{"name":"avg_by_status","op":"avg","group_by":["status"],"measure":"amount"}]}}
+    ;
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(
+        alloc,
+        "SELECT avg(amount) AS avg_amount FROM docs GROUP BY status LIMIT 10",
+    );
+    defer parsed_sql.deinit(alloc);
+    var document_plan = try sql_adapter.lowerDocumentAggregatePlanWithOptionalIndexesAndCapabilitiesParsedSqlAlloc(
+        alloc,
+        &parsed_sql,
+        schema,
+        indexes_json,
+        .{},
+    );
+    defer document_plan.deinit(alloc);
+    const plan = sql_adapter_runtime.LoweredReadPlan{ .document_aggregate = document_plan };
+
+    var result = (try executeLoweredSqlReadPlanAlloc(
+        alloc,
+        source.source(),
+        catalog.iface(),
+        "docs",
+        schema,
+        plan,
+        .read_index,
+    )).?;
+    defer result.deinit(alloc);
+    switch (result) {
+        .aggregate => |aggregate| {
+            try std.testing.expectEqual(@as(u32, 2), aggregate.total_groups);
+            try std.testing.expectEqual(@as(usize, 2), aggregate.rows.len);
+            try std.testing.expectEqualStrings("{\"status\":\"active\",\"avg_amount\":11}", aggregate.rows[0]);
+            try std.testing.expectEqualStrings("{\"status\":\"archived\",\"avg_amount\":25}", aggregate.rows[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "lowered document sql aggregate uses catalog target for non-default namespace materialization" {
+    const alloc = std.testing.allocator;
+    var parsed_schema = try schema_api.parseValidatedTableSchema(alloc,
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"status":{"type":"keyword"},"amount":{"type":"numeric"}},"additionalProperties":true}}}}
+    );
+    defer parsed_schema.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, schema);
+
+    const indexes_json =
+        \\{"amount_alg":{"type":"algebraic","materializations":[{"name":"avg_by_status","op":"avg","group_by":["status"],"measure":"amount"}]}}
+    ;
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(
+        alloc,
+        "SELECT avg(amount) AS avg_amount FROM docs GROUP BY status LIMIT 10",
+    );
+    defer parsed_sql.deinit(alloc);
+    var document_plan = try sql_adapter.lowerDocumentAggregatePlanWithOptionalIndexesAndCapabilitiesParsedSqlAlloc(
+        alloc,
+        &parsed_sql,
+        schema,
+        indexes_json,
+        .{},
+    );
+    defer document_plan.deinit(alloc);
+    const plan = sql_adapter_runtime.LoweredReadPlan{ .document_aggregate = document_plan };
+
+    const FakeCatalog = struct {
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 99,
+                    .database_name = "tenant_ops",
+                    .namespace_name = "analytics",
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeSource = struct {
+        catalog_calls: usize = 0,
+        string_calls: usize = 0,
+
+        fn source(self: *@This()) TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .document_algebraic_aggregate = documentAlgebraicAggregate,
+                    .document_algebraic_aggregate_catalog = documentAlgebraicAggregateCatalog,
+                },
+            };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?LookupResponse {
+            return error.UnexpectedLookup;
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?ScanResponse {
+            return error.UnexpectedScan;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.UnexpectedQuery;
+        }
+
+        fn documentAlgebraicAggregate(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: document_sql_runtime.AlgebraicAggregateRequest,
+            _: raft_mod.ReadConsistency,
+        ) !?document_sql_runtime.AlgebraicAggregateResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.string_calls += 1;
+            return error.UnexpectedStringAggregate;
+        }
+
+        fn documentAlgebraicAggregateCatalog(
+            ptr: *anyopaque,
+            aggregate_alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            req: document_sql_runtime.AlgebraicAggregateRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) !?document_sql_runtime.AlgebraicAggregateResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.catalog_calls += 1;
+            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+            try std.testing.expectEqualStrings("tenant_ops", target.database_name);
+            try std.testing.expectEqualStrings("analytics", target.namespace_name);
+            try std.testing.expectEqualStrings("docs", target.table_name);
+            try std.testing.expectEqualStrings("amount_alg", req.index_name);
+            try std.testing.expectEqualStrings("avg_by_status", req.materialization_name);
+            var rows = try aggregate_alloc.alloc(document_sql_runtime.AlgebraicAggregateRow, 1);
+            errdefer aggregate_alloc.free(rows);
+            rows[0] = .{
+                .group_json = try aggregate_alloc.dupe(u8, "\"active\""),
+                .value_json = try aggregate_alloc.dupe(u8, "11"),
+                .raw_value = try db_mod.algebraic.algebra.encodeAvgAlloc(aggregate_alloc, .{ .sum = 11, .count = 1 }),
+            };
+            return .{ .rows = rows, .total_groups = 1 };
+        }
+    };
+
+    const tenant_session: catalog_resources.SqlCatalogSession = .{
+        .current_database_name = "tenant_ops",
+        .search_path = &.{ "analytics", "public" },
+    };
+    var catalog = FakeCatalog{};
+    var fake = FakeSource{};
+    var result = (try executeLoweredSqlReadPlanWithSessionAlloc(
+        alloc,
+        fake.source(),
+        catalog.iface(),
+        tenant_session,
+        "docs",
+        schema,
+        plan,
+        .read_index,
+    )).?;
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), fake.catalog_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.string_calls);
+    switch (result) {
+        .aggregate => |aggregate| {
+            try std.testing.expectEqual(@as(u32, 1), aggregate.total_groups);
+            try std.testing.expectEqual(@as(usize, 1), aggregate.rows.len);
+            try std.testing.expectEqualStrings("{\"status\":\"active\",\"avg_amount\":11}", aggregate.rows[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "remote document algebraic aggregate preserves typed unavailable and not found errors" {
+    const alloc = std.testing.allocator;
+    const FakeExecutor = struct {
+        status: u16,
+        body: []const u8,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute = execute,
+                },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, response_alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = self.status,
+                .body = try response_alloc.dupe(u8, self.body),
+            };
+        }
+    };
+
+    const req = document_sql_runtime.AlgebraicAggregateRequest{
+        .index_name = "amount_alg",
+        .materialization_name = "avg_by_status",
+        .aggregate_op = .avg,
+        .group_by = null,
+        .limit = null,
+    };
+
+    var unavailable = FakeExecutor{ .status = 424, .body = "DocumentSqlIndexUnavailable" };
+    try std.testing.expectError(error.DocumentSqlIndexUnavailable, documentAlgebraicAggregateRemote(
+        unavailable.executor(),
+        alloc,
+        "http://127.0.0.1:1",
+        7,
+        "docs",
+        req,
+    ));
+
+    var table_missing = FakeExecutor{ .status = 404, .body = "TableNotFound" };
+    try std.testing.expectError(error.TableNotFound, documentAlgebraicAggregateRemote(
+        table_missing.executor(),
+        alloc,
+        "http://127.0.0.1:1",
+        7,
+        "docs",
+        req,
+    ));
+
+    var group_missing = FakeExecutor{ .status = 404, .body = "UnknownGroup" };
+    try std.testing.expectError(error.UnknownGroup, documentAlgebraicAggregateRemote(
+        group_missing.executor(),
+        alloc,
+        "http://127.0.0.1:1",
+        7,
+        "docs",
+        req,
+    ));
+}
+
+test "document algebraic aggregate fan-in merges raw grouped averages before applying limit" {
+    const alloc = std.testing.allocator;
+    const left_raw = try db_mod.algebraic.algebra.encodeAvgAlloc(alloc, .{ .sum = 10, .count = 1 });
+    defer alloc.free(left_raw);
+    const right_raw = try db_mod.algebraic.algebra.encodeAvgAlloc(alloc, .{ .sum = 12, .count = 1 });
+    defer alloc.free(right_raw);
+    var left_rows = [_]document_sql_runtime.AlgebraicAggregateRow{.{
+        .group_json = try alloc.dupe(u8, "\"active\""),
+        .value_json = try alloc.dupe(u8, "10"),
+        .raw_value = try alloc.dupe(u8, left_raw),
+    }};
+    defer left_rows[0].deinit(alloc);
+    var right_rows = [_]document_sql_runtime.AlgebraicAggregateRow{
+        .{
+            .group_json = try alloc.dupe(u8, "\"active\""),
+            .value_json = try alloc.dupe(u8, "12"),
+            .raw_value = try alloc.dupe(u8, right_raw),
+        },
+        .{
+            .group_json = try alloc.dupe(u8, "\"archived\""),
+            .value_json = try alloc.dupe(u8, "30"),
+            .raw_value = try db_mod.algebraic.algebra.encodeAvgAlloc(alloc, .{ .sum = 30, .count = 1 }),
+        },
+    };
+    defer {
+        right_rows[0].deinit(alloc);
+        right_rows[1].deinit(alloc);
+    }
+    const responses = [_]document_sql_runtime.AlgebraicAggregateResponse{
+        .{ .rows = left_rows[0..], .total_groups = 1 },
+        .{ .rows = right_rows[0..], .total_groups = 2 },
+    };
+    var merged = try documentAlgebraicAggregateMergeResponsesAlloc(alloc, .{
+        .index_name = "amount_alg",
+        .materialization_name = "avg_by_status",
+        .aggregate_op = .avg,
+        .group_by = .{ .field = "status", .source_field = "status", .field_type = .keyword, .output = "status" },
+        .limit = 1,
+    }, responses[0..]);
+    defer merged.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), merged.total_groups);
+    try std.testing.expectEqual(@as(usize, 1), merged.rows.len);
+    try std.testing.expectEqualStrings("\"active\"", merged.rows[0].group_json.?);
+    try std.testing.expectEqualStrings("11", merged.rows[0].value_json);
+}
+
+test "document algebraic aggregate fan-in preserves empty scalar aggregate semantics" {
+    const alloc = std.testing.allocator;
+    var empty_sum_rows = [_]document_sql_runtime.AlgebraicAggregateRow{
+        .{ .value_json = try alloc.dupe(u8, "null"), .raw_value = null },
+        .{ .value_json = try alloc.dupe(u8, "null"), .raw_value = null },
+    };
+    defer {
+        empty_sum_rows[0].deinit(alloc);
+        empty_sum_rows[1].deinit(alloc);
+    }
+    const empty_sum_responses = [_]document_sql_runtime.AlgebraicAggregateResponse{
+        .{ .rows = empty_sum_rows[0..1], .total_groups = 1 },
+        .{ .rows = empty_sum_rows[1..2], .total_groups = 1 },
+    };
+    var merged_empty_sum = try documentAlgebraicAggregateMergeResponsesAlloc(alloc, .{
+        .index_name = "amount_alg",
+        .materialization_name = "sum_all",
+        .aggregate_op = .sum,
+        .group_by = null,
+        .limit = null,
+    }, empty_sum_responses[0..]);
+    defer merged_empty_sum.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), merged_empty_sum.rows.len);
+    try std.testing.expectEqualStrings("null", merged_empty_sum.rows[0].value_json);
+    try std.testing.expect(merged_empty_sum.rows[0].raw_value == null);
+
+    var empty_count_rows = [_]document_sql_runtime.AlgebraicAggregateRow{
+        .{ .value_json = try alloc.dupe(u8, "0"), .raw_value = null },
+        .{ .value_json = try alloc.dupe(u8, "0"), .raw_value = null },
+    };
+    defer {
+        empty_count_rows[0].deinit(alloc);
+        empty_count_rows[1].deinit(alloc);
+    }
+    const empty_count_responses = [_]document_sql_runtime.AlgebraicAggregateResponse{
+        .{ .rows = empty_count_rows[0..1], .total_groups = 1 },
+        .{ .rows = empty_count_rows[1..2], .total_groups = 1 },
+    };
+    var merged_empty_count = try documentAlgebraicAggregateMergeResponsesAlloc(alloc, .{
+        .index_name = "amount_alg",
+        .materialization_name = "count_all",
+        .aggregate_op = .count,
+        .group_by = null,
+        .limit = null,
+    }, empty_count_responses[0..]);
+    defer merged_empty_count.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), merged_empty_count.rows.len);
+    try std.testing.expectEqualStrings("0", merged_empty_count.rows[0].value_json);
 }
 
 test "bound table read source scans keys as ndjson" {

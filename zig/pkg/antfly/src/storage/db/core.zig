@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const platform = @import("antfly_platform");
 const Allocator = std.mem.Allocator;
 const db_config = @import("config.zig");
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
@@ -1394,9 +1395,7 @@ fn cleanupTransactionRecoveryIdentityExtraBatch(ctx: ?*anyopaque, batch: transac
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) {
-        std.atomic.spinLoopHint();
-    }
+    platform.sync.lockYielding(mutex);
 }
 
 pub const Engine = struct {

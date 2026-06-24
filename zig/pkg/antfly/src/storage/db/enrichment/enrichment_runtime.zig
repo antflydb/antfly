@@ -193,18 +193,14 @@ fn generatedEmbedBatchBytes() usize {
 
 fn backoffWriterLockRetry() void {
     if (comptime builtin.os.tag == .freestanding) return;
-    std.Thread.yield() catch {};
-    if (@hasDecl(std.Thread, "sleep")) {
-        std.Thread.sleep(writer_locked_retry_sleep_ns);
-    }
+    platform.time.yieldBriefly();
+    platform.time.sleepNs(writer_locked_retry_sleep_ns);
 }
 
 fn sleepRetryBackoff(sleep_ns: u64) void {
     if (comptime builtin.os.tag == .freestanding) return;
-    std.Thread.yield() catch {};
-    if (@hasDecl(std.Thread, "sleep")) {
-        std.Thread.sleep(sleep_ns);
-    }
+    platform.time.yieldBriefly();
+    platform.time.sleepNs(sleep_ns);
 }
 
 fn transientEmbedRetrySleepNs(attempt: u32) u64 {
@@ -3029,8 +3025,115 @@ fn appendRuntimeDocumentUnitChunkWrites(
                 });
             }
 
+            if (mode == .publish_replay) {
+                try appendRuntimeDocumentUnitChunkDenseEmbeddingWrites(runtime, doc_key, chunk_key, entry.name, entry.source_field, chunk, window);
+                try appendRuntimeDocumentUnitChunkSparseEmbeddingWrites(runtime, chunk_key, entry.name, chunk, window);
+            }
+
             _ = arena_state.reset(.retain_capacity);
         }
+    }
+}
+
+fn appendRuntimeDocumentUnitChunkDenseEmbeddingWrites(
+    runtime: *EnrichmentRuntime,
+    doc_key: []const u8,
+    chunk_key: []const u8,
+    chunk_artifact_name: []const u8,
+    source_field: []const u8,
+    chunk: chunker_mod.Chunk,
+    window: *GeneratedReplayWindow,
+) !void {
+    const chunk_text = chunk.text orelse return;
+    const dense_embedder = runtime.config.dense_embedder orelse return;
+
+    for (runtime.index_manager.enrichments.items) |entry| {
+        if (entry.kind != .embedding) continue;
+        if (!std.mem.eql(u8, entry.source_artifact_name, chunk_artifact_name)) continue;
+        if (entry.expected_dims == 0) continue;
+
+        const consumer_indexes = try runtime.index_manager.denseIndexesForEmbedding(runtime.alloc, entry.name, entry.expected_dims);
+        defer {
+            for (consumer_indexes) |name| runtime.alloc.free(name);
+            runtime.alloc.free(consumer_indexes);
+        }
+        if (consumer_indexes.len == 0) continue;
+
+        const source_hash = enrichment_artifact_codec.hashSource(chunk_text);
+        const artifact_key = try embeddingArtifactKey(runtime, chunk_key, entry.name);
+        defer runtime.alloc.free(artifact_key);
+        if (try shouldSkipEmbeddingArtifact(runtime, artifact_key, source_hash)) {
+            try appendCachedDenseEmbeddingToWindow(runtime, window, chunk_key, artifact_key, consumer_indexes);
+            continue;
+        }
+
+        const vector = try embedDenseWithRetry(dense_embedder, runtime, entry.name, chunk_text, entry.expected_dims);
+        defer runtime.alloc.free(vector);
+        try writeEmbeddingArtifact(runtime, .{
+            .base_key = chunk_key,
+            .parent_doc_key = doc_key,
+            .artifact_name = entry.name,
+            .source_field = source_field,
+            .source_key = chunk_key,
+            .source_hash = source_hash,
+            .vector = vector,
+        });
+
+        var embeddings = try singleDenseEmbeddingForConsumers(runtime, chunk_key, artifact_key, vector, consumer_indexes);
+        defer {
+            for (embeddings) |embedding| freeDerivedDenseEmbedding(runtime.alloc, embedding);
+            if (embeddings.len > 0) runtime.alloc.free(embeddings);
+        }
+        try appendOwnedDenseEmbeddingsToWindow(runtime, window, &embeddings);
+    }
+}
+
+fn appendRuntimeDocumentUnitChunkSparseEmbeddingWrites(
+    runtime: *EnrichmentRuntime,
+    chunk_key: []const u8,
+    chunk_artifact_name: []const u8,
+    chunk: chunker_mod.Chunk,
+    window: *GeneratedReplayWindow,
+) !void {
+    const chunk_text = chunk.text orelse return;
+    const sparse_embedder = runtime.config.sparse_embedder orelse return;
+
+    for (runtime.index_manager.enrichments.items) |entry| {
+        if (entry.kind != .embedding) continue;
+        if (!std.mem.eql(u8, entry.source_artifact_name, chunk_artifact_name)) continue;
+        if (entry.expected_dims != 0) continue;
+
+        const consumer_indexes = try runtime.index_manager.sparseIndexesForEmbedding(runtime.alloc, entry.name);
+        defer {
+            for (consumer_indexes) |name| runtime.alloc.free(name);
+            runtime.alloc.free(consumer_indexes);
+        }
+        if (consumer_indexes.len == 0) continue;
+
+        const source_hash = enrichment_artifact_codec.hashSource(chunk_text);
+        const artifact_key = try embeddingArtifactKey(runtime, chunk_key, entry.name);
+        defer runtime.alloc.free(artifact_key);
+        if (try shouldSkipEmbeddingArtifact(runtime, artifact_key, source_hash)) {
+            try appendCachedSparseEmbeddingToWindow(runtime, window, chunk_key, artifact_key, consumer_indexes);
+            continue;
+        }
+
+        var sparse = try embedSparseWithRetry(sparse_embedder, runtime, entry.name, chunk_text);
+        defer sparse.deinit(runtime.alloc);
+        try writeSparseEmbeddingArtifact(runtime, chunk_key, entry.name, source_hash, sparse.indices, sparse.values);
+
+        var embeddings = try singleSparseEmbeddingForConsumers(runtime, chunk_key, artifact_key, sparse.indices, sparse.values, consumer_indexes);
+        defer {
+            for (embeddings) |embedding| {
+                runtime.alloc.free(@constCast(embedding.index_name));
+                runtime.alloc.free(@constCast(embedding.doc_key));
+                if (embedding.artifact_key) |key| runtime.alloc.free(@constCast(key));
+                if (embedding.indices.len > 0) runtime.alloc.free(@constCast(embedding.indices));
+                if (embedding.values.len > 0) runtime.alloc.free(@constCast(embedding.values));
+            }
+            if (embeddings.len > 0) runtime.alloc.free(embeddings);
+        }
+        try appendOwnedSparseEmbeddingsToWindow(runtime, window, &embeddings);
     }
 }
 

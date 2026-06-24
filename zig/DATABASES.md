@@ -101,6 +101,42 @@ resolution. Renaming a namespace or table should update catalog metadata without
 rewriting storage keys unless the storage layer has a deliberate identity
 rewrite plan.
 
+## Physical Storage Identity
+
+`database.namespace.table` is the logical catalog name. It is the name users see
+in SQL, REST, MCP, A2A, CLI, audit logs, grants, and table listings. It should
+not be the long-term physical storage key.
+
+The storage layer should route by stable IDs derived from the catalog table
+record:
+
+```text
+table:<table_id>
+range:<range_id>
+shard:<shard_id>
+```
+
+The table name, database name, and namespace name are mutable catalog metadata.
+The table ID and range IDs are the durable storage and routing identity. A table
+rename, namespace move, or future schema search-path change should update
+catalog rows and authorization resources without requiring LSM, HBC, full text,
+algebraic, backup, restore, lake-cache, or serverless-index storage to be
+rewritten.
+
+Current compatibility storage names are transitional:
+
+```text
+users                         # legacy shorthand for default.public.users
+tenant_ops.analytics.events   # compatibility qualified table name
+```
+
+Those strings may remain lookup aliases while old APIs and existing on-disk
+state migrate. New code should carry both the resolved logical target and the
+catalog table record, then derive backend storage identity from `table_id` and
+range metadata. Tablespaces stay separate from physical names: they select
+placement, storage class, replica policy, cache/lake policy, retention, and
+compliance behavior, but do not become path prefixes.
+
 ## Tablespaces
 
 Tablespaces should model placement and storage-class policy, not local
@@ -243,12 +279,30 @@ Explicit table I/O routes pass a typed catalog target through the REST and
 read/write API boundary. Provisioned and hosted table read/write sources expose
 native catalog-target vtable methods for query, batch, indexes, runtime status,
 table lifecycle, backup, and restore calls. Those methods resolve the catalog
-table first and use the qualified `database.namespace.table` resource as the
-backend table identity, including `default.public` when the explicit catalog
-route is used. Direct foreign-source query dispatch keys the source metadata by
-the same typed catalog target instead of a compatibility storage key. Legacy
-`/tables/{table}` shorthand still maps to `default.public.{table}` before
-authorization and routing.
+table first, keep the typed logical target for authorization and audit, and pass
+the stable `table_id` / range identity to backend storage. Direct foreign-source
+query dispatch keys the source metadata by the same typed catalog target instead
+of a compatibility storage key. Legacy `/tables/{table}` shorthand still maps
+to `default.public.{table}` before authorization and routing, but the backend
+storage identity should be derived from the catalog table record after
+resolution.
+
+While the current read/write APIs still carry a single table string through
+catalog lookup and backend open/cache paths, `storageTableNameForTargetAlloc` is
+a compatibility bridge. It preserves the legacy raw table name for
+`default.public.<table>` and a qualified string for non-default targets. The
+long-term handler shape is:
+
+```text
+CatalogTableOperation {
+  logical_target: TableTarget,
+  table_record: TableRecord,
+  physical_identity: table:<table_id> plus range/shard metadata
+}
+```
+
+Callers should not build physical storage names from logical names once that
+operation model is available.
 
 MCP tools should be catalog-aware wrappers over those OpenAPI operations:
 
@@ -451,10 +505,10 @@ Transitional bridge:
 
 1. Public explicit catalog table I/O routes (`query`, `batch`, `rows/batch`,
    `documents/{key}`, `indexes`, `backup`, and `restore`) resolve typed catalog
-   targets first, then use catalog-aware read/write vtable methods. Physical
-   backup/restore still consumes the backend's native snapshot layout, but
-   explicit catalog dispatch no longer converts through compatibility storage
-   keys.
+   targets first, then use catalog-aware read/write vtable methods. The current
+   implementation still uses compatibility storage names where a backend entry
+   point only accepts one table string; the bridge must disappear once those
+   entry points accept both logical target and physical table identity.
 2. MCP table tools call those same public routes and inherit the same typed
    target resolution.
 3. A2A query-builder and retrieval task handlers normalize explicit
@@ -482,6 +536,12 @@ Production hardening now in place:
 
 Future expansion:
 
-1. Teach placement/storage schedulers to consume future tablespace policy fields
+1. Split table read/write internals so catalog lookup returns a `TableRecord`
+   and backend open/cache/routing consumes `table:<table_id>` plus range/shard
+   identity. Compatibility names remain aliases only for migration and rollback.
+2. Migrate LSM, HBC, full text, algebraic, document-row, backup/restore,
+   lake-cache, and serverless-index metadata to table-id physical identity.
+   Group and range resolution should never depend on mutable human table names.
+3. Teach placement/storage schedulers to consume future tablespace policy fields
    for storage class, lake tier, retention, encryption, and compliance once
    those native schedulers exist.

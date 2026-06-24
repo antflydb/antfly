@@ -17843,6 +17843,7 @@ pub fn parseQueryPlanAlloc(
     tokens: []const Token,
     pos: *usize,
     params: []const value_mod.SqlValue,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
     cte_hooks: plan_mod.CteSelectParserHooks,
     query_hooks: QueryPlanParserHooks,
     tail_hooks: plan_mod.SimpleSelectSetTailHooks,
@@ -17858,7 +17859,7 @@ pub fn parseQueryPlanAlloc(
             if (rhs.ctes.len != 0) return error.UnsupportedSqlShape;
             if (lowered.system_time_as_of_sequence != null or rhs.system_time_as_of_sequence != null) return error.UnsupportedSqlShape;
             try applySimpleSelectSetOperationAlloc(alloc, &lowered, rhs, op);
-            try plan_mod.parseSimpleSelectSetResultTailAlloc(alloc, tokens, pos, params, &lowered, tail_hooks);
+            try plan_mod.parseSimpleSelectSetResultTailAlloc(alloc, tokens, pos, params, generated_read_ast, &lowered, tail_hooks);
         }
         var base_table_name: ?[]const u8 = null;
         defer if (base_table_name) |table| alloc.free(table);
@@ -17904,7 +17905,7 @@ pub fn parseQueryPlanAlloc(
         try plan_mod.resolveSelectSourceForPlanAlloc(alloc, &rhs, ctes, &base_table_name);
         if (final.system_time_as_of_sequence != null or rhs.system_time_as_of_sequence != null) return error.UnsupportedSqlShape;
         try applySimpleSelectSetOperationAlloc(alloc, &final, rhs, op);
-        try plan_mod.parseSimpleSelectSetResultTailAlloc(alloc, tokens, pos, params, &final, tail_hooks);
+        try plan_mod.parseSimpleSelectSetResultTailAlloc(alloc, tokens, pos, params, generated_read_ast, &final, tail_hooks);
     }
     if (parser.matchToken(tokens, pos, .semicolon) != null and !parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
     if (!parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
@@ -25113,6 +25114,20 @@ fn generatedReadAstForParsedSql(
     return null;
 }
 
+fn generatedQueryPlanReadAstForParsedSql(
+    parsed_sql: *const tokenized.ParsedSql,
+) ?*const generated_parser.GeneratedSqlReadAst {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            return switch (generated_ast.*) {
+                .read => |*read| if ((read.kind == .query or read.kind == .set_operation) and read.cte_tokens == null) read else null,
+                else => null,
+            };
+        }
+    }
+    return null;
+}
+
 fn generatedCteReadAstForParsedSql(
     parsed_sql: *const tokenized.ParsedSql,
 ) ?*const generated_parser.GeneratedSqlReadAst {
@@ -25167,13 +25182,14 @@ fn lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
         .schema = schema,
         .params = params,
         .function_bindings = function_bindings,
-        .generated_read_ast = if (cte_adapter_shape) generatedCteReadAstForParsedSql(parsed_sql) else generatedReadAstForParsedSql(parsed_sql, .query),
+        .generated_read_ast = if (cte_adapter_shape) generatedCteReadAstForParsedSql(parsed_sql) else generatedQueryPlanReadAstForParsedSql(parsed_sql),
     };
     var lowered = parseQueryPlanAlloc(
         alloc,
         tokens,
         &parser_state.pos,
         params,
+        parser_state.generated_read_ast,
         parser_context.ParserState.ContextAccessors.cteSelectParserHooks(&parser_state),
         parser_context.ParserState.ContextAccessors.queryPlanParserHooks(&parser_state),
         parser_context.ParserState.ContextAccessors.simpleSelectSetTailHooks(&parser_state),
@@ -28707,6 +28723,27 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms" {
     defer set_operation.deinit(alloc);
     try std.testing.expect(set_operation.limit == null);
     try std.testing.expectEqual(@as(u32, 2), set_operation.offset);
+
+    var malformed_generated_simple_set_tail = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' UNION SELECT id FROM usage_records WHERE status = 'closed' LIMIT 10",
+    );
+    defer malformed_generated_simple_set_tail.deinit(alloc);
+    if (malformed_generated_simple_set_tail.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |*read| read.limit_tokens = .{ .start = 3, .end = 4 },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_simple_set_tail,
+        schema,
+        &.{},
+        .{},
+    ));
 
     var malformed_generated_set_operation_pagination = try tokenized.ParsedSql.initAlloc(
         alloc,

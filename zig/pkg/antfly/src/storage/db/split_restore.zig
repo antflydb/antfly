@@ -13,17 +13,19 @@
 // limitations.
 
 const std = @import("std");
-const builtin = @import("builtin");
-
+const platform = @import("antfly_platform");
 const fs_paths = @import("../../common/fs_paths.zig");
 const docstore_mod = @import("../docstore.zig");
+const ha_replication = @import("ha_replication.zig");
 const internal_keys = @import("../internal_keys.zig");
 const lsm_backend_mod = @import("../lsm_backend/mod.zig");
 const shard_mod = @import("../shard.zig");
 const artifact_replay = @import("artifact_replay.zig");
 const db_config = @import("config.zig");
 const db_core = @import("core.zig");
+const db_internal = @import("internal.zig");
 const doc_identity = @import("doc_identity.zig");
+const lifecycle = @import("lifecycle.zig");
 const mapper = @import("document_mapper.zig");
 const apply_state = @import("derived/apply_state.zig");
 const range_state_mod = @import("range_state.zig");
@@ -34,10 +36,10 @@ const index_manager_mod = @import("catalog/index_manager.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
-fn threadedIo() if (builtin.os.tag == .freestanding) void else std.Io.Threaded {
-    if (builtin.os.tag == .freestanding) return;
-    return std.Io.Threaded.init(std.heap.page_allocator, .{});
-}
+const putLeakyJsonStringField = db_internal.putLeakyJsonStringField;
+const putLeakyJsonU64Field = db_internal.putLeakyJsonU64Field;
+
+const threadedIo = db_internal.threadedIo;
 
 fn ensureDirPath(path: []const u8) !void {
     if (path.len == 0) return;
@@ -63,9 +65,26 @@ fn isBaseDocumentStoreKeyForMode(relational_base_rows: bool, key: []const u8) bo
     return internal_keys.isPrimaryDocumentKey(key);
 }
 
+fn skipNonPrimaryMedianKey(key: []const u8) bool {
+    return !internal_keys.isPrimaryDocumentKey(key);
+}
+
+fn skipNonRelationalMedianKey(key: []const u8) bool {
+    return !internal_keys.isRelationalRowKey(key);
+}
+
 fn isSplitMetadataKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, "splitstate:") or
         std.mem.startsWith(u8, key, "splitdelta:");
+}
+
+fn jsonObjectOptionalU64(object: std.json.ObjectMap, field_name: []const u8) !?u64 {
+    const value = object.get(field_name) orelse return null;
+    return switch (value) {
+        .integer => |int_value| if (int_value >= 0) @as(u64, @intCast(int_value)) else error.InvalidArgument,
+        .number_string => |text| std.fmt.parseUnsigned(u64, text, 10) catch error.InvalidArgument,
+        else => error.InvalidArgument,
+    };
 }
 
 fn identityMetadataRange() struct { lower: [1]u8, upper: [1]u8 } {
@@ -844,6 +863,40 @@ pub fn Impl(comptime DB: type) type {
     return struct {
         const Self = @This();
 
+        pub fn updateRange(self: *DB, byte_range: types.ByteRange) !void {
+            if (lifecycle.openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+            try ha_replication.enforceWriteGateOptional(self.ha_write_gate);
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            try self.core.updateRange(byte_range);
+        }
+
+        pub fn getRange(self: *DB) types.ByteRange {
+            return self.core.byteRange();
+        }
+
+        pub fn findMedianKey(self: *DB, alloc: Allocator) ![]u8 {
+            const byte_range = Self.getRange(self);
+            const lower = try self.core.documentRangeLowerAlloc(byte_range.start);
+            defer self.core.alloc.free(lower);
+            const upper = if (byte_range.end.len > 0) try self.core.documentRangeUpperAlloc(byte_range.end) else null;
+            defer if (upper) |buf| self.core.alloc.free(buf);
+
+            const skip_fn = if (self.relationalColumnsForStore() != null)
+                &skipNonRelationalMedianKey
+            else
+                &skipNonPrimaryMedianKey;
+            const internal_key = self.core.findMedianStoreKey(alloc, lower, if (upper) |buf| buf else "", .{
+                .skip_fn = skip_fn,
+            }) catch |err| switch (err) {
+                error.NotFound => return try doc_identity.findMedianDocIdAlloc(alloc, self.core.store, byte_range.start, byte_range.end),
+                else => return err,
+            };
+            defer alloc.free(internal_key);
+
+            return (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, internal_key)) orelse error.NotFound;
+        }
+
         fn tryFinalizePrimarySplitFast(self: *DB, split_lower: []const u8) !bool {
             const owner_fast = try self.core.primary_store_owner.rewriteLeftInPlace(split_lower);
             if (owner_fast) return true;
@@ -1140,7 +1193,7 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn getSplitState(self: *DB, alloc: Allocator) !?types.SplitState {
-            self.splitRestoreLockApplyShared();
+            self.core.lockApplyShared();
             defer self.core.unlockApplyShared();
             const state = self.core.splitState() orelse return null;
             return .{
@@ -1153,7 +1206,7 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn setSplitState(self: *DB, state: ?types.SplitState) !void {
-            self.splitRestoreLockApply();
+            self.core.lockApply();
             defer self.core.unlockApply();
             if (state == null) {
                 try self.core.setSplitState(null);
@@ -1181,19 +1234,19 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn setSplitDeltaFinalSeq(self: *DB, seq: u64) !void {
-            self.splitRestoreLockApply();
+            self.core.lockApply();
             defer self.core.unlockApply();
             try self.core.saveSplitDeltaFinalSeq(seq);
         }
 
         pub fn clearSplitDeltaFinalSeq(self: *DB) !void {
-            self.splitRestoreLockApply();
+            self.core.lockApply();
             defer self.core.unlockApply();
             try self.core.clearSplitDeltaFinalSeq();
         }
 
         pub fn listSplitDeltaEntriesAfter(self: *DB, alloc: Allocator, after_seq: u64) ![]types.SplitDeltaEntry {
-            self.splitRestoreLockApplyShared();
+            self.core.lockApplyShared();
             defer self.core.unlockApplyShared();
 
             const deltas = try self.core.listSplitDeltasAfter(alloc, after_seq);
@@ -1236,17 +1289,17 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn clearSplitDeltaEntries(self: *DB) !void {
-            self.splitRestoreLockApply();
+            self.core.lockApply();
             defer self.core.unlockApply();
             try self.core.clearSplitDeltas();
         }
 
         pub fn createShadowIndexManager(self: *DB, split_key: []const u8, original_range_end: []const u8) !void {
-            self.splitRestoreLockApply();
+            self.core.lockApply();
             defer self.core.unlockApply();
             if (self.shadow != null) return error.ShadowIndexManagerExists;
 
-            const base_path = try std.fmt.allocPrint(self.alloc, "{s}/.shadow-{d}", .{ self.core.path, self.splitRestoreMonotonicTimeNs() });
+            const base_path = try std.fmt.allocPrint(self.alloc, "{s}/.shadow-{d}", .{ self.core.path, platform.time.monotonicNs() });
             errdefer self.alloc.free(base_path);
             const indexes_path = try std.fmt.allocPrint(self.alloc, "{s}/indexes", .{base_path});
             errdefer self.alloc.free(indexes_path);
@@ -1296,6 +1349,153 @@ pub fn Impl(comptime DB: type) type {
             return shadow.indexes_path;
         }
 
+        pub fn shouldAppendSplitDelta(self: *DB) bool {
+            const state = self.core.splitState() orelse return false;
+            return state.phase == .splitting;
+        }
+
+        pub fn splitShadowRequiresMaterializedDerivedBatch(self: *DB) bool {
+            if (self.shadow == null) return false;
+            const state = self.core.splitState() orelse return false;
+            return state.phase == .splitting;
+        }
+
+        pub fn rebuildGraphIndexesForTargetCoverage(self: *DB, alloc: Allocator) !void {
+            try applySplitGraphArtifactsInRange(
+                alloc,
+                "",
+                "",
+                self.core.store,
+                self.core.index_manager,
+            );
+        }
+
+        pub fn markSplitOffDocumentArtifactChildRangesLocked(
+            self: *DB,
+            split_state: shard_mod.SplitState,
+            split_lower: []const u8,
+        ) !void {
+            if (split_state.new_shard_id == 0) return;
+
+            const parent_lower = try documentRangeLowerAlloc(self.alloc, self.core.byteRange().start);
+            defer self.alloc.free(parent_lower);
+            const parent_upper = split_lower;
+            const split_upper = if (split_state.original_range_end.len > 0)
+                try documentRangeUpperAlloc(self.alloc, split_state.original_range_end)
+            else
+                null;
+            defer if (split_upper) |upper| self.alloc.free(upper);
+
+            const scanned = try self.core.scanStoreRange(self.alloc, parent_lower, parent_upper);
+            defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
+
+            var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+            defer writes.deinit(self.alloc);
+            var owned_values = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (owned_values.items) |value| self.alloc.free(value);
+                owned_values.deinit(self.alloc);
+            }
+            var changed_artifact_keys = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (changed_artifact_keys.items) |key| self.alloc.free(key);
+                changed_artifact_keys.deinit(self.alloc);
+            }
+
+            for (scanned) |entry| {
+                if (std.mem.indexOf(u8, entry.value, "\"child_ranges\"") == null) continue;
+                var artifact_ref = (try db_internal.decodeArtifactRefIfKnownAlloc(self.alloc, entry.key)) orelse continue;
+                defer artifact_ref.deinit(self.alloc);
+                if (artifact_ref.kind != .asset or artifact_ref.unit_id != null) continue;
+
+                var arena = std.heap.ArenaAllocator.init(self.alloc);
+                defer arena.deinit();
+                const arena_alloc = arena.allocator();
+                var manifest_value = try std.json.parseFromSliceLeaky(std.json.Value, arena_alloc, entry.value, .{ .allocate = .alloc_always });
+                if (manifest_value != .object) continue;
+                const child_ranges = manifest_value.object.getPtr("child_ranges") orelse continue;
+                if (child_ranges.* != .array) continue;
+
+                var changed = false;
+                for (child_ranges.array.items) |*item| {
+                    if (item.* != .object) continue;
+                    if (!documentArtifactChildRangeMovedBySplit(item.object, split_lower, split_upper)) continue;
+                    try putLeakyJsonStringField(arena_alloc, &item.object, "placement", "remote");
+                    try putLeakyJsonU64Field(arena_alloc, &item.object, "owner_group_id", split_state.new_shard_id);
+                    try putLeakyJsonU64Field(arena_alloc, &item.object, "placement_generation", (try jsonObjectOptionalU64(item.object, "placement_generation") orelse 0) + 1);
+                    try putLeakyJsonStringField(arena_alloc, &item.object, "route_status", "remote_committed");
+                    try item.object.put(arena_alloc, "split_eligible", .{ .bool = false });
+                    changed = true;
+                }
+                if (!changed) continue;
+
+                const updated_manifest = try std.json.Stringify.valueAlloc(self.alloc, manifest_value, .{});
+                errdefer self.alloc.free(updated_manifest);
+                try owned_values.append(self.alloc, updated_manifest);
+                try writes.append(self.alloc, .{
+                    .key = entry.key,
+                    .value = updated_manifest,
+                });
+                try db_internal.appendUniqueOwnedKey(self.alloc, &changed_artifact_keys, entry.key);
+            }
+
+            if (writes.items.len == 0) return;
+            const sequence = self.core.reserveDerivedAppendSequence();
+            var batch_ctx = self.batchContext();
+            const replay_payload = try DB.WritePathCallbacks.encode_change_record_payload_context(&batch_ctx, .{
+                .sequence = sequence,
+                .changed_artifact_keys = changed_artifact_keys.items,
+            }, sequence);
+            defer self.alloc.free(replay_payload);
+            try self.core.store.putBatchWithReplay(self.backend_runtime.io(), writes.items, &.{}, .{
+                .sequence = sequence,
+                .payload = replay_payload,
+            });
+            DB.WritePathCallbacks.mirror_ha_replay_payload_best_effort(self, replay_payload);
+            if (DB.WritePathCallbacks.should_append_split_delta(self)) {
+                try self.core.appendSplitDelta(DB.WritePathCallbacks.current_time_ns(), writes.items, &.{});
+            }
+            self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
+        }
+
+        fn documentArtifactChildRangeMovedBySplit(
+            object: std.json.ObjectMap,
+            split_lower: []const u8,
+            split_upper: ?[]const u8,
+        ) bool {
+            const split_eligible = blk: {
+                const value = object.get("split_eligible") orelse break :blk false;
+                if (value != .bool) return false;
+                break :blk value.bool;
+            };
+            if (!split_eligible) return false;
+
+            const placement = object.get("placement") orelse return false;
+            if (placement != .string) return false;
+            if (std.mem.eql(u8, placement.string, "remote")) return false;
+
+            if (object.get("owner_group_id")) |owner| {
+                if (owner == .integer and owner.integer > 0) return false;
+            }
+
+            const route_status = object.get("route_status") orelse null;
+            if (route_status) |status| {
+                if (status != .string) return false;
+                if (std.mem.eql(u8, status.string, "remote_committed")) return false;
+            }
+
+            const start_key = object.get("start_key") orelse return false;
+            if (start_key != .string) return false;
+            if (std.mem.order(u8, start_key.string, split_lower) == .lt) return false;
+            const end_key = object.get("end_key_exclusive") orelse return false;
+            if (end_key != .string) return false;
+            if (split_upper) |upper| {
+                if (end_key.string.len == 0) return false;
+                if (std.mem.order(u8, end_key.string, upper) == .gt) return false;
+            }
+            return true;
+        }
+
         pub fn split(
             self: *DB,
             curr_range: types.ByteRange,
@@ -1309,7 +1509,7 @@ pub fn Impl(comptime DB: type) type {
                 const target_sequence = self.core.nextDerivedSequence();
                 try self.runMaintenanceUntil(target_sequence, .{});
 
-                self.splitRestoreLockApply();
+                self.core.lockApply();
                 if (self.core.nextDerivedSequence() == target_sequence) break;
                 self.core.unlockApply();
             }
@@ -1337,7 +1537,7 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn finalizeSplit(self: *DB, new_range: types.ByteRange) !void {
-            self.splitRestoreLockApply();
+            self.core.lockApply();
             defer self.core.unlockApply();
             try Self.finalizeSplitLocked(self, new_range);
         }
@@ -1368,7 +1568,7 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn snapshot(self: *DB, id: []const u8) !u64 {
-            self.splitRestoreLockApply();
+            self.core.lockApply();
             defer self.core.unlockApply();
 
             try self.core.syncStore(true);
@@ -1382,7 +1582,7 @@ pub fn Impl(comptime DB: type) type {
 
         pub fn restoreSnapshotStoreTo(alloc: Allocator, snapshot_root: []const u8, path: []const u8, opts: anytype, restore_identity: ?RestoreIdentity) !void {
             if (restore_identity) |identity| try beginRestoreImport(alloc, path, snapshot_root, identity);
-            var opened_primary = try DB.splitRestoreOpenPrimaryStore(alloc, path, .{
+            var opened_primary = try lifecycle.openPrimaryStore(alloc, path, .{
                 .map_size = opts.map_size,
                 .no_sync = opts.no_sync,
                 .primary_backend = opts.primary_backend,
@@ -1656,7 +1856,7 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn rebuildGraphDerivedState(self: *DB) !usize {
-            self.splitRestoreLockApply();
+            self.core.lockApply();
             defer self.core.unlockApply();
             return try self.core.index_manager.rebuildGraphSplitDestination(
                 self.getRange().start,

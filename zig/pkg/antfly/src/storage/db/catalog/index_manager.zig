@@ -72,8 +72,7 @@ const zig_lmdb = if (builtin.is_test) @import("lmdb_engine") else struct {
 };
 
 fn getenv(name: [*:0]const u8) ?[*:0]u8 {
-    if (!builtin.link_libc) return null;
-    return std.c.getenv(name);
+    return platform.env.getenvZ(name);
 }
 
 const index_catalog_key = "\x00\x00__metadata__:indexes";
@@ -1329,18 +1328,7 @@ pub const IndexManager = struct {
     }
 
     fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {
-        var attempts: usize = 0;
-        while (!mutex.tryLock()) : (attempts += 1) {
-            if (builtin.os.tag == .freestanding or builtin.single_threaded) {
-                std.atomic.spinLoopHint();
-                continue;
-            }
-            if (attempts < 64) {
-                std.atomic.spinLoopHint();
-                continue;
-            }
-            std.Thread.yield() catch {};
-        }
+        platform.sync.lockYielding(mutex);
     }
 
     pub fn lockManagedIndexApply(self: *IndexManager, index_ref: ManagedIndexRef) !ManagedIndexApplyGuard {
@@ -11874,10 +11862,7 @@ pub const IndexManager = struct {
         candidate: []const f32,
         metric: vector_mod.DistanceMetric,
     ) f32 {
-        return switch (metric) {
-            .cosine => if (query_measure == 0) 1.0 else 1.0 - (vector_mod.dot(query, candidate) / query_measure),
-            else => vector_mod.distanceToQuery(query, query_measure, candidate, metric),
-        };
+        return vector_mod.distanceToQuery(query, query_measure, candidate, metric);
     }
 
     fn loadDenseVectorArtifactForHbc(
@@ -13316,7 +13301,7 @@ fn openTextPersistentIndexWithRetry(
     opts: persistent_mod.PersistentIndexOptions,
 ) !persistent_mod.PersistentIndex {
     const max_attempts: usize = 6;
-    const debug_open = std.c.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
+    const debug_open = getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         if (debug_open) {

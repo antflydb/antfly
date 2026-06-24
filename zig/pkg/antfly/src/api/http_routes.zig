@@ -119,6 +119,7 @@ pub const Routes = struct {
     pub const query_preflight_suffix = "/query-preflight";
     pub const text_stats_suffix = "/text-stats";
     pub const algebraic_partials_suffix = "/algebraic-partials";
+    pub const document_algebraic_aggregate_suffix = "/document-algebraic-aggregate";
     pub const join_partition_suffix = "/join-partition";
     pub const join_rows_suffix = "/join-rows";
     pub const join_unmatched_suffix = "/join-unmatched";
@@ -385,6 +386,11 @@ pub const Routes = struct {
     };
 
     pub const GroupAlgebraicPartials = struct {
+        group_id: u64,
+        table_name: []const u8,
+    };
+
+    pub const GroupDocumentAlgebraicAggregate = struct {
         group_id: u64,
         table_name: []const u8,
     };
@@ -1221,6 +1227,16 @@ pub const Routes = struct {
         return .{ .group_id = group.group_id, .table_name = table_name };
     }
 
+    pub fn matchGroupDocumentAlgebraicAggregate(path: []const u8) ?GroupDocumentAlgebraicAggregate {
+        const group = parseGroupPrefix(path) orelse return null;
+        const rest = group.rest;
+        if (!std.mem.startsWith(u8, rest, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, rest, document_algebraic_aggregate_suffix)) return null;
+        const table_name = rest[tables_prefix.len .. rest.len - document_algebraic_aggregate_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .group_id = group.group_id, .table_name = table_name };
+    }
+
     pub fn matchGroupJoinPartition(path: []const u8) ?GroupJoinPartition {
         const group = parseGroupPrefix(path) orelse return null;
         const rest = group.rest;
@@ -1769,6 +1785,9 @@ test "public api routes compile" {
     const algebraic_partials = Routes.matchGroupAlgebraicPartials("/internal/v1/groups/42/tables/docs/algebraic-partials").?;
     try std.testing.expectEqual(@as(u64, 42), algebraic_partials.group_id);
     try std.testing.expectEqualStrings("docs", algebraic_partials.table_name);
+    const document_algebraic_aggregate = Routes.matchGroupDocumentAlgebraicAggregate("/internal/v1/groups/42/tables/docs/document-algebraic-aggregate").?;
+    try std.testing.expectEqual(@as(u64, 42), document_algebraic_aggregate.group_id);
+    try std.testing.expectEqualStrings("docs", document_algebraic_aggregate.table_name);
     const table_path = Routes.matchTablePath("/tables/docs").?;
     try std.testing.expectEqualStrings("docs", table_path.table_name);
     const user_path = Routes.matchUserPath("/auth/v1/users/alice").?;

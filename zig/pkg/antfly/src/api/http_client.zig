@@ -953,6 +953,42 @@ pub const ApiHttpClient = struct {
         return .{ .body = try self.alloc.dupe(u8, resp.body) };
     }
 
+    pub fn fetchGroupDocumentAlgebraicAggregate(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !QueryResponse {
+        const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
+            routes.Routes.tables_prefix,
+            table_name,
+            routes.Routes.document_algebraic_aggregate_suffix,
+        });
+        defer self.alloc.free(suffix);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{ routes.Routes.internal_groups_prefix, group_id, suffix });
+        defer self.alloc.free(path);
+        const uri = try raft_routes.Routes.join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executor.execute(self.alloc, .{
+            .method = .POST,
+            .uri = uri,
+            .content_type = "application/json",
+            .body = body,
+        });
+        defer resp.deinit(self.alloc);
+        switch (resp.status) {
+            200 => {},
+            409 => return remoteGroupConflictError(resp.body),
+            424 => return remoteDocumentAlgebraicAggregateUnavailableError(resp.body),
+            404 => return remoteDocumentAlgebraicAggregateNotFoundError(resp.body),
+            400 => return remoteDocumentAlgebraicAggregateBadRequestError(resp.body),
+            else => return error.UnexpectedHttpStatus,
+        }
+        return .{ .body = try self.alloc.dupe(u8, resp.body) };
+    }
+
     pub fn fetchGroupJoinFinalize(
         self: *ApiHttpClient,
         base_uri: []const u8,
@@ -2876,6 +2912,23 @@ fn remoteGroupConflictError(body: []const u8) anyerror {
     if (std.mem.eql(u8, body, "foreign key action limit exceeded")) return error.ForeignKeyActionLimitExceeded;
     if (std.mem.eql(u8, body, "foreign key action job claim busy")) return error.ForeignKeyIntegrityClaimBusy;
     return error.UnexpectedHttpStatus;
+}
+
+fn remoteDocumentAlgebraicAggregateBadRequestError(body: []const u8) anyerror {
+    if (std.mem.eql(u8, body, "InvalidQueryRequest")) return error.InvalidQueryRequest;
+    if (std.mem.eql(u8, body, "UnsupportedQueryRequest")) return error.UnsupportedQueryRequest;
+    return error.UnexpectedHttpStatus;
+}
+
+fn remoteDocumentAlgebraicAggregateUnavailableError(body: []const u8) anyerror {
+    if (std.mem.eql(u8, body, "DocumentSqlIndexUnavailable")) return error.DocumentSqlIndexUnavailable;
+    return error.UnexpectedHttpStatus;
+}
+
+fn remoteDocumentAlgebraicAggregateNotFoundError(body: []const u8) anyerror {
+    if (std.mem.eql(u8, body, "TableNotFound")) return error.TableNotFound;
+    if (std.mem.eql(u8, body, "UnknownGroup")) return error.UnknownGroup;
+    return error.NotFound;
 }
 
 fn remoteGroupTxnPrepareConflictError(body: []const u8) anyerror {

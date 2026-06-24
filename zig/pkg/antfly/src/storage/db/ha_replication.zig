@@ -21,6 +21,9 @@ const ha_primary_mod = @import("../ha/primary.zig");
 const ha_session_mod = @import("../ha/session.zig");
 const ha_standby_mod = @import("../ha/standby.zig");
 const ha_write_gate_mod = @import("../ha/write_gate.zig");
+const docstore_mod = @import("../docstore.zig");
+const internal_keys = @import("../internal_keys.zig");
+const ha_replication_record_mod = @import("../ha/replication_record.zig");
 const schema_mod = @import("../schema.zig");
 const types = @import("types.zig");
 
@@ -142,6 +145,114 @@ pub const WriteGate = union(enum) {
     fenced_primary: ha_write_gate_mod.FencedPrimary,
     standby: *ha_standby_mod.Standby,
 };
+
+pub const applied_lsn_value_len: usize = @sizeOf(u64);
+
+pub fn appliedReplicationLsnWrite(lsn: u64, value_buf: *[applied_lsn_value_len]u8) docstore_mod.KVPair {
+    std.mem.writeInt(u64, value_buf, lsn, .little);
+    return .{
+        .key = internal_keys.ha_applied_lsn_key[0..],
+        .value = value_buf[0..],
+    };
+}
+
+pub fn readAppliedReplicationLsn(alloc: Allocator, store: *docstore_mod.DocStore) !u64 {
+    const raw = store.get(alloc, internal_keys.ha_applied_lsn_key[0..]) catch |err| switch (err) {
+        error.NotFound => return 0,
+        else => return err,
+    };
+    defer alloc.free(raw);
+    if (raw.len != applied_lsn_value_len) return error.CorruptHAAppliedReplicationLsn;
+    return std.mem.readInt(u64, raw[0..applied_lsn_value_len], .little);
+}
+
+pub fn Impl(comptime DB: type) type {
+    return struct {
+        pub fn enforceDBWriteGate(self: *DB) !void {
+            try enforceWriteGateOptional(self.ha_write_gate);
+        }
+
+        pub fn mirrorDBReplayPayloadBestEffort(self: *DB, payload: []const u8) void {
+            const resources = self.core.batchExecutionResources();
+            mirrorReplayPayloadBestEffort(resources.log_mutex, self.ha_async_effect_mirror, payload);
+        }
+
+        pub fn preflightDBBatchSyncCommit(self: *DB) !void {
+            const resources = self.core.batchExecutionResources();
+            try preflightMirrorSyncCommit(resources.log_mutex, self.ha_async_batch_mirror);
+            try preflightMirrorSyncCommit(resources.log_mutex, self.ha_async_effect_mirror);
+        }
+
+        pub fn mirrorDBBatchMutationCommit(self: *DB, request: types.BatchRequest) !void {
+            const resources = self.core.batchExecutionResources();
+            try mirrorBatchMutationCommit(self.alloc, resources.log_mutex, self.ha_async_batch_mirror, request);
+        }
+
+        pub fn mirrorDBReplayPayloadCommit(self: *DB, payload: []const u8) !void {
+            const resources = self.core.batchExecutionResources();
+            try mirrorReplayPayloadCommit(resources.log_mutex, self.ha_async_effect_mirror, payload);
+        }
+
+        pub fn appliedReplicationLsn(self: *DB) anyerror!u64 {
+            return try readAppliedReplicationLsn(self.alloc, self.core.store);
+        }
+
+        pub fn replicationRecordAlreadyApplied(self: *DB, record: ha_replication_record_mod.RecordView) !bool {
+            if (record.lsn == 0) return false;
+            return (try Self.appliedReplicationLsn(self)) >= record.lsn;
+        }
+
+        pub fn markReplicationRecordApplied(self: *DB, lsn: u64) !void {
+            if (lsn == 0) return;
+            const current = try Self.appliedReplicationLsn(self);
+            if (current >= lsn) return;
+            var value_buf: [applied_lsn_value_len]u8 = undefined;
+            const marker = appliedReplicationLsnWrite(lsn, &value_buf);
+            try self.core.store.putBatch(&.{marker}, &.{});
+        }
+
+        pub fn setSchemaReplicatedApplyWithMarker(self: *DB, table_schema: schema_mod.TableSchema, applied_lsn_marker: ?u64) anyerror!void {
+            try self.core.setSchema(table_schema);
+            if (applied_lsn_marker) |lsn| try Self.markReplicationRecordApplied(self, lsn);
+        }
+
+        pub fn applyReplicationRecord(self: *DB, record: ha_replication_record_mod.RecordView) anyerror!void {
+            if (try Self.replicationRecordAlreadyApplied(self, record)) return;
+
+            switch (record.kind) {
+                .batch_mutation => {
+                    var decoded = try ha_effects_mod.decodeBatchMutationRequest(self.alloc, record);
+                    defer decoded.deinit();
+                    try DB.HAReplicationCallbacks.batch_replicated_apply_with_marker(self, decoded.value.request, record.lsn);
+                },
+                .metadata_mutation => {
+                    const decoded_schema = try ha_effects_mod.decodeSchemaMetadataMutation(self.alloc, record);
+                    defer schema_mod.freeSchema(self.alloc, decoded_schema);
+                    try Self.setSchemaReplicatedApplyWithMarker(self, decoded_schema, record.lsn);
+                },
+                .derived_effect => {
+                    _ = try DB.HAReplicationCallbacks.apply_ha_derived_effect_record(self, record);
+                    try Self.markReplicationRecordApplied(self, record.lsn);
+                },
+                .backup_start,
+                .backup_end,
+                .checkpoint,
+                .manifest,
+                .truncate,
+                .timeline_switch,
+                => try Self.markReplicationRecordApplied(self, record.lsn),
+                _ => return error.HAReplicationRecordApplyUnsupported,
+            }
+        }
+
+        pub fn applyReplicationRecordCallback(ctx: *anyopaque, record: ha_replication_record_mod.RecordView) anyerror!void {
+            const self: *DB = @ptrCast(@alignCast(ctx));
+            try Self.applyReplicationRecord(self, record);
+        }
+
+        const Self = @This();
+    };
+}
 
 pub fn writeGateIsStandby(gate: ?WriteGate) bool {
     const configured = gate orelse return false;

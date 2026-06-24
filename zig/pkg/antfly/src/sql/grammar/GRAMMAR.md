@@ -472,9 +472,10 @@ Unsupported DDL remains on the existing parser until
    `ROW`/`ROWS`, and `FETCH FIRST`/`FETCH NEXT` tails with optional fetch
    counts; generated metadata records limit expressions, the `LIMIT ALL`
    marker, offset expressions, and explicit fetch-count expressions, and
-   simple query, aggregate, join, lateral, set-operation, window, and
-   non-recursive CTE final-read pagination now use generated range-validated
-   lowering when generated read metadata is available. Generated read validation
+   simple query, simple select-set result tails, aggregate, join, lateral,
+   set-operation, window, and non-recursive CTE final-read pagination now use
+   generated range-validated lowering when generated read metadata is available.
+   Generated read validation
    rejects pagination payloads that are missing required expressions, attach
    expressions to `LIMIT ALL`, place expression spans outside their owning
    pagination tail, or mismatch explicit `FETCH` count spans.

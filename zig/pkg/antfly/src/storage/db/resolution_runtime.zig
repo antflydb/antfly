@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const platform = @import("antfly_platform");
 const resolver_lib = @import("antfly_resolver");
 const matcher = @import("antfly_matcher");
 const resolver_catalog = @import("catalog/resolver_catalog.zig");
@@ -1785,13 +1786,7 @@ pub const ResolutionRuntime = struct {
 };
 
 fn lockMutex(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) {
-        if (builtin.single_threaded) {
-            std.atomic.spinLoopHint();
-            continue;
-        }
-        std.Thread.yield() catch {};
-    }
+    platform.sync.lockYielding(mutex);
 }
 
 const testing = std.testing;

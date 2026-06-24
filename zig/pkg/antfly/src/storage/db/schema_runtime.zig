@@ -14,15 +14,22 @@
 
 const std = @import("std");
 
+const apply_state = @import("derived/apply_state.zig");
+const db_internal = @import("internal.zig");
+const derived_types = @import("derived/derived_types.zig");
 const ha_replication = @import("ha_replication.zig");
+const lifecycle_mod = @import("lifecycle.zig");
+const index_manager_mod = @import("catalog/index_manager.zig");
 const docstore_mod = @import("../docstore.zig");
 const internal_keys = @import("../internal_keys.zig");
 const mapper = @import("document_mapper.zig");
 const metadata_table_manager = @import("../../metadata/table_manager.zig");
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
+const relational_rows = @import("relational_rows.zig");
 const relational_store_mod = @import("relational_store.zig");
 const schema_api_mod = @import("../../schema/mod.zig");
 const schema_mod = @import("../schema.zig");
+const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -64,6 +71,46 @@ pub const SchemaRewriteJobDrainOptions = struct {
 pub fn Impl(comptime DB: type) type {
     return struct {
         const Self = @This();
+        const relational_rows_impl = relational_rows.Impl(DB);
+
+        fn currentTimeNs() u64 {
+            return db_internal.currentTimeNs();
+        }
+
+        fn validateRelationalRowsExpressionAgainstSchema(
+            runtime_schema: schema_mod.TableSchema,
+            expression: schema_mod.RelationalRowsExpression,
+        ) !void {
+            try relational_rows.validateExpressionAgainstSchema(runtime_schema, expression);
+        }
+
+        fn relationalRowsExpressionValueJsonAlloc(
+            alloc: Allocator,
+            row: std.json.Value,
+            expression: schema_mod.RelationalRowsExpression,
+        ) ![]u8 {
+            return try relational_rows_impl.relationalRowsExpressionValueJsonAlloc(alloc, row, expression);
+        }
+
+        fn relationalRowsGeneratedColumnValueJsonAlloc(
+            alloc: Allocator,
+            row: std.json.Value,
+            generated: schema_mod.RelationalGeneratedValue,
+        ) ![]u8 {
+            return try relational_rows_impl.schemaRuntimeRelationalRowsGeneratedColumnValueJsonAlloc(alloc, row, generated);
+        }
+
+        fn recordForeignKeyIntegrityProgressLocked(
+            self: *DB,
+            alloc: Allocator,
+            mode: relational_store_mod.ForeignKeyIntegrityMode,
+            constraint_name: ?[]const u8,
+            lower_doc_key: []const u8,
+            upper_doc_key: []const u8,
+            report: relational_store_mod.ForeignKeyIntegrityReport,
+        ) !void {
+            try self.relationalIntegrityRecordForeignKeyIntegrityProgressLocked(alloc, mode, constraint_name, lower_doc_key, upper_doc_key, report);
+        }
 
         pub fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
             try ha_replication.enforceWriteGateOptional(self.ha_write_gate);
@@ -209,6 +256,360 @@ pub fn Impl(comptime DB: type) type {
             var parsed = try std.json.parseFromSlice(metadata_table_manager.TableRecord, alloc, raw, .{ .allocate = .alloc_always });
             defer parsed.deinit();
             return try metadata_table_manager.cloneTable(alloc, parsed.value);
+        }
+
+        pub fn listAlgebraicMaterializationStates(self: *DB, alloc: Allocator, index_name: ?[]const u8) ![]types.AlgebraicMaterializationState {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+
+            var out = std.ArrayListUnmanaged(types.AlgebraicMaterializationState).empty;
+            errdefer {
+                for (out.items) |*state| state.deinit(alloc);
+                out.deinit(alloc);
+            }
+
+            for (self.core.index_manager.algebraic_indexes.items) |*entry| {
+                if (index_name) |filter| {
+                    if (!std.mem.eql(u8, entry.config.name, filter)) continue;
+                }
+
+                const persisted = try entry.index.scanPersistedMaterializationStates(self.core.store);
+                defer {
+                    for (persisted) |*state| state.deinit(entry.index.alloc);
+                    if (persisted.len > 0) entry.index.alloc.free(persisted);
+                }
+
+                for (persisted) |state| {
+                    const owned_index_name = try alloc.dupe(u8, entry.config.name);
+                    errdefer alloc.free(owned_index_name);
+                    const owned_recommendation = try alloc.dupe(u8, state.recommendation);
+                    errdefer alloc.free(owned_recommendation);
+                    const owned_lifecycle = try alloc.dupe(u8, @tagName(state.lifecycle));
+                    errdefer alloc.free(owned_lifecycle);
+                    try out.append(alloc, .{
+                        .index_name = owned_index_name,
+                        .recommendation = owned_recommendation,
+                        .lifecycle = owned_lifecycle,
+                        .observation_count = state.observation_count,
+                    });
+                }
+            }
+
+            return try out.toOwnedSlice(alloc);
+        }
+
+        pub fn listAlgebraicQueryObservations(self: *DB, alloc: Allocator, index_name: ?[]const u8) ![]types.AlgebraicQueryObservation {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+
+            var out = std.ArrayListUnmanaged(types.AlgebraicQueryObservation).empty;
+            errdefer {
+                for (out.items) |*observation| observation.deinit(alloc);
+                out.deinit(alloc);
+            }
+
+            for (self.core.index_manager.algebraic_indexes.items) |*entry| {
+                if (index_name) |filter| {
+                    if (!std.mem.eql(u8, entry.config.name, filter)) continue;
+                }
+
+                const persisted = try entry.index.scanPersistedQueryObservations(self.core.store);
+                defer {
+                    for (persisted) |*observation| observation.deinit(entry.index.alloc);
+                    if (persisted.len > 0) entry.index.alloc.free(persisted);
+                }
+
+                for (persisted) |observation| {
+                    const owned_index_name = try alloc.dupe(u8, entry.config.name);
+                    errdefer alloc.free(owned_index_name);
+                    const owned_shape = try alloc.dupe(u8, observation.shape);
+                    errdefer alloc.free(owned_shape);
+                    const owned_reason = try alloc.dupe(u8, observation.reason);
+                    errdefer alloc.free(owned_reason);
+                    const owned_recommendation = if (observation.recommendation) |value| try alloc.dupe(u8, value) else null;
+                    errdefer if (owned_recommendation) |value| alloc.free(value);
+                    const owned_lifecycle = try alloc.dupe(u8, @tagName(observation.lifecycle));
+                    errdefer alloc.free(owned_lifecycle);
+                    try out.append(alloc, .{
+                        .index_name = owned_index_name,
+                        .shape = owned_shape,
+                        .count = observation.count,
+                        .reason = owned_reason,
+                        .recommendation = owned_recommendation,
+                        .lifecycle = owned_lifecycle,
+                    });
+                }
+            }
+
+            return try out.toOwnedSlice(alloc);
+        }
+
+        pub fn evaluateAlgebraicAdaptiveCandidates(self: *DB) !u64 {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            return try Self.evaluateAlgebraicAdaptiveCandidatesLocked(self);
+        }
+
+        fn evaluateAlgebraicAdaptiveCandidatesLocked(self: *DB) !u64 {
+            const target_sequence = self.core.nextDerivedSequence();
+            var changed: u64 = 0;
+            for (self.core.index_manager.algebraic_indexes.items) |*entry| {
+                changed += try entry.index.evaluateAdaptiveCandidates(self.core.store, target_sequence);
+                // Promote + backfill recurring cardinality observations into HLL
+                // sketches here (leader-gated), not on the read path.
+                changed += try entry.index.evaluateHllCardinalityCandidates(self.core.store);
+            }
+            return changed;
+        }
+
+        pub fn runAlgebraicAdaptiveWork(self: *DB) !u64 {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            const target_sequence = self.core.nextDerivedSequence();
+            var changed: u64 = 0;
+            for (self.core.index_manager.algebraic_indexes.items) |*entry| {
+                changed += try entry.index.runAdaptiveWork(self.core.store, target_sequence);
+            }
+            return changed;
+        }
+
+        pub fn listAlgebraicAdaptiveCandidates(self: *DB, alloc: Allocator, index_name: ?[]const u8) ![]types.AlgebraicAdaptiveCandidate {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+
+            var out = std.ArrayListUnmanaged(types.AlgebraicAdaptiveCandidate).empty;
+            errdefer {
+                for (out.items) |*candidate| candidate.deinit(alloc);
+                out.deinit(alloc);
+            }
+
+            for (self.core.index_manager.algebraic_indexes.items) |*entry| {
+                if (index_name) |filter| {
+                    if (!std.mem.eql(u8, entry.config.name, filter)) continue;
+                }
+                const persisted = try entry.index.scanPersistedAdaptiveCandidates(self.core.store);
+                defer {
+                    for (persisted) |*candidate| candidate.deinit(entry.index.alloc);
+                    if (persisted.len > 0) entry.index.alloc.free(persisted);
+                }
+                for (persisted) |candidate| {
+                    const owned_index_name = try alloc.dupe(u8, entry.config.name);
+                    errdefer alloc.free(owned_index_name);
+                    const owned_recommendation = try alloc.dupe(u8, candidate.recommendation);
+                    errdefer alloc.free(owned_recommendation);
+                    const owned_materialization_id = try alloc.dupe(u8, candidate.materialization_id);
+                    errdefer alloc.free(owned_materialization_id);
+                    const owned_lifecycle = try alloc.dupe(u8, @tagName(candidate.lifecycle));
+                    errdefer alloc.free(owned_lifecycle);
+                    const owned_decision = try alloc.dupe(u8, candidate.decision);
+                    errdefer alloc.free(owned_decision);
+                    try out.append(alloc, .{
+                        .index_name = owned_index_name,
+                        .recommendation = owned_recommendation,
+                        .materialization_id = owned_materialization_id,
+                        .lifecycle = owned_lifecycle,
+                        .observation_count = candidate.observation_count,
+                        .estimated_scan_rows_saved = candidate.estimated_scan_rows_saved,
+                        .estimated_write_cost = candidate.estimated_write_cost,
+                        .estimated_doc_rows = candidate.estimated_doc_rows,
+                        .estimated_bucket_cardinality = candidate.estimated_bucket_cardinality,
+                        .estimated_tensor_rows = candidate.estimated_tensor_rows,
+                        .estimated_storage_bytes = candidate.estimated_storage_bytes,
+                        .estimated_write_amplification = candidate.estimated_write_amplification,
+                        .score = candidate.score,
+                        .decision = owned_decision,
+                        .idle_miss_count = candidate.idle_miss_count,
+                        .generation = candidate.generation,
+                    });
+                }
+            }
+            return try out.toOwnedSlice(alloc);
+        }
+
+        pub fn listAlgebraicAdaptiveProgress(self: *DB, alloc: Allocator, index_name: ?[]const u8) ![]types.AlgebraicAdaptiveProgress {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+
+            var out = std.ArrayListUnmanaged(types.AlgebraicAdaptiveProgress).empty;
+            errdefer {
+                for (out.items) |*progress| progress.deinit(alloc);
+                out.deinit(alloc);
+            }
+
+            for (self.core.index_manager.algebraic_indexes.items) |*entry| {
+                if (index_name) |filter| {
+                    if (!std.mem.eql(u8, entry.config.name, filter)) continue;
+                }
+                const persisted = try entry.index.scanPersistedAdaptiveProgress(self.core.store);
+                defer {
+                    for (persisted) |*progress| progress.deinit(entry.index.alloc);
+                    if (persisted.len > 0) entry.index.alloc.free(persisted);
+                }
+                for (persisted) |progress| {
+                    const owned_index_name = try alloc.dupe(u8, entry.config.name);
+                    errdefer alloc.free(owned_index_name);
+                    const owned_recommendation = try alloc.dupe(u8, progress.recommendation);
+                    errdefer alloc.free(owned_recommendation);
+                    const owned_materialization_id = try alloc.dupe(u8, progress.materialization_id);
+                    errdefer alloc.free(owned_materialization_id);
+                    const owned_lifecycle = try alloc.dupe(u8, @tagName(progress.lifecycle));
+                    errdefer alloc.free(owned_lifecycle);
+                    try out.append(alloc, .{
+                        .index_name = owned_index_name,
+                        .recommendation = owned_recommendation,
+                        .materialization_id = owned_materialization_id,
+                        .lifecycle = owned_lifecycle,
+                        .target_sequence = progress.target_sequence,
+                        .applied_sequence = progress.applied_sequence,
+                        .rows_processed = progress.rows_processed,
+                        .target_rows = progress.target_rows,
+                    });
+                }
+            }
+            return try out.toOwnedSlice(alloc);
+        }
+
+        pub fn replayGeneratedEnrichmentsFromStoredDocs(self: *DB, alloc: Allocator) !usize {
+            if (self.enrichment_runtime == null) return 0;
+
+            const lower = try self.core.documentRangeLowerAlloc("");
+            defer self.core.alloc.free(lower);
+            const docs = try self.core.scanStoreRange(alloc, lower, "");
+            defer docstore_mod.DocStore.freeResults(alloc, docs);
+            var materialized_values = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (materialized_values.items) |value| alloc.free(value);
+                materialized_values.deinit(alloc);
+            }
+            const chunk_size: usize = 128;
+            var index: usize = 0;
+            var generated_ref_count: usize = 0;
+            const relational_base_rows = self.relationalColumnsForStore() != null;
+            while (index < docs.len) {
+                var write_count: usize = 0;
+                var probe = index;
+                while (probe < docs.len and write_count < chunk_size) : (probe += 1) {
+                    if (db_internal.isBaseDocumentStoreKeyForMode(relational_base_rows, docs[probe].key)) write_count += 1;
+                }
+                if (write_count == 0) break;
+
+                var writes = try alloc.alloc(types.BatchWrite, write_count);
+                defer {
+                    for (writes) |write| alloc.free(@constCast(write.key));
+                    alloc.free(writes);
+                }
+
+                var extracted = try alloc.alloc(mapper.ExtractedWrite, write_count);
+                var extracted_initialized: usize = 0;
+                defer {
+                    for (extracted[0..extracted_initialized]) |*item| item.deinit(alloc);
+                    alloc.free(extracted);
+                }
+
+                var filled: usize = 0;
+                while (index < docs.len and filled < write_count) : (index += 1) {
+                    const doc = docs[index];
+                    if (!db_internal.isBaseDocumentStoreKeyForMode(relational_base_rows, doc.key)) continue;
+                    const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, doc.key)) orelse continue;
+                    errdefer alloc.free(raw_key);
+                    const doc_json = if (relational_base_rows)
+                        try mapper.materializeRelationalRowValueAlloc(alloc, doc.value)
+                    else
+                        try mapper.materializeDocumentValueAlloc(alloc, doc.value);
+                    errdefer alloc.free(doc_json);
+                    try materialized_values.append(alloc, doc_json);
+                    writes[filled] = .{
+                        .key = raw_key,
+                        .value = doc_json,
+                    };
+                    extracted[filled] = try mapper.extractWrite(alloc, raw_key, doc_json);
+                    extracted_initialized += 1;
+                    filled += 1;
+                }
+
+                var pending_batch = derived_types.DerivedBatch{};
+                defer derived_types.deinitDerivedBatch(alloc, &pending_batch);
+                try DB.SchemaRuntimeCallbacks.append_generated_enrichments(self, &pending_batch, .{
+                    .writes = writes[0..filled],
+                    .sync_level = .write,
+                }, extracted[0..filled]);
+                if (pending_batch.generated_enrichment_refs.len == 0) continue;
+                generated_ref_count += pending_batch.generated_enrichment_refs.len;
+                const sequence = try DB.SchemaRuntimeCallbacks.append_derived_batch_record(self, pending_batch);
+                self.executor.notifySequence(sequence);
+                if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
+                DB.SchemaRuntimeCallbacks.notify_resolver_replay_runtimes(self, sequence);
+            }
+            return generated_ref_count;
+        }
+
+        pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
+            self.core.lockApply();
+            var apply_locked = true;
+            errdefer if (apply_locked) self.core.unlockApply();
+            const applied = try self.core.addIndex(cfg);
+            try lifecycle_mod.saveIndexStatusSnapshots(self.alloc, self.core.store, self.core.index_manager, &[_]apply_state.AppliedSequenceUpdate{.{
+                .index_name = cfg.name,
+                .sequence = applied,
+            }});
+            if (cfg.kind == .algebraic) {
+                DB.SchemaRuntimeCallbacks.hydrate_algebraic_observation_status_for_index_best_effort(self, cfg.name);
+            }
+            const needs_enrichment_replay = try self.core.indexRequiresEnrichmentReplay(cfg.name);
+            self.core.unlockApply();
+            apply_locked = false;
+            if (self.start_index_workers) {
+                try self.executor.addWorker(cfg.name, .{ .name = cfg.name, .kind = cfg.kind }, applied);
+            }
+            if (needs_enrichment_replay) {
+                if (self.enrichment_runtime != null) {
+                    const refs = try DB.SchemaRuntimeCallbacks.replay_generated_enrichments_from_stored_docs(self, self.alloc);
+                    if (refs == 0) try self.core.saveAppliedSequence(cfg.name, self.core.nextDerivedSequence());
+                }
+            }
+        }
+
+        pub fn addEnrichment(self: *DB, cfg: types.EnrichmentConfig) !void {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            try self.core.addEnrichment(cfg);
+        }
+
+        pub fn upsertEnrichment(self: *DB, cfg: types.EnrichmentConfig) !index_manager_mod.IndexManager.EnrichmentUpsertResult {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            return try self.core.upsertEnrichment(cfg);
+        }
+
+        pub fn getEnrichment(self: *DB, alloc: Allocator, kind: types.EnrichmentKind, name: []const u8) !?types.EnrichmentConfig {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+            return try self.core.getEnrichment(alloc, kind, name);
+        }
+
+        pub fn listIndexes(self: *DB, alloc: Allocator) ![]types.IndexConfig {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+            return try self.core.listIndexes(alloc);
+        }
+
+        pub fn listEnrichments(self: *DB, alloc: Allocator) ![]types.EnrichmentConfig {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+            return try self.core.listEnrichments(alloc);
+        }
+
+        pub fn deleteIndex(self: *DB, name: []const u8) !bool {
+            self.executor.removeWorker(name);
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            return try self.core.deleteIndex(name);
+        }
+
+        pub fn deleteEnrichment(self: *DB, kind: types.EnrichmentKind, name: []const u8) !bool {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            return try self.core.deleteEnrichment(kind, name);
         }
 
         pub fn validateTableSchemaCompatibilityLocked(self: *DB, alloc: Allocator, next_schema: schema_mod.TableSchema) !void {
@@ -359,7 +760,7 @@ pub fn Impl(comptime DB: type) type {
 
                 for (generated_columns) |column| {
                     const generated = column.generated orelse continue;
-                    const value_json = self.schemaRuntimeRelationalRowsGeneratedColumnValueJsonAlloc(alloc, parsed.value, generated) catch return error.InvalidRowsRequest;
+                    const value_json = Self.relationalRowsGeneratedColumnValueJsonAlloc(alloc, parsed.value, generated) catch return error.InvalidRowsRequest;
                     defer alloc.free(value_json);
                     const generated_row = try relationalDefaultColumnRowValueAlloc(alloc, column, value_json);
                     errdefer alloc.free(generated_row);
@@ -466,7 +867,7 @@ pub fn Impl(comptime DB: type) type {
                     self.getRange().end,
                     .validate,
                 );
-                try self.schemaRuntimeRecordForeignKeyIntegrityProgressLocked(alloc, .validate, null, self.getRange().start, self.getRange().end, validate_report);
+                try Self.recordForeignKeyIntegrityProgressLocked(self, alloc, .validate, null, self.getRange().start, self.getRange().end, validate_report);
                 if (validate_report.missing_parent_rows != 0) return error.ForeignKeyViolation;
 
                 const repair_report = try relational_store_mod.reconcileForeignKeyRefsInRangeWithPrimaryKey(
@@ -482,11 +883,12 @@ pub fn Impl(comptime DB: type) type {
                     self.getRange().end,
                     .repair,
                 );
-                try self.schemaRuntimeRecordForeignKeyIntegrityProgressLocked(alloc, .repair, null, self.getRange().start, self.getRange().end, repair_report);
+                try Self.recordForeignKeyIntegrityProgressLocked(self, alloc, .repair, null, self.getRange().start, self.getRange().end, repair_report);
                 if (repair_report.missing_parent_rows != 0) return error.ForeignKeyViolation;
             }
             if (checks_to_validate.items.len > 0) {
-                try self.schemaRuntimeValidateRelationalChecksInRangeLocked(
+                try Self.validateRelationalChecksInRangeLocked(
+                    self,
                     alloc,
                     checks_to_validate.items,
                     self.getRange().start,
@@ -508,13 +910,14 @@ pub fn Impl(comptime DB: type) type {
             target_column: schema_mod.RelationalColumn,
             expression: schema_mod.RelationalRowsExpression,
         ) !?[]u8 {
+            _ = self;
             const row_json = mapper.materializeRelationalRowValueAlloc(alloc, row_value) catch return error.InvalidRowsRequest;
             defer alloc.free(row_json);
             var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
             defer parsed.deinit();
             if (parsed.value != .object) return error.InvalidRowsRequest;
 
-            const value_json = self.schemaRuntimeRelationalRowsExpressionValueJsonAlloc(alloc, parsed.value, expression) catch return error.InvalidRowsRequest;
+            const value_json = Self.relationalRowsExpressionValueJsonAlloc(alloc, parsed.value, expression) catch return error.InvalidRowsRequest;
             defer alloc.free(value_json);
             var parsed_value = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidRowsRequest;
             defer parsed_value.deinit();
@@ -562,7 +965,7 @@ pub fn Impl(comptime DB: type) type {
                 return error.UnsupportedOperation;
             }
 
-            const now_ms = options.now_ms orelse @divTrunc(self.schemaRuntimeCurrentTimeNs(), std.time.ns_per_ms);
+            const now_ms = options.now_ms orelse @divTrunc(Self.currentTimeNs(), std.time.ns_per_ms);
             const lease_expires_at_ms = now_ms +| options.lease_ttl_ms;
             if (options.worker_id.len == 0 or lease_expires_at_ms <= now_ms) return error.InvalidSchemaRewriteJobLease;
 
@@ -661,7 +1064,7 @@ pub fn Impl(comptime DB: type) type {
             const column_index_policy = relational_store_mod.ColumnIndexPolicy.fromColumns(runtime_schema.relational_columns);
 
             if (validate_constraints) {
-                const report = try self.schemaRuntimeValidateRelationalSchemaConstraintsForJobLocked(alloc, runtime_schema, local_range.start, local_range.end);
+                const report = try Self.validateRelationalSchemaConstraintsForJobLocked(self, alloc, runtime_schema, local_range.start, local_range.end);
                 const progress_row_key = try alloc.dupe(u8, local_range.end);
                 return .{ .report = report, .progress_row_key = progress_row_key };
             }
@@ -669,7 +1072,7 @@ pub fn Impl(comptime DB: type) type {
             if (has_expression_rewrite) {
                 const expression = job.expression.?;
                 const target_column = relationalRowsFindColumn(runtime_schema.relational_columns, job.target_column) orelse return error.InvalidSchemaRewriteExpression;
-                try self.schemaRuntimeValidateRelationalRowsExpressionAgainstSchema(runtime_schema, expression);
+                try Self.validateRelationalRowsExpressionAgainstSchema(runtime_schema, expression);
 
                 const rows = try relational_store_mod.scanRowsAlloc(alloc, self.core.store, local_range.start, local_range.end);
                 defer relational_store_mod.freeRows(alloc, rows);
@@ -785,6 +1188,92 @@ pub fn Impl(comptime DB: type) type {
             return .{ .report = report, .progress_row_key = progress_row_key };
         }
 
+        pub fn validateRelationalSchemaConstraintsForJobLocked(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            lower_doc_key: []const u8,
+            upper_doc_key: []const u8,
+        ) !relational_store_mod.RowRewriteReport {
+            if (runtime_schema.storage_mode != .relational) return error.InvalidSchemaUpdateRequest;
+
+            const unique_report = try self.relationalIntegrityReconcileUniqueConstraintRowsInRangeLocked(
+                lower_doc_key,
+                upper_doc_key,
+                .validate,
+            );
+            if (!unique_report.valid()) return error.UniqueConstraintViolation;
+
+            const foreign_key_report = try self.relationalIntegrityReconcileForeignKeyRefsInRangeLocked(
+                null,
+                lower_doc_key,
+                upper_doc_key,
+                .validate,
+            );
+            if (!foreign_key_report.valid()) return error.ForeignKeyViolation;
+
+            var checks_to_validate = std.ArrayListUnmanaged(schema_mod.RelationalCheck).empty;
+            defer checks_to_validate.deinit(alloc);
+            for (runtime_schema.checks) |check| {
+                if (check.validation_state == .enforced) try checks_to_validate.append(alloc, check);
+            }
+            try Self.validateRelationalChecksInRangeLocked(
+                self,
+                alloc,
+                checks_to_validate.items,
+                lower_doc_key,
+                upper_doc_key,
+            );
+
+            const rows = try relational_store_mod.scanRowsAlloc(alloc, self.core.store, lower_doc_key, upper_doc_key);
+            defer relational_store_mod.freeRows(alloc, rows);
+            return .{
+                .scanned_rows = @intCast(rows.len),
+                .unchanged_rows = @intCast(rows.len),
+            };
+        }
+
+        pub fn validateRelationalChecksInRangeLocked(
+            self: *DB,
+            alloc: Allocator,
+            checks: []const schema_mod.RelationalCheck,
+            lower_doc_key: []const u8,
+            upper_doc_key: []const u8,
+        ) !void {
+            if (checks.len == 0) return;
+            const rows = try relational_store_mod.scanRowsAlloc(alloc, self.core.store, lower_doc_key, upper_doc_key);
+            defer relational_store_mod.freeRows(alloc, rows);
+
+            for (rows) |row| {
+                const row_json = mapper.materializeRelationalRowValueAlloc(alloc, row.row_value) catch return error.InvalidRowsRequest;
+                defer alloc.free(row_json);
+                var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
+                defer parsed.deinit();
+                if (parsed.value != .object) return error.InvalidRowsRequest;
+                for (checks) |check| {
+                    const passes = Self.relationalCheckPassesExistingRow(self, alloc, parsed.value, check) catch |err| switch (err) {
+                        error.InvalidQueryRequest => return error.InvalidRowsRequest,
+                        else => return err,
+                    };
+                    if (!passes) {
+                        return error.InvalidRowsRequest;
+                    }
+                }
+            }
+        }
+
+        fn relationalCheckPassesExistingRow(
+            self: *DB,
+            alloc: Allocator,
+            row: std.json.Value,
+            check: schema_mod.RelationalCheck,
+        ) !bool {
+            _ = self;
+            const now_ns = Self.currentTimeNs();
+            if (check.expression) |condition| return try relational_rows.expressionConditionMatches(alloc, row, condition, now_ns);
+            return try relational_rows.queryPredicatePasses(alloc, row, check);
+        }
+
         pub fn validateRuntimeSchemaFeatureLevel(table_schema: schema_mod.TableSchema) !void {
             if (table_schema.storage_mode != .relational) return;
             for (table_schema.foreign_keys) |foreign_key| {
@@ -792,8 +1281,47 @@ pub fn Impl(comptime DB: type) type {
             }
         }
 
+        pub fn clearDenseHbcCaches(self: *DB) void {
+            self.core.index_manager.clearDenseHbcCaches();
+        }
+
+        pub fn relationalColumnsForStore(self: *DB) ?[]const schema_mod.RelationalColumn {
+            const schema = self.core.schema orelse return null;
+            if (schema.storage_mode != .relational) return null;
+            return schema.relational_columns;
+        }
+
+        pub fn relationalColumnIndexPolicyForStore(self: *DB) relational_store_mod.ColumnIndexPolicy {
+            const columns = Self.relationalColumnsForStore(self) orelse return relational_store_mod.ColumnIndexPolicy.all();
+            return relational_store_mod.ColumnIndexPolicy.fromColumns(columns);
+        }
+
+        pub fn rebuildRelationalSecondaryIndexInRange(
+            self: *DB,
+            index_name: []const u8,
+            index_generation: u64,
+            lower_doc_key: []const u8,
+            upper_doc_key: []const u8,
+        ) !relational_store_mod.SecondaryIndexRebuildReport {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            return try relational_store_mod.rebuildColumnIndexFromRowsInSpanWithColumnIndexPolicy(
+                self.alloc,
+                self.core.store,
+                index_name,
+                index_generation,
+                lower_doc_key,
+                upper_doc_key,
+                Self.relationalColumnIndexPolicyForStore(self),
+            );
+        }
+
+        pub fn hasIndex(self: *DB, name: []const u8) bool {
+            return self.core.hasIndex(name);
+        }
+
         pub fn refreshRuntimeSideEffects(self: *DB) void {
-            const maybe_relational_columns = self.schemaRuntimeRelationalColumnsForStore();
+            const maybe_relational_columns = Self.relationalColumnsForStore(self);
             const relational_columns = maybe_relational_columns orelse &.{};
             const relational_base_rows = maybe_relational_columns != null;
             self.async_context.relational_base_rows = relational_base_rows;
@@ -1071,17 +1599,32 @@ fn relationalRowsFindColumn(columns: []const schema_mod.RelationalColumn, name: 
     return null;
 }
 
-fn optionalStringsEqual(a: ?[]const u8, b: ?[]const u8) bool {
+pub fn optionalStringsEqual(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
     return std.mem.eql(u8, a.?, b.?);
 }
 
-fn findUniqueConstraintByName(unique_constraints: []const schema_mod.UniqueConstraint, name: []const u8) ?schema_mod.UniqueConstraint {
+pub fn findUniqueConstraintByName(unique_constraints: []const schema_mod.UniqueConstraint, name: []const u8) ?schema_mod.UniqueConstraint {
     for (unique_constraints) |constraint| {
         if (std.mem.eql(u8, constraint.name, name)) return constraint;
     }
     return null;
+}
+
+pub fn uniqueOwnerConstraintsAlloc(alloc: Allocator, runtime_schema: schema_mod.TableSchema) ![]schema_mod.UniqueConstraint {
+    const extra: usize = if (runtime_schema.primary_key != null) 1 else 0;
+    const constraints = try alloc.alloc(schema_mod.UniqueConstraint, runtime_schema.unique_constraints.len + extra);
+    var index: usize = 0;
+    if (runtime_schema.primary_key) |primary_key| {
+        constraints[index] = relational_store_mod.primaryKeyAsUniqueConstraint(primary_key);
+        index += 1;
+    }
+    for (runtime_schema.unique_constraints) |constraint| {
+        constraints[index] = constraint;
+        index += 1;
+    }
+    return constraints;
 }
 
 fn findForeignKeyByName(foreign_keys: []const schema_mod.ForeignKey, name: []const u8) ?schema_mod.ForeignKey {
@@ -1105,6 +1648,13 @@ fn uniqueConstraintsEqual(a: schema_mod.UniqueConstraint, b: schema_mod.UniqueCo
         optionalStringsEqual(a.without_overlaps_period, b.without_overlaps_period) and
         uniquePredicateSlicesEqual(a.where, b.where) and
         relationalRowsExpressionConditionSlicesEqual(a.where_expressions, b.where_expressions);
+}
+
+pub fn uniqueConstraintCanBackForeignKey(constraint: schema_mod.UniqueConstraint) bool {
+    return constraint.where.len == 0 and
+        constraint.where_expressions.len == 0 and
+        constraint.expressions.len == 0 and
+        constraint.without_overlaps_period == null;
 }
 
 fn uniqueExpressionSlicesEqual(a: []const schema_mod.UniqueExpression, b: []const schema_mod.UniqueExpression) bool {
@@ -1154,7 +1704,7 @@ fn foreignKeysSameDefinition(a: schema_mod.ForeignKey, b: schema_mod.ForeignKey)
         a.match == b.match;
 }
 
-fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
+pub fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |left, right| {
         if (!std.mem.eql(u8, left, right)) return false;

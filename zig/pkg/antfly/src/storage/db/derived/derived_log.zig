@@ -313,7 +313,7 @@ test "derived log propagates wal group commit settings" {
                 const ready = self.open;
                 self.mutex.unlock();
                 if (ready) return;
-                std.Thread.yield() catch {};
+                @import("antfly_platform").time.yieldBriefly();
             }
         }
     };

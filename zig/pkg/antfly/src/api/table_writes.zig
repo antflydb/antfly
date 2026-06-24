@@ -73,14 +73,14 @@ fn nativeCatalogTableNameAlloc(
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
     _ = tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse return error.TableNotFound;
-    return try catalog_resources.tableResourceNameAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+    return try catalog_resources.storageTableNameForTargetAlloc(alloc, target);
 }
 
 fn nativeCatalogTableNameForCreateAlloc(
     alloc: std.mem.Allocator,
     target: catalog_resources.TableTarget,
 ) ![]u8 {
-    return try catalog_resources.tableResourceNameAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+    return try catalog_resources.storageTableNameForTargetAlloc(alloc, target);
 }
 
 var txn_id_nonce: std.atomic.Value(u64) = .init(0);

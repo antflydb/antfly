@@ -17,12 +17,20 @@ const std = @import("std");
 const docstore_mod = @import("../docstore.zig");
 const internal_keys = @import("../internal_keys.zig");
 const schema_mod = @import("../schema.zig");
+const transactions_mod = @import("../transactions.zig");
+const mapper = @import("document_mapper.zig");
+const db_internal = @import("internal.zig");
 const relational_store_mod = @import("relational_store.zig");
+const relational_rows = @import("relational_rows.zig");
+const schema_runtime = @import("schema_runtime.zig");
 const types = @import("types.zig");
 const platform_clock = @import("../../platform/clock.zig");
+const temporal_typed_dv = @import("../../section/typed_doc_values.zig");
 
 const Allocator = std.mem.Allocator;
 
+const temporal_bound_neg_infinity_tag: u8 = 0xf0;
+const temporal_bound_pos_infinity_tag: u8 = 0xf1;
 const foreign_key_integrity_progress_key_prefix = "\x00\x00__metadata__:foreign_key_integrity_progress";
 const foreign_key_integrity_claim_key_prefix = "\x00\x00__metadata__:foreign_key_integrity_claim";
 const foreign_key_integrity_job_key_prefix = "\x00\x00__metadata__:foreign_key_integrity_job";
@@ -30,17 +38,343 @@ const foreign_key_action_job_key_prefix = "\x00\x00__metadata__:foreign_key_acti
 const foreign_key_action_schedule_key_prefix = "\x00\x00__metadata__:foreign_key_action_schedule";
 const unique_constraint_integrity_progress_key_prefix = "\x00\x00__metadata__:unique_constraint_integrity_progress";
 const foreign_key_action_default_cascade_max_depth: u32 = 64;
+const foreign_key_externalized_parent_check_intent_key_prefix = "\x00\x00__metadata__:txn_fk_externalized_parent_check:";
+const foreign_key_constraint_timing_override_intent_key_prefix = "\x00\x00__metadata__:txn_fk_constraint_timing:";
 
 fn currentTimeNs() u64 {
     return platform_clock.Clock.real().nowRealtimeNs();
 }
 
+pub fn findUniqueConstraintMutation(
+    mutations: []const types.UniqueConstraintMutation,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+) ?types.UniqueConstraintMutation {
+    for (mutations) |mutation| {
+        if (std.mem.eql(u8, mutation.constraint_name, constraint_name) and std.mem.eql(u8, mutation.encoded_value, encoded_value)) return mutation;
+    }
+    return null;
+}
+
+fn mutationIsTemporal(mutation: types.UniqueConstraintMutation) bool {
+    return mutation.temporal_start != null and mutation.temporal_end != null;
+}
+
+fn findTemporalUniqueConstraintMutationConflict(
+    mutations: []const types.UniqueConstraintMutation,
+    needle: types.UniqueConstraintMutation,
+) ?types.UniqueConstraintMutation {
+    if (!mutationIsTemporal(needle)) return null;
+    for (mutations) |mutation| {
+        if (!mutationIsTemporal(mutation)) continue;
+        if (!std.mem.eql(u8, mutation.constraint_name, needle.constraint_name)) continue;
+        if (!std.mem.eql(u8, mutation.encoded_value, needle.encoded_value)) continue;
+        const overlaps = relational_store_mod.temporalPeriodSpanBytesOverlap(
+            mutation.temporal_start.?,
+            mutation.temporal_end.?,
+            needle.temporal_start.?,
+            needle.temporal_end.?,
+        ) catch return mutation;
+        if (overlaps) return mutation;
+    }
+    return null;
+}
+
+fn findUniqueConstraintByName(unique_constraints: []const schema_mod.UniqueConstraint, name: []const u8) ?schema_mod.UniqueConstraint {
+    for (unique_constraints) |constraint| {
+        if (std.mem.eql(u8, constraint.name, name)) return constraint;
+    }
+    return null;
+}
+
+pub fn isForeignKeyActionScheduleMetadataKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, foreign_key_action_schedule_key_prefix);
+}
+
+pub fn foreignKeyExternalizedParentCheckIntentKeyAlloc(alloc: Allocator, txn_id: transactions_mod.TxnId, check: types.ForeignKeyParentCheck) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.appendSlice(alloc, foreign_key_externalized_parent_check_intent_key_prefix);
+    try appendHexBytes(alloc, &out, txn_id[0..]);
+    try appendHexField(alloc, &out, check.constraint_name);
+    try appendHexField(alloc, &out, check.child_table);
+    try appendHexField(alloc, &out, check.child_key);
+    try appendHexField(alloc, &out, check.parent_table);
+    try appendHexField(alloc, &out, check.parent_key);
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn foreignKeyConstraintTimingOverrideIntentKeyAlloc(alloc: Allocator, txn_id: transactions_mod.TxnId, override: types.ForeignKeyConstraintTimingOverride) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.appendSlice(alloc, foreign_key_constraint_timing_override_intent_key_prefix);
+    try appendHexBytes(alloc, &out, txn_id[0..]);
+    try appendHexField(alloc, &out, override.constraint_name);
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn encodeForeignKeyExternalizedParentCheckIntentValueAlloc(alloc: Allocator, check: types.ForeignKeyParentCheck) ![]u8 {
+    const timing = switch (check.timing) {
+        .immediate => "immediate",
+        .deferred => "deferred",
+    };
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    const prefix = try std.fmt.allocPrint(
+        alloc,
+        "{{\"constraint_name\":{f},\"child_table\":{f},\"child_key\":{f},\"parent_table\":{f},\"parent_key\":{f},\"timing\":{f}",
+        .{
+            std.json.fmt(check.constraint_name, .{}),
+            std.json.fmt(check.child_table, .{}),
+            std.json.fmt(check.child_key, .{}),
+            std.json.fmt(check.parent_table, .{}),
+            std.json.fmt(check.parent_key, .{}),
+            std.json.fmt(timing, .{}),
+        },
+    );
+    defer alloc.free(prefix);
+    try out.appendSlice(alloc, prefix);
+    if (check.parent_constraint_name) |name| {
+        const encoded = try std.fmt.allocPrint(alloc, ",\"parent_constraint_name\":{f}", .{std.json.fmt(name, .{})});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+    }
+    if (check.child_period_start_json) |json| {
+        const encoded = try std.fmt.allocPrint(alloc, ",\"child_period_start\":{s}", .{json});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+    }
+    if (check.child_period_end_json) |json| {
+        const encoded = try std.fmt.allocPrint(alloc, ",\"child_period_end\":{s}", .{json});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+    }
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn encodeForeignKeyConstraintTimingOverrideIntentValueAlloc(alloc: Allocator, override: types.ForeignKeyConstraintTimingOverride) ![]u8 {
+    const timing = switch (override.timing) {
+        .immediate => "immediate",
+        .deferred => "deferred",
+    };
+    return try std.fmt.allocPrint(
+        alloc,
+        "{{\"constraint_name\":{f},\"timing\":{f}}}",
+        .{
+            std.json.fmt(override.constraint_name, .{}),
+            std.json.fmt(timing, .{}),
+        },
+    );
+}
+
+pub fn collectTransactionExternalizedForeignKeyParentChecksAlloc(
+    alloc: Allocator,
+    mutations: []const transactions_mod.OwnedIntentMutation,
+    skip_keys: *std.ArrayListUnmanaged([]const u8),
+) ![]relational_store_mod.ExternalizedForeignKeyParentCheck {
+    var out = std.ArrayListUnmanaged(relational_store_mod.ExternalizedForeignKeyParentCheck).empty;
+    errdefer {
+        for (out.items) |*check| freeExternalizedForeignKeyParentCheck(alloc, check);
+        out.deinit(alloc);
+    }
+    for (mutations) |mutation| {
+        if (!isForeignKeyExternalizedParentCheckIntentKey(mutation.key)) continue;
+        const raw = mutation.value orelse continue;
+        const check = try parseForeignKeyExternalizedParentCheckIntentValueAlloc(alloc, raw);
+        var check_owned = true;
+        errdefer if (check_owned) {
+            var owned = check;
+            freeExternalizedForeignKeyParentCheck(alloc, &owned);
+        };
+        const skip_key = try alloc.dupe(u8, mutation.key);
+        var skip_key_owned = true;
+        errdefer if (skip_key_owned) alloc.free(skip_key);
+        try skip_keys.append(alloc, skip_key);
+        skip_key_owned = false;
+        try out.append(alloc, check);
+        check_owned = false;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn collectTransactionForeignKeyConstraintTimingOverridesAlloc(
+    alloc: Allocator,
+    mutations: []const transactions_mod.OwnedIntentMutation,
+    skip_keys: *std.ArrayListUnmanaged([]const u8),
+) ![]relational_store_mod.ForeignKeyConstraintTimingOverride {
+    var out = std.ArrayListUnmanaged(relational_store_mod.ForeignKeyConstraintTimingOverride).empty;
+    errdefer {
+        for (out.items) |*override| freeRelationalForeignKeyConstraintTimingOverride(alloc, override);
+        out.deinit(alloc);
+    }
+    for (mutations) |mutation| {
+        if (!isForeignKeyConstraintTimingOverrideIntentKey(mutation.key)) continue;
+        const raw = mutation.value orelse continue;
+        const override = try parseForeignKeyConstraintTimingOverrideIntentValueAlloc(alloc, raw);
+        var override_owned = true;
+        errdefer if (override_owned) {
+            var owned = override;
+            freeRelationalForeignKeyConstraintTimingOverride(alloc, &owned);
+        };
+        const skip_key = try alloc.dupe(u8, mutation.key);
+        var skip_key_owned = true;
+        errdefer if (skip_key_owned) alloc.free(skip_key);
+        try skip_keys.append(alloc, skip_key);
+        skip_key_owned = false;
+        try out.append(alloc, override);
+        override_owned = false;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn freeExternalizedForeignKeyParentChecks(alloc: Allocator, checks: []relational_store_mod.ExternalizedForeignKeyParentCheck) void {
+    for (checks) |*check| freeExternalizedForeignKeyParentCheck(alloc, check);
+    if (checks.len > 0) alloc.free(checks);
+}
+
+pub fn freeExternalizedForeignKeyParentCheck(alloc: Allocator, check: *relational_store_mod.ExternalizedForeignKeyParentCheck) void {
+    alloc.free(@constCast(check.constraint_name));
+    alloc.free(@constCast(check.child_table));
+    alloc.free(@constCast(check.child_key));
+    alloc.free(@constCast(check.parent_table));
+    alloc.free(@constCast(check.parent_key));
+    if (check.parent_constraint_name) |name| alloc.free(@constCast(name));
+    if (check.child_period_start_json) |json| alloc.free(@constCast(json));
+    if (check.child_period_end_json) |json| alloc.free(@constCast(json));
+    check.* = undefined;
+}
+
+pub fn freeRelationalForeignKeyConstraintTimingOverrides(alloc: Allocator, overrides: []relational_store_mod.ForeignKeyConstraintTimingOverride) void {
+    for (overrides) |*override| freeRelationalForeignKeyConstraintTimingOverride(alloc, override);
+    if (overrides.len > 0) alloc.free(overrides);
+}
+
+pub fn freeRelationalForeignKeyConstraintTimingOverride(alloc: Allocator, override: *relational_store_mod.ForeignKeyConstraintTimingOverride) void {
+    alloc.free(@constCast(override.constraint_name));
+    override.* = undefined;
+}
+
+fn parseForeignKeyExternalizedParentCheckIntentValueAlloc(alloc: Allocator, raw: []const u8) !relational_store_mod.ExternalizedForeignKeyParentCheck {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.ForeignKeyViolation,
+    };
+    const timing = jsonObjectString(obj, "timing") orelse return error.ForeignKeyViolation;
+    if (!std.mem.eql(u8, timing, "deferred") and !std.mem.eql(u8, timing, "immediate")) return error.ForeignKeyViolation;
+    const constraint_name = try alloc.dupe(u8, jsonObjectString(obj, "constraint_name") orelse return error.ForeignKeyViolation);
+    errdefer alloc.free(constraint_name);
+    const child_table = try alloc.dupe(u8, jsonObjectString(obj, "child_table") orelse return error.ForeignKeyViolation);
+    errdefer alloc.free(child_table);
+    const child_key = try alloc.dupe(u8, jsonObjectString(obj, "child_key") orelse return error.ForeignKeyViolation);
+    errdefer alloc.free(child_key);
+    const parent_table = try alloc.dupe(u8, jsonObjectString(obj, "parent_table") orelse return error.ForeignKeyViolation);
+    errdefer alloc.free(parent_table);
+    const parent_key = try alloc.dupe(u8, jsonObjectString(obj, "parent_key") orelse return error.ForeignKeyViolation);
+    errdefer alloc.free(parent_key);
+    const parent_constraint_name = if (jsonObjectString(obj, "parent_constraint_name")) |name|
+        try alloc.dupe(u8, name)
+    else
+        null;
+    errdefer if (parent_constraint_name) |name| alloc.free(name);
+    const child_period_start_json = if (obj.get("child_period_start")) |value|
+        try std.json.Stringify.valueAlloc(alloc, value, .{ .emit_null_optional_fields = false })
+    else
+        null;
+    errdefer if (child_period_start_json) |json| alloc.free(json);
+    const child_period_end_json = if (obj.get("child_period_end")) |value|
+        try std.json.Stringify.valueAlloc(alloc, value, .{ .emit_null_optional_fields = false })
+    else
+        null;
+    errdefer if (child_period_end_json) |json| alloc.free(json);
+    if ((child_period_start_json == null) != (child_period_end_json == null)) return error.ForeignKeyViolation;
+    return .{
+        .constraint_name = constraint_name,
+        .child_table = child_table,
+        .child_key = child_key,
+        .parent_table = parent_table,
+        .parent_key = parent_key,
+        .parent_constraint_name = parent_constraint_name,
+        .child_period_start_json = child_period_start_json,
+        .child_period_end_json = child_period_end_json,
+        .timing = if (std.mem.eql(u8, timing, "deferred")) .deferred else .immediate,
+    };
+}
+
+fn parseForeignKeyConstraintTimingOverrideIntentValueAlloc(alloc: Allocator, raw: []const u8) !relational_store_mod.ForeignKeyConstraintTimingOverride {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.ForeignKeyViolation,
+    };
+    const timing = jsonObjectString(obj, "timing") orelse return error.ForeignKeyViolation;
+    if (!std.mem.eql(u8, timing, "deferred") and !std.mem.eql(u8, timing, "immediate")) return error.ForeignKeyViolation;
+    const constraint_name = try alloc.dupe(u8, jsonObjectString(obj, "constraint_name") orelse return error.ForeignKeyViolation);
+    errdefer alloc.free(constraint_name);
+    return .{
+        .constraint_name = constraint_name,
+        .timing = if (std.mem.eql(u8, timing, "deferred")) .deferred else .immediate,
+    };
+}
+
+fn isForeignKeyExternalizedParentCheckIntentKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, foreign_key_externalized_parent_check_intent_key_prefix);
+}
+
+fn isForeignKeyConstraintTimingOverrideIntentKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, foreign_key_constraint_timing_override_intent_key_prefix);
+}
+
+fn appendHexField(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    try out.append(alloc, ':');
+    try appendHexBytes(alloc, out, value);
+}
+
+fn appendHexBytes(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    const hex = "0123456789abcdef";
+    try out.ensureUnusedCapacity(alloc, value.len * 2);
+    for (value) |byte| {
+        out.appendAssumeCapacity(hex[byte >> 4]);
+        out.appendAssumeCapacity(hex[byte & 0x0f]);
+    }
+}
+
+fn jsonObjectString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
 pub fn Impl(comptime DB: type) type {
     return struct {
+        const Self = @This();
         const ForeignKeyIntegrityReport = relational_store_mod.ForeignKeyIntegrityReport;
         const ForeignKeyIntegrityViolation = relational_store_mod.ForeignKeyIntegrityViolation;
         const ForeignKeyDeletePlan = relational_store_mod.ForeignKeyDeletePlan;
         const UniqueConstraintIntegrityReport = relational_store_mod.UniqueConstraintIntegrityReport;
+        const RelationalTemporalBound = relational_rows.TemporalBound;
+        const RelationalTemporalSpan = relational_rows.TemporalSpan;
+
+        pub fn recordForeignKeyChildWriteReject(self: *DB) void {
+            self.foreign_key_stats.recordChildWriteReject();
+        }
+
+        pub fn recordForeignKeyParentDeleteReject(self: *DB) void {
+            self.foreign_key_stats.recordParentDeleteReject();
+        }
+
+        pub fn recordForeignKeyIntegrityReport(
+            self: *DB,
+            mode: relational_store_mod.ForeignKeyIntegrityMode,
+            report: ForeignKeyIntegrityReport,
+        ) void {
+            self.foreign_key_stats.recordIntegrityReport(mode, report);
+        }
 
         pub fn validateForeignKeyRefsInRange(
             self: *DB,
@@ -427,7 +761,7 @@ pub fn Impl(comptime DB: type) type {
         ) !UniqueConstraintIntegrityReport {
             const runtime_schema = self.core.schema orelse return .{};
             if (runtime_schema.storage_mode != .relational or (runtime_schema.primary_key == null and runtime_schema.unique_constraints.len == 0)) return .{};
-            const owner_constraints = try self.relationalIntegrityUniqueOwnerConstraintsAlloc(self.alloc, runtime_schema);
+            const owner_constraints = try schema_runtime.uniqueOwnerConstraintsAlloc(self.alloc, runtime_schema);
             defer self.alloc.free(owner_constraints);
             const report = try relational_store_mod.reconcileUniqueConstraintRowsInRange(
                 self.alloc,
@@ -441,6 +775,952 @@ pub fn Impl(comptime DB: type) type {
             );
             try recordUniqueConstraintIntegrityProgressLocked(self, self.alloc, mode, lower_doc_key, upper_doc_key, report);
             return report;
+        }
+
+        pub fn validateUniqueConstraintMutations(
+            self: *DB,
+            unique_writes: []const types.UniqueConstraintMutation,
+            unique_deletes: []const types.UniqueConstraintMutation,
+        ) !void {
+            if (unique_writes.len == 0 and unique_deletes.len == 0) return;
+            const runtime_schema = self.core.schema orelse return error.UniqueConstraintViolation;
+            if (runtime_schema.storage_mode != .relational) return error.UniqueConstraintViolation;
+            const owner_constraints = try schema_runtime.uniqueOwnerConstraintsAlloc(self.alloc, runtime_schema);
+            defer self.alloc.free(owner_constraints);
+            for (unique_writes) |mutation| {
+                const constraint = try Self.validateUniqueConstraintMutation(self, owner_constraints, mutation);
+                if (mutationIsTemporal(mutation)) {
+                    if (findTemporalUniqueConstraintMutationConflict(unique_writes, mutation)) |existing| {
+                        if (!std.mem.eql(u8, existing.owner_key, mutation.owner_key)) {
+                            return error.UniqueConstraintViolation;
+                        }
+                    }
+                    const committed_owner = relational_store_mod.lookupTemporalUniqueOverlapOwnerAlloc(
+                        self.alloc,
+                        self.core.store,
+                        mutation.constraint_name,
+                        mutation.encoded_value,
+                        mutation.temporal_start.?,
+                        mutation.temporal_end.?,
+                    ) catch |err| switch (err) {
+                        error.NotFound => continue,
+                        else => return err,
+                    };
+                    if (committed_owner) |owner| {
+                        defer self.alloc.free(owner);
+                        if (std.mem.eql(u8, owner, mutation.owner_key)) continue;
+                        if (findTemporalUniqueConstraintMutationConflict(unique_deletes, mutation)) |delete_mutation| {
+                            if (std.mem.eql(u8, delete_mutation.owner_key, owner)) continue;
+                        }
+                        return error.UniqueConstraintViolation;
+                    }
+                    _ = constraint;
+                    continue;
+                }
+                const key = try internal_keys.relationalUniqueKeyAlloc(self.alloc, mutation.constraint_name, mutation.encoded_value);
+                defer self.alloc.free(key);
+                if (findUniqueConstraintMutation(unique_writes, mutation.constraint_name, mutation.encoded_value)) |existing| {
+                    if (!std.mem.eql(u8, existing.owner_key, mutation.owner_key)) {
+                        return error.UniqueConstraintViolation;
+                    }
+                }
+                const committed_owner = self.core.store.get(self.alloc, key) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return err,
+                };
+                defer self.alloc.free(committed_owner);
+                if (std.mem.eql(u8, committed_owner, mutation.owner_key)) continue;
+                if (findUniqueConstraintMutation(unique_deletes, mutation.constraint_name, mutation.encoded_value)) |delete_mutation| {
+                    if (std.mem.eql(u8, delete_mutation.owner_key, committed_owner)) continue;
+                }
+                return error.UniqueConstraintViolation;
+            }
+            for (unique_deletes) |mutation| {
+                _ = try Self.validateUniqueConstraintMutation(self, owner_constraints, mutation);
+                if (mutationIsTemporal(mutation)) {
+                    const committed_owner = relational_store_mod.lookupTemporalUniqueOverlapOwnerAlloc(
+                        self.alloc,
+                        self.core.store,
+                        mutation.constraint_name,
+                        mutation.encoded_value,
+                        mutation.temporal_start.?,
+                        mutation.temporal_end.?,
+                    ) catch |err| switch (err) {
+                        error.NotFound => continue,
+                        else => return err,
+                    };
+                    if (committed_owner) |owner| {
+                        defer self.alloc.free(owner);
+                        if (std.mem.eql(u8, owner, mutation.owner_key)) continue;
+                        if (findTemporalUniqueConstraintMutationConflict(unique_writes, mutation)) |write_mutation| {
+                            if (std.mem.eql(u8, write_mutation.owner_key, owner)) continue;
+                        }
+                        return error.UniqueConstraintViolation;
+                    }
+                    continue;
+                }
+                const key = try internal_keys.relationalUniqueKeyAlloc(self.alloc, mutation.constraint_name, mutation.encoded_value);
+                defer self.alloc.free(key);
+                const committed_owner = self.core.store.get(self.alloc, key) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return err,
+                };
+                defer self.alloc.free(committed_owner);
+                if (std.mem.eql(u8, committed_owner, mutation.owner_key)) continue;
+                if (findUniqueConstraintMutation(unique_writes, mutation.constraint_name, mutation.encoded_value)) |write_mutation| {
+                    if (std.mem.eql(u8, write_mutation.owner_key, committed_owner)) continue;
+                }
+                return error.UniqueConstraintViolation;
+            }
+        }
+
+        fn validateUniqueConstraintMutation(
+            _: *DB,
+            constraints: []const schema_mod.UniqueConstraint,
+            mutation: types.UniqueConstraintMutation,
+        ) !schema_mod.UniqueConstraint {
+            if (mutation.constraint_name.len == 0 or mutation.encoded_value.len == 0 or mutation.owner_key.len == 0) {
+                return error.UniqueConstraintViolation;
+            }
+            if (!isForeignKeyExternalDocKey(mutation.owner_key)) {
+                return error.UniqueConstraintViolation;
+            }
+            const constraint = findUniqueConstraintByName(constraints, mutation.constraint_name) orelse return error.UniqueConstraintViolation;
+            const has_start = mutation.temporal_start != null;
+            const has_end = mutation.temporal_end != null;
+            if (has_start != has_end) return error.UniqueConstraintViolation;
+            if (has_start) {
+                if (constraint.without_overlaps_period == null) return error.UniqueConstraintViolation;
+                if (!(relational_store_mod.temporalPeriodSpanBytesValid(mutation.temporal_start.?, mutation.temporal_end.?) catch return error.UniqueConstraintViolation)) {
+                    return error.UniqueConstraintViolation;
+                }
+            } else if (constraint.without_overlaps_period != null) {
+                return error.UniqueConstraintViolation;
+            }
+            return constraint;
+        }
+
+        pub fn appendUniqueConstraintMutationIntents(
+            self: *DB,
+            intents: *std.ArrayListUnmanaged(transactions_mod.WriteIntent),
+            owned_keys: *std.ArrayListUnmanaged([]u8),
+            owned_values: *std.ArrayListUnmanaged([]u8),
+            unique_writes: []const types.UniqueConstraintMutation,
+            unique_deletes: []const types.UniqueConstraintMutation,
+        ) !void {
+            for (unique_deletes) |mutation| {
+                const key = if (mutationIsTemporal(mutation))
+                    try internal_keys.relationalTemporalUniqueKeyAlloc(self.alloc, mutation.constraint_name, mutation.encoded_value, mutation.temporal_start.?, mutation.temporal_end.?, mutation.owner_key)
+                else
+                    try internal_keys.relationalUniqueKeyAlloc(self.alloc, mutation.constraint_name, mutation.encoded_value);
+                errdefer self.alloc.free(key);
+                try owned_keys.append(self.alloc, key);
+                try intents.append(self.alloc, .{ .key = key, .value = null });
+            }
+            for (unique_writes) |mutation| {
+                const key = if (mutationIsTemporal(mutation))
+                    try internal_keys.relationalTemporalUniqueKeyAlloc(self.alloc, mutation.constraint_name, mutation.encoded_value, mutation.temporal_start.?, mutation.temporal_end.?, mutation.owner_key)
+                else
+                    try internal_keys.relationalUniqueKeyAlloc(self.alloc, mutation.constraint_name, mutation.encoded_value);
+                errdefer self.alloc.free(key);
+                const owner = try self.alloc.dupe(u8, mutation.owner_key);
+                errdefer self.alloc.free(owner);
+                try owned_keys.append(self.alloc, key);
+                try owned_values.append(self.alloc, owner);
+                try intents.append(self.alloc, .{ .key = key, .value = owner });
+            }
+        }
+
+        pub fn appendForeignKeyExternalizedParentCheckIntents(
+            self: *DB,
+            txn_id: types.TxnId,
+            intents: *std.ArrayListUnmanaged(transactions_mod.WriteIntent),
+            owned_keys: *std.ArrayListUnmanaged([]u8),
+            owned_values: *std.ArrayListUnmanaged([]u8),
+            checks: []const types.ForeignKeyParentCheck,
+        ) !void {
+            for (checks) |check| {
+                const key = try foreignKeyExternalizedParentCheckIntentKeyAlloc(self.alloc, txn_id, check);
+                errdefer self.alloc.free(key);
+                const value = try encodeForeignKeyExternalizedParentCheckIntentValueAlloc(self.alloc, check);
+                errdefer self.alloc.free(value);
+                try owned_keys.append(self.alloc, key);
+                try owned_values.append(self.alloc, value);
+                try intents.append(self.alloc, .{ .key = key, .value = value });
+            }
+        }
+
+        pub fn appendForeignKeyConstraintTimingOverrideIntents(
+            self: *DB,
+            txn_id: types.TxnId,
+            intents: *std.ArrayListUnmanaged(transactions_mod.WriteIntent),
+            owned_keys: *std.ArrayListUnmanaged([]u8),
+            owned_values: *std.ArrayListUnmanaged([]u8),
+            overrides: []const types.ForeignKeyConstraintTimingOverride,
+        ) !void {
+            for (overrides) |override| {
+                const key = try foreignKeyConstraintTimingOverrideIntentKeyAlloc(self.alloc, txn_id, override);
+                errdefer self.alloc.free(key);
+                const value = try encodeForeignKeyConstraintTimingOverrideIntentValueAlloc(self.alloc, override);
+                errdefer self.alloc.free(value);
+                try owned_keys.append(self.alloc, key);
+                try owned_values.append(self.alloc, value);
+                try intents.append(self.alloc, .{ .key = key, .value = value });
+            }
+        }
+
+        pub fn validateForeignKeyConstraintTimingOverrides(
+            self: *DB,
+            overrides: []const types.ForeignKeyConstraintTimingOverride,
+        ) !void {
+            if (overrides.len == 0) return;
+            const runtime_schema = self.core.schema orelse return error.ForeignKeyViolation;
+            if (runtime_schema.storage_mode != .relational) return error.ForeignKeyViolation;
+            for (overrides, 0..) |override, i| {
+                if (override.constraint_name.len == 0) return error.ForeignKeyViolation;
+                if (override.timing != .immediate and override.timing != .deferred) return error.ForeignKeyViolation;
+                for (overrides[0..i]) |previous| {
+                    if (std.mem.eql(u8, previous.constraint_name, override.constraint_name)) return error.ForeignKeyViolation;
+                }
+                const foreign_key = findRuntimeForeignKeyByName(runtime_schema.foreign_keys, override.constraint_name) orelse return error.ForeignKeyViolation;
+                if (foreign_key.validation_state != .enforced) return error.ForeignKeyViolation;
+                if (!foreign_key.deferrable) return error.ForeignKeyViolation;
+            }
+        }
+
+        pub fn appendForeignKeyRefMutationIntents(
+            self: *DB,
+            intents: *std.ArrayListUnmanaged(transactions_mod.WriteIntent),
+            owned_keys: *std.ArrayListUnmanaged([]u8),
+            ref_writes: []const types.ForeignKeyRefMutation,
+            ref_deletes: []const types.ForeignKeyRefMutation,
+        ) !void {
+            for (ref_writes) |mutation| {
+                const key = try internal_keys.relationalForeignKeyRefKeyAlloc(self.alloc, mutation.constraint_name, mutation.parent_table, mutation.parent_key, mutation.child_table, mutation.child_key);
+                errdefer self.alloc.free(key);
+                try owned_keys.append(self.alloc, key);
+                try intents.append(self.alloc, .{ .key = key, .value = "" });
+            }
+            for (ref_deletes) |mutation| {
+                const key = try internal_keys.relationalForeignKeyRefKeyAlloc(self.alloc, mutation.constraint_name, mutation.parent_table, mutation.parent_key, mutation.child_table, mutation.child_key);
+                errdefer self.alloc.free(key);
+                try owned_keys.append(self.alloc, key);
+                try intents.append(self.alloc, .{ .key = key, .value = null });
+            }
+        }
+
+        pub fn validateForeignKeyRefMutations(self: *DB, mutations: []const types.ForeignKeyRefMutation) !void {
+            if (mutations.len == 0) return;
+            const runtime_schema = self.core.schema orelse return error.ForeignKeyViolation;
+            if (runtime_schema.storage_mode != .relational) return error.ForeignKeyViolation;
+            for (mutations) |mutation| {
+                if (mutation.constraint_name.len == 0 or mutation.parent_table.len == 0 or mutation.parent_key.len == 0 or mutation.child_table.len == 0 or mutation.child_key.len == 0) return error.ForeignKeyViolation;
+                if (!isForeignKeyExternalDocKey(mutation.child_key)) return error.ForeignKeyViolation;
+                if (!std.mem.eql(u8, mutation.child_table, runtime_schema.default_type)) return error.ForeignKeyViolation;
+                const foreign_key = findRuntimeForeignKeyByName(runtime_schema.foreign_keys, mutation.constraint_name) orelse return error.ForeignKeyViolation;
+                if (foreign_key.validation_state != .enforced) return error.ForeignKeyViolation;
+                if (!std.mem.eql(u8, foreign_key.parent_table, mutation.parent_table)) return error.ForeignKeyViolation;
+                if (foreignKeyReferencesPrimaryKey(foreign_key)) {
+                    if (!isForeignKeyExternalDocKey(mutation.parent_key)) return error.ForeignKeyViolation;
+                }
+            }
+        }
+
+        pub fn applyForeignKeyParentDeleteActions(
+            self: *DB,
+            intents: *std.ArrayListUnmanaged(transactions_mod.WriteIntent),
+            owned_keys: *std.ArrayListUnmanaged([]u8),
+            owned_values: *std.ArrayListUnmanaged([]u8),
+            checks: []const types.ForeignKeyParentDeleteCheck,
+        ) !void {
+            if (checks.len == 0) return;
+            const runtime_schema = self.core.schema orelse return error.ForeignKeyViolation;
+            if (runtime_schema.storage_mode != .relational) return error.ForeignKeyViolation;
+
+            var action_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+            defer action_writes.deinit(self.alloc);
+            var action_deletes = std.ArrayListUnmanaged([]const u8).empty;
+            defer action_deletes.deinit(self.alloc);
+            var participant = relational_store_mod.WriteParticipant.initWithColumnIndexPolicy(
+                self.alloc,
+                self.core.store,
+                &action_writes,
+                &action_deletes,
+                owned_keys,
+                owned_values,
+                relationalColumnIndexPolicyForStore(self),
+            );
+            participant.configureForeignKeys(runtime_schema.default_type, runtime_schema.foreign_keys, &.{});
+            participant.configurePrimaryKey(runtime_schema.primary_key);
+            participant.configureUniqueConstraints(runtime_schema.unique_constraints);
+            participant.configurePeriods(runtime_schema.periods, runtime_schema.relational_columns);
+            var prepared = false;
+            var closed = false;
+            defer if (prepared and !closed) participant.abort(null);
+
+            for (checks) |check| {
+                if (check.operation != .delete) continue;
+                const foreign_key = findRuntimeForeignKeyByName(runtime_schema.foreign_keys, check.constraint_name) orelse return error.ForeignKeyViolation;
+                if (foreign_key.on_delete != .set_null) continue;
+                if (check.constraint_name.len == 0 or check.parent_table.len == 0 or check.parent_key.len == 0) return error.ForeignKeyViolation;
+                if (!isForeignKeyExternalDocKey(check.parent_key)) return error.ForeignKeyViolation;
+                try participant.prepareSetNullForeignKeyParentDelete(check.constraint_name, check.parent_table, check.parent_key);
+                prepared = true;
+            }
+            if (!prepared) return;
+            try participant.commit(null, 0);
+            closed = true;
+
+            for (action_writes.items) |write| {
+                try intents.append(self.alloc, .{ .key = write.key, .value = write.value });
+            }
+            for (action_deletes.items) |key| {
+                try intents.append(self.alloc, .{ .key = key, .value = null });
+            }
+        }
+
+        pub fn applyForeignKeySetNullChildActions(
+            self: *DB,
+            intents: *std.ArrayListUnmanaged(transactions_mod.WriteIntent),
+            owned_keys: *std.ArrayListUnmanaged([]u8),
+            owned_values: *std.ArrayListUnmanaged([]u8),
+            actions: []const types.ForeignKeySetNullChildAction,
+        ) !void {
+            if (actions.len == 0) return;
+            const runtime_schema = self.core.schema orelse return error.ForeignKeyViolation;
+            if (runtime_schema.storage_mode != .relational) return error.ForeignKeyViolation;
+
+            var action_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+            defer action_writes.deinit(self.alloc);
+            var action_deletes = std.ArrayListUnmanaged([]const u8).empty;
+            defer action_deletes.deinit(self.alloc);
+            var participant = relational_store_mod.WriteParticipant.initWithColumnIndexPolicy(
+                self.alloc,
+                self.core.store,
+                &action_writes,
+                &action_deletes,
+                owned_keys,
+                owned_values,
+                relationalColumnIndexPolicyForStore(self),
+            );
+            participant.configureForeignKeys(runtime_schema.default_type, runtime_schema.foreign_keys, &.{});
+            participant.configurePrimaryKey(runtime_schema.primary_key);
+            participant.configureUniqueConstraints(runtime_schema.unique_constraints);
+            participant.configurePeriods(runtime_schema.periods, runtime_schema.relational_columns);
+            var prepared = false;
+            var closed = false;
+            defer if (prepared and !closed) participant.abort(null);
+
+            for (actions) |action| {
+                if (action.constraint_name.len == 0 or action.parent_table.len == 0 or action.parent_key.len == 0 or action.child_key.len == 0) return error.ForeignKeyViolation;
+                if (!isForeignKeyExternalDocKey(action.child_key)) return error.ForeignKeyViolation;
+                const foreign_key = findRuntimeForeignKeyByName(runtime_schema.foreign_keys, action.constraint_name) orelse return error.ForeignKeyViolation;
+                if (foreignKeyReferencesPrimaryKey(foreign_key) and !isForeignKeyExternalDocKey(action.parent_key)) return error.ForeignKeyViolation;
+                switch (action.operation) {
+                    .delete => try participant.prepareSetNullForeignKeyChildAction(action.constraint_name, action.parent_table, action.parent_key, action.child_key),
+                    .update => try participant.prepareSetNullForeignKeyUpdateChildAction(action.constraint_name, action.parent_table, action.parent_key, action.child_key),
+                }
+                prepared = true;
+            }
+            if (!prepared) return;
+            try participant.commit(null, 0);
+            closed = true;
+
+            for (action_writes.items) |write| {
+                try intents.append(self.alloc, .{ .key = write.key, .value = write.value });
+            }
+            for (action_deletes.items) |key| {
+                try intents.append(self.alloc, .{ .key = key, .value = null });
+            }
+        }
+
+        pub fn applyForeignKeyCascadeChildActions(
+            self: *DB,
+            intents: *std.ArrayListUnmanaged(transactions_mod.WriteIntent),
+            owned_keys: *std.ArrayListUnmanaged([]u8),
+            owned_values: *std.ArrayListUnmanaged([]u8),
+            actions: []const types.ForeignKeyCascadeChildAction,
+        ) !void {
+            if (actions.len == 0) return;
+            const runtime_schema = self.core.schema orelse return error.ForeignKeyViolation;
+            if (runtime_schema.storage_mode != .relational) return error.ForeignKeyViolation;
+
+            var action_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+            defer action_writes.deinit(self.alloc);
+            var action_deletes = std.ArrayListUnmanaged([]const u8).empty;
+            defer action_deletes.deinit(self.alloc);
+            var participant = relational_store_mod.WriteParticipant.initWithColumnIndexPolicy(
+                self.alloc,
+                self.core.store,
+                &action_writes,
+                &action_deletes,
+                owned_keys,
+                owned_values,
+                relationalColumnIndexPolicyForStore(self),
+            );
+            participant.configureForeignKeys(runtime_schema.default_type, runtime_schema.foreign_keys, &.{});
+            participant.configurePrimaryKey(runtime_schema.primary_key);
+            participant.configureUniqueConstraints(runtime_schema.unique_constraints);
+            participant.configurePeriods(runtime_schema.periods, runtime_schema.relational_columns);
+            var prepared = false;
+            var closed = false;
+            defer if (prepared and !closed) participant.abort(null);
+
+            for (actions) |action| {
+                if (action.constraint_name.len == 0 or action.parent_table.len == 0 or action.parent_key.len == 0 or action.child_key.len == 0) return error.ForeignKeyViolation;
+                if (!isForeignKeyExternalDocKey(action.child_key)) return error.ForeignKeyViolation;
+                const foreign_key = findRuntimeForeignKeyByName(runtime_schema.foreign_keys, action.constraint_name) orelse return error.ForeignKeyViolation;
+                if (foreignKeyReferencesPrimaryKey(foreign_key) and !isForeignKeyExternalDocKey(action.parent_key)) return error.ForeignKeyViolation;
+                switch (action.operation) {
+                    .delete => try participant.prepareCascadeForeignKeyChildAction(action.constraint_name, action.parent_table, action.parent_key, action.child_key),
+                    .update => {
+                        const updated_parent_key = action.updated_parent_key orelse return error.ForeignKeyViolation;
+                        if (foreignKeyReferencesPrimaryKey(foreign_key) and !isForeignKeyExternalDocKey(updated_parent_key)) return error.ForeignKeyViolation;
+                        try participant.prepareCascadeForeignKeyUpdateChildAction(action.constraint_name, action.parent_table, action.parent_key, updated_parent_key, action.child_key);
+                    },
+                }
+                prepared = true;
+            }
+            if (!prepared) return;
+            try participant.commit(null, 0);
+            closed = true;
+
+            for (action_writes.items) |write| {
+                try intents.append(self.alloc, .{ .key = write.key, .value = write.value });
+            }
+            for (action_deletes.items) |key| {
+                try intents.append(self.alloc, .{ .key = key, .value = null });
+            }
+        }
+
+        pub fn appendForeignKeyConflictIntents(
+            self: *DB,
+            intents: *std.ArrayListUnmanaged(transactions_mod.WriteIntent),
+            owned_keys: *std.ArrayListUnmanaged([]u8),
+            writes: []const types.TransactionWrite,
+            parent_delete_checks: []const types.ForeignKeyParentDeleteCheck,
+            conflict_checks: []const types.ForeignKeyConflictCheck,
+            ref_writes: []const types.ForeignKeyRefMutation,
+        ) !void {
+            if (writes.len == 0 and parent_delete_checks.len == 0 and conflict_checks.len == 0 and ref_writes.len == 0) return;
+            if (self.core.schema) |runtime_schema| {
+                for (writes) |write| {
+                    if (isMetadataOrPhysicalTableDataKey(write.key)) continue;
+                    for (runtime_schema.foreign_keys) |foreign_key| {
+                        if (!foreignKeyNeedsRestrictConflictKey(foreign_key)) continue;
+                        const parent_key = (try foreignKeyParentKeyFromJsonAlloc(self.alloc, runtime_schema.relational_columns, foreign_key, write.value)) orelse continue;
+                        defer self.alloc.free(parent_key);
+                        try appendForeignKeyConflictIntent(self.alloc, intents, owned_keys, foreign_key.name, foreign_key.parent_table, parent_key);
+                    }
+                }
+            }
+            for (ref_writes) |mutation| {
+                try appendForeignKeyConflictIntent(self.alloc, intents, owned_keys, mutation.constraint_name, mutation.parent_table, mutation.parent_key);
+            }
+            for (parent_delete_checks) |check| {
+                try appendForeignKeyConflictIntent(self.alloc, intents, owned_keys, check.constraint_name, check.parent_table, check.parent_key);
+            }
+            for (conflict_checks) |check| {
+                try appendForeignKeyConflictIntent(self.alloc, intents, owned_keys, check.constraint_name, check.parent_table, check.parent_key);
+            }
+        }
+
+        fn appendForeignKeyConflictIntent(
+            alloc: Allocator,
+            intents: *std.ArrayListUnmanaged(transactions_mod.WriteIntent),
+            owned_keys: *std.ArrayListUnmanaged([]u8),
+            constraint_name: []const u8,
+            parent_table: []const u8,
+            parent_key: []const u8,
+        ) !void {
+            const key = try internal_keys.relationalForeignKeyConflictKeyAlloc(alloc, constraint_name, parent_table, parent_key);
+            errdefer alloc.free(key);
+            if (containsString(owned_keys.items, key)) {
+                alloc.free(key);
+                return;
+            }
+            try owned_keys.append(alloc, key);
+            try intents.append(alloc, .{ .key = key, .value = null });
+        }
+
+        fn foreignKeyNeedsRestrictConflictKey(foreign_key: schema_mod.ForeignKey) bool {
+            return foreign_key.validation_state == .enforced and
+                foreignKeyDeleteActionRestricts(foreign_key) and
+                foreign_key.parent_columns.len == 1 and
+                std.mem.eql(u8, foreign_key.parent_columns[0], "_id");
+        }
+
+        pub fn validateForeignKeyParentChecks(
+            self: *DB,
+            checks: []const types.ForeignKeyParentCheck,
+            writes: []const types.TransactionWrite,
+            deletes: []const []const u8,
+            unique_writes: []const types.UniqueConstraintMutation,
+            unique_deletes: []const types.UniqueConstraintMutation,
+        ) !void {
+            if (checks.len == 0) return;
+            const runtime_schema = self.core.schema orelse return error.ForeignKeyViolation;
+            if (runtime_schema.storage_mode != .relational) return error.ForeignKeyViolation;
+            for (checks) |check| {
+                if (check.parent_key.len == 0 or check.parent_table.len == 0 or check.constraint_name.len == 0 or check.child_table.len == 0 or check.child_key.len == 0) return error.ForeignKeyViolation;
+                if (!isForeignKeyExternalDocKey(check.child_key)) return error.ForeignKeyViolation;
+                if (!std.mem.eql(u8, runtime_schema.default_type, check.parent_table)) return error.ForeignKeyViolation;
+                const has_temporal_payload = check.child_period_start_json != null and check.child_period_end_json != null;
+                if ((check.child_period_start_json == null) != (check.child_period_end_json == null)) return error.ForeignKeyViolation;
+                if (has_temporal_payload) {
+                    try validateTemporalForeignKeyParentCheck(self, runtime_schema, check, deletes);
+                    continue;
+                }
+                if (check.parent_constraint_name) |constraint_name| {
+                    if (findUniqueConstraintByName(runtime_schema.unique_constraints, constraint_name) == null) return error.ForeignKeyViolation;
+                    if (findUniqueConstraintMutation(unique_deletes, constraint_name, check.parent_key) != null and
+                        findUniqueConstraintMutation(unique_writes, constraint_name, check.parent_key) == null) return error.ForeignKeyViolation;
+                    if (findUniqueConstraintMutation(unique_writes, constraint_name, check.parent_key) != null) continue;
+                    const unique_key = try internal_keys.relationalUniqueKeyAlloc(self.alloc, constraint_name, check.parent_key);
+                    defer self.alloc.free(unique_key);
+                    const owner = self.core.store.get(self.alloc, unique_key) catch |err| switch (err) {
+                        error.NotFound => return error.ForeignKeyViolation,
+                        else => return err,
+                    };
+                    self.alloc.free(owner);
+                    continue;
+                }
+                if (!isForeignKeyExternalDocKey(check.parent_key)) return error.ForeignKeyViolation;
+                if (containsString(deletes, check.parent_key)) return error.ForeignKeyViolation;
+                if (containsTransactionWrite(writes, check.parent_key)) continue;
+                const existing = try self.get(self.alloc, check.parent_key);
+                defer if (existing) |body| self.alloc.free(body);
+                if (existing == null) return error.ForeignKeyViolation;
+            }
+        }
+
+        pub fn validateForeignKeyReferenceShapes(
+            self: *DB,
+            writes: []const types.TransactionWrite,
+        ) !void {
+            if (writes.len == 0) return;
+            const runtime_schema = self.core.schema orelse return;
+            if (runtime_schema.storage_mode != .relational or runtime_schema.foreign_keys.len == 0) return;
+            for (writes) |write| {
+                if (isMetadataOrPhysicalTableDataKey(write.key)) continue;
+                for (runtime_schema.foreign_keys) |foreign_key| {
+                    if (foreign_key.validation_state != .enforced) continue;
+                    const parent_key = try foreignKeyParentKeyFromJsonAlloc(self.alloc, runtime_schema.relational_columns, foreign_key, write.value);
+                    defer if (parent_key) |value| self.alloc.free(value);
+                }
+            }
+        }
+
+        fn validateTemporalForeignKeyParentCheck(
+            self: *DB,
+            runtime_schema: schema_mod.TableSchema,
+            check: types.ForeignKeyParentCheck,
+            deletes: []const []const u8,
+        ) !void {
+            const start_json = check.child_period_start_json orelse return error.ForeignKeyViolation;
+            const end_json = check.child_period_end_json orelse return error.ForeignKeyViolation;
+            const parent_constraint = temporalForeignKeyParentConstraint(runtime_schema, check) orelse return error.ForeignKeyViolation;
+            const parent_period_name = parent_constraint.without_overlaps_period orelse return error.ForeignKeyViolation;
+            const parent_period = relational_rows.findPeriod(runtime_schema.periods, parent_period_name) orelse return error.ForeignKeyViolation;
+            const start_column = relational_rows.findTemporalColumn(runtime_schema.relational_columns, parent_period.start_column) orelse return error.ForeignKeyViolation;
+            const end_column = relational_rows.findTemporalColumn(runtime_schema.relational_columns, parent_period.end_column) orelse return error.ForeignKeyViolation;
+            const child_span = try relationalTemporalSpanFromBoundJsonAlloc(self.alloc, start_json, end_json, start_column, end_column);
+            try requireTemporalForeignKeyParentCoverage(self, parent_constraint, check.parent_key, child_span, deletes);
+        }
+
+        fn temporalForeignKeyParentConstraint(
+            runtime_schema: schema_mod.TableSchema,
+            check: types.ForeignKeyParentCheck,
+        ) ?schema_mod.UniqueConstraint {
+            const name = check.parent_constraint_name orelse return null;
+            if (runtime_schema.primary_key) |primary_key| {
+                if (std.mem.eql(u8, name, relational_store_mod.primary_key_constraint_name)) {
+                    return relational_store_mod.primaryKeyAsUniqueConstraint(primary_key);
+                }
+            }
+            return findUniqueConstraintByName(runtime_schema.unique_constraints, name);
+        }
+
+        fn relationalTemporalSpanFromBoundJsonAlloc(
+            alloc: Allocator,
+            start_json: []const u8,
+            end_json: []const u8,
+            start_column: schema_mod.RelationalColumn,
+            end_column: schema_mod.RelationalColumn,
+        ) !RelationalTemporalSpan {
+            const start = try relational_rows.temporalStartBoundFromJsonAlloc(alloc, start_json, start_column);
+            const end = try relational_rows.temporalEndBoundFromJsonAlloc(alloc, end_json, end_column);
+            const span: RelationalTemporalSpan = .{ .start = start, .end = end };
+            if (!relational_rows.temporalSpanValid(span)) return error.ForeignKeyViolation;
+            return span;
+        }
+
+        fn requireTemporalForeignKeyParentCoverage(
+            self: *DB,
+            parent_constraint: schema_mod.UniqueConstraint,
+            parent_key: []const u8,
+            child_span: RelationalTemporalSpan,
+            deletes: []const []const u8,
+        ) !void {
+            var covered_end = child_span.start;
+            var matched_any = false;
+            while (relational_rows.temporalBoundLessThan(covered_end, child_span.end)) {
+                const next = try findTemporalForeignKeyParentCoverageEnd(self, parent_constraint, parent_key, covered_end, child_span.end, deletes);
+                if (next == null) return error.ForeignKeyViolation;
+                if (!relational_rows.temporalBoundLessThan(covered_end, next.?)) return error.ForeignKeyViolation;
+                covered_end = next.?;
+                matched_any = true;
+            }
+            if (!matched_any or !relational_rows.temporalBoundEqual(covered_end, child_span.end)) return error.ForeignKeyViolation;
+        }
+
+        fn findTemporalForeignKeyParentCoverageEnd(
+            self: *DB,
+            parent_constraint: schema_mod.UniqueConstraint,
+            parent_key: []const u8,
+            needed_start: RelationalTemporalBound,
+            child_end: RelationalTemporalBound,
+            deletes: []const []const u8,
+        ) !?RelationalTemporalBound {
+            const prefix = try internal_keys.relationalTemporalUniquePrefixAlloc(self.alloc, parent_constraint.name, parent_key);
+            defer self.alloc.free(prefix);
+            const upper = try internal_keys.relationalTemporalUniquePrefixUpperAlloc(self.alloc, parent_constraint.name, parent_key);
+            defer if (upper) |buf| self.alloc.free(buf);
+            const scanned = try self.core.store.scanRange(self.alloc, prefix, if (upper) |buf| buf else "");
+            defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
+            var best: ?RelationalTemporalBound = null;
+            for (scanned) |entry| {
+                if (containsString(deletes, entry.value)) continue;
+                const span = try decodeTemporalForeignKeyOwnerSpanFromKeyAlloc(self.alloc, entry.key, prefix);
+                best = temporalForeignKeyCoverageCandidateEnd(best, needed_start, child_end, span);
+            }
+            return best;
+        }
+
+        fn temporalForeignKeyCoverageCandidateEnd(
+            current_best: ?RelationalTemporalBound,
+            needed_start: RelationalTemporalBound,
+            child_end: RelationalTemporalBound,
+            parent_span: RelationalTemporalSpan,
+        ) ?RelationalTemporalBound {
+            if (relational_rows.temporalBoundLessThan(needed_start, parent_span.start)) return current_best;
+            if (!relational_rows.temporalBoundLessThan(needed_start, parent_span.end)) return current_best;
+            const candidate = if (relational_rows.temporalBoundLessThan(child_end, parent_span.end)) child_end else parent_span.end;
+            if (current_best) |best| {
+                return if (relational_rows.temporalBoundLessThan(best, candidate)) candidate else best;
+            }
+            return candidate;
+        }
+
+        fn decodeTemporalForeignKeyOwnerSpanFromKeyAlloc(
+            alloc: Allocator,
+            key: []const u8,
+            prefix: []const u8,
+        ) !RelationalTemporalSpan {
+            if (!std.mem.startsWith(u8, key, prefix)) return error.ForeignKeyViolation;
+            var pos: usize = prefix.len;
+            const start_term = internal_keys.findComponentTerminator(key, pos) orelse return error.ForeignKeyViolation;
+            const start = try internal_keys.decodeBodyAlloc(alloc, key[pos..start_term]);
+            defer alloc.free(start);
+            pos = start_term + 2;
+            const end_term = internal_keys.findComponentTerminator(key, pos) orelse return error.ForeignKeyViolation;
+            const end = try internal_keys.decodeBodyAlloc(alloc, key[pos..end_term]);
+            defer alloc.free(end);
+            return .{
+                .start = try relationalTemporalBoundFromOwnerBytes(start),
+                .end = try relationalTemporalBoundFromOwnerBytes(end),
+            };
+        }
+
+        fn relationalTemporalBoundFromOwnerBytes(bytes: []const u8) !RelationalTemporalBound {
+            if (bytes.len == 1 and bytes[0] == temporal_bound_neg_infinity_tag) return .neg_infinity;
+            if (bytes.len == 1 and bytes[0] == temporal_bound_pos_infinity_tag) return .pos_infinity;
+            if (bytes.len != 9) return error.ForeignKeyViolation;
+            const raw = std.mem.readInt(u64, bytes[1..9], .big);
+            if (bytes[0] == @intFromEnum(temporal_typed_dv.ValueType.f64_val)) return .{ .number = @bitCast(raw) };
+            if (bytes[0] == @intFromEnum(temporal_typed_dv.ValueType.u64_val)) return .{ .datetime_ns = @bitCast(raw) };
+            return error.ForeignKeyViolation;
+        }
+
+        pub fn validateExternalizedForeignKeyParentChecks(
+            self: *DB,
+            checks: []const types.ForeignKeyParentCheck,
+            constraint_timing_overrides: []const types.ForeignKeyConstraintTimingOverride,
+            writes: []const types.TransactionWrite,
+        ) !void {
+            const runtime_schema = self.core.schema orelse {
+                if (checks.len > 0) return error.ForeignKeyViolation;
+                return;
+            };
+            if (runtime_schema.storage_mode != .relational or runtime_schema.foreign_keys.len == 0) {
+                if (checks.len > 0) return error.ForeignKeyViolation;
+                return;
+            }
+            for (checks) |check| {
+                if (check.constraint_name.len == 0 or check.child_table.len == 0 or check.child_key.len == 0 or check.parent_table.len == 0 or check.parent_key.len == 0) return error.ForeignKeyViolation;
+                const foreign_key = findRuntimeForeignKeyByName(runtime_schema.foreign_keys, check.constraint_name) orelse return error.ForeignKeyViolation;
+                if (foreign_key.validation_state != .enforced) return error.ForeignKeyViolation;
+                if (check.timing != effectiveForeignKeyParentCheckTiming(foreign_key, constraint_timing_overrides)) return error.ForeignKeyViolation;
+                const has_temporal_payload = check.child_period_start_json != null and check.child_period_end_json != null;
+                if ((check.child_period_start_json == null) != (check.child_period_end_json == null)) return error.ForeignKeyViolation;
+                if ((foreign_key.child_period != null or foreign_key.parent_period != null) != has_temporal_payload) return error.ForeignKeyViolation;
+                if (!std.mem.eql(u8, check.child_table, runtime_schema.default_type)) return error.ForeignKeyViolation;
+                if (!std.mem.eql(u8, check.parent_table, foreign_key.parent_table)) return error.ForeignKeyViolation;
+                if (!isForeignKeyExternalDocKey(check.child_key)) return error.ForeignKeyViolation;
+                if (foreignKeyReferencesPrimaryKey(foreign_key)) {
+                    if (!isForeignKeyExternalDocKey(check.parent_key)) return error.ForeignKeyViolation;
+                    if (check.parent_constraint_name != null) return error.ForeignKeyViolation;
+                } else {
+                    const parent_constraint_name = check.parent_constraint_name orelse return error.ForeignKeyViolation;
+                    if (parent_constraint_name.len == 0) return error.ForeignKeyViolation;
+                    if (std.mem.eql(u8, foreign_key.parent_table, runtime_schema.default_type)) {
+                        if (foreign_key.parent_period) |parent_period| {
+                            const parent_constraint = temporalForeignKeyParentConstraint(runtime_schema, check) orelse return error.ForeignKeyViolation;
+                            if (!stringSlicesEqual(parent_constraint.columns, foreign_key.parent_columns)) return error.ForeignKeyViolation;
+                            if (parent_constraint.without_overlaps_period == null or
+                                !std.mem.eql(u8, parent_constraint.without_overlaps_period.?, parent_period))
+                            {
+                                return error.ForeignKeyViolation;
+                            }
+                        } else {
+                            const parent_constraint = findUniqueConstraintByName(runtime_schema.unique_constraints, parent_constraint_name) orelse return error.ForeignKeyViolation;
+                            if (!uniqueConstraintCanBackForeignKey(parent_constraint)) return error.ForeignKeyViolation;
+                            if (!stringSlicesEqual(parent_constraint.columns, foreign_key.parent_columns)) return error.ForeignKeyViolation;
+                        }
+                    }
+                }
+            }
+            if (writes.len == 0) return;
+            for (runtime_schema.foreign_keys) |foreign_key| {
+                if (foreign_key.validation_state != .enforced or effectiveForeignKeyParentCheckTiming(foreign_key, constraint_timing_overrides) != .deferred) continue;
+                for (writes) |write| {
+                    if (isMetadataOrPhysicalTableDataKey(write.key)) continue;
+                    const parent_key = (try foreignKeyParentKeyFromJsonAlloc(self.alloc, runtime_schema.relational_columns, foreign_key, write.value)) orelse continue;
+                    defer self.alloc.free(parent_key);
+                    var child_period_bounds = try foreignKeyChildPeriodBoundsFromJsonAlloc(self.alloc, runtime_schema, foreign_key, write.value);
+                    defer child_period_bounds.deinit(self.alloc);
+                    if (!containsExternalizedForeignKeyParentCheck(checks, foreign_key, runtime_schema.default_type, write.key, parent_key, child_period_bounds.start_json, child_period_bounds.end_json)) return error.ForeignKeyViolation;
+                }
+            }
+        }
+
+        fn containsExternalizedForeignKeyParentCheck(
+            checks: []const types.ForeignKeyParentCheck,
+            foreign_key: schema_mod.ForeignKey,
+            child_table: []const u8,
+            child_key: []const u8,
+            parent_key: []const u8,
+            child_period_start_json: ?[]const u8,
+            child_period_end_json: ?[]const u8,
+        ) bool {
+            for (checks) |check| {
+                if (check.timing != .deferred) continue;
+                if (!std.mem.eql(u8, check.constraint_name, foreign_key.name)) continue;
+                if (!std.mem.eql(u8, check.child_table, child_table)) continue;
+                if (!std.mem.eql(u8, check.child_key, child_key)) continue;
+                if (!std.mem.eql(u8, check.parent_table, foreign_key.parent_table)) continue;
+                if (!std.mem.eql(u8, check.parent_key, parent_key)) continue;
+                if (!optionalStringsEqual(check.child_period_start_json, child_period_start_json)) continue;
+                if (!optionalStringsEqual(check.child_period_end_json, child_period_end_json)) continue;
+                return true;
+            }
+            return false;
+        }
+
+        fn effectiveForeignKeyParentCheckTiming(
+            foreign_key: schema_mod.ForeignKey,
+            overrides: []const types.ForeignKeyConstraintTimingOverride,
+        ) types.ForeignKeyParentCheck.Timing {
+            for (overrides) |override| {
+                if (std.mem.eql(u8, override.constraint_name, foreign_key.name)) return override.timing;
+            }
+            return foreignKeyParentCheckTiming(foreign_key);
+        }
+
+        fn foreignKeyParentCheckTiming(foreign_key: schema_mod.ForeignKey) types.ForeignKeyParentCheck.Timing {
+            return switch (foreign_key.timing) {
+                .immediate => .immediate,
+                .deferred => .deferred,
+            };
+        }
+
+        fn foreignKeyDeleteActionRestricts(foreign_key: schema_mod.ForeignKey) bool {
+            return foreign_key.on_delete == .restrict or foreign_key.on_delete == .no_action;
+        }
+
+        fn foreignKeyUpdateActionRestricts(foreign_key: schema_mod.ForeignKey) bool {
+            return foreign_key.on_update == .restrict or foreign_key.on_update == .no_action;
+        }
+
+        fn containsTransactionWrite(writes: []const types.TransactionWrite, key: []const u8) bool {
+            for (writes) |write| {
+                if (std.mem.eql(u8, write.key, key)) return true;
+            }
+            return false;
+        }
+
+        fn containsString(values: []const []const u8, key: []const u8) bool {
+            for (values) |value| {
+                if (std.mem.eql(u8, value, key)) return true;
+            }
+            return false;
+        }
+
+        pub fn validateForeignKeyParentDeleteChecks(
+            self: *DB,
+            checks: []const types.ForeignKeyParentDeleteCheck,
+            constraint_timing_overrides: []const types.ForeignKeyConstraintTimingOverride,
+            writes: []const types.TransactionWrite,
+            deletes: []const []const u8,
+            ref_writes: []const types.ForeignKeyRefMutation,
+            ref_deletes: []const types.ForeignKeyRefMutation,
+        ) !void {
+            if (checks.len == 0) return;
+            const runtime_schema = self.core.schema orelse return error.ForeignKeyViolation;
+            if (runtime_schema.storage_mode != .relational) return error.ForeignKeyViolation;
+            for (checks) |check| {
+                if (check.constraint_name.len == 0 or check.parent_table.len == 0 or check.parent_key.len == 0) return error.ForeignKeyViolation;
+                const foreign_key = findRuntimeForeignKeyByName(runtime_schema.foreign_keys, check.constraint_name) orelse return error.ForeignKeyViolation;
+                if (foreign_key.validation_state != .enforced) return error.ForeignKeyViolation;
+                if (check.timing != effectiveForeignKeyParentCheckTiming(foreign_key, constraint_timing_overrides)) return error.ForeignKeyViolation;
+                switch (check.operation) {
+                    .delete => if (!foreignKeyDeleteActionRestricts(foreign_key)) continue,
+                    .update => if (!foreignKeyUpdateActionRestricts(foreign_key)) continue,
+                }
+                if (foreignKeyReferencesPrimaryKey(foreign_key) and !isForeignKeyExternalDocKey(check.parent_key)) return error.ForeignKeyViolation;
+                if (!std.mem.eql(u8, foreign_key.parent_table, check.parent_table)) return error.ForeignKeyViolation;
+
+                for (writes) |write| {
+                    if (isMetadataOrPhysicalTableDataKey(write.key)) continue;
+                    if (try foreignKeyWriteReferencesParent(self.alloc, runtime_schema.relational_columns, foreign_key, write.value, check.parent_key)) return error.ForeignKeyViolation;
+                }
+                for (ref_writes) |mutation| {
+                    if (foreignKeyRefMutationMatchesParentDeleteCheck(mutation, check)) return error.ForeignKeyViolation;
+                }
+
+                const prefix = try internal_keys.relationalForeignKeyRefParentPrefixAlloc(self.alloc, foreign_key.name, foreign_key.parent_table, check.parent_key);
+                defer self.alloc.free(prefix);
+                const upper = try internal_keys.relationalForeignKeyRefParentPrefixUpperAlloc(self.alloc, foreign_key.name, foreign_key.parent_table, check.parent_key);
+                defer if (upper) |buf| self.alloc.free(buf);
+                const scanned = try self.core.store.scanRange(self.alloc, prefix, if (upper) |buf| buf else "");
+                defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
+                for (scanned) |entry| {
+                    var decoded = (try internal_keys.decodeRelationalForeignKeyRefKeyAlloc(self.alloc, entry.key)) orelse continue;
+                    defer decoded.deinit(self.alloc);
+                    if (!std.mem.eql(u8, decoded.child_table, runtime_schema.default_type)) continue;
+                    if (containsString(deletes, decoded.child_key)) continue;
+                    if (containsForeignKeyRefDelete(ref_deletes, decoded, check)) continue;
+                    if (findTransactionWrite(writes, decoded.child_key)) |write| {
+                        if (!try foreignKeyWriteReferencesParent(self.alloc, runtime_schema.relational_columns, foreign_key, write.value, check.parent_key)) continue;
+                    }
+                    return error.ForeignKeyViolation;
+                }
+            }
+        }
+
+        fn foreignKeyRefMutationMatchesParentDeleteCheck(mutation: types.ForeignKeyRefMutation, check: types.ForeignKeyParentDeleteCheck) bool {
+            return std.mem.eql(u8, mutation.constraint_name, check.constraint_name) and
+                std.mem.eql(u8, mutation.parent_table, check.parent_table) and
+                std.mem.eql(u8, mutation.parent_key, check.parent_key);
+        }
+
+        fn containsForeignKeyRefDelete(
+            ref_deletes: []const types.ForeignKeyRefMutation,
+            decoded: internal_keys.RelationalForeignKeyRefKey,
+            check: types.ForeignKeyParentDeleteCheck,
+        ) bool {
+            for (ref_deletes) |mutation| {
+                if (!foreignKeyRefMutationMatchesParentDeleteCheck(mutation, check)) continue;
+                if (!std.mem.eql(u8, mutation.child_table, decoded.child_table)) continue;
+                if (!std.mem.eql(u8, mutation.child_key, decoded.child_key)) continue;
+                return true;
+            }
+            return false;
+        }
+
+        fn findTransactionWrite(writes: []const types.TransactionWrite, key: []const u8) ?types.TransactionWrite {
+            for (writes) |write| {
+                if (std.mem.eql(u8, write.key, key)) return write;
+            }
+            return null;
+        }
+
+        fn foreignKeyWriteReferencesParent(
+            alloc: Allocator,
+            relational_columns: []const schema_mod.RelationalColumn,
+            foreign_key: schema_mod.ForeignKey,
+            value: []const u8,
+            parent_key: []const u8,
+        ) !bool {
+            const actual_parent_key = (try foreignKeyParentKeyFromJsonAlloc(alloc, relational_columns, foreign_key, value)) orelse return false;
+            defer alloc.free(actual_parent_key);
+            return std.mem.eql(u8, actual_parent_key, parent_key);
+        }
+
+        fn foreignKeyParentKeyFromJsonAlloc(
+            alloc: Allocator,
+            relational_columns: []const schema_mod.RelationalColumn,
+            foreign_key: schema_mod.ForeignKey,
+            value: []const u8,
+        ) !?[]u8 {
+            const row = try mapper.buildRelationalRowValueAlloc(alloc, value, relational_columns);
+            defer alloc.free(row);
+            return try relational_store_mod.foreignKeyReferenceValueAlloc(alloc, row, foreign_key);
+        }
+
+        const ForeignKeyChildPeriodJsonBounds = struct {
+            start_json: ?[]const u8 = null,
+            end_json: ?[]const u8 = null,
+
+            fn deinit(self: *@This(), alloc: Allocator) void {
+                if (self.start_json) |json| alloc.free(@constCast(json));
+                if (self.end_json) |json| alloc.free(@constCast(json));
+                self.* = .{};
+            }
+        };
+
+        fn foreignKeyChildPeriodBoundsFromJsonAlloc(
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            foreign_key: schema_mod.ForeignKey,
+            value: []const u8,
+        ) !ForeignKeyChildPeriodJsonBounds {
+            const period_name = foreign_key.child_period orelse return .{};
+            const period = relational_rows.findPeriod(runtime_schema.periods, period_name) orelse return error.ForeignKeyViolation;
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, value, .{}) catch return error.ForeignKeyViolation;
+            defer parsed.deinit();
+            const obj = switch (parsed.value) {
+                .object => |object| object,
+                else => return error.ForeignKeyViolation,
+            };
+            const start_value = obj.get(period.start_column) orelse return error.ForeignKeyViolation;
+            const end_value = obj.get(period.end_column) orelse return error.ForeignKeyViolation;
+            const start_json = try std.json.Stringify.valueAlloc(alloc, start_value, .{ .emit_null_optional_fields = false });
+            errdefer alloc.free(start_json);
+            const end_json = try std.json.Stringify.valueAlloc(alloc, end_value, .{ .emit_null_optional_fields = false });
+            errdefer alloc.free(end_json);
+            return .{ .start_json = start_json, .end_json = end_json };
+        }
+
+        fn optionalStringsEqual(a: ?[]const u8, b: ?[]const u8) bool {
+            if (a == null and b == null) return true;
+            if (a == null or b == null) return false;
+            return std.mem.eql(u8, a.?, b.?);
+        }
+
+        fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
+            if (a.len != b.len) return false;
+            for (a, b) |left, right| {
+                if (!std.mem.eql(u8, left, right)) return false;
+            }
+            return true;
+        }
+
+        fn uniqueConstraintCanBackForeignKey(constraint: schema_mod.UniqueConstraint) bool {
+            return constraint.where.len == 0 and
+                constraint.where_expressions.len == 0 and
+                constraint.expressions.len == 0 and
+                constraint.without_overlaps_period == null;
         }
 
         pub fn reconcileForeignKeyRefOwnerForParentLocked(
@@ -559,6 +1839,20 @@ pub fn Impl(comptime DB: type) type {
             return null;
         }
 
+        fn isForeignKeyExternalDocKey(key: []const u8) bool {
+            return !db_internal.isMetadataKey(key) and !internal_keys.isInternalPhysicalTableDataKey(key);
+        }
+
+        fn isMetadataOrPhysicalTableDataKey(key: []const u8) bool {
+            return db_internal.isMetadataKey(key) or internal_keys.isInternalPhysicalTableDataKey(key);
+        }
+
+        fn relationalColumnIndexPolicyForStore(self: *DB) relational_store_mod.ColumnIndexPolicy {
+            const schema = self.core.schema orelse return relational_store_mod.ColumnIndexPolicy.all();
+            if (schema.storage_mode != .relational) return relational_store_mod.ColumnIndexPolicy.all();
+            return relational_store_mod.ColumnIndexPolicy.fromColumns(schema.relational_columns);
+        }
+
         fn foreignKeyIsEnforcedImmediate(foreign_key: schema_mod.ForeignKey) bool {
             return foreign_key.validation_state == .enforced and foreign_key.timing == .immediate;
         }
@@ -566,6 +1860,10 @@ pub fn Impl(comptime DB: type) type {
         fn foreignKeyIsLocallyEnforced(foreign_key: schema_mod.ForeignKey) bool {
             return foreign_key.validation_state == .enforced and
                 (foreign_key.timing == .immediate or foreign_key.timing == .deferred);
+        }
+
+        fn foreignKeyReferencesPrimaryKey(foreign_key: schema_mod.ForeignKey) bool {
+            return foreign_key.parent_columns.len == 1 and std.mem.eql(u8, foreign_key.parent_columns[0], "_id");
         }
 
         pub const ForeignKeyIntegrityProgressRecord = struct {

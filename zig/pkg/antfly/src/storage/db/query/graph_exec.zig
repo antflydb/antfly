@@ -23,6 +23,7 @@ const geo_mod = @import("../../../search/geo.zig");
 const levenshtein_mod = @import("../../../search/levenshtein.zig");
 const regex_mod = @import("../../../search/regex.zig");
 const doc_set = @import("../doc_set.zig");
+const db_internal = @import("../internal.zig");
 
 pub const NamedResultSet = struct {
     name: []const u8,
@@ -2824,49 +2825,7 @@ fn freePatternGeoPolygons(alloc: Allocator, polygons: []const []const geo_mod.Ge
     alloc.free(polygons);
 }
 
-pub fn parsePatternRfc3339ToNs(text: []const u8) !?u64 {
-    if (text.len < 20) return null;
-    if (text[4] != '-' or text[7] != '-' or text[10] != 'T' or text[13] != ':' or text[16] != ':') return null;
-
-    const year = std.fmt.parseInt(i64, text[0..4], 10) catch return null;
-    const month = std.fmt.parseInt(i64, text[5..7], 10) catch return null;
-    const day = std.fmt.parseInt(i64, text[8..10], 10) catch return null;
-    const hour = std.fmt.parseInt(i64, text[11..13], 10) catch return null;
-    const minute = std.fmt.parseInt(i64, text[14..16], 10) catch return null;
-    const second = std.fmt.parseInt(i64, text[17..19], 10) catch return null;
-
-    var idx: usize = 19;
-    var nanos: u64 = 0;
-    if (idx < text.len and text[idx] == '.') {
-        idx += 1;
-        const frac_start = idx;
-        while (idx < text.len and text[idx] >= '0' and text[idx] <= '9') : (idx += 1) {}
-        const frac = text[frac_start..idx];
-        if (frac.len == 0 or frac.len > 9) return null;
-        var frac_ns = std.fmt.parseInt(u64, frac, 10) catch return null;
-        var scale: usize = frac.len;
-        while (scale < 9) : (scale += 1) frac_ns *= 10;
-        nanos = frac_ns;
-    }
-    if (idx >= text.len or text[idx] != 'Z' or idx + 1 != text.len) return null;
-
-    const days = daysFromCivil(year, month, day);
-    if (days < 0) return null;
-    const secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
-    if (secs < 0) return null;
-    return @as(u64, @intCast(secs)) * std.time.ns_per_s + nanos;
-}
-
-fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
-    var y = year;
-    y -= if (month <= 2) @as(i64, 1) else @as(i64, 0);
-    const era = @divFloor(if (y >= 0) y else y - 399, 400);
-    const yoe = y - era * 400;
-    const mp = month + (if (month > 2) @as(i64, -3) else @as(i64, 9));
-    const doy = @divFloor(153 * mp + 2, 5) + day - 1;
-    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-    return era * 146_097 + doe - 719_468;
-}
+pub const parsePatternRfc3339ToNs = db_internal.parseRfc3339ToNs;
 
 fn wildcardMatch(pattern: []const u8, text: []const u8) bool {
     var pi: usize = 0;

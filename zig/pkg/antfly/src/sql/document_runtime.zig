@@ -78,10 +78,12 @@ pub const AlgebraicAggregateRequest = struct {
 pub const AlgebraicAggregateRow = struct {
     group_json: ?[]u8 = null,
     value_json: []u8,
+    raw_value: ?[]u8 = null,
 
     pub fn deinit(self: *AlgebraicAggregateRow, alloc: std.mem.Allocator) void {
         if (self.group_json) |value| alloc.free(value);
         alloc.free(self.value_json);
+        if (self.raw_value) |value| alloc.free(value);
         self.* = undefined;
     }
 };
@@ -150,6 +152,14 @@ pub const Source = struct {
             opts: ScanOptions,
             consistency: raft_mod.ReadConsistency,
         ) anyerror!?ScanResponse,
+        scan_catalog: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: ScanOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?ScanResponse = null,
         query: *const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -170,6 +180,12 @@ pub const Source = struct {
             req: AlgebraicAggregateRequest,
             consistency: raft_mod.ReadConsistency,
         ) anyerror!?AlgebraicAggregateResponse = null,
+        algebraic_aggregate_catalog: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            req: AlgebraicAggregateRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?AlgebraicAggregateResponse = null,
     };
 
     pub fn lookup(self: Source, alloc: std.mem.Allocator, table_name: []const u8, key: []const u8, opts: LookupOptions, consistency: raft_mod.ReadConsistency) !?LookupResponse {
@@ -185,6 +201,11 @@ pub const Source = struct {
         return try self.vtable.scan(self.ptr, alloc, table_name, from_key, to_key, opts, consistency);
     }
 
+    pub fn scanCatalog(self: Source, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: ScanOptions, consistency: raft_mod.ReadConsistency) !?ScanResponse {
+        const callback = self.vtable.scan_catalog orelse return error.UnsupportedOperation;
+        return try callback(self.ptr, alloc, from_key, to_key, opts, consistency);
+    }
+
     pub fn query(self: Source, alloc: std.mem.Allocator, table_name: []const u8, req: QueryRequest, consistency: raft_mod.ReadConsistency) !?QueryResponse {
         return try self.vtable.query(self.ptr, alloc, table_name, req, consistency);
     }
@@ -197,6 +218,11 @@ pub const Source = struct {
     pub fn algebraicAggregate(self: Source, alloc: std.mem.Allocator, table_name: []const u8, req: AlgebraicAggregateRequest, consistency: raft_mod.ReadConsistency) !?AlgebraicAggregateResponse {
         const callback = self.vtable.algebraic_aggregate orelse return error.DocumentSqlIndexUnavailable;
         return try callback(self.ptr, alloc, table_name, req, consistency);
+    }
+
+    pub fn algebraicAggregateCatalog(self: Source, alloc: std.mem.Allocator, req: AlgebraicAggregateRequest, consistency: raft_mod.ReadConsistency) !?AlgebraicAggregateResponse {
+        const callback = self.vtable.algebraic_aggregate_catalog orelse return error.UnsupportedOperation;
+        return try callback(self.ptr, alloc, req, consistency);
     }
 };
 
@@ -467,13 +493,19 @@ fn executeLoweredDocumentSqlAlgebraicAggregatePlanAlloc(
     const materialization_name = lowered.materialization_name orelse return error.DocumentSqlIndexUnavailable;
     if (lowered.candidate_producer != null or lowered.filter_query_json != null) return error.DocumentSqlIndexUnavailable;
 
-    var response = (try source.algebraicAggregate(alloc, native_table_name, .{
+    const req: AlgebraicAggregateRequest = .{
         .index_name = index_name,
         .materialization_name = materialization_name,
         .aggregate_op = lowered.aggregate.op,
         .group_by = lowered.group_by,
         .limit = lowered.limit,
-    }, consistency)) orelse return null;
+    };
+    var response = if (source.algebraicAggregateCatalog(alloc, req, consistency)) |result|
+        result orelse return null
+    else |err| switch (err) {
+        error.UnsupportedOperation => (try source.algebraicAggregate(alloc, native_table_name, req, consistency)) orelse return null,
+        else => return err,
+    };
     defer response.deinit(alloc);
 
     if (lowered.group_by) |group_by| {
@@ -528,7 +560,7 @@ fn executeLoweredDocumentSqlNumericAggregatePlanAlloc(
             var query_response = (try documentSqlIndexQueryAlloc(alloc, source, native_table_name, public_table_name, query, query_limit, false, false, consistency)) orelse return null;
             defer query_response.deinit(alloc);
             const total_hits = try documentSqlTotalHitsFromQueryResponse(alloc, query_response.json);
-            if (total_hits > query_limit) return error.DocumentSqlRequiresBoundedScan;
+            if (total_hits >= query_limit) return error.DocumentSqlRequiresBoundedScan;
             var rows = std.ArrayListUnmanaged([]const u8).empty;
             defer {
                 for (rows.items) |row| alloc.free(@constCast(row));
@@ -724,7 +756,7 @@ fn executeLoweredDocumentSqlGroupedNumericAggregatePlanAlloc(
             var query_response = (try documentSqlIndexQueryAlloc(alloc, source, native_table_name, public_table_name, query, query_limit, false, false, consistency)) orelse return null;
             defer query_response.deinit(alloc);
             const total_hits = try documentSqlTotalHitsFromQueryResponse(alloc, query_response.json);
-            if (total_hits > query_limit) return error.DocumentSqlRequiresBoundedScan;
+            if (total_hits >= query_limit) return error.DocumentSqlRequiresBoundedScan;
             var rows = std.ArrayListUnmanaged([]const u8).empty;
             defer {
                 for (rows.items) |row| alloc.free(@constCast(row));
@@ -1011,7 +1043,7 @@ fn executeOrderedLoweredDocumentSqlReadPlanAlloc(
             var query_response = (try documentSqlIndexQueryAlloc(alloc, source, native_table_name, public_table_name, query, query_limit, false, false, consistency)) orelse return null;
             defer query_response.deinit(alloc);
             const total_hits = try documentSqlTotalHitsFromQueryResponse(alloc, query_response.json);
-            if (total_hits > query_limit) return error.DocumentSqlRequiresBoundedScan;
+            if (total_hits >= query_limit) return error.DocumentSqlRequiresBoundedScan;
             try appendOrderedDocumentSqlCandidatesFromQueryResponseAlloc(
                 alloc,
                 source,
@@ -1458,7 +1490,7 @@ fn documentSqlLookupAlloc(
     consistency: raft_mod.ReadConsistency,
 ) !?LookupResponse {
     if (source.lookupCatalog(alloc, key, opts, consistency)) |result| {
-        if (result) |value| return value;
+        return result;
     } else |err| switch (err) {
         error.UnsupportedOperation => {},
         else => return err,
@@ -1478,6 +1510,12 @@ fn documentSqlScanAlloc(
     opts: ScanOptions,
     consistency: raft_mod.ReadConsistency,
 ) !?ScanResponse {
+    if (source.scanCatalog(alloc, from_key, to_key, opts, consistency)) |result| {
+        return result;
+    } else |err| switch (err) {
+        error.UnsupportedOperation => {},
+        else => return err,
+    }
     if (try source.scan(alloc, native_table_name, from_key, to_key, opts, consistency)) |result| return result;
     if (std.mem.eql(u8, native_table_name, public_table_name)) return null;
     return try source.scan(alloc, public_table_name, from_key, to_key, opts, consistency);
@@ -1497,7 +1535,7 @@ fn documentSqlIndexQueryAlloc(
     var query_req = try documentSqlIndexQueryRequestAlloc(alloc, query, limit, include_documents, count_only);
     defer query_req.deinit(alloc);
     if (source.queryCatalog(alloc, query_req.request(), consistency)) |result| {
-        if (result) |value| return value;
+        return result;
     } else |err| switch (err) {
         error.UnsupportedOperation => {},
         else => return err,
@@ -1813,7 +1851,7 @@ fn executeOrderedLoweredDocumentSqlUnnestReadPlanAlloc(
             var query_response = (try documentSqlIndexQueryAlloc(alloc, source, native_table_name, public_table_name, query, query_limit, false, false, consistency)) orelse return null;
             defer query_response.deinit(alloc);
             const total_hits = try documentSqlTotalHitsFromQueryResponse(alloc, query_response.json);
-            if (total_hits > query_limit) return error.DocumentSqlRequiresBoundedScan;
+            if (total_hits >= query_limit) return error.DocumentSqlRequiresBoundedScan;
             try appendOrderedDocumentSqlUnnestCandidatesFromQueryResponseAlloc(
                 alloc,
                 source,

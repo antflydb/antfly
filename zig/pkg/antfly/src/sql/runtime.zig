@@ -16,6 +16,10 @@ const std = @import("std");
 
 const catalog_resources = @import("../api/catalog_resources.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const metadata_api = @import("../metadata/api.zig");
+const metadata_table_manager = @import("../metadata/table_manager.zig");
+const metadata_transition_state = @import("../metadata/transition_state.zig");
+const raft_reconciler = @import("../raft/reconciler.zig");
 const relational_rows = @import("../api/relational_rows.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
@@ -623,6 +627,20 @@ fn generatedReadAstForParsedSql(
     return null;
 }
 
+fn generatedQueryPlanReadAstForParsedSql(
+    parsed_sql: *const sql_adapter.ParsedSql,
+) ?*const sql_adapter.generated_parser.GeneratedSqlReadAst {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            return switch (generated_ast.*) {
+                .read => |*read| if ((read.kind == .query or read.kind == .set_operation) and read.cte_tokens == null) read else null,
+                else => null,
+            };
+        }
+    }
+    return null;
+}
+
 fn generatedCteReadAstForParsedSql(
     parsed_sql: *const sql_adapter.ParsedSql,
 ) ?*const sql_adapter.generated_parser.GeneratedSqlReadAst {
@@ -663,13 +681,14 @@ pub fn lowerSelectParsedSqlAlloc(
         .tokens = tokens,
         .schema = schema,
         .params = params,
-        .generated_read_ast = if (cte_adapter_shape) generatedCteReadAstForParsedSql(parsed_sql) else generatedReadAstForParsedSql(parsed_sql, .query),
+        .generated_read_ast = if (cte_adapter_shape) generatedCteReadAstForParsedSql(parsed_sql) else generatedQueryPlanReadAstForParsedSql(parsed_sql),
     };
     var lowered = sql_adapter.parseQueryPlanAlloc(
         alloc,
         tokens,
         &parser.pos,
         params,
+        parser.generated_read_ast,
         Parser.ContextAccessors.cteSelectParserHooks(&parser),
         Parser.ContextAccessors.queryPlanParserHooks(&parser),
         Parser.ContextAccessors.simpleSelectSetTailHooks(&parser),
@@ -746,13 +765,14 @@ pub fn lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(
         .schema = schema,
         .params = params,
         .function_bindings = function_bindings,
-        .generated_read_ast = if (cte_adapter_shape) generatedCteReadAstForParsedSql(parsed_sql) else generatedReadAstForParsedSql(parsed_sql, .query),
+        .generated_read_ast = if (cte_adapter_shape) generatedCteReadAstForParsedSql(parsed_sql) else generatedQueryPlanReadAstForParsedSql(parsed_sql),
     };
     var lowered = sql_adapter.parseQueryPlanAlloc(
         alloc,
         tokens,
         &parser.pos,
         params,
+        parser.generated_read_ast,
         Parser.ContextAccessors.cteSelectParserHooks(&parser),
         Parser.ContextAccessors.queryPlanParserHooks(&parser),
         Parser.ContextAccessors.simpleSelectSetTailHooks(&parser),
@@ -1165,6 +1185,75 @@ test "sql runtime non catalog document reads use conservative capabilities" {
         .document_query => |plan| {
             try std.testing.expectEqual(sql_adapter.default_document_sql_bounded_scan_rows, plan.producer.bounded_scan.max_rows);
             try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}", plan.producer.bounded_scan.residual_filter_json.?);
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "sql runtime catalog document aggregate lowers schema-derived materialization" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":0,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"body":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"note":{"type":"keyword"},"tags":{"type":"array","items":{"type":"keyword"}},"metadata":{"type":"json"}},"additionalProperties":true}}}}
+    ;
+    const indexes_json =
+        \\{"full_text_index_v0":{"name":"full_text_index_v0","type":"full_text"},"amount_alg":{"version":2,"table":"docs","schema_version":0,"capability_fingerprint":"8a6d29a74f129f6b","capability_lifecycle_status":"current","group_fields":[{"name":"status","path":"status","type":"string"},{"name":"amount","path":"amount","type":"number"},{"name":"note","path":"note","type":"string"}],"measure_fields":[{"name":"amount","path":"amount","type":"number"}],"time_fields":[],"dynamic_field_rules":[],"laws":[{"name":"count","id":"count","structure":"group","invertible":true},{"name":"sum","id":"sum","structure":"group","invertible":true},{"name":"avg","id":"avg","structure":"group","invertible":true},{"name":"min","id":"min","structure":"lattice","invertible":false},{"name":"max","id":"max","structure":"lattice","invertible":false}],"joins":[],"adaptive":{"observe":true,"lazy_materialization":true,"dematerialization":false,"min_observations":3},"materializations":[{"name":"auto_count_0","op":"count","group_by":["status"]},{"name":"auto_sum_3","op":"sum","group_by":["status"],"measure":"amount"},{"name":"auto_avg_4","op":"avg","group_by":["status"],"measure":"amount"}],"type":"algebraic","name":"amount_alg"}}
+    ;
+
+    const FakeCatalog = struct {
+        table: metadata_table_manager.TableRecord,
+
+        fn init() @This() {
+            return .{ .table = .{
+                .table_id = 7,
+                .name = "docs",
+                .database_name = catalog_resources.default_database_name,
+                .namespace_name = catalog_resources.default_namespace_name,
+                .placement_role = "data",
+                .schema_json = schema_json,
+                .indexes_json = indexes_json,
+            } };
+        }
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{self.table})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var parsed_schema = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, "SELECT avg(amount) AS avg_amount FROM docs GROUP BY status LIMIT 10");
+    defer parsed_sql.deinit(alloc);
+    var catalog = FakeCatalog.init();
+
+    var lowered = try lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, schema, &.{}, catalog.iface(), .{});
+    defer lowered.deinit(alloc);
+    switch (lowered) {
+        .document_aggregate => |plan| {
+            try std.testing.expectEqualStrings("amount_alg", plan.index_name.?);
+            try std.testing.expectEqualStrings("auto_avg_4", plan.materialization_name.?);
         },
         else => return error.TestExpectedEqual,
     }

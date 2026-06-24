@@ -18,25 +18,42 @@ const builtin = @import("builtin");
 
 const aggregations_mod = @import("aggregations.zig");
 const algebraic_mod = @import("algebraic/mod.zig");
+const artifact_ids = @import("artifact_ids.zig");
+const db_internal = @import("internal.zig");
+const doc_identity = @import("doc_identity.zig");
 const doc_set = @import("doc_set.zig");
 const docstore_mod = @import("../docstore.zig");
+const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const planning_adapter_mod = @import("planning_adapter.zig");
 const planning_bindings_mod = @import("planning_bindings.zig");
 const planning_stats_mod = @import("planning_stats.zig");
+const relational_row_codec = @import("algebraic/relational_row_codec.zig");
+const relational_rows = @import("relational_rows.zig");
+const relational_store_mod = @import("relational_store.zig");
 const schema_mod = @import("../schema.zig");
 const graph_mod = @import("../../graph/graph.zig");
+const paths_mod = @import("../../graph/paths.zig");
+const traversal_mod = @import("../../graph/traversal.zig");
 const graph_query_mod = @import("../../graph/query.zig");
 const graph_pattern_mod = @import("../../graph/pattern.zig");
+const internal_keys = @import("../internal_keys.zig");
+const search_geo_mod = @import("../../search/geo.zig");
 const search_mod = @import("../../search/search.zig");
+const ttl_mod = @import("../ttl.zig");
+const transactions_mod = @import("../transactions.zig");
 const types = @import("types.zig");
 const db_query_graph = @import("query/graph_exec.zig");
 const db_query_metrics = @import("query_metrics.zig");
+const db_query_projection = @import("query/projection.zig");
 const db_query_result_shape = @import("query/result_shape.zig");
 const db_query_search = @import("query/search_exec.zig");
 const distributed_stats_mod = @import("../../search/distributed_stats.zig");
+const graph_metric_runtime_mod = @import("maintenance/graph_metric_runtime.zig");
+const platform_clock = @import("../../platform/clock.zig");
 const platform_time = @import("../../platform/time.zig");
 const vectorindex_mod = @import("antfly_vectorindex");
+const mapper = @import("document_mapper.zig");
 
 const Allocator = std.mem.Allocator;
 const NamedResultSet = db_query_graph.NamedResultSet;
@@ -63,6 +80,177 @@ pub const AlgebraicDocFilterRequest = struct {
         self.* = undefined;
     }
 };
+
+fn freeConstDocIdsAlloc(alloc: Allocator, doc_ids: []const []const u8) void {
+    for (doc_ids) |doc_id| alloc.free(@constCast(doc_id));
+    if (doc_ids.len > 0) alloc.free(@constCast(doc_ids));
+}
+
+fn freeOptionalOwnedBytes(alloc: Allocator, values: []?[]u8) void {
+    for (values) |value| {
+        if (value) |bytes| alloc.free(bytes);
+    }
+    alloc.free(values);
+}
+
+fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {
+    db_query_projection.freeJsonValue(alloc, value);
+}
+
+fn cloneJsonValue(alloc: Allocator, value: std.json.Value) !std.json.Value {
+    return try db_query_projection.cloneJsonValue(alloc, value);
+}
+
+fn putOwnedValue(
+    alloc: Allocator,
+    obj: *std.json.ObjectMap,
+    key: []const u8,
+    value: std.json.Value,
+) !void {
+    try db_query_projection.putOwnedValue(alloc, obj, key, value);
+}
+
+fn appendArtifactProjectionValue(
+    alloc: Allocator,
+    artifacts_obj: *std.json.ObjectMap,
+    artifact_name: []const u8,
+    artifact_kind: types.ArtifactKind,
+    artifact_value: std.json.Value,
+) !void {
+    if (artifacts_obj.getPtr(artifact_name)) |existing| {
+        if (existing.* == .object) {
+            if (existing.object.getPtr("items")) |items| {
+                if (items.* == .array) {
+                    try items.array.append(artifact_value);
+                    return;
+                }
+            }
+        }
+
+        var first = try cloneJsonValue(alloc, existing.*);
+        var first_moved = false;
+        errdefer if (!first_moved) freeJsonValue(alloc, &first);
+        var items = std.json.Array.init(alloc);
+        errdefer {
+            for (items.items) |*item| freeJsonValue(alloc, item);
+            items.deinit();
+        }
+        try items.append(first);
+        first_moved = true;
+        try items.append(artifact_value);
+
+        var grouped = std.json.ObjectMap.empty;
+        errdefer {
+            var value = std.json.Value{ .object = grouped };
+            freeJsonValue(alloc, &value);
+        }
+        try putOwnedValue(alloc, &grouped, "kind", .{ .string = try alloc.dupe(u8, artifactSetKindText(artifact_kind)) });
+        try putOwnedValue(alloc, &grouped, "status", .{ .string = try alloc.dupe(u8, "ready") });
+        try putOwnedValue(alloc, &grouped, "items", .{ .array = items });
+
+        freeJsonValue(alloc, existing);
+        existing.* = .{ .object = grouped };
+        return;
+    }
+
+    try artifacts_obj.put(alloc, try alloc.dupe(u8, artifact_name), artifact_value);
+}
+
+fn artifactRefJsonValue(alloc: Allocator, artifact_ref: types.ArtifactRef) !std.json.Value {
+    var obj = std.json.ObjectMap.empty;
+    errdefer {
+        var value = std.json.Value{ .object = obj };
+        freeJsonValue(alloc, &value);
+    }
+    try putOwnedValue(alloc, &obj, "document_id", .{ .string = try alloc.dupe(u8, artifact_ref.document_id) });
+    try putOwnedValue(alloc, &obj, "name", .{ .string = try alloc.dupe(u8, artifact_ref.name) });
+    try putOwnedValue(alloc, &obj, "kind", .{ .string = try alloc.dupe(u8, artifactKindText(artifact_ref.kind)) });
+    if (artifact_ref.chunk_id) |chunk_id| {
+        try putOwnedValue(alloc, &obj, "chunk_id", .{ .integer = @intCast(chunk_id) });
+    }
+    if (artifact_ref.source) |source| {
+        var source_obj = std.json.ObjectMap.empty;
+        errdefer {
+            var value = std.json.Value{ .object = source_obj };
+            freeJsonValue(alloc, &value);
+        }
+        try putOwnedValue(alloc, &source_obj, "kind", .{ .string = try alloc.dupe(u8, artifactKindText(source.kind)) });
+        try putOwnedValue(alloc, &source_obj, "name", .{ .string = try alloc.dupe(u8, source.name) });
+        if (source.chunk_id) |chunk_id| {
+            try putOwnedValue(alloc, &source_obj, "chunk_id", .{ .integer = @intCast(chunk_id) });
+        }
+        try putOwnedValue(alloc, &obj, "source", .{ .object = source_obj });
+    }
+    return .{ .object = obj };
+}
+
+fn artifactKindText(kind: types.ArtifactKind) []const u8 {
+    return switch (kind) {
+        .chunk => "chunk",
+        .asset => "asset",
+        .embedding => "embedding",
+    };
+}
+
+fn artifactSetKindText(kind: types.ArtifactKind) []const u8 {
+    return switch (kind) {
+        .chunk => "chunk_set",
+        .asset => "asset_set",
+        .embedding => "embedding_set",
+    };
+}
+
+fn artifactContentType(kind: types.ArtifactKind) []const u8 {
+    return switch (kind) {
+        .chunk => "application/json",
+        .asset => "application/octet-stream",
+        .embedding => "application/vnd.antfly.embedding+binary",
+    };
+}
+
+fn assetPayloadJsonValue(alloc: Allocator, content_type: []const u8, raw: []const u8) !std.json.Value {
+    if (assetContentTypeIsJson(content_type)) {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        return try cloneJsonValue(alloc, parsed.value);
+    }
+    return .{ .string = try alloc.dupe(u8, raw) };
+}
+
+fn assetContentTypeIsJson(content_type: []const u8) bool {
+    const media_type = std.mem.trim(u8, if (std.mem.indexOfScalar(u8, content_type, ';')) |semi| content_type[0..semi] else content_type, &std.ascii.whitespace);
+    return std.mem.eql(u8, media_type, "application/json") or std.mem.endsWith(u8, media_type, "+json");
+}
+
+pub fn resolvedDocSetFromSearchHitOrdinalsAlloc(alloc: Allocator, hits: []const types.SearchHit) !?doc_set.ResolvedDocSet {
+    const ordinals = try alloc.alloc(doc_set.DocOrdinal, hits.len);
+    defer if (ordinals.len > 0) alloc.free(ordinals);
+
+    for (hits, 0..) |hit, i| {
+        ordinals[i] = hit.doc_ordinal orelse return null;
+    }
+    return try doc_set.fromOrdinalsAlloc(alloc, ordinals);
+}
+
+test "resolved doc set from search hits uses complete hit ordinals" {
+    const alloc = std.testing.allocator;
+
+    const hits = [_]types.SearchHit{
+        .{ .id = @constCast("doc:a"), .doc_ordinal = 3 },
+        .{ .id = @constCast("doc:b"), .doc_ordinal = 1 },
+    };
+    var resolved = (try resolvedDocSetFromSearchHitOrdinalsAlloc(alloc, &hits)) orelse return error.TestUnexpectedResult;
+    defer resolved.deinit(alloc);
+    try std.testing.expect(resolved.containsOrdinal(1));
+    try std.testing.expect(resolved.containsOrdinal(3));
+    try std.testing.expect(!resolved.containsOrdinal(2));
+
+    const mixed = [_]types.SearchHit{
+        .{ .id = @constCast("doc:a"), .doc_ordinal = 1 },
+        .{ .id = @constCast("doc:b") },
+    };
+    try std.testing.expect((try resolvedDocSetFromSearchHitOrdinalsAlloc(alloc, &mixed)) == null);
+}
 
 fn benchQueryProfileEnabled() bool {
     return platform.env.getenv("ANTFLY_BENCH_QUERY_PROFILE") != null;
@@ -188,6 +376,7 @@ fn cloneGraphMetricBuildPageStatusesFromGraph(
 pub fn Impl(comptime DB: type) type {
     return struct {
         const Self = @This();
+        const internal_impl = db_internal.Impl(DB);
 
         pub fn search(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
             return try Self.searchWithExecutionContext(self, alloc, req, .{});
@@ -267,6 +456,332 @@ pub fn Impl(comptime DB: type) type {
             return result;
         }
 
+        pub fn applyRowClaimToSearchResult(
+            self: *DB,
+            result: *types.SearchResult,
+            txn_id: types.TxnId,
+            claim: types.RowClaimRequest,
+        ) !void {
+            if (result.graph_results.len > 0) return error.UnsupportedQueryRequest;
+            if (!claim.effectiveSkipLocked()) {
+                var row_keys = std.ArrayListUnmanaged([]const u8).empty;
+                defer row_keys.deinit(self.alloc);
+                for (result.hits) |hit| try row_keys.append(self.alloc, hit.id);
+                try self.claimRowsForTransaction(txn_id, row_keys.items, claim);
+                return;
+            }
+
+            var kept = std.ArrayListUnmanaged(types.SearchHit).empty;
+            errdefer {
+                for (kept.items) |*hit| hit.deinit(result.alloc);
+                kept.deinit(result.alloc);
+            }
+            for (result.hits) |hit| {
+                if (try Self.tryClaimRowForTransaction(self, txn_id, hit.id, claim)) {
+                    try kept.append(result.alloc, try hit.clone(result.alloc));
+                }
+            }
+            const old_hits = result.hits;
+            result.hits = &.{};
+            result.total_hits = 0;
+            for (old_hits) |*hit| hit.deinit(result.alloc);
+            if (old_hits.len > 0) result.alloc.free(old_hits);
+            result.hits = try kept.toOwnedSlice(result.alloc);
+            result.total_hits = @intCast(result.hits.len);
+            result.total_hits_relation = .exact;
+        }
+
+        pub fn resolveSearchHitsToDocSet(
+            self: *DB,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            hits: []const types.SearchHit,
+        ) !doc_set.ResolvedDocSet {
+            if (try resolvedDocSetFromSearchHitOrdinalsAlloc(alloc, hits)) |resolved| {
+                internal_impl.recordResolvedDocSet(self, &resolved, false);
+                return resolved;
+            }
+            var doc_ids = try alloc.alloc([]const u8, hits.len);
+            defer alloc.free(doc_ids);
+            for (hits, 0..) |hit, i| doc_ids[i] = hit.id;
+            return try internal_impl.resolveDocSetForIdsNoLockAtGenerationAlloc(self, alloc, doc_ids, req.identity_read_generation);
+        }
+
+        pub fn resolveGraphNodesToDocSet(
+            self: *DB,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            nodes: []const graph_query_mod.GraphResultNode,
+        ) !doc_set.ResolvedDocSet {
+            var doc_ids = try alloc.alloc([]const u8, nodes.len);
+            defer alloc.free(doc_ids);
+            for (nodes, 0..) |node, i| doc_ids[i] = node.key;
+            return try internal_impl.resolveDocSetForIdsNoLockAtGenerationAlloc(self, alloc, doc_ids, req.identity_read_generation);
+        }
+
+        pub fn liveFilterDocSet(
+            self: *DB,
+            alloc: Allocator,
+            set: *const doc_set.ResolvedDocSet,
+            generation: ?u64,
+        ) !doc_set.ResolvedDocSet {
+            if (try internal_impl.allDocsVisibleAtGeneration(self, generation)) {
+                return try doc_set.cloneAlloc(alloc, set);
+            }
+            return try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, set, generation);
+        }
+
+        pub fn denseOrdinalsForVectorIds(
+            self: *DB,
+            alloc: Allocator,
+            index_name: []const u8,
+            vector_ids: []const u64,
+            generation: ?u64,
+        ) ![]?doc_set.DocOrdinal {
+            const ordinals = try self.core.index_manager.lookupDenseOrdinalsForVectorIdsAlloc(
+                alloc,
+                self.core.store,
+                index_name,
+                vector_ids,
+            );
+            errdefer alloc.free(ordinals);
+            const all_visible = try internal_impl.allDocsVisibleSummaryFast(self, generation);
+            if (all_visible) return ordinals;
+
+            var txn = try self.core.store.beginProbeTxn();
+            defer txn.abort();
+            for (ordinals) |*maybe_ordinal| {
+                const ordinal = maybe_ordinal.* orelse continue;
+                const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse {
+                    maybe_ordinal.* = null;
+                    continue;
+                };
+                const visible = if (generation) |at| state.isVisibleAt(at) else state.isLive();
+                if (!visible) maybe_ordinal.* = null;
+            }
+            return ordinals;
+        }
+
+        pub fn lookupLiveDocOrdinal(
+            self: *DB,
+            alloc: Allocator,
+            doc_id: []const u8,
+            generation: ?u64,
+        ) !?doc_set.DocOrdinal {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+            return try internal_impl.lookupLiveDocOrdinalNoLock(self, alloc, doc_id, generation);
+        }
+
+        pub fn loadChunkFieldValue(self: *DB, alloc: Allocator, doc_key: []const u8) !?std.json.Value {
+            const prefix = try internal_keys.artifactTypePrefixAlloc(alloc, doc_key, "chunk");
+            defer alloc.free(prefix);
+
+            const artifacts = try self.core.scanStorePrefix(alloc, prefix);
+            defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+
+            var chunks_obj = std.json.ObjectMap.empty;
+            errdefer {
+                var it = chunks_obj.iterator();
+                while (it.next()) |entry| {
+                    alloc.free(entry.key_ptr.*);
+                    freeJsonValue(alloc, entry.value_ptr);
+                }
+                chunks_obj.deinit(alloc);
+            }
+
+            var chunk_count: usize = 0;
+            for (artifacts) |entry| {
+                if (!internal_keys.isChunkArtifactRecordKey(entry.key)) continue;
+
+                var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, entry.key)) orelse continue;
+                defer artifact_ref.deinit(alloc);
+                if (artifact_ref.kind != .chunk or artifact_ref.chunk_id == null) continue;
+
+                var parsed = try std.json.parseFromSlice(std.json.Value, alloc, entry.value, .{});
+                defer parsed.deinit();
+                var cloned = try cloneJsonValue(alloc, parsed.value);
+                errdefer freeJsonValue(alloc, &cloned);
+                try db_query_projection.normalizeChunkArtifactForQuery(alloc, &cloned);
+
+                const chunk_name = artifact_ref.name;
+                if (chunks_obj.getPtr(chunk_name)) |existing| {
+                    if (existing.* != .array) {
+                        freeJsonValue(alloc, existing);
+                        existing.* = .{ .array = std.json.Array.init(alloc) };
+                    }
+                    try existing.array.append(cloned);
+                } else {
+                    var arr = std.json.Array.init(alloc);
+                    errdefer {
+                        var mutable = cloned;
+                        freeJsonValue(alloc, &mutable);
+                        arr.deinit();
+                    }
+                    try arr.append(cloned);
+                    try chunks_obj.put(alloc, try alloc.dupe(u8, chunk_name), .{ .array = arr });
+                }
+
+                chunk_count += 1;
+            }
+
+            if (chunk_count == 0) {
+                var empty = std.json.Value{ .object = chunks_obj };
+                freeJsonValue(alloc, &empty);
+                return null;
+            }
+            return .{ .object = chunks_obj };
+        }
+
+        pub fn loadEmbeddingFieldValue(self: *DB, alloc: Allocator, doc_key: []const u8) !?std.json.Value {
+            const prefix = try internal_keys.artifactTypePrefixAlloc(alloc, doc_key, "embedding");
+            defer alloc.free(prefix);
+
+            const artifacts = try self.core.scanStorePrefix(alloc, prefix);
+            defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+
+            var embeddings_obj = std.json.ObjectMap.empty;
+            errdefer {
+                var it = embeddings_obj.iterator();
+                while (it.next()) |entry| {
+                    alloc.free(entry.key_ptr.*);
+                    freeJsonValue(alloc, entry.value_ptr);
+                }
+                embeddings_obj.deinit(alloc);
+            }
+
+            var embedding_count: usize = 0;
+            for (artifacts) |entry| {
+                if (!internal_keys.isInternalUserKey(entry.key)) continue;
+
+                var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, entry.key)) orelse continue;
+                defer artifact_ref.deinit(alloc);
+                if (artifact_ref.kind != .embedding or artifact_ref.source != null) continue;
+
+                var vector = enrichment_artifact_codec.decodeDenseEmbeddingJsonVectorAlloc(alloc, entry.value) catch continue;
+                errdefer freeJsonValue(alloc, &vector);
+                try putOwnedValue(alloc, &embeddings_obj, artifact_ref.name, vector);
+                embedding_count += 1;
+            }
+
+            if (embedding_count == 0) {
+                var empty = std.json.Value{ .object = embeddings_obj };
+                freeJsonValue(alloc, &empty);
+                return null;
+            }
+            return .{ .object = embeddings_obj };
+        }
+
+        pub fn loadArtifactFieldValue(self: *DB, alloc: Allocator, doc_key: []const u8) !?std.json.Value {
+            const prefix = try internal_keys.artifactRootPrefixAlloc(alloc, doc_key);
+            defer alloc.free(prefix);
+
+            const artifacts = try self.core.scanStorePrefix(alloc, prefix);
+            defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+
+            var artifacts_obj = std.json.ObjectMap.empty;
+            errdefer {
+                var it = artifacts_obj.iterator();
+                while (it.next()) |entry| {
+                    alloc.free(entry.key_ptr.*);
+                    freeJsonValue(alloc, entry.value_ptr);
+                }
+                artifacts_obj.deinit(alloc);
+            }
+
+            var artifact_count: usize = 0;
+            for (artifacts) |entry| {
+                var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, entry.key)) orelse continue;
+                defer artifact_ref.deinit(alloc);
+
+                var artifact_value = try Self.artifactProjectionValue(self, alloc, artifact_ref, entry.value);
+                errdefer freeJsonValue(alloc, &artifact_value);
+
+                try appendArtifactProjectionValue(alloc, &artifacts_obj, artifact_ref.name, artifact_ref.kind, artifact_value);
+                artifact_count += 1;
+            }
+
+            if (artifact_count == 0) {
+                var empty = std.json.Value{ .object = artifacts_obj };
+                freeJsonValue(alloc, &empty);
+                return null;
+            }
+            return .{ .object = artifacts_obj };
+        }
+
+        fn tryClaimRowForTransaction(self: *DB, txn_id: types.TxnId, row_key: []const u8, claim: types.RowClaimRequest) !bool {
+            self.claimRowsForTransaction(txn_id, &.{row_key}, claim) catch |err| switch (err) {
+                transactions_mod.TxnError.IntentConflict => return false,
+                else => return err,
+            };
+            return true;
+        }
+
+        fn artifactProjectionValue(self: *DB, alloc: Allocator, artifact_ref: types.ArtifactRef, raw: []const u8) !std.json.Value {
+            var obj = std.json.ObjectMap.empty;
+            errdefer {
+                var value = std.json.Value{ .object = obj };
+                freeJsonValue(alloc, &value);
+            }
+
+            {
+                const artifact_id = try artifact_ids.artifactPublicIdAlloc(alloc, artifact_ref);
+                errdefer alloc.free(artifact_id);
+                try putOwnedValue(alloc, &obj, "artifact_id", .{ .string = artifact_id });
+            }
+
+            {
+                var ref_value = try artifactRefJsonValue(alloc, artifact_ref);
+                errdefer freeJsonValue(alloc, &ref_value);
+                try putOwnedValue(alloc, &obj, "artifact_ref", ref_value);
+            }
+
+            try putOwnedValue(alloc, &obj, "kind", .{ .string = try alloc.dupe(u8, artifactKindText(artifact_ref.kind)) });
+            const content_type = try Self.artifactContentTypeAlloc(self, alloc, artifact_ref.kind, artifact_ref.name);
+            try putOwnedValue(alloc, &obj, "content_type", .{ .string = content_type });
+            try putOwnedValue(alloc, &obj, "status", .{ .string = try alloc.dupe(u8, "ready") });
+
+            if (enrichment_artifact_codec.sourceHash(raw) catch null) |source_hash| {
+                try putOwnedValue(alloc, &obj, "source_hash", .{ .string = try std.fmt.allocPrint(alloc, "xxh64:{x}", .{source_hash}) });
+            }
+
+            switch (artifact_ref.kind) {
+                .chunk => {
+                    var parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch null;
+                    if (parsed) |*owned| {
+                        defer owned.deinit();
+                        var cloned = try cloneJsonValue(alloc, owned.value);
+                        errdefer freeJsonValue(alloc, &cloned);
+                        try db_query_projection.normalizeChunkArtifactForQuery(alloc, &cloned);
+                        try putOwnedValue(alloc, &obj, "value", cloned);
+                    } else {
+                        try putOwnedValue(alloc, &obj, "value", .{ .string = try alloc.dupe(u8, raw) });
+                    }
+                },
+                .asset => {
+                    try putOwnedValue(alloc, &obj, "value", try assetPayloadJsonValue(alloc, content_type, raw));
+                },
+                .embedding => {
+                    if (enrichment_artifact_codec.decodeDenseEmbeddingDims(raw) catch null) |dims| {
+                        try putOwnedValue(alloc, &obj, "dims", .{ .integer = @intCast(dims) });
+                    }
+                    try putOwnedValue(alloc, &obj, "value", .null);
+                },
+            }
+
+            return .{ .object = obj };
+        }
+
+        fn artifactContentTypeAlloc(self: *DB, alloc: Allocator, kind: types.ArtifactKind, artifact_name: []const u8) ![]u8 {
+            if (kind == .asset) {
+                if (self.core.index_manager.getEnrichment(.asset, artifact_name)) |cfg| {
+                    if (cfg.content_type.len > 0) return try alloc.dupe(u8, cfg.content_type);
+                    return try alloc.dupe(u8, "text/plain");
+                }
+            }
+            return try alloc.dupe(u8, artifactContentType(kind));
+        }
+
         fn searchLockedWithExecutionContext(
             self: *DB,
             alloc: Allocator,
@@ -332,7 +847,7 @@ pub fn Impl(comptime DB: type) type {
             }
 
             base.graph_results = try Self.executeGraphQueries(self, alloc, execution_req, execution_req.graph_queries, base.hits, base.total_hits);
-            try self.searchRuntimeApplyGraphExpandStrategy(alloc, &base, execution_req.expand_strategy);
+            try Self.applyGraphExpandStrategy(self, alloc, &base, execution_req.expand_strategy);
             try db_query_result_shape.externalizeSearchResultArtifactIds(alloc, &base);
             return base;
         }
@@ -512,14 +1027,14 @@ pub fn Impl(comptime DB: type) type {
                 if (try Self.searchRequestWithDynamicStructuredDocFilterAlloc(self, req)) |direct| return direct;
             }
             const entry = self.core.index_manager.algebraicIndex(null) orelse {
-                self.searchRuntimeRecordUnsupportedDocSetFilterShape();
+                Self.recordUnsupportedDocSetFilterShape(self);
                 if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
                 return .{ .req = req };
             };
             entry.index.recordVectorFilterAttempt();
             if (entry.index.hasErrors() or !entry.index.plannerLifecycleReady()) {
                 entry.index.recordVectorFilterUnsupported(req.require_algebraic_filter_resolution);
-                self.searchRuntimeRecordUnsupportedDocSetFilterShape();
+                Self.recordUnsupportedDocSetFilterShape(self);
                 if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
                 return .{ .req = req };
             }
@@ -552,7 +1067,7 @@ pub fn Impl(comptime DB: type) type {
                     filter_bindings.items,
                 )) orelse {
                     entry.index.recordVectorFilterUnsupported(req.require_algebraic_filter_resolution);
-                    self.searchRuntimeRecordUnsupportedDocSetFilterShape();
+                    Self.recordUnsupportedDocSetFilterShape(self);
                     if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
                     return .{ .req = req };
                 };
@@ -609,7 +1124,7 @@ pub fn Impl(comptime DB: type) type {
             }
             if (!changed) {
                 entry.index.recordVectorFilterUnsupported(req.require_algebraic_filter_resolution);
-                self.searchRuntimeRecordUnsupportedDocSetFilterShape();
+                Self.recordUnsupportedDocSetFilterShape(self);
                 if (req.require_algebraic_filter_resolution) return error.UnsupportedQueryRequest;
                 return .{ .req = req };
             }
@@ -625,12 +1140,12 @@ pub fn Impl(comptime DB: type) type {
             if (filter_bindings.items.len > 0) next.doc_filter_bindings = &.{};
             if (next.require_algebraic_filter_resolution and (next.filter_query_json.len > 0 or next.exclusion_query_json.len > 0)) {
                 entry.index.recordVectorFilterUnsupported(true);
-                self.searchRuntimeRecordUnsupportedDocSetFilterShape();
+                Self.recordUnsupportedDocSetFilterShape(self);
                 return error.UnsupportedQueryRequest;
             }
             const resolved_filter = try self.alloc.create(doc_set.ResolvedDocFilter);
             errdefer self.alloc.destroy(resolved_filter);
-            resolved_filter.* = try self.searchRuntimeResolvedDocFilterForIdsAlloc(filter_supported, filter_doc_ids, exclude_doc_ids, req.identity_read_generation);
+            resolved_filter.* = try Self.resolvedDocFilterForIdsAlloc(self, filter_supported, filter_doc_ids, exclude_doc_ids, req.identity_read_generation);
             errdefer resolved_filter.deinit(self.alloc);
             next.resolved_doc_filter = resolved_filter;
             entry.index.recordVectorFilterResolved(filter_doc_ids.len, exclude_doc_ids.len);
@@ -826,7 +1341,7 @@ pub fn Impl(comptime DB: type) type {
                 var include = if (req.filter_doc_ids.len == 0)
                     doc_set.ResolvedDocSet.none
                 else
-                    try self.searchRuntimeResolveDocIdsToDocSet(alloc, req.filter_doc_ids, req.identity_read_generation);
+                    try Self.resolveDocIdsToDocSet(self, alloc, req.filter_doc_ids, req.identity_read_generation);
                 defer include.deinit(alloc);
                 if (!(try intersectResolvedFilterIncludeAlloc(alloc, &filter, &include))) {
                     filter.deinit(alloc);
@@ -836,7 +1351,7 @@ pub fn Impl(comptime DB: type) type {
             }
 
             if (req.exclude_doc_ids.len != 0) {
-                var exclude = try self.searchRuntimeResolveDocIdsToDocSet(alloc, req.exclude_doc_ids, req.identity_read_generation);
+                var exclude = try Self.resolveDocIdsToDocSet(self, alloc, req.exclude_doc_ids, req.identity_read_generation);
                 defer exclude.deinit(alloc);
                 if (!(try unionResolvedFilterExcludeAlloc(alloc, &filter, &exclude))) {
                     filter.deinit(alloc);
@@ -870,7 +1385,7 @@ pub fn Impl(comptime DB: type) type {
             generation: ?u64,
         ) !doc_set.ResolvedDocSet {
             return switch (set.*) {
-                .doc_keys => |keys| try self.searchRuntimeResolveDocIdsToDocSet(alloc, keys, generation),
+                .doc_keys => |keys| try Self.resolveDocIdsToDocSet(self, alloc, keys, generation),
                 else => try doc_set.cloneAlloc(alloc, set),
             };
         }
@@ -1071,8 +1586,8 @@ pub fn Impl(comptime DB: type) type {
                 .lookup_doc_ordinal = Self.lookupLiveDocOrdinalNoLockCallback,
             });
             errdefer raw.deinit();
-            try self.searchRuntimeAnnotateSearchHitOrdinalsNoLock(alloc, req, raw.hits);
-            return try self.searchRuntimeFilterExpiredSearchResult(alloc, raw);
+            try Self.annotateSearchHitOrdinalsNoLock(self, alloc, req, raw.hits);
+            return try Self.filterExpiredSearchResult(self, alloc, raw);
         }
 
         fn fuseNamedSets(self: *DB, alloc: Allocator, req: types.SearchRequest, named_sets: []const NamedResultSet) !types.SearchResult {
@@ -1080,7 +1595,7 @@ pub fn Impl(comptime DB: type) type {
                 .ctx = self,
                 .load_projected_document = Self.loadProjectedSearchDocumentCallback,
             });
-            return try self.searchRuntimeFilterExpiredSearchResult(alloc, raw);
+            return try Self.filterExpiredSearchResult(self, alloc, raw);
         }
 
         fn executeGraphQueries(
@@ -1134,7 +1649,7 @@ pub fn Impl(comptime DB: type) type {
                 }),
             };
             errdefer result.deinit(alloc);
-            try self.searchRuntimeAnnotateSearchHitOrdinalsNoLock(alloc, req, result.hits);
+            try Self.annotateSearchHitOrdinalsNoLock(self, alloc, req, result.hits);
             return result;
         }
 
@@ -1337,7 +1852,12 @@ pub fn Impl(comptime DB: type) type {
                 .sparse_vector => self.core.index_manager.sparseVectorAccessPath(index_name),
                 else => null,
             };
-            const access_path = selected_path orelse return error.IndexNotFound;
+            const access_path = selected_path orelse {
+                if (index_name) |name| {
+                    if (self.core.index_manager.loadFailure(name) != null) return error.IndexUnavailable;
+                }
+                return error.IndexNotFound;
+            };
             var planned = (try algebraic_mod.planner.planVectorSearchTensorProgramAlloc(self.alloc, access_path.owner, layout, constrained)) orelse return error.InvalidIndexConfig;
             defer planned.deinit(self.alloc);
             if (planned.access_paths.len != 1 or
@@ -1537,7 +2057,7 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn searchDenseProfiled(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
-            if (self.searchRuntimeCanUsePublishedDenseSearch(req)) {
+            if (Self.canUsePublishedDenseSearch(self, req)) {
                 return try Self.searchDenseProfiledAtSnapshot(self, alloc, try Self.searchRequestAtCurrentIdentityGeneration(self, req), dense);
             }
             {
@@ -1545,6 +2065,2014 @@ pub fn Impl(comptime DB: type) type {
                 defer self.core.unlockApplyShared();
                 return try Self.searchDenseProfiledAtSnapshot(self, alloc, try Self.searchRequestAtCurrentIdentityGeneration(self, req), dense);
             }
+        }
+
+        pub fn canUsePublishedDenseSearch(self: *DB, req: types.SearchRequest) bool {
+            if (req.graph_queries.len != 0) return false;
+            if (req.graph_metric_queries.len != 0) return false;
+            if (req.full_text != null or req.sparse != null) return false;
+            if (req.full_text_queries.len != 0 or req.dense_queries.len != 0 or req.sparse_queries.len != 0) return false;
+            if (req.merge_config != null) return false;
+            if (req.doc_filter_bindings.len != 0) return false;
+            if (req.filter_query_json.len != 0 or req.exclusion_query_json.len != 0) return false;
+            if (req.resolved_doc_filter != null) return false;
+            if (req.filter_doc_ids_positive or req.filter_doc_ids.len != 0 or req.exclude_doc_ids.len != 0) return false;
+            if (!(req.dense != null or req.query == .dense_knn)) return false;
+            const entry = Self.denseIndex(self, req.index_name) orelse return false;
+            return !entry.index.hasExternalVectorLoader();
+        }
+
+        pub fn relationalFilterGenerationCanUseCurrentRows(self: *DB, generation: ?u64) bool {
+            const requested = generation orelse return true;
+            return requested == self.core.nextDerivedSequence();
+        }
+
+        pub fn relationalAllRowsDocSetAlloc(
+            self: *DB,
+            alloc: Allocator,
+            generation: ?u64,
+        ) !doc_set.ResolvedDocSet {
+            const rows = try relational_store_mod.scanRowsAlloc(alloc, self.core.store, "", "");
+            defer relational_store_mod.freeRows(alloc, rows);
+
+            var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
+            defer doc_ids.deinit(alloc);
+            try doc_ids.ensureUnusedCapacity(alloc, rows.len);
+            for (rows) |row| doc_ids.appendAssumeCapacity(row.doc_key);
+            return try Self.resolveDocIdsToDocSet(self, alloc, doc_ids.items, generation);
+        }
+
+        pub fn combineRelationalFilterSetAlloc(
+            self: *DB,
+            alloc: Allocator,
+            current: *?doc_set.ResolvedDocSet,
+            child: *const doc_set.ResolvedDocSet,
+            generation: ?u64,
+            mode: relational_rows.FilterCombineMode,
+        ) !void {
+            if (current.* == null) {
+                current.* = try doc_set.cloneAlloc(alloc, child);
+                return;
+            }
+
+            if (try relational_rows.combineFilterSetFastAlloc(alloc, &current.*.?, child, mode)) |next| {
+                var owned_next = next;
+                errdefer owned_next.deinit(alloc);
+                current.*.?.deinit(alloc);
+                current.* = owned_next;
+                return;
+            }
+
+            var fallback = try Self.combineRelationalFilterSetByVisibleDocIdsAlloc(self, alloc, &current.*.?, child, generation, mode);
+            errdefer fallback.deinit(alloc);
+            current.*.?.deinit(alloc);
+            current.* = fallback;
+        }
+
+        fn combineRelationalFilterSetByVisibleDocIdsAlloc(
+            self: *DB,
+            alloc: Allocator,
+            left: *const doc_set.ResolvedDocSet,
+            right: *const doc_set.ResolvedDocSet,
+            generation: ?u64,
+            mode: relational_rows.FilterCombineMode,
+        ) !doc_set.ResolvedDocSet {
+            const left_ids = try Self.relationalFilterDocIdsForSetAlloc(self, alloc, left, generation);
+            defer freeConstDocIdsAlloc(alloc, left_ids);
+            const right_ids = try Self.relationalFilterDocIdsForSetAlloc(self, alloc, right, generation);
+            defer freeConstDocIdsAlloc(alloc, right_ids);
+
+            var right_set = std.StringHashMapUnmanaged(void).empty;
+            defer right_set.deinit(alloc);
+            for (right_ids) |doc_id| try right_set.put(alloc, doc_id, {});
+
+            var out = std.ArrayListUnmanaged([]const u8).empty;
+            errdefer {
+                for (out.items) |doc_id| alloc.free(@constCast(doc_id));
+                out.deinit(alloc);
+            }
+
+            switch (mode) {
+                .intersect => {
+                    for (left_ids) |doc_id| {
+                        if (right_set.contains(doc_id)) try out.append(alloc, try alloc.dupe(u8, doc_id));
+                    }
+                },
+                .difference => {
+                    for (left_ids) |doc_id| {
+                        if (!right_set.contains(doc_id)) try out.append(alloc, try alloc.dupe(u8, doc_id));
+                    }
+                },
+                .union_set => {
+                    var seen = std.StringHashMapUnmanaged(void).empty;
+                    defer seen.deinit(alloc);
+                    for (left_ids) |doc_id| {
+                        const entry = try seen.getOrPut(alloc, doc_id);
+                        if (!entry.found_existing) try out.append(alloc, try alloc.dupe(u8, doc_id));
+                    }
+                    for (right_ids) |doc_id| {
+                        const entry = try seen.getOrPut(alloc, doc_id);
+                        if (!entry.found_existing) try out.append(alloc, try alloc.dupe(u8, doc_id));
+                    }
+                },
+            }
+
+            return if (out.items.len == 0) .none else .{ .doc_keys = try out.toOwnedSlice(alloc) };
+        }
+
+        fn relationalFilterDocIdsForSetAlloc(
+            self: *DB,
+            alloc: Allocator,
+            set: *const doc_set.ResolvedDocSet,
+            generation: ?u64,
+        ) ![]const []const u8 {
+            if (set.* != .all) {
+                return (try Self.resolveDocSetDocIds(self, alloc, set, generation)) orelse error.UnsupportedQueryRequest;
+            }
+
+            var all_rows = try Self.relationalAllRowsDocSetAlloc(self, alloc, generation);
+            defer all_rows.deinit(alloc);
+            return (try Self.resolveDocSetDocIds(self, alloc, &all_rows, generation)) orelse error.UnsupportedQueryRequest;
+        }
+
+        pub fn relationalColumnIndexUsableForQuery(
+            self: *DB,
+            alloc: Allocator,
+            column: schema_mod.RelationalColumn,
+            implications: relational_rows.PredicateImplications,
+        ) !bool {
+            _ = self;
+            return try relational_rows.columnIndexUsableForQuery(alloc, column, implications, platform_time.realtimeNs());
+        }
+
+        pub fn resolveRelationalFilterQueryDocSetAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            query: search_mod.SearchQuery,
+            generation: ?u64,
+        ) anyerror!?doc_set.ResolvedDocSet {
+            return try Self.resolveRelationalFilterQueryDocSetWithImplicationsAlloc(self, alloc, runtime_schema, query, .{}, generation);
+        }
+
+        pub fn resolveRelationalFilterQueryDocSetWithImplicationsAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            query: search_mod.SearchQuery,
+            implications: relational_rows.PredicateImplications,
+            generation: ?u64,
+        ) anyerror!?doc_set.ResolvedDocSet {
+            if (!Self.relationalFilterGenerationCanUseCurrentRows(self, generation)) return null;
+            return switch (query) {
+                .match_none => .none,
+                .match_all => try Self.relationalAllRowsDocSetAlloc(self, alloc, generation),
+                .doc_id => |doc_id| try Self.resolveDocIdsToDocSet(self, alloc, doc_id.ids, generation),
+                .term => |term| try Self.resolveRelationalTermFilterDocSetAlloc(self, alloc, runtime_schema, term, implications, generation),
+                .array_any => |array_any| try Self.resolveRelationalArrayAnyFilterDocSetAlloc(self, alloc, runtime_schema, array_any, implications, generation),
+                .json_contains => |json_contains| try Self.resolveRelationalJsonContainsFilterDocSetAlloc(self, alloc, runtime_schema, json_contains, implications, generation),
+                .term_range => |range| try Self.resolveRelationalTermRangeFilterDocSetAlloc(self, alloc, runtime_schema, range, implications, generation),
+                .numeric_range => |range| try Self.resolveRelationalNumericFilterDocSetAlloc(self, alloc, runtime_schema, range, implications, generation),
+                .date_range => |range| try Self.resolveRelationalDateFilterDocSetAlloc(self, alloc, runtime_schema, range, implications, generation),
+                .bool_field => |bool_query| try Self.resolveRelationalBoolFieldFilterDocSetAlloc(self, alloc, runtime_schema, bool_query, implications, generation),
+                .geo_distance => |geo_query| try Self.resolveRelationalGeoDistanceFilterDocSetAlloc(self, alloc, runtime_schema, geo_query, implications, generation),
+                .geo_bbox => |geo_query| try Self.resolveRelationalGeoBBoxFilterDocSetAlloc(self, alloc, runtime_schema, geo_query, implications, generation),
+                .bool_query => |bool_query| try Self.resolveRelationalBoolQueryDocSetAlloc(self, alloc, runtime_schema, bool_query, implications, generation),
+                else => null,
+            };
+        }
+
+        fn resolveRelationalTermFilterDocSetAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            term: search_mod.TermQuery,
+            implications: relational_rows.PredicateImplications,
+            generation: ?u64,
+        ) !?doc_set.ResolvedDocSet {
+            const column = relational_rows.columnForField(runtime_schema, term.field) orelse return null;
+            if (column.field_type != .keyword) return null;
+            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, column, implications, generation, struct {
+                wanted: []const u8,
+
+                fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
+                    return value.value_type == .bytes_val and !value.is_json and std.mem.eql(u8, value.value.bytes_val, ctx.wanted);
+                }
+            }{ .wanted = term.term });
+        }
+
+        fn resolveRelationalArrayAnyFilterDocSetAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            array_any: search_mod.ArrayAnyQuery,
+            implications: relational_rows.PredicateImplications,
+            generation: ?u64,
+        ) !?doc_set.ResolvedDocSet {
+            const column = relational_rows.columnForField(runtime_schema, array_any.field) orelse return null;
+            if (column.field_type != .array) return null;
+
+            var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
+            errdefer {
+                for (doc_ids.items) |doc_id| alloc.free(@constCast(doc_id));
+                doc_ids.deinit(alloc);
+            }
+
+            if (try Self.relationalColumnIndexUsableForQuery(self, alloc, column, implications)) {
+                const element_key = try relational_store_mod.arrayElementIndexKeyForValueAlloc(alloc, array_any.value);
+                defer alloc.free(element_key);
+                const indexed_doc_ids = try relational_store_mod.scanArrayElementDocKeysAlloc(alloc, self.core.store, column.path, element_key, "", "");
+                defer relational_store_mod.freeDocKeys(alloc, indexed_doc_ids);
+                for (indexed_doc_ids) |doc_id| {
+                    const owned_doc_id = try alloc.dupe(u8, doc_id);
+                    errdefer alloc.free(owned_doc_id);
+                    try doc_ids.append(alloc, owned_doc_id);
+                }
+            } else {
+                const rows = try relational_store_mod.scanRowsAlloc(alloc, self.core.store, "", "");
+                defer relational_store_mod.freeRows(alloc, rows);
+                for (rows) |row| {
+                    const cell = (try relational_row_codec.findCellByPath(row.row_value, column.path)) orelse continue;
+                    const value = relational_store_mod.OwnedColumnValue{
+                        .doc_key = row.doc_key,
+                        .value_type = cell.value_type,
+                        .is_json = cell.is_json,
+                        .value = cell.value,
+                    };
+                    if (!(try relational_rows.arrayColumnValueContains(alloc, value, array_any.value))) continue;
+                    const owned_doc_id = try alloc.dupe(u8, row.doc_key);
+                    errdefer alloc.free(owned_doc_id);
+                    try doc_ids.append(alloc, owned_doc_id);
+                }
+            }
+
+            _ = generation;
+            if (doc_ids.items.len == 0) return .none;
+            return .{ .doc_keys = try doc_ids.toOwnedSlice(alloc) };
+        }
+
+        fn resolveRelationalJsonContainsFilterDocSetAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            json_contains: search_mod.JsonContainsQuery,
+            implications: relational_rows.PredicateImplications,
+            generation: ?u64,
+        ) !?doc_set.ResolvedDocSet {
+            const column = relational_rows.columnForField(runtime_schema, json_contains.field) orelse return null;
+            if (column.field_type != .json) return null;
+
+            var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
+            errdefer {
+                for (doc_ids.items) |doc_id| alloc.free(@constCast(doc_id));
+                doc_ids.deinit(alloc);
+            }
+
+            if ((try Self.relationalColumnIndexUsableForQuery(self, alloc, column, implications)) and relational_store_mod.jsonContainsHasIndexableLeaf(json_contains.value)) {
+                const indexed_doc_ids = try relational_store_mod.scanJsonContainmentDocKeysAlloc(alloc, self.core.store, column.path, json_contains.value, "", "");
+                defer relational_store_mod.freeDocKeys(alloc, indexed_doc_ids);
+                for (indexed_doc_ids) |doc_id| {
+                    const owned_doc_id = try alloc.dupe(u8, doc_id);
+                    errdefer alloc.free(owned_doc_id);
+                    try doc_ids.append(alloc, owned_doc_id);
+                }
+            } else {
+                const rows = try relational_store_mod.scanRowsAlloc(alloc, self.core.store, "", "");
+                defer relational_store_mod.freeRows(alloc, rows);
+                for (rows) |row| {
+                    const cell = (try relational_row_codec.findCellByPath(row.row_value, column.path)) orelse continue;
+                    if (!(try relational_store_mod.jsonCellContains(alloc, cell, json_contains.value))) continue;
+                    const owned_doc_id = try alloc.dupe(u8, row.doc_key);
+                    errdefer alloc.free(owned_doc_id);
+                    try doc_ids.append(alloc, owned_doc_id);
+                }
+            }
+
+            _ = generation;
+            if (doc_ids.items.len == 0) return .none;
+            return .{ .doc_keys = try doc_ids.toOwnedSlice(alloc) };
+        }
+
+        fn resolveRelationalTermRangeFilterDocSetAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            range: search_mod.TermRangeQuery,
+            implications: relational_rows.PredicateImplications,
+            generation: ?u64,
+        ) !?doc_set.ResolvedDocSet {
+            const column = relational_rows.columnForField(runtime_schema, range.field) orelse return null;
+            if (column.field_type != .keyword) return null;
+            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, column, implications, generation, struct {
+                min: ?[]const u8,
+                max: ?[]const u8,
+                inclusive_min: bool,
+                inclusive_max: bool,
+
+                fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
+                    if (value.value_type != .bytes_val or value.is_json) return false;
+                    const bytes = value.value.bytes_val;
+                    const above_min = if (ctx.min) |min| blk: {
+                        const order = std.mem.order(u8, bytes, min);
+                        break :blk order == .gt or (ctx.inclusive_min and order == .eq);
+                    } else true;
+                    const below_max = if (ctx.max) |max| blk: {
+                        const order = std.mem.order(u8, bytes, max);
+                        break :blk order == .lt or (ctx.inclusive_max and order == .eq);
+                    } else true;
+                    return above_min and below_max;
+                }
+            }{
+                .min = range.min,
+                .max = range.max,
+                .inclusive_min = range.inclusive_min,
+                .inclusive_max = range.inclusive_max,
+            });
+        }
+
+        fn resolveRelationalNumericFilterDocSetAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            range: search_mod.NumericRangeQuery,
+            implications: relational_rows.PredicateImplications,
+            generation: ?u64,
+        ) !?doc_set.ResolvedDocSet {
+            const column = relational_rows.columnForField(runtime_schema, range.field) orelse return null;
+            if (column.field_type != .numeric) return null;
+            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, column, implications, generation, struct {
+                min: ?f64,
+                max: ?f64,
+                inclusive_min: bool,
+                inclusive_max: bool,
+
+                fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
+                    if (value.value_type != .f64_val) return false;
+                    const number = value.value.f64_val;
+                    const above_min = if (ctx.min) |min| if (ctx.inclusive_min) number >= min else number > min else true;
+                    const below_max = if (ctx.max) |max| if (ctx.inclusive_max) number <= max else number < max else true;
+                    return above_min and below_max;
+                }
+            }{
+                .min = range.min,
+                .max = range.max,
+                .inclusive_min = range.inclusive_min,
+                .inclusive_max = range.inclusive_max,
+            });
+        }
+
+        fn resolveRelationalDateFilterDocSetAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            range: search_mod.DateRangeQuery,
+            implications: relational_rows.PredicateImplications,
+            generation: ?u64,
+        ) !?doc_set.ResolvedDocSet {
+            const column = relational_rows.columnForField(runtime_schema, range.field) orelse return null;
+            if (column.field_type != .datetime) return null;
+            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, column, implications, generation, struct {
+                start_ns: ?u64,
+                end_ns: ?u64,
+                inclusive_start: bool,
+                inclusive_end: bool,
+
+                fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
+                    if (value.value_type != .u64_val) return false;
+                    const timestamp = value.value.u64_val;
+                    const after_start = if (ctx.start_ns) |start| if (ctx.inclusive_start) timestamp >= start else timestamp > start else true;
+                    const before_end = if (ctx.end_ns) |end| if (ctx.inclusive_end) timestamp <= end else timestamp < end else true;
+                    return after_start and before_end;
+                }
+            }{
+                .start_ns = range.start_ns,
+                .end_ns = range.end_ns,
+                .inclusive_start = range.inclusive_start,
+                .inclusive_end = range.inclusive_end,
+            });
+        }
+
+        fn resolveRelationalBoolFieldFilterDocSetAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            bool_query: search_mod.BoolFieldQuery,
+            implications: relational_rows.PredicateImplications,
+            generation: ?u64,
+        ) !?doc_set.ResolvedDocSet {
+            const column = relational_rows.columnForField(runtime_schema, bool_query.field) orelse return null;
+            if (column.field_type != .boolean) return null;
+            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, column, implications, generation, struct {
+                wanted: bool,
+
+                fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
+                    return value.value_type == .bool_val and value.value.bool_val == ctx.wanted;
+                }
+            }{ .wanted = bool_query.value });
+        }
+
+        fn resolveRelationalGeoDistanceFilterDocSetAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            geo_query: search_mod.GeoDistanceQuery,
+            implications: relational_rows.PredicateImplications,
+            generation: ?u64,
+        ) !?doc_set.ResolvedDocSet {
+            const column = relational_rows.columnForField(runtime_schema, geo_query.field) orelse return null;
+            if (column.field_type != .geopoint) return null;
+            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, column, implications, generation, struct {
+                center: search_mod.GeoPoint,
+                radius_meters: f64,
+
+                fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
+                    if (value.value_type != .geo_point) return false;
+                    const point = search_mod.GeoPoint{
+                        .lat = value.value.geo_point.lat,
+                        .lon = value.value.geo_point.lon,
+                    };
+                    return search_geo_mod.haversineDistance(ctx.center, point) <= ctx.radius_meters;
+                }
+            }{
+                .center = geo_query.center,
+                .radius_meters = geo_query.radius_meters,
+            });
+        }
+
+        fn resolveRelationalGeoBBoxFilterDocSetAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            geo_query: search_mod.GeoBBoxQuery,
+            implications: relational_rows.PredicateImplications,
+            generation: ?u64,
+        ) !?doc_set.ResolvedDocSet {
+            const column = relational_rows.columnForField(runtime_schema, geo_query.field) orelse return null;
+            if (column.field_type != .geopoint) return null;
+            return try Self.scanRelationalColumnFilterDocSetAlloc(self, alloc, column, implications, generation, struct {
+                min_lat: f64,
+                min_lon: f64,
+                max_lat: f64,
+                max_lon: f64,
+
+                fn matches(ctx: @This(), value: relational_store_mod.OwnedColumnValue) bool {
+                    if (value.value_type != .geo_point) return false;
+                    const point = value.value.geo_point;
+                    return point.lat >= ctx.min_lat and point.lat <= ctx.max_lat and
+                        point.lon >= ctx.min_lon and point.lon <= ctx.max_lon;
+                }
+            }{
+                .min_lat = geo_query.min_lat,
+                .min_lon = geo_query.min_lon,
+                .max_lat = geo_query.max_lat,
+                .max_lon = geo_query.max_lon,
+            });
+        }
+
+        fn resolveRelationalBoolQueryDocSetAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            bool_query: search_mod.BoolQuery,
+            implications: relational_rows.PredicateImplications,
+            generation: ?u64,
+        ) anyerror!?doc_set.ResolvedDocSet {
+            if (bool_query.min_should > 1) return null;
+
+            var current: ?doc_set.ResolvedDocSet = null;
+            errdefer if (current) |*set| set.deinit(alloc);
+
+            for (bool_query.must) |child_query| {
+                var child = (try Self.resolveRelationalFilterQueryDocSetWithImplicationsAlloc(self, alloc, runtime_schema, child_query, implications, generation)) orelse {
+                    if (current) |*set| set.deinit(alloc);
+                    return null;
+                };
+                defer child.deinit(alloc);
+                try Self.combineRelationalFilterSetAlloc(self, alloc, &current, &child, generation, .intersect);
+            }
+
+            if (bool_query.should.len > 0 and (bool_query.min_should > 0 or current == null)) {
+                var should_set: ?doc_set.ResolvedDocSet = null;
+                errdefer if (should_set) |*set| set.deinit(alloc);
+                for (bool_query.should) |child_query| {
+                    var child = (try Self.resolveRelationalFilterQueryDocSetWithImplicationsAlloc(self, alloc, runtime_schema, child_query, implications, generation)) orelse {
+                        if (current) |*set| set.deinit(alloc);
+                        if (should_set) |*set| set.deinit(alloc);
+                        return null;
+                    };
+                    defer child.deinit(alloc);
+                    try Self.combineRelationalFilterSetAlloc(self, alloc, &should_set, &child, generation, .union_set);
+                }
+                if (should_set) |*set| {
+                    try Self.combineRelationalFilterSetAlloc(self, alloc, &current, set, generation, .intersect);
+                    set.* = .none;
+                }
+            }
+
+            if (current == null and bool_query.must_not.len > 0) {
+                current = try Self.relationalAllRowsDocSetAlloc(self, alloc, generation);
+            }
+
+            for (bool_query.must_not) |child_query| {
+                var child = (try Self.resolveRelationalFilterQueryDocSetWithImplicationsAlloc(self, alloc, runtime_schema, child_query, implications, generation)) orelse {
+                    if (current) |*set| set.deinit(alloc);
+                    return null;
+                };
+                defer child.deinit(alloc);
+                try Self.combineRelationalFilterSetAlloc(self, alloc, &current, &child, generation, .difference);
+            }
+
+            return current orelse null;
+        }
+
+        fn scanRelationalColumnFilterDocSetAlloc(
+            self: *DB,
+            alloc: Allocator,
+            column: schema_mod.RelationalColumn,
+            implications: relational_rows.PredicateImplications,
+            generation: ?u64,
+            matcher: anytype,
+        ) !doc_set.ResolvedDocSet {
+            if (!(try Self.relationalColumnIndexUsableForQuery(self, alloc, column, implications))) {
+                return try Self.scanRelationalBaseRowsFilterDocSetAlloc(self, alloc, column, generation, matcher);
+            }
+
+            const values = try relational_store_mod.scanColumnAlloc(alloc, self.core.store, column.path, "", "");
+            defer relational_store_mod.freeColumnValues(alloc, values);
+
+            var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
+            defer doc_ids.deinit(alloc);
+            for (values) |value| {
+                if (!matcher.matches(value)) continue;
+                try doc_ids.append(alloc, value.doc_key);
+            }
+            return try Self.resolveDocIdsToDocSet(self, alloc, doc_ids.items, generation);
+        }
+
+        fn scanRelationalBaseRowsFilterDocSetAlloc(
+            self: *DB,
+            alloc: Allocator,
+            column: schema_mod.RelationalColumn,
+            generation: ?u64,
+            matcher: anytype,
+        ) !doc_set.ResolvedDocSet {
+            const rows = try relational_store_mod.scanRowsAlloc(alloc, self.core.store, "", "");
+            defer relational_store_mod.freeRows(alloc, rows);
+
+            var doc_ids = std.ArrayListUnmanaged([]const u8).empty;
+            defer doc_ids.deinit(alloc);
+            for (rows) |row| {
+                const cell = (try relational_row_codec.findCellByPath(row.row_value, column.path)) orelse continue;
+                const value = relational_store_mod.OwnedColumnValue{
+                    .doc_key = row.doc_key,
+                    .value_type = cell.value_type,
+                    .is_json = cell.is_json,
+                    .value = cell.value,
+                };
+                if (!matcher.matches(value)) continue;
+                try doc_ids.append(alloc, row.doc_key);
+            }
+            return try Self.resolveDocIdsToDocSet(self, alloc, doc_ids.items, generation);
+        }
+
+        pub fn applyGraphExpandStrategy(self: *DB, alloc: Allocator, result: *types.SearchResult, strategy: ?graph_query_mod.ExpandStrategy) !void {
+            _ = self;
+            try db_query_graph.applyGraphExpandStrategy(alloc, result, strategy);
+        }
+
+        pub fn executeSearchGraphQuery(
+            self: *DB,
+            alloc: Allocator,
+            graph_query: graph_query_mod.GraphQuery,
+            start_key_refs: []const []const u8,
+            target_keys: [][]u8,
+        ) !graph_query_mod.GraphQueryResult {
+            const entry = self.core.graphIndex(graph_query.index_name) orelse return error.IndexNotFound;
+            if (entry.index.supportsAlgebraicSemiringTraversal()) {
+                try Self.proveGraphTraversalProgram(self, graph_query.index_name, target_keys.len > 0);
+            }
+
+            var resolved_query = graph_query;
+            if (graph_query.target_nodes != null) {
+                resolved_query.target_nodes = .{ .keys = try Self.castOwnedKeysToConst(alloc, target_keys) };
+            }
+            defer if (graph_query.target_nodes != null) {
+                switch (resolved_query.target_nodes.?) {
+                    .keys => |owned| alloc.free(owned),
+                    .result_ref => unreachable,
+                }
+            };
+
+            var graph_engine = graph_query_mod.GraphQueryEngine{ .alloc = alloc };
+            return try graph_engine.execute(&entry.index, resolved_query, start_key_refs);
+        }
+
+        pub fn proveGraphTraversalProgram(self: *DB, index_name: []const u8, constrained_targets: bool) !void {
+            const graph_access_path = self.core.index_manager.graphTraversalAccessPath(index_name) orelse return error.InvalidIndexConfig;
+            var tensor_program = (try algebraic_mod.planner.planGraphTraversalTensorProgramAlloc(self.alloc, index_name, constrained_targets)) orelse return error.InvalidIndexConfig;
+            defer tensor_program.deinit(self.alloc);
+            if (tensor_program.access_paths.len != 1 or
+                tensor_program.access_paths[0].layout != .graph_edges or
+                !std.mem.eql(u8, tensor_program.access_paths[0].owner, index_name) or
+                !std.mem.eql(algebraic_mod.ir.Dimension, tensor_program.access_paths[0].output_dims, graph_access_path.output_dims))
+            {
+                return error.InvalidIndexConfig;
+            }
+            if (!algebraic_mod.ir.graphTraversalProgramMatchesTarget(tensor_program.asProgram(), index_name, constrained_targets)) {
+                return error.InvalidIndexConfig;
+            }
+        }
+
+        pub fn getEdges(
+            self: *DB,
+            alloc: Allocator,
+            index_name: []const u8,
+            key: []const u8,
+            edge_type: []const u8,
+            direction: graph_mod.EdgeDirection,
+        ) ![]graph_mod.Edge {
+            if (key.len == 0) return try alloc.alloc(graph_mod.Edge, 0);
+            return try self.core.graphGetEdges(alloc, index_name, key, edge_type, direction);
+        }
+
+        pub fn traverseEdges(
+            self: *DB,
+            alloc: Allocator,
+            index_name: []const u8,
+            start_key: []const u8,
+            rules: traversal_mod.TraversalRules,
+        ) ![]traversal_mod.TraversalResult {
+            if (start_key.len == 0) return try alloc.alloc(traversal_mod.TraversalResult, 0);
+            return try self.core.graphTraverseEdges(alloc, index_name, start_key, rules);
+        }
+
+        pub fn getNeighbors(
+            self: *DB,
+            alloc: Allocator,
+            index_name: []const u8,
+            key: []const u8,
+            edge_type: []const u8,
+            direction: graph_mod.EdgeDirection,
+        ) ![]traversal_mod.TraversalResult {
+            var edge_types_storage: [1][]const u8 = undefined;
+            const edge_types = if (edge_type.len > 0) blk: {
+                edge_types_storage[0] = edge_type;
+                break :blk edge_types_storage[0..1];
+            } else &.{};
+            return try Self.traverseEdges(self, alloc, index_name, key, .{
+                .edge_types = edge_types,
+                .direction = direction,
+                .max_depth = 1,
+            });
+        }
+
+        pub fn rewriteEntityEdges(
+            self: *DB,
+            alloc: Allocator,
+            index_name: []const u8,
+            old_key: []const u8,
+            new_key: []const u8,
+        ) !usize {
+            if (std.mem.eql(u8, old_key, new_key)) return 0;
+            const inbound = try Self.getEdges(self, alloc, index_name, old_key, "", .in);
+            defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
+            if (inbound.len == 0) return 0;
+
+            var writes = try alloc.alloc(types.GraphEdgeWrite, inbound.len);
+            defer alloc.free(writes);
+            var deletes = try alloc.alloc(types.GraphEdgeDelete, inbound.len);
+            defer alloc.free(deletes);
+            for (inbound, 0..) |edge, i| {
+                deletes[i] = .{ .index_name = index_name, .source = edge.source, .target = old_key, .edge_type = edge.edge_type };
+                writes[i] = .{
+                    .index_name = index_name,
+                    .source = edge.source,
+                    .target = new_key,
+                    .edge_type = edge.edge_type,
+                    .weight = edge.weight,
+                    .created_at = edge.created_at,
+                    .updated_at = edge.updated_at,
+                    .metadata_json = edge.metadata,
+                };
+            }
+            try self.batch(.{ .graph_writes = writes, .graph_deletes = deletes, .sync_level = .write });
+            return inbound.len;
+        }
+
+        pub fn findShortestPath(
+            self: *DB,
+            alloc: Allocator,
+            index_name: []const u8,
+            source: []const u8,
+            target: []const u8,
+            edge_types: []const []const u8,
+            direction: graph_mod.EdgeDirection,
+            weight_mode: paths_mod.PathWeightMode,
+            max_depth: u32,
+            min_weight: f64,
+            max_weight: f64,
+        ) !?paths_mod.Path {
+            if (source.len == 0 or target.len == 0) return null;
+            if (try Self.findAlgebraicShortestPath(self, alloc, index_name, source, target, edge_types, direction, weight_mode, max_depth, min_weight, max_weight)) |path| {
+                return path;
+            }
+            return try self.core.graphFindShortestPath(
+                alloc,
+                index_name,
+                source,
+                target,
+                edge_types,
+                direction,
+                weight_mode,
+                max_depth,
+                min_weight,
+                max_weight,
+            );
+        }
+
+        pub fn findKShortestPaths(
+            self: *DB,
+            alloc: Allocator,
+            index_name: []const u8,
+            source: []const u8,
+            target: []const u8,
+            k: u32,
+            edge_types: []const []const u8,
+            direction: graph_mod.EdgeDirection,
+            weight_mode: paths_mod.PathWeightMode,
+            max_depth: u32,
+            min_weight: f64,
+            max_weight: f64,
+        ) ![]paths_mod.Path {
+            if (source.len == 0 or target.len == 0 or k == 0) return try alloc.alloc(paths_mod.Path, 0);
+            if (k == 1) {
+                if (try Self.findShortestPath(self, alloc, index_name, source, target, edge_types, direction, weight_mode, max_depth, min_weight, max_weight)) |path| {
+                    const paths = try alloc.alloc(paths_mod.Path, 1);
+                    paths[0] = path;
+                    return paths;
+                }
+                return try alloc.alloc(paths_mod.Path, 0);
+            }
+            return try self.core.graphFindKShortestPaths(
+                alloc,
+                index_name,
+                source,
+                target,
+                k,
+                edge_types,
+                direction,
+                weight_mode,
+                max_depth,
+                min_weight,
+                max_weight,
+            );
+        }
+
+        fn findAlgebraicShortestPath(
+            self: *DB,
+            alloc: Allocator,
+            index_name: []const u8,
+            source: []const u8,
+            target: []const u8,
+            edge_types: []const []const u8,
+            direction: graph_mod.EdgeDirection,
+            weight_mode: paths_mod.PathWeightMode,
+            max_depth: u32,
+            min_weight: f64,
+            max_weight: f64,
+        ) !?paths_mod.Path {
+            const entry = self.core.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
+            const params = graph_query_mod.QueryParams{
+                .edge_types = edge_types,
+                .direction = direction,
+                .max_depth = max_depth,
+                .max_results = 0,
+                .min_weight = min_weight,
+                .max_weight = max_weight,
+                .deduplicate = true,
+                .include_paths = false,
+                .weight_mode = weight_mode,
+            };
+            if (!(graph_query_mod.algebraicTraversalProof(&entry.index, params).safe())) return null;
+            try Self.proveGraphTraversalProgram(self, index_name, true);
+
+            var graph_engine = graph_query_mod.GraphQueryEngine{ .alloc = alloc };
+            var result = try graph_engine.execute(&entry.index, .{
+                .query_type = .shortest_path,
+                .index_name = index_name,
+                .start_nodes = .{ .keys = &.{source} },
+                .target_nodes = .{ .keys = &.{target} },
+                .params = params,
+            }, &.{source});
+            defer result.deinit(alloc);
+            if (result.nodes.len == 0) return null;
+            return try Self.graphResultNodePathAlloc(alloc, result.nodes[0]);
+        }
+
+        fn graphResultNodePathAlloc(alloc: Allocator, node: graph_query_mod.GraphResultNode) !?paths_mod.Path {
+            const node_path = node.path orelse return null;
+            const edge_path = node.path_edges orelse return null;
+            const nodes = try alloc.alloc([]const u8, node_path.len);
+            var initialized_nodes: usize = 0;
+            errdefer {
+                for (nodes[0..initialized_nodes]) |item| alloc.free(item);
+                alloc.free(nodes);
+            }
+            for (node_path, 0..) |item, i| {
+                nodes[i] = try alloc.dupe(u8, item);
+                initialized_nodes += 1;
+            }
+
+            const edges = try alloc.alloc(paths_mod.PathEdge, edge_path.len);
+            var initialized_edges: usize = 0;
+            errdefer {
+                for (edges[0..initialized_edges]) |edge| {
+                    alloc.free(edge.source);
+                    alloc.free(edge.target);
+                    alloc.free(edge.edge_type);
+                }
+                alloc.free(edges);
+            }
+            var total_weight: f64 = 0;
+            for (edge_path, 0..) |item, i| {
+                edges[i] = .{
+                    .source = try alloc.dupe(u8, item.source),
+                    .target = try alloc.dupe(u8, item.target),
+                    .edge_type = try alloc.dupe(u8, item.edge_type),
+                    .weight = item.weight,
+                };
+                initialized_edges += 1;
+                total_weight += item.weight;
+            }
+
+            return .{
+                .nodes = nodes,
+                .edges = edges,
+                .total_weight = total_weight,
+                .length = @intCast(edges.len),
+            };
+        }
+
+        fn castOwnedKeysToConst(alloc: Allocator, keys: [][]u8) ![]const []const u8 {
+            const out = try alloc.alloc([]const u8, keys.len);
+            for (keys, 0..) |key, i| out[i] = key;
+            return out;
+        }
+
+        pub fn matchPattern(
+            self: *DB,
+            alloc: Allocator,
+            index_name: []const u8,
+            start_keys: []const []const u8,
+            pattern: []const graph_pattern_mod.PatternStep,
+            max_results: u32,
+            return_aliases: []const []const u8,
+        ) ![]graph_pattern_mod.PatternMatch {
+            if (start_keys.len == 0) return try alloc.alloc(graph_pattern_mod.PatternMatch, 0);
+            return try self.core.graphMatchPattern(alloc, index_name, start_keys, pattern, .{
+                .max_results = max_results,
+                .return_aliases = return_aliases,
+                .evaluator = .{
+                    .ctx = self,
+                    .func = Self.patternNodeFilterEvaluator,
+                },
+            });
+        }
+
+        fn graphInputSetHitsAlloc(
+            self: *DB,
+            alloc: Allocator,
+            hit_ids: []const []const u8,
+            generation: ?u64,
+        ) ![]types.SearchHit {
+            const hits = try alloc.alloc(types.SearchHit, hit_ids.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (hits[0..initialized]) |*hit| hit.deinit(alloc);
+                if (hits.len > 0) alloc.free(hits);
+            }
+            for (hit_ids, 0..) |hit_id, j| {
+                hits[j] = .{
+                    .id = try alloc.dupe(u8, hit_id),
+                    .doc_ordinal = try self.searchRuntimeLookupLiveDocOrdinalNoLock(alloc, hit_id, generation),
+                    .score = null,
+                    .stored_data = null,
+                    .chunk_hits = &.{},
+                };
+                initialized += 1;
+            }
+            return hits;
+        }
+
+        pub fn executeNamedGraphQueries(
+            self: *DB,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            graph_queries: []const types.NamedGraphQuery,
+            input_sets: []const types.NamedGraphInputSet,
+        ) ![]types.GraphSearchResult {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+            if (req.identity_read_generation == null) {
+                for (input_sets) |input_set| {
+                    if (input_set.hit_ids.len > 0) return error.UnsupportedQueryRequest;
+                }
+            }
+            const snapshot_req = try Self.searchRequestAtCurrentIdentityGeneration(self, req);
+
+            var named_sets = try alloc.alloc(NamedResultSet, input_sets.len);
+            defer alloc.free(named_sets);
+            var temp_hits = try alloc.alloc([]types.SearchHit, input_sets.len);
+            defer alloc.free(temp_hits);
+            var resolved_sets = try alloc.alloc(?doc_set.ResolvedDocSet, input_sets.len);
+            defer {
+                for (resolved_sets) |*maybe_set| {
+                    if (maybe_set.*) |*set| set.deinit(alloc);
+                }
+                if (resolved_sets.len > 0) alloc.free(resolved_sets);
+            }
+            @memset(resolved_sets, null);
+            var initialized_sets: usize = 0;
+
+            for (input_sets, 0..) |input_set, i| {
+                resolved_sets[i] = try Self.resolveDocIdsToDocSet(self, alloc, input_set.hit_ids, snapshot_req.identity_read_generation);
+                temp_hits[i] = try Self.graphInputSetHitsAlloc(self, alloc, input_set.hit_ids, snapshot_req.identity_read_generation);
+                const resolved_doc_set = if (resolved_sets[i]) |*set| set else null;
+                named_sets[i] = .{
+                    .name = input_set.name,
+                    .hits = temp_hits[i],
+                    .total_hits = if (input_set.total_hits > 0) input_set.total_hits else @intCast(input_set.hit_ids.len),
+                    .resolved_doc_set = resolved_doc_set,
+                    .resolved_doc_set_complete = input_set.total_hits == 0 or @as(u64, input_set.total_hits) <= input_set.hit_ids.len,
+                };
+                initialized_sets += 1;
+            }
+            defer {
+                for (temp_hits[0..initialized_sets]) |hits| {
+                    for (hits) |*hit| hit.deinit(alloc);
+                    if (hits.len > 0) alloc.free(hits);
+                }
+            }
+
+            return try Self.executeGraphQueriesWithSets(self, alloc, snapshot_req, graph_queries, named_sets);
+        }
+
+        pub fn runGraphMetricMaintenanceForIdle(self: *DB) !usize {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            return switch (self.graph_metric_idle_maintenance) {
+                .legacy => try self.core.index_manager.runGraphMetricMaintenance(),
+                .planned => try Self.runGraphMetricPlannedMaintenanceForIdleLocked(self),
+                .auto => if (try self.core.index_manager.shouldRunGraphMetricPlannedAutoIdle(self.graph_metric_idle_auto_options))
+                    try Self.runGraphMetricPlannedAutoMaintenanceForIdleLocked(self)
+                else
+                    try self.core.index_manager.runGraphMetricMaintenance(),
+                .degree_canary => try Self.runGraphMetricDegreeCanaryMaintenanceForIdleLocked(self),
+            };
+        }
+
+        fn runGraphMetricPlannedMaintenanceForIdleLocked(self: *DB) !usize {
+            const result = try self.core.index_manager.runGraphMetricPlannedMaintenance(self.graph_metric_idle_planned_options);
+            if (result.budget_exhausted) return error.RunUntilIdleDidNotConverge;
+            return result.builds_started + result.pages_completed + result.phases_advanced + result.published;
+        }
+
+        fn runGraphMetricPlannedAutoMaintenanceForIdleLocked(self: *DB) !usize {
+            const result = try self.core.index_manager.runGraphMetricPlannedAutoMaintenance(
+                self.graph_metric_idle_planned_options,
+                self.graph_metric_idle_auto_options,
+            );
+            if (result.budget_exhausted) return error.RunUntilIdleDidNotConverge;
+            const progressed = result.builds_started + result.pages_completed + result.phases_advanced + result.published;
+            const after_decision = try self.core.index_manager.graphMetricPlannedAutoIdleDecision(self.graph_metric_idle_auto_options);
+            if (!after_decision.shouldRunPlanned() and after_decision.ineligible_queued != 0) {
+                return progressed + try self.core.index_manager.runGraphMetricMaintenance();
+            }
+            return progressed;
+        }
+
+        fn runGraphMetricDegreeCanaryMaintenanceForIdleLocked(self: *DB) !usize {
+            const decision = try self.core.index_manager.graphMetricDegreeCanaryDecision(self.graph_metric_idle_degree_canary_options);
+            if (decision.shouldRunPlanned()) return try Self.runGraphMetricPlannedMaintenanceForIdleLocked(self);
+            if (decision.active_degree_builds != 0 or decision.blocked_active_non_degree != 0) {
+                return error.RunUntilIdleDidNotConverge;
+            }
+            return try self.core.index_manager.runGraphMetricMaintenance();
+        }
+
+        pub fn runGraphMetricPlannedMaintenanceForIdle(
+            self: *DB,
+            options: index_manager_mod.IndexManager.GraphMetricPlannedMaintenanceOptions,
+        ) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            return try self.core.index_manager.runGraphMetricPlannedMaintenance(options);
+        }
+
+        const GraphMetricServiceMaintenanceAction = enum {
+            tick,
+            status,
+            release,
+        };
+
+        const GraphMetricServiceMaintenanceRequest = struct {
+            action: GraphMetricServiceMaintenanceAction = .tick,
+            role: graph_metric_runtime_mod.Role,
+            runtime_id: []const u8,
+            owner_id: []const u8,
+            lease_owned: bool = false,
+            lease_ttl_ms: u64 = 30_000,
+            worker_id: ?[]const u8 = null,
+            worker_ids: ?[]const []const u8 = null,
+            start_background_builds: bool = true,
+            max_rounds: usize = 1,
+            max_metrics_per_round: usize = 8,
+            max_pages_per_round: usize = 1,
+            preserve_lease_after_tick: bool = false,
+            now_ms: ?u64 = null,
+        };
+
+        pub fn runGraphMetricServiceMaintenanceJsonAlloc(self: *DB, alloc: Allocator, body: []const u8) ![]u8 {
+            var parsed = std.json.parseFromSlice(GraphMetricServiceMaintenanceRequest, alloc, if (body.len == 0) "{}" else body, .{
+                .allocate = .alloc_always,
+                .ignore_unknown_fields = true,
+            }) catch return error.InvalidGraphMetricRuntimeConfig;
+            defer parsed.deinit();
+
+            var manual_clock = platform_clock.ManualClock{};
+            if (parsed.value.now_ms) |now_ms| manual_clock.setRealtimeNs(now_ms * std.time.ns_per_ms);
+            const clock = if (parsed.value.now_ms != null) manual_clock.clock() else platform_clock.Clock.real();
+            const resources = self.core.asyncResources();
+            const worker_ids = parsed.value.worker_ids orelse &.{};
+            var runtime = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+                alloc,
+                resources.store,
+                resources.index_manager,
+                resources.apply_mutex,
+                self.backend_runtime,
+                .{
+                    .enabled = true,
+                    .start_background_loop = false,
+                    .role = parsed.value.role,
+                    .runtime_id = parsed.value.runtime_id,
+                    .lease_owned = parsed.value.lease_owned,
+                    .owner_id = parsed.value.owner_id,
+                    .lease_ttl_ms = parsed.value.lease_ttl_ms,
+                    .coordinator_start_background_builds = parsed.value.start_background_builds,
+                    .planned_options = .{
+                        .worker_id = parsed.value.worker_id orelse "",
+                        .worker_ids = worker_ids,
+                        .max_rounds = parsed.value.max_rounds,
+                        .max_metrics_per_round = parsed.value.max_metrics_per_round,
+                        .max_pages_per_round = parsed.value.max_pages_per_round,
+                    },
+                    .clock = clock,
+                },
+            );
+            var preserve_lease = false;
+            defer if (preserve_lease) runtime.deinitPreserveLease() else runtime.deinit();
+
+            if (parsed.value.action == .release) {
+                runtime.ownership.releaseHeldLease();
+                var runtime_stats = runtime.stats();
+                runtime_stats.shutdown = true;
+                return try std.json.Stringify.valueAlloc(alloc, .{
+                    .released = true,
+                    .stats = runtime_stats,
+                }, .{ .emit_null_optional_fields = false });
+            }
+
+            const result: index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult = if (parsed.value.action == .tick) try runtime.runOnceDetailed() else .{};
+            const runtime_stats = runtime.stats();
+            if (parsed.value.preserve_lease_after_tick and parsed.value.lease_owned and parsed.value.action == .tick and runtime_stats.has_lease) {
+                preserve_lease = true;
+            }
+            return try std.json.Stringify.valueAlloc(alloc, .{
+                .result = result,
+                .stats = runtime_stats,
+            }, .{ .emit_null_optional_fields = false });
+        }
+
+        pub fn refreshGraphMetric(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            var status = try self.core.index_manager.refreshGraphMetric(index_name, metric_name);
+            defer status.deinit(self.core.index_manager.alloc);
+            return try cloneGraphMetricStatusFromGraph(alloc, status);
+        }
+
+        pub fn rebuildGraphMetric(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            var status = try self.core.index_manager.rebuildGraphMetric(index_name, metric_name);
+            defer status.deinit(self.core.index_manager.alloc);
+            return try cloneGraphMetricStatusFromGraph(alloc, status);
+        }
+
+        pub fn deleteGraphMetricMaterialization(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            var status = try self.core.index_manager.deleteGraphMetricMaterialization(index_name, metric_name);
+            defer status.deinit(self.core.index_manager.alloc);
+            return try cloneGraphMetricStatusFromGraph(alloc, status);
+        }
+
+        pub fn pauseGraphMetricMaintenance(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            var status = try self.core.index_manager.pauseGraphMetricMaintenance(index_name, metric_name);
+            defer status.deinit(self.core.index_manager.alloc);
+            return try cloneGraphMetricStatusFromGraph(alloc, status);
+        }
+
+        pub fn resumeGraphMetricMaintenance(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            var status = try self.core.index_manager.resumeGraphMetricMaintenance(index_name, metric_name);
+            defer status.deinit(self.core.index_manager.alloc);
+            return try cloneGraphMetricStatusFromGraph(alloc, status);
+        }
+
+        pub fn ensureGraphMetricPlannedBuild(
+            self: *DB,
+            alloc: Allocator,
+            index_name: []const u8,
+            metric_name: []const u8,
+            target_generation: u64,
+        ) !types.GraphMetricStatus {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            var status = try self.core.index_manager.ensureGraphMetricPlannedBuild(index_name, metric_name, target_generation);
+            defer status.deinit(self.core.index_manager.alloc);
+            return try cloneGraphMetricStatusFromGraph(alloc, status);
+        }
+
+        pub fn runGraphMetricPlannedWorkerPageStep(
+            self: *DB,
+            index_name: []const u8,
+            metric_name: []const u8,
+            worker_id: []const u8,
+        ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            return try self.core.index_manager.runGraphMetricPlannedWorkerPageStep(index_name, metric_name, worker_id);
+        }
+
+        pub fn runGraphMetricPlannedWorkerPageStepAt(
+            self: *DB,
+            index_name: []const u8,
+            metric_name: []const u8,
+            worker_id: []const u8,
+            now_ms: u64,
+        ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            return try self.core.index_manager.runGraphMetricPlannedWorkerPageStepAt(index_name, metric_name, worker_id, now_ms);
+        }
+
+        pub fn runGraphMetricPlannedCoordinatorStep(
+            self: *DB,
+            index_name: []const u8,
+            metric_name: []const u8,
+        ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            return try self.core.index_manager.runGraphMetricPlannedCoordinatorStep(index_name, metric_name);
+        }
+
+        pub fn runGraphMetricPlannedCoordinatorStepAt(
+            self: *DB,
+            index_name: []const u8,
+            metric_name: []const u8,
+            now_ms: u64,
+        ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            return try self.core.index_manager.runGraphMetricPlannedCoordinatorStepAt(index_name, metric_name, now_ms);
+        }
+
+        pub fn failGraphMetricPlannedBuild(
+            self: *DB,
+            alloc: Allocator,
+            index_name: []const u8,
+            metric_name: []const u8,
+            err: anyerror,
+        ) !types.GraphMetricStatus {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            var status = try self.core.index_manager.failGraphMetricPlannedBuild(index_name, metric_name, err);
+            defer status.deinit(self.core.index_manager.alloc);
+            return try cloneGraphMetricStatusFromGraph(alloc, status);
+        }
+
+        pub fn runGraphMetricPlannedDrain(
+            self: *DB,
+            alloc: Allocator,
+            index_name: []const u8,
+            metric_name: []const u8,
+            target_generation: u64,
+            options: graph_mod.GraphIndex.GraphMetricPlannedDrainOptions,
+        ) !types.GraphMetricStatus {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            var status = try self.core.index_manager.runGraphMetricPlannedDrain(index_name, metric_name, target_generation, options);
+            defer status.deinit(self.core.index_manager.alloc);
+            return try cloneGraphMetricStatusFromGraph(alloc, status);
+        }
+
+        pub fn runGraphMetricPlannedCoordinatorSweep(
+            self: *DB,
+            options: index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepOptions,
+        ) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            return try self.core.index_manager.runGraphMetricPlannedCoordinatorSweep(options);
+        }
+
+        pub fn runGraphMetricPlannedWorkerSweep(
+            self: *DB,
+            options: index_manager_mod.IndexManager.GraphMetricPlannedWorkerSweepOptions,
+        ) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
+            self.core.lockApply();
+            defer self.core.unlockApply();
+            return try self.core.index_manager.runGraphMetricPlannedWorkerSweep(options);
+        }
+
+        pub fn matchNamedPattern(
+            self: *DB,
+            alloc: Allocator,
+            named: *const types.NamedGraphQuery,
+            start_key_refs: []const []const u8,
+        ) ![]graph_pattern_mod.PatternMatch {
+            return try Self.matchPattern(
+                self,
+                alloc,
+                named.query.index_name,
+                start_key_refs,
+                named.query.pattern,
+                named.query.params.max_results,
+                named.query.return_aliases,
+            );
+        }
+
+        pub fn loadPatternProjectedDocument(
+            self: *DB,
+            alloc: Allocator,
+            query: graph_query_mod.GraphQuery,
+            key: []const u8,
+        ) !?[]u8 {
+            return if (try Self.loadStoredSearchDocument(self, alloc, key)) |stored|
+                try self.searchRuntimeProjectLookupStoredBytes(alloc, key, stored, .{
+                    .fields = query.fields,
+                    .include_all_fields = query.include_all_fields,
+                })
+            else
+                null;
+        }
+
+        fn patternNodeFilterEvaluator(ctx: ?*anyopaque, key: []const u8, filter: graph_pattern_mod.NodeFilter) anyerror!bool {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.UnsupportedNodeFilterQuery));
+            return try Self.matchesPatternNodeFilter(self, key, filter);
+        }
+
+        fn matchesPatternNodeFilter(self: *DB, key: []const u8, filter: graph_pattern_mod.NodeFilter) !bool {
+            if (filter.filter_query_json == null) return true;
+            const stored = (try Self.loadStoredSearchDocument(self, self.alloc, key)) orelse return false;
+            defer self.alloc.free(stored);
+            return try db_query_graph.storedDocMatchesPatternFilter(self.alloc, key, stored, filter.filter_query_json.?);
+        }
+
+        pub fn projectStoredBytesForSearch(self: *DB, alloc: Allocator, req: types.SearchRequest, doc_key: []const u8, raw: []const u8) ![]u8 {
+            if (req.defer_stored_projection and db_query_projection.shouldProjectSearchStored(req)) {
+                return try alloc.dupe(u8, raw);
+            }
+            return try db_query_projection.projectStoredBytesForSearch(alloc, req, doc_key, raw, .{
+                .ctx = self,
+                .load_chunks = Self.loadChunkFieldValueCallback,
+                .load_embeddings = Self.loadEmbeddingFieldValueCallback,
+                .load_artifacts = Self.loadArtifactFieldValueCallback,
+            });
+        }
+
+        pub fn projectOwnedStoredBytesForSearch(self: *DB, alloc: Allocator, req: types.SearchRequest, doc_key: []const u8, raw: []u8) ![]u8 {
+            if (req.defer_stored_projection and db_query_projection.shouldProjectSearchStored(req)) {
+                return raw;
+            }
+            return try db_query_projection.projectOwnedStoredBytesForSearch(alloc, req, doc_key, raw, .{
+                .ctx = self,
+                .load_chunks = Self.loadChunkFieldValueCallback,
+                .load_embeddings = Self.loadEmbeddingFieldValueCallback,
+                .load_artifacts = Self.loadArtifactFieldValueCallback,
+            });
+        }
+
+        pub fn loadProjectedSearchDocument(self: *DB, alloc: Allocator, req: types.SearchRequest, key: []const u8) !?[]u8 {
+            return if (try Self.loadStoredSearchDocument(self, alloc, key)) |stored|
+                try Self.projectOwnedStoredBytesForSearch(self, alloc, req, key, stored)
+            else
+                null;
+        }
+
+        pub fn loadRequiredProjectedSearchDocument(self: *DB, alloc: Allocator, req: types.SearchRequest, key: []const u8) ![]u8 {
+            return try Self.projectOwnedStoredBytesForSearch(
+                self,
+                alloc,
+                req,
+                key,
+                (try Self.loadStoredSearchDocument(self, alloc, key)) orelse return error.StoredDocMissing,
+            );
+        }
+
+        pub fn loadProjectedSearchDocumentMany(
+            self: *DB,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            keys: []const []const u8,
+        ) ![]?[]u8 {
+            const bench_profile = benchQueryProfileEnabled();
+            const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            const loaded = try Self.loadStoredSearchDocumentMany(self, alloc, keys);
+            errdefer freeOptionalOwnedBytes(alloc, loaded);
+
+            var project_ns: u64 = 0;
+            for (loaded, 0..) |maybe_stored, i| {
+                if (maybe_stored) |stored| {
+                    const project_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+                    loaded[i] = try Self.projectOwnedStoredBytesForSearch(self, alloc, req, keys[i], stored);
+                    if (bench_profile) project_ns += platform_time.monotonicNs() - project_start_ns;
+                }
+            }
+            if (bench_profile) {
+                std.log.info(
+                    "antfly_bench_projected_many total_us={d} project_us={d} keys={d}",
+                    .{ (platform_time.monotonicNs() - total_start_ns) / 1000, project_ns / 1000, keys.len },
+                );
+            }
+            return loaded;
+        }
+
+        pub fn loadParentStoredForSearch(self: *DB, alloc: Allocator, req: types.SearchRequest, parent_id: []const u8) !?[]u8 {
+            return if (try Self.loadStoredSearchDocument(self, alloc, parent_id)) |stored|
+                try Self.projectOwnedStoredBytesForSearch(self, alloc, req, parent_id, stored)
+            else
+                null;
+        }
+
+        pub fn loadParentStoredForSearchMany(
+            self: *DB,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            parent_ids: []const []const u8,
+        ) ![]?[]u8 {
+            return try Self.loadProjectedSearchDocumentMany(self, alloc, req, parent_ids);
+        }
+
+        pub fn get(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
+            if (Self.hasRelationalBaseRows(self) and !Self.isMetadataKey(self, key) and !internal_keys.isInternalPhysicalTableDataKey(key)) {
+                return try relational_store_mod.getMaterializedAlloc(alloc, self.core.store, key);
+            }
+            const store_key = try Self.encodeStoreLookupKeyAlloc(self, alloc, key);
+            defer alloc.free(store_key);
+            const value = try self.core.getStoreValue(alloc, store_key) orelse return null;
+            return try mapper.materializeOwnedDocumentValueAlloc(alloc, value);
+        }
+
+        pub fn getRawStoreValue(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
+            return self.core.getStoreValue(alloc, key) catch |err| switch (err) {
+                error.NotFound => null,
+                else => err,
+            };
+        }
+
+        pub fn getArtifact(self: *DB, alloc: Allocator, artifact_id: []const u8) !?types.ArtifactRecord {
+            var artifact_ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, artifact_id)) orelse return error.InvalidArgument;
+            errdefer artifact_ref.deinit(alloc);
+
+            const internal_key = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, artifact_ref);
+            defer alloc.free(internal_key);
+
+            const value = try self.core.getStoreValue(alloc, internal_key) orelse return null;
+            errdefer alloc.free(value);
+
+            return .{
+                .id = try alloc.dupe(u8, artifact_id),
+                .value = value,
+                .artifact_ref = artifact_ref,
+            };
+        }
+
+        pub fn getDocument(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
+            return try Self.lookup(self, alloc, key, opts);
+        }
+
+        pub fn lookup(self: *DB, alloc: Allocator, key: []const u8, opts: types.LookupOptions) !?types.LookupResult {
+            if (!internal_keys.isInternalPhysicalTableDataKey(key) and (try Self.isExpiredDocumentKey(self, alloc, key))) return null;
+            const raw = try Self.get(self, alloc, key) orelse return null;
+            defer alloc.free(raw);
+            const stored = try Self.projectLookupStoredBytes(self, alloc, key, raw, opts);
+            return .{ .json = stored };
+        }
+
+        pub fn getTimestamp(self: *DB, alloc: Allocator, key: []const u8) !u64 {
+            if (internal_keys.isInternalPhysicalTableDataKey(key)) return 0;
+            return try self.core.readTimestamp(alloc, key);
+        }
+
+        pub fn scan(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) !types.ScanResult {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+
+            const byte_range = self.core.byteRange();
+            const lower_raw = if (from_key.len == 0 or std.mem.order(u8, from_key, byte_range.start) == .lt) byte_range.start else from_key;
+            const upper_raw = blk: {
+                if (to_key.len == 0) break :blk byte_range.end;
+                if (byte_range.end.len == 0 or std.mem.order(u8, to_key, byte_range.end) == .lt) break :blk to_key;
+                break :blk byte_range.end;
+            };
+            const lower = try self.core.documentRangeLowerAlloc(lower_raw);
+            defer self.core.alloc.free(lower);
+            const upper = if (upper_raw.len > 0) try self.core.documentRangeUpperAlloc(upper_raw) else null;
+            defer if (upper) |buf| self.core.alloc.free(buf);
+
+            const docs = try self.core.scanStoreRange(alloc, lower, if (upper) |buf| buf else "");
+            defer docstore_mod.DocStore.freeResults(alloc, docs);
+
+            var hashes = std.ArrayListUnmanaged(types.ScanHash).empty;
+            errdefer {
+                for (hashes.items) |*entry| entry.deinit(alloc);
+                hashes.deinit(alloc);
+            }
+            var documents = std.ArrayListUnmanaged(types.ScanDocument).empty;
+            errdefer {
+                for (documents.items) |*doc| doc.deinit(alloc);
+                documents.deinit(alloc);
+            }
+
+            var count: u32 = 0;
+            const relational_base_rows = Self.hasRelationalBaseRows(self);
+            for (docs) |doc| {
+                if (!db_internal.isBaseDocumentStoreKeyForMode(relational_base_rows, doc.key)) continue;
+                const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, doc.key)) orelse continue;
+                defer alloc.free(raw_key);
+
+                if (!byte_range.contains(raw_key)) continue;
+                if (from_key.len > 0 and !opts.inclusive_from and std.mem.eql(u8, raw_key, from_key)) continue;
+                if (to_key.len > 0) {
+                    const ord = std.mem.order(u8, raw_key, to_key);
+                    if (opts.exclusive_to) {
+                        if (ord != .lt) break;
+                    } else {
+                        if (ord == .gt) break;
+                    }
+                }
+                if (try Self.isExpiredDocumentKey(self, alloc, raw_key)) continue;
+
+                const doc_json = if (relational_base_rows)
+                    try mapper.materializeRelationalRowValueAlloc(alloc, doc.value)
+                else
+                    try mapper.materializeDocumentValueAlloc(alloc, doc.value);
+                defer alloc.free(doc_json);
+
+                const hash = std.hash.Wyhash.hash(0, doc_json);
+                try hashes.append(alloc, .{
+                    .id = try alloc.dupe(u8, raw_key),
+                    .hash = hash,
+                });
+
+                if (opts.include_documents) {
+                    try documents.append(alloc, .{
+                        .id = try alloc.dupe(u8, raw_key),
+                        .json = try Self.projectLookupStoredBytes(self, alloc, raw_key, doc_json, .{
+                            .fields = opts.fields,
+                            .include_all_fields = opts.include_all_fields,
+                        }),
+                    });
+                }
+
+                count += 1;
+                if (opts.limit > 0 and count >= opts.limit) break;
+            }
+
+            return .{
+                .hashes = try hashes.toOwnedSlice(alloc),
+                .documents = try documents.toOwnedSlice(alloc),
+            };
+        }
+
+        pub fn loadStoredSearchDocument(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
+            const relational_row = Self.hasRelationalBaseRows(self) and
+                !Self.isMetadataKey(self, key) and
+                !internal_keys.isInternalPhysicalTableDataKey(key);
+            const store_key = try Self.encodeBaseDocumentLookupKeyAlloc(self, alloc, key);
+            defer alloc.free(store_key);
+            var txn = try self.core.store.beginProbeTxn();
+            defer txn.abort();
+            const raw = txn.get(store_key) catch |err| switch (err) {
+                error.NotFound => return null,
+                else => return err,
+            };
+            const owned = try alloc.dupe(u8, raw);
+            return if (relational_row)
+                try mapper.materializeOwnedRelationalRowValueAlloc(alloc, owned)
+            else
+                try mapper.materializeOwnedDocumentValueAlloc(alloc, owned);
+        }
+
+        pub fn loadStoredSearchDocumentMany(self: *DB, alloc: Allocator, keys: []const []const u8) ![]?[]u8 {
+            const bench_profile = benchQueryProfileEnabled();
+            const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            var key_ns: u64 = 0;
+            var sort_ns: u64 = 0;
+            var txn_ns: u64 = 0;
+            var get_many_ns: u64 = 0;
+            var dupe_ns: u64 = 0;
+            const PendingStoredSearchLoad = struct {
+                original_index: usize,
+                store_key: []u8,
+                relational_row: bool,
+            };
+
+            const loaded = try alloc.alloc(?[]u8, keys.len);
+            errdefer alloc.free(loaded);
+            @memset(loaded, null);
+            if (keys.len == 0) return loaded;
+
+            var pending = std.ArrayListUnmanaged(PendingStoredSearchLoad).empty;
+            defer {
+                for (pending.items) |item| alloc.free(item.store_key);
+                pending.deinit(alloc);
+            }
+
+            errdefer freeOptionalOwnedBytes(alloc, loaded);
+
+            const key_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            const relational_base_rows = Self.hasRelationalBaseRows(self);
+            for (keys, 0..) |key, i| {
+                try pending.append(alloc, .{
+                    .original_index = i,
+                    .store_key = try Self.encodeBaseDocumentLookupKeyAlloc(self, alloc, key),
+                    .relational_row = relational_base_rows and !Self.isMetadataKey(self, key) and !internal_keys.isInternalPhysicalTableDataKey(key),
+                });
+            }
+            if (bench_profile) key_ns = platform_time.monotonicNs() - key_start_ns;
+
+            const sort_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            std.mem.sort(PendingStoredSearchLoad, pending.items, {}, struct {
+                fn lessThan(_: void, lhs: PendingStoredSearchLoad, rhs: PendingStoredSearchLoad) bool {
+                    return std.mem.order(u8, lhs.store_key, rhs.store_key) == .lt;
+                }
+            }.lessThan);
+            if (bench_profile) sort_ns = platform_time.monotonicNs() - sort_start_ns;
+
+            const read_keys = try alloc.alloc([]const u8, pending.items.len);
+            defer alloc.free(read_keys);
+            const read_values = try alloc.alloc(?[]const u8, pending.items.len);
+            defer alloc.free(read_values);
+            @memset(read_values, null);
+
+            for (pending.items, 0..) |item, i| read_keys[i] = item.store_key;
+
+            const txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            var txn = try self.core.store.beginProbeTxn();
+            defer txn.abort();
+            if (bench_profile) txn_ns = platform_time.monotonicNs() - txn_start_ns;
+            const get_many_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            try txn.getManySorted(read_keys, read_values);
+            if (bench_profile) get_many_ns = platform_time.monotonicNs() - get_many_start_ns;
+
+            const dupe_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            for (pending.items, 0..) |item, i| {
+                const value = read_values[i] orelse continue;
+                const owned = try alloc.dupe(u8, value);
+                loaded[item.original_index] = if (item.relational_row)
+                    try mapper.materializeOwnedRelationalRowValueAlloc(alloc, owned)
+                else
+                    try mapper.materializeOwnedDocumentValueAlloc(alloc, owned);
+            }
+            if (bench_profile) dupe_ns = platform_time.monotonicNs() - dupe_start_ns;
+            if (bench_profile) {
+                std.log.info(
+                    "antfly_bench_stored_many total_us={d} key_us={d} sort_us={d} txn_us={d} get_many_us={d} dupe_us={d} keys={d}",
+                    .{ (platform_time.monotonicNs() - total_start_ns) / 1000, key_ns / 1000, sort_ns / 1000, txn_ns / 1000, get_many_ns / 1000, dupe_ns / 1000, keys.len },
+                );
+            }
+            return loaded;
+        }
+
+        pub fn projectLookupStoredBytes(self: *DB, alloc: Allocator, doc_key: []const u8, raw: []const u8, opts: types.LookupOptions) ![]u8 {
+            return try db_query_projection.projectLookupStoredBytes(alloc, doc_key, raw, opts, .{
+                .ctx = self,
+                .load_chunks = Self.loadChunkFieldValueCallback,
+                .load_embeddings = Self.loadEmbeddingFieldValueCallback,
+                .load_artifacts = Self.loadArtifactFieldValueCallback,
+            });
+        }
+
+        pub fn cloneNamedSetAsResult(
+            self: *DB,
+            alloc: Allocator,
+            set: NamedResultSet,
+            include_stored: bool,
+        ) !types.SearchResult {
+            _ = self;
+            return try db_query_graph.cloneNamedSetAsResult(alloc, set, include_stored);
+        }
+
+        pub fn resolveDocSetDocIds(
+            self: *DB,
+            alloc: Allocator,
+            set: *const doc_set.ResolvedDocSet,
+            generation: ?u64,
+        ) !?[]const []const u8 {
+            return try internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(self, alloc, set, generation);
+        }
+
+        pub fn resolveDocIdsToDocSet(
+            self: *DB,
+            alloc: Allocator,
+            doc_ids: []const []const u8,
+            generation: ?u64,
+        ) !doc_set.ResolvedDocSet {
+            return try internal_impl.resolveDocSetForIdsNoLockAtGenerationAlloc(self, alloc, doc_ids, generation);
+        }
+
+        pub fn resolvedDocFilterForIdsAlloc(
+            self: *DB,
+            include_positive: bool,
+            include_doc_ids: []const []const u8,
+            exclude_doc_ids: []const []const u8,
+            generation: ?u64,
+        ) !doc_set.ResolvedDocFilter {
+            return try internal_impl.resolvedDocFilterForIdsAlloc(self, include_positive, include_doc_ids, exclude_doc_ids, generation);
+        }
+
+        pub fn recordUnsupportedDocSetFilterShape(self: *DB) void {
+            internal_impl.recordUnsupportedDocSetFilterShape(self);
+        }
+
+        pub fn resolveRelationalFilterDocSet(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            query: search_mod.SearchQuery,
+            generation: ?u64,
+        ) !?doc_set.ResolvedDocSet {
+            if (runtime_schema.storage_mode != .relational or runtime_schema.relational_columns.len == 0) return null;
+            return try Self.resolveRelationalFilterQueryDocSetAlloc(self, alloc, runtime_schema, query, generation);
+        }
+
+        pub fn allDocsVisible(self: *DB, generation: ?u64) !bool {
+            return try internal_impl.allDocsVisibleAtGeneration(self, generation);
+        }
+
+        pub fn allDocsVisibleFast(self: *DB, generation: ?u64) !bool {
+            return try internal_impl.allDocsVisibleSummaryFast(self, generation);
+        }
+
+        pub fn denseIndex(self: *DB, index_name: ?[]const u8) ?*index_manager_mod.IndexManager.DenseIndex {
+            return self.core.denseIndex(index_name);
+        }
+
+        pub fn sparseIndex(self: *DB, index_name: ?[]const u8) ?*index_manager_mod.IndexManager.SparseIndex {
+            return self.core.sparseIndex(index_name);
+        }
+
+        pub fn denseDocKey(self: *DB, index_name: []const u8, vector_id: u64) !?[]u8 {
+            return try self.core.index_manager.lookupDenseDocKey(self.core.store, index_name, vector_id);
+        }
+
+        pub fn denseVectorId(self: *DB, index_name: []const u8, doc_key: []const u8) !?u64 {
+            return try self.core.index_manager.lookupDenseVectorId(self.core.store, index_name, doc_key);
+        }
+
+        pub fn denseVectorIdsForOrdinals(
+            self: *DB,
+            alloc: Allocator,
+            index_name: []const u8,
+            ordinals: []const u32,
+        ) ![]u64 {
+            return try self.core.index_manager.lookupDenseVectorIdsForOrdinalsAlloc(
+                alloc,
+                self.core.store,
+                index_name,
+                ordinals,
+            );
+        }
+
+        pub fn lookupLiveDocOrdinalNoLock(
+            self: *DB,
+            alloc: Allocator,
+            doc_id: []const u8,
+            generation: ?u64,
+        ) !?doc_set.DocOrdinal {
+            return try internal_impl.lookupLiveDocOrdinalNoLock(self, alloc, doc_id, generation);
+        }
+
+        pub fn lookupLiveDocOrdinalsNoLock(
+            self: *DB,
+            alloc: Allocator,
+            doc_ids: []const []const u8,
+            generation: ?u64,
+        ) ![]?doc_set.DocOrdinal {
+            return try internal_impl.lookupLiveDocOrdinalsNoLock(self, alloc, doc_ids, generation);
+        }
+
+        pub fn sparseDocNumsForOrdinals(
+            self: *DB,
+            alloc: Allocator,
+            index_name: []const u8,
+            ordinals: []const u32,
+        ) ![]const u32 {
+            return try self.core.index_manager.lookupSparseDocNumsForOrdinalsAlloc(alloc, self.core.store, index_name, ordinals);
+        }
+
+        pub fn hbcSearch(
+            self: *DB,
+            entry: *index_manager_mod.IndexManager.DenseIndex,
+            req: vectorindex_mod.SearchRequest,
+        ) !vectorindex_mod.SearchResults {
+            return try self.core.index_manager.searchDenseEntryWithRequest(entry, req);
+        }
+
+        pub fn hbcSearchProfiled(
+            self: *DB,
+            entry: *index_manager_mod.IndexManager.DenseIndex,
+            req: vectorindex_mod.SearchRequest,
+        ) !vectorindex_mod.ProfiledSearchResults {
+            return try self.core.index_manager.searchDenseEntryProfiledWithRequest(entry, req);
+        }
+
+        pub fn hasRelationalBaseRows(self: *DB) bool {
+            return self.relationalColumnsForStore() != null;
+        }
+
+        pub fn isMetadataKey(self: *DB, key: []const u8) bool {
+            _ = self;
+            return db_internal.isMetadataKey(key);
+        }
+
+        pub fn scanStoreRange(
+            self: *DB,
+            alloc: Allocator,
+            lower: []const u8,
+            upper: []const u8,
+        ) ![]docstore_mod.OwnedKVPair {
+            return try self.core.scanStoreRange(alloc, lower, upper);
+        }
+
+        pub fn ttlDurationNs(self: *DB) u64 {
+            return if (self.core.schema) |schema| schema.ttl_duration_ns else 0;
+        }
+
+        pub fn isExpiredDocumentKey(self: *DB, alloc: Allocator, key: []const u8) !bool {
+            const duration_ns = Self.ttlDurationNs(self);
+            if (duration_ns == 0) return false;
+            const ts = try self.getTimestamp(alloc, key);
+            if (ts == 0) return false;
+            return ttl_mod.isExpired(ts, duration_ns, platform_clock.Clock.real().nowRealtimeNs());
+        }
+
+        pub fn loadDocumentTimestampsMany(self: *DB, alloc: Allocator, keys: []const []const u8) ![]u64 {
+            const timestamps = try alloc.alloc(u64, keys.len);
+            errdefer alloc.free(timestamps);
+            @memset(timestamps, 0);
+            if (keys.len == 0) return timestamps;
+
+            const PendingTimestampLoad = struct {
+                original_index: usize,
+                store_key: []u8,
+            };
+
+            var pending = std.ArrayListUnmanaged(PendingTimestampLoad).empty;
+            defer {
+                for (pending.items) |item| alloc.free(item.store_key);
+                pending.deinit(alloc);
+            }
+
+            for (keys, 0..) |key, i| {
+                if (internal_keys.isInternalPhysicalTableDataKey(key)) continue;
+                try pending.append(alloc, .{
+                    .original_index = i,
+                    .store_key = try internal_keys.ttlKeyAlloc(alloc, key),
+                });
+            }
+            if (pending.items.len == 0) return timestamps;
+
+            std.mem.sort(PendingTimestampLoad, pending.items, {}, struct {
+                fn lessThan(_: void, lhs: PendingTimestampLoad, rhs: PendingTimestampLoad) bool {
+                    return std.mem.order(u8, lhs.store_key, rhs.store_key) == .lt;
+                }
+            }.lessThan);
+
+            const read_keys = try alloc.alloc([]const u8, pending.items.len);
+            defer alloc.free(read_keys);
+            const read_values = try alloc.alloc(?[]const u8, pending.items.len);
+            defer alloc.free(read_values);
+            @memset(read_values, null);
+
+            for (pending.items, 0..) |item, i| read_keys[i] = item.store_key;
+
+            var txn = try self.core.store.beginProbeTxn();
+            defer txn.abort();
+            try txn.getManySorted(read_keys, read_values);
+
+            for (pending.items, 0..) |item, i| {
+                const raw = read_values[i] orelse continue;
+                if (raw.len != 8) continue;
+                timestamps[item.original_index] = std.mem.readInt(u64, raw[0..8], .little);
+            }
+            return timestamps;
+        }
+
+        pub fn annotateSearchHitOrdinalsNoLock(
+            self: *DB,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            hits: []types.SearchHit,
+        ) !void {
+            try internal_impl.annotateSearchHitOrdinalsNoLock(self, alloc, req, hits);
+        }
+
+        fn encodeBaseDocumentLookupKeyAlloc(self: *DB, alloc: Allocator, key: []const u8) ![]u8 {
+            if (Self.hasRelationalBaseRows(self) and !Self.isMetadataKey(self, key) and !internal_keys.isInternalPhysicalTableDataKey(key)) {
+                return try relational_store_mod.rowKeyAlloc(alloc, key);
+            }
+            if (internal_keys.isInternalPhysicalTableDataKey(key) or Self.isMetadataKey(self, key)) {
+                return try alloc.dupe(u8, key);
+            }
+            return try internal_keys.documentKeyAlloc(alloc, key);
+        }
+
+        fn encodeStoreLookupKeyAlloc(self: *DB, alloc: Allocator, key: []const u8) ![]u8 {
+            if (internal_keys.isInternalPhysicalTableDataKey(key) or Self.isMetadataKey(self, key)) {
+                return try alloc.dupe(u8, key);
+            }
+            return try internal_keys.documentKeyAlloc(alloc, key);
+        }
+
+        pub fn filterVisibleSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.SearchHit) ![]bool {
+            const keep = try alloc.alloc(bool, hits.len);
+            errdefer alloc.free(keep);
+            @memset(keep, true);
+
+            const duration_ns = Self.ttlDurationNs(self);
+            if (duration_ns == 0 or hits.len == 0) return keep;
+
+            const expiry_now = platform_time.realtimeNs();
+            const parent_ids = try alloc.alloc([]const u8, hits.len);
+            defer alloc.free(parent_ids);
+
+            const needs_stored = try alloc.alloc(bool, hits.len);
+            defer alloc.free(needs_stored);
+            @memset(needs_stored, false);
+
+            const fallback_to_hit = try alloc.alloc(bool, hits.len);
+            defer alloc.free(fallback_to_hit);
+            @memset(fallback_to_hit, false);
+
+            for (hits, 0..) |hit, i| {
+                if (internal_keys.isChunkArtifactRecordKey(hit.id)) {
+                    const parent = (try internal_keys.decodeDocumentComponentAlloc(alloc, hit.id)) orelse {
+                        fallback_to_hit[i] = true;
+                        parent_ids[i] = hit.id;
+                        continue;
+                    };
+                    parent_ids[i] = parent;
+                    continue;
+                }
+                if (hit.stored_data != null) {
+                    parent_ids[i] = Self.parseChunkParentIdFromStoredAlloc(alloc, hit.stored_data.?) catch {
+                        fallback_to_hit[i] = true;
+                        parent_ids[i] = hit.id;
+                        continue;
+                    };
+                    continue;
+                }
+                needs_stored[i] = true;
+                parent_ids[i] = hit.id;
+            }
+            defer {
+                for (hits, 0..) |_, i| {
+                    if (!needs_stored[i] and !std.mem.eql(u8, parent_ids[i], hits[i].id)) alloc.free(parent_ids[i]);
+                }
+            }
+
+            var pending_indices = std.ArrayListUnmanaged(usize).empty;
+            defer pending_indices.deinit(alloc);
+            for (needs_stored, 0..) |needed, i| if (needed) try pending_indices.append(alloc, i);
+            if (pending_indices.items.len > 0) {
+                const pending_keys = try alloc.alloc([]const u8, pending_indices.items.len);
+                defer alloc.free(pending_keys);
+                for (pending_indices.items, 0..) |hit_index, i| pending_keys[i] = hits[hit_index].id;
+
+                const loaded = try Self.loadStoredSearchDocumentMany(self, alloc, pending_keys);
+                defer freeOptionalOwnedBytes(alloc, loaded);
+                for (pending_indices.items, 0..) |hit_index, i| {
+                    const stored = loaded[i] orelse {
+                        fallback_to_hit[hit_index] = true;
+                        continue;
+                    };
+                    parent_ids[hit_index] = Self.parseChunkParentIdFromStoredAlloc(alloc, stored) catch {
+                        fallback_to_hit[hit_index] = true;
+                        continue;
+                    };
+                }
+            }
+
+            const timestamps = try Self.loadDocumentTimestampsMany(self, alloc, parent_ids);
+            defer alloc.free(timestamps);
+            for (timestamps, 0..) |ts, i| {
+                if (ts == 0) continue;
+                keep[i] = !ttl_mod.isExpired(ts, duration_ns, expiry_now);
+            }
+            return keep;
+        }
+
+        pub fn filterExpiredSearchResult(self: *DB, alloc: Allocator, raw: types.SearchResult) !types.SearchResult {
+            if (Self.ttlDurationNs(self) == 0) return raw;
+            return try db_query_result_shape.filterVisibleSearchResult(alloc, raw, .{
+                .ctx = self,
+                .func = Self.isVisibleSearchHitCallback,
+                .filter_many = Self.filterVisibleSearchHitsManyCallback,
+            });
+        }
+
+        pub fn isVisibleSearchHit(self: *DB, alloc: Allocator, hit: types.SearchHit) !bool {
+            return try db_query_result_shape.isVisibleSearchHit(alloc, hit, .{
+                .ctx = self,
+                .load_stored = Self.loadStoredSearchDocumentCallback,
+                .is_expired_key = Self.isExpiredDocumentKeyCallback,
+            });
+        }
+
+        pub fn isVisibleNonChunkSearchHit(self: *DB, alloc: Allocator, hit: types.SearchHit) !bool {
+            return !(try Self.isExpiredDocumentKey(self, alloc, hit.id));
+        }
+
+        pub fn reshapeChunkBackedResult(self: *DB, alloc: Allocator, req: types.SearchRequest, raw: types.SearchResult) !types.SearchResult {
+            return try db_query_result_shape.reshapeChunkBackedResult(alloc, req, raw, .{
+                .ctx = self,
+                .resolve_parent_id = Self.resolveChunkParentIdCallback,
+                .load_parent_stored = Self.loadParentStoredForSearchCallback,
+            });
+        }
+
+        pub fn resolveChunkParentId(self: *DB, alloc: Allocator, hit: types.SearchHit) ![]u8 {
+            return try db_query_result_shape.resolveChunkParentId(alloc, hit, .{
+                .ctx = self,
+                .load_stored = Self.loadStoredSearchDocumentCallback,
+            });
+        }
+
+        fn parseChunkParentIdFromStoredAlloc(alloc: Allocator, stored: []const u8) ![]u8 {
+            const parsed = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.InvalidChunkArtifact;
+            const parent = parsed.value.object.get("_parent_doc_key") orelse parsed.value.object.get("parent_doc_key") orelse return error.InvalidChunkArtifact;
+            if (parent != .string) return error.InvalidChunkArtifact;
+            return try alloc.dupe(u8, parent.string);
+        }
+
+        pub fn postprocessTextSearchResult(
+            self: *DB,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            raw: types.SearchResult,
+            chunk_backed: bool,
+        ) !types.SearchResult {
+            return try db_query_result_shape.postprocessTextSearchResult(alloc, req, raw, chunk_backed, .{
+                .ctx = self,
+                .is_visible = Self.isVisibleSearchHitCallback,
+                .filter_visible_many = Self.filterVisibleSearchHitsManyCallback,
+                .resolve_parent_id = Self.resolveChunkParentIdCallback,
+                .load_parent_stored = Self.loadParentStoredForSearchCallback,
+                .load_stored = Self.loadStoredSearchDocumentCallback,
+                .resolve_doc_set_doc_ids = Self.resolveDocSetDocIdsCallback,
+                .resolve_doc_ids_to_doc_set = Self.resolveDocIdsToDocSetCallback,
+                .load_many_parent_stored = Self.loadParentStoredForSearchManyCallback,
+                .load_many_stored = Self.loadStoredSearchDocumentManyCallback,
+            });
+        }
+
+        pub fn postprocessVectorSearchResult(
+            self: *DB,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            raw: types.SearchResult,
+            chunk_backed: bool,
+        ) !types.SearchResult {
+            return try db_query_result_shape.postprocessVectorSearchResult(alloc, req, raw, chunk_backed, .{
+                .ctx = self,
+                .is_visible = if (chunk_backed) Self.isVisibleSearchHitCallback else Self.isVisibleNonChunkSearchHitCallback,
+                .filter_visible_many = Self.filterVisibleSearchHitsManyCallback,
+                .resolve_parent_id = Self.resolveChunkParentIdCallback,
+                .load_parent_stored = Self.loadParentStoredForSearchCallback,
+                .load_stored = Self.loadStoredSearchDocumentCallback,
+                .resolve_doc_set_doc_ids = Self.resolveDocSetDocIdsCallback,
+                .resolve_doc_ids_to_doc_set = Self.resolveDocIdsToDocSetCallback,
+                .load_many_parent_stored = Self.loadParentStoredForSearchManyCallback,
+                .load_many_stored = Self.loadStoredSearchDocumentManyCallback,
+            });
         }
 
         fn textIndexEntryCallback(
@@ -1638,7 +4166,7 @@ pub fn Impl(comptime DB: type) type {
             include_stored: bool,
         ) anyerror!types.SearchResult {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeCloneNamedSetAsResult(alloc, set, include_stored);
+            return try Self.cloneNamedSetAsResult(self, alloc, set, include_stored);
         }
 
         fn fuseNamedSetsCallback(
@@ -1670,7 +4198,7 @@ pub fn Impl(comptime DB: type) type {
         ) anyerror!void {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
             base.graph_results = try Self.executeGraphQueriesWithSets(self, alloc, req, req.graph_queries, named_sets);
-            try self.searchRuntimeApplyGraphExpandStrategy(alloc, base, req.expand_strategy);
+            try Self.applyGraphExpandStrategy(self, alloc, base, req.expand_strategy);
         }
 
         fn executeSingleGraphQueryWithSetsCallback(
@@ -1691,7 +4219,7 @@ pub fn Impl(comptime DB: type) type {
             generation: ?u64,
         ) anyerror!?[]const []const u8 {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeResolveDocSetDocIds(alloc, set, generation);
+            return try Self.resolveDocSetDocIds(self, alloc, set, generation);
         }
 
         fn resolveDocSetDocIdsForGraphCallback(
@@ -1701,7 +4229,7 @@ pub fn Impl(comptime DB: type) type {
             generation: ?u64,
         ) anyerror!?[][]u8 {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            const ids = (try self.searchRuntimeResolveDocSetDocIds(alloc, set, generation)) orelse return null;
+            const ids = (try Self.resolveDocSetDocIds(self, alloc, set, generation)) orelse return null;
             defer alloc.free(@constCast(ids));
             errdefer for (ids) |id| alloc.free(@constCast(id));
 
@@ -1727,7 +4255,7 @@ pub fn Impl(comptime DB: type) type {
             generation: ?u64,
         ) anyerror!doc_set.ResolvedDocSet {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeResolveDocIdsToDocSet(alloc, doc_ids, generation);
+            return try Self.resolveDocIdsToDocSet(self, alloc, doc_ids, generation);
         }
 
         fn resolveRelationalFilterDocSetCallback(
@@ -1738,7 +4266,7 @@ pub fn Impl(comptime DB: type) type {
             generation: ?u64,
         ) anyerror!?doc_set.ResolvedDocSet {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeResolveRelationalFilterDocSet(alloc, runtime_schema, query, generation);
+            return try Self.resolveRelationalFilterDocSet(self, alloc, runtime_schema, query, generation);
         }
 
         fn liveFilterDocSetCallback(
@@ -1756,7 +4284,7 @@ pub fn Impl(comptime DB: type) type {
             generation: ?u64,
         ) anyerror!bool {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeAllDocsVisible(generation);
+            return try Self.allDocsVisible(self, generation);
         }
 
         fn textIndexIsChunkBackedCallback(
@@ -1785,7 +4313,7 @@ pub fn Impl(comptime DB: type) type {
             raw: []const u8,
         ) anyerror![]u8 {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeProjectStoredBytesForSearch(alloc, req, doc_key, raw);
+            return try Self.projectStoredBytesForSearch(self, alloc, req, doc_key, raw);
         }
 
         fn loadProjectedSearchDocumentCallback(
@@ -1795,7 +4323,7 @@ pub fn Impl(comptime DB: type) type {
             key: []const u8,
         ) anyerror!?[]u8 {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeLoadProjectedSearchDocument(alloc, req, key);
+            return try Self.loadProjectedSearchDocument(self, alloc, req, key);
         }
 
         fn postprocessTextSearchResultCallback(
@@ -1806,7 +4334,7 @@ pub fn Impl(comptime DB: type) type {
             chunk_backed: bool,
         ) anyerror!types.SearchResult {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimePostprocessTextSearchResult(alloc, req, raw, chunk_backed);
+            return try Self.postprocessTextSearchResult(self, alloc, req, raw, chunk_backed);
         }
 
         fn denseIndexCallback(
@@ -1814,7 +4342,7 @@ pub fn Impl(comptime DB: type) type {
             index_name: ?[]const u8,
         ) anyerror!?*index_manager_mod.IndexManager.DenseIndex {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return self.searchRuntimeDenseIndex(index_name);
+            return Self.denseIndex(self, index_name);
         }
 
         fn sparseIndexCallback(
@@ -1822,7 +4350,7 @@ pub fn Impl(comptime DB: type) type {
             index_name: ?[]const u8,
         ) anyerror!?*index_manager_mod.IndexManager.SparseIndex {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return self.searchRuntimeSparseIndex(index_name);
+            return Self.sparseIndex(self, index_name);
         }
 
         fn denseDocKeyCallback(
@@ -1831,7 +4359,7 @@ pub fn Impl(comptime DB: type) type {
             vector_id: u64,
         ) anyerror!?[]u8 {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeDenseDocKey(index_name, vector_id);
+            return try Self.denseDocKey(self, index_name, vector_id);
         }
 
         fn denseVectorIdCallback(
@@ -1840,7 +4368,7 @@ pub fn Impl(comptime DB: type) type {
             doc_key: []const u8,
         ) anyerror!?u64 {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeDenseVectorId(index_name, doc_key);
+            return try Self.denseVectorId(self, index_name, doc_key);
         }
 
         fn denseVectorIdsForOrdinalsCallback(
@@ -1850,7 +4378,7 @@ pub fn Impl(comptime DB: type) type {
             ordinals: []const u32,
         ) anyerror![]u64 {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeDenseVectorIdsForOrdinals(alloc, index_name, ordinals);
+            return try Self.denseVectorIdsForOrdinals(self, alloc, index_name, ordinals);
         }
 
         fn allDocsVisibleFastCallback(
@@ -1858,7 +4386,7 @@ pub fn Impl(comptime DB: type) type {
             generation: ?u64,
         ) anyerror!bool {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeAllDocsVisibleFast(generation);
+            return try Self.allDocsVisibleFast(self, generation);
         }
 
         fn lookupLiveDocOrdinalNoLockCallback(
@@ -1899,7 +4427,7 @@ pub fn Impl(comptime DB: type) type {
             ordinals: []const u32,
         ) anyerror![]const u32 {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeSparseDocNumsForOrdinals(alloc, index_name, ordinals);
+            return try Self.sparseDocNumsForOrdinals(self, alloc, index_name, ordinals);
         }
 
         fn loadRequiredProjectedSearchDocumentCallback(
@@ -1909,7 +4437,7 @@ pub fn Impl(comptime DB: type) type {
             key: []const u8,
         ) anyerror![]u8 {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeLoadRequiredProjectedSearchDocument(alloc, req, key);
+            return try Self.loadRequiredProjectedSearchDocument(self, alloc, req, key);
         }
 
         fn loadProjectedSearchDocumentManyCallback(
@@ -1919,7 +4447,90 @@ pub fn Impl(comptime DB: type) type {
             keys: []const []const u8,
         ) anyerror![]?[]u8 {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeLoadProjectedSearchDocumentMany(alloc, req, keys);
+            return try Self.loadProjectedSearchDocumentMany(self, alloc, req, keys);
+        }
+
+        fn loadChunkFieldValueCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            doc_key: []const u8,
+        ) anyerror!?std.json.Value {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeLoadChunkFieldValue(alloc, doc_key);
+        }
+
+        fn loadEmbeddingFieldValueCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            doc_key: []const u8,
+        ) anyerror!?std.json.Value {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeLoadEmbeddingFieldValue(alloc, doc_key);
+        }
+
+        fn loadArtifactFieldValueCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            doc_key: []const u8,
+        ) anyerror!?std.json.Value {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeLoadArtifactFieldValue(alloc, doc_key);
+        }
+
+        fn isVisibleSearchHitCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            hit: types.SearchHit,
+        ) anyerror!bool {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try Self.isVisibleSearchHit(self, alloc, hit);
+        }
+
+        fn filterVisibleSearchHitsManyCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            hits: []const types.SearchHit,
+        ) anyerror![]bool {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try Self.filterVisibleSearchHitsMany(self, alloc, hits);
+        }
+
+        fn isVisibleNonChunkSearchHitCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            hit: types.SearchHit,
+        ) anyerror!bool {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try Self.isVisibleNonChunkSearchHit(self, alloc, hit);
+        }
+
+        fn resolveChunkParentIdCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            hit: types.SearchHit,
+        ) anyerror![]u8 {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try Self.resolveChunkParentId(self, alloc, hit);
+        }
+
+        fn loadParentStoredForSearchCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            parent_id: []const u8,
+        ) anyerror!?[]u8 {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try Self.loadParentStoredForSearch(self, alloc, req, parent_id);
+        }
+
+        fn loadParentStoredForSearchManyCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            parent_ids: []const []const u8,
+        ) anyerror![]?[]u8 {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try Self.loadParentStoredForSearchMany(self, alloc, req, parent_ids);
         }
 
         fn postprocessVectorSearchResultCallback(
@@ -1930,7 +4541,7 @@ pub fn Impl(comptime DB: type) type {
             chunk_backed: bool,
         ) anyerror!types.SearchResult {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimePostprocessVectorSearchResult(alloc, req, raw, chunk_backed);
+            return try Self.postprocessVectorSearchResult(self, alloc, req, raw, chunk_backed);
         }
 
         fn hbcSearchCallback(
@@ -1939,7 +4550,7 @@ pub fn Impl(comptime DB: type) type {
             req: vectorindex_mod.SearchRequest,
         ) anyerror!vectorindex_mod.SearchResults {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeHbcSearch(entry, req);
+            return try Self.hbcSearch(self, entry, req);
         }
 
         fn hbcSearchProfiledCallback(
@@ -1948,7 +4559,7 @@ pub fn Impl(comptime DB: type) type {
             req: vectorindex_mod.SearchRequest,
         ) anyerror!vectorindex_mod.ProfiledSearchResults {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeHbcSearchProfiled(entry, req);
+            return try Self.hbcSearchProfiled(self, entry, req);
         }
 
         fn collectSearchMatchAllCandidatesCallback(
@@ -1959,7 +4570,7 @@ pub fn Impl(comptime DB: type) type {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
             return try db_query_search.collectMatchAllCandidates(alloc, req, .{
                 .ctx = self,
-                .relational_base_rows = self.searchRuntimeHasRelationalBaseRows(),
+                .relational_base_rows = Self.hasRelationalBaseRows(self),
                 .scan_store_range = Self.scanStoreRangeCallback,
                 .is_expired_key = Self.isExpiredDocumentKeyCallback,
                 .lookup_doc_ordinal = Self.lookupLiveDocOrdinalCallback,
@@ -1973,7 +4584,7 @@ pub fn Impl(comptime DB: type) type {
             upper: []const u8,
         ) anyerror![]docstore_mod.OwnedKVPair {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeScanStoreRange(alloc, lower, upper);
+            return try Self.scanStoreRange(self, alloc, lower, upper);
         }
 
         fn isExpiredDocumentKeyCallback(
@@ -1982,7 +4593,7 @@ pub fn Impl(comptime DB: type) type {
             key: []const u8,
         ) anyerror!bool {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeIsExpiredDocumentKey(alloc, key);
+            return try Self.isExpiredDocumentKey(self, alloc, key);
         }
 
         fn lookupLiveDocOrdinalCallback(
@@ -2001,7 +4612,7 @@ pub fn Impl(comptime DB: type) type {
             key: []const u8,
         ) anyerror!?[]u8 {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeLoadStoredSearchDocument(alloc, key);
+            return try Self.loadStoredSearchDocument(self, alloc, key);
         }
 
         fn loadStoredSearchDocumentManyCallback(
@@ -2010,7 +4621,7 @@ pub fn Impl(comptime DB: type) type {
             keys: []const []const u8,
         ) anyerror![]?[]u8 {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeLoadStoredSearchDocumentMany(alloc, keys);
+            return try Self.loadStoredSearchDocumentMany(self, alloc, keys);
         }
 
         fn executePatternMatchCallback(
@@ -2020,7 +4631,7 @@ pub fn Impl(comptime DB: type) type {
             start_key_refs: []const []const u8,
         ) anyerror![]graph_pattern_mod.PatternMatch {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeMatchPattern(alloc, named, start_key_refs);
+            return try Self.matchNamedPattern(self, alloc, named, start_key_refs);
         }
 
         fn loadPatternProjectedDocumentCallback(
@@ -2030,7 +4641,7 @@ pub fn Impl(comptime DB: type) type {
             key: []const u8,
         ) anyerror!?[]u8 {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeLoadPatternProjectedDocument(alloc, query, key);
+            return try Self.loadPatternProjectedDocument(self, alloc, query, key);
         }
 
         fn executeShortestPathCallback(
@@ -2041,7 +4652,19 @@ pub fn Impl(comptime DB: type) type {
             target: []const u8,
         ) anyerror!?types.GraphPath {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeFindShortestPath(alloc, named, source, target);
+            return try Self.findShortestPath(
+                self,
+                alloc,
+                named.query.index_name,
+                source,
+                target,
+                named.query.params.edge_types,
+                named.query.params.direction,
+                named.query.params.weight_mode,
+                named.query.params.max_depth,
+                named.query.params.min_weight,
+                named.query.params.max_weight,
+            );
         }
 
         fn executeKShortestPathsCallback(
@@ -2052,7 +4675,20 @@ pub fn Impl(comptime DB: type) type {
             target: []const u8,
         ) anyerror![]types.GraphPath {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeFindKShortestPaths(alloc, named, source, target);
+            return try Self.findKShortestPaths(
+                self,
+                alloc,
+                named.query.index_name,
+                source,
+                target,
+                named.query.k,
+                named.query.params.edge_types,
+                named.query.params.direction,
+                named.query.params.weight_mode,
+                named.query.params.max_depth,
+                named.query.params.min_weight,
+                named.query.params.max_weight,
+            );
         }
 
         fn executeGraphQueryCallback(
@@ -2063,7 +4699,7 @@ pub fn Impl(comptime DB: type) type {
             target_keys: [][]u8,
         ) anyerror!graph_query_mod.GraphQueryResult {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeExecuteSearchGraphQuery(alloc, named.query, start_key_refs, target_keys);
+            return try Self.executeSearchGraphQuery(self, alloc, named.query, start_key_refs, target_keys);
         }
 
         fn executeSearchGraphQueryCallback(
@@ -2074,7 +4710,7 @@ pub fn Impl(comptime DB: type) type {
             target_keys: [][]u8,
         ) anyerror!graph_query_mod.GraphQueryResult {
             const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            return try self.searchRuntimeExecuteSearchGraphQuery(alloc, graph_query, start_key_refs, target_keys);
+            return try Self.executeSearchGraphQuery(self, alloc, graph_query, start_key_refs, target_keys);
         }
     };
 }

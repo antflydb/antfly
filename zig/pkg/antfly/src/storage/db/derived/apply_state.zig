@@ -672,7 +672,7 @@ test "derived apply checkpoint serializes concurrent sidecar writers" {
                 const ready = self.open;
                 self.mutex.unlock();
                 if (ready) return;
-                std.Thread.yield() catch {};
+                @import("antfly_platform").time.yieldBriefly();
             }
         }
     };
