@@ -210,6 +210,8 @@ pub const GeneratedSqlExpressionKind = enum {
     interval_literal,
     extract_expression,
     timestamp_literal,
+    current_date,
+    current_timestamp,
 };
 
 pub const GeneratedSqlBetweenModifier = enum {
@@ -259,6 +261,7 @@ pub const GeneratedSqlExpressionAst = struct {
     interval_value_tokens: ?GeneratedSqlTokenRange = null,
     timestamp_type_tokens: ?GeneratedSqlTokenRange = null,
     timestamp_value_tokens: ?GeneratedSqlTokenRange = null,
+    current_timestamp_precision_tokens: ?GeneratedSqlTokenRange = null,
     extract_field_tokens: ?GeneratedSqlTokenRange = null,
     extract_source_tokens: ?GeneratedSqlTokenRange = null,
     left_tokens: ?GeneratedSqlTokenRange = null,
@@ -623,6 +626,8 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT date_bin(INTERVAL '1 hour', amount, 0) AS amount_bucket FROM usage_records WHERE date_bin(INTERVAL '1 day', amount, 0) = $1", .kind = .read },
     .{ .sql = "SELECT date_bin(INTERVAL '1 hour', TIMESTAMPTZ '2025-01-01T01:30:00+01:30', TIMESTAMP '2025-01-01T00:00:00') AS planned_bucket FROM usage_records WHERE id = $1", .kind = .read },
     .{ .sql = "SELECT EXTRACT(dow FROM amount) AS amount_dow FROM usage_records WHERE EXTRACT(hour FROM amount) = $1", .kind = .read },
+    .{ .sql = "SELECT CURRENT_TIMESTAMP(6) AS planned_at_ns FROM users WHERE id = $1", .kind = .read },
+    .{ .sql = "SELECT CURRENT_DATE AS planned_day_ns FROM users WHERE id = $1", .kind = .read },
     .{ .sql = "SELECT CASE WHEN email IS NULL THEN 'missing' WHEN email = 'blocked@example.test' THEN 'blocked' ELSE lower(status) END AS email_bucket FROM usage_records WHERE id = 'u1'", .kind = .read },
     .{ .sql = "SELECT CASE WHEN email IS NULL THEN NULL ELSE email END AS maybe_email FROM usage_records WHERE id = 'u1'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status LIKE 'open%'", .kind = .read },
@@ -2030,6 +2035,15 @@ fn buildGeneratedExpressionAst(alloc: std.mem.Allocator, tokens: []const token_m
         ast.timestamp_value_tokens = timestamp_literal.value_tokens;
         return ast;
     }
+    if (generatedCurrentTimestampExpression(tokens, range)) |precision_tokens| {
+        ast.kind = .current_timestamp;
+        ast.current_timestamp_precision_tokens = precision_tokens;
+        return ast;
+    }
+    if (generatedCurrentDateExpression(tokens, range)) {
+        ast.kind = .current_date;
+        return ast;
+    }
     if (generatedExtractExpression(tokens, range)) |extract_expression| {
         ast.kind = .extract_expression;
         ast.extract_field_tokens = extract_expression.field_tokens;
@@ -2138,6 +2152,8 @@ fn generatedExpressionKindForRange(tokens: []const token_mod.Token, range: Gener
     if (generatedCaseExpression(tokens, range) != null) return .case_expression;
     if (generatedIntervalLiteralExpression(tokens, range) != null) return .interval_literal;
     if (generatedTimestampLiteralExpression(tokens, range) != null) return .timestamp_literal;
+    if (generatedCurrentTimestampExpression(tokens, range) != null) return .current_timestamp;
+    if (generatedCurrentDateExpression(tokens, range)) return .current_date;
     if (generatedExtractExpression(tokens, range) != null) return .extract_expression;
     if (generatedFunctionCallExpression(tokens, range) != null) return .function_call;
     if (generatedArrayConstructorExpression(tokens, range) != null) return .array_constructor;
@@ -2171,6 +2187,21 @@ fn generatedTimestampLiteralExpression(tokens: []const token_mod.Token, range: G
         .type_tokens = .{ .start = range.start, .end = range.start + 1 },
         .value_tokens = .{ .start = range.start + 1, .end = range.end },
     };
+}
+
+fn generatedCurrentDateExpression(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) bool {
+    return range.start < range.end and range.end <= tokens.len and range.end - range.start == 1 and tokens[range.start].matchesKeywordTag(.current_date);
+}
+
+fn generatedCurrentTimestampExpression(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?GeneratedSqlTokenRange {
+    if (range.start >= range.end or range.end > tokens.len) return null;
+    if (!tokens[range.start].matchesKeywordTag(.current_timestamp)) return null;
+    if (range.end - range.start == 1) return .{ .start = range.start + 1, .end = range.start + 1 };
+    if (range.end - range.start != 4) return null;
+    if (tokens[range.start + 1].kind != .lparen) return null;
+    if (tokens[range.start + 2].kind != .number) return null;
+    if (tokens[range.start + 3].kind != .rparen) return null;
+    return .{ .start = range.start + 2, .end = range.start + 3 };
 }
 
 const GeneratedExtractExpression = struct {
@@ -4951,6 +4982,40 @@ test "generated SQL parser exposes timestamp literal AST metadata" {
             try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 18, .end = 19 }, read.where_expression.operator_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 19, .end = 20 }, read.where_expression.right_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "generated SQL parser exposes current temporal keyword AST metadata" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const current_timestamp_sql = "SELECT CURRENT_TIMESTAMP(6) AS planned_at_ns FROM users WHERE id = $1";
+    const current_timestamp_result = try parseSqlAlloc(alloc, current_timestamp_sql);
+    switch (current_timestamp_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.current_timestamp, read.projection_first_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read.projection_first_expression.current_timestamp_precision_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 12 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read.where_expression.right_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const current_date_sql = "SELECT CURRENT_DATE AS planned_day_ns FROM users WHERE id = $1";
+    const current_date_result = try parseSqlAlloc(alloc, current_date_sql);
+    switch (current_date_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.current_date, read.projection_first_expression.kind);
+            try std.testing.expect(read.projection_first_expression.current_timestamp_precision_tokens == null);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.where_expression.right_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
