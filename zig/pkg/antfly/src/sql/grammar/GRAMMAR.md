@@ -121,7 +121,8 @@ operator, negation, and subquery token spans. Generated subquery expression
 metadata now records subquery read kind plus first-query `SELECT`, projection,
 source, `WHERE`, and set-operation ranges plus owned projection-list and
 `WHERE` predicate expression payloads, plus generated set-operation payloads
-for subquery set-operation tails, for later direct subquery planning.
+for subquery set-operation tails, and subquery-owned `ORDER BY`, `LIMIT`,
+`OFFSET`, and `FETCH` tail payloads for later direct subquery planning.
 `IS NULL` and `IS NOT NULL` predicates are accepted and
 classified as explicit null-test expression kinds, `IS TRUE`/`IS FALSE`/
 `IS UNKNOWN` boolean-test predicates are accepted with their `IS NOT` variants,
@@ -488,7 +489,7 @@ Unsupported DDL remains on the existing parser until
    planning/lowering and richer join-tree semantics beyond the current
    validated left-associative generated join nodes, expression AST
    planning/lowering beyond the current recursive
-   predicate/operator metadata and structural checks, broader function
+   predicate/operator/subquery-tail metadata and structural checks, broader function
    coverage, broader boolean expression-tree coverage, quantified and `EXISTS`
    subquery planning/lowering, remaining specialized expression operators, richer
    inline window-expression semantic planning beyond current generated `OVER`
@@ -708,7 +709,9 @@ Generated grammar work needs evidence at multiple levels:
   positive/negated predicate expression-shape coverage for read predicates,
   including escaped `LIKE`/`ILIKE` pattern metadata and fail-closed
   expression-owned token range containment plus operator/kind token
-  consistency validation.
+  consistency validation. Subquery expression tests cover generated
+  `ORDER BY`, `LIMIT`, `OFFSET`, and `FETCH` tail payloads plus fail-closed
+  malformed subquery tail validation.
   Seed graph DDL has generated AST-to-plan parity for graph index and graph
   metric index plans, and generated read AST tests cover canonical
   `antfly.*` table-function source ranges and named-argument item ranges,

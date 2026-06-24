@@ -281,6 +281,46 @@ pub const GeneratedSqlExpressionKind = enum {
     current_timestamp,
 };
 
+pub const GeneratedSqlSubqueryTailAst = struct {
+    order_tokens: ?GeneratedSqlTokenRange = null,
+    order_items: GeneratedSqlListAst = .{},
+    order_first_expression: ?*GeneratedSqlExpressionAst = null,
+    order_last_expression: ?*GeneratedSqlExpressionAst = null,
+    limit_tokens: ?GeneratedSqlTokenRange = null,
+    limit_expression: ?*GeneratedSqlExpressionAst = null,
+    limit_all: bool = false,
+    offset_tokens: ?GeneratedSqlTokenRange = null,
+    offset_expression: ?*GeneratedSqlExpressionAst = null,
+    fetch_tokens: ?GeneratedSqlTokenRange = null,
+    fetch_count_tokens: ?GeneratedSqlTokenRange = null,
+    fetch_count_expression: ?*GeneratedSqlExpressionAst = null,
+
+    pub fn deinit(self: *GeneratedSqlSubqueryTailAst, alloc: std.mem.Allocator) void {
+        self.order_items.deinit(alloc);
+        if (self.order_first_expression) |expr| {
+            expr.deinit(alloc);
+            alloc.destroy(expr);
+        }
+        if (self.order_last_expression) |expr| {
+            expr.deinit(alloc);
+            alloc.destroy(expr);
+        }
+        if (self.limit_expression) |expr| {
+            expr.deinit(alloc);
+            alloc.destroy(expr);
+        }
+        if (self.offset_expression) |expr| {
+            expr.deinit(alloc);
+            alloc.destroy(expr);
+        }
+        if (self.fetch_count_expression) |expr| {
+            expr.deinit(alloc);
+            alloc.destroy(expr);
+        }
+        self.* = .{};
+    }
+};
+
 pub const GeneratedSqlBetweenModifier = enum {
     asymmetric,
     symmetric,
@@ -302,6 +342,7 @@ pub const GeneratedSqlExpressionAst = struct {
     subquery_where_expression: ?*GeneratedSqlExpressionAst = null,
     subquery_set_operation_tokens: ?GeneratedSqlTokenRange = null,
     subquery_set_operation: ?*GeneratedSqlSetOperationAst = null,
+    subquery_tail: ?*GeneratedSqlSubqueryTailAst = null,
     function_name_tokens: ?GeneratedSqlTokenRange = null,
     argument_tokens: ?GeneratedSqlTokenRange = null,
     argument_distinct_tokens: ?GeneratedSqlTokenRange = null,
@@ -463,6 +504,10 @@ pub const GeneratedSqlExpressionAst = struct {
         if (self.subquery_set_operation) |subquery_set_operation| {
             subquery_set_operation.deinit(alloc);
             alloc.destroy(subquery_set_operation);
+        }
+        if (self.subquery_tail) |tail| {
+            tail.deinit(alloc);
+            alloc.destroy(tail);
         }
         self.boolean_condition_items.deinit(alloc);
         self.argument_items.deinit(alloc);
@@ -1922,12 +1967,15 @@ fn buildGeneratedSubqueryExpressionAst(
     const select_index = findTopLevelKeyword(tokens, inner_range.start, inner_range.end, .select) orelse return;
     ast.subquery_select_tokens = .{ .start = select_index, .end = select_index + 1 };
 
-    const body_end = firstTopLevelSetOperation(tokens, select_index + 1, inner_range.end) orelse inner_range.end;
+    const set_operation_index = firstTopLevelSetOperation(tokens, select_index + 1, inner_range.end);
+    const body_end = set_operation_index orelse inner_range.end;
+    var set_operation_tail_start: ?usize = null;
     if (body_end < inner_range.end) {
-        const set_operation_tail_start = generatedSetOperationResultTailStart(tokens, .{ .start = body_end, .end = inner_range.end }) orelse inner_range.end;
-        const set_operation_tokens = GeneratedSqlTokenRange{ .start = body_end, .end = set_operation_tail_start };
+        const tail_start = generatedSetOperationResultTailStart(tokens, .{ .start = body_end, .end = inner_range.end }) orelse inner_range.end;
+        const set_operation_tokens = GeneratedSqlTokenRange{ .start = body_end, .end = tail_start };
         ast.subquery_set_operation_tokens = set_operation_tokens;
         ast.subquery_set_operation = try buildGeneratedSetOperationAstAlloc(alloc, tokens, set_operation_tokens);
+        set_operation_tail_start = tail_start;
     }
 
     var distinct_tokens: ?GeneratedSqlTokenRange = null;
@@ -1959,6 +2007,86 @@ fn buildGeneratedSubqueryExpressionAst(
             ast.subquery_where_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, ast.subquery_where_tokens.?);
         }
     }
+    const tail_start = set_operation_tail_start orelse projection_start;
+    try buildGeneratedSubqueryResultTailAst(alloc, tokens, tail_start, inner_range.end, ast);
+}
+
+fn buildGeneratedSubqueryResultTailAst(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    start: usize,
+    end: usize,
+    ast: *GeneratedSqlExpressionAst,
+) !void {
+    if (start >= end or end > tokens.len) return;
+
+    const order_index = findTopLevelKeyword(tokens, start, end, .order);
+    const limit_index = findTopLevelKeyword(tokens, start, end, .limit);
+    const offset_index = findTopLevelKeyword(tokens, start, end, .offset);
+    const fetch_index = findTopLevelKeyword(tokens, start, end, .fetch);
+
+    if (order_index) |idx| {
+        const order_start = if (idx + 1 < end and tokens[idx + 1].matchesKeywordTag(.by)) idx + 2 else idx + 1;
+        const order_end = firstOptionalIndex(&[_]?usize{ limit_index, offset_index, fetch_index }) orelse end;
+        if (order_start < order_end) {
+            const tail = try ensureGeneratedSubqueryTailAstAlloc(alloc, ast);
+            const order_tokens = GeneratedSqlTokenRange{ .start = order_start, .end = order_end };
+            tail.order_tokens = order_tokens;
+            tail.order_items = try buildTopLevelListAst(alloc, tokens, order_tokens, .{ .order_modifiers = true });
+            if (generatedListExpressionTokens(tail.order_items, 0)) |first_tokens| {
+                tail.order_first_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, first_tokens);
+            }
+            if (generatedListExpressionTokens(tail.order_items, tail.order_items.count -| 1)) |last_tokens| {
+                tail.order_last_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, last_tokens);
+            }
+        }
+    }
+    if (limit_index) |idx| {
+        const limit_end = firstOptionalIndex(&[_]?usize{ offset_index, fetch_index }) orelse end;
+        if (idx + 1 < limit_end) {
+            const tail = try ensureGeneratedSubqueryTailAstAlloc(alloc, ast);
+            const limit_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = limit_end };
+            tail.limit_tokens = limit_tokens;
+            if (limit_tokens.end == limit_tokens.start + 1 and tokens[limit_tokens.start].matchesKeywordTag(.all)) {
+                tail.limit_all = true;
+            } else {
+                tail.limit_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, limit_tokens);
+            }
+        }
+    }
+    if (offset_index) |idx| {
+        const offset_end = firstOptionalIndex(&[_]?usize{fetch_index}) orelse end;
+        if (idx + 1 < offset_end) {
+            const tail = try ensureGeneratedSubqueryTailAstAlloc(alloc, ast);
+            const offset_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = offset_end };
+            tail.offset_tokens = offset_tokens;
+            if (generatedOffsetExpressionTokens(tokens, offset_tokens)) |expression_tokens| {
+                tail.offset_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, expression_tokens);
+            }
+        }
+    }
+    if (fetch_index) |idx| {
+        if (idx + 1 < end) {
+            const tail = try ensureGeneratedSubqueryTailAstAlloc(alloc, ast);
+            const fetch_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = end };
+            tail.fetch_tokens = fetch_tokens;
+            if (generatedFetchCountTokens(tokens, fetch_tokens)) |count_tokens| {
+                tail.fetch_count_tokens = count_tokens;
+                tail.fetch_count_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, count_tokens);
+            }
+        }
+    }
+}
+
+fn ensureGeneratedSubqueryTailAstAlloc(
+    alloc: std.mem.Allocator,
+    ast: *GeneratedSqlExpressionAst,
+) !*GeneratedSqlSubqueryTailAst {
+    if (ast.subquery_tail) |tail| return tail;
+    const tail = try alloc.create(GeneratedSqlSubqueryTailAst);
+    tail.* = .{};
+    ast.subquery_tail = tail;
+    return tail;
 }
 
 fn generatedOffsetExpressionTokens(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?GeneratedSqlTokenRange {
@@ -5307,6 +5435,48 @@ test "generated SQL parser facade builds predicate read AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, subquery.subquery_projection_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 12 }, subquery.subquery_source_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 16 }, subquery.subquery_where_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const in_subquery_tail_read_sql = "SELECT id FROM usage_records WHERE id IN (SELECT id FROM archived_records WHERE archived IS TRUE ORDER BY id DESC LIMIT 5 OFFSET 1 ROWS FETCH NEXT 2 ROWS ONLY)";
+    var in_subquery_tail_tokens = try lexer.tokenizeAlloc(alloc, in_subquery_tail_read_sql);
+    defer in_subquery_tail_tokens.deinit(alloc);
+    const in_subquery_tail_read_result = try parseTokensAlloc(alloc, in_subquery_tail_tokens.items);
+    switch (in_subquery_tail_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.in_list, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.subquery, read.where_expression.right_expression_kind.?);
+            const subquery = read.where_expression.right_expression orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.subquery, subquery.kind);
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, subquery.subquery_read_kind.?);
+            const tail = subquery.subquery_tail orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings(
+                "id DESC",
+                tokenRangeText(in_subquery_tail_read_sql, in_subquery_tail_tokens.items, tail.order_tokens.?),
+            );
+            try std.testing.expectEqual(@as(usize, 1), tail.order_items.count);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, tail.order_first_expression.?.kind);
+            try std.testing.expectEqualStrings(
+                "5",
+                tokenRangeText(in_subquery_tail_read_sql, in_subquery_tail_tokens.items, tail.limit_tokens.?),
+            );
+            try std.testing.expect(!tail.limit_all);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, tail.limit_expression.?.kind);
+            try std.testing.expectEqualStrings(
+                "1 ROWS",
+                tokenRangeText(in_subquery_tail_read_sql, in_subquery_tail_tokens.items, tail.offset_tokens.?),
+            );
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, tail.offset_expression.?.kind);
+            try std.testing.expectEqualStrings(
+                "NEXT 2 ROWS ONLY",
+                tokenRangeText(in_subquery_tail_read_sql, in_subquery_tail_tokens.items, tail.fetch_tokens.?),
+            );
+            try std.testing.expectEqualStrings(
+                "2",
+                tokenRangeText(in_subquery_tail_read_sql, in_subquery_tail_tokens.items, tail.fetch_count_tokens.?),
+            );
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, tail.fetch_count_expression.?.kind);
         },
         else => return error.TestUnexpectedResult,
     }
