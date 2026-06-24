@@ -90,11 +90,26 @@ pub const AntflyProvider = struct {
         roles: []const []const u8,
         contents: []const []const u8,
     ) anyerror![]u8 = null,
+    generate_text_with_timeout_ms: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        roles: []const []const u8,
+        contents: []const []const u8,
+        timeout_ms: u64,
+    ) anyerror![]u8 = null,
     generate_messages: ?*const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         model: []const u8,
         messages: []const inference_types.ChatMessage,
+    ) anyerror![]u8 = null,
+    generate_messages_with_timeout_ms: ?*const fn (
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        messages: []const inference_types.ChatMessage,
+        timeout_ms: u64,
     ) anyerror![]u8 = null,
     chunk_input: ?*const fn (
         ptr: *anyopaque,

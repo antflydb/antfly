@@ -2777,6 +2777,12 @@ pub fn build(b: *std.Build) void {
         "retrieval agent treats aggregations as first-class tool capability",
         "retrieval agent requires filter and aggregate tools for filtered aggregations",
         "retrieval agent ignores empty map-valued tool fields for policy and strategy",
+        "api query builder recursive aggregation inference emits typed candidate artifact",
+        "api query builder recursive aggregation inference uses field catalog metadata",
+        "api query builder recursive join aggregation inference emits typed candidate artifact",
+        "api query builder recursive join inference uses related table catalog metadata",
+        "api query builder require executable rejects inferred join until runtime support lands",
+        "api query builder require executable accepts runtime validated join",
     };
     const lib_unit_tests = b.addTest(.{
         .root_module = lib_test_mod,
