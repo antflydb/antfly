@@ -1397,6 +1397,212 @@ fn validateGeneratedExpressionAstBinaryStructure(expression: generated_parser.Ge
     try requireGeneratedExpressionAstChild(expression.right_expression_kind, expression.right_tokens, expression.right_expression);
 }
 
+fn validateGeneratedExpressionOperatorTokens(
+    tokens: []const tokenized.Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    const operator = expression.operator_tokens orelse return;
+    if (operator.start >= operator.end or operator.end > tokens.len) return error.UnsupportedSqlShape;
+    const operator_len = operator.end - operator.start;
+
+    switch (expression.kind) {
+        .comparison => {
+            if (operator_len != 1) return error.UnsupportedSqlShape;
+            switch (tokens[operator.start].kind) {
+                .eq, .neq, .lt, .lte, .gt, .gte => {},
+                else => return error.UnsupportedSqlShape,
+            }
+            if (expression.quantifier_tokens != null or expression.negation_tokens != null) return error.UnsupportedSqlShape;
+        },
+        .quantified_comparison => {
+            if (operator_len != 1) return error.UnsupportedSqlShape;
+            switch (tokens[operator.start].kind) {
+                .eq, .neq, .lt, .lte, .gt, .gte => {},
+                else => return error.UnsupportedSqlShape,
+            }
+            const quantifier = expression.quantifier_tokens orelse return error.UnsupportedSqlShape;
+            if (quantifier.start != operator.end or quantifier.end != quantifier.start + 1) return error.UnsupportedSqlShape;
+            if (!tokens[quantifier.start].matchesKeywordTag(.any) and
+                !tokens[quantifier.start].matchesKeywordTag(.all) and
+                !tokens[quantifier.start].matchesKeywordTag(.some))
+            {
+                return error.UnsupportedSqlShape;
+            }
+            if (expression.negation_tokens != null) return error.UnsupportedSqlShape;
+        },
+        .like,
+        .ilike,
+        .not_like,
+        .not_ilike,
+        => {
+            if (operator_len != 1) return error.UnsupportedSqlShape;
+            const expected: token_mod.TokenKeyword = switch (expression.kind) {
+                .like, .not_like => .like,
+                .ilike, .not_ilike => .ilike,
+                else => unreachable,
+            };
+            if (!tokens[operator.start].matchesKeywordTag(expected)) return error.UnsupportedSqlShape;
+            const negated = expression.kind == .not_like or expression.kind == .not_ilike;
+            if (negated) {
+                const negation = expression.negation_tokens orelse return error.UnsupportedSqlShape;
+                if (negation.end != operator.start or negation.start + 1 != negation.end) return error.UnsupportedSqlShape;
+                if (!tokens[negation.start].matchesKeywordTag(.not)) return error.UnsupportedSqlShape;
+            } else if (expression.negation_tokens != null) {
+                return error.UnsupportedSqlShape;
+            }
+            if (expression.quantifier_tokens) |quantifier| {
+                if (quantifier.start != operator.end or quantifier.end != quantifier.start + 1) return error.UnsupportedSqlShape;
+                if (!tokens[quantifier.start].matchesKeywordTag(.any) and
+                    !tokens[quantifier.start].matchesKeywordTag(.all) and
+                    !tokens[quantifier.start].matchesKeywordTag(.some))
+                {
+                    return error.UnsupportedSqlShape;
+                }
+            }
+        },
+        .in_list,
+        .not_in_list,
+        .between,
+        .not_between,
+        => {
+            if (operator_len != 1) return error.UnsupportedSqlShape;
+            const expected: token_mod.TokenKeyword = switch (expression.kind) {
+                .in_list, .not_in_list => .in,
+                .between, .not_between => .between,
+                else => unreachable,
+            };
+            if (!tokens[operator.start].matchesKeywordTag(expected)) return error.UnsupportedSqlShape;
+            const negated = expression.kind == .not_in_list or expression.kind == .not_between;
+            if (negated) {
+                const negation = expression.negation_tokens orelse return error.UnsupportedSqlShape;
+                if (negation.end != operator.start or negation.start + 1 != negation.end) return error.UnsupportedSqlShape;
+                if (!tokens[negation.start].matchesKeywordTag(.not)) return error.UnsupportedSqlShape;
+            } else if (expression.negation_tokens != null) {
+                return error.UnsupportedSqlShape;
+            }
+            if (expression.quantifier_tokens != null) return error.UnsupportedSqlShape;
+        },
+        .logical_or,
+        .logical_and,
+        .logical_not,
+        => {
+            if (operator_len != 1) return error.UnsupportedSqlShape;
+            const expected: token_mod.TokenKeyword = switch (expression.kind) {
+                .logical_or => .@"or",
+                .logical_and => .@"and",
+                .logical_not => .not,
+                else => unreachable,
+            };
+            if (!tokens[operator.start].matchesKeywordTag(expected)) return error.UnsupportedSqlShape;
+            if (expression.quantifier_tokens != null or expression.negation_tokens != null) return error.UnsupportedSqlShape;
+        },
+        .exists_subquery,
+        .not_exists_subquery,
+        => {
+            if (operator_len != 1 or !tokens[operator.start].matchesKeywordTag(.exists)) return error.UnsupportedSqlShape;
+            if (expression.kind == .not_exists_subquery) {
+                const negation = expression.negation_tokens orelse return error.UnsupportedSqlShape;
+                if (negation.end != operator.start or negation.start + 1 != negation.end) return error.UnsupportedSqlShape;
+                if (!tokens[negation.start].matchesKeywordTag(.not)) return error.UnsupportedSqlShape;
+            } else if (expression.negation_tokens != null) {
+                return error.UnsupportedSqlShape;
+            }
+            if (expression.quantifier_tokens != null) return error.UnsupportedSqlShape;
+        },
+        .unary_positive,
+        .unary_negative,
+        .additive,
+        .subtractive,
+        .multiplicative,
+        .divisive,
+        .modulo,
+        .contains,
+        .overlaps,
+        .json_key_exists,
+        .json_key_any,
+        .json_key_all,
+        .regex_match,
+        .regex_imatch,
+        .regex_not_match,
+        .regex_not_imatch,
+        .string_concat,
+        .json_access,
+        .json_text_access,
+        .json_path_access,
+        .json_path_text_access,
+        => {
+            if (operator_len != 1) return error.UnsupportedSqlShape;
+            const expected_kind: token_mod.TokenKind = switch (expression.kind) {
+                .unary_positive, .additive => .plus,
+                .unary_negative, .subtractive => .minus,
+                .multiplicative => .star,
+                .divisive => .slash,
+                .modulo => .percent,
+                .contains => .at_contains,
+                .overlaps => .range_overlap,
+                .json_key_exists => .question,
+                .json_key_any => .question_any,
+                .json_key_all => .question_all,
+                .regex_match => .regex_match,
+                .regex_imatch => .regex_imatch,
+                .regex_not_match => .regex_not_match,
+                .regex_not_imatch => .regex_not_imatch,
+                .string_concat => .pipe_concat,
+                .json_access => .arrow_json,
+                .json_text_access => .arrow_text,
+                .json_path_access => .path_arrow_json,
+                .json_path_text_access => .path_arrow_text,
+                else => unreachable,
+            };
+            if (tokens[operator.start].kind != expected_kind) return error.UnsupportedSqlShape;
+            if (expression.quantifier_tokens != null or expression.negation_tokens != null) return error.UnsupportedSqlShape;
+        },
+        .is_null,
+        .is_not_null,
+        .is_true,
+        .is_false,
+        .is_unknown,
+        .is_not_true,
+        .is_not_false,
+        .is_not_unknown,
+        => {
+            if (operator_len != 1) return error.UnsupportedSqlShape;
+            const operator_token = tokens[operator.start];
+            if (expression.kind == .is_null and operator_token.matchesKeywordTag(.isnull)) return;
+            if (expression.kind == .is_not_null and operator_token.matchesKeywordTag(.notnull)) return;
+            if (!operator_token.matchesKeywordTag(.is)) return error.UnsupportedSqlShape;
+            if (expression.quantifier_tokens != null or expression.negation_tokens != null) return error.UnsupportedSqlShape;
+        },
+        .is_distinct_from,
+        .is_not_distinct_from,
+        => {
+            const negated = expression.kind == .is_not_distinct_from;
+            const expected_len: usize = if (negated) 4 else 3;
+            if (operator_len != expected_len) return error.UnsupportedSqlShape;
+            if (!tokens[operator.start].matchesKeywordTag(.is)) return error.UnsupportedSqlShape;
+            if (negated) {
+                if (!tokens[operator.start + 1].matchesKeywordTag(.not) or
+                    !tokens[operator.start + 2].matchesKeywordTag(.distinct) or
+                    !tokens[operator.start + 3].matchesKeywordTag(.from))
+                {
+                    return error.UnsupportedSqlShape;
+                }
+                const negation = expression.negation_tokens orelse return error.UnsupportedSqlShape;
+                if (negation.start != operator.start + 1 or negation.end != operator.start + 2) return error.UnsupportedSqlShape;
+            } else {
+                if (!tokens[operator.start + 1].matchesKeywordTag(.distinct) or
+                    !tokens[operator.start + 2].matchesKeywordTag(.from))
+                {
+                    return error.UnsupportedSqlShape;
+                }
+                if (expression.negation_tokens != null) return error.UnsupportedSqlShape;
+            }
+            if (expression.quantifier_tokens != null) return error.UnsupportedSqlShape;
+        },
+        else => {},
+    }
+}
+
 fn validateGeneratedBooleanChainExpressionAstStructure(expression: generated_parser.GeneratedSqlExpressionAst) !void {
     try validateGeneratedExpressionAstBinaryStructure(expression);
     if (expression.boolean_condition_count < 2 or
@@ -1714,6 +1920,7 @@ fn validateGeneratedExpressionAstRanges(
     expression: generated_parser.GeneratedSqlExpressionAst,
 ) GeneratedReadValidationError!void {
     try validateGeneratedExpressionAstStructure(expression);
+    try validateGeneratedExpressionOperatorTokens(tokens, expression);
     const ranges = [_]?generated_parser.GeneratedSqlTokenRange{
         expression.tokens,
         expression.inner_tokens,
@@ -3030,6 +3237,15 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         else => return error.UnsupportedSqlShape,
     };
     malformed_comparison_expression_read_ast.where_expression.operator_tokens = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_comparison_expression_parsed_sql, malformed_comparison_expression_read_ast),
+    );
+    malformed_comparison_expression_read_ast = switch (malformed_comparison_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_comparison_expression_read_ast.where_expression.kind = .contains;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_comparison_expression_parsed_sql, malformed_comparison_expression_read_ast),
