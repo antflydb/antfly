@@ -588,11 +588,201 @@ fn validateGeneratedExpressionAstRangesIfPresent(
     try validateGeneratedExpressionAstRanges(tokens, read_ast, expression);
 }
 
+fn validateGeneratedExpressionAstChild(
+    expected_kind: ?generated_parser.GeneratedSqlExpressionKind,
+    child: *const generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    if (expected_kind) |kind| {
+        if (child.kind != kind) return error.UnsupportedSqlShape;
+    } else if (child.kind != .token_range) {
+        return error.UnsupportedSqlShape;
+    }
+}
+
+fn requireGeneratedExpressionAstChild(
+    expected_kind: ?generated_parser.GeneratedSqlExpressionKind,
+    child: ?*generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    const required_child = child orelse return error.UnsupportedSqlShape;
+    try validateGeneratedExpressionAstChild(expected_kind, required_child);
+}
+
+fn validateGeneratedExpressionAstOptionalChild(
+    expected_kind: ?generated_parser.GeneratedSqlExpressionKind,
+    child: ?*generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    if (child) |value| {
+        try validateGeneratedExpressionAstChild(expected_kind, value);
+    } else if (expected_kind != null) {
+        return error.UnsupportedSqlShape;
+    }
+}
+
+fn validateGeneratedExpressionAstBinaryStructure(expression: generated_parser.GeneratedSqlExpressionAst) !void {
+    if (expression.tokens == null or
+        expression.left_tokens == null or
+        expression.operator_tokens == null or
+        expression.right_tokens == null)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    try requireGeneratedExpressionAstChild(expression.left_expression_kind, expression.left_expression);
+    try requireGeneratedExpressionAstChild(expression.right_expression_kind, expression.right_expression);
+}
+
+fn validateGeneratedExpressionAstStructure(expression: generated_parser.GeneratedSqlExpressionAst) !void {
+    switch (expression.kind) {
+        .token_range => {
+            if (expression.tokens == null) return error.UnsupportedSqlShape;
+        },
+        .subquery => {
+            if (expression.tokens == null or expression.inner_tokens == null) return error.UnsupportedSqlShape;
+        },
+        .grouped => {
+            if (expression.tokens == null or expression.inner_tokens == null) return error.UnsupportedSqlShape;
+            try requireGeneratedExpressionAstChild(expression.inner_expression_kind, expression.inner_expression);
+        },
+        .cast => {
+            if (expression.tokens == null or expression.cast_expression_tokens == null or expression.cast_type_tokens == null) {
+                return error.UnsupportedSqlShape;
+            }
+            try requireGeneratedExpressionAstChild(expression.cast_expression_kind, expression.cast_expression);
+        },
+        .case_expression => {
+            if (expression.tokens == null or
+                expression.case_branch_count == 0 or
+                expression.case_first_when_tokens == null or
+                expression.case_first_condition_tokens == null or
+                expression.case_first_result_tokens == null)
+            {
+                return error.UnsupportedSqlShape;
+            }
+            if (expression.case_branch_count > 1 and expression.case_last_when_tokens == null) return error.UnsupportedSqlShape;
+            try requireGeneratedExpressionAstChild(expression.case_first_condition_kind, expression.case_first_condition);
+            try requireGeneratedExpressionAstChild(expression.case_first_result_kind, expression.case_first_result);
+            if (expression.case_else_tokens != null and expression.case_else_expression_tokens == null) return error.UnsupportedSqlShape;
+            if (expression.case_else_expression_tokens != null and expression.case_else_tokens == null) return error.UnsupportedSqlShape;
+            try validateGeneratedExpressionAstOptionalChild(expression.case_else_expression_kind, expression.case_else_expression);
+        },
+        .interval_literal => {
+            if (expression.tokens == null or expression.interval_value_tokens == null) return error.UnsupportedSqlShape;
+        },
+        .timestamp_literal => {
+            if (expression.tokens == null or expression.timestamp_type_tokens == null or expression.timestamp_value_tokens == null) {
+                return error.UnsupportedSqlShape;
+            }
+        },
+        .current_date,
+        .current_timestamp,
+        => {
+            if (expression.tokens == null) return error.UnsupportedSqlShape;
+        },
+        .extract_expression => {
+            if (expression.tokens == null or expression.extract_field_tokens == null or expression.extract_source_tokens == null) {
+                return error.UnsupportedSqlShape;
+            }
+        },
+        .function_call => {
+            if (expression.tokens == null or expression.function_name_tokens == null) return error.UnsupportedSqlShape;
+            if (expression.argument_distinct_tokens != null and expression.argument_value_tokens == null) return error.UnsupportedSqlShape;
+            if (expression.argument_value_tokens != null and expression.argument_tokens == null) return error.UnsupportedSqlShape;
+            if (expression.argument_order_tokens != null and expression.argument_order_items.count == 0) return error.UnsupportedSqlShape;
+            if (expression.within_group_tokens != null and
+                (expression.within_group_order_tokens == null or expression.within_group_order_items.count == 0))
+            {
+                return error.UnsupportedSqlShape;
+            }
+            if (expression.within_group_order_tokens != null and expression.within_group_tokens == null) return error.UnsupportedSqlShape;
+            if (expression.filter_tokens != null and expression.filter_predicate_tokens == null) return error.UnsupportedSqlShape;
+            if (expression.filter_predicate_tokens != null and expression.filter_tokens == null) return error.UnsupportedSqlShape;
+            try validateGeneratedExpressionAstOptionalChild(expression.filter_expression_kind, expression.filter_expression);
+        },
+        .array_constructor => {
+            if (expression.tokens == null) return error.UnsupportedSqlShape;
+            if (expression.array_tokens == null and expression.array_items.count != 0) return error.UnsupportedSqlShape;
+        },
+        .logical_not => {
+            if (expression.tokens == null or expression.operator_tokens == null or expression.right_tokens == null) {
+                return error.UnsupportedSqlShape;
+            }
+            if (expression.left_tokens != null or expression.left_expression != null or expression.left_expression_kind != null) {
+                return error.UnsupportedSqlShape;
+            }
+            try requireGeneratedExpressionAstChild(expression.right_expression_kind, expression.right_expression);
+        },
+        .is_null,
+        .is_not_null,
+        .is_true,
+        .is_false,
+        .is_unknown,
+        .is_not_true,
+        .is_not_false,
+        .is_not_unknown,
+        => {
+            if (expression.tokens == null or expression.left_tokens == null or expression.operator_tokens == null) {
+                return error.UnsupportedSqlShape;
+            }
+            try requireGeneratedExpressionAstChild(expression.left_expression_kind, expression.left_expression);
+            try validateGeneratedExpressionAstOptionalChild(expression.right_expression_kind, expression.right_expression);
+        },
+        .not_like,
+        .not_ilike,
+        .not_in_list,
+        .not_between,
+        => {
+            if (expression.negation_tokens == null) return error.UnsupportedSqlShape;
+            try validateGeneratedExpressionAstBinaryStructure(expression);
+        },
+        .quantified_comparison => {
+            if (expression.quantifier_tokens == null) return error.UnsupportedSqlShape;
+            try validateGeneratedExpressionAstBinaryStructure(expression);
+        },
+        .like,
+        .ilike,
+        => {
+            try validateGeneratedExpressionAstBinaryStructure(expression);
+            if (expression.escape_tokens != null and expression.escape_expression == null) return error.UnsupportedSqlShape;
+            try validateGeneratedExpressionAstOptionalChild(expression.escape_expression_kind, expression.escape_expression);
+        },
+        .between => {
+            if (expression.between_modifier_tokens != null and expression.between_modifier == null) return error.UnsupportedSqlShape;
+            try validateGeneratedExpressionAstBinaryStructure(expression);
+        },
+        .comparison,
+        .in_list,
+        .is_distinct_from,
+        .is_not_distinct_from,
+        .logical_or,
+        .logical_and,
+        .additive,
+        .subtractive,
+        .multiplicative,
+        .divisive,
+        .modulo,
+        .contains,
+        .overlaps,
+        .json_key_exists,
+        .json_key_any,
+        .json_key_all,
+        .regex_match,
+        .regex_imatch,
+        .regex_not_match,
+        .regex_not_imatch,
+        .string_concat,
+        .json_access,
+        .json_text_access,
+        .json_path_access,
+        .json_path_text_access,
+        => try validateGeneratedExpressionAstBinaryStructure(expression),
+    }
+}
+
 fn validateGeneratedExpressionAstRanges(
     tokens: []const tokenized.Token,
     read_ast: generated_parser.GeneratedSqlReadAst,
     expression: generated_parser.GeneratedSqlExpressionAst,
 ) !void {
+    try validateGeneratedExpressionAstStructure(expression);
     const ranges = [_]?generated_parser.GeneratedSqlTokenRange{
         expression.tokens,
         expression.inner_tokens,
@@ -1289,6 +1479,54 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_projection_alias_parsed_sql, malformed_projection_alias_read_ast),
+    );
+
+    var malformed_function_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT lower(status) AS status_key FROM usage_records WHERE kind = 'order'",
+    );
+    defer malformed_function_expression_parsed_sql.deinit(alloc);
+    const malformed_function_expression_generated_raw = malformed_function_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_function_expression_read_ast = switch (malformed_function_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_function_expression_read_ast.projection_items.expressions[0].function_name_tokens = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_function_expression_parsed_sql, malformed_function_expression_read_ast),
+    );
+
+    var malformed_comparison_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE kind = 'order'",
+    );
+    defer malformed_comparison_expression_parsed_sql.deinit(alloc);
+    const malformed_comparison_expression_generated_raw = malformed_comparison_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_comparison_expression_read_ast = switch (malformed_comparison_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_comparison_expression_read_ast.where_expression.operator_tokens = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_comparison_expression_parsed_sql, malformed_comparison_expression_read_ast),
+    );
+
+    var malformed_case_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT CASE WHEN status IS NULL THEN 'missing' ELSE status END AS status_key FROM usage_records WHERE kind = 'order'",
+    );
+    defer malformed_case_expression_parsed_sql.deinit(alloc);
+    const malformed_case_expression_generated_raw = malformed_case_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_case_expression_read_ast = switch (malformed_case_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_case_expression_read_ast.projection_items.expressions[0].case_branch_count = 0;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_case_expression_parsed_sql, malformed_case_expression_read_ast),
     );
 
     var cte_parsed_sql = try tokenized.ParsedSql.initAlloc(
