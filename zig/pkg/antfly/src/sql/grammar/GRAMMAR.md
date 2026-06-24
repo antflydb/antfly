@@ -147,7 +147,8 @@ non-recursive CTE reads dispatch directly when those ranges validate; generated 
 grammar now covers `LIMIT`, `OFFSET`, and `FETCH FIRST`/`FETCH NEXT` query
 tails with count expression metadata, and simple query, aggregate, join, and
 window pagination use generated range-validated lowering when generated read
-metadata is available.
+metadata is available; lateral read pagination now uses the same generated
+range validation on the typed lateral lowerer path.
 Unsupported read shapes
 still fall back, and deeper read cutover still requires full generated
 query-body AST payloads for expression-level projections and predicates,
@@ -354,8 +355,9 @@ Suggested migration order:
    `ROW`/`ROWS`, and `FETCH FIRST`/`FETCH NEXT` tails with optional fetch
    counts; generated metadata records limit expressions, the `LIMIT ALL`
    marker, offset expressions, and explicit fetch-count expressions, and
-   simple query, aggregate, join, and window pagination now use generated
-   range-validated lowering when generated read metadata is available.
+   simple query, aggregate, join, lateral, and window pagination now use
+   generated range-validated lowering when generated read metadata is
+   available.
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression AST semantics beyond the current owned

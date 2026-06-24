@@ -715,6 +715,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             return .{
                 .params = ptr.params,
                 .available_ctes = ptr.available_ctes,
+                .generated_read_ast = ptr.generated_read_ast,
                 .context_hooks = Accessors.joinParserContextHooks(ptr),
                 .subquery_hooks = Accessors.lateralSubqueryParserHooks(ptr),
                 .expression_where_options = Accessors.joinedMutationExpressionWhereOptions(ptr),

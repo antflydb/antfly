@@ -2358,6 +2358,7 @@ fn lowerLateralPlanWithSchemasParsedSqlAlloc(
         .schema = schema,
         .joined_source_schema = source_schema,
         .params = params,
+        .generated_read_ast = generatedReadAstForParsedSql(parsed_sql, .lateral),
     };
     var lowered = sql_adapter.parseLateralPlanAlloc(
         alloc,

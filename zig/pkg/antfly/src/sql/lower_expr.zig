@@ -155,6 +155,7 @@ fn parseGeneratedFetchLimitValueForClause(
 
 fn validateGeneratedSingleJoinForClause(
     generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+    expected_read_kind: generated_parser.GeneratedSqlReadKind,
     tokens: []const Token,
     left_tokens: generated_parser.GeneratedSqlTokenRange,
     operator_tokens: generated_parser.GeneratedSqlTokenRange,
@@ -164,7 +165,7 @@ fn validateGeneratedSingleJoinForClause(
     predicate_tokens: generated_parser.GeneratedSqlTokenRange,
 ) !void {
     const read = generated_read_ast orelse return;
-    if (read.kind != .join) return error.UnsupportedSqlShape;
+    if (read.kind != expected_read_kind) return error.UnsupportedSqlShape;
     const root_index = read.join_tree_root_index orelse return error.UnsupportedSqlShape;
     if (read.join_items.len != 1 or root_index != 0 or read.join_tree_depth != 1) return error.UnsupportedSqlShape;
     const join = read.join_items[0];
@@ -228,6 +229,7 @@ pub const LateralSubqueryParserHooks = struct {
 pub const LateralParserOptions = struct {
     params: []const value_mod.SqlValue = &.{},
     available_ctes: []const db_mod.types.RelationalRowsCte = &.{},
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst = null,
     context_hooks: JoinParserContextHooks,
     subquery_hooks: LateralSubqueryParserHooks,
     expression_where_options: JoinedMutationExpressionWhereConditionParserOptions,
@@ -16925,6 +16927,7 @@ pub fn parseJoinAlloc(
     );
     try validateGeneratedSingleJoinForClause(
         options.generated_read_ast,
+        .join,
         tokens,
         .{ .start = left_tokens_start, .end = operator_tokens_start },
         .{ .start = operator_tokens_start, .end = right_tokens_start },
@@ -17393,8 +17396,10 @@ pub fn parseLateralAlloc(
     defer plan_mod.freeQualifiedProjections(alloc, raw_select);
 
     try parser.expectKeyword(tokens, pos, "from");
+    const left_tokens_start = pos.*;
     const left_table = try plan_mod.parseTableAliasAlloc(alloc, tokens, pos);
     defer plan_mod.freeTableAlias(alloc, left_table);
+    const operator_tokens_start = pos.*;
 
     const initial_context = options.context_hooks.get_context(options.context_hooks.ptr);
     defer options.context_hooks.set_context(options.context_hooks.ptr, initial_context);
@@ -17415,6 +17420,7 @@ pub fn parseLateralAlloc(
     try parser.expectKeyword(tokens, pos, "left");
     _ = parser.matchKeyword(tokens, pos, "outer");
     try parser.expectKeyword(tokens, pos, "join");
+    const right_tokens_start = pos.*;
     try parser.expectKeyword(tokens, pos, "lateral");
     try parser.expectToken(tokens, pos, .lparen);
     const close_index = (parser.findMatchingRParenAfterOpenIndex(tokens, pos.*) orelse return error.UnsupportedSqlShape);
@@ -17431,6 +17437,7 @@ pub fn parseLateralAlloc(
 
     const lateral_alias = try grammar.parseRequiredAliasAlloc(alloc, tokens, pos);
     defer alloc.free(lateral_alias);
+    const condition_tokens_start = pos.*;
 
     current_context.joined_source_schema = .{
         .storage_mode = .relational,
@@ -17439,7 +17446,19 @@ pub fn parseLateralAlloc(
     options.context_hooks.set_context(options.context_hooks.ptr, current_context);
 
     try parser.expectKeyword(tokens, pos, "on");
+    const predicate_tokens_start = pos.*;
     try parser.expectKeyword(tokens, pos, "true");
+    try validateGeneratedSingleJoinForClause(
+        options.generated_read_ast,
+        .lateral,
+        tokens,
+        .{ .start = left_tokens_start, .end = operator_tokens_start },
+        .{ .start = operator_tokens_start, .end = right_tokens_start },
+        .left,
+        .{ .start = right_tokens_start, .end = condition_tokens_start },
+        .{ .start = condition_tokens_start, .end = pos.* },
+        .{ .start = predicate_tokens_start, .end = pos.* },
+    );
 
     var left_predicates = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
     errdefer {
@@ -17652,11 +17671,25 @@ pub fn parseLateralAlloc(
                 options.output_order_expression_options,
             );
         } else if (parser.matchKeyword(tokens, pos, "limit")) {
-            limit = try value_mod.parseLimitValue(tokens, pos, options.params);
+            const keyword_index = pos.* - 1;
+            if (try parseGeneratedLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_limit| {
+                limit = generated_limit.value;
+            } else {
+                limit = try value_mod.parseLimitValue(tokens, pos, options.params);
+            }
         } else if (parser.matchKeyword(tokens, pos, "offset")) {
-            offset = try value_mod.parseOffsetValue(tokens, pos, options.params);
+            const keyword_index = pos.* - 1;
+            offset = if (try parseGeneratedOffsetValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_offset|
+                generated_offset
+            else
+                try value_mod.parseOffsetValue(tokens, pos, options.params);
         } else if (parser.matchKeyword(tokens, pos, "fetch")) {
-            limit = try value_mod.parseFetchLimitValue(tokens, pos, options.params);
+            const keyword_index = pos.* - 1;
+            if (try parseGeneratedFetchLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_limit| {
+                limit = generated_limit.value;
+            } else {
+                limit = try value_mod.parseFetchLimitValue(tokens, pos, options.params);
+            }
         } else if (parser.matchToken(tokens, pos, .semicolon) != null) {
             if (!parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
         } else {
@@ -25201,11 +25234,20 @@ fn lowerLateralForLowerExprTestAlloc(
     schema: runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
 ) !plan_mod.LoweredLateralPlan {
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerParsedLateralForLowerExprTestAlloc(alloc, &parsed_sql, schema, params);
+}
+
+fn lowerParsedLateralForLowerExprTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+) !plan_mod.LoweredLateralPlan {
     const parser_context = @import("parser_context.zig");
 
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
-    defer parsed_sql.deinit(alloc);
     const tokens = parsed_sql.items();
     const cte_adapter_shape = parser.tokensStartWithKeywordTag(tokens, .with);
 
@@ -25215,6 +25257,7 @@ fn lowerLateralForLowerExprTestAlloc(
         .schema = schema,
         .joined_source_schema = schema,
         .params = params,
+        .generated_read_ast = generatedReadAstForParsedSql(parsed_sql, .lateral),
     };
     var lowered = plan_mod.parseLateralPlanAlloc(
         alloc,
@@ -34597,6 +34640,42 @@ test "sql adapter lower expr lowers bounded left join lateral queries" {
     try std.testing.expectEqual(@as(usize, 1), lowered.plan.lateral.order_by.len);
     try std.testing.expectEqualStrings("latest_amount", lowered.plan.lateral.order_by[0].field);
     try std.testing.expectEqual(@as(u32, 10), lowered.plan.lateral.limit.?);
+
+    var malformed_generated_lateral_join = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' ORDER BY 2 DESC LIMIT 1) AS latest ON true WHERE org.kind = 'organization' ORDER BY latest_amount DESC LIMIT 10",
+    );
+    defer malformed_generated_lateral_join.deinit(alloc);
+    if (malformed_generated_lateral_join.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |*read| read.join_tree_depth = 2,
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedLateralForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_lateral_join,
+        schema,
+        &.{},
+    ));
+
+    var malformed_generated_lateral_pagination = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' ORDER BY 2 DESC LIMIT 1) AS latest ON true WHERE org.kind = 'organization' ORDER BY latest_amount DESC LIMIT 10",
+    );
+    defer malformed_generated_lateral_pagination.deinit(alloc);
+    if (malformed_generated_lateral_pagination.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |*read| read.limit_tokens = .{ .start = 3, .end = 4 },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedLateralForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_lateral_pagination,
+        schema,
+        &.{},
+    ));
 
     var escaped_lateral_filter = try lowerLateralForLowerExprTestAlloc(
         alloc,
