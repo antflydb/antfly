@@ -320,6 +320,9 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: gen
         if (cte.body_having_tokens) |body_having_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_having_tokens);
         if (cte.body_order_tokens) |body_order_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_order_tokens);
         if (cte.body_limit_tokens) |body_limit_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_limit_tokens);
+        if (cte.body_offset_tokens) |body_offset_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_offset_tokens);
+        if (cte.body_fetch_tokens) |body_fetch_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_fetch_tokens);
+        if (cte.body_fetch_count_tokens) |body_fetch_count_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_fetch_count_tokens);
         if (cte.body_set_operation_tokens) |body_set_operation_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_set_operation_tokens);
         try validateGeneratedReadListAstRanges(tokens, read_ast, cte.column_names);
         try validateGeneratedReadListAstRanges(tokens, read_ast, cte.body_projection_items);
@@ -333,6 +336,9 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: gen
         try validateGeneratedReadListAstRanges(tokens, read_ast, cte.body_order_items);
         try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, cte.body_order_first_expression);
         try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, cte.body_order_last_expression);
+        try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, cte.body_limit_expression);
+        try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, cte.body_offset_expression);
+        try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, cte.body_fetch_count_expression);
     }
     try validateGeneratedCteListMetadata(tokens, read_ast);
     for (read_ast.join_items) |join| {
@@ -457,6 +463,9 @@ fn validateGeneratedCteBodyMetadata(cte: generated_parser.GeneratedSqlCteAst) !v
         cte.body_having_tokens,
         cte.body_order_tokens,
         cte.body_limit_tokens,
+        cte.body_offset_tokens,
+        cte.body_fetch_tokens,
+        cte.body_fetch_count_tokens,
         cte.body_set_operation_tokens,
     };
     for (body_ranges) |maybe_range| {
@@ -500,6 +509,30 @@ fn validateGeneratedCteBodyMetadata(cte: generated_parser.GeneratedSqlCteAst) !v
     }
     if (cte.body_limit_tokens) |limit_tokens| {
         if (limit_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
+        if (cte.body_limit_all) {
+            if (generatedExpressionAstHasMetadata(cte.body_limit_expression)) return error.UnsupportedSqlShape;
+        } else if (!generatedExpressionAstHasMetadata(cte.body_limit_expression)) {
+            return error.UnsupportedSqlShape;
+        }
+    } else if (cte.body_limit_all or generatedExpressionAstHasMetadata(cte.body_limit_expression)) {
+        return error.UnsupportedSqlShape;
+    }
+    if (cte.body_offset_tokens) |offset_tokens| {
+        if (offset_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
+        if (!generatedExpressionAstHasMetadata(cte.body_offset_expression)) return error.UnsupportedSqlShape;
+    } else if (generatedExpressionAstHasMetadata(cte.body_offset_expression)) {
+        return error.UnsupportedSqlShape;
+    }
+    if (cte.body_fetch_tokens) |fetch_tokens| {
+        if (fetch_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
+        if (cte.body_fetch_count_tokens) |count_tokens| {
+            if (count_tokens.start < fetch_tokens.start or count_tokens.end > fetch_tokens.end) return error.UnsupportedSqlShape;
+            if (!generatedExpressionAstHasMetadata(cte.body_fetch_count_expression)) return error.UnsupportedSqlShape;
+        } else if (generatedExpressionAstHasMetadata(cte.body_fetch_count_expression)) {
+            return error.UnsupportedSqlShape;
+        }
+    } else if (cte.body_fetch_count_tokens != null or generatedExpressionAstHasMetadata(cte.body_fetch_count_expression)) {
+        return error.UnsupportedSqlShape;
     }
     if (cte.body_set_operation_tokens) |set_operation_tokens| {
         if (set_operation_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
@@ -1978,6 +2011,22 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_cte_body_projection_list_parsed_sql, malformed_cte_body_projection_list_read_ast),
+    );
+
+    var malformed_cte_body_limit_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH source_rows AS (SELECT id FROM usage_records LIMIT 5) SELECT id FROM source_rows",
+    );
+    defer malformed_cte_body_limit_parsed_sql.deinit(alloc);
+    const malformed_cte_body_limit_generated_raw = malformed_cte_body_limit_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_cte_body_limit_read_ast = switch (malformed_cte_body_limit_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_cte_body_limit_read_ast.cte_items[0].body_limit_expression = .{};
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_cte_body_limit_parsed_sql, malformed_cte_body_limit_read_ast),
     );
 
     var recursive_cte_parsed_sql = try tokenized.ParsedSql.initAlloc(

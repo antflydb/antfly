@@ -151,7 +151,8 @@ compatibility fields, column-alias lists, materialization hints, and body
 enclosure metadata; each generated CTE item also carries body read-kind and
 body clause-span metadata for the first body query, including set-operation
 tails, plus owned body projection/group/order lists and predicate expression
-metadata, and the lowerer validates those body payloads before dispatch;
+metadata, body pagination expression metadata for `LIMIT`, `OFFSET`, and
+`FETCH`, and the lowerer validates those body payloads before dispatch;
 recursive CTE reads carry an explicit generated recursive flag, and simple
 non-recursive CTE reads dispatch directly when those ranges validate; recursive
 CTE reads now validate generated recursive CTE metadata before dispatching to
@@ -375,12 +376,13 @@ Suggested migration order:
    materialization hint payloads, and parenthesized body spans; each generated
    CTE item now carries body read-kind and first-query clause-span metadata,
    including set-operation tails, plus owned body projection/group/order list
-   payloads and body predicate expression payloads, and generated CTE lowering
-   validates those body payloads. Recursive CTE reads carry an explicit
-   recursive flag; and simple non-recursive CTE reads dispatch to the typed
-   read lowerer after validating those ranges. Recursive CTE reads now validate
-   generated recursive CTE ranges and the recursive flag before dispatching to
-   the typed recursive CTE lowerer.
+   payloads, body predicate expression payloads, and body pagination
+   expression payloads for `LIMIT`, `OFFSET`, and `FETCH`; generated CTE
+   lowering validates those body payloads. Recursive CTE reads carry an
+   explicit recursive flag; and simple non-recursive CTE reads dispatch to the
+   typed read lowerer after validating those ranges. Recursive CTE reads now
+   validate generated recursive CTE ranges and the recursive flag before
+   dispatching to the typed recursive CTE lowerer.
    Generated pagination coverage now accepts and ranges expression and
    PostgreSQL-compatible `ALL`/`NULL` `LIMIT` tails, `OFFSET` with optional
    `ROW`/`ROWS`, and `FETCH FIRST`/`FETCH NEXT` tails with optional fetch
@@ -400,8 +402,8 @@ Suggested migration order:
    predicate/operator metadata and structural checks, broader function
    coverage, broader boolean expression-tree coverage, quantified subquery
    planning/lowering, remaining specialized expression operators, recursive
-   full CTE body planning beyond the current body clause/list/expression
-   metadata, direct generated read-plan lowering, and
+   full CTE body planning beyond the current body clause/list/expression and
+   pagination metadata, direct generated read-plan lowering, and
    unsupported-shape diagnostics.
 5. Advanced DML: `INSERT ... SELECT`, `UPDATE ... FROM`, `DELETE ... USING`,
    `TRUNCATE`, and `MERGE`.
