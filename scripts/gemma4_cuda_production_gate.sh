@@ -34,7 +34,7 @@ Environment:
   GEMMA12_Q4=.models/google/gemma-4-12B-it-q4_k
   GEMMA12_ASSISTANT_Q8=.models/google/gemma-4-12B-it-assistant
   GEMMA12_ASSISTANT_Q4=
-  E2B_TARGET=.models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf
+  E2B_TARGET=.models/unsloth/gemma-4-E2B-it-qat-GGUF
   E2B_ASSISTANT_Q8=.models/unsloth/gemma-4-E2B-it-qat-GGUF/MTP/gemma-4-E2B-it-Q8_0-MTP.gguf
   E2B_ASSISTANT_Q4=.models/unsloth/gemma-4-E2B-it-qat-GGUF/MTP/gemma-4-E2B-it-Q4_0-MTP.gguf
 USAGE
@@ -90,7 +90,7 @@ GEMMA12_Q8="${GEMMA12_Q8:-$ROOT_DIR/.models/google/gemma-4-12B-it-q8_0}"
 GEMMA12_Q4="${GEMMA12_Q4:-$ROOT_DIR/.models/google/gemma-4-12B-it-q4_k}"
 GEMMA12_ASSISTANT_Q8="${GEMMA12_ASSISTANT_Q8:-$ROOT_DIR/.models/google/gemma-4-12B-it-assistant}"
 GEMMA12_ASSISTANT_Q4="${GEMMA12_ASSISTANT_Q4:-}"
-E2B_TARGET="${E2B_TARGET:-$ROOT_DIR/.models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf}"
+E2B_TARGET="${E2B_TARGET:-$ROOT_DIR/.models/unsloth/gemma-4-E2B-it-qat-GGUF}"
 E2B_ASSISTANT_Q8="${E2B_ASSISTANT_Q8:-$ROOT_DIR/.models/unsloth/gemma-4-E2B-it-qat-GGUF/MTP/gemma-4-E2B-it-Q8_0-MTP.gguf}"
 E2B_ASSISTANT_Q4="${E2B_ASSISTANT_Q4:-$ROOT_DIR/.models/unsloth/gemma-4-E2B-it-qat-GGUF/MTP/gemma-4-E2B-it-Q4_0-MTP.gguf}"
 

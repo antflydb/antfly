@@ -170,6 +170,7 @@ pub const DraftDeviceRequest = struct {
     draft_config: gpt_mod.Config,
     token_id: i64,
     activation: ops.CT,
+    target_embedding_on_draft: ?ops.CT = null,
     decode_context: *const gpt_arch.DecodeContext,
     debug_top_k: usize = 0,
 };
@@ -346,6 +347,10 @@ fn mtpStageTraceEnabled() bool {
     return getenvBool("ANTFLY_GEMMA4_MTP_STAGE_TRACE");
 }
 
+fn mtpAssistantReplayEnabled() bool {
+    return getenvBool("ANTFLY_GEMMA4_MTP_ASSISTANT_REPLAY");
+}
+
 fn mtpStageTraceValueCount() usize {
     return @min(getenvUsize("ANTFLY_GEMMA4_MTP_STAGE_TRACE_VALUES") orelse 6, 32);
 }
@@ -515,7 +520,25 @@ pub fn draftToken(request: DraftRequest) !DraftResult {
     const assistant_input = try request.draft_cb.linearNoBias(concat_ct, pre_w, 1, backbone_hidden * 2, draft_hidden);
     try traceBackendStage(request.draft_cb, allocator, "assistant_input", assistant_input);
 
-    const assistant_hidden = try gpt_arch.forwardFinalHiddenLastRowFromEmbeddingsWithLayer0Overrides(
+    const assistant_hidden = if (mtpAssistantReplayEnabled()) blk: {
+        const hidden_result = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesCudaReplay(
+            request.draft_cb,
+            allocator,
+            draft_cfg,
+            assistant_input,
+            .{},
+            1,
+            request.decode_context.total_sequence_len,
+            request.decode_context,
+            null,
+            "gpt.mtp_assistant_final_hidden",
+        );
+        if (hidden_result.total_rows != 1) {
+            request.draft_cb.free(hidden_result.hidden);
+            return error.InvalidTensorShape;
+        }
+        break :blk hidden_result.hidden;
+    } else try gpt_arch.forwardFinalHiddenLastRowFromEmbeddingsWithLayer0Overrides(
         request.draft_cb,
         allocator,
         draft_cfg,
@@ -611,21 +634,25 @@ pub fn draftTokenDevice(request: DraftDeviceRequest) !DraftDeviceResult {
     const concat_order = concatOrderFromEnv();
     try prepareDraftConfigForMtp(request.target_config, &draft_cfg, kv_donor_mode);
 
-    const target_embed_w = try gpt_arch.getEmbeddingWeight(request.target_cb, request.target_config);
-    defer request.target_cb.free(target_embed_w);
-    const token_arr = [_]i64{request.token_id};
-    const target_embedded = try request.target_cb.embeddingLookup(target_embed_w, &token_arr, 1, backbone_hidden);
-    const target_embedding = try gpt_arch.maybeScaleTokenEmbeddings(
-        request.target_cb,
-        allocator,
-        request.target_config,
-        target_embedded,
-        1,
-        backbone_hidden,
-    );
-    defer request.target_cb.free(target_embedding);
-    const draft_target_embedding = (try request.draft_cb.copyTensorFromBackend(request.target_cb, target_embedding)) orelse return error.UnsupportedBackend;
-    defer request.draft_cb.free(draft_target_embedding);
+    const draft_target_embedding = if (request.target_embedding_on_draft) |cached|
+        cached
+    else blk: {
+        const target_embed_w = try gpt_arch.getEmbeddingWeight(request.target_cb, request.target_config);
+        defer request.target_cb.free(target_embed_w);
+        const token_arr = [_]i64{request.token_id};
+        const target_embedded = try request.target_cb.embeddingLookup(target_embed_w, &token_arr, 1, backbone_hidden);
+        const target_embedding = try gpt_arch.maybeScaleTokenEmbeddings(
+            request.target_cb,
+            allocator,
+            request.target_config,
+            target_embedded,
+            1,
+            backbone_hidden,
+        );
+        defer request.target_cb.free(target_embedding);
+        break :blk (try request.draft_cb.copyTensorFromBackend(request.target_cb, target_embedding)) orelse return error.UnsupportedBackend;
+    };
+    defer if (request.target_embedding_on_draft == null) request.draft_cb.free(draft_target_embedding);
 
     const concat_ct = switch (concat_order) {
         .embedding_activation => try request.draft_cb.concat(draft_target_embedding, request.activation, 1, backbone_hidden, backbone_hidden),
@@ -637,7 +664,25 @@ pub fn draftTokenDevice(request: DraftDeviceRequest) !DraftDeviceResult {
     defer request.draft_cb.free(pre_w);
     const assistant_input = try request.draft_cb.linearNoBias(concat_ct, pre_w, 1, backbone_hidden * 2, draft_hidden);
 
-    const assistant_hidden = try gpt_arch.forwardFinalHiddenLastRowFromEmbeddingsWithLayer0Overrides(
+    const assistant_hidden = if (mtpAssistantReplayEnabled()) blk: {
+        const hidden_result = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesCudaReplay(
+            request.draft_cb,
+            allocator,
+            draft_cfg,
+            assistant_input,
+            .{},
+            1,
+            request.decode_context.total_sequence_len,
+            request.decode_context,
+            null,
+            "gpt.mtp_assistant_final_hidden",
+        );
+        if (hidden_result.total_rows != 1) {
+            request.draft_cb.free(hidden_result.hidden);
+            return error.InvalidTensorShape;
+        }
+        break :blk hidden_result.hidden;
+    } else try gpt_arch.forwardFinalHiddenLastRowFromEmbeddingsWithLayer0Overrides(
         request.draft_cb,
         allocator,
         draft_cfg,

@@ -845,9 +845,9 @@ pub const ComputeBackend = struct {
         return op(self.ptr, label);
     }
 
-    pub fn debugCudaGraphPrepareDecodeScalars(self: *const ComputeBackend, position_offset: usize, query_position_offset: usize, kv_seq_len: usize, total_sequence_len: usize) !bool {
+    pub fn debugCudaGraphPrepareDecodeScalars(self: *const ComputeBackend, position_offset: usize, query_position_offset: usize, kv_seq_len: usize, total_sequence_len: usize, kv_position_offset: usize) !bool {
         const op = self.vtable.debugCudaGraphPrepareDecodeScalars orelse return false;
-        return op(self.ptr, position_offset, query_position_offset, kv_seq_len, total_sequence_len);
+        return op(self.ptr, position_offset, query_position_offset, kv_seq_len, total_sequence_len, kv_position_offset);
     }
 
     pub fn debugCudaTraceTensor(self: *const ComputeBackend, label: []const u8, tensor: CT) !void {
@@ -865,9 +865,9 @@ pub const ComputeBackend = struct {
         return op(self.ptr, input);
     }
 
-    pub fn debugCudaGraphPrepareFinalHiddenReplayInput(self: *const ComputeBackend, input: CT) !?CT {
+    pub fn debugCudaGraphPrepareFinalHiddenReplayInput(self: *const ComputeBackend, label: []const u8, input: CT) !?CT {
         const op = self.vtable.debugCudaGraphPrepareFinalHiddenReplayInput orelse return null;
-        return op(self.ptr, input);
+        return op(self.ptr, label, input);
     }
 
     pub fn debugCudaGraphReplayFinalHidden(self: *const ComputeBackend, input: CT) !?CT {
@@ -910,11 +910,11 @@ pub const ComputeBackend = struct {
         convertDType: ?*const fn (ctx: *anyopaque, tensor: CT, target: GraphDType) anyerror!?CT = null,
 
         debugCudaGraphCaptureBegin: ?*const fn (ctx: *anyopaque, label: []const u8) anyerror!bool = null,
-        debugCudaGraphPrepareDecodeScalars: ?*const fn (ctx: *anyopaque, position_offset: usize, query_position_offset: usize, kv_seq_len: usize, total_sequence_len: usize) anyerror!bool = null,
+        debugCudaGraphPrepareDecodeScalars: ?*const fn (ctx: *anyopaque, position_offset: usize, query_position_offset: usize, kv_seq_len: usize, total_sequence_len: usize, kv_position_offset: usize) anyerror!bool = null,
         debugCudaTraceTensor: ?*const fn (ctx: *anyopaque, label: []const u8, tensor: CT) anyerror!void = null,
         debugCudaGraphRegisterFinalHiddenReplayBoundary: ?*const fn (ctx: *anyopaque, input: CT, output: CT) anyerror!void = null,
         debugCudaGraphRegisterFinalHiddenReplayInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!void = null,
-        debugCudaGraphPrepareFinalHiddenReplayInput: ?*const fn (ctx: *anyopaque, input: CT) anyerror!?CT = null,
+        debugCudaGraphPrepareFinalHiddenReplayInput: ?*const fn (ctx: *anyopaque, label: []const u8, input: CT) anyerror!?CT = null,
         debugCudaGraphReplayFinalHidden: ?*const fn (ctx: *anyopaque, input: CT) anyerror!?CT = null,
         debugCudaGraphCaptureEnd: ?*const fn (ctx: *anyopaque, replay: bool) anyerror!void = null,
 
@@ -1001,6 +1001,11 @@ pub const ComputeBackend = struct {
         /// Backends may fuse the common gated-FFN activation/multiply pair.
         activationMultiply: ?*const fn (ctx: *anyopaque, gate: CT, up: CT, activation: DecoderRuntimeActivationKind) anyerror!?CT = null,
 
+        /// Y = activation(gate) * sliceLastDim(source, start, stop).
+        /// Backends may fuse Gemma4 per-layer input conditioning without
+        /// materializing the sliced PLE vector.
+        activationMultiplySliceLastDim: ?*const fn (ctx: *anyopaque, gate: CT, source: CT, start: usize, stop: usize, activation: DecoderRuntimeActivationKind) anyerror!?CT = null,
+
         /// Y = (A + B) * scalar[0]. Backends may fuse residual add and a
         /// device-resident scalar multiply used by per-layer output scales.
         addMultiplyScalarTensor: ?*const fn (ctx: *anyopaque, a: CT, b: CT, scalar: CT) anyerror!?CT = null,
@@ -1013,6 +1018,10 @@ pub const ComputeBackend = struct {
         /// Backends may fuse Gemma-style post-norm residual epilogues when no
         /// layer-output scale is present.
         rmsNormAddTensor: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, residual: CT, dim: usize, eps: f32) anyerror!?CT = null,
+
+        /// Y = (rms_norm(input, weight, dim, eps) + residual) * scalar[0].
+        /// Backends may fuse Gemma4 PLE/post-FFN residual output-scale epilogues.
+        rmsNormAddOutputScaleTensor: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, residual: CT, scalar: CT, dim: usize, eps: f32) anyerror!?CT = null,
 
         /// Y = rope(rms_norm_heads(input, weight, eps), ...), optionally scaled.
         /// Backends may fuse Gemma/Qwen Q/K head norm immediately followed by RoPE.
@@ -2851,6 +2860,11 @@ pub const ComputeBackend = struct {
         return op(self.ptr, gate, up, activation);
     }
 
+    pub fn activationMultiplySliceLastDim(self: *const ComputeBackend, gate: CT, source: CT, start: usize, stop: usize, activation: DecoderRuntimeActivationKind) !?CT {
+        const op = self.vtable.activationMultiplySliceLastDim orelse return null;
+        return op(self.ptr, gate, source, start, stop, activation);
+    }
+
     pub fn addMultiplyScalarTensor(self: *const ComputeBackend, a: CT, b: CT, scalar: CT) !?CT {
         const op = self.vtable.addMultiplyScalarTensor orelse return null;
         return op(self.ptr, a, b, scalar);
@@ -2864,6 +2878,11 @@ pub const ComputeBackend = struct {
     pub fn rmsNormAddTensor(self: *const ComputeBackend, input: CT, weight: CT, residual: CT, dim: usize, eps: f32) !?CT {
         const op = self.vtable.rmsNormAddTensor orelse return null;
         return op(self.ptr, input, weight, residual, dim, eps);
+    }
+
+    pub fn rmsNormAddOutputScaleTensor(self: *const ComputeBackend, input: CT, weight: CT, residual: CT, scalar: CT, dim: usize, eps: f32) !?CT {
+        const op = self.vtable.rmsNormAddOutputScaleTensor orelse return null;
+        return op(self.ptr, input, weight, residual, scalar, dim, eps);
     }
 
     pub fn rmsNormHeadsRope(self: *const ComputeBackend, input: CT, weight: CT, rows: usize, total_dim: usize, head_dim: usize, rope_dim: usize, eps: f32, theta: f32, freq_scale: f32, position_offset: usize, seq_len: usize, consecutive_pairs: bool, scale: f32) !?CT {

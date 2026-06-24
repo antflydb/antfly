@@ -92,6 +92,7 @@ const CudaDispatchQuant = enum {
     q8_0,
     q4_0,
     q4_k,
+    q6_k,
     f32,
     bf16,
 };
@@ -102,6 +103,7 @@ const CudaDispatchRoute = enum {
     q4_tc_hmma,
     q8_simt,
     q4_simt,
+    q6_simt,
     q4_span_simt,
     dense_lt,
     dense_cuda,
@@ -629,6 +631,7 @@ const max_cuda_graph_replay_slots = 8;
 
 const CudaGraphReplaySlot = struct {
     exec: driver_mod.CUgraphExec = null,
+    replay_key: u64 = 0,
     input_storage: buffer_mod.DeviceBuffer = .{},
     output_storage: buffer_mod.DeviceBuffer = .{},
     input: buffer_mod.DeviceBuffer = .{},
@@ -679,6 +682,7 @@ pub const CudaCompute = struct {
     florence_image_projection_vision_dim: usize = 0,
     florence_image_projection_projection_dim: usize = 0,
     debug_cuda_graph_capture_active: bool = false,
+    debug_cuda_graph_capture_disabled: bool = false,
     debug_cuda_graph_slots: [max_cuda_graph_replay_slots]CudaGraphReplaySlot = [_]CudaGraphReplaySlot{.{}} ** max_cuda_graph_replay_slots,
     debug_cuda_graph_active_slot: ?usize = null,
     debug_cuda_graph_prepared_slot: ?usize = null,
@@ -1400,7 +1404,7 @@ const CudaKvDeviceStorage = struct {
             return;
         }
         const dst_offset = try checkedMul(token_start, layer.value_row_bytes);
-        if (cudaDebugDecodeScalarsReady(self.compute) and write.suffix_token_count == 1) {
+        if (cudaDebugDecodeScalarsReady(self.compute)) {
             try self.compute.kernels.launchKvWriteSuffixDecodeScalarsF32(
                 &self.compute.ctx,
                 layer.k,
@@ -1624,13 +1628,25 @@ fn cudaShouldDequantizeWeightOnUpload(name: []const u8, storage: weight_source_m
     // Matrix weights stay quantized for CUDA matmul kernels. Small affine
     // parameters are consumed by f32 norm/elementwise kernels, so upload them
     // as f32 even if the bundle stored them in a quantized GGUF block.
-    if (isKnownQuantStorage(storage, .Q6_K)) return true;
+    if (isKnownQuantStorage(storage, .Q6_K) and !cudaKeepQ6KQuantizedByName(name)) return true;
     if (storage.shape.len < 2) return true;
     if (std.mem.endsWith(u8, name, ".bias")) return true;
     if (std.mem.eql(u8, name, "count_embed.pos_embedding.weight")) return true;
     if (std.mem.eql(u8, name, "encoder.rel_embeddings.weight")) return true;
     if (std.mem.indexOf(u8, name, ".norm") != null) return true;
     if (std.mem.indexOf(u8, name, "layer_norm") != null) return true;
+    return false;
+}
+
+fn cudaKeepQ6KQuantizedByName(name: []const u8) bool {
+    if (std.mem.eql(u8, name, "token_embd.weight") or
+        std.mem.eql(u8, name, "per_layer_token_embd.weight") or
+        std.mem.eql(u8, name, "model.per_layer_input.per_layer_token_embd.weight"))
+    {
+        return true;
+    }
+    if (std.mem.endsWith(u8, name, ".ffn_down.weight")) return true;
+    if (std.mem.indexOf(u8, name, ".mlp.down_proj.weight") != null) return true;
     return false;
 }
 
@@ -2399,16 +2415,31 @@ fn getDenseStreamWeight(self: *CudaCompute, name: []const u8) !?*CudaTensor {
 }
 
 fn copyFromHostTracked(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []const u8) !void {
+    if (self.debug_cuda_graph_capture_active) {
+        self.debug_cuda_graph_capture_disabled = true;
+        std.log.warn("cuda_graph_capture_probe: unsafe_h2d_copy bytes={d} disabled=1", .{bytes.len});
+        return error.CudaGraphCaptureUnsafeHostCopy;
+    }
     try device.copyFromHost(&self.ctx, bytes);
     self.stats.h2d_bytes += bytes.len;
 }
 
 fn copyToHostTracked(self: *CudaCompute, device: buffer_mod.DeviceBuffer, bytes: []u8) !void {
+    if (self.debug_cuda_graph_capture_active) {
+        self.debug_cuda_graph_capture_disabled = true;
+        std.log.warn("cuda_graph_capture_probe: unsafe_d2h_copy bytes={d} disabled=1", .{bytes.len});
+        return error.CudaGraphCaptureUnsafeHostCopy;
+    }
     try device.copyToHost(&self.ctx, bytes);
     self.stats.d2h_bytes += bytes.len;
 }
 
 fn copyFromDeviceTracked(self: *CudaCompute, device: buffer_mod.DeviceBuffer, src: buffer_mod.DeviceBuffer, len: usize) !void {
+    if (self.debug_cuda_graph_capture_active) {
+        try self.kernels.launchCopyBytes(&self.ctx, device, src, len);
+        self.stats.d2d_bytes += len;
+        return;
+    }
     try device.copyFromDevice(&self.ctx, src, len);
     self.stats.d2d_bytes += len;
 }
@@ -2528,7 +2559,7 @@ fn cudaTempSlotPeriod() usize {
 
 fn cudaTempSlotSkip() usize {
     if (platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_SLOT_SKIP")) |configured| return configured;
-    if (cudaMtpTargetReplayEnabled()) return 2500;
+    if (cudaMtpTargetReplayEnabled() and cudaMtpUnsafeTargetReplayEnabled()) return 2500;
     return cudaTempTraceSkip();
 }
 
@@ -2551,13 +2582,17 @@ fn cudaMtpTargetReplayEnabled() bool {
     return true;
 }
 
+fn cudaMtpUnsafeTargetReplayEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_UNSAFE_TARGET_REPLAY", false);
+}
+
 fn cudaMtpVerifyDeviceResultEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_VERIFY_DEVICE_RESULT", false);
 }
 
 fn cudaDebugGraphPersistentReplayEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_PERSISTENT_REPLAY", false) or
-        cudaMtpTargetReplayEnabled();
+        (cudaMtpTargetReplayEnabled() and cudaMtpUnsafeTargetReplayEnabled());
 }
 
 fn cudaDebugGraphForcedKvReplayCapacityTokens() ?usize {
@@ -2617,11 +2652,15 @@ fn noteDecodeProfileUs(self: *CudaCompute, category: CudaDecodeProfileCategory, 
 
 fn cudaDebugGraphCaptureDeviceScalarsEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_DEVICE_SCALARS", false) or
-        cudaMtpTargetReplayEnabled();
+        (cudaMtpTargetReplayEnabled() and cudaMtpUnsafeTargetReplayEnabled());
 }
 
 fn cudaDebugGraphCaptureTensorTraceEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_TENSOR_TRACE", false);
+}
+
+fn cudaDebugGraphCaptureProbeTraceEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_GRAPH_CAPTURE_PROBE_TRACE", false);
 }
 
 fn cudaDebugGraphCaptureTensorTraceLimit() usize {
@@ -2901,6 +2940,11 @@ fn allocDeviceBuffer(self: *CudaCompute, len: usize) !buffer_mod.DeviceBuffer {
         self.stats.temp_buffer_hits += 1;
         traceCudaTempAlloc(self, seq, "alloc_hit", len, buffer);
         return buffer;
+    }
+    if (self.debug_cuda_graph_capture_active) {
+        self.debug_cuda_graph_capture_disabled = true;
+        std.log.warn("cuda_graph_capture_probe: unsafe_temp_alloc seq={d} bytes={d} disabled=1", .{ seq, len });
+        return error.CudaGraphCaptureUnsafeTempAlloc;
     }
     self.stats.temp_buffer_misses += 1;
     const buffer = buffer_mod.DeviceBuffer.alloc(&self.ctx, len) catch |err| {
@@ -3322,6 +3366,7 @@ fn debugProfileCheckpoint(ctx: *anyopaque, label: []const u8, layer: usize) void
 fn debugCudaGraphCaptureBegin(ctx: *anyopaque, label: []const u8) !bool {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (self.debug_cuda_graph_capture_active) return error.InvalidCudaState;
+    if (self.debug_cuda_graph_capture_disabled) return false;
     if (cudaTempSlotPeriod() == 0 and !platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_ALLOW_UNPINNED", false)) return false;
     const min_alloc_seq = cudaDebugGraphCaptureMinAllocSeq();
     if (self.temp_trace_seq < min_alloc_seq) return false;
@@ -3334,12 +3379,14 @@ fn debugCudaGraphCaptureBegin(ctx: *anyopaque, label: []const u8) !bool {
         slot.kv_replay_capacity_valid = false;
     }
     self.stats.cuda_graph_capture_begins += 1;
-    std.log.info("cuda_graph_capture_probe: begin label={s} slot={d} alloc_seq={d} min_alloc_seq={d}", .{
-        label,
-        self.debug_cuda_graph_active_slot.?,
-        self.temp_trace_seq,
-        min_alloc_seq,
-    });
+    if (cudaDebugGraphCaptureProbeTraceEnabled()) {
+        std.log.info("cuda_graph_capture_probe: begin label={s} slot={d} alloc_seq={d} min_alloc_seq={d}", .{
+            label,
+            self.debug_cuda_graph_active_slot.?,
+            self.temp_trace_seq,
+            min_alloc_seq,
+        });
+    }
     return true;
 }
 
@@ -3349,29 +3396,34 @@ fn debugCudaGraphPrepareDecodeScalars(
     query_position_offset: usize,
     kv_seq_len: usize,
     total_sequence_len: usize,
+    kv_position_offset: usize,
 ) !bool {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (!cudaDebugGraphCaptureDeviceScalarsEnabled()) return false;
     if (self.debug_cuda_graph_capture_active) return error.InvalidCudaState;
     self.debug_cuda_graph_decode_kv_seq_len = kv_seq_len;
     if (self.debug_cuda_decode_scalars.ptr == 0) {
-        self.debug_cuda_decode_scalars = try buffer_mod.DeviceBuffer.alloc(&self.ctx, 4 * @sizeOf(u32));
+        self.debug_cuda_decode_scalars = try buffer_mod.DeviceBuffer.alloc(&self.ctx, 5 * @sizeOf(u32));
     }
     var scalars = [_]u32{
         std.math.cast(u32, position_offset) orelse return error.InvalidCudaState,
         std.math.cast(u32, query_position_offset) orelse return error.InvalidCudaState,
         std.math.cast(u32, kv_seq_len) orelse return error.InvalidCudaState,
         std.math.cast(u32, total_sequence_len) orelse return error.InvalidCudaState,
+        std.math.cast(u32, kv_position_offset) orelse return error.InvalidCudaState,
     };
     try copyFromHostTracked(self, self.debug_cuda_decode_scalars, std.mem.sliceAsBytes(&scalars));
     self.stats.cuda_graph_capture_scalar_updates += 1;
-    std.log.info("cuda_graph_capture_probe: decode_scalars position_offset={d} query_position_offset={d} kv_seq_len={d} total_sequence_len={d} ptr=0x{x}", .{
-        scalars[0],
-        scalars[1],
-        scalars[2],
-        scalars[3],
-        self.debug_cuda_decode_scalars.ptr,
-    });
+    if (cudaDebugGraphCaptureProbeTraceEnabled()) {
+        std.log.info("cuda_graph_capture_probe: decode_scalars position_offset={d} query_position_offset={d} kv_seq_len={d} total_sequence_len={d} kv_position_offset={d} ptr=0x{x}", .{
+            scalars[0],
+            scalars[1],
+            scalars[2],
+            scalars[3],
+            scalars[4],
+            self.debug_cuda_decode_scalars.ptr,
+        });
+    }
     return true;
 }
 
@@ -3437,9 +3489,14 @@ fn invalidateDebugFinalHiddenGraph(self: *CudaCompute) void {
     self.debug_cuda_graph_prepared_slot = null;
 }
 
-fn findCudaGraphReplaySlotForByteLen(self: *CudaCompute, byte_len: usize) usize {
+fn cudaGraphReplayKey(label: []const u8) u64 {
+    const key = std.hash.Wyhash.hash(0, label);
+    return if (key == 0) 1 else key;
+}
+
+fn findCudaGraphReplaySlotForByteLen(self: *CudaCompute, replay_key: u64, byte_len: usize) usize {
     for (&self.debug_cuda_graph_slots, 0..) |*slot, idx| {
-        if (slot.input_storage.ptr != 0 and slot.input_storage.len == byte_len) return idx;
+        if (slot.input_storage.ptr != 0 and slot.input_storage.len == byte_len and slot.replay_key == replay_key) return idx;
     }
     for (&self.debug_cuda_graph_slots, 0..) |*slot, idx| {
         if (slot.input_storage.ptr == 0) return idx;
@@ -3452,9 +3509,9 @@ fn findCudaGraphReplaySlotForByteLen(self: *CudaCompute, byte_len: usize) usize 
     return idx;
 }
 
-fn findExistingCudaGraphReplaySlotForByteLen(self: *CudaCompute, byte_len: usize) ?usize {
+fn findExistingCudaGraphReplaySlotForByteLen(self: *CudaCompute, replay_key: u64, byte_len: usize) ?usize {
     for (&self.debug_cuda_graph_slots, 0..) |*slot, idx| {
-        if (slot.input_storage.ptr != 0 and slot.input_storage.len == byte_len and slot.valid and slot.exec != null) return idx;
+        if (slot.input_storage.ptr != 0 and slot.input_storage.len == byte_len and slot.replay_key == replay_key and slot.valid and slot.exec != null) return idx;
     }
     return null;
 }
@@ -3479,20 +3536,24 @@ fn ensureCudaGraphReplaySlotStorage(self: *CudaCompute, slot: *CudaGraphReplaySl
     slot.input_storage = try buffer_mod.DeviceBuffer.alloc(&self.ctx, byte_len);
     self.noteDeviceBytes(byte_len);
     self.stats.device_alloc_calls += 1;
-    std.log.info("cuda_graph_capture_probe: persistent_input_alloc ptr=0x{x} len={d}", .{
-        slot.input_storage.ptr,
-        slot.input_storage.len,
-    });
+    if (cudaDebugGraphCaptureProbeTraceEnabled()) {
+        std.log.info("cuda_graph_capture_probe: persistent_input_alloc ptr=0x{x} len={d}", .{
+            slot.input_storage.ptr,
+            slot.input_storage.len,
+        });
+    }
     slot.output_storage = try buffer_mod.DeviceBuffer.alloc(&self.ctx, byte_len);
     self.noteDeviceBytes(byte_len);
     self.stats.device_alloc_calls += 1;
-    std.log.info("cuda_graph_capture_probe: persistent_output_alloc ptr=0x{x} len={d}", .{
-        slot.output_storage.ptr,
-        slot.output_storage.len,
-    });
+    if (cudaDebugGraphCaptureProbeTraceEnabled()) {
+        std.log.info("cuda_graph_capture_probe: persistent_output_alloc ptr=0x{x} len={d}", .{
+            slot.output_storage.ptr,
+            slot.output_storage.len,
+        });
+    }
 }
 
-fn debugCudaGraphPrepareFinalHiddenReplayInput(ctx: *anyopaque, input: CT) !?CT {
+fn debugCudaGraphPrepareFinalHiddenReplayInput(ctx: *anyopaque, label: []const u8, input: CT) !?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     self.debug_cuda_graph_prepared_slot = null;
     if (!cudaDebugGraphPersistentReplayEnabled()) return null;
@@ -3506,13 +3567,18 @@ fn debugCudaGraphPrepareFinalHiddenReplayInput(ctx: *anyopaque, input: CT) !?CT 
 
     const capture_possible = cudaTempSlotPeriod() != 0 or
         platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CAPTURE_ALLOW_UNPINNED", false);
+    const replay_key = cudaGraphReplayKey(label);
     const slot_idx = if (capture_possible)
-        findCudaGraphReplaySlotForByteLen(self, byte_len)
+        findCudaGraphReplaySlotForByteLen(self, replay_key, byte_len)
     else
-        findExistingCudaGraphReplaySlotForByteLen(self, byte_len) orelse return null;
+        findExistingCudaGraphReplaySlotForByteLen(self, replay_key, byte_len) orelse return null;
     self.debug_cuda_graph_prepared_slot = slot_idx;
     const slot = &self.debug_cuda_graph_slots[slot_idx];
     try ensureCudaGraphReplaySlotStorage(self, slot, byte_len);
+    if (slot.replay_key != replay_key) {
+        resetCudaGraphReplaySlotMetadata(self, slot);
+        slot.replay_key = replay_key;
+    }
 
     try copyFromDeviceTracked(self, slot.input_storage, input_tensor.buffer, byte_len);
 
@@ -3539,11 +3605,13 @@ fn debugCudaGraphRegisterFinalHiddenReplayInput(ctx: *anyopaque, input: CT) !voi
     const input_tensor = tensorFromCt(input);
     slot.input = input_tensor.buffer;
     slot.input_valid = true;
-    std.log.info("cuda_graph_capture_probe: persistent_input slot={d} input=0x{x} len={d}", .{
-        slot_idx,
-        input_tensor.buffer.ptr,
-        input_tensor.buffer.len,
-    });
+    if (cudaDebugGraphCaptureProbeTraceEnabled()) {
+        std.log.info("cuda_graph_capture_probe: persistent_input slot={d} input=0x{x} len={d}", .{
+            slot_idx,
+            input_tensor.buffer.ptr,
+            input_tensor.buffer.len,
+        });
+    }
 }
 
 fn debugCudaGraphRegisterFinalHiddenReplayBoundary(ctx: *anyopaque, input: CT, output: CT) !void {
@@ -3560,7 +3628,8 @@ fn debugCudaGraphRegisterFinalHiddenReplayBoundary(ctx: *anyopaque, input: CT, o
     const byte_len = try checkedMul(output_tensor.elem_count, output_tensor.dtype.byteSize());
     if (byte_len == 0) return error.InvalidTensorShape;
     if (slot.output_storage.ptr == 0 or slot.output_storage.len < byte_len) return error.InvalidCudaState;
-    try copyFromDeviceTracked(self, slot.output_storage, output_tensor.buffer, byte_len);
+    if (output_tensor.dtype != .f32) return error.UnsupportedTensorType;
+    try self.kernels.launchCopyF32(&self.ctx, slot.output_storage, output_tensor.buffer, output_tensor.elem_count);
 
     const shape = try dupeShape(self.allocator, output_tensor.shape);
     errdefer self.allocator.free(shape);
@@ -3574,16 +3643,18 @@ fn debugCudaGraphRegisterFinalHiddenReplayBoundary(ctx: *anyopaque, input: CT, o
     slot.dtype = output_tensor.dtype;
     slot.valid = true;
 
-    std.log.info("cuda_graph_capture_probe: persistent_boundary slot={d} input=0x{x} output=0x{x} temp_output=0x{x} elem_count={d} dtype={s} kv_capacity={d} shape={any}", .{
-        slot_idx,
-        slot.input.ptr,
-        slot.output.ptr,
-        output_tensor.buffer.ptr,
-        output_tensor.elem_count,
-        @tagName(output_tensor.dtype),
-        if (slot.kv_replay_capacity_valid) slot.kv_replay_capacity_tokens else 0,
-        output_tensor.shape,
-    });
+    if (cudaDebugGraphCaptureProbeTraceEnabled()) {
+        std.log.info("cuda_graph_capture_probe: persistent_boundary slot={d} input=0x{x} output=0x{x} temp_output=0x{x} elem_count={d} dtype={s} kv_capacity={d} shape={any}", .{
+            slot_idx,
+            slot.input.ptr,
+            slot.output.ptr,
+            output_tensor.buffer.ptr,
+            output_tensor.elem_count,
+            @tagName(output_tensor.dtype),
+            if (slot.kv_replay_capacity_valid) slot.kv_replay_capacity_tokens else 0,
+            output_tensor.shape,
+        });
+    }
 }
 
 fn debugCudaGraphReplayFinalHidden(ctx: *anyopaque, input: CT) !?CT {
@@ -3628,13 +3699,15 @@ fn debugCudaGraphReplayFinalHidden(ctx: *anyopaque, input: CT) !?CT {
     try self.ctx.launchGraph(exec);
     self.stats.cuda_graph_capture_replays += 1;
     self.stats.cuda_graph_capture_persistent_replays += 1;
-    std.log.info("cuda_graph_capture_probe: persistent_replayed slot={d} input=0x{x} output=0x{x} kv_seq_len={d} kv_capacity={d}", .{
-        slot_idx,
-        input_tensor.buffer.ptr,
-        output.ptr,
-        self.debug_cuda_graph_decode_kv_seq_len,
-        if (slot.kv_replay_capacity_valid) slot.kv_replay_capacity_tokens else 0,
-    });
+    if (cudaDebugGraphCaptureProbeTraceEnabled()) {
+        std.log.info("cuda_graph_capture_probe: persistent_replayed slot={d} input=0x{x} output=0x{x} kv_seq_len={d} kv_capacity={d}", .{
+            slot_idx,
+            input_tensor.buffer.ptr,
+            output.ptr,
+            self.debug_cuda_graph_decode_kv_seq_len,
+            if (slot.kv_replay_capacity_valid) slot.kv_replay_capacity_tokens else 0,
+        });
+    }
 
     const tensor = try self.allocator.create(CudaTensor);
     tensor.* = .{
@@ -3653,7 +3726,9 @@ fn replayCapturedDebugGraphOneShot(self: *CudaCompute, graph: driver_mod.CUgraph
     self.stats.cuda_graph_capture_instantiates += 1;
     try self.ctx.launchGraph(exec);
     self.stats.cuda_graph_capture_replays += 1;
-    std.log.info("cuda_graph_capture_probe: replayed", .{});
+    if (cudaDebugGraphCaptureProbeTraceEnabled()) {
+        std.log.info("cuda_graph_capture_probe: replayed", .{});
+    }
 }
 
 fn replayCapturedDebugGraphWithUpdate(self: *CudaCompute, slot_idx: usize, graph: driver_mod.CUgraph) !void {
@@ -3671,7 +3746,9 @@ fn replayCapturedDebugGraphWithUpdate(self: *CudaCompute, slot_idx: usize, graph
             self.stats.cuda_graph_capture_update_successes += 1;
             try self.ctx.launchGraph(exec);
             self.stats.cuda_graph_capture_replays += 1;
-            std.log.info("cuda_graph_capture_probe: updated_replayed", .{});
+            if (cudaDebugGraphCaptureProbeTraceEnabled()) {
+                std.log.info("cuda_graph_capture_probe: updated_replayed", .{});
+            }
             return;
         }
 
@@ -3689,7 +3766,9 @@ fn replayCapturedDebugGraphWithUpdate(self: *CudaCompute, slot_idx: usize, graph
     self.stats.cuda_graph_capture_instantiates += 1;
     try self.ctx.launchGraph(exec);
     self.stats.cuda_graph_capture_replays += 1;
-    std.log.info("cuda_graph_capture_probe: instantiated_cached_replayed slot={d}", .{slot_idx});
+    if (cudaDebugGraphCaptureProbeTraceEnabled()) {
+        std.log.info("cuda_graph_capture_probe: instantiated_cached_replayed slot={d}", .{slot_idx});
+    }
 }
 
 fn debugCudaGraphCaptureEnd(ctx: *anyopaque, replay: bool) !void {
@@ -3708,7 +3787,9 @@ fn debugCudaGraphCaptureEnd(ctx: *anyopaque, replay: bool) !void {
         }
     } else {
         self.stats.cuda_graph_capture_discards += 1;
-        std.log.info("cuda_graph_capture_probe: discarded", .{});
+        if (cudaDebugGraphCaptureProbeTraceEnabled()) {
+            std.log.info("cuda_graph_capture_probe: discarded", .{});
+        }
     }
 }
 
@@ -3929,6 +4010,18 @@ fn createTensorWithDType(
         .elem_count = elem_count,
     };
     return tensor;
+}
+
+fn zeroTensorOp(ctx: *anyopaque, rows: usize, dim: usize) anyerror!?CT {
+    if (rows == 0 or dim == 0) return null;
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const elem_count = try checkedMul(rows, dim);
+    const shape = try allocShape2(self.allocator, rows, dim);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, elem_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try self.kernels.launchFillF32(&self.ctx, device, elem_count, 0.0);
+    return createTensor(self, device, shape, elem_count);
 }
 
 fn uploadOwnedHost(self: *CudaCompute, data: []f32, shape_src: []const i64) !CT {
@@ -4691,6 +4784,7 @@ fn embeddingLookup(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, 
                 .Q8_0 => try self.kernels.launchEmbeddingLookupQ8_0F32(&self.ctx, device, weight_tensor.buffer, ids_device, total, dim),
                 .Q4_0 => try self.kernels.launchEmbeddingLookupQ4_0F32(&self.ctx, device, weight_tensor.buffer, ids_device, total, dim),
                 .Q4_K => try self.kernels.launchEmbeddingLookupQ4KF32(&self.ctx, device, weight_tensor.buffer, ids_device, total, dim),
+                .Q6_K => try self.kernels.launchEmbeddingLookupQ6KF32(&self.ctx, device, weight_tensor.buffer, ids_device, total, dim),
                 else => return error.UnsupportedTensorType,
             },
             else => return error.UnsupportedTensorType,
@@ -4731,6 +4825,7 @@ fn embeddingLookupTensor(ctx: *anyopaque, weight: CT, ids: CT, total: usize, dim
                 .Q8_0 => try self.kernels.launchEmbeddingLookupI32Q8_0F32(&self.ctx, device, weight_tensor.buffer, ids_tensor.buffer, total, dim),
                 .Q4_0 => try self.kernels.launchEmbeddingLookupI32Q4_0F32(&self.ctx, device, weight_tensor.buffer, ids_tensor.buffer, total, dim),
                 .Q4_K => try self.kernels.launchEmbeddingLookupI32Q4KF32(&self.ctx, device, weight_tensor.buffer, ids_tensor.buffer, total, dim),
+                .Q6_K => try self.kernels.launchEmbeddingLookupI32Q6KF32(&self.ctx, device, weight_tensor.buffer, ids_tensor.buffer, total, dim),
                 else => return error.UnsupportedTensorType,
             },
             else => return error.UnsupportedTensorType,
@@ -5490,6 +5585,10 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
                         try self.kernels.launchLinearQ4KTile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
                     }
                     self.dispatch_stats.note(self.allocator, .linear_no_bias, .q4_k, .q4_simt, .none, tcUnavailableReason(), rows, in_dim, out_dim, 0);
+                },
+                .Q6_K => {
+                    try self.kernels.launchLinearQ6KTile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+                    self.dispatch_stats.note(self.allocator, .linear_no_bias, .q6_k, .q6_simt, .none, tcUnavailableReason(), rows, in_dim, out_dim, 0);
                 },
                 else => return error.UnsupportedTensorType,
             },
@@ -7207,6 +7306,49 @@ fn activationMultiply(ctx: *anyopaque, gate: CT, up: CT, activation: ops.Decoder
     return createTensor(self, device, shape, gate_tensor.elem_count);
 }
 
+fn activationMultiplySliceLastDim(ctx: *anyopaque, gate: CT, source: CT, start: usize, stop: usize, activation: ops.DecoderRuntimeActivationKind) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const gate_tensor = tensorFromCt(gate);
+    const source_tensor = tensorFromCt(source);
+    try ensureF32(gate_tensor);
+    try ensureF32(source_tensor);
+    if (gate_tensor.shape.len != 2 or source_tensor.shape.len != 2) return null;
+    if (gate_tensor.shape[0] < 0 or gate_tensor.shape[1] < 0 or source_tensor.shape[0] < 0 or source_tensor.shape[1] < 0) return error.InvalidShape;
+    const rows: usize = @intCast(gate_tensor.shape[0]);
+    const out_cols: usize = @intCast(gate_tensor.shape[1]);
+    const source_rows: usize = @intCast(source_tensor.shape[0]);
+    const source_cols: usize = @intCast(source_tensor.shape[1]);
+    if (rows != source_rows or start > stop or stop > source_cols or stop - start != out_cols) return null;
+    try ensureCount(gate_tensor, try checkedMul(rows, out_cols));
+    try ensureCount(source_tensor, try checkedMul(source_rows, source_cols));
+
+    const shape = try dupeShape(self.allocator, gate_tensor.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, gate_tensor.elem_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    self.kernels.launchActivationMultiplySliceLastDimF32(
+        &self.ctx,
+        device,
+        gate_tensor.buffer,
+        source_tensor.buffer,
+        rows,
+        source_cols,
+        start,
+        out_cols,
+        @intFromEnum(activation),
+    ) catch |err| switch (err) {
+        error.CudaKernelUnavailable, error.InvalidCudaState => {
+            device.free(&self.ctx);
+            self.allocator.free(shape);
+            return null;
+        },
+        else => return err,
+    };
+    self.stats.launch_elementwise += 1;
+    self.stats.activation_multiply_fused += 1;
+    return createTensor(self, device, shape, gate_tensor.elem_count);
+}
+
 fn linearNoBiasGatedDown(
     ctx: *anyopaque,
     gate: CT,
@@ -7234,7 +7376,8 @@ fn linearNoBiasGatedDown(
 
     const use_q8 = isKnownQuant(weight_tensor, .Q8_0);
     const use_q4 = isKnownQuant(weight_tensor, .Q4_K);
-    if (!use_q8 and !use_q4) {
+    const use_q6 = isKnownQuant(weight_tensor, .Q6_K);
+    if (!use_q8 and !use_q4 and !use_q6) {
         self.stats.gated_down_fallbacks += 1;
         return null;
     }
@@ -7268,7 +7411,7 @@ fn linearNoBiasGatedDown(
             else => return err,
         };
         self.stats.gated_down_fused_q8 += 1;
-    } else {
+    } else if (use_q4) {
         self.kernels.launchLinearQ4KGatedDownTile4F32(
             &self.ctx,
             device,
@@ -7290,6 +7433,26 @@ fn linearNoBiasGatedDown(
         };
         self.stats.gated_down_fused_q4 += 1;
         if (rows == 1) self.stats.q4k_decode_fast_hits += 1;
+    } else {
+        self.kernels.launchLinearQ6KGatedDownTile4F32(
+            &self.ctx,
+            device,
+            gate_tensor.buffer,
+            up_tensor.buffer,
+            weight_tensor.buffer,
+            rows,
+            in_dim,
+            out_dim,
+            @intFromEnum(activation),
+        ) catch |err| switch (err) {
+            error.CudaKernelUnavailable, error.InvalidCudaState => {
+                self.stats.gated_down_fallbacks += 1;
+                device.free(&self.ctx);
+                self.allocator.free(shape);
+                return null;
+            },
+            else => return err,
+        };
     }
 
     self.stats.launch_linear += 1;
@@ -8432,7 +8595,11 @@ fn rope(ctx: *anyopaque, input: CT, seq_len: usize, head_dim: usize, rope_dim: u
     errdefer self.allocator.free(shape);
     var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
-    self.kernels.launchRopeF32(&self.ctx, device, input_tensor.buffer, total_chunks, head_dim, rope_dim, theta, freq_scale, position_offset, seq_len, chunks_per_position, consecutive_pairs) catch |err| {
+    const launch_result = if (cudaDebugDecodeScalarsReady(self))
+        self.kernels.launchRopeDecodeScalarsF32(&self.ctx, device, input_tensor.buffer, self.debug_cuda_decode_scalars, total_chunks, head_dim, rope_dim, theta, freq_scale, position_offset, seq_len, chunks_per_position, consecutive_pairs)
+    else
+        self.kernels.launchRopeF32(&self.ctx, device, input_tensor.buffer, total_chunks, head_dim, rope_dim, theta, freq_scale, position_offset, seq_len, chunks_per_position, consecutive_pairs);
+    launch_result catch |err| {
         if (err == error.CudaKernelUnavailable and cudaAllowHostAttentionFallback()) {
             return ropeHostFallback(self, input_tensor, seq_len, head_dim, rope_dim, theta, freq_scale, position_offset, consecutive_pairs);
         }
@@ -8492,7 +8659,11 @@ fn ropeScaled(ctx: *anyopaque, input: CT, scale: f32, seq_len: usize, head_dim: 
     errdefer self.allocator.free(shape);
     var device = try allocDeviceBuffer(self, input_tensor.elem_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
-    self.kernels.launchRopeScaledF32(&self.ctx, device, input_tensor.buffer, total_chunks, head_dim, rope_dim, theta, freq_scale, position_offset, seq_len, chunks_per_position, consecutive_pairs, scale) catch |err| switch (err) {
+    const launch_result = if (cudaDebugDecodeScalarsReady(self))
+        self.kernels.launchRopeScaledDecodeScalarsF32(&self.ctx, device, input_tensor.buffer, self.debug_cuda_decode_scalars, total_chunks, head_dim, rope_dim, theta, freq_scale, position_offset, seq_len, chunks_per_position, consecutive_pairs, scale)
+    else
+        self.kernels.launchRopeScaledF32(&self.ctx, device, input_tensor.buffer, total_chunks, head_dim, rope_dim, theta, freq_scale, position_offset, seq_len, chunks_per_position, consecutive_pairs, scale);
+    launch_result catch |err| switch (err) {
         error.CudaKernelUnavailable => return null,
         else => return err,
     };
@@ -9380,12 +9551,14 @@ const vtable = ops.ComputeBackend.VTable{
     .addScalar = &addScalar,
     .siluMultiply = &siluMultiply,
     .activationMultiply = &activationMultiply,
+    .activationMultiplySliceLastDim = &activationMultiplySliceLastDim,
     .addMultiplyScalarTensor = &addMultiplyScalarTensor,
     .layerNorm = &layerNorm,
     .addLayerNorm = &addLayerNorm,
     .rmsNorm = &rmsNorm,
     .rmsNormAddMultiplyScalarTensor = &rmsNormAddMultiplyScalarTensor,
     .rmsNormAddTensor = &rmsNormAddTensor,
+    .rmsNormAddOutputScaleTensor = &rmsNormAddOutputScaleTensor,
     .rmsNormHeadsRope = &rmsNormHeadsRope,
     .rmsNormBare = &rmsNormBare,
     .gelu = &gelu,
@@ -9436,6 +9609,7 @@ const vtable = ops.ComputeBackend.VTable{
     .tensorDType = &tensorDTypeOp,
     .tensorShape = &tensorShapeOp,
     .evalTensor = &evalTensorOp,
+    .zeroTensor = &zeroTensorOp,
 };
 
 test "cuda compute vtable is type checked" {

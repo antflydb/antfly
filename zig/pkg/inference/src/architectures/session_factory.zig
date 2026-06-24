@@ -2773,7 +2773,8 @@ fn shouldKeepResidentGptEmbeddingQuantizedOnly(
 fn isCudaResidentEmbeddingQuantType(tensor_type: gguf_mod.tensor_types.TensorType) bool {
     return std.meta.eql(tensor_type, gguf_mod.tensor_types.TensorType{ .known = .Q8_0 }) or
         std.meta.eql(tensor_type, gguf_mod.tensor_types.TensorType{ .known = .Q4_0 }) or
-        std.meta.eql(tensor_type, gguf_mod.tensor_types.TensorType{ .known = .Q4_K });
+        std.meta.eql(tensor_type, gguf_mod.tensor_types.TensorType{ .known = .Q4_K }) or
+        std.meta.eql(tensor_type, gguf_mod.tensor_types.TensorType{ .known = .Q6_K });
 }
 
 fn shouldKeepResidentGptWeightQuantizedOnly(
@@ -6169,4 +6170,15 @@ test "defaultResidentExpertsPerLayer returns 0 for non-MoE model" {
     const cfg: gpt_mod.Config = .{};
     const resident = defaultResidentExpertsPerLayer(.{ .gpt = cfg });
     try std.testing.expectEqual(@as(usize, 0), resident);
+}
+
+test "Gemma resident embeddings retain CUDA-supported quantized formats" {
+    const gemma_cfg: gpt_mod.Config = .{ .family = .gemma };
+    try std.testing.expect(shouldKeepResidentGptEmbeddingQuantizedOnly(gemma_cfg, .{ .known = .Q8_0 }));
+    try std.testing.expect(shouldKeepResidentGptEmbeddingQuantizedOnly(gemma_cfg, .{ .known = .Q4_0 }));
+    try std.testing.expect(shouldKeepResidentGptEmbeddingQuantizedOnly(gemma_cfg, .{ .known = .Q4_K }));
+    try std.testing.expect(shouldKeepResidentGptEmbeddingQuantizedOnly(gemma_cfg, .{ .known = .Q6_K }));
+
+    const llama_cfg: gpt_mod.Config = .{ .family = .llama };
+    try std.testing.expect(!shouldKeepResidentGptEmbeddingQuantizedOnly(llama_cfg, .{ .known = .Q6_K }));
 }

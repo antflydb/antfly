@@ -28,9 +28,12 @@ pub const Kind = enum {
 };
 
 pub fn detectPath(allocator: std.mem.Allocator, projector_path: []const u8) !Kind {
-    const raw = try c_file.readFile(allocator, projector_path);
-    defer allocator.free(raw);
-    return detectBytes(allocator, raw);
+    var mapped = try c_file.MmapRegion.init(allocator, projector_path);
+    defer mapped.deinit();
+
+    var parsed = try gguf_format.parse(allocator, mapped.data);
+    defer parsed.deinit(allocator);
+    return detectFile(&parsed);
 }
 
 pub fn detectBytes(allocator: std.mem.Allocator, raw: []const u8) !Kind {
