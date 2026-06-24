@@ -316,6 +316,7 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: gen
     try validateGeneratedReadListAstRanges(tokens, read_ast, read_ast.projection_items);
     try validateGeneratedReadListAstContainedByOptionalRange(read_ast.projection_items, read_ast.projection_tokens);
     try validateGeneratedReadListAstBoundaryExpressions(tokens, read_ast, read_ast.projection_items, read_ast.projection_first_expression, read_ast.projection_last_expression);
+    try validateGeneratedAntflySourceMetadata(tokens, read_ast);
     try validateGeneratedGraphSourceMetadata(tokens, read_ast);
     try validateGeneratedReadListAstRanges(tokens, read_ast, read_ast.group_items);
     try validateGeneratedReadListAstContainedByOptionalRange(read_ast.group_items, read_ast.group_tokens);
@@ -1054,14 +1055,76 @@ fn validateGeneratedExpressionAstRangesIfPresent(
 }
 
 fn generatedGraphTableFunctionKindForToken(token: tokenized.Token) ?generated_parser.GeneratedSqlGraphTableFunctionKind {
-    if (token.matchesQualifiedKeywordTag("antfly", .graph_traverse)) return .traverse;
-    if (token.matchesQualifiedKeywordTag("antfly", .graph_neighbors)) return .neighbors;
-    if (token.matchesQualifiedKeywordTag("antfly", .graph_shortest_path)) return .shortest_path;
-    if (token.matchesQualifiedKeywordTag("antfly", .graph_k_shortest_paths)) return .k_shortest_paths;
-    if (token.matchesQualifiedKeywordTag("antfly", .graph_match)) return .match;
-    if (token.matchesQualifiedKeywordTag("antfly", .graph_metric)) return .metric;
-    if (token.matchesQualifiedKeywordTag("antfly", .graph_metric_rerank)) return .metric_rerank;
+    return generatedGraphTableFunctionKindFromAntfly(generatedAntflyTableFunctionKindForToken(token) orelse return null);
+}
+
+fn generatedGraphTableFunctionKindFromAntfly(kind: generated_parser.GeneratedSqlAntflyTableFunctionKind) ?generated_parser.GeneratedSqlGraphTableFunctionKind {
+    return switch (kind) {
+        .graph_traverse => .traverse,
+        .graph_neighbors => .neighbors,
+        .graph_shortest_path => .shortest_path,
+        .graph_k_shortest_paths => .k_shortest_paths,
+        .graph_match => .match,
+        .graph_metric => .metric,
+        .graph_metric_rerank => .metric_rerank,
+        else => null,
+    };
+}
+
+fn generatedAntflyTableFunctionKindForToken(token: tokenized.Token) ?generated_parser.GeneratedSqlAntflyTableFunctionKind {
+    if (token.matchesQualifiedKeywordTag("antfly", .full_text_search)) return .full_text_search;
+    if (token.matchesQualifiedKeywordTag("antfly", .semantic_search)) return .semantic_search;
+    if (token.matchesQualifiedKeywordTag("antfly", .vector_search)) return .vector_search;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_traverse)) return .graph_traverse;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_neighbors)) return .graph_neighbors;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_shortest_path)) return .graph_shortest_path;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_k_shortest_paths)) return .graph_k_shortest_paths;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_match)) return .graph_match;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_metric)) return .graph_metric;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_metric_rerank)) return .graph_metric_rerank;
+    if (token.matchesQualifiedKeywordTag("antfly", .hybrid_search)) return .hybrid_search;
     return null;
+}
+
+fn validateGeneratedAntflySourceMetadata(
+    tokens: []const tokenized.Token,
+    read_ast: generated_parser.GeneratedSqlReadAst,
+) !void {
+    if (read_ast.source_antfly_function_items.len != read_ast.source_antfly_function_count) return error.UnsupportedSqlShape;
+    var previous_end: usize = if (read_ast.source_tokens) |source_tokens| source_tokens.start else 0;
+    for (read_ast.source_antfly_function_items) |item| {
+        if (item.tokens.start < previous_end) return error.UnsupportedSqlShape;
+        try validateGeneratedAntflySourceItemMetadata(tokens, read_ast, item);
+        previous_end = item.tokens.end;
+    }
+}
+
+fn validateGeneratedAntflySourceItemMetadata(
+    tokens: []const tokenized.Token,
+    read_ast: generated_parser.GeneratedSqlReadAst,
+    item: generated_parser.GeneratedSqlAntflyTableFunctionAst,
+) !void {
+    const source_tokens = read_ast.source_tokens orelse return error.UnsupportedSqlShape;
+    const function_tokens = item.tokens;
+    const name_tokens = item.name_tokens;
+    const argument_tokens = item.argument_tokens;
+    if (function_tokens.start < source_tokens.start or function_tokens.end > source_tokens.end) return error.UnsupportedSqlShape;
+    if (function_tokens.end > tokens.len or function_tokens.end < function_tokens.start + 3) return error.UnsupportedSqlShape;
+    if (!std.meta.eql(name_tokens, generated_parser.GeneratedSqlTokenRange{ .start = function_tokens.start, .end = function_tokens.start + 1 })) return error.UnsupportedSqlShape;
+    if (!std.meta.eql(argument_tokens, generated_parser.GeneratedSqlTokenRange{ .start = function_tokens.start + 2, .end = function_tokens.end - 1 })) return error.UnsupportedSqlShape;
+    if (tokens[function_tokens.start + 1].kind != .lparen or tokens[function_tokens.end - 1].kind != .rparen) return error.UnsupportedSqlShape;
+    if (generatedAntflyTableFunctionKindForToken(tokens[name_tokens.start]) != item.kind) return error.UnsupportedSqlShape;
+}
+
+fn generatedGraphSourceItemMatchesAntflyItem(
+    graph_item: generated_parser.GeneratedSqlGraphTableFunctionAst,
+    antfly_item: generated_parser.GeneratedSqlAntflyTableFunctionAst,
+) bool {
+    const antfly_graph_kind = generatedGraphTableFunctionKindFromAntfly(antfly_item.kind) orelse return false;
+    return graph_item.kind == antfly_graph_kind and
+        std.meta.eql(graph_item.tokens, antfly_item.tokens) and
+        std.meta.eql(graph_item.name_tokens, antfly_item.name_tokens) and
+        std.meta.eql(graph_item.argument_tokens, antfly_item.argument_tokens);
 }
 
 fn validateGeneratedGraphSourceMetadata(
@@ -1098,6 +1161,13 @@ fn validateGeneratedGraphSourceMetadata(
     for (read_ast.source_graph_function_items) |item| {
         if (item.tokens.start < previous_end) return error.UnsupportedSqlShape;
         try validateGeneratedGraphSourceItemMetadata(tokens, read_ast, item);
+        var found_matching_antfly_item = false;
+        for (read_ast.source_antfly_function_items) |antfly_item| {
+            if (!generatedGraphSourceItemMatchesAntflyItem(item, antfly_item)) continue;
+            found_matching_antfly_item = true;
+            break;
+        }
+        if (!found_matching_antfly_item) return error.UnsupportedSqlShape;
         previous_end = item.tokens.end;
     }
 }
@@ -2777,6 +2847,15 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         else => return error.UnsupportedSqlShape,
     };
     malformed_graph_source_read_ast.source_graph_function_kind = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_graph_source_parsed_sql, malformed_graph_source_read_ast),
+    );
+    malformed_graph_source_read_ast = switch (malformed_graph_source_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_graph_source_read_ast.source_antfly_function_count += 1;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_graph_source_parsed_sql, malformed_graph_source_read_ast),

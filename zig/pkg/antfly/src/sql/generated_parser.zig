@@ -100,6 +100,20 @@ pub const GeneratedSqlGraphTableFunctionKind = enum {
     metric_rerank,
 };
 
+pub const GeneratedSqlAntflyTableFunctionKind = enum {
+    full_text_search,
+    semantic_search,
+    vector_search,
+    graph_traverse,
+    graph_neighbors,
+    graph_shortest_path,
+    graph_k_shortest_paths,
+    graph_match,
+    graph_metric,
+    graph_metric_rerank,
+    hybrid_search,
+};
+
 pub const GeneratedSqlExtensionIndexKind = enum {
     create_index,
     drop_index,
@@ -537,6 +551,13 @@ pub const GeneratedSqlGraphTableFunctionAst = struct {
     kind: GeneratedSqlGraphTableFunctionKind,
 };
 
+pub const GeneratedSqlAntflyTableFunctionAst = struct {
+    tokens: GeneratedSqlTokenRange,
+    name_tokens: GeneratedSqlTokenRange,
+    argument_tokens: GeneratedSqlTokenRange,
+    kind: GeneratedSqlAntflyTableFunctionKind,
+};
+
 pub const GeneratedSqlWindowAst = struct {
     tokens: GeneratedSqlTokenRange,
     name_tokens: GeneratedSqlTokenRange,
@@ -740,6 +761,8 @@ pub const GeneratedSqlReadAst = struct {
     source_graph_function_name_tokens: ?GeneratedSqlTokenRange = null,
     source_graph_function_argument_tokens: ?GeneratedSqlTokenRange = null,
     source_graph_function_kind: ?GeneratedSqlGraphTableFunctionKind = null,
+    source_antfly_function_items: []GeneratedSqlAntflyTableFunctionAst = &.{},
+    source_antfly_function_count: usize = 0,
     source_graph_function_items: []GeneratedSqlGraphTableFunctionAst = &.{},
     source_graph_function_count: usize = 0,
     join_tokens: ?GeneratedSqlTokenRange = null,
@@ -781,6 +804,7 @@ pub const GeneratedSqlReadAst = struct {
     pub fn deinit(self: *GeneratedSqlReadAst, alloc: std.mem.Allocator) void {
         for (self.cte_items) |*cte| cte.deinit(alloc);
         if (self.cte_items.len > 0) alloc.free(self.cte_items);
+        if (self.source_antfly_function_items.len > 0) alloc.free(self.source_antfly_function_items);
         if (self.source_graph_function_items.len > 0) alloc.free(self.source_graph_function_items);
         for (self.join_items) |*join| join.deinit(alloc);
         if (self.join_items.len > 0) alloc.free(self.join_items);
@@ -2475,13 +2499,34 @@ fn classifyReadKindInRange(tokens: []const token_mod.Token, range: GeneratedSqlT
 }
 
 fn generatedGraphTableFunctionKind(token: token_mod.Token) ?GeneratedSqlGraphTableFunctionKind {
-    if (token.matchesQualifiedKeywordTag("antfly", .graph_traverse)) return .traverse;
-    if (token.matchesQualifiedKeywordTag("antfly", .graph_neighbors)) return .neighbors;
-    if (token.matchesQualifiedKeywordTag("antfly", .graph_shortest_path)) return .shortest_path;
-    if (token.matchesQualifiedKeywordTag("antfly", .graph_k_shortest_paths)) return .k_shortest_paths;
-    if (token.matchesQualifiedKeywordTag("antfly", .graph_match)) return .match;
-    if (token.matchesQualifiedKeywordTag("antfly", .graph_metric)) return .metric;
-    if (token.matchesQualifiedKeywordTag("antfly", .graph_metric_rerank)) return .metric_rerank;
+    return generatedGraphTableFunctionKindFromAntfly(generatedAntflyTableFunctionKind(token) orelse return null);
+}
+
+fn generatedGraphTableFunctionKindFromAntfly(kind: GeneratedSqlAntflyTableFunctionKind) ?GeneratedSqlGraphTableFunctionKind {
+    return switch (kind) {
+        .graph_traverse => .traverse,
+        .graph_neighbors => .neighbors,
+        .graph_shortest_path => .shortest_path,
+        .graph_k_shortest_paths => .k_shortest_paths,
+        .graph_match => .match,
+        .graph_metric => .metric,
+        .graph_metric_rerank => .metric_rerank,
+        else => null,
+    };
+}
+
+fn generatedAntflyTableFunctionKind(token: token_mod.Token) ?GeneratedSqlAntflyTableFunctionKind {
+    if (token.matchesQualifiedKeywordTag("antfly", .full_text_search)) return .full_text_search;
+    if (token.matchesQualifiedKeywordTag("antfly", .semantic_search)) return .semantic_search;
+    if (token.matchesQualifiedKeywordTag("antfly", .vector_search)) return .vector_search;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_traverse)) return .graph_traverse;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_neighbors)) return .graph_neighbors;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_shortest_path)) return .graph_shortest_path;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_k_shortest_paths)) return .graph_k_shortest_paths;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_match)) return .graph_match;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_metric)) return .graph_metric;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_metric_rerank)) return .graph_metric_rerank;
+    if (token.matchesQualifiedKeywordTag("antfly", .hybrid_search)) return .hybrid_search;
     return null;
 }
 
@@ -2491,7 +2536,9 @@ fn buildGeneratedReadGraphSourceAst(
     source_tokens: GeneratedSqlTokenRange,
     ast: *GeneratedSqlReadAst,
 ) !void {
-    ast.source_graph_function_items = try buildGeneratedGraphTableFunctionItemsAst(alloc, tokens, source_tokens);
+    ast.source_antfly_function_items = try buildGeneratedAntflyTableFunctionItemsAst(alloc, tokens, source_tokens);
+    ast.source_antfly_function_count = ast.source_antfly_function_items.len;
+    ast.source_graph_function_items = try buildGeneratedGraphTableFunctionItemsAst(alloc, ast.source_antfly_function_items);
     ast.source_graph_function_count = ast.source_graph_function_items.len;
     if (ast.source_graph_function_items.len == 0) return;
 
@@ -2502,13 +2549,13 @@ fn buildGeneratedReadGraphSourceAst(
     ast.source_graph_function_kind = first.kind;
 }
 
-fn buildGeneratedGraphTableFunctionItemsAst(
+fn buildGeneratedAntflyTableFunctionItemsAst(
     alloc: std.mem.Allocator,
     tokens: []const token_mod.Token,
     source_tokens: GeneratedSqlTokenRange,
-) ![]GeneratedSqlGraphTableFunctionAst {
+) ![]GeneratedSqlAntflyTableFunctionAst {
     if (source_tokens.start >= source_tokens.end or source_tokens.end > tokens.len) return &.{};
-    var items: std.ArrayListUnmanaged(GeneratedSqlGraphTableFunctionAst) = .empty;
+    var items: std.ArrayListUnmanaged(GeneratedSqlAntflyTableFunctionAst) = .empty;
     errdefer items.deinit(alloc);
 
     var index = source_tokens.start;
@@ -2531,7 +2578,7 @@ fn buildGeneratedGraphTableFunctionItemsAst(
             if (function_start + 1 >= source_tokens.end) continue;
             function_start += 1;
         }
-        const kind = generatedGraphTableFunctionKind(tokens[function_start]) orelse continue;
+        const kind = generatedAntflyTableFunctionKind(tokens[function_start]) orelse continue;
         if (function_start + 1 >= source_tokens.end or tokens[function_start + 1].kind != .lparen) continue;
         const close_index = findMatchingParen(tokens, function_start + 1, source_tokens.end) orelse continue;
         try items.append(alloc, .{
@@ -2543,6 +2590,25 @@ fn buildGeneratedGraphTableFunctionItemsAst(
         index = close_index;
     }
 
+    if (items.items.len == 0) return &.{};
+    return try items.toOwnedSlice(alloc);
+}
+
+fn buildGeneratedGraphTableFunctionItemsAst(
+    alloc: std.mem.Allocator,
+    antfly_items: []const GeneratedSqlAntflyTableFunctionAst,
+) ![]GeneratedSqlGraphTableFunctionAst {
+    var items: std.ArrayListUnmanaged(GeneratedSqlGraphTableFunctionAst) = .empty;
+    errdefer items.deinit(alloc);
+    for (antfly_items) |item| {
+        const kind = generatedGraphTableFunctionKindFromAntfly(item.kind) orelse continue;
+        try items.append(alloc, .{
+            .tokens = item.tokens,
+            .name_tokens = item.name_tokens,
+            .argument_tokens = item.argument_tokens,
+            .kind = kind,
+        });
+    }
     if (items.items.len == 0) return &.{};
     return try items.toOwnedSlice(alloc);
 }
@@ -4792,6 +4858,25 @@ test "generated SQL parser facade builds read AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const full_text_source_read_sql = "SELECT * FROM antfly.full_text_search(index => 'docs_body_fts', query => 'refund', limit => 10) AS hits";
+    var full_text_source_tokens = try lexer.tokenizeAlloc(alloc, full_text_source_read_sql);
+    defer lexer.freeTokens(alloc, &full_text_source_tokens);
+    const full_text_source_read_result = try parseTokensAlloc(alloc, full_text_source_tokens.items);
+    switch (full_text_source_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(@as(usize, 1), read.source_antfly_function_count);
+            try std.testing.expectEqual(@as(usize, 1), read.source_antfly_function_items.len);
+            try std.testing.expectEqual(@as(usize, 0), read.source_graph_function_count);
+            try std.testing.expectEqual(GeneratedSqlAntflyTableFunctionKind.full_text_search, read.source_antfly_function_items[0].kind);
+            try std.testing.expectEqualStrings(
+                "antfly.full_text_search(index => 'docs_body_fts', query => 'refund', limit => 10)",
+                tokenRangeText(full_text_source_read_sql, full_text_source_tokens.items, read.source_antfly_function_items[0].tokens),
+            );
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const joined_graph_source_read_sql = "SELECT gm.id, ranked.score FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b') AS gm JOIN antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 5) AS ranked ON gm.id = ranked.id";
     var joined_graph_source_tokens = try lexer.tokenizeAlloc(alloc, joined_graph_source_read_sql);
     defer lexer.freeTokens(alloc, &joined_graph_source_tokens);
@@ -4799,8 +4884,12 @@ test "generated SQL parser facade builds read AST spans" {
     switch (joined_graph_source_read_result.ast.?) {
         .read => |read| {
             try std.testing.expectEqual(GeneratedSqlReadKind.join, read.kind);
+            try std.testing.expectEqual(@as(usize, 2), read.source_antfly_function_count);
+            try std.testing.expectEqual(@as(usize, 2), read.source_antfly_function_items.len);
             try std.testing.expectEqual(@as(usize, 2), read.source_graph_function_count);
             try std.testing.expectEqual(@as(usize, 2), read.source_graph_function_items.len);
+            try std.testing.expectEqual(GeneratedSqlAntflyTableFunctionKind.graph_match, read.source_antfly_function_items[0].kind);
+            try std.testing.expectEqual(GeneratedSqlAntflyTableFunctionKind.graph_metric, read.source_antfly_function_items[1].kind);
             try std.testing.expectEqual(GeneratedSqlGraphTableFunctionKind.match, read.source_graph_function_items[0].kind);
             try std.testing.expectEqual(GeneratedSqlGraphTableFunctionKind.metric, read.source_graph_function_items[1].kind);
             try std.testing.expect(std.meta.eql(read.source_graph_function_tokens.?, read.source_graph_function_items[0].tokens));
