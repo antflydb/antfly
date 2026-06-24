@@ -933,6 +933,9 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                     try std.testing.expectEqual(@as(usize, 2), read_ast.projection_items.items.len);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read_ast.projection_items.items[0]);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read_ast.projection_items.items[1]);
+                    try std.testing.expectEqual(@as(usize, 2), read_ast.projection_items.expressions.len);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.token_range, read_ast.projection_items.expressions[0].kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.token_range, read_ast.projection_items.expressions[1].kind);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.token_range, read_ast.projection_first_expression.kind);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read_ast.projection_first_expression.tokens.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.token_range, read_ast.projection_last_expression.kind);
@@ -940,6 +943,8 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                     try std.testing.expectEqual(@as(usize, 1), read_ast.order_items.count);
                     try std.testing.expectEqual(@as(usize, 1), read_ast.order_items.items.len);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read_ast.order_items.items[0]);
+                    try std.testing.expectEqual(@as(usize, 1), read_ast.order_items.expressions.len);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.token_range, read_ast.order_items.expressions[0].kind);
                 } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records WHERE status LIKE 'open%'")) {
                     try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.like, read_ast.where_expression.kind);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read_ast.where_expression.left_tokens.?);
@@ -1102,6 +1107,9 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                     try std.testing.expectEqual(@as(usize, 2), read_ast.projection_items.items.len);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = 7 }, read_ast.projection_items.items[0]);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read_ast.projection_items.items[1]);
+                    try std.testing.expectEqual(@as(usize, 2), read_ast.projection_items.expressions.len);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.function_call, read_ast.projection_items.expressions[0].kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.token_range, read_ast.projection_items.expressions[1].kind);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.function_call, read_ast.projection_first_expression.kind);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read_ast.projection_first_expression.function_name_tokens.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 6 }, read_ast.projection_first_expression.argument_tokens.?);
@@ -1109,6 +1117,7 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                     try std.testing.expectEqual(@as(usize, 2), read_ast.projection_first_expression.argument_items.items.len);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read_ast.projection_first_expression.argument_items.items[0]);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read_ast.projection_first_expression.argument_items.items[1]);
+                    try std.testing.expectEqual(@as(usize, 2), read_ast.projection_first_expression.argument_items.expressions.len);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.token_range, read_ast.projection_last_expression.kind);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read_ast.projection_last_expression.tokens.?);
                     try std.testing.expectEqual(@as(usize, 2), read_ast.order_items.count);

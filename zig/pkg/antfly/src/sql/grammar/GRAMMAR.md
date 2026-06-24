@@ -87,8 +87,8 @@ read queries now have generated-parser corpus coverage, retained generated raw
 and AST nodes for covered read statements, top-level generated AST ranges for
 covered `SELECT` projections, sources, predicates, grouping, having filters,
 window clauses, ordering, pagination, set-operation tails, and CTE prefixes,
-owned list item arrays plus first/last expression metadata for top-level
-projection, grouping, ordering, and function argument lists, and first-join generated metadata for
+owned list item and expression arrays plus first/last expression metadata for
+top-level projection, grouping, ordering, and function argument lists, and first-join generated metadata for
 join operator/type, left input, right input, and join predicate ranges, plus simple top-level
 comparison expression metadata for covered `WHERE`, `HAVING`, and join
 predicates. Normal function-call argument
@@ -246,10 +246,10 @@ Suggested migration order:
    non-recursive CTE query shapes; generated read ASTs now carry top-level
    ranges for covered `SELECT` projection, source, `WHERE`, `GROUP BY`,
    `HAVING`, `WINDOW`, `ORDER BY`, `LIMIT`, `OFFSET`, `FETCH`, set-operation,
-   and CTE-prefix bodies, plus owned list item arrays for top-level projection,
-   grouping, ordering, and function argument lists with first/last expression
-   metadata for those lists, and first-join metadata for join operator/type, left input, right
-   input, and join predicate ranges, plus simple top-level comparison
+   and CTE-prefix bodies, plus owned list item and expression arrays for
+   top-level projection, grouping, ordering, and function argument lists with
+   first/last expression metadata for those lists, and first-join metadata for
+   join operator/type, left input, right input, and join predicate ranges, plus simple top-level comparison
    expression metadata for covered `WHERE`, `HAVING`, and join predicates; and
    normal function-call argument lists are accepted by the generated expression
    grammar for covered read projections, and positive `LIKE`, `ILIKE`,
@@ -296,9 +296,9 @@ Suggested migration order:
    `FETCH FIRST`/`FETCH NEXT` tails with generated expression metadata for
    `LIMIT`, `OFFSET`, and explicit fetch counts.
    Switching reads from fallback to required generated parsing still requires
-   broader PostgreSQL-compatible grammar coverage, complete projection,
-   grouping, and ordering expression AST arrays beyond the current token-range
-   item arrays, full join-tree generated
+   broader PostgreSQL-compatible grammar coverage, richer projection,
+   grouping, and ordering expression AST semantics beyond the current owned
+   expression item arrays, full join-tree generated
    query-body ASTs beyond the current first-join operator/type metadata, full pagination AST/lowering coverage, broader expression AST
    nodes beyond the current recursive predicate/operator metadata, broader function
    coverage, broader boolean expression-tree coverage, quantified subquery and
