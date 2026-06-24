@@ -17404,6 +17404,7 @@ pub fn parseLateralAlloc(
     pos: *usize,
     options: LateralParserOptions,
 ) !plan_mod.LoweredLateralPlan {
+    try validateGeneratedJoinExecutableContract(options.generated_read_ast, .lateral);
     try parser.expectKeyword(tokens, pos, "select");
 
     const raw_select = try plan_mod.parseJoinProjectionListAlloc(alloc, tokens, pos);
@@ -34804,6 +34805,12 @@ test "sql adapter lower expr lowers bounded left join lateral queries" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedLateralForLowerExprTestAlloc(
         alloc,
         &malformed_generated_lateral_join,
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerLateralForLowerExprTestAlloc(
+        alloc,
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' ORDER BY 2 DESC LIMIT 1) AS latest ON true JOIN usage_records AS extra ON extra.organization_id = org.id",
         schema,
         &.{},
     ));
