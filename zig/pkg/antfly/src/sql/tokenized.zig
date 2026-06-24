@@ -294,11 +294,37 @@ fn parseGeneratedRawStatementAlloc(
     tokens: []const Token,
     raw_statement: RawSqlStatement,
 ) !?GeneratedRawSqlStatement {
-    const result = try generated_parser.parseGeneratedGateTokensAlloc(alloc, tokens);
+    const result = generated_parser.parseGeneratedGateTokensAlloc(alloc, tokens) catch |err| switch (err) {
+        error.UnsupportedSqlShape, error.UnexpectedToken => {
+            if (allowsGeneratedGrammarFallback(tokens, raw_statement)) return null;
+            return err;
+        },
+        else => return err,
+    };
     if (result) |parsed| {
         return .{ .raw = raw_statement, .statement = parsed.statement };
     }
     return null;
+}
+
+fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlStatement) bool {
+    if (raw_statement.token_start >= raw_statement.token_end or raw_statement.token_end > tokens.len) return false;
+    if (tokens[raw_statement.token_end - 1].kind == .eq or tokens[raw_statement.token_end - 1].kind == .comma) return false;
+    if (tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .to) or tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .as)) return false;
+
+    const first = tokens[raw_statement.token_start];
+    if (tokenMatchesKeyword(first, .set)) return raw_statement.token_end > raw_statement.token_start + 2;
+    if (tokenMatchesKeyword(first, .prepare)) return raw_statement.token_end > raw_statement.token_start + 2;
+    if (tokenMatchesKeyword(first, .execute) or tokenMatchesKeyword(first, .deallocate)) return raw_statement.token_end > raw_statement.token_start + 1;
+    if (tokenMatchesKeyword(first, .commit) or tokenMatchesKeyword(first, .rollback)) return raw_statement.token_end > raw_statement.token_start + 1;
+    if (tokenMatchesText(first, "start") or tokenMatchesText(first, "lock")) return raw_statement.token_end > raw_statement.token_start + 1;
+    if (tokenMatchesKeyword(first, .begin)) return true;
+    if (tokenMatchesKeyword(first, .savepoint)) return raw_statement.token_end > raw_statement.token_start + 1;
+    if (tokenMatchesText(first, "release")) return raw_statement.token_end > raw_statement.token_start + 1;
+    if (tokenMatchesText(first, "declare") or tokenMatchesText(first, "close") or tokenMatchesText(first, "fetch") or tokenMatchesText(first, "move")) {
+        return raw_statement.token_end > raw_statement.token_start + 1;
+    }
+    return false;
 }
 
 fn parseStatement(
@@ -312,6 +338,7 @@ fn parseStatement(
             .transaction => return .{ .transaction = .{ .raw = raw_statement } },
             .prepared => return .{ .prepared = .{ .raw = raw_statement } },
             .ddl => return .{ .ddl = .{ .raw = raw_statement } },
+            .dml => if (tokenized_sql.write_statement_kind) |kind| return .{ .write = .{ .kind = kind, .raw = raw_statement } },
             .other => {},
         }
     }
@@ -743,4 +770,36 @@ test "sql adapter parsed sql owns typed statement variants" {
     var unsupported_generated = try ParsedSql.initAlloc(alloc, "SELECT id FROM docs WHERE status = 'active' LIMIT 5");
     defer unsupported_generated.deinit(alloc);
     try std.testing.expect(unsupported_generated.generated_statement == null);
+}
+
+test "sql adapter parsed sql retains generated DML nodes for covered write corpus" {
+    const alloc = std.testing.allocator;
+
+    const cases = [_]struct {
+        sql: []const u8,
+        generated: generated_parser.GeneratedSqlDmlKind,
+        write: classifier.SqlWriteStatementKind,
+    }{
+        .{ .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'open')", .generated = .insert_values, .write = .insert },
+        .{ .sql = "INSERT INTO usage_records (id) SELECT id FROM incoming_usage", .generated = .insert_select, .write = .insert_source },
+        .{ .sql = "UPDATE usage_records SET status = 'done' WHERE id = 'u1'", .generated = .update, .write = .update },
+        .{ .sql = "DELETE FROM usage_records WHERE id = 'u1'", .generated = .delete, .write = .delete },
+        .{ .sql = "TRUNCATE usage_records", .generated = .truncate, .write = .truncate },
+        .{ .sql = "MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status", .generated = .merge, .write = .merge },
+    };
+
+    for (cases) |case| {
+        var parsed = try ParsedSql.initAlloc(alloc, case.sql);
+        defer parsed.deinit(alloc);
+        try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.dml, parsed.generatedStatementKind().?);
+        try std.testing.expectEqual(case.write, parsed.writeStatementKind().?);
+        switch (parsed.generated_statement.?.statement) {
+            .dml => |kind| try std.testing.expectEqual(case.generated, kind),
+            else => return error.TestUnexpectedResult,
+        }
+        switch (parsed.statement) {
+            .write => |statement| try std.testing.expectEqual(case.write, statement.kind),
+            else => return error.TestUnexpectedResult,
+        }
+    }
 }

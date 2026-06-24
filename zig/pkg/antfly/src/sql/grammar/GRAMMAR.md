@@ -40,10 +40,12 @@ accepts a statement, `ParsedSql` retains a source-span-bearing generated raw
 node and uses it for the first migrated statement variants. Session,
 transaction, and prepared statements now require generated parser success;
 simple DDL has generated-parser corpus coverage but still falls back to the
-existing parser when the seed grammar does not yet cover the shape. The
-generated facade now returns closed statement-family nodes for the covered
-families; full production AST construction remains the next migration boundary
-for larger DDL, query, and DML families.
+existing parser when the seed grammar does not yet cover the shape. Simple DML
+now has generated-parser corpus coverage and retained generated raw nodes for
+covered write statements, but unsupported DML still falls back until plan parity
+is proven. The generated facade now returns closed statement-family nodes for
+the covered families; full production AST construction remains the next
+migration boundary for larger DDL, query, and DML families.
 
 ## Compatibility Policy
 
@@ -105,7 +107,11 @@ Suggested migration order:
    when it matches the seed grammar; unsupported DDL remains on the existing
    parser until each shape has raw AST parity.
 3. Simple DML: `INSERT ... VALUES`, primary-key `UPDATE`, primary-key
-   `DELETE`, `RETURNING`, and `ON CONFLICT`.
+   `DELETE`, `RETURNING`, and `ON CONFLICT`. Initial generated-parser coverage
+   now retains raw DML nodes for representative `INSERT ... VALUES`,
+   `INSERT ... SELECT`, `UPDATE`, `DELETE`, `TRUNCATE`, and `MERGE` statements;
+   switching DML from fallback to required generated parsing still requires
+   lowering parity and broader unsupported-shape diagnostics.
 4. Read queries: projections, predicates, joins, CTEs, aggregates, windows,
    set operations, lateral, ordering, limits, and document-table sources.
 5. Advanced DML: `INSERT ... SELECT`, `UPDATE ... FROM`, `DELETE ... USING`,
@@ -214,9 +220,9 @@ Generated grammar work needs evidence at multiple levels:
 
 - Corpus tests for accepted PostgreSQL-compatible syntax. The initial checked
   corpus covers session commands, transaction commands, prepared statements,
-  simple database/schema/table/index/extension DDL. Runtime parsing also
-  enforces generated parser success for the session, transaction, and prepared
-  statement corpus.
+  simple database/schema/table/index/extension DDL, and representative DML.
+  Runtime parsing also enforces generated parser success for the session,
+  transaction, and prepared statement corpus.
 - Corpus tests for accepted Antfly-specific syntax.
 - Corpus tests for intentionally unsupported PostgreSQL syntax with stable
   diagnostics.
