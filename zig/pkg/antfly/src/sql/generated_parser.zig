@@ -1035,6 +1035,16 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows", .kind = .read },
 };
 
+pub const antfly_extension_read_corpus = [_]GeneratedSqlCorpusCase{
+    .{ .sql = "SELECT * FROM antfly.full_text_search(index => 'docs_body_fts', query => 'refund', limit => 10)", .kind = .read },
+    .{ .sql = "SELECT id, score FROM antfly.semantic_search(index => 'docs_embeddings', query => 'refund', limit => 10)", .kind = .read },
+    .{ .sql = "SELECT id FROM antfly.vector_search(index => 'docs_vectors', vector => '[0.1,0.2]', limit => 10)", .kind = .read },
+    .{ .sql = "SELECT id FROM antfly.graph_traverse(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', max_depth => 2)", .kind = .read },
+    .{ .sql = "SELECT id, score FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b') AS gm", .kind = .read },
+    .{ .sql = "SELECT gm.id, ranked.score FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b') AS gm JOIN antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 5) AS ranked ON gm.id = ranked.id", .kind = .read },
+    .{ .sql = "SELECT * FROM antfly.graph_metric_rerank(full_text_index => 'docs_body_fts', query => 'refund', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', weight => 1.5, base_weight => 0.25)", .kind = .read },
+};
+
 pub const simple_graph_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CREATE GRAPH INDEX docs_edge_graph ON doc_edges", .kind = .graph },
     .{ .sql = "CREATE GRAPH METRIC docs_pagerank ON doc_edges WITH (metric = 'pagerank')", .kind = .graph },
@@ -4371,7 +4381,7 @@ test "generated SQL parser facade classifies gated corpus" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const corpus = first_family_corpus ++ simple_ddl_corpus ++ simple_dml_corpus ++ simple_read_corpus ++ simple_graph_corpus ++ unsupported_corpus;
+    const corpus = first_family_corpus ++ simple_ddl_corpus ++ simple_dml_corpus ++ simple_read_corpus ++ antfly_extension_read_corpus ++ simple_graph_corpus ++ unsupported_corpus;
     for (corpus) |case| {
         const generated_result = parseSqlAlloc(alloc, case.sql) catch |err| {
             std.debug.print("generated parser rejected corpus SQL: {s}\n", .{case.sql});

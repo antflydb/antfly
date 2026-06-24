@@ -653,7 +653,11 @@ Generated grammar work needs evidence at multiple levels:
   graph statements as a distinct generated family. Runtime parsing also
   enforces generated parser success for the session, transaction, and prepared
   statement corpus.
-- Corpus tests for accepted Antfly-specific syntax.
+- Corpus tests for accepted Antfly-specific syntax. The generated corpus now
+  covers canonical `antfly.full_text_search`, `antfly.semantic_search`,
+  `antfly.vector_search`, `antfly.graph_traverse`, `antfly.graph_match`,
+  `antfly.graph_metric`, and `antfly.graph_metric_rerank` table-function read
+  sources with named arguments.
 - Corpus tests for intentionally unsupported PostgreSQL syntax with stable
   diagnostics. Seed `ANALYZE`, bulk I/O `COPY`, maintenance `VACUUM`/`REINDEX`,
   utility/control statements such as `CLUSTER`, `COMMENT`, `GRANT`/`REVOKE`,
