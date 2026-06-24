@@ -157,6 +157,7 @@ pub const WindowParserOptions = struct {
     params: []const value_mod.SqlValue = &.{},
     available_ctes: []const db_mod.types.RelationalRowsCte = &.{},
     function_bindings: SqlFunctionBindings = .{},
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst = null,
     context_hooks: SelectParserContextHooks,
     named_window_hooks: NamedWindowSpecsContextHooks,
     fixed_binary_hooks: FixedBinaryRowExpressionParserOptions,
@@ -220,6 +221,7 @@ pub const AggregateParserOptions = struct {
     available_ctes: []const db_mod.types.RelationalRowsCte = &.{},
     function_bindings: SqlFunctionBindings = .{},
     field_source: db_mod.types.RelationalRowsExpressionFieldSource = .row,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst = null,
     context_hooks: SelectParserContextHooks,
     aggregate_spec_options: AggregateSpecParserOptions,
     select_item_options: SelectItemParserOptions,
@@ -16168,11 +16170,25 @@ pub fn parseAggregateAlloc(
                 options.output_order_expression_options,
             );
         } else if (parser.matchKeyword(tokens, pos, "limit")) {
-            limit = try value_mod.parseLimitValue(tokens, pos, options.params);
+            const keyword_index = pos.* - 1;
+            if (try parseGeneratedLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_limit| {
+                limit = generated_limit.value;
+            } else {
+                limit = try value_mod.parseLimitValue(tokens, pos, options.params);
+            }
         } else if (parser.matchKeyword(tokens, pos, "offset")) {
-            offset = try value_mod.parseOffsetValue(tokens, pos, options.params);
+            const keyword_index = pos.* - 1;
+            offset = if (try parseGeneratedOffsetValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_offset|
+                generated_offset
+            else
+                try value_mod.parseOffsetValue(tokens, pos, options.params);
         } else if (parser.matchKeyword(tokens, pos, "fetch")) {
-            limit = try value_mod.parseFetchLimitValue(tokens, pos, options.params);
+            const keyword_index = pos.* - 1;
+            if (try parseGeneratedFetchLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_limit| {
+                limit = generated_limit.value;
+            } else {
+                limit = try value_mod.parseFetchLimitValue(tokens, pos, options.params);
+            }
         } else if (parser.matchToken(tokens, pos, .semicolon) != null) {
             if (!parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
         } else if (nextIsUnsupportedQueryKeyword(tokens, pos.*)) {
@@ -16521,11 +16537,25 @@ pub fn parseWindowSelectAlloc(
                 options.output_order_expression_options,
             );
         } else if (parser.matchKeyword(tokens, pos, "limit")) {
-            limit = try value_mod.parseLimitValue(tokens, pos, options.params);
+            const keyword_index = pos.* - 1;
+            if (try parseGeneratedLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_limit| {
+                limit = generated_limit.value;
+            } else {
+                limit = try value_mod.parseLimitValue(tokens, pos, options.params);
+            }
         } else if (parser.matchKeyword(tokens, pos, "offset")) {
-            offset = try value_mod.parseOffsetValue(tokens, pos, options.params);
+            const keyword_index = pos.* - 1;
+            offset = if (try parseGeneratedOffsetValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_offset|
+                generated_offset
+            else
+                try value_mod.parseOffsetValue(tokens, pos, options.params);
         } else if (parser.matchKeyword(tokens, pos, "fetch")) {
-            limit = try value_mod.parseFetchLimitValue(tokens, pos, options.params);
+            const keyword_index = pos.* - 1;
+            if (try parseGeneratedFetchLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_limit| {
+                limit = generated_limit.value;
+            } else {
+                limit = try value_mod.parseFetchLimitValue(tokens, pos, options.params);
+            }
         } else if (parser.matchKeyword(tokens, pos, "for")) {
             return error.UnsupportedSqlShape;
         } else if (parser.matchToken(tokens, pos, .semicolon) != null) {
@@ -24973,11 +25003,14 @@ fn runtimeSchemaFromJsonForLowerExprTestAlloc(alloc: std.mem.Allocator, schema_j
     return try schema_api.deriveRuntimeTableSchema(alloc, parsed);
 }
 
-fn generatedQueryReadAstForParsedSql(parsed_sql: *const tokenized.ParsedSql) ?*const generated_parser.GeneratedSqlReadAst {
+fn generatedReadAstForParsedSql(
+    parsed_sql: *const tokenized.ParsedSql,
+    expected_kind: generated_parser.GeneratedSqlReadKind,
+) ?*const generated_parser.GeneratedSqlReadAst {
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
-                .read => |*read| if (read.kind == .query and read.set_operation_tokens == null and read.cte_tokens == null) read else null,
+                .read => |*read| if (read.kind == expected_kind and read.set_operation_tokens == null and read.cte_tokens == null) read else null,
                 else => null,
             };
         }
@@ -25025,7 +25058,7 @@ fn lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
         .schema = schema,
         .params = params,
         .function_bindings = function_bindings,
-        .generated_read_ast = generatedQueryReadAstForParsedSql(parsed_sql),
+        .generated_read_ast = generatedReadAstForParsedSql(parsed_sql, .query),
     };
     var lowered = parseQueryPlanAlloc(
         alloc,
@@ -25137,11 +25170,20 @@ fn lowerWindowPlanForLowerExprTestAlloc(
     schema: runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
 ) !plan_mod.LoweredWindowPlan {
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerParsedWindowPlanForLowerExprTestAlloc(alloc, &parsed_sql, schema, params);
+}
+
+fn lowerParsedWindowPlanForLowerExprTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+) !plan_mod.LoweredWindowPlan {
     const parser_context = @import("parser_context.zig");
 
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
-    defer parsed_sql.deinit(alloc);
     const tokens = parsed_sql.items();
     const cte_adapter_shape = parser.tokensStartWithKeywordTag(tokens, .with);
 
@@ -25150,6 +25192,7 @@ fn lowerWindowPlanForLowerExprTestAlloc(
         .tokens = tokens,
         .schema = schema,
         .params = params,
+        .generated_read_ast = generatedReadAstForParsedSql(parsed_sql, .window),
     };
     var lowered = plan_mod.parseWindowPlanAlloc(
         alloc,
@@ -25190,6 +25233,7 @@ fn lowerAggregatePlanForLowerExprTestAlloc(
         .tokens = tokens,
         .schema = schema,
         .params = params,
+        .generated_read_ast = generatedReadAstForParsedSql(&parsed_sql, .aggregate),
     };
     var lowered = plan_mod.parseAggregatePlanAlloc(
         alloc,
@@ -25217,11 +25261,20 @@ fn lowerAggregateForLowerExprTestAlloc(
     schema: runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
 ) !plan_mod.LoweredAggregate {
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerParsedAggregateForLowerExprTestAlloc(alloc, &parsed_sql, schema, params);
+}
+
+fn lowerParsedAggregateForLowerExprTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+) !plan_mod.LoweredAggregate {
     const parser_context = @import("parser_context.zig");
 
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
-    defer parsed_sql.deinit(alloc);
     const tokens = parsed_sql.items();
 
     var parser_state = parser_context.ParserState{
@@ -25229,6 +25282,7 @@ fn lowerAggregateForLowerExprTestAlloc(
         .tokens = tokens,
         .schema = schema,
         .params = params,
+        .generated_read_ast = generatedReadAstForParsedSql(parsed_sql, .aggregate),
     };
     return parser_context.ParserState.ContextAccessors.parseAggregate(&parser_state) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
@@ -28513,6 +28567,26 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms" {
     try std.testing.expect(aggregate.aggregate.limit == null);
     try std.testing.expectEqual(@as(u32, 3), aggregate.aggregate.offset);
 
+    var malformed_generated_aggregate_pagination = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT status, SUM(amount) AS total FROM usage_records GROUP BY status LIMIT 10",
+    );
+    defer malformed_generated_aggregate_pagination.deinit(alloc);
+    if (malformed_generated_aggregate_pagination.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |*read| read.limit_tokens = .{ .start = 13, .end = 14 },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_aggregate_pagination,
+        schema,
+        &.{},
+    ));
+
     var window = try lowerWindowPlanForLowerExprTestAlloc(
         alloc,
         "SELECT tenant_id, id, row_number() OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS rn FROM usage_records WHERE status = 'open' ORDER BY rn ASC OFFSET 4 ROWS FETCH FIRST 2 ROWS ONLY",
@@ -28522,6 +28596,26 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms" {
     defer window.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 2), window.plan.window.limit.?);
     try std.testing.expectEqual(@as(u32, 4), window.plan.window.offset);
+
+    var malformed_generated_window_pagination = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT tenant_id, row_number() OVER (PARTITION BY tenant_id) AS rn FROM usage_records LIMIT 2",
+    );
+    defer malformed_generated_window_pagination.deinit(alloc);
+    if (malformed_generated_window_pagination.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |*read| read.limit_tokens = .{ .start = 3, .end = 4 },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedWindowPlanForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_window_pagination,
+        schema,
+        &.{},
+    ));
 }
 
 test "sql adapter lower expr lowers row claim query plans" {
