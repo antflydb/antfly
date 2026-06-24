@@ -491,6 +491,7 @@ pub const simple_dml_corpus = [_]GeneratedSqlCorpusCase{
 pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT id, status FROM usage_records WHERE status = 'open' ORDER BY id LIMIT 10", .kind = .read },
     .{ .sql = "SELECT status AS state, id FROM usage_records", .kind = .read },
+    .{ .sql = "SELECT status state, id FROM usage_records", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status LIKE 'open%'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status ILIKE 'open%'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE id IN ('u1', 'u2')", .kind = .read },
@@ -1034,7 +1035,7 @@ fn buildReadAst(
     if (projection_start < projection_end) {
         const projection_tokens = GeneratedSqlTokenRange{ .start = projection_start, .end = projection_end };
         ast.projection_tokens = projection_tokens;
-        ast.projection_items = try buildTopLevelListAst(alloc, tokens, projection_tokens);
+        ast.projection_items = try buildTopLevelListAst(alloc, tokens, projection_tokens, .{ .bare_alias = true });
         if (generatedListExpressionTokens(ast.projection_items, 0)) |first_tokens| {
             ast.projection_first_expression = try buildGeneratedExpressionAst(alloc, tokens, first_tokens);
         }
@@ -1065,7 +1066,7 @@ fn buildReadAst(
         if (group_start < group_end) {
             const group_tokens = GeneratedSqlTokenRange{ .start = group_start, .end = group_end };
             ast.group_tokens = group_tokens;
-            ast.group_items = try buildTopLevelListAst(alloc, tokens, group_tokens);
+            ast.group_items = try buildTopLevelListAst(alloc, tokens, group_tokens, .{});
             if (generatedListExpressionTokens(ast.group_items, 0)) |first_tokens| {
                 ast.group_first_expression = try buildGeneratedExpressionAst(alloc, tokens, first_tokens);
             }
@@ -1092,7 +1093,7 @@ fn buildReadAst(
         if (order_start < order_end) {
             const order_tokens = GeneratedSqlTokenRange{ .start = order_start, .end = order_end };
             ast.order_tokens = order_tokens;
-            ast.order_items = try buildTopLevelListAst(alloc, tokens, order_tokens);
+            ast.order_items = try buildTopLevelListAst(alloc, tokens, order_tokens, .{});
             if (generatedListExpressionTokens(ast.order_items, 0)) |first_tokens| {
                 ast.order_first_expression = try buildGeneratedExpressionAst(alloc, tokens, first_tokens);
             }
@@ -1489,7 +1490,16 @@ fn generatedSingleTokenRangeIfIdentifier(tokens: []const token_mod.Token, index:
     return .{ .start = index, .end = index + 1 };
 }
 
-fn buildTopLevelListAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) !GeneratedSqlListAst {
+const GeneratedSqlListOptions = struct {
+    bare_alias: bool = false,
+};
+
+fn buildTopLevelListAst(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    range: GeneratedSqlTokenRange,
+    options: GeneratedSqlListOptions,
+) !GeneratedSqlListAst {
     var ast = GeneratedSqlListAst{};
     if (range.start >= range.end or range.end > tokens.len) return ast;
 
@@ -1538,7 +1548,7 @@ fn buildTopLevelListAst(alloc: std.mem.Allocator, tokens: []const token_mod.Toke
             ast.alias_name_items = &.{};
         }
         for (ast.items, 0..) |item, item_index| {
-            const aliased = generatedAliasedListItem(tokens, item);
+            const aliased = generatedAliasedListItem(tokens, item, options);
             ast.expression_items[item_index] = aliased.expression_tokens;
             ast.alias_items[item_index] = aliased.alias_tokens;
             ast.alias_name_items[item_index] = aliased.alias_name_tokens;
@@ -1564,9 +1574,13 @@ const GeneratedAliasedListItem = struct {
     alias_name_tokens: ?GeneratedSqlTokenRange = null,
 };
 
-fn generatedAliasedListItem(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) GeneratedAliasedListItem {
+fn generatedAliasedListItem(
+    tokens: []const token_mod.Token,
+    range: GeneratedSqlTokenRange,
+    options: GeneratedSqlListOptions,
+) GeneratedAliasedListItem {
     var result = GeneratedAliasedListItem{ .expression_tokens = range };
-    if (range.end <= range.start + 2 or range.end > tokens.len) return result;
+    if (range.end <= range.start + 1 or range.end > tokens.len) return result;
 
     var depth: usize = 0;
     var index = range.start;
@@ -1585,7 +1599,48 @@ fn generatedAliasedListItem(tokens: []const token_mod.Token, range: GeneratedSql
             },
         }
     }
+    if (options.bare_alias and generatedBareAliasCandidate(tokens, range)) {
+        result.expression_tokens = .{ .start = range.start, .end = range.end - 1 };
+        result.alias_tokens = .{ .start = range.end - 1, .end = range.end };
+        result.alias_name_tokens = result.alias_tokens;
+    }
     return result;
+}
+
+fn generatedBareAliasCandidate(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) bool {
+    if (range.end <= range.start + 1 or range.end > tokens.len) return false;
+    if (tokens[range.end - 1].kind != .identifier) return false;
+    return switch (tokens[range.end - 2].kind) {
+        .comma,
+        .lparen,
+        .lbracket,
+        .eq,
+        .neq,
+        .lt,
+        .lte,
+        .gt,
+        .gte,
+        .plus,
+        .minus,
+        .slash,
+        .percent,
+        .pipe_concat,
+        .at_contains,
+        .range_overlap,
+        .question,
+        .question_any,
+        .question_all,
+        .arrow_json,
+        .arrow_text,
+        .path_arrow_json,
+        .path_arrow_text,
+        .regex_match,
+        .regex_imatch,
+        .regex_not_match,
+        .regex_not_imatch,
+        => false,
+        else => true,
+    };
 }
 
 fn generatedListExpressionTokens(list: GeneratedSqlListAst, index: usize) ?GeneratedSqlTokenRange {
@@ -1627,7 +1682,7 @@ fn buildGeneratedExpressionAst(alloc: std.mem.Allocator, tokens: []const token_m
         ast.function_name_tokens = function_call.name_tokens;
         ast.argument_tokens = function_call.argument_tokens;
         if (function_call.argument_tokens) |argument_tokens| {
-            ast.argument_items = try buildTopLevelListAst(alloc, tokens, argument_tokens);
+            ast.argument_items = try buildTopLevelListAst(alloc, tokens, argument_tokens, .{});
         }
         return ast;
     }
@@ -1635,7 +1690,7 @@ fn buildGeneratedExpressionAst(alloc: std.mem.Allocator, tokens: []const token_m
         ast.kind = .array_constructor;
         ast.array_tokens = array_constructor.element_tokens;
         if (array_constructor.element_tokens) |element_tokens| {
-            ast.array_items = try buildTopLevelListAst(alloc, tokens, element_tokens);
+            ast.array_items = try buildTopLevelListAst(alloc, tokens, element_tokens, .{});
         }
         return ast;
     }
@@ -2341,6 +2396,30 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.projection_first_expression.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.projection_first_expression.tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.source_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const bare_alias_projection_read_sql = "SELECT status state, id FROM usage_records";
+    const bare_alias_projection_read_result = try parseSqlAlloc(alloc, bare_alias_projection_read_sql);
+    switch (bare_alias_projection_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 5 }, read.projection_tokens.?);
+            try std.testing.expectEqual(@as(usize, 2), read.projection_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 3 }, read.projection_items.items[0]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.projection_items.expression_items[0]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, read.projection_items.alias_items[0].?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, read.projection_items.alias_name_items[0].?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, read.projection_items.items[1]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, read.projection_items.expression_items[1]);
+            try std.testing.expect(read.projection_items.alias_items[1] == null);
+            try std.testing.expect(read.projection_items.alias_name_items[1] == null);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.projection_items.expressions[0].kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.projection_items.expressions[0].tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.projection_first_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.projection_first_expression.tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.source_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

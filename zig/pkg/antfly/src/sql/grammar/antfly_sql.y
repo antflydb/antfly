@@ -289,8 +289,10 @@ select_item_list:
 select_item:
     expression
   | expression AS IDENT
+  | expression IDENT
   | window_function_expression
   | window_function_expression AS IDENT
+  | window_function_expression IDENT
   ;
 
 window_function_expression:
