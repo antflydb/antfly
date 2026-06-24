@@ -12353,6 +12353,7 @@ fn lowerWritePlanParsedSqlForDmlTestAlloc(
         .schema = schema,
         .params = params,
         .callbacks = .{
+            .lower_generated_dml = lowerWritePlanFromGeneratedDmlAstDirectAlloc,
             .lower_recursive_insert_source_with_schemas = lowerRecursiveInsertSourceWithSchemasParsedSqlForDmlTestAlloc,
             .lower_recursive_update_joined_source_with_schemas = lowerRecursiveUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc,
             .lower_recursive_delete_joined_source_with_schemas = lowerRecursiveDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc,
@@ -12375,7 +12376,7 @@ fn lowerWritePlanParsedSqlForDmlTestAlloc(
     return try context.lowerParsed(parsed_sql, options);
 }
 
-pub fn lowerWritePlanFromGeneratedDmlAstAlloc(
+pub fn lowerWritePlanFromGeneratedDmlAstDirectAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
     dml_ast: generated_parser.GeneratedSqlDmlAst,
@@ -12480,7 +12481,23 @@ pub fn lowerWritePlanFromGeneratedDmlAstAlloc(
             else => return err,
         }
     }
-    return try lowerWritePlanParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, options);
+    return error.UnsupportedSqlShape;
+}
+
+pub fn lowerWritePlanFromGeneratedDmlAstAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    dml_ast: generated_parser.GeneratedSqlDmlAst,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+) !plan_mod.LoweredWritePlan {
+    if (lowerWritePlanFromGeneratedDmlAstDirectAlloc(alloc, parsed_sql, dml_ast, schema, params, options)) |lowered| {
+        return lowered;
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => return try lowerWritePlanParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, options),
+        else => return err,
+    }
 }
 
 fn insertValuesFromGeneratedDmlAstAlloc(
@@ -12679,7 +12696,7 @@ fn insertSourceFromGeneratedDmlAstAlloc(
         .params = params,
         .unique_resolver = unique_resolver,
     };
-    var lowered = try parseInsertSourceAlloc(
+    var lowered = parseInsertSourceAlloc(
         alloc,
         tokens,
         &parser_state.pos,
@@ -12879,7 +12896,7 @@ fn updateJoinedSourceFromGeneratedDmlAstAlloc(
         .params = params,
         .mutation_claim = row_claim,
     };
-    var lowered = try parseJoinedMutationSourceAlloc(
+    var lowered = parseJoinedMutationSourceAlloc(
         alloc,
         tokens,
         &parser_state.pos,
@@ -12922,7 +12939,7 @@ fn deleteJoinedSourceFromGeneratedDmlAstAlloc(
         .params = params,
         .mutation_claim = row_claim,
     };
-    var lowered = try parseJoinedMutationSourceAlloc(
+    var lowered = parseJoinedMutationSourceAlloc(
         alloc,
         tokens,
         &parser_state.pos,

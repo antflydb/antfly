@@ -275,10 +275,12 @@ Suggested migration order:
    mutation-source lowerers; non-CTE `MERGE` has a generated range-validated
    direct merge-plan lowerer; and `TRUNCATE` has a direct generated AST-to-plan
    lowerer for the supported table-list, identity, and drop-behavior surface.
-   Other DML still has a validated wrapper into the current typed DML lowerer
-   for representative generated-covered write plans. Switching the full DML
-   family from fallback to required generated parsing still requires generated
-   command-body ASTs for broader insert-select source bodies,
+   The write-plan lowering context now dispatches through retained generated
+   DML ASTs when the generated parser covers the statement, using direct
+   generated AST-to-plan lowerers where available and falling back to the
+   classifier path only for generated shapes that are not direct-lowered yet.
+   Switching the full DML family from fallback to required generated parsing
+   still requires generated command-body ASTs for broader insert-select source bodies,
    semijoin/exists joined mutation bodies, full merge arms, and CTE/recursive
    merge forms, plus broader unsupported-shape diagnostics.
 4. Read queries: projections, predicates, joins, CTEs, aggregates, windows,
@@ -536,7 +538,8 @@ variants for:
   `CREATE TABLE` / `CREATE INDEX` plans
 - DML statement, including generated AST payloads for command spans, target
   tables, source/body ranges, predicates, conflict clauses, returning clauses,
-  values lists, default-values inserts, truncate options, direct generated AST-to-plan
+  values lists, default-values inserts, truncate options, generated-first
+  write-plan dispatch, direct generated AST-to-plan
   lowerers for supported explicit-column `INSERT ... VALUES`,
   `INSERT ... VALUES ... ON CONFLICT`, `INSERT ... DEFAULT VALUES`, insert
   `RETURNING`, single-table point `UPDATE`/`DELETE` with returning projections,
@@ -605,9 +608,9 @@ Generated grammar work needs evidence at multiple levels:
   single-table source update/delete mutation-source requests without joined
   sources, direct generated AST-to-plan coverage for explicit update-from and
   delete-using joined mutation-source requests, direct generated AST-to-plan
-  coverage for non-CTE merge plans, and initial generated AST-to-plan parity
-  through a generated-family validation wrapper over other representative write
-  plans. Read plans have initial
+  coverage for non-CTE merge plans, generated-first write lowering context
+  dispatch, and generated-family validation fallback over other representative
+  write plans. Read plans have initial
   generated AST-to-plan parity through generated-first read lowering context
   dispatch and generated-family validation wrappers over representative query,
   aggregate, join, lateral, and non-recursive CTE plans, AST-shape coverage for

@@ -2137,6 +2137,7 @@ pub fn lowerWritePlanParsedSqlAlloc(
         .schema = schema,
         .params = params,
         .callbacks = .{
+            .lower_generated_dml = sql_adapter.lowerWritePlanFromGeneratedDmlAstDirectAlloc,
             .lower_recursive_insert_source_with_schemas = lowerRecursiveInsertSourceWithSchemasParsedSqlAlloc,
             .lower_recursive_update_joined_source_with_schemas = lowerRecursiveUpdateJoinedMutationSourceWithSchemasParsedSqlAlloc,
             .lower_recursive_delete_joined_source_with_schemas = lowerRecursiveDeleteJoinedMutationSourceWithSchemasParsedSqlAlloc,

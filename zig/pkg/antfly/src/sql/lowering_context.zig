@@ -3133,6 +3133,14 @@ pub const CatalogWritePlanLoweringContext = struct {
 };
 
 pub const WritePlanLoweringCallbacks = struct {
+    lower_generated_dml: *const fn (
+        std.mem.Allocator,
+        *const tokenized.ParsedSql,
+        generated_parser.GeneratedSqlDmlAst,
+        runtime_schema.TableSchema,
+        []const value_mod.SqlValue,
+        plan.LowerWritePlanOptions,
+    ) anyerror!plan.LoweredWritePlan,
     lower_recursive_insert_source_with_schemas: *const fn (
         std.mem.Allocator,
         *const tokenized.ParsedSql,
@@ -3277,6 +3285,14 @@ pub const WritePlanLoweringContext = struct {
         const old_parsed_sql = self.parsed_sql;
         self.parsed_sql = parsed_sql;
         defer self.parsed_sql = old_parsed_sql;
+        if (generatedDmlAstForParsedSql(parsed_sql)) |dml_ast| {
+            if (self.callbacks.lower_generated_dml(self.alloc, parsed_sql, dml_ast.*, self.schema, self.params, options)) |lowered| {
+                return lowered;
+            } else |err| switch (err) {
+                error.UnsupportedSqlShape => {},
+                else => return err,
+            }
+        }
         return try plan.lowerWritePlanWithParsedSqlAlloc(parsed_sql, self.schema, options, self.hooks());
     }
 
@@ -3392,6 +3408,18 @@ pub const WritePlanLoweringContext = struct {
         return try self.callbacks.lower_merge_mutation_with_schemas(self.alloc, self.parsed_sql.?, self.schema, source_schema, self.params);
     }
 };
+
+fn generatedDmlAstForParsedSql(parsed_sql: *const tokenized.ParsedSql) ?*const generated_parser.GeneratedSqlDmlAst {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            return switch (generated_ast.*) {
+                .dml => |*dml| dml,
+                else => null,
+            };
+        }
+    }
+    return null;
+}
 
 pub const ExplainPlanLoweringCallbacks = struct {
     lower_read_with_catalog: *const fn (
