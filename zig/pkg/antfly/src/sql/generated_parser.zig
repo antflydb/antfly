@@ -130,8 +130,22 @@ pub const GeneratedSqlUnsupportedKind = enum {
     cluster,
     comment,
     copy,
+    alter_foreign_table,
+    alter_policy,
+    alter_publication,
+    alter_server,
+    alter_subscription,
+    create_foreign_table,
     create_materialized_view,
+    create_policy,
+    create_publication,
+    create_rule,
+    create_server,
+    create_subscription,
+    create_trigger,
     declare,
+    do_block,
+    drop_foreign_table,
     explain,
     fetch,
     grant,
@@ -147,6 +161,12 @@ pub const GeneratedSqlUnsupportedKind = enum {
     savepoint,
     security_label,
     drop_materialized_view,
+    drop_policy,
+    drop_publication,
+    drop_rule,
+    drop_server,
+    drop_subscription,
+    drop_trigger,
     unlisten,
     vacuum,
 };
@@ -159,8 +179,22 @@ pub const GeneratedSqlUnsupportedReason = enum {
     cluster_not_planned_by_generated_parser,
     comment_not_planned_by_generated_parser,
     copy_not_planned_by_generated_parser,
+    alter_foreign_table_not_planned_by_generated_parser,
+    alter_policy_not_planned_by_generated_parser,
+    alter_publication_not_planned_by_generated_parser,
+    alter_server_not_planned_by_generated_parser,
+    alter_subscription_not_planned_by_generated_parser,
+    create_foreign_table_not_planned_by_generated_parser,
     create_materialized_view_not_planned_by_generated_parser,
+    create_policy_not_planned_by_generated_parser,
+    create_publication_not_planned_by_generated_parser,
+    create_rule_not_planned_by_generated_parser,
+    create_server_not_planned_by_generated_parser,
+    create_subscription_not_planned_by_generated_parser,
+    create_trigger_not_planned_by_generated_parser,
     declare_not_planned_by_generated_parser,
+    do_block_not_planned_by_generated_parser,
+    drop_foreign_table_not_planned_by_generated_parser,
     explain_not_planned_by_generated_parser,
     fetch_not_planned_by_generated_parser,
     grant_not_planned_by_generated_parser,
@@ -176,6 +210,12 @@ pub const GeneratedSqlUnsupportedReason = enum {
     savepoint_not_planned_by_generated_parser,
     security_label_not_planned_by_generated_parser,
     drop_materialized_view_not_planned_by_generated_parser,
+    drop_policy_not_planned_by_generated_parser,
+    drop_publication_not_planned_by_generated_parser,
+    drop_rule_not_planned_by_generated_parser,
+    drop_server_not_planned_by_generated_parser,
+    drop_subscription_not_planned_by_generated_parser,
+    drop_trigger_not_planned_by_generated_parser,
     unlisten_not_planned_by_generated_parser,
     vacuum_not_planned_by_generated_parser,
 };
@@ -1156,6 +1196,11 @@ pub const simple_graph_corpus = [_]GeneratedSqlCorpusCase{
 };
 
 pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
+    .{ .sql = "ALTER FOREIGN TABLE foreign_usage_records RENAME TO foreign_usage_archive", .kind = .unsupported },
+    .{ .sql = "ALTER POLICY usage_policy ON usage_records RENAME TO usage_policy_v2", .kind = .unsupported },
+    .{ .sql = "ALTER PUBLICATION usage_pub ADD TABLE usage_records", .kind = .unsupported },
+    .{ .sql = "ALTER SERVER usage_server VERSION '15'", .kind = .unsupported },
+    .{ .sql = "ALTER SUBSCRIPTION usage_sub DISABLE", .kind = .unsupported },
     .{ .sql = "ANALYZE", .kind = .unsupported },
     .{ .sql = "CALL refresh_usage_records()", .kind = .unsupported },
     .{ .sql = "CHECKPOINT", .kind = .unsupported },
@@ -1163,8 +1208,17 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CLUSTER usage_records USING usage_status_idx", .kind = .unsupported },
     .{ .sql = "COMMENT ON TABLE usage_records IS 'billing rows'", .kind = .unsupported },
     .{ .sql = "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)", .kind = .unsupported },
+    .{ .sql = "CREATE FOREIGN TABLE foreign_usage_records (id text) SERVER usage_fdw", .kind = .unsupported },
     .{ .sql = "CREATE MATERIALIZED VIEW usage_summary AS SELECT status, count(*) FROM usage_records GROUP BY status", .kind = .unsupported },
+    .{ .sql = "CREATE POLICY usage_policy ON usage_records USING (tenant_id = current_user)", .kind = .unsupported },
+    .{ .sql = "CREATE PUBLICATION usage_pub FOR TABLE usage_records", .kind = .unsupported },
+    .{ .sql = "CREATE RULE usage_insert AS ON INSERT TO usage_records DO ALSO NOTIFY usage_events", .kind = .unsupported },
+    .{ .sql = "CREATE SERVER usage_server FOREIGN DATA WRAPPER postgres_fdw", .kind = .unsupported },
+    .{ .sql = "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=example dbname=usage' PUBLICATION usage_pub", .kind = .unsupported },
+    .{ .sql = "CREATE TRIGGER usage_audit BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage()", .kind = .unsupported },
     .{ .sql = "DECLARE usage_cursor NO SCROLL CURSOR FOR SELECT id FROM usage_records", .kind = .unsupported },
+    .{ .sql = "DO 'BEGIN NULL; END'", .kind = .unsupported },
+    .{ .sql = "DROP FOREIGN TABLE IF EXISTS foreign_usage_records", .kind = .unsupported },
     .{ .sql = "EXPLAIN", .kind = .unsupported },
     .{ .sql = "EXPLAIN SELECT id FROM usage_records", .kind = .unsupported },
     .{ .sql = "EXPLAIN ANALYZE INSERT INTO usage_records (id) VALUES ('u1')", .kind = .unsupported },
@@ -1185,6 +1239,12 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SAVEPOINT usage_batch", .kind = .unsupported },
     .{ .sql = "SECURITY LABEL ON TABLE usage_records IS 'internal'", .kind = .unsupported },
     .{ .sql = "DROP MATERIALIZED VIEW IF EXISTS usage_summary CASCADE", .kind = .unsupported },
+    .{ .sql = "DROP POLICY IF EXISTS usage_policy ON usage_records", .kind = .unsupported },
+    .{ .sql = "DROP PUBLICATION IF EXISTS usage_pub", .kind = .unsupported },
+    .{ .sql = "DROP RULE IF EXISTS usage_insert ON usage_records", .kind = .unsupported },
+    .{ .sql = "DROP SERVER IF EXISTS usage_server CASCADE", .kind = .unsupported },
+    .{ .sql = "DROP SUBSCRIPTION IF EXISTS usage_sub", .kind = .unsupported },
+    .{ .sql = "DROP TRIGGER IF EXISTS usage_audit ON usage_records", .kind = .unsupported },
     .{ .sql = "UNLISTEN *", .kind = .unsupported },
 };
 
@@ -1373,18 +1433,35 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.table)) return .{ .ddl = .create_table };
         if (second.matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
         if (second.matchesKeywordTag(.unique) and tokens.len > 2 and tokens[2].matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
+        if (second.matchesKeywordTag(.foreign) and tokens.len > 2 and tokens[2].matchesKeywordTag(.table)) return .{ .unsupported = .create_foreign_table };
         if (second.matchesKeywordTag(.graph) and tokens.len > 2) {
             if (tokens[2].matchesKeywordTag(.index)) return .{ .graph = .create_index };
             if (tokens[2].matchesKeywordTag(.metric)) return .{ .graph = .create_metric };
         }
         if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .unsupported = .create_materialized_view };
+        if (second.matchesKeywordTag(.policy)) return .{ .unsupported = .create_policy };
+        if (second.matchesKeywordTag(.publication)) return .{ .unsupported = .create_publication };
+        if (second.matchesKeywordTag(.rule)) return .{ .unsupported = .create_rule };
+        if (second.matchesKeywordTag(.server)) return .{ .unsupported = .create_server };
+        if (second.matchesKeywordTag(.subscription)) return .{ .unsupported = .create_subscription };
+        if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .create_trigger };
         if (second.matchesKeywordTag(.extension)) return .{ .extension_index = .create_extension };
     }
     if (first.matchesKeywordTag(.alter) and tokens.len > 2 and tokens[1].matchesKeywordTag(.graph) and tokens[2].matchesKeywordTag(.index)) {
         return .{ .graph = .alter_metric };
     }
+    if (first.matchesKeywordTag(.alter) and tokens.len > 2 and tokens[1].matchesKeywordTag(.foreign) and tokens[2].matchesKeywordTag(.table)) {
+        return .{ .unsupported = .alter_foreign_table };
+    }
     if (first.matchesKeywordTag(.alter) and tokens.len > 1 and tokens[1].matchesKeywordTag(.table)) {
         return .{ .ddl = .alter_table };
+    }
+    if (first.matchesKeywordTag(.alter) and tokens.len > 1) {
+        const second = tokens[1];
+        if (second.matchesKeywordTag(.policy)) return .{ .unsupported = .alter_policy };
+        if (second.matchesKeywordTag(.publication)) return .{ .unsupported = .alter_publication };
+        if (second.matchesKeywordTag(.server)) return .{ .unsupported = .alter_server };
+        if (second.matchesKeywordTag(.subscription)) return .{ .unsupported = .alter_subscription };
     }
     if (first.matchesKeywordTag(.drop) and tokens.len > 1) {
         const second = tokens[1];
@@ -1393,7 +1470,14 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.schema)) return .{ .ddl = .drop_schema };
         if (second.matchesKeywordTag(.database)) return .{ .ddl = .drop_database };
         if (second.matchesKeywordTag(.extension)) return .{ .extension_index = .drop_extension };
+        if (second.matchesKeywordTag(.foreign) and tokens.len > 2 and tokens[2].matchesKeywordTag(.table)) return .{ .unsupported = .drop_foreign_table };
         if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .unsupported = .drop_materialized_view };
+        if (second.matchesKeywordTag(.policy)) return .{ .unsupported = .drop_policy };
+        if (second.matchesKeywordTag(.publication)) return .{ .unsupported = .drop_publication };
+        if (second.matchesKeywordTag(.rule)) return .{ .unsupported = .drop_rule };
+        if (second.matchesKeywordTag(.server)) return .{ .unsupported = .drop_server };
+        if (second.matchesKeywordTag(.subscription)) return .{ .unsupported = .drop_subscription };
+        if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .drop_trigger };
     }
     if (first.matchesKeywordTag(.insert)) {
         for (tokens) |token| {
@@ -1416,6 +1500,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.comment)) return .{ .unsupported = .comment };
     if (first.matchesKeywordTag(.copy)) return .{ .unsupported = .copy };
     if (first.matchesKeywordTag(.declare)) return .{ .unsupported = .declare };
+    if (first.matchesKeywordTag(.do)) return .{ .unsupported = .do_block };
     if (first.matchesKeywordTag(.explain)) return .{ .unsupported = .explain };
     if (first.matchesKeywordTag(.fetch)) return .{ .unsupported = .fetch };
     if (first.matchesKeywordTag(.grant)) return .{ .unsupported = .grant };
@@ -1474,8 +1559,22 @@ fn buildUnsupportedAst(
             .cluster => .cluster_not_planned_by_generated_parser,
             .comment => .comment_not_planned_by_generated_parser,
             .copy => .copy_not_planned_by_generated_parser,
+            .alter_foreign_table => .alter_foreign_table_not_planned_by_generated_parser,
+            .alter_policy => .alter_policy_not_planned_by_generated_parser,
+            .alter_publication => .alter_publication_not_planned_by_generated_parser,
+            .alter_server => .alter_server_not_planned_by_generated_parser,
+            .alter_subscription => .alter_subscription_not_planned_by_generated_parser,
+            .create_foreign_table => .create_foreign_table_not_planned_by_generated_parser,
             .create_materialized_view => .create_materialized_view_not_planned_by_generated_parser,
+            .create_policy => .create_policy_not_planned_by_generated_parser,
+            .create_publication => .create_publication_not_planned_by_generated_parser,
+            .create_rule => .create_rule_not_planned_by_generated_parser,
+            .create_server => .create_server_not_planned_by_generated_parser,
+            .create_subscription => .create_subscription_not_planned_by_generated_parser,
+            .create_trigger => .create_trigger_not_planned_by_generated_parser,
             .declare => .declare_not_planned_by_generated_parser,
+            .do_block => .do_block_not_planned_by_generated_parser,
+            .drop_foreign_table => .drop_foreign_table_not_planned_by_generated_parser,
             .explain => .explain_not_planned_by_generated_parser,
             .fetch => .fetch_not_planned_by_generated_parser,
             .grant => .grant_not_planned_by_generated_parser,
@@ -1491,6 +1590,12 @@ fn buildUnsupportedAst(
             .savepoint => .savepoint_not_planned_by_generated_parser,
             .security_label => .security_label_not_planned_by_generated_parser,
             .drop_materialized_view => .drop_materialized_view_not_planned_by_generated_parser,
+            .drop_policy => .drop_policy_not_planned_by_generated_parser,
+            .drop_publication => .drop_publication_not_planned_by_generated_parser,
+            .drop_rule => .drop_rule_not_planned_by_generated_parser,
+            .drop_server => .drop_server_not_planned_by_generated_parser,
+            .drop_subscription => .drop_subscription_not_planned_by_generated_parser,
+            .drop_trigger => .drop_trigger_not_planned_by_generated_parser,
             .unlisten => .unlisten_not_planned_by_generated_parser,
             .vacuum => .vacuum_not_planned_by_generated_parser,
         },
@@ -7600,6 +7705,36 @@ test "generated SQL parser facade builds extended read AST spans" {
         subject_tokens: GeneratedSqlTokenRange,
     }{
         .{
+            .sql = "ALTER FOREIGN TABLE foreign_usage_records RENAME TO foreign_usage_archive",
+            .kind = .alter_foreign_table,
+            .reason = .alter_foreign_table_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 7 },
+        },
+        .{
+            .sql = "ALTER POLICY usage_policy ON usage_records RENAME TO usage_policy_v2",
+            .kind = .alter_policy,
+            .reason = .alter_policy_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 8 },
+        },
+        .{
+            .sql = "ALTER PUBLICATION usage_pub ADD TABLE usage_records",
+            .kind = .alter_publication,
+            .reason = .alter_publication_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 6 },
+        },
+        .{
+            .sql = "ALTER SERVER usage_server VERSION '15'",
+            .kind = .alter_server,
+            .reason = .alter_server_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 5 },
+        },
+        .{
+            .sql = "ALTER SUBSCRIPTION usage_sub DISABLE",
+            .kind = .alter_subscription,
+            .reason = .alter_subscription_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 4 },
+        },
+        .{
             .sql = "CALL refresh_usage_records()",
             .kind = .call,
             .reason = .call_not_planned_by_generated_parser,
@@ -7618,16 +7753,70 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 6 },
         },
         .{
+            .sql = "CREATE FOREIGN TABLE foreign_usage_records (id text) SERVER usage_fdw",
+            .kind = .create_foreign_table,
+            .reason = .create_foreign_table_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 10 },
+        },
+        .{
             .sql = "CREATE MATERIALIZED VIEW usage_summary AS SELECT status FROM usage_records",
             .kind = .create_materialized_view,
             .reason = .create_materialized_view_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 9 },
         },
         .{
+            .sql = "CREATE POLICY usage_policy ON usage_records USING (tenant_id = current_user)",
+            .kind = .create_policy,
+            .reason = .create_policy_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 11 },
+        },
+        .{
+            .sql = "CREATE PUBLICATION usage_pub FOR TABLE usage_records",
+            .kind = .create_publication,
+            .reason = .create_publication_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 6 },
+        },
+        .{
+            .sql = "CREATE RULE usage_insert AS ON INSERT TO usage_records DO ALSO NOTIFY usage_events",
+            .kind = .create_rule,
+            .reason = .create_rule_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 12 },
+        },
+        .{
+            .sql = "CREATE SERVER usage_server FOREIGN DATA WRAPPER postgres_fdw",
+            .kind = .create_server,
+            .reason = .create_server_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 7 },
+        },
+        .{
+            .sql = "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=example dbname=usage' PUBLICATION usage_pub",
+            .kind = .create_subscription,
+            .reason = .create_subscription_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 7 },
+        },
+        .{
+            .sql = "CREATE TRIGGER usage_audit BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage()",
+            .kind = .create_trigger,
+            .reason = .create_trigger_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 15 },
+        },
+        .{
             .sql = "DECLARE usage_cursor NO SCROLL CURSOR FOR SELECT id FROM usage_records",
             .kind = .declare,
             .reason = .declare_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 10 },
+        },
+        .{
+            .sql = "DO 'BEGIN NULL; END'",
+            .kind = .do_block,
+            .reason = .do_block_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 2 },
+        },
+        .{
+            .sql = "DROP FOREIGN TABLE IF EXISTS foreign_usage_records",
+            .kind = .drop_foreign_table,
+            .reason = .drop_foreign_table_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 6 },
         },
         .{
             .sql = "GRANT SELECT ON TABLE usage_records TO readonly",
@@ -7681,6 +7870,42 @@ test "generated SQL parser facade builds extended read AST spans" {
             .sql = "DROP MATERIALIZED VIEW IF EXISTS usage_summary CASCADE",
             .kind = .drop_materialized_view,
             .reason = .drop_materialized_view_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 7 },
+        },
+        .{
+            .sql = "DROP POLICY IF EXISTS usage_policy ON usage_records",
+            .kind = .drop_policy,
+            .reason = .drop_policy_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 7 },
+        },
+        .{
+            .sql = "DROP PUBLICATION IF EXISTS usage_pub",
+            .kind = .drop_publication,
+            .reason = .drop_publication_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 5 },
+        },
+        .{
+            .sql = "DROP RULE IF EXISTS usage_insert ON usage_records",
+            .kind = .drop_rule,
+            .reason = .drop_rule_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 7 },
+        },
+        .{
+            .sql = "DROP SERVER IF EXISTS usage_server CASCADE",
+            .kind = .drop_server,
+            .reason = .drop_server_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 6 },
+        },
+        .{
+            .sql = "DROP SUBSCRIPTION IF EXISTS usage_sub",
+            .kind = .drop_subscription,
+            .reason = .drop_subscription_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 5 },
+        },
+        .{
+            .sql = "DROP TRIGGER IF EXISTS usage_audit ON usage_records",
+            .kind = .drop_trigger,
+            .reason = .drop_trigger_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 7 },
         },
         .{

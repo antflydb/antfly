@@ -238,8 +238,11 @@ remains the next migration boundary for larger DDL, query, DML, and Antfly
 extension families.
 Unsupported generated diagnostics also cover PostgreSQL materialized-view DDL
 entry points, including `CREATE MATERIALIZED VIEW` and
-`DROP MATERIALIZED VIEW`, so these common unsupported DDL shapes have stable
-unsupported AST reasons instead of generic parser fallback.
+`DROP MATERIALIZED VIEW`; procedural blocks with `DO`; foreign-table DDL;
+trigger and rewrite-rule DDL; row-security policy DDL; logical-replication
+publication and subscription DDL; and foreign-server DDL. These common
+unsupported PostgreSQL dump/admin shapes now have stable unsupported AST
+reasons instead of generic parser fallback.
 
 ## Compatibility Policy
 

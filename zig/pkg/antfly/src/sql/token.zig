@@ -252,6 +252,7 @@ pub const TokenKeyword = enum {
     percentile_disc,
     period,
     placing,
+    policy,
     portion,
     position,
     power,
@@ -261,6 +262,7 @@ pub const TokenKeyword = enum {
     primary,
     procedure,
     program,
+    publication,
     regexp_count,
     regexp_instr,
     regexp_like,
@@ -286,11 +288,13 @@ pub const TokenKeyword = enum {
     round,
     row,
     rows,
+    rule,
     sign,
     savepoint,
     schema,
     security,
     select,
+    server,
     set,
     settings,
     show,
@@ -308,6 +312,7 @@ pub const TokenKeyword = enum {
     string_to_array,
     substr,
     substring,
+    subscription,
     sum,
     summary,
     symmetric,
@@ -547,6 +552,11 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.view, keywordFromIdentifier("VIEW").?);
     try std.testing.expectEqual(TokenKeyword.wal, keywordFromIdentifier("WAL").?);
     try std.testing.expectEqual(TokenKeyword.partition, keywordFromIdentifier("PARTITION").?);
+    try std.testing.expectEqual(TokenKeyword.policy, keywordFromIdentifier("POLICY").?);
+    try std.testing.expectEqual(TokenKeyword.publication, keywordFromIdentifier("PUBLICATION").?);
+    try std.testing.expectEqual(TokenKeyword.rule, keywordFromIdentifier("RULE").?);
+    try std.testing.expectEqual(TokenKeyword.server, keywordFromIdentifier("SERVER").?);
+    try std.testing.expectEqual(TokenKeyword.subscription, keywordFromIdentifier("SUBSCRIPTION").?);
     try std.testing.expectEqual(TokenKeyword.unbounded, keywordFromIdentifier("UNBOUNDED").?);
     try std.testing.expectEqual(TokenKeyword.window, keywordFromIdentifier("WINDOW").?);
     try std.testing.expectEqual(TokenKeyword.yes, keywordFromIdentifier("YES").?);
