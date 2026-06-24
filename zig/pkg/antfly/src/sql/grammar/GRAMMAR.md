@@ -88,7 +88,8 @@ and AST nodes for covered read statements, top-level generated AST ranges for
 covered `SELECT` projections, sources, predicates, grouping, having filters,
 window clauses, ordering, pagination, set-operation tails, and CTE prefixes,
 owned list item and expression arrays plus first/last expression metadata for
-top-level projection, grouping, ordering, and function argument lists, and first-join generated metadata for
+top-level projection, grouping, ordering, and function argument lists, explicit
+projection expression/alias token splits for `AS` aliases, and first-join generated metadata for
 join operator/type, left input, right input, and join predicate ranges, plus simple top-level
 comparison expression metadata for covered `WHERE`, `HAVING`, and join
 predicates. Normal function-call argument
@@ -249,7 +250,8 @@ Suggested migration order:
    `HAVING`, `WINDOW`, `ORDER BY`, `LIMIT`, `OFFSET`, `FETCH`, set-operation,
    and CTE-prefix bodies, plus owned list item and expression arrays for
    top-level projection, grouping, ordering, and function argument lists with
-   first/last expression metadata for those lists, and owned join item arrays
+   first/last expression metadata for those lists, explicit projection
+   expression/alias token splits for `AS` aliases, and owned join item arrays
    with first-join compatibility metadata for join operator/type, left input,
    right input, and join predicate ranges, plus simple top-level comparison
    expression metadata for covered `WHERE`, `HAVING`, and join predicates; and
