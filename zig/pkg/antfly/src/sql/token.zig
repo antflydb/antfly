@@ -446,6 +446,7 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.function, keywordFromIdentifier("FUNCTION").?);
     try std.testing.expectEqual(TokenKeyword.initcap, keywordFromIdentifier("INITCAP").?);
     try std.testing.expectEqual(TokenKeyword.all, keywordFromIdentifier("ALL").?);
+    try std.testing.expectEqual(TokenKeyword.@"and", keywordFromIdentifier("AND").?);
     try std.testing.expectEqual(TokenKeyword.any, keywordFromIdentifier("ANY").?);
     try std.testing.expectEqual(TokenKeyword.ilike, keywordFromIdentifier("ILIKE").?);
     try std.testing.expectEqual(TokenKeyword.in, keywordFromIdentifier("IN").?);

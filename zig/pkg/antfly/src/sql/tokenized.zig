@@ -858,6 +858,13 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
         .{ .sql = "SELECT id FROM usage_records WHERE status NOT ILIKE 'closed%'", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE id NOT IN ('u1', 'u2')", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE score NOT BETWEEN 1 AND 10", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records WHERE score = ANY (1, 2)", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records WHERE score <> ALL (1, 2)", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records WHERE score > SOME (1, 2)", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records WHERE deleted_at IS NULL", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records WHERE deleted_at IS NOT NULL", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records WHERE status = 'open' OR deleted_at IS NULL", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records WHERE status = 'open' AND deleted_at IS NULL", .generated = .query, .read = .query },
         .{ .sql = "SELECT concat_ws(',', status), id FROM usage_records ORDER BY status, id", .generated = .query, .read = .query },
         .{ .sql = "SELECT id, row_number() OVER (PARTITION BY tenant, account ORDER BY id) AS rn FROM usage_records ORDER BY id, tenant", .generated = .window, .read = .window },
         .{ .sql = "SELECT DISTINCT status FROM usage_records ORDER BY status", .generated = .aggregate, .read = .aggregate },
@@ -970,6 +977,11 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 9 }, read_ast.where_expression.right_tokens.?);
                 } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records WHERE status = 'open' OR deleted_at IS NULL")) {
                     try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.logical_or, read_ast.where_expression.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 8 }, read_ast.where_expression.left_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read_ast.where_expression.operator_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 9, .end = 12 }, read_ast.where_expression.right_tokens.?);
+                } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records WHERE status = 'open' AND deleted_at IS NULL")) {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.logical_and, read_ast.where_expression.kind);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 8 }, read_ast.where_expression.left_tokens.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read_ast.where_expression.operator_tokens.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 9, .end = 12 }, read_ast.where_expression.right_tokens.?);

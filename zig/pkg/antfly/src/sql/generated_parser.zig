@@ -137,6 +137,7 @@ pub const GeneratedSqlExpressionKind = enum {
     is_null,
     is_not_null,
     logical_or,
+    logical_and,
 };
 
 pub const GeneratedSqlExpressionAst = struct {
@@ -349,6 +350,7 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT id FROM usage_records WHERE deleted_at IS NULL", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE deleted_at IS NOT NULL", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status = 'open' OR deleted_at IS NULL", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE status = 'open' AND deleted_at IS NULL", .kind = .read },
     .{ .sql = "SELECT concat_ws(',', status), id FROM usage_records ORDER BY status, id", .kind = .read },
     .{ .sql = "SELECT id, row_number() OVER (PARTITION BY tenant, account ORDER BY id) AS rn FROM usage_records ORDER BY id, tenant", .kind = .read },
     .{ .sql = "SELECT DISTINCT status FROM usage_records ORDER BY status", .kind = .read },
@@ -1207,6 +1209,29 @@ fn findTopLevelExpressionOperator(tokens: []const token_mod.Token, range: Genera
     }
     depth = 0;
     index = range.start;
+    var skip_next_between_and = false;
+    while (index < range.end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth == 0) return null;
+                depth -= 1;
+            },
+            else => if (depth == 0) {
+                if (tokens[index].matchesKeywordTag(.between)) {
+                    skip_next_between_and = true;
+                } else if (tokens[index].matchesKeywordTag(.@"and")) {
+                    if (skip_next_between_and) {
+                        skip_next_between_and = false;
+                    } else {
+                        return .{ .kind = .logical_and, .index = index };
+                    }
+                }
+            },
+        }
+    }
+    depth = 0;
+    index = range.start;
     while (index < range.end) : (index += 1) {
         switch (tokens[index].kind) {
             .lparen, .lbracket => depth += 1,
@@ -1755,6 +1780,20 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 12 }, read.where_tokens.?);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.logical_or, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 8 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 12 }, read.where_expression.right_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const logical_and_read_sql = "SELECT id FROM usage_records WHERE status = 'open' AND deleted_at IS NULL";
+    const logical_and_read_result = try parseSqlAlloc(alloc, logical_and_read_sql);
+    switch (logical_and_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 12 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.logical_and, read.where_expression.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 8 }, read.where_expression.left_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.where_expression.operator_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 12 }, read.where_expression.right_tokens.?);
