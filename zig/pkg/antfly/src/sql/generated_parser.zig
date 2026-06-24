@@ -166,6 +166,7 @@ pub const GeneratedSqlReadAst = struct {
     cte_tokens: ?GeneratedSqlTokenRange = null,
     cte_name_tokens: ?GeneratedSqlTokenRange = null,
     cte_body_tokens: ?GeneratedSqlTokenRange = null,
+    distinct_tokens: ?GeneratedSqlTokenRange = null,
     projection_tokens: ?GeneratedSqlTokenRange = null,
     source_tokens: ?GeneratedSqlTokenRange = null,
     where_tokens: ?GeneratedSqlTokenRange = null,
@@ -265,6 +266,8 @@ pub const simple_dml_corpus = [_]GeneratedSqlCorpusCase{
 
 pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT id, status FROM usage_records WHERE status = 'open' ORDER BY id LIMIT 10", .kind = .read },
+    .{ .sql = "SELECT DISTINCT status FROM usage_records ORDER BY status", .kind = .read },
+    .{ .sql = "SELECT DISTINCT ON (organization_id) organization_id, id FROM usage_records ORDER BY organization_id ASC, created_at DESC", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY", .kind = .read },
     .{ .sql = "SELECT status FROM usage_records GROUP BY status HAVING status = 'open'", .kind = .read },
     .{ .sql = "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id", .kind = .read },
@@ -499,6 +502,10 @@ fn classifyReadKind(tokens: []const token_mod.Token) GeneratedSqlReadKind {
     for (tokens) |token| {
         if (token.matchesKeywordTag(.over)) return .window;
     }
+    if (tokens.len > 1 and tokens[0].matchesKeywordTag(.select) and tokens[1].matchesKeywordTag(.distinct)) {
+        if (tokens.len > 2 and tokens[2].matchesKeywordTag(.on)) return .query;
+        return .aggregate;
+    }
     for (tokens) |token| {
         if (token.matchesKeywordTag(.join)) return .join;
     }
@@ -695,18 +702,19 @@ fn buildReadAst(
     const body_end = firstTopLevelSetOperation(tokens, select_index + 1, end) orelse end;
     if (body_end < end) ast.set_operation_tokens = .{ .start = body_end, .end = end };
 
-    const from_index = findTopLevelKeyword(tokens, select_index + 1, body_end, .from);
-    const where_index = findTopLevelKeyword(tokens, select_index + 1, body_end, .where);
-    const group_index = findTopLevelKeyword(tokens, select_index + 1, body_end, .group);
-    const having_index = findTopLevelKeyword(tokens, select_index + 1, body_end, .having);
-    const window_index = findTopLevelKeyword(tokens, select_index + 1, body_end, .window);
-    const order_index = findTopLevelKeyword(tokens, select_index + 1, body_end, .order);
-    const limit_index = findTopLevelKeyword(tokens, select_index + 1, body_end, .limit);
-    const offset_index = findTopLevelKeyword(tokens, select_index + 1, body_end, .offset);
-    const fetch_index = findTopLevelKeyword(tokens, select_index + 1, body_end, .fetch);
+    const projection_start = generatedReadProjectionStart(tokens, select_index, body_end, &ast);
+    const from_index = findTopLevelKeyword(tokens, projection_start, body_end, .from);
+    const where_index = findTopLevelKeyword(tokens, projection_start, body_end, .where);
+    const group_index = findTopLevelKeyword(tokens, projection_start, body_end, .group);
+    const having_index = findTopLevelKeyword(tokens, projection_start, body_end, .having);
+    const window_index = findTopLevelKeyword(tokens, projection_start, body_end, .window);
+    const order_index = findTopLevelKeyword(tokens, projection_start, body_end, .order);
+    const limit_index = findTopLevelKeyword(tokens, projection_start, body_end, .limit);
+    const offset_index = findTopLevelKeyword(tokens, projection_start, body_end, .offset);
+    const fetch_index = findTopLevelKeyword(tokens, projection_start, body_end, .fetch);
 
     const projection_end = firstOptionalIndex(&[_]?usize{ from_index, where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
-    if (select_index + 1 < projection_end) ast.projection_tokens = .{ .start = select_index + 1, .end = projection_end };
+    if (projection_start < projection_end) ast.projection_tokens = .{ .start = projection_start, .end = projection_end };
 
     if (from_index) |idx| {
         const source_end = firstOptionalIndex(&[_]?usize{ where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
@@ -747,6 +755,24 @@ fn buildReadAst(
     }
 
     return ast;
+}
+
+fn generatedReadProjectionStart(
+    tokens: []const token_mod.Token,
+    select_index: usize,
+    body_end: usize,
+    ast: *GeneratedSqlReadAst,
+) usize {
+    const distinct_index = select_index + 1;
+    if (distinct_index >= body_end or !tokens[distinct_index].matchesKeywordTag(.distinct)) return distinct_index;
+    if (distinct_index + 2 < body_end and tokens[distinct_index + 1].matchesKeywordTag(.on) and tokens[distinct_index + 2].kind == .lparen) {
+        if (findMatchingParen(tokens, distinct_index + 2, body_end)) |close| {
+            ast.distinct_tokens = .{ .start = distinct_index, .end = close + 1 };
+            return close + 1;
+        }
+    }
+    ast.distinct_tokens = .{ .start = distinct_index, .end = distinct_index + 1 };
+    return distinct_index + 1;
 }
 
 fn buildReadCteAst(tokens: []const token_mod.Token, final_select_index: usize, ast: *GeneratedSqlReadAst) void {
@@ -1232,6 +1258,31 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read.source_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.group_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 11 }, read.having_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const distinct_read_sql = "SELECT DISTINCT status FROM usage_records ORDER BY status";
+    const distinct_read_result = try parseSqlAlloc(alloc, distinct_read_sql);
+    switch (distinct_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.aggregate, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.distinct_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, read.projection_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.order_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const distinct_on_read_sql = "SELECT DISTINCT ON (organization_id) organization_id, id FROM usage_records ORDER BY organization_id ASC, created_at DESC";
+    const distinct_on_read_result = try parseSqlAlloc(alloc, distinct_on_read_sql);
+    switch (distinct_on_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 6 }, read.distinct_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 9 }, read.projection_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.source_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

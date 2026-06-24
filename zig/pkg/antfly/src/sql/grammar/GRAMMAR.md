@@ -95,6 +95,8 @@ basic `OVER (PARTITION BY ... ORDER BY ...)` window reads now classify as a
 generated window family, minimal named `WINDOW ... AS (PARTITION BY ... ORDER
 BY ...)` clauses are accepted and ranged, and window reads dispatch directly
 after validating projection/source ranges;
+plain `DISTINCT` and `DISTINCT ON (...)` reads now carry generated distinct
+ranges and match the production aggregate/query-family split;
 generated set-operation reads now classify as a distinct read family and
 validate the left query and set-operation tail before calling the set-operation
 lowerer directly;
@@ -221,6 +223,8 @@ Suggested migration order:
    `WINDOW ... AS (PARTITION BY ... ORDER BY ...)` reads now classify as
    generated window reads and dispatch to the typed window lowerer after range
    validation.
+   Plain `DISTINCT` and `DISTINCT ON (...)` reads now carry generated distinct
+   ranges and preserve the production aggregate/query-family split.
    Set-operation reads now classify as their own generated read family and
    dispatch to the native set-operation lowerer after validating the generated
    left-query and set-operation-tail ranges. Simple non-recursive CTE reads now

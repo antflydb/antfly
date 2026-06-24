@@ -31,7 +31,7 @@
 %token EQ NEQ LT LTE GT GTE PLUS MINUS SLASH PERCENT COLON COLON_COLON
 %token ARROW_JSON ARROW_TEXT PATH_ARROW_JSON PATH_ARROW_TEXT
 %token ALL ALTER ANALYZE AND AS ASC BEGIN BY CASCADE COMMIT CONFLICT CONSTRAINT CONTINUE
-%token CREATE DATABASE DEALLOCATE DEFAULT DELETE DESC DISCARD DO DROP EXECUTE
+%token CREATE DATABASE DEALLOCATE DEFAULT DELETE DESC DISCARD DISTINCT DO DROP EXECUTE
 %token EXPLAIN EXISTS EXTENSION FALSE FETCH FIRST FROM FULL GRAPH GROUP HAVING IDENTITY IF INDEX INSERT INTO
 %token JOIN KEY LATERAL LIMIT MATCHED MERGE METRIC NOT NULL ON OR ORDER OVER PARTITION PREPARE PRIMARY PUBLIC
 %token NEXT NOTHING OFFSET ONLY QUERY RESET RESTART RESTRICT RETURNING ROLLBACK ROW ROWS SCHEMA SELECT SET SHOW TABLE TO TRUNCATE
@@ -207,7 +207,13 @@ all_opt:
   ;
 
 select_statement:
-    SELECT select_list from_clause_opt where_clause_opt group_by_clause_opt having_clause_opt window_clause_opt order_by_clause_opt pagination_clause_list_opt
+    SELECT distinct_clause_opt select_list from_clause_opt where_clause_opt group_by_clause_opt having_clause_opt window_clause_opt order_by_clause_opt pagination_clause_list_opt
+  ;
+
+distinct_clause_opt:
+    /* empty */
+  | DISTINCT
+  | DISTINCT ON LPAREN expression_list RPAREN
   ;
 
 graph_statement:

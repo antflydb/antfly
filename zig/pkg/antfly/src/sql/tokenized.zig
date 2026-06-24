@@ -840,6 +840,8 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
         read: classifier.SqlReadStatementKind,
     }{
         .{ .sql = "SELECT id, status FROM usage_records WHERE status = 'open' ORDER BY id LIMIT 10", .generated = .query, .read = .query },
+        .{ .sql = "SELECT DISTINCT status FROM usage_records ORDER BY status", .generated = .aggregate, .read = .aggregate },
+        .{ .sql = "SELECT DISTINCT ON (organization_id) organization_id, id FROM usage_records ORDER BY organization_id ASC, created_at DESC", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY", .generated = .query, .read = .query },
         .{ .sql = "SELECT status FROM usage_records GROUP BY status HAVING status = 'open'", .generated = .aggregate, .read = .aggregate },
         .{ .sql = "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id", .generated = .join, .read = .join },
@@ -873,9 +875,16 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                 } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY")) {
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 7 }, read_ast.offset_tokens.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 8, .end = 12 }, read_ast.fetch_tokens.?);
+                } else if (std.mem.eql(u8, case.sql, "SELECT DISTINCT ON (organization_id) organization_id, id FROM usage_records ORDER BY organization_id ASC, created_at DESC")) {
+                    try std.testing.expect(read_ast.distinct_tokens != null);
+                    try std.testing.expect(read_ast.projection_tokens != null);
                 } else if (case.generated == .aggregate) {
-                    try std.testing.expect(read_ast.group_tokens != null);
-                    try std.testing.expect(read_ast.having_tokens != null);
+                    if (std.mem.indexOf(u8, case.sql, "DISTINCT")) |_| {
+                        try std.testing.expect(read_ast.distinct_tokens != null);
+                    } else {
+                        try std.testing.expect(read_ast.group_tokens != null);
+                        try std.testing.expect(read_ast.having_tokens != null);
+                    }
                 } else if (case.generated == .window) {
                     try std.testing.expect(read_ast.projection_tokens != null);
                     try std.testing.expect(read_ast.source_tokens != null);
@@ -899,10 +908,10 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
         }
     }
 
-    var unsupported_read = try ParsedSql.initAlloc(alloc, "SELECT DISTINCT ON (organization_id) organization_id, id FROM usage_records ORDER BY organization_id ASC, created_at DESC");
-    defer unsupported_read.deinit(alloc);
-    try std.testing.expect(unsupported_read.generated_statement == null);
-    try std.testing.expectEqual(classifier.SqlReadStatementKind.query, unsupported_read.readStatementKind().?);
+    var generated_distinct_on = try ParsedSql.initAlloc(alloc, "SELECT DISTINCT ON (organization_id) organization_id, id FROM usage_records ORDER BY organization_id ASC, created_at DESC");
+    defer generated_distinct_on.deinit(alloc);
+    try std.testing.expect(generated_distinct_on.generated_statement != null);
+    try std.testing.expectEqual(classifier.SqlReadStatementKind.query, generated_distinct_on.readStatementKind().?);
 }
 
 test "sql adapter parsed sql retains generated graph nodes as DDL until graph cutover" {

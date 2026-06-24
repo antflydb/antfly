@@ -269,6 +269,7 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: gen
         read_ast.cte_tokens,
         read_ast.cte_name_tokens,
         read_ast.cte_body_tokens,
+        read_ast.distinct_tokens,
         read_ast.projection_tokens,
         read_ast.source_tokens,
         read_ast.where_tokens,
@@ -291,7 +292,7 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: gen
         },
         .aggregate => {
             if (read_ast.projection_tokens == null) return error.UnsupportedSqlShape;
-            if (read_ast.group_tokens == null and read_ast.having_tokens == null) return error.UnsupportedSqlShape;
+            if (read_ast.group_tokens == null and read_ast.having_tokens == null and read_ast.distinct_tokens == null) return error.UnsupportedSqlShape;
         },
         .join => {
             if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return error.UnsupportedSqlShape;
@@ -322,7 +323,12 @@ fn validateGeneratedSimpleQueryReadAst(tokens: []const tokenized.Token, read_ast
     }
     const projection = read_ast.projection_tokens orelse return error.UnsupportedSqlShape;
     const source = read_ast.source_tokens orelse return error.UnsupportedSqlShape;
-    try validateGeneratedReadRangePrecededByKeyword(tokens, projection, .select);
+    if (read_ast.distinct_tokens) |range| {
+        try validateGeneratedReadRangePrecededByKeyword(tokens, range, .select);
+        if (projection.start != range.end) return error.UnsupportedSqlShape;
+    } else {
+        try validateGeneratedReadRangePrecededByKeyword(tokens, projection, .select);
+    }
     try validateGeneratedReadRangePrecededByKeyword(tokens, source, .from);
     if (read_ast.where_tokens) |range| try validateGeneratedReadRangePrecededByKeyword(tokens, range, .where);
     if (read_ast.order_tokens) |range| try validateGeneratedReadOrderRange(tokens, range);
@@ -336,7 +342,7 @@ fn validateGeneratedAggregateReadAst(read_ast: generated_parser.GeneratedSqlRead
         return error.UnsupportedSqlShape;
     }
     if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return error.UnsupportedSqlShape;
-    if (read_ast.group_tokens == null and read_ast.having_tokens == null) return error.UnsupportedSqlShape;
+    if (read_ast.group_tokens == null and read_ast.having_tokens == null and read_ast.distinct_tokens == null) return error.UnsupportedSqlShape;
 }
 
 fn validateGeneratedJoinedReadAst(
