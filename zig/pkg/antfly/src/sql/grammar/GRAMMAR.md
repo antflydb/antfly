@@ -212,9 +212,10 @@ routing through the generic DDL family. The generated
 facade now returns closed statement-family nodes for the covered families and
 explicit unsupported statement nodes for seed `ANALYZE`, bulk I/O `COPY`,
 maintenance `VACUUM`/`REINDEX`, utility/control statements such as `CLUSTER`,
-`COMMENT`, `GRANT`/`REVOKE`, `LISTEN`/`NOTIFY`, and `LOCK`, plus simple
-cursor and transaction-control statements such as `CLOSE`, `FETCH`, `MOVE`,
-`SAVEPOINT`, and `RELEASE`, plus simple `EXPLAIN` forms with stable reason metadata; full production AST construction
+`COMMENT`, `GRANT`/`REVOKE`, `LISTEN`/`NOTIFY`, `LOCK`, `CALL`,
+`CHECKPOINT`, `LOAD`, `REFRESH`, `SECURITY LABEL`, and `UNLISTEN`, plus
+simple cursor and transaction-control statements such as `CLOSE`, `DECLARE`,
+`FETCH`, `MOVE`, `SAVEPOINT`, and `RELEASE`, plus simple `EXPLAIN` forms with stable reason metadata; full production AST construction
 remains the next migration boundary for larger DDL, query, DML, and Antfly
 extension families.
 
@@ -631,7 +632,8 @@ variants for:
   retained as a subset rather than as standalone graph statements
 - unsupported statement, including generated AST payloads for seed `ANALYZE`,
   `COPY`, `VACUUM`, `REINDEX`, `CLUSTER`, `COMMENT`, `GRANT`, `REVOKE`,
-  `LISTEN`, `NOTIFY`, `LOCK`, `CLOSE`, `DECLARE`, `FETCH`, `MOVE`,
+  `LISTEN`, `NOTIFY`, `LOCK`, `CALL`, `CHECKPOINT`, `LOAD`, `REFRESH`,
+  `SECURITY LABEL`, `UNLISTEN`, `CLOSE`, `DECLARE`, `FETCH`, `MOVE`,
   `SAVEPOINT`, and `RELEASE`, plus bare, simple, optioned, and
   `EXPLAIN ANALYZE` forms with command spans, subject ranges where present,
   and stable unsupported reason metadata
@@ -668,7 +670,8 @@ Generated grammar work needs evidence at multiple levels:
 - Corpus tests for intentionally unsupported PostgreSQL syntax with stable
   diagnostics. Seed `ANALYZE`, bulk I/O `COPY`, maintenance `VACUUM`/`REINDEX`,
   utility/control statements such as `CLUSTER`, `COMMENT`, `GRANT`/`REVOKE`,
-  `LISTEN`/`NOTIFY`, `LOCK`, cursor commands `CLOSE`/`FETCH`/`MOVE`, and
+  `LISTEN`/`NOTIFY`, `LOCK`, `CALL`, `CHECKPOINT`, `LOAD`, `REFRESH`,
+  `SECURITY LABEL`, `UNLISTEN`, cursor commands `CLOSE`/`DECLARE`/`FETCH`/`MOVE`, and
   transaction-control commands `SAVEPOINT`/`RELEASE`, and bare, simple, optioned, and
   `EXPLAIN ANALYZE` forms now produce generated unsupported AST nodes with
   stable reason metadata and subject ranges where available.

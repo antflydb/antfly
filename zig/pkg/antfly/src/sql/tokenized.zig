@@ -817,6 +817,16 @@ test "sql adapter parsed sql owns typed statement variants" {
         reason: generated_parser.GeneratedSqlUnsupportedReason,
     }{
         .{
+            .sql = "CALL refresh_usage_records()",
+            .kind = .call,
+            .reason = .call_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "CHECKPOINT",
+            .kind = .checkpoint,
+            .reason = .checkpoint_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "CLOSE usage_cursor",
             .kind = .close,
             .reason = .close_not_planned_by_generated_parser,
@@ -857,6 +867,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .listen_not_planned_by_generated_parser,
         },
         .{
+            .sql = "LOAD 'auto_explain'",
+            .kind = .load,
+            .reason = .load_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "LOCK TABLE usage_records IN SHARE MODE",
             .kind = .lock,
             .reason = .lock_not_planned_by_generated_parser,
@@ -870,6 +885,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "NOTIFY usage_events, 'changed'",
             .kind = .notify,
             .reason = .notify_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "REFRESH MATERIALIZED VIEW usage_summary",
+            .kind = .refresh,
+            .reason = .refresh_not_planned_by_generated_parser,
         },
         .{
             .sql = "VACUUM (FULL, VERBOSE, ANALYZE) public.usage_records",
@@ -896,6 +916,16 @@ test "sql adapter parsed sql owns typed statement variants" {
             .kind = .savepoint,
             .reason = .savepoint_not_planned_by_generated_parser,
         },
+        .{
+            .sql = "SECURITY LABEL ON TABLE usage_records IS 'internal'",
+            .kind = .security_label,
+            .reason = .security_label_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "UNLISTEN *",
+            .kind = .unlisten,
+            .reason = .unlisten_not_planned_by_generated_parser,
+        },
     };
     for (unsupported_diagnostics) |case| {
         var parsed = try ParsedSql.initAlloc(alloc, case.sql);
@@ -905,7 +935,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .unsupported => |unsupported| {
                 try std.testing.expectEqual(case.kind, unsupported.kind);
                 try std.testing.expectEqual(case.reason, unsupported.reason);
-                try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = parsed.items().len }, unsupported.subject_tokens.?);
+                if (parsed.items().len == 1) {
+                    try std.testing.expect(unsupported.subject_tokens == null);
+                } else {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = parsed.items().len }, unsupported.subject_tokens.?);
+                }
             },
             else => return error.TestUnexpectedResult,
         }
