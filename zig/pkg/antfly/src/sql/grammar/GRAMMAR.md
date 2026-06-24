@@ -54,9 +54,10 @@ simple DDL ASTs now have AST-to-plan parity for database, schema, and extension
 create/drop catalog plans, plus generated AST-to-plan parity for seed
 `CREATE TABLE` and `CREATE INDEX` forms using the same parser options as the
 existing lowerer. Simple DML now has generated-parser corpus coverage and
-retained generated raw nodes for covered write statements, but unsupported DML
-still falls back until plan parity is proven. Representative read queries now
-have generated-parser corpus coverage and retained generated raw nodes for
+retained generated raw and AST nodes for covered write statements, but
+unsupported DML still falls back and DML execution still uses the existing
+token-based lowerers until plan parity is proven. Representative read queries
+now have generated-parser corpus coverage and retained generated raw nodes for
 covered read statements, while unsupported read shapes still fall back until
 read-plan parity is proven. The generated parser now also treats seed graph DDL
 as a distinct graph statement family and `ParsedSql` retains those generated
@@ -233,7 +234,7 @@ variants for:
 - DDL statement, including a generated AST payload for command spans, plus
   generated AST-to-plan parity for database, schema, and extension create/drop
   catalog plans and seed `CREATE TABLE` / `CREATE INDEX` plans
-- DML statement
+- DML statement, including a generated AST payload for command spans
 - read statement
 - graph statement
 

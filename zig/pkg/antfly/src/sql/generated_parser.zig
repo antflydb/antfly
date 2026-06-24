@@ -132,11 +132,18 @@ pub const GeneratedSqlDdlAst = struct {
     command_span: token_mod.SourceSpan,
 };
 
+pub const GeneratedSqlDmlAst = struct {
+    kind: GeneratedSqlDmlKind,
+    statement_span: token_mod.SourceSpan,
+    command_span: token_mod.SourceSpan,
+};
+
 pub const GeneratedSqlAst = union(enum) {
     session: GeneratedSqlSessionAst,
     transaction: GeneratedSqlTransactionAst,
     prepared: GeneratedSqlPreparedAst,
     ddl: GeneratedSqlDdlAst,
+    dml: GeneratedSqlDmlAst,
 };
 
 pub const GeneratedSqlParseResult = struct {
@@ -460,6 +467,11 @@ fn buildGeneratedAst(tokens: []const token_mod.Token, statement: GeneratedSqlSta
             .statement_span = statement_span,
             .command_span = command_span,
         } },
+        .dml => |kind| .{ .dml = .{
+            .kind = kind,
+            .statement_span = statement_span,
+            .command_span = command_span,
+        } },
         else => null,
     };
 }
@@ -631,6 +643,17 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlDdlKind.create_schema, ddl.kind);
             try std.testing.expectEqualStrings("CREATE SCHEMA IF NOT EXISTS analytics", spanText(ddl_sql, ddl.statement_span));
             try std.testing.expectEqualStrings("CREATE", spanText(ddl_sql, ddl.command_span));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const dml_sql = "UPDATE usage_records SET status = 'done' WHERE id = 'u1'";
+    const dml_result = try parseSqlAlloc(alloc, dml_sql);
+    switch (dml_result.ast.?) {
+        .dml => |dml| {
+            try std.testing.expectEqual(GeneratedSqlDmlKind.update, dml.kind);
+            try std.testing.expectEqualStrings("UPDATE usage_records SET status = 'done' WHERE id = 'u1'", spanText(dml_sql, dml.statement_span));
+            try std.testing.expectEqualStrings("UPDATE", spanText(dml_sql, dml.command_span));
         },
         else => return error.TestUnexpectedResult,
     }

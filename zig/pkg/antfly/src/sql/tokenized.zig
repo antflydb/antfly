@@ -816,6 +816,10 @@ test "sql adapter parsed sql retains generated DML nodes for covered write corpu
             .dml => |kind| try std.testing.expectEqual(case.generated, kind),
             else => return error.TestUnexpectedResult,
         }
+        switch (parsed.generated_statement.?.ast.?) {
+            .dml => |dml_ast| try std.testing.expectEqual(case.generated, dml_ast.kind),
+            else => return error.TestUnexpectedResult,
+        }
         switch (parsed.statement) {
             .write => |statement| try std.testing.expectEqual(case.write, statement.kind),
             else => return error.TestUnexpectedResult,
