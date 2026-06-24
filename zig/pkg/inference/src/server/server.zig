@@ -136,12 +136,12 @@ const GenerateBackendSelection = struct {
 };
 
 fn parseGenerateBackendSelection(
-    backend_value: ?[]const u8,
+    backend_value: ?api.GenerateBackendOverride,
     mode_value: ?[]const u8,
     compiled_target_value: ?[]const u8,
 ) !GenerateBackendSelection {
     const choice = if (backend_value) |value|
-        native_backend_choice.parse(value) orelse return error.InvalidBackend
+        generateBackendOverrideToChoice(value)
     else
         native_backend_choice.Choice.auto;
     try native_backend_choice.validate(choice);
@@ -170,6 +170,18 @@ fn parseGenerateBackendSelection(
         .compiled_partition_backend = explicit_partition_backend,
         .compiled_attachment_target = compiled_attachment_target,
         .graph_mode_requested = compiled_mode_requested,
+    };
+}
+
+fn generateBackendOverrideToChoice(value: api.GenerateBackendOverride) native_backend_choice.Choice {
+    return switch (value) {
+        .auto => .auto,
+        .onnx => .onnx,
+        .native => .native,
+        .metal => .metal,
+        .cuda => .cuda,
+        .xla => .xla,
+        .webgpu => .webgpu,
     };
 }
 
@@ -5832,14 +5844,14 @@ test "modelKindAcceptsInput infers text and image modalities" {
 }
 
 test "generate backend selection keeps compiled mode explicit" {
-    const eager_webgpu = parseGenerateBackendSelection("webgpu", null, null);
+    const eager_webgpu = parseGenerateBackendSelection(.webgpu, null, null);
     if (build_options.enable_wasm and build_options.enable_webgpu) {
         const eager = try eager_webgpu;
         try std.testing.expectEqual(native_backend_choice.Choice.webgpu, eager.native_choice);
         try std.testing.expectEqual(@as(?ops.BackendKind, null), eager.compiled_partition_backend);
         try std.testing.expect(!eager.graph_mode_requested);
 
-        const compiled = try parseGenerateBackendSelection("webgpu", "compiled", null);
+        const compiled = try parseGenerateBackendSelection(.webgpu, "compiled", null);
         try std.testing.expectEqual(native_backend_choice.Choice.webgpu, compiled.native_choice);
         try std.testing.expectEqual(@as(?ops.BackendKind, .webgpu), compiled.compiled_partition_backend);
         try std.testing.expectEqual(graph_mod.compiled_backend.AttachmentTarget.partitioned, compiled.compiled_attachment_target);

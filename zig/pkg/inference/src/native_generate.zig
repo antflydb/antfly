@@ -3602,7 +3602,7 @@ fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, qu
         .stream = if (opts.stream) true else null,
         .cache_dtype = opts.cache_dtype,
         .cache_compaction_ratio = opts.cache_compaction_ratio,
-        .backend = if (opts.backend == .auto) null else @tagName(opts.backend),
+        .backend = generateBackendOverrideForChoice(opts.backend),
         .mode = serverGenerateModeName(opts),
         .compiled_target = serverGenerateCompiledTargetName(opts),
     };
@@ -3650,6 +3650,18 @@ fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, qu
             0;
         print("timing_ms: server_request={d} total={d} tokens_per_sec={d:.2}\n", .{ total_ms, total_ms, tokens_per_sec });
     }
+}
+
+fn generateBackendOverrideForChoice(choice: BackendChoice) ?api.GenerateBackendOverride {
+    return switch (choice) {
+        .auto => null,
+        .onnx => .onnx,
+        .native => .native,
+        .metal => .metal,
+        .cuda => .cuda,
+        .xla => .xla,
+        .webgpu => .webgpu,
+    };
 }
 
 const SseEventBoundary = struct {
