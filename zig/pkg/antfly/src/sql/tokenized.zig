@@ -851,6 +851,10 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
             .read => |kind| try std.testing.expectEqual(case.generated, kind),
             else => return error.TestUnexpectedResult,
         }
+        switch (parsed.generated_statement.?.ast.?) {
+            .read => |read_ast| try std.testing.expectEqual(case.generated, read_ast.kind),
+            else => return error.TestUnexpectedResult,
+        }
         switch (parsed.statement) {
             .read => |statement| try std.testing.expectEqual(case.read, statement.kind),
             else => return error.TestUnexpectedResult,
@@ -880,6 +884,10 @@ test "sql adapter parsed sql retains generated graph nodes as DDL until graph cu
         try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.graph, parsed.generatedStatementKind().?);
         switch (parsed.generated_statement.?.statement) {
             .graph => |kind| try std.testing.expectEqual(case.generated, kind),
+            else => return error.TestUnexpectedResult,
+        }
+        switch (parsed.generated_statement.?.ast.?) {
+            .graph => |graph_ast| try std.testing.expectEqual(case.generated, graph_ast.kind),
             else => return error.TestUnexpectedResult,
         }
         switch (parsed.statement) {

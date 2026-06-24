@@ -138,12 +138,26 @@ pub const GeneratedSqlDmlAst = struct {
     command_span: token_mod.SourceSpan,
 };
 
+pub const GeneratedSqlReadAst = struct {
+    kind: GeneratedSqlReadKind,
+    statement_span: token_mod.SourceSpan,
+    command_span: token_mod.SourceSpan,
+};
+
+pub const GeneratedSqlGraphAst = struct {
+    kind: GeneratedSqlGraphKind,
+    statement_span: token_mod.SourceSpan,
+    command_span: token_mod.SourceSpan,
+};
+
 pub const GeneratedSqlAst = union(enum) {
     session: GeneratedSqlSessionAst,
     transaction: GeneratedSqlTransactionAst,
     prepared: GeneratedSqlPreparedAst,
     ddl: GeneratedSqlDdlAst,
     dml: GeneratedSqlDmlAst,
+    read: GeneratedSqlReadAst,
+    graph: GeneratedSqlGraphAst,
 };
 
 pub const GeneratedSqlParseResult = struct {
@@ -472,6 +486,16 @@ fn buildGeneratedAst(tokens: []const token_mod.Token, statement: GeneratedSqlSta
             .statement_span = statement_span,
             .command_span = command_span,
         } },
+        .read => |kind| .{ .read = .{
+            .kind = kind,
+            .statement_span = statement_span,
+            .command_span = command_span,
+        } },
+        .graph => |kind| .{ .graph = .{
+            .kind = kind,
+            .statement_span = statement_span,
+            .command_span = command_span,
+        } },
         else => null,
     };
 }
@@ -654,6 +678,28 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlDmlKind.update, dml.kind);
             try std.testing.expectEqualStrings("UPDATE usage_records SET status = 'done' WHERE id = 'u1'", spanText(dml_sql, dml.statement_span));
             try std.testing.expectEqualStrings("UPDATE", spanText(dml_sql, dml.command_span));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const read_sql = "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id";
+    const read_result = try parseSqlAlloc(alloc, read_sql);
+    switch (read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.join, read.kind);
+            try std.testing.expectEqualStrings("SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id", spanText(read_sql, read.statement_span));
+            try std.testing.expectEqualStrings("SELECT", spanText(read_sql, read.command_span));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const graph_sql = "CREATE GRAPH METRIC docs_pagerank ON doc_edges WITH (metric = 'pagerank')";
+    const graph_result = try parseSqlAlloc(alloc, graph_sql);
+    switch (graph_result.ast.?) {
+        .graph => |graph| {
+            try std.testing.expectEqual(GeneratedSqlGraphKind.create_metric, graph.kind);
+            try std.testing.expectEqualStrings("CREATE GRAPH METRIC docs_pagerank ON doc_edges WITH (metric = 'pagerank')", spanText(graph_sql, graph.statement_span));
+            try std.testing.expectEqualStrings("CREATE", spanText(graph_sql, graph.command_span));
         },
         else => return error.TestUnexpectedResult,
     }

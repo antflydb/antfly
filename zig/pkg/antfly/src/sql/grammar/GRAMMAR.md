@@ -57,12 +57,13 @@ existing lowerer. Simple DML now has generated-parser corpus coverage and
 retained generated raw and AST nodes for covered write statements, but
 unsupported DML still falls back and DML execution still uses the existing
 token-based lowerers until plan parity is proven. Representative read queries
-now have generated-parser corpus coverage and retained generated raw nodes for
-covered read statements, while unsupported read shapes still fall back until
-read-plan parity is proven. The generated parser now also treats seed graph DDL
-as a distinct graph statement family and `ParsedSql` retains those generated
-nodes, but graph execution still routes through the existing DDL variant until
-graph-specific raw AST and lowering parity exist. The generated facade now
+now have generated-parser corpus coverage and retained generated raw and AST
+nodes for covered read statements, while unsupported read shapes still fall back
+until read-plan parity is proven. The generated parser now also treats seed
+graph DDL as a distinct graph statement family and `ParsedSql` retains those
+generated raw and AST nodes, but graph execution still routes through the
+existing DDL variant until graph-specific lowering parity exists. The generated
+facade now
 returns closed statement-family nodes for the covered families; full production
 AST construction remains the next migration boundary for larger DDL, query,
 DML, and Antfly extension families.
@@ -235,8 +236,8 @@ variants for:
   generated AST-to-plan parity for database, schema, and extension create/drop
   catalog plans and seed `CREATE TABLE` / `CREATE INDEX` plans
 - DML statement, including a generated AST payload for command spans
-- read statement
-- graph statement
+- read statement, including a generated AST payload for command spans
+- graph statement, including a generated AST payload for command spans
 
 Later statement-family cutovers should add closed variants for:
 
@@ -266,7 +267,8 @@ Generated grammar work needs evidence at multiple levels:
   diagnostics.
 - AST shape tests for source spans, identifier normalization, literals,
   placeholders, casts, operators, and nested statements. The first AST shape
-  test covers generated session, transaction, and prepared statement payloads.
+  tests cover generated session, transaction, prepared, DDL, DML, read, and
+  graph statement payloads.
 - Plan parity tests showing generated ASTs lower to the same typed plans as the
   current parser for migrated statement families. Session catalog commands,
   transaction boundaries, prepared statements, and simple DDL database/schema/
