@@ -3047,6 +3047,7 @@ pub fn ddlPlanFromGeneratedAstAlloc(
     return switch (ast.kind) {
         .create_table => .{ .create_table = try parseCreateTablePlanAlloc(alloc, tail, &pos, options.column_definition_options) },
         .create_index => .{ .create_index = try createIndexPlanFromGeneratedAstAlloc(alloc, tokens, ast, options.create_index_options) },
+        .alter_table => .{ .alter_table = try alterTablePlanFromGeneratedAstAlloc(alloc, tokens, ast, options.column_definition_options) },
         else => try simpleDdlPlanFromGeneratedAstAlloc(alloc, tokens, ast),
     };
 }
@@ -3357,6 +3358,33 @@ fn createIndexPlanFromGeneratedAstAlloc(
     var plan = try parseCreateIndexPlanAlloc(alloc, tokens[index_keyword..end], &pos, ast.unique, options);
     errdefer plan.deinit(alloc);
     if (plan.unique != ast.unique) return error.UnsupportedSqlShape;
+    return plan;
+}
+
+fn alterTablePlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+    options: DdlColumnDefinitionOptions,
+) !AlterTablePlan {
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    if (end < 5 or !tokens[0].matchesKeywordTag(.alter) or !tokens[1].matchesKeywordTag(.table)) return error.UnsupportedSqlShape;
+
+    var index: usize = 2;
+    if (ast.if_exists) try expectGeneratedIfExists(tokens, &index, end);
+    if (index < end and tokens[index].matchesKeywordTag(.only)) index += 1;
+
+    const table_range = ast.object_name_tokens orelse return error.UnsupportedSqlShape;
+    if (table_range.start != index or table_range.end <= table_range.start or table_range.end > end) return error.UnsupportedSqlShape;
+    index = table_range.end;
+
+    const operation_range = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+    if (operation_range.start != index or operation_range.end != end or operation_range.start >= operation_range.end) return error.UnsupportedSqlShape;
+
+    var pos: usize = 0;
+    var plan = try parseAlterTablePlanAlloc(alloc, tokens[1..end], &pos, options);
+    errdefer plan.deinit(alloc);
+    if (plan.if_exists != ast.if_exists) return error.UnsupportedSqlShape;
     return plan;
 }
 
@@ -12461,6 +12489,95 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
                 try std.testing.expectEqual(legacy.method, generated.method);
                 try std.testing.expectEqual(legacy.columns.len, generated.columns.len);
                 try std.testing.expectEqualStrings(legacy.columns[0], generated.columns[0]);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const alter_add_sql = "ALTER TABLE usage_records ADD COLUMN status text;";
+    var generated_alter_add = try generatedDdlPlanForTestAlloc(alloc, alter_add_sql);
+    defer generated_alter_add.deinit(alloc);
+    var legacy_alter_add = try lowerDdlPlanForTestAlloc(alloc, alter_add_sql);
+    defer legacy_alter_add.deinit(alloc);
+    switch (generated_alter_add) {
+        .alter_table => |generated| switch (legacy_alter_add) {
+            .alter_table => |legacy| {
+                try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
+                try std.testing.expectEqual(legacy.if_exists, generated.if_exists);
+                try std.testing.expectEqual(legacy.operations.len, generated.operations.len);
+                switch (generated.operations[0]) {
+                    .add_column => |operation| try std.testing.expectEqualStrings("status", operation.column.name),
+                    else => return error.TestUnexpectedResult,
+                }
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const alter_drop_sql = "ALTER TABLE IF EXISTS ONLY usage_records DROP COLUMN IF EXISTS status RESTRICT;";
+    var generated_alter_drop = try generatedDdlPlanForTestAlloc(alloc, alter_drop_sql);
+    defer generated_alter_drop.deinit(alloc);
+    var legacy_alter_drop = try lowerDdlPlanForTestAlloc(alloc, alter_drop_sql);
+    defer legacy_alter_drop.deinit(alloc);
+    switch (generated_alter_drop) {
+        .alter_table => |generated| switch (legacy_alter_drop) {
+            .alter_table => |legacy| {
+                try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
+                try std.testing.expectEqual(legacy.if_exists, generated.if_exists);
+                try std.testing.expectEqual(legacy.operations.len, generated.operations.len);
+                switch (generated.operations[0]) {
+                    .drop_column => |operation| {
+                        try std.testing.expectEqualStrings("status", operation.name);
+                        try std.testing.expect(operation.if_exists);
+                        try std.testing.expectEqual(DropDependencyMode.restrict, operation.dependency_mode);
+                    },
+                    else => return error.TestUnexpectedResult,
+                }
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const alter_rename_sql = "ALTER TABLE usage_records RENAME COLUMN status TO state;";
+    var generated_alter_rename = try generatedDdlPlanForTestAlloc(alloc, alter_rename_sql);
+    defer generated_alter_rename.deinit(alloc);
+    var legacy_alter_rename = try lowerDdlPlanForTestAlloc(alloc, alter_rename_sql);
+    defer legacy_alter_rename.deinit(alloc);
+    switch (generated_alter_rename) {
+        .alter_table => |generated| switch (legacy_alter_rename) {
+            .alter_table => |legacy| {
+                try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
+                try std.testing.expectEqual(legacy.operations.len, generated.operations.len);
+                switch (generated.operations[0]) {
+                    .rename_column => |operation| {
+                        try std.testing.expectEqualStrings("status", operation.old_name);
+                        try std.testing.expectEqualStrings("state", operation.new_name);
+                    },
+                    else => return error.TestUnexpectedResult,
+                }
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const alter_validate_sql = "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_amount_check;";
+    var generated_alter_validate = try generatedDdlPlanForTestAlloc(alloc, alter_validate_sql);
+    defer generated_alter_validate.deinit(alloc);
+    var legacy_alter_validate = try lowerDdlPlanForTestAlloc(alloc, alter_validate_sql);
+    defer legacy_alter_validate.deinit(alloc);
+    switch (generated_alter_validate) {
+        .alter_table => |generated| switch (legacy_alter_validate) {
+            .alter_table => |legacy| {
+                try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
+                try std.testing.expectEqual(legacy.operations.len, generated.operations.len);
+                switch (generated.operations[0]) {
+                    .validate_constraint => |constraint_name| try std.testing.expectEqualStrings("usage_records_amount_check", constraint_name),
+                    else => return error.TestUnexpectedResult,
+                }
             },
             else => return error.TestUnexpectedResult,
         },

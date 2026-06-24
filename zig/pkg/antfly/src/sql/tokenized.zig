@@ -960,6 +960,23 @@ test "sql adapter parsed sql owns typed statement variants" {
         else => return error.TestUnexpectedResult,
     }
 
+    var alter_table = try ParsedSql.initAlloc(alloc, "ALTER TABLE IF EXISTS ONLY usage_records DROP COLUMN IF EXISTS status RESTRICT");
+    defer alter_table.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, alter_table.generatedStatementKind().?);
+    switch (alter_table.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_table, ddl_ast.kind);
+            try std.testing.expect(ddl_ast.if_exists);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, ddl_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 12 }, ddl_ast.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (alter_table.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
     var covering_partial_index = try ParsedSql.initAlloc(alloc, "CREATE UNIQUE INDEX usage_status_active_idx ON usage_records (status) INCLUDE (tenant_id, amount) WHERE deleted_at IS NULL");
     defer covering_partial_index.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.extension_index, covering_partial_index.generatedStatementKind().?);

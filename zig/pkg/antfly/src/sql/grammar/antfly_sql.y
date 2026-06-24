@@ -129,7 +129,14 @@ extension_version_opt:
   ;
 
 alter_table_statement:
-    ALTER TABLE qualified_name unsupported_tail_opt
+    ALTER TABLE alter_table_relation_prefix_opt qualified_name diagnostic_tail_opt
+  ;
+
+alter_table_relation_prefix_opt:
+    /* empty */
+  | IF EXISTS
+  | ONLY
+  | IF EXISTS ONLY
   ;
 
 drop_statement:
@@ -947,34 +954,51 @@ diagnostic_token:
   | LBRACKET
   | RBRACKET
   | ALL
+  | ALTER
   | ANALYZE
+  | CASCADE
   | CLOSE
   | CLUSTER
   | COMMENT
+  | CONSTRAINT
   | COPY
   | DATABASE
+  | DEFAULT
+  | DELETE
+  | DROP
+  | EXISTS
   | FALSE
   | FETCH
   | FROM
   | FULL
   | GRANT
+  | IF
   | INCLUDE
   | IN
   | INDEX
   | IS
+  | KEY
   | LISTEN
   | LOCK
   | MOVE
+  | NEXT
+  | NOT
+  | NULL
   | NOTIFY
   | ON
+  | ONLY
+  | PRIMARY
   | RELEASE
+  | RESTRICT
   | REVOKE
   | SAVEPOINT
   | SCHEMA
   | SELECT
+  | SET
   | TABLE
   | TO
   | TRUE
+  | UNIQUE
   | USING
   | VACUUM
   | WITH

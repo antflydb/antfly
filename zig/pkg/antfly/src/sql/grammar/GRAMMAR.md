@@ -257,10 +257,14 @@ Suggested migration order:
    metric declarations, and extension declarations. Simple database, schema,
    table, index, and extension DDL now has generated-parser corpus coverage
    when it matches the seed grammar. Database, schema, and extension create/drop
-   catalog DDL now has structured generated AST payloads and direct generated
-   AST-to-plan lowering, and generated create-index metadata covers basic
-   PostgreSQL-style unique, covering, partial, method, element-list, and option
-   clauses with generated-first AST-to-plan parity validation. Unsupported DDL remains on the existing parser until
+catalog DDL now has structured generated AST payloads and direct generated
+AST-to-plan lowering, and generated create-index metadata covers basic
+PostgreSQL-style unique, covering, partial, method, element-list, and option
+clauses with generated-first AST-to-plan parity validation. Generated
+`ALTER TABLE` ASTs now retain target-table and operation-tail ranges and
+generated-first ALTER TABLE planning validates those ranges before lowering
+through the typed DDL planner for covered add/drop/rename/validate operations.
+Unsupported DDL remains on the existing parser until
    each shape has raw AST parity.
 3. Simple DML: `INSERT ... VALUES`, primary-key `UPDATE`, primary-key
    `DELETE`, `RETURNING`, and `ON CONFLICT`. Initial generated-parser coverage
@@ -543,7 +547,8 @@ variants for:
   for typed `PREPARE`, `EXECUTE`, and `DEALLOCATE`
 - DDL statement, including generated AST payloads for command spans, object
   names, catalog option fields, drop behavior, and generated AST-to-plan parity
-  for database and schema catalog plans plus seed `CREATE TABLE` plans
+  for database and schema catalog plans plus seed `CREATE TABLE` and
+  `ALTER TABLE` plans
 - DML statement, including generated AST payloads for command spans, target
   tables, source/body ranges, predicates, conflict clauses, returning clauses,
   values lists, default-values inserts, truncate options, generated-first
@@ -615,7 +620,7 @@ Generated grammar work needs evidence at multiple levels:
   `CREATE INDEX` plus extension catalog plans have generated AST-to-plan parity
   tests for their generated-covered forms; simple catalog DDL also has generated
   field-level checks for object names, option flags, version strings, drop
-  behavior, and fail-closed unsupported clauses.
+  behavior, ALTER TABLE operation tails, and fail-closed unsupported clauses.
   Simple DML has generated field-level checks for update and truncate body
   ranges, direct generated AST-to-plan parity for truncate mutation-source
   plans, direct resolver-free generated AST-to-plan coverage for supported

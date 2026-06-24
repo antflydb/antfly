@@ -585,6 +585,7 @@ pub const GeneratedSqlDdlAst = struct {
     index_include_tokens: ?GeneratedSqlTokenRange = null,
     index_options_tokens: ?GeneratedSqlTokenRange = null,
     index_where_tokens: ?GeneratedSqlTokenRange = null,
+    alter_table_operation_tokens: ?GeneratedSqlTokenRange = null,
     unique: bool = false,
     if_not_exists: bool = false,
     if_exists: bool = false,
@@ -782,6 +783,8 @@ pub const simple_ddl_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CREATE SCHEMA IF NOT EXISTS analytics", .kind = .ddl },
     .{ .sql = "CREATE TABLE usage_records (id text PRIMARY KEY, status text DEFAULT 'open')", .kind = .ddl },
     .{ .sql = "CREATE TABLE IF NOT EXISTS usage_records (id text PRIMARY KEY)", .kind = .ddl },
+    .{ .sql = "ALTER TABLE usage_records ADD COLUMN status text", .kind = .ddl },
+    .{ .sql = "ALTER TABLE IF EXISTS ONLY usage_records DROP COLUMN IF EXISTS status RESTRICT", .kind = .ddl },
     .{ .sql = "CREATE INDEX usage_records_status_idx ON usage_records (status)", .kind = .extension_index },
     .{ .sql = "CREATE INDEX IF NOT EXISTS usage_records_status_idx ON usage_records (status)", .kind = .extension_index },
     .{ .sql = "CREATE UNIQUE INDEX usage_records_status_active_idx ON usage_records (status) INCLUDE (tenant_id, amount) WHERE deleted_at IS NULL", .kind = .extension_index },
@@ -1438,6 +1441,18 @@ fn buildDdlAst(
                 }
                 if (index < end and tokens[index].matchesKeywordTag(.where)) {
                     ast.index_where_tokens = .{ .start = index + 1, .end = end };
+                }
+            }
+        },
+        .alter_table => {
+            if (end > 2 and tokens[1].matchesKeywordTag(.table)) {
+                index = 2;
+                ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
+                if (index < end and tokens[index].matchesKeywordTag(.only)) index += 1;
+                ast.object_name_tokens = generatedQualifiedNameRange(tokens, index, end);
+                if (ast.object_name_tokens) |table_range| {
+                    index = table_range.end;
+                    if (index < end) ast.alter_table_operation_tokens = .{ .start = index, .end = end };
                 }
             }
         },
@@ -3829,6 +3844,18 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 14 }, ddl.index_include_tokens.?);
             try std.testing.expect(ddl.index_options_tokens == null);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 16, .end = 19 }, ddl.index_where_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const alter_table_sql = "ALTER TABLE IF EXISTS ONLY docs ADD COLUMN status text";
+    const alter_table_result = try parseSqlAlloc(alloc, alter_table_sql);
+    switch (alter_table_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.alter_table, ddl.kind);
+            try std.testing.expect(ddl.if_exists);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 10 }, ddl.alter_table_operation_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
