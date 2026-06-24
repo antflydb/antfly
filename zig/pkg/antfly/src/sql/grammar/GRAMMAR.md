@@ -105,7 +105,11 @@ join operator/type, left input, right input, `ON` predicate ranges, and
 `USING` column-list ranges, explicit generated join-tree root/depth metadata
 for left-associative generated join nodes, plus simple top-level
 comparison expression metadata for covered `WHERE`, `HAVING`, and join
-predicates. Normal function-call argument
+predicates. Generated top-level read validation now verifies clause keyword
+layout and generated payload consistency for projection, `DISTINCT`,
+source, `WHERE`, `GROUP BY`, `HAVING`, `WINDOW`, `ORDER BY`, pagination,
+and set-operation tails before dispatching to read-family lowerers. Normal
+function-call argument
 lists are accepted in generated expression grammar, including top-level
 projection functions with comma-separated arguments, `*` aggregate arguments,
 aggregate `DISTINCT` argument metadata, aggregate-local argument `ORDER BY`
@@ -492,15 +496,17 @@ Unsupported DDL remains on the existing parser until
    Generated read validation
    rejects pagination payloads that are missing required expressions, attach
    expressions to `LIMIT ALL`, place expression spans outside their owning
-   pagination tail, or mismatch explicit `FETCH` count spans.
+   pagination tail, or mismatch explicit `FETCH` count spans; it also
+   validates top-level clause keyword layout and payload consistency for
+   projection, `DISTINCT`, source, `WHERE`, `GROUP BY`, `HAVING`, `WINDOW`,
+   `ORDER BY`, pagination, and set-operation tails before invoking the typed
+   read-family lowerers.
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current
-   validated owned expression item arrays, exact child/list expression span and
-   expression-owned token range containment checks, expression- and
-   clause-owned list containment checks, first/last list expression summary
-   checks, expression-kind structural checks, expression operator/kind token
-   consistency checks, full multi-join
+   validated owned expression item arrays, expression-kind structural checks
+   and expression operator/kind token consistency checks for remaining
+   specialized operators, full multi-join
    planning/lowering and richer join-tree semantics beyond the current
    validated left-associative generated join nodes, expression AST
    planning/lowering beyond the current recursive

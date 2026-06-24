@@ -312,6 +312,7 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: gen
     for (ranges) |range| {
         if (range) |value| try validateGeneratedReadTokenRange(tokens, read_ast, value);
     }
+    try validateGeneratedReadClauseMetadata(tokens, read_ast);
     try validateGeneratedDistinctOnListAstRanges(tokens, read_ast, read_ast.distinct_tokens, read_ast.distinct_on_items);
     try validateGeneratedReadListAstRanges(tokens, read_ast, read_ast.projection_items);
     try validateGeneratedReadListAstContainedByOptionalRange(read_ast.projection_items, read_ast.projection_tokens);
@@ -776,6 +777,119 @@ fn optionalGeneratedTokenRangeEql(
         return false;
     }
     return rhs == null;
+}
+
+fn validateGeneratedReadClauseMetadata(tokens: []const tokenized.Token, read_ast: generated_parser.GeneratedSqlReadAst) !void {
+    const projection_tokens = read_ast.projection_tokens orelse return error.UnsupportedSqlShape;
+    const select_tokens: generated_parser.GeneratedSqlTokenRange = if (read_ast.cte_tokens) |cte_tokens| blk: {
+        if (cte_tokens.end >= tokens.len or !tokens[cte_tokens.end].matchesKeywordTag(.select)) {
+            return error.UnsupportedSqlShape;
+        }
+        break :blk .{ .start = cte_tokens.end, .end = cte_tokens.end + 1 };
+    } else blk: {
+        if (tokens.len == 0 or !tokens[0].matchesKeywordTag(.select)) return error.UnsupportedSqlShape;
+        break :blk .{ .start = 0, .end = 1 };
+    };
+
+    if (projection_tokens.start < select_tokens.end) return error.UnsupportedSqlShape;
+    if (read_ast.projection_items.count == 0) return error.UnsupportedSqlShape;
+    if (!generatedExpressionAstHasMetadata(read_ast.projection_first_expression)) return error.UnsupportedSqlShape;
+    if (!generatedExpressionAstHasMetadata(read_ast.projection_last_expression)) return error.UnsupportedSqlShape;
+
+    if (read_ast.distinct_tokens) |distinct_tokens| {
+        if (distinct_tokens.start != select_tokens.end or projection_tokens.start != distinct_tokens.end) {
+            return error.UnsupportedSqlShape;
+        }
+        try validateGeneratedReadRangePrecededByKeyword(tokens, distinct_tokens, .select);
+        try validateGeneratedDistinctOnListMetadata(read_ast.distinct_tokens, read_ast.distinct_on_items);
+    } else {
+        if (projection_tokens.start != select_tokens.end) return error.UnsupportedSqlShape;
+        if (read_ast.distinct_on_items.count != 0) return error.UnsupportedSqlShape;
+    }
+
+    if (read_ast.source_tokens) |source_tokens| {
+        if (source_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
+        try validateGeneratedReadRangePrecededByKeyword(tokens, source_tokens, .from);
+    } else if (read_ast.source_antfly_function_items.len != 0 or
+        read_ast.source_antfly_function_count != 0 or
+        read_ast.source_graph_function_items.len != 0 or
+        read_ast.source_graph_function_count != 0 or
+        read_ast.source_graph_function_tokens != null or
+        read_ast.source_graph_function_name_tokens != null or
+        read_ast.source_graph_function_argument_tokens != null or
+        read_ast.source_graph_function_kind != null)
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (read_ast.where_tokens) |where_tokens| {
+        if (where_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
+        try validateGeneratedReadRangePrecededByKeyword(tokens, where_tokens, .where);
+        if (!generatedExpressionAstHasMetadata(read_ast.where_expression)) return error.UnsupportedSqlShape;
+    } else if (generatedExpressionAstHasMetadata(read_ast.where_expression)) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (read_ast.group_tokens) |group_tokens| {
+        if (group_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
+        try validateGeneratedReadGroupRange(tokens, group_tokens);
+        if (read_ast.group_items.count == 0) return error.UnsupportedSqlShape;
+        if (!generatedExpressionAstHasMetadata(read_ast.group_first_expression)) return error.UnsupportedSqlShape;
+        if (!generatedExpressionAstHasMetadata(read_ast.group_last_expression)) return error.UnsupportedSqlShape;
+    } else if (read_ast.group_items.count != 0 or
+        generatedExpressionAstHasMetadata(read_ast.group_first_expression) or
+        generatedExpressionAstHasMetadata(read_ast.group_last_expression))
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (read_ast.having_tokens) |having_tokens| {
+        if (having_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
+        try validateGeneratedReadRangePrecededByKeyword(tokens, having_tokens, .having);
+        if (!generatedExpressionAstHasMetadata(read_ast.having_expression)) return error.UnsupportedSqlShape;
+    } else if (generatedExpressionAstHasMetadata(read_ast.having_expression)) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (read_ast.window_tokens) |window_tokens| {
+        if (window_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
+        try validateGeneratedReadRangePrecededByKeyword(tokens, window_tokens, .window);
+        if (read_ast.window_count == 0 or read_ast.window_items.len != read_ast.window_count) return error.UnsupportedSqlShape;
+    } else if (read_ast.window_count != 0 or read_ast.window_items.len != 0) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (read_ast.order_tokens) |order_tokens| {
+        if (order_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
+        try validateGeneratedReadOrderRange(tokens, order_tokens);
+        if (read_ast.order_items.count == 0) return error.UnsupportedSqlShape;
+        if (!generatedExpressionAstHasMetadata(read_ast.order_first_expression)) return error.UnsupportedSqlShape;
+        if (!generatedExpressionAstHasMetadata(read_ast.order_last_expression)) return error.UnsupportedSqlShape;
+    } else if (read_ast.order_items.count != 0 or
+        generatedExpressionAstHasMetadata(read_ast.order_first_expression) or
+        generatedExpressionAstHasMetadata(read_ast.order_last_expression))
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (read_ast.limit_tokens) |limit_tokens| {
+        if (limit_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
+        try validateGeneratedReadRangePrecededByKeyword(tokens, limit_tokens, .limit);
+    }
+    if (read_ast.offset_tokens) |offset_tokens| {
+        if (offset_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
+        try validateGeneratedReadRangePrecededByKeyword(tokens, offset_tokens, .offset);
+    }
+    if (read_ast.fetch_tokens) |fetch_tokens| {
+        if (fetch_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
+        try validateGeneratedReadRangePrecededByKeyword(tokens, fetch_tokens, .fetch);
+    }
+    if (read_ast.set_operation_tokens) |set_operation_tokens| {
+        if (set_operation_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
+        try validateGeneratedSetOperationMetadata(read_ast.set_operation_tokens, read_ast.set_operation);
+    } else if (generatedSetOperationAstHasMetadata(read_ast.set_operation)) {
+        return error.UnsupportedSqlShape;
+    }
 }
 
 fn validateGeneratedSimpleQueryReadAst(tokens: []const tokenized.Token, read_ast: generated_parser.GeneratedSqlReadAst) !void {
@@ -2880,6 +2994,13 @@ fn validateGeneratedReadOrderRange(tokens: []const tokenized.Token, range: gener
     }
 }
 
+fn validateGeneratedReadGroupRange(tokens: []const tokenized.Token, range: generated_parser.GeneratedSqlTokenRange) !void {
+    if (range.start < 2) return error.UnsupportedSqlShape;
+    if (!tokens[range.start - 2].matchesKeywordTag(.group) or !tokens[range.start - 1].matchesKeywordTag(.by)) {
+        return error.UnsupportedSqlShape;
+    }
+}
+
 pub const CatalogReadPlanLoweringCallbacks = struct {
     lower_document_target: *const fn (
         std.mem.Allocator,
@@ -3490,6 +3611,46 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_group_list_containment_parsed_sql, malformed_group_list_containment_read_ast),
+    );
+
+    var malformed_group_clause_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT status, COUNT(*) FROM usage_records GROUP BY status",
+    );
+    defer malformed_group_clause_parsed_sql.deinit(alloc);
+    const malformed_group_clause_generated_raw = malformed_group_clause_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_group_clause_read_ast = switch (malformed_group_clause_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    const malformed_group_clause_tokens = malformed_group_clause_read_ast.group_tokens orelse return error.UnsupportedSqlShape;
+    malformed_group_clause_read_ast.group_tokens = .{
+        .start = malformed_group_clause_tokens.start - 1,
+        .end = malformed_group_clause_tokens.end,
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_group_clause_parsed_sql, malformed_group_clause_read_ast),
+    );
+
+    var malformed_having_clause_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT status, COUNT(*) FROM usage_records GROUP BY status HAVING COUNT(*) > 1",
+    );
+    defer malformed_having_clause_parsed_sql.deinit(alloc);
+    const malformed_having_clause_generated_raw = malformed_having_clause_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_having_clause_read_ast = switch (malformed_having_clause_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    const malformed_having_clause_tokens = malformed_having_clause_read_ast.having_tokens orelse return error.UnsupportedSqlShape;
+    malformed_having_clause_read_ast.having_tokens = .{
+        .start = malformed_having_clause_tokens.start - 1,
+        .end = malformed_having_clause_tokens.end,
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_having_clause_parsed_sql, malformed_having_clause_read_ast),
     );
 
     var malformed_order_list_containment_parsed_sql = try tokenized.ParsedSql.initAlloc(
