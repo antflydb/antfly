@@ -34,7 +34,7 @@
 %token REGEX_MATCH REGEX_IMATCH REGEX_NOT_MATCH REGEX_NOT_IMATCH
 %token ALL ALTER ANALYZE AND ANY ARRAY AS ASC BEGIN BETWEEN BY CASCADE COMMIT CONFLICT CONSTRAINT CONTINUE CURRENT
 %token CREATE DATABASE DEALLOCATE DEFAULT DELETE DESC DISCARD DISTINCT DO DROP EXECUTE
-%token EXPLAIN EXISTS EXTENSION FALSE FETCH FILTER FIRST FOLLOWING FROM FULL GRAPH GROUP HAVING IDENTITY IF ILIKE IN INDEX INNER INSERT INTO IS
+%token ESCAPE EXPLAIN EXISTS EXTENSION FALSE FETCH FILTER FIRST FOLLOWING FROM FULL GRAPH GROUP HAVING IDENTITY IF ILIKE IN INDEX INNER INSERT INTO IS
 %token JOIN KEY LAST LATERAL LEFT LIKE LIMIT MATCHED MATERIALIZED MERGE METRIC NOT NULL NULLS ON OR ORDER OUTER OVER PARTITION PRECEDING PREPARE PRIMARY PUBLIC
 %token NEXT NOTHING OFFSET ONLY QUERY RANGE RECURSIVE RESET RESTART RESTRICT RETURNING RIGHT ROLLBACK ROW ROWS SCHEMA SELECT SET SHOW SOME TABLE TO TRUNCATE
 %token THEN TRUE UNION UNKNOWN UPDATE USING VALUES WHEN WHERE WINDOW WITH WITHIN
@@ -655,12 +655,12 @@ comparison_expression:
   | concat_expression REGEX_IMATCH concat_expression
   | concat_expression REGEX_NOT_MATCH concat_expression
   | concat_expression REGEX_NOT_IMATCH concat_expression
-  | concat_expression LIKE concat_expression
-  | concat_expression ILIKE concat_expression
+  | concat_expression LIKE concat_expression like_escape_opt
+  | concat_expression ILIKE concat_expression like_escape_opt
   | concat_expression IN LPAREN expression_list RPAREN
   | concat_expression BETWEEN concat_expression AND concat_expression
-  | concat_expression NOT LIKE concat_expression
-  | concat_expression NOT ILIKE concat_expression
+  | concat_expression NOT LIKE concat_expression like_escape_opt
+  | concat_expression NOT ILIKE concat_expression like_escape_opt
   | concat_expression NOT IN LPAREN expression_list RPAREN
   | concat_expression NOT BETWEEN concat_expression AND concat_expression
   | concat_expression comparison_operator quantified_operator quantified_rhs
@@ -674,6 +674,11 @@ comparison_expression:
   | concat_expression IS NOT UNKNOWN
   | concat_expression IS DISTINCT FROM concat_expression
   | concat_expression IS NOT DISTINCT FROM concat_expression
+  ;
+
+like_escape_opt:
+    /* empty */
+  | ESCAPE concat_expression
   ;
 
 comparison_operator:

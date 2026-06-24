@@ -268,8 +268,9 @@ Suggested migration order:
    grammar for covered read projections, including `*` aggregate arguments and
    aggregate `DISTINCT` argument metadata, aggregate-local argument `ORDER BY`
    metadata, aggregate `FILTER (WHERE ...)` predicate metadata, plus ordered-set
-   aggregate `WITHIN GROUP (ORDER BY ...)` metadata, and positive `LIKE`, `ILIKE`,
-   `IN (...)`, and `BETWEEN ... AND ...` predicates are accepted and classified
+   aggregate `WITHIN GROUP (ORDER BY ...)` metadata, and positive `LIKE`/`ILIKE`
+   predicates, including PostgreSQL `ESCAPE` tails, `IN (...)`, and
+   `BETWEEN ... AND ...` predicates are accepted and classified
    in generated expression metadata along with their `NOT` negated forms.
    `ANY`/`ALL`/`SOME` quantified comparison predicates over parenthesized
    expression lists and parenthesized read subqueries are accepted and
@@ -510,7 +511,8 @@ Generated grammar work needs evidence at multiple levels:
   over representative query, aggregate, join, lateral, and non-recursive CTE
   plans, AST-shape coverage for generated-ranged multi-CTE and recursive CTE
   prefixes, single- and multi-join component range coverage, and simple comparison plus
-  positive/negated predicate expression-shape coverage for read predicates.
+  positive/negated predicate expression-shape coverage for read predicates,
+  including escaped `LIKE`/`ILIKE` pattern metadata.
   Seed graph DDL has generated AST-to-plan parity for graph index and graph
   metric index plans.
 - SQL/API parity tests showing SQL and native API requests reach the same

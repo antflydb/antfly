@@ -127,6 +127,7 @@ pub const TokenKeyword = enum {
     each,
     end,
     ends_with,
+    escape,
     except,
     exists,
     explain,

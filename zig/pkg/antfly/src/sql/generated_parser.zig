@@ -238,6 +238,9 @@ pub const GeneratedSqlExpressionAst = struct {
     right_tokens: ?GeneratedSqlTokenRange = null,
     right_expression_kind: ?GeneratedSqlExpressionKind = null,
     right_expression: ?*GeneratedSqlExpressionAst = null,
+    escape_tokens: ?GeneratedSqlTokenRange = null,
+    escape_expression_kind: ?GeneratedSqlExpressionKind = null,
+    escape_expression: ?*GeneratedSqlExpressionAst = null,
 
     pub fn deinit(self: *GeneratedSqlExpressionAst, alloc: std.mem.Allocator) void {
         if (self.inner_expression) |inner| {
@@ -255,6 +258,10 @@ pub const GeneratedSqlExpressionAst = struct {
         if (self.filter_expression) |filter| {
             filter.deinit(alloc);
             alloc.destroy(filter);
+        }
+        if (self.escape_expression) |escape| {
+            escape.deinit(alloc);
+            alloc.destroy(escape);
         }
         self.argument_items.deinit(alloc);
         self.argument_order_items.deinit(alloc);
@@ -558,10 +565,14 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT status state, id FROM usage_records", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status LIKE 'open%'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status ILIKE 'open%'", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE status LIKE 'op!_%' ESCAPE '!'", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE lower(status) ILIKE 'op!_%' ESCAPE '!'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE id IN ('u1', 'u2')", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE score BETWEEN 1 AND 10", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status NOT LIKE 'closed%'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status NOT ILIKE 'closed%'", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE status NOT LIKE 'cl!_%' ESCAPE '!'", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE lower(status) NOT ILIKE 'cl!_%' ESCAPE '!'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE id NOT IN ('u1', 'u2')", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE score NOT BETWEEN 1 AND 10", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE score = ANY (1, 2)", .kind = .read },
@@ -1966,7 +1977,18 @@ fn buildGeneratedExpressionAst(alloc: std.mem.Allocator, tokens: []const token_m
         break :blk quantifier_index + 1;
     } else operator_end;
     if (right_start >= range.end) return ast;
-    ast.right_tokens = .{ .start = right_start, .end = range.end };
+    var right_end = range.end;
+    if (isGeneratedLikeExpressionKind(operator.kind)) {
+        if (findTopLevelKeyword(tokens, right_start, range.end, .escape)) |escape_index| {
+            if (right_start >= escape_index or escape_index + 1 >= range.end) return ast;
+            right_end = escape_index;
+            ast.escape_tokens = .{ .start = escape_index, .end = range.end };
+            const escape_expression_tokens = GeneratedSqlTokenRange{ .start = escape_index + 1, .end = range.end };
+            ast.escape_expression_kind = generatedExpressionKindForRange(tokens, escape_expression_tokens);
+            ast.escape_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, escape_expression_tokens);
+        }
+    }
+    ast.right_tokens = .{ .start = right_start, .end = right_end };
     ast.right_expression_kind = generatedExpressionKindForRange(tokens, ast.right_tokens.?);
     ast.right_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, ast.right_tokens.?);
     return ast;
@@ -2352,6 +2374,10 @@ fn findTopLevelExpressionOperator(tokens: []const token_mod.Token, range: Genera
 
 fn isGeneratedQuantifiedOperator(token: token_mod.Token) bool {
     return token.matchesKeywordTag(.any) or token.matchesKeywordTag(.all) or token.matchesKeywordTag(.some);
+}
+
+fn isGeneratedLikeExpressionKind(kind: GeneratedSqlExpressionKind) bool {
+    return kind == .like or kind == .ilike or kind == .not_like or kind == .not_ilike;
 }
 
 fn findKeyword(tokens: []const token_mod.Token, start: usize, end: usize, keyword: token_mod.TokenKeyword) ?usize {
@@ -2779,6 +2805,40 @@ test "generated SQL parser facade builds control AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const like_escape_read_sql = "SELECT id FROM usage_records WHERE status LIKE 'op!_%' ESCAPE '!'";
+    const like_escape_read_result = try parseSqlAlloc(alloc, like_escape_read_sql);
+    switch (like_escape_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 10 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.like, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.where_expression.right_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 10 }, read.where_expression.escape_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.where_expression.escape_expression.?.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.where_expression.escape_expression.?.tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const ilike_escape_read_sql = "SELECT id FROM usage_records WHERE lower(status) ILIKE 'op!_%' ESCAPE '!'";
+    const ilike_escape_read_result = try parseSqlAlloc(alloc, ilike_escape_read_sql);
+    switch (ilike_escape_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 13 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.ilike, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 9 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.where_expression.right_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 13 }, read.where_expression.escape_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.where_expression.escape_expression.?.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read.where_expression.escape_expression.?.tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const in_list_read_sql = "SELECT id FROM usage_records WHERE id IN ('u1', 'u2')";
     const in_list_read_result = try parseSqlAlloc(alloc, in_list_read_sql);
     switch (in_list_read_result.ast.?) {
@@ -2833,6 +2893,42 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.where_expression.negation_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.where_expression.operator_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.where_expression.right_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const not_like_escape_read_sql = "SELECT id FROM usage_records WHERE status NOT LIKE 'cl!_%' ESCAPE '!'";
+    const not_like_escape_read_result = try parseSqlAlloc(alloc, not_like_escape_read_sql);
+    switch (not_like_escape_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 11 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.not_like, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.where_expression.negation_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.where_expression.right_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 11 }, read.where_expression.escape_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.where_expression.escape_expression.?.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.where_expression.escape_expression.?.tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const not_ilike_escape_read_sql = "SELECT id FROM usage_records WHERE lower(status) NOT ILIKE 'cl!_%' ESCAPE '!'";
+    const not_ilike_escape_read_result = try parseSqlAlloc(alloc, not_ilike_escape_read_sql);
+    switch (not_ilike_escape_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 14 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.not_ilike, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 9 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.where_expression.negation_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 12 }, read.where_expression.right_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 14 }, read.where_expression.escape_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.where_expression.escape_expression.?.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 14 }, read.where_expression.escape_expression.?.tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
