@@ -4,7 +4,7 @@
 package v1
 
 //go:generate go tool controller-gen object:headerFile="../../../hack/boilerplate.go.txt" paths="."
-//go:generate go tool controller-gen crd paths="." output:crd:artifacts:config=../../../manifests/crd
+//go:generate go tool controller-gen crd:maxDescLen=0 paths="." output:crd:artifacts:config=../../../manifests/crd
 
 import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
