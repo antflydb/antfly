@@ -126,10 +126,17 @@ pub const GeneratedSqlPreparedAst = struct {
     inner_statement_tokens: ?GeneratedSqlTokenRange = null,
 };
 
+pub const GeneratedSqlDdlAst = struct {
+    kind: GeneratedSqlDdlKind,
+    statement_span: token_mod.SourceSpan,
+    command_span: token_mod.SourceSpan,
+};
+
 pub const GeneratedSqlAst = union(enum) {
     session: GeneratedSqlSessionAst,
     transaction: GeneratedSqlTransactionAst,
     prepared: GeneratedSqlPreparedAst,
+    ddl: GeneratedSqlDdlAst,
 };
 
 pub const GeneratedSqlParseResult = struct {
@@ -227,7 +234,7 @@ pub fn parseTokensAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Toke
     return .{
         .kind = std.meta.activeTag(statement),
         .statement = statement,
-        .ast = buildControlAst(tokens, statement),
+        .ast = buildGeneratedAst(tokens, statement),
     };
 }
 
@@ -435,7 +442,7 @@ fn classifyReadKind(tokens: []const token_mod.Token) GeneratedSqlReadKind {
     return .query;
 }
 
-fn buildControlAst(tokens: []const token_mod.Token, statement: GeneratedSqlStatement) ?GeneratedSqlAst {
+fn buildGeneratedAst(tokens: []const token_mod.Token, statement: GeneratedSqlStatement) ?GeneratedSqlAst {
     const end = statementTokenEnd(tokens);
     if (end == 0) return null;
     const statement_span = sourceSpanForTokenRange(tokens, .{ .start = 0, .end = end }) orelse return null;
@@ -448,6 +455,11 @@ fn buildControlAst(tokens: []const token_mod.Token, statement: GeneratedSqlState
             .command_span = command_span,
         } },
         .prepared => |kind| .{ .prepared = buildPreparedAst(tokens, end, kind, statement_span, command_span) },
+        .ddl => |kind| .{ .ddl = .{
+            .kind = kind,
+            .statement_span = statement_span,
+            .command_span = command_span,
+        } },
         else => null,
     };
 }
@@ -608,6 +620,17 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, prepared.name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 5 }, prepared.parameter_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 14 }, prepared.inner_statement_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const ddl_sql = "CREATE SCHEMA IF NOT EXISTS analytics";
+    const ddl_result = try parseSqlAlloc(alloc, ddl_sql);
+    switch (ddl_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.create_schema, ddl.kind);
+            try std.testing.expectEqualStrings("CREATE SCHEMA IF NOT EXISTS analytics", spanText(ddl_sql, ddl.statement_span));
+            try std.testing.expectEqualStrings("CREATE", spanText(ddl_sql, ddl.command_span));
         },
         else => return error.TestUnexpectedResult,
     }

@@ -3015,6 +3015,24 @@ pub fn transactionBoundaryPlanFromGeneratedAst(ast: generated_parser.GeneratedSq
     return .{ .adapter_noop = .{ .reason = .transaction_control } };
 }
 
+pub fn simpleDdlPlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+) !LoweredDdlPlan {
+    const tail = generatedStatementTail(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    var pos: usize = 0;
+    return switch (ast.kind) {
+        .create_database => .{ .database_catalog = .{ .create = try parseCreateDatabasePlanTailAlloc(alloc, tail, &pos) } },
+        .create_schema => .{ .schema_namespace_catalog = .{ .create = try parseCreateSchemaNamespacePlanTailAlloc(alloc, tail, &pos) } },
+        .create_extension => .{ .extension_catalog = .{ .create = try parseCreateExtensionPlanTailAlloc(alloc, tail, &pos, catalog_resources.default_namespace_name) } },
+        .drop_database => .{ .database_catalog = .{ .drop = try parseDropDatabasePlanTailAlloc(alloc, tail, &pos) } },
+        .drop_schema => .{ .schema_namespace_catalog = .{ .drop = try parseDropSchemaNamespacePlanTailAlloc(alloc, tail, &pos) } },
+        .drop_extension => .{ .extension_catalog = .{ .drop = try parseDropExtensionPlanTailAlloc(alloc, tail, &pos) } },
+        else => error.UnsupportedSqlShape,
+    };
+}
+
 fn setSessionCatalogPlanFromGeneratedTailAlloc(alloc: std.mem.Allocator, tail: []const grammar.Token) !SessionCatalogPlan {
     var pos: usize = 0;
     if (parseSetSearchPathPlanTailAlloc(alloc, tail, &pos)) |plan| {
@@ -11845,6 +11863,41 @@ test "sql adapter generated transaction AST lowers to transaction boundary plans
     }
 }
 
+test "sql adapter generated simple DDL AST lowers to catalog plans" {
+    const alloc = std.testing.allocator;
+
+    const cases = [_][]const u8{
+        "CREATE DATABASE tenant_ops;",
+        "CREATE SCHEMA IF NOT EXISTS analytics;",
+        "CREATE EXTENSION vector;",
+        "DROP DATABASE tenant_ops;",
+        "DROP SCHEMA analytics CASCADE;",
+        "DROP EXTENSION IF EXISTS vector CASCADE;",
+    };
+    for (cases) |sql| {
+        var generated = try generatedSimpleDdlPlanForTestAlloc(alloc, sql);
+        defer generated.deinit(alloc);
+        var legacy = try lowerDdlPlanForTestAlloc(alloc, sql);
+        defer legacy.deinit(alloc);
+        try std.testing.expectEqual(std.meta.activeTag(legacy), std.meta.activeTag(generated));
+        switch (generated) {
+            .database_catalog => |generated_plan| switch (legacy) {
+                .database_catalog => |legacy_plan| try std.testing.expectEqual(std.meta.activeTag(legacy_plan), std.meta.activeTag(generated_plan)),
+                else => return error.TestUnexpectedResult,
+            },
+            .schema_namespace_catalog => |generated_plan| switch (legacy) {
+                .schema_namespace_catalog => |legacy_plan| try std.testing.expectEqual(std.meta.activeTag(legacy_plan), std.meta.activeTag(generated_plan)),
+                else => return error.TestUnexpectedResult,
+            },
+            .extension_catalog => |generated_plan| switch (legacy) {
+                .extension_catalog => |legacy_plan| try std.testing.expectEqual(std.meta.activeTag(legacy_plan), std.meta.activeTag(generated_plan)),
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
 test "sql adapter ddl plan lowers prepared transaction ddl plans" {
     const alloc = std.testing.allocator;
 
@@ -12163,6 +12216,17 @@ fn generatedTransactionBoundaryPlanForTestAlloc(alloc: std.mem.Allocator, sql: [
         else => return error.UnsupportedSqlShape,
     };
     return transactionBoundaryPlanFromGeneratedAst(transaction_ast);
+}
+
+fn generatedSimpleDdlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !LoweredDdlPlan {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    const generated_raw = parsed.generated_statement orelse return error.UnsupportedSqlShape;
+    const ddl_ast = switch (generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .ddl => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    return try simpleDdlPlanFromGeneratedAstAlloc(alloc, parsed.items(), ddl_ast);
 }
 
 test "sql adapter ddl plan lowers routine expression bindings into ddl plans" {
