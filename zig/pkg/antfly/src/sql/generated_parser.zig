@@ -1461,6 +1461,11 @@ fn buildDdlAst(
             ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
             if (findKeywordText(tokens, index + 1, end, "force") != null) ast.force = true;
         },
+        .drop_table => {
+            ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
+            ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
+            ast.cascade = findKeyword(tokens, index + 1, end, .cascade) != null;
+        },
         .drop_index => {
             ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
             ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
@@ -3866,6 +3871,18 @@ test "generated SQL parser facade builds control AST spans" {
         .extension_index => |ddl| {
             try std.testing.expectEqual(GeneratedSqlDdlKind.drop_index, ddl.kind);
             try std.testing.expect(ddl.if_exists);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const drop_table_sql = "DROP TABLE IF EXISTS usage_records CASCADE";
+    const drop_table_result = try parseSqlAlloc(alloc, drop_table_sql);
+    switch (drop_table_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.drop_table, ddl.kind);
+            try std.testing.expect(ddl.if_exists);
+            try std.testing.expect(ddl.cascade);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl.object_name_tokens.?);
         },
         else => return error.TestUnexpectedResult,

@@ -960,6 +960,40 @@ test "sql adapter parsed sql owns typed statement variants" {
         else => return error.TestUnexpectedResult,
     }
 
+    var drop_table = try ParsedSql.initAlloc(alloc, "DROP TABLE IF EXISTS usage_records CASCADE");
+    defer drop_table.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, drop_table.generatedStatementKind().?);
+    switch (drop_table.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.drop_table, ddl_ast.kind);
+            try std.testing.expect(ddl_ast.if_exists);
+            try std.testing.expect(ddl_ast.cascade);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl_ast.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (drop_table.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_index = try ParsedSql.initAlloc(alloc, "DROP INDEX IF EXISTS usage_status_idx RESTRICT");
+    defer drop_index.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.extension_index, drop_index.generatedStatementKind().?);
+    switch (drop_index.generated_statement.?.ast.?) {
+        .extension_index => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.drop_index, ddl_ast.kind);
+            try std.testing.expect(ddl_ast.if_exists);
+            try std.testing.expect(!ddl_ast.cascade);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl_ast.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (drop_index.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
     var alter_table = try ParsedSql.initAlloc(alloc, "ALTER TABLE IF EXISTS ONLY usage_records DROP COLUMN IF EXISTS status RESTRICT");
     defer alter_table.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, alter_table.generatedStatementKind().?);

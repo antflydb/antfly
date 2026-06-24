@@ -53,8 +53,9 @@ existing parser when the seed grammar does not yet cover the shape; generated
 simple DDL ASTs now carry structured object, option, and behavior fields for
 database, schema, and extension create/drop catalog plans and lower those
 catalog plans directly from generated AST ranges, plus generated AST-to-plan
-parity for seed `CREATE TABLE` and `CREATE INDEX` forms using the same parser
-options as the existing lowerer. Generated `CREATE INDEX` ASTs also retain
+parity for seed `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, and `DROP INDEX`
+forms using the same parser options as the existing lowerer. Generated
+`CREATE INDEX` ASTs also retain
 `UNIQUE`, method, element-list, covering-index `INCLUDE (...)`, options, and
 partial-index `WHERE ...` token ranges and generated-first create-index
 planning validates those ranges before lowering through the typed DDL planner.
@@ -258,7 +259,9 @@ Suggested migration order:
    table, index, and extension DDL now has generated-parser corpus coverage
    when it matches the seed grammar. Database, schema, and extension create/drop
 catalog DDL now has structured generated AST payloads and direct generated
-AST-to-plan lowering, and generated create-index metadata covers basic
+AST-to-plan lowering, generated table/index drops validate generated object,
+`IF EXISTS`, and dependency-behavior ranges before typed planning, and generated
+create-index metadata covers basic
 PostgreSQL-style unique, covering, partial, method, element-list, and option
 clauses with generated-first AST-to-plan parity validation. Generated
 `ALTER TABLE` ASTs now retain target-table and operation-tail ranges and
@@ -547,8 +550,8 @@ variants for:
   for typed `PREPARE`, `EXECUTE`, and `DEALLOCATE`
 - DDL statement, including generated AST payloads for command spans, object
   names, catalog option fields, drop behavior, and generated AST-to-plan parity
-  for database and schema catalog plans plus seed `CREATE TABLE` and
-  `ALTER TABLE` plans
+  for database and schema catalog plans plus seed `CREATE TABLE`, `ALTER TABLE`,
+  `DROP TABLE`, and `DROP INDEX` plans
 - DML statement, including generated AST payloads for command spans, target
   tables, source/body ranges, predicates, conflict clauses, returning clauses,
   values lists, default-values inserts, truncate options, generated-first
@@ -616,9 +619,10 @@ Generated grammar work needs evidence at multiple levels:
 - Plan parity tests showing generated ASTs lower to the same typed plans as the
   current parser for migrated statement families. Session catalog commands,
   transaction boundaries, prepared statements, simple DDL database/schema
-  catalog plans plus seed `CREATE TABLE` plans, and extension/index
-  `CREATE INDEX` plus extension catalog plans have generated AST-to-plan parity
-  tests for their generated-covered forms; simple catalog DDL also has generated
+  catalog plans plus seed `CREATE TABLE` and `DROP TABLE` plans, and
+  extension/index `CREATE INDEX`, `DROP INDEX`, plus extension catalog plans
+  have generated AST-to-plan parity tests for their generated-covered forms;
+  simple catalog DDL also has generated
   field-level checks for object names, option flags, version strings, drop
   behavior, ALTER TABLE operation tails, and fail-closed unsupported clauses.
   Simple DML has generated field-level checks for update and truncate body

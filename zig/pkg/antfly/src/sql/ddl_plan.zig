@@ -3048,6 +3048,8 @@ pub fn ddlPlanFromGeneratedAstAlloc(
         .create_table => .{ .create_table = try parseCreateTablePlanAlloc(alloc, tail, &pos, options.column_definition_options) },
         .create_index => .{ .create_index = try createIndexPlanFromGeneratedAstAlloc(alloc, tokens, ast, options.create_index_options) },
         .alter_table => .{ .alter_table = try alterTablePlanFromGeneratedAstAlloc(alloc, tokens, ast, options.column_definition_options) },
+        .drop_table => .{ .drop_table = try dropTablePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) },
+        .drop_index => .{ .drop_index = try dropIndexPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) },
         else => try simpleDdlPlanFromGeneratedAstAlloc(alloc, tokens, ast),
     };
 }
@@ -3279,6 +3281,58 @@ fn dropExtensionPlanFromGeneratedDdlAstAlloc(
     };
     errdefer syntax.deinit(alloc);
     return dropExtensionPlanFromSyntax(&syntax);
+}
+
+fn dropTablePlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+) !DropTablePlan {
+    const end = try requireGeneratedDdlHeader(tokens, ast.statement_span, .drop, .table);
+    var index: usize = 2;
+    if (ast.if_exists) try expectGeneratedIfExists(tokens, &index, end);
+    const name_range = try requireGeneratedTokenRangeAt(ast.object_name_tokens, index, end);
+    index = name_range.end;
+    if (ast.cascade) {
+        if (index >= end or !tokens[index].matchesKeywordTag(.cascade)) return error.UnsupportedSqlShape;
+        index += 1;
+    } else if (index < end and tokens[index].matchesKeywordTag(.restrict)) {
+        index += 1;
+    }
+    if (index != end) return error.UnsupportedSqlShape;
+    var syntax = grammar.DropTableSyntax{
+        .table_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, name_range),
+        .if_exists = ast.if_exists,
+        .cascade = ast.cascade,
+    };
+    errdefer syntax.deinit(alloc);
+    return dropTablePlanFromSyntax(&syntax);
+}
+
+fn dropIndexPlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+) !DropIndexPlan {
+    const end = try requireGeneratedDdlHeader(tokens, ast.statement_span, .drop, .index);
+    var index: usize = 2;
+    if (index < end and tokens[index].matchesKeyword("concurrently")) index += 1;
+    if (ast.if_exists) try expectGeneratedIfExists(tokens, &index, end);
+    const name_range = try requireGeneratedTokenRangeAt(ast.object_name_tokens, index, end);
+    index = name_range.end;
+    if (ast.cascade) {
+        if (index >= end or !tokens[index].matchesKeywordTag(.cascade)) return error.UnsupportedSqlShape;
+        index += 1;
+    } else if (index < end and tokens[index].matchesKeywordTag(.restrict)) {
+        index += 1;
+    }
+    if (index != end) return error.UnsupportedSqlShape;
+    var syntax = grammar.DropIndexSyntax{
+        .index_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, name_range),
+        .if_exists = ast.if_exists,
+    };
+    errdefer syntax.deinit(alloc);
+    return dropIndexPlanFromSyntax(&syntax);
 }
 
 fn createIndexPlanFromGeneratedAstAlloc(
@@ -12475,6 +12529,23 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const drop_table_sql = "DROP TABLE IF EXISTS usage_records CASCADE;";
+    var generated_drop_table = try generatedDdlPlanForTestAlloc(alloc, drop_table_sql);
+    defer generated_drop_table.deinit(alloc);
+    var legacy_drop_table = try lowerDdlPlanForTestAlloc(alloc, drop_table_sql);
+    defer legacy_drop_table.deinit(alloc);
+    switch (generated_drop_table) {
+        .drop_table => |generated| switch (legacy_drop_table) {
+            .drop_table => |legacy| {
+                try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
+                try std.testing.expectEqual(legacy.if_exists, generated.if_exists);
+                try std.testing.expectEqual(legacy.cascade, generated.cascade);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     var generated_index = try generatedDdlPlanForTestAlloc(alloc, "CREATE INDEX usage_records_status_idx ON usage_records (status);");
     defer generated_index.deinit(alloc);
     var legacy_index = try lowerDdlPlanForTestAlloc(alloc, "CREATE INDEX usage_records_status_idx ON usage_records (status);");
@@ -12489,6 +12560,22 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
                 try std.testing.expectEqual(legacy.method, generated.method);
                 try std.testing.expectEqual(legacy.columns.len, generated.columns.len);
                 try std.testing.expectEqualStrings(legacy.columns[0], generated.columns[0]);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const drop_index_sql = "DROP INDEX IF EXISTS usage_records_status_idx RESTRICT;";
+    var generated_drop_index = try generatedDdlPlanForTestAlloc(alloc, drop_index_sql);
+    defer generated_drop_index.deinit(alloc);
+    var legacy_drop_index = try lowerDdlPlanForTestAlloc(alloc, drop_index_sql);
+    defer legacy_drop_index.deinit(alloc);
+    switch (generated_drop_index) {
+        .drop_index => |generated| switch (legacy_drop_index) {
+            .drop_index => |legacy| {
+                try std.testing.expectEqualStrings(legacy.index_name, generated.index_name);
+                try std.testing.expectEqual(legacy.if_exists, generated.if_exists);
             },
             else => return error.TestUnexpectedResult,
         },
