@@ -1654,6 +1654,27 @@ test "generated SQL parser reports source-aware diagnostics" {
     try std.testing.expect(diagnostic.source_end >= diagnostic.source_start);
 }
 
+test "generated SQL parser reports bounded diagnostics for malformed corpus" {
+    const cases = [_][]const u8{
+        "SELECT id FROM",
+        "SELECT id FROM usage_records WHERE",
+        "WITH source_rows AS (SELECT id FROM usage_records SELECT id FROM source_rows",
+        "CREATE TABLE usage_records (id text",
+        "INSERT INTO usage_records (id VALUES ('u1')",
+        "EXPLAIN",
+    };
+
+    for (cases) |sql| {
+        var tokens = try lexer.tokenizeAlloc(std.testing.allocator, sql);
+        defer lexer.freeTokens(std.testing.allocator, &tokens);
+        const diagnostic = try diagnosticAlloc(std.testing.allocator, tokens.items) orelse return error.ExpectedDiagnostic;
+        defer std.testing.allocator.free(diagnostic.expected);
+        try std.testing.expect(diagnostic.token_index <= tokens.items.len);
+        try std.testing.expect(diagnostic.source_end >= diagnostic.source_start);
+        try std.testing.expect(diagnostic.expected.len > 0);
+    }
+}
+
 test "generated SQL parser rejects unsupported token shapes" {
     try std.testing.expectError(error.UnsupportedSqlShape, parseSqlAlloc(std.testing.allocator, "SELECT a @> b"));
 }

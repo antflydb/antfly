@@ -424,7 +424,10 @@ Generated grammar work needs evidence at multiple levels:
 - SQL/API parity tests showing SQL and native API requests reach the same
   service contracts.
 - Fuzz or mutation tests for scanner/parser crash resistance and bounded error
-  recovery.
+  recovery. A deterministic malformed SQL corpus now exercises generated
+  source-aware diagnostics for incomplete read, CTE, DDL, DML, and unsupported
+  statement shapes; broader randomized scanner/parser fuzzing remains future
+  evidence.
 - Parser microbenchmarks for corpus throughput, allocation count, parse-table
   size, generated-code compile time, and binary size.
 
