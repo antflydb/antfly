@@ -187,10 +187,12 @@ generated raw and AST nodes. Seed graph index and graph metric statements now
 have graph-specific generated AST-to-plan wrappers that lower to typed index
 plans instead of only routing through the generic DDL family. The generated
 facade now returns closed statement-family nodes for the covered families and
-an explicit unsupported statement node for seed `ANALYZE` and simple `EXPLAIN`
-forms with stable reason metadata; full production AST construction remains the
-next migration boundary for larger DDL, query, DML, and Antfly extension
-families.
+explicit unsupported statement nodes for seed `ANALYZE`, bulk I/O `COPY`,
+maintenance `VACUUM`/`REINDEX`, utility/control statements such as `CLUSTER`,
+`COMMENT`, `GRANT`/`REVOKE`, `LISTEN`/`NOTIFY`, and `LOCK`, plus simple
+`EXPLAIN` forms with stable reason metadata; full production AST construction
+remains the next migration boundary for larger DDL, query, DML, and Antfly
+extension families.
 
 ## Compatibility Policy
 
@@ -551,14 +553,16 @@ variants for:
 - graph statement, including a generated AST payload for command spans and
   graph-specific AST-to-plan wrappers for seed graph index and graph metric DDL
 - unsupported statement, including generated AST payloads for seed `ANALYZE`,
-  `COPY`, `VACUUM`, and `REINDEX`, plus bare, simple, optioned, and
+  `COPY`, `VACUUM`, `REINDEX`, `CLUSTER`, `COMMENT`, `GRANT`, `REVOKE`,
+  `LISTEN`, `NOTIFY`, and `LOCK`, plus bare, simple, optioned, and
   `EXPLAIN ANALYZE` forms with command spans, subject ranges where present,
   and stable unsupported reason metadata
 
 Later statement-family cutovers should add closed variants for:
 
 - extension/index statement
-- broader unsupported PostgreSQL-compatible statements with diagnostic reasons
+- broader unsupported PostgreSQL-compatible statements with diagnostic reasons,
+  beyond the first generated utility/control diagnostic set
 
 Those variants should become the normal dispatch boundary for binder and lowerer
 code.
@@ -581,9 +585,10 @@ Generated grammar work needs evidence at multiple levels:
 - Corpus tests for accepted Antfly-specific syntax.
 - Corpus tests for intentionally unsupported PostgreSQL syntax with stable
   diagnostics. Seed `ANALYZE`, bulk I/O `COPY`, maintenance `VACUUM`/`REINDEX`,
-  and bare, simple, optioned, and `EXPLAIN ANALYZE` forms now produce generated
-  unsupported AST nodes with stable reason metadata and subject ranges where
-  available.
+  utility/control statements such as `CLUSTER`, `COMMENT`, `GRANT`/`REVOKE`,
+  `LISTEN`/`NOTIFY`, and `LOCK`, and bare, simple, optioned, and
+  `EXPLAIN ANALYZE` forms now produce generated unsupported AST nodes with
+  stable reason metadata and subject ranges where available.
 - AST shape tests for source spans, identifier normalization, literals,
   placeholders, casts, operators, and nested statements. The first AST shape
   tests cover generated session, transaction, prepared, DDL, DML, read, and

@@ -91,17 +91,31 @@ pub const GeneratedSqlGraphKind = enum {
 
 pub const GeneratedSqlUnsupportedKind = enum {
     analyze,
+    cluster,
+    comment,
     copy,
     explain,
+    grant,
+    listen,
+    lock,
+    notify,
     reindex,
+    revoke,
     vacuum,
 };
 
 pub const GeneratedSqlUnsupportedReason = enum {
     analyze_not_planned_by_generated_parser,
+    cluster_not_planned_by_generated_parser,
+    comment_not_planned_by_generated_parser,
     copy_not_planned_by_generated_parser,
     explain_not_planned_by_generated_parser,
+    grant_not_planned_by_generated_parser,
+    listen_not_planned_by_generated_parser,
+    lock_not_planned_by_generated_parser,
+    notify_not_planned_by_generated_parser,
     reindex_not_planned_by_generated_parser,
+    revoke_not_planned_by_generated_parser,
     vacuum_not_planned_by_generated_parser,
 };
 
@@ -827,6 +841,7 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT id FROM usage_records WHERE deleted_at IS NOT NULL", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status ISNULL", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE lower(status) NOTNULL", .kind = .read },
+    .{ .sql = "SELECT cluster, comment, grant, listen, lock, notify, revoke FROM usage_records", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE active IS TRUE", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE active IS NOT FALSE", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE active IS UNKNOWN", .kind = .read },
@@ -883,14 +898,21 @@ pub const simple_graph_corpus = [_]GeneratedSqlCorpusCase{
 
 pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "ANALYZE", .kind = .unsupported },
+    .{ .sql = "CLUSTER usage_records USING usage_status_idx", .kind = .unsupported },
+    .{ .sql = "COMMENT ON TABLE usage_records IS 'billing rows'", .kind = .unsupported },
     .{ .sql = "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)", .kind = .unsupported },
     .{ .sql = "EXPLAIN", .kind = .unsupported },
     .{ .sql = "EXPLAIN SELECT id FROM usage_records", .kind = .unsupported },
     .{ .sql = "EXPLAIN ANALYZE INSERT INTO usage_records (id) VALUES ('u1')", .kind = .unsupported },
     .{ .sql = "EXPLAIN (FORMAT JSON, VERBOSE, COSTS OFF, ANALYZE ON, BUFFERS, TIMING OFF, SUMMARY OFF, SETTINGS ON, WAL) SELECT id FROM usage_records", .kind = .unsupported },
     .{ .sql = "EXPLAIN (FORMAT YAML) SELECT 1", .kind = .unsupported },
+    .{ .sql = "GRANT SELECT ON TABLE usage_records TO readonly", .kind = .unsupported },
+    .{ .sql = "LISTEN usage_events", .kind = .unsupported },
+    .{ .sql = "LOCK TABLE usage_records IN SHARE MODE", .kind = .unsupported },
+    .{ .sql = "NOTIFY usage_events, 'changed'", .kind = .unsupported },
     .{ .sql = "VACUUM (FULL, VERBOSE, ANALYZE) public.usage_records", .kind = .unsupported },
     .{ .sql = "REINDEX INDEX CONCURRENTLY public.usage_status_idx", .kind = .unsupported },
+    .{ .sql = "REVOKE SELECT ON TABLE usage_records FROM readonly", .kind = .unsupported },
 };
 
 pub fn parseSqlAlloc(alloc: std.mem.Allocator, sql: []const u8) !GeneratedSqlParseResult {
@@ -1108,9 +1130,16 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         return .{ .read = classifyReadKind(tokens) };
     }
     if (first.matchesKeywordTag(.analyze)) return .{ .unsupported = .analyze };
+    if (first.matchesKeywordTag(.cluster)) return .{ .unsupported = .cluster };
+    if (first.matchesKeywordTag(.comment)) return .{ .unsupported = .comment };
     if (first.matchesKeywordTag(.copy)) return .{ .unsupported = .copy };
     if (first.matchesKeywordTag(.explain)) return .{ .unsupported = .explain };
+    if (first.matchesKeywordTag(.grant)) return .{ .unsupported = .grant };
+    if (first.matchesKeywordTag(.listen)) return .{ .unsupported = .listen };
+    if (first.matchesKeywordTag(.lock)) return .{ .unsupported = .lock };
+    if (first.matchesKeywordTag(.notify)) return .{ .unsupported = .notify };
     if (first.matchesKeywordTag(.reindex)) return .{ .unsupported = .reindex };
+    if (first.matchesKeywordTag(.revoke)) return .{ .unsupported = .revoke };
     if (first.matchesKeywordTag(.vacuum)) return .{ .unsupported = .vacuum };
     return .other;
 }
@@ -1148,9 +1177,16 @@ fn buildUnsupportedAst(
         .kind = kind,
         .reason = switch (kind) {
             .analyze => .analyze_not_planned_by_generated_parser,
+            .cluster => .cluster_not_planned_by_generated_parser,
+            .comment => .comment_not_planned_by_generated_parser,
             .copy => .copy_not_planned_by_generated_parser,
             .explain => .explain_not_planned_by_generated_parser,
+            .grant => .grant_not_planned_by_generated_parser,
+            .listen => .listen_not_planned_by_generated_parser,
+            .lock => .lock_not_planned_by_generated_parser,
+            .notify => .notify_not_planned_by_generated_parser,
             .reindex => .reindex_not_planned_by_generated_parser,
+            .revoke => .revoke_not_planned_by_generated_parser,
             .vacuum => .vacuum_not_planned_by_generated_parser,
         },
         .statement_span = statement_span,
@@ -3558,10 +3594,17 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .create_index }, (try parseSqlAlloc(alloc, "CREATE GRAPH INDEX docs_edge_graph ON doc_edges")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .create_metric }, (try parseSqlAlloc(alloc, "CREATE GRAPH METRIC docs_pagerank ON doc_edges")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .analyze }, (try parseSqlAlloc(alloc, "ANALYZE")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .cluster }, (try parseSqlAlloc(alloc, "CLUSTER usage_records USING usage_status_idx")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .comment }, (try parseSqlAlloc(alloc, "COMMENT ON TABLE usage_records IS 'billing rows'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .copy }, (try parseSqlAlloc(alloc, "COPY usage_records FROM STDIN")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .explain }, (try parseSqlAlloc(alloc, "EXPLAIN SELECT id FROM usage_records")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .grant }, (try parseSqlAlloc(alloc, "GRANT SELECT ON TABLE usage_records TO readonly")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .listen }, (try parseSqlAlloc(alloc, "LISTEN usage_events")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .lock }, (try parseSqlAlloc(alloc, "LOCK TABLE usage_records IN SHARE MODE")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .notify }, (try parseSqlAlloc(alloc, "NOTIFY usage_events, 'changed'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .vacuum }, (try parseSqlAlloc(alloc, "VACUUM FULL usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .reindex }, (try parseSqlAlloc(alloc, "REINDEX INDEX usage_records_status_idx")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .revoke }, (try parseSqlAlloc(alloc, "REVOKE SELECT ON TABLE usage_records FROM readonly")).statement);
 }
 
 test "generated SQL parser facade builds control AST spans" {
@@ -5956,6 +5999,68 @@ test "generated SQL parser facade builds extended read AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 4 }, unsupported.subject_tokens.?);
         },
         else => return error.TestUnexpectedResult,
+    }
+
+    const utility_cases = [_]struct {
+        sql: []const u8,
+        kind: GeneratedSqlUnsupportedKind,
+        reason: GeneratedSqlUnsupportedReason,
+        subject_tokens: GeneratedSqlTokenRange,
+    }{
+        .{
+            .sql = "CLUSTER usage_records USING usage_status_idx",
+            .kind = .cluster,
+            .reason = .cluster_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 4 },
+        },
+        .{
+            .sql = "COMMENT ON TABLE usage_records IS 'billing rows'",
+            .kind = .comment,
+            .reason = .comment_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 6 },
+        },
+        .{
+            .sql = "GRANT SELECT ON TABLE usage_records TO readonly",
+            .kind = .grant,
+            .reason = .grant_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 7 },
+        },
+        .{
+            .sql = "LISTEN usage_events",
+            .kind = .listen,
+            .reason = .listen_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 2 },
+        },
+        .{
+            .sql = "LOCK TABLE usage_records IN SHARE MODE",
+            .kind = .lock,
+            .reason = .lock_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 6 },
+        },
+        .{
+            .sql = "NOTIFY usage_events, 'changed'",
+            .kind = .notify,
+            .reason = .notify_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 4 },
+        },
+        .{
+            .sql = "REVOKE SELECT ON TABLE usage_records FROM readonly",
+            .kind = .revoke,
+            .reason = .revoke_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 7 },
+        },
+    };
+    for (utility_cases) |case| {
+        const result = try parseSqlAlloc(alloc, case.sql);
+        switch (result.ast.?) {
+            .unsupported => |unsupported| {
+                try std.testing.expectEqual(case.kind, unsupported.kind);
+                try std.testing.expectEqual(case.reason, unsupported.reason);
+                try std.testing.expectEqualStrings(case.sql[0..std.mem.indexOfScalar(u8, case.sql, ' ').?], spanText(case.sql, unsupported.command_span));
+                try std.testing.expectEqual(case.subject_tokens, unsupported.subject_tokens.?);
+            },
+            else => return error.TestUnexpectedResult,
+        }
     }
 
     const explain_sql = "EXPLAIN SELECT id FROM usage_records";

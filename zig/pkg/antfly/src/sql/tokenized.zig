@@ -816,9 +816,39 @@ test "sql adapter parsed sql owns typed statement variants" {
         reason: generated_parser.GeneratedSqlUnsupportedReason,
     }{
         .{
+            .sql = "CLUSTER usage_records USING usage_status_idx",
+            .kind = .cluster,
+            .reason = .cluster_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "COMMENT ON TABLE usage_records IS 'billing rows'",
+            .kind = .comment,
+            .reason = .comment_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)",
             .kind = .copy,
             .reason = .copy_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "GRANT SELECT ON TABLE usage_records TO readonly",
+            .kind = .grant,
+            .reason = .grant_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "LISTEN usage_events",
+            .kind = .listen,
+            .reason = .listen_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "LOCK TABLE usage_records IN SHARE MODE",
+            .kind = .lock,
+            .reason = .lock_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "NOTIFY usage_events, 'changed'",
+            .kind = .notify,
+            .reason = .notify_not_planned_by_generated_parser,
         },
         .{
             .sql = "VACUUM (FULL, VERBOSE, ANALYZE) public.usage_records",
@@ -829,6 +859,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "REINDEX INDEX CONCURRENTLY public.usage_status_idx",
             .kind = .reindex,
             .reason = .reindex_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "REVOKE SELECT ON TABLE usage_records FROM readonly",
+            .kind = .revoke,
+            .reason = .revoke_not_planned_by_generated_parser,
         },
     };
     for (unsupported_diagnostics) |case| {

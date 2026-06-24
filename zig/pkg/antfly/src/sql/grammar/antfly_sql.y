@@ -32,11 +32,11 @@
 %token AT_CONTAINS RANGE_OVERLAP QUESTION QUESTION_ANY QUESTION_ALL
 %token ARROW_JSON ARROW_TEXT PATH_ARROW_JSON PATH_ARROW_TEXT
 %token REGEX_MATCH REGEX_IMATCH REGEX_NOT_MATCH REGEX_NOT_IMATCH
-%token ALL ALTER ANALYZE AND ANY ARRAY AS ASC ASYMMETRIC BEGIN BETWEEN BY CASCADE CASE CAST COMMIT CONFLICT CONSTRAINT CONTINUE CURRENT CURRENT_DATE CURRENT_TIMESTAMP
+%token ALL ALTER ANALYZE AND ANY ARRAY AS ASC ASYMMETRIC BEGIN BETWEEN BY CASCADE CASE CAST CLUSTER COMMIT COMMENT CONFLICT CONSTRAINT CONTINUE CURRENT CURRENT_DATE CURRENT_TIMESTAMP
 %token CREATE COPY DATABASE DEALLOCATE DEFAULT DELETE DESC DISCARD DISTINCT DO DROP EXECUTE
-%token ELSE END ESCAPE EXPLAIN EXISTS EXTENSION EXTRACT FALSE FETCH FILTER FIRST FOLLOWING FROM FULL GRAPH GROUP HAVING IDENTITY IF ILIKE IN INDEX INNER INSERT INTERVAL INTO IS
-%token ISNULL JOIN KEY LAST LATERAL LEFT LIKE LIMIT MATCHED MATERIALIZED MERGE METRIC NOT NULL NOTNULL NULLS ON OR ORDER OUTER OVER PARTITION PRECEDING PREPARE PRIMARY PUBLIC
-%token NEXT NOTHING OFFSET ONLY QUERY RANGE RECURSIVE REINDEX RESET RESTART RESTRICT RETURNING RIGHT ROLLBACK ROW ROWS SCHEMA SELECT SET SHOW SOME TABLE TIMESTAMP TIMESTAMPTZ TO TRUNCATE
+%token ELSE END ESCAPE EXPLAIN EXISTS EXTENSION EXTRACT FALSE FETCH FILTER FIRST FOLLOWING FROM FULL GRANT GRAPH GROUP HAVING IDENTITY IF ILIKE IN INDEX INNER INSERT INTERVAL INTO IS
+%token ISNULL JOIN KEY LAST LATERAL LEFT LIKE LIMIT LISTEN LOCK MATCHED MATERIALIZED MERGE METRIC NOT NULL NOTIFY NOTNULL NULLS ON OR ORDER OUTER OVER PARTITION PRECEDING PREPARE PRIMARY PUBLIC
+%token NEXT NOTHING OFFSET ONLY QUERY RANGE RECURSIVE REINDEX RESET RESTART RESTRICT RETURNING REVOKE RIGHT ROLLBACK ROW ROWS SCHEMA SELECT SET SHOW SOME TABLE TIMESTAMP TIMESTAMPTZ TO TRUNCATE
 %token SYMMETRIC THEN TRUE UNION UNKNOWN UPDATE USING VACUUM VALUES WHEN WHERE WINDOW WITH WITHIN
 %token EXCEPT INTERSECT UNBOUNDED
 
@@ -67,9 +67,9 @@ transaction_statement:
   ;
 
 prepared_statement:
-    PREPARE IDENT prepare_parameter_types_opt AS statement
-  | EXECUTE IDENT execute_argument_list_opt
-  | DEALLOCATE IDENT
+    PREPARE identifier_name prepare_parameter_types_opt AS statement
+  | EXECUTE identifier_name execute_argument_list_opt
+  | DEALLOCATE identifier_name
   ;
 
 prepare_parameter_types_opt:
@@ -105,7 +105,7 @@ create_table_statement:
   ;
 
 create_index_statement:
-    CREATE INDEX if_not_exists_opt IDENT ON qualified_name index_method_opt LPAREN index_element_list RPAREN index_options_opt
+    CREATE INDEX if_not_exists_opt identifier_name ON qualified_name index_method_opt LPAREN index_element_list RPAREN index_options_opt
   ;
 
 create_extension_statement:
@@ -120,7 +120,7 @@ extension_schema_opt:
 
 extension_version_opt:
     /* empty */
-  | IDENT STRING
+  | identifier_name STRING
   ;
 
 alter_table_statement:
@@ -137,7 +137,7 @@ drop_statement:
 
 drop_database_force_opt:
     /* empty */
-  | WITH LPAREN IDENT RPAREN
+  | WITH LPAREN identifier_name RPAREN
   ;
 
 dml_statement:
@@ -219,16 +219,23 @@ distinct_clause_opt:
   ;
 
 graph_statement:
-    CREATE GRAPH INDEX IDENT ON qualified_name graph_options_opt
-  | CREATE GRAPH METRIC IDENT ON qualified_name graph_options_opt
+    CREATE GRAPH INDEX identifier_name ON qualified_name graph_options_opt
+  | CREATE GRAPH METRIC identifier_name ON qualified_name graph_options_opt
   ;
 
 unsupported_statement:
     ANALYZE unsupported_tail_opt
   | EXPLAIN explain_options_opt explain_subject_opt
   | COPY diagnostic_tail_opt
+  | CLUSTER diagnostic_tail_opt
+  | COMMENT diagnostic_tail_opt
+  | GRANT diagnostic_tail_opt
+  | LISTEN diagnostic_tail_opt
+  | LOCK diagnostic_tail_opt
+  | NOTIFY diagnostic_tail_opt
   | VACUUM diagnostic_tail_opt
   | REINDEX diagnostic_tail_opt
+  | REVOKE diagnostic_tail_opt
   ;
 
 explain_options_opt:
@@ -247,7 +254,7 @@ explain_option:
   ;
 
 explain_option_name:
-    IDENT
+    identifier_name
   | ANALYZE
   ;
 
@@ -276,7 +283,7 @@ column_definition_list:
   ;
 
 column_definition:
-    IDENT type_name column_constraint_list_opt
+    identifier_name type_name column_constraint_list_opt
   ;
 
 column_constraint_list_opt:
@@ -330,16 +337,16 @@ select_item_list:
 
 select_item:
     expression
-  | expression AS IDENT
-  | expression IDENT
+  | expression AS identifier_name
+  | expression identifier_name
   | window_function_expression
-  | window_function_expression AS IDENT
-  | window_function_expression IDENT
+  | window_function_expression AS identifier_name
+  | window_function_expression identifier_name
   ;
 
 window_function_expression:
     qualified_name LPAREN function_argument_list_opt RPAREN OVER LPAREN window_definition RPAREN
-  | qualified_name LPAREN function_argument_list_opt RPAREN OVER IDENT
+  | qualified_name LPAREN function_argument_list_opt RPAREN OVER identifier_name
   ;
 
 window_definition:
@@ -362,7 +369,7 @@ named_window_list:
   ;
 
 named_window:
-    IDENT AS LPAREN window_definition RPAREN
+    identifier_name AS LPAREN window_definition RPAREN
   ;
 
 window_frame_opt:
@@ -400,9 +407,9 @@ table_reference_list:
 
 table_reference:
     qualified_name
-  | qualified_name AS IDENT
+  | qualified_name AS identifier_name
   | table_reference join_operator table_reference join_condition
-  | LATERAL LPAREN read_statement RPAREN AS IDENT
+  | LATERAL LPAREN read_statement RPAREN AS identifier_name
   ;
 
 join_condition:
@@ -518,7 +525,7 @@ conflict_clause_opt:
 
 conflict_target:
     LPAREN identifier_list RPAREN conflict_target_where_opt
-  | ON CONSTRAINT IDENT
+  | ON CONSTRAINT identifier_name
   ;
 
 conflict_target_where_opt:
@@ -546,7 +553,7 @@ cte_list:
   ;
 
 cte:
-    IDENT cte_column_aliases_opt AS cte_materialization_opt LPAREN statement RPAREN
+    identifier_name cte_column_aliases_opt AS cte_materialization_opt LPAREN statement RPAREN
   ;
 
 cte_column_aliases_opt:
@@ -573,7 +580,7 @@ merge_action:
 
 index_method_opt:
     /* empty */
-  | USING IDENT
+  | USING identifier_name
   ;
 
 index_element_list:
@@ -605,7 +612,7 @@ option:
   ;
 
 option_name:
-    IDENT
+    identifier_name
   | METRIC
   ;
 
@@ -802,7 +809,7 @@ primary_expression:
   | CAST LPAREN expression AS type_name RPAREN
   | CASE case_when_list case_else_opt END
   | EXISTS LPAREN read_statement RPAREN
-  | EXTRACT LPAREN IDENT FROM expression RPAREN
+  | EXTRACT LPAREN identifier_name FROM expression RPAREN
   | CURRENT_DATE
   | CURRENT_TIMESTAMP current_timestamp_precision_opt
   | qualified_name LPAREN function_argument_list_opt RPAREN within_group_clause_opt filter_clause_opt
@@ -845,13 +852,24 @@ literal:
   ;
 
 qualified_name:
-    IDENT
-  | qualified_name DOT IDENT
+    identifier_name
+  | qualified_name DOT identifier_name
   ;
 
 identifier_list:
+    identifier_name
+  | identifier_list COMMA identifier_name
+  ;
+
+identifier_name:
     IDENT
-  | identifier_list COMMA IDENT
+  | CLUSTER
+  | COMMENT
+  | GRANT
+  | LISTEN
+  | LOCK
+  | NOTIFY
+  | REVOKE
   ;
 
 type_name:
@@ -903,17 +921,28 @@ diagnostic_token:
   | RBRACKET
   | ALL
   | ANALYZE
+  | CLUSTER
+  | COMMENT
   | COPY
   | DATABASE
   | FALSE
   | FROM
   | FULL
+  | GRANT
+  | IN
   | INDEX
+  | IS
+  | LISTEN
+  | LOCK
+  | NOTIFY
   | ON
+  | REVOKE
   | SCHEMA
+  | SELECT
   | TABLE
   | TO
   | TRUE
+  | USING
   | VACUUM
   | WITH
   ;
