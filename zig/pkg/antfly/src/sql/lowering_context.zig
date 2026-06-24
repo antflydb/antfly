@@ -1425,35 +1425,75 @@ fn validateGeneratedExpressionAstOptionalChild(
     }
 }
 
+fn generatedExpressionAstHasScalarShapeMetadata(expression: generated_parser.GeneratedSqlExpressionAst) bool {
+    return expression.inner_expression_kind != null or
+        expression.subquery_read_kind != null or
+        expression.subquery_where_expression_kind != null or
+        expression.filter_expression_kind != null or
+        expression.over_frame_start_expression_kind != null or
+        expression.over_frame_end_expression_kind != null or
+        expression.cast_expression_kind != null or
+        expression.case_branch_count != 0 or
+        expression.case_first_condition_kind != null or
+        expression.case_first_result_kind != null or
+        expression.case_else_expression_kind != null or
+        expression.boolean_condition_count != 0 or
+        expression.boolean_first_condition_kind != null or
+        expression.boolean_last_condition_kind != null or
+        expression.extract_source_expression_kind != null or
+        expression.left_expression_kind != null or
+        expression.between_modifier != null or
+        expression.between_lower_expression_kind != null or
+        expression.between_upper_expression_kind != null or
+        expression.right_expression_kind != null or
+        expression.escape_expression_kind != null;
+}
+
+fn validateGeneratedExpressionAstHasNoUnexpectedPayload(expression: generated_parser.GeneratedSqlExpressionAst) !void {
+    if (generatedExpressionAstHasMetadata(expression) or generatedExpressionAstHasScalarShapeMetadata(expression)) {
+        return error.UnsupportedSqlShape;
+    }
+}
+
 fn validateGeneratedTokenRangeExpressionAstStructure(expression: generated_parser.GeneratedSqlExpressionAst) !void {
     if (expression.tokens == null) return error.UnsupportedSqlShape;
     var payload = expression;
     payload.tokens = null;
-    if (generatedExpressionAstHasMetadata(payload) or
-        payload.inner_expression_kind != null or
-        payload.subquery_read_kind != null or
-        payload.subquery_where_expression_kind != null or
-        payload.filter_expression_kind != null or
-        payload.over_frame_start_expression_kind != null or
-        payload.over_frame_end_expression_kind != null or
-        payload.cast_expression_kind != null or
-        payload.case_branch_count != 0 or
-        payload.case_first_condition_kind != null or
-        payload.case_first_result_kind != null or
-        payload.case_else_expression_kind != null or
-        payload.boolean_condition_count != 0 or
-        payload.boolean_first_condition_kind != null or
-        payload.boolean_last_condition_kind != null or
-        payload.extract_source_expression_kind != null or
-        payload.left_expression_kind != null or
-        payload.between_modifier != null or
-        payload.between_lower_expression_kind != null or
-        payload.between_upper_expression_kind != null or
-        payload.right_expression_kind != null or
-        payload.escape_expression_kind != null)
-    {
+    try validateGeneratedExpressionAstHasNoUnexpectedPayload(payload);
+}
+
+fn validateGeneratedIntervalExpressionAstStructure(expression: generated_parser.GeneratedSqlExpressionAst) !void {
+    if (expression.tokens == null or expression.interval_value_tokens == null) return error.UnsupportedSqlShape;
+    var payload = expression;
+    payload.tokens = null;
+    payload.interval_value_tokens = null;
+    try validateGeneratedExpressionAstHasNoUnexpectedPayload(payload);
+}
+
+fn validateGeneratedTimestampExpressionAstStructure(expression: generated_parser.GeneratedSqlExpressionAst) !void {
+    if (expression.tokens == null or expression.timestamp_type_tokens == null or expression.timestamp_value_tokens == null) {
         return error.UnsupportedSqlShape;
     }
+    var payload = expression;
+    payload.tokens = null;
+    payload.timestamp_type_tokens = null;
+    payload.timestamp_value_tokens = null;
+    try validateGeneratedExpressionAstHasNoUnexpectedPayload(payload);
+}
+
+fn validateGeneratedCurrentDateExpressionAstStructure(expression: generated_parser.GeneratedSqlExpressionAst) !void {
+    if (expression.tokens == null) return error.UnsupportedSqlShape;
+    var payload = expression;
+    payload.tokens = null;
+    try validateGeneratedExpressionAstHasNoUnexpectedPayload(payload);
+}
+
+fn validateGeneratedCurrentTimestampExpressionAstStructure(expression: generated_parser.GeneratedSqlExpressionAst) !void {
+    if (expression.tokens == null) return error.UnsupportedSqlShape;
+    var payload = expression;
+    payload.tokens = null;
+    payload.current_timestamp_precision_tokens = null;
+    try validateGeneratedExpressionAstHasNoUnexpectedPayload(payload);
 }
 
 fn validateGeneratedReadListAstContainedByRange(
@@ -2277,19 +2317,10 @@ fn validateGeneratedExpressionAstStructure(expression: generated_parser.Generate
             if (expression.case_else_expression_tokens != null and expression.case_else_tokens == null) return error.UnsupportedSqlShape;
             try validateGeneratedExpressionAstOptionalChild(expression.case_else_expression_kind, expression.case_else_expression_tokens, expression.case_else_expression);
         },
-        .interval_literal => {
-            if (expression.tokens == null or expression.interval_value_tokens == null) return error.UnsupportedSqlShape;
-        },
-        .timestamp_literal => {
-            if (expression.tokens == null or expression.timestamp_type_tokens == null or expression.timestamp_value_tokens == null) {
-                return error.UnsupportedSqlShape;
-            }
-        },
-        .current_date,
-        .current_timestamp,
-        => {
-            if (expression.tokens == null) return error.UnsupportedSqlShape;
-        },
+        .interval_literal => try validateGeneratedIntervalExpressionAstStructure(expression),
+        .timestamp_literal => try validateGeneratedTimestampExpressionAstStructure(expression),
+        .current_date => try validateGeneratedCurrentDateExpressionAstStructure(expression),
+        .current_timestamp => try validateGeneratedCurrentTimestampExpressionAstStructure(expression),
         .extract_expression => {
             if (expression.tokens == null or expression.extract_field_tokens == null or expression.extract_source_tokens == null) {
                 return error.UnsupportedSqlShape;
@@ -4442,6 +4473,56 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_extract_expression_parsed_sql, malformed_extract_expression_read_ast),
+    );
+
+    var malformed_current_timestamp_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT CURRENT_TIMESTAMP FROM usage_records WHERE id = 'u1'",
+    );
+    defer malformed_current_timestamp_parsed_sql.deinit(alloc);
+    const malformed_current_timestamp_generated_raw = malformed_current_timestamp_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_current_timestamp_read_ast = switch (malformed_current_timestamp_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_current_timestamp_read_ast.projection_items.expressions[0].operator_tokens =
+        malformed_current_timestamp_read_ast.projection_items.expressions[0].tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_current_timestamp_parsed_sql, malformed_current_timestamp_read_ast),
+    );
+
+    var malformed_interval_literal_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT INTERVAL '1 day' FROM usage_records WHERE id = 'u1'",
+    );
+    defer malformed_interval_literal_parsed_sql.deinit(alloc);
+    const malformed_interval_literal_generated_raw = malformed_interval_literal_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_interval_literal_read_ast = switch (malformed_interval_literal_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_interval_literal_read_ast.projection_items.expressions[0].right_expression_kind = .token_range;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_interval_literal_parsed_sql, malformed_interval_literal_read_ast),
+    );
+
+    var malformed_timestamp_literal_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT TIMESTAMP '2026-01-01 00:00:00' FROM usage_records WHERE id = 'u1'",
+    );
+    defer malformed_timestamp_literal_parsed_sql.deinit(alloc);
+    const malformed_timestamp_literal_generated_raw = malformed_timestamp_literal_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_timestamp_literal_read_ast = switch (malformed_timestamp_literal_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_timestamp_literal_read_ast.projection_items.expressions[0].interval_value_tokens =
+        malformed_timestamp_literal_read_ast.projection_items.expressions[0].timestamp_value_tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_timestamp_literal_parsed_sql, malformed_timestamp_literal_read_ast),
     );
 
     var malformed_join_tree_parsed_sql = try tokenized.ParsedSql.initAlloc(

@@ -462,10 +462,10 @@ Unsupported DDL remains on the existing parser until
    Plain `DISTINCT` and `DISTINCT ON (...)` reads now carry generated distinct
    ranges, `DISTINCT ON` expression-list AST items for top-level and CTE body
    reads, and preserve the production aggregate/query-family split.
-   Generated expression validation now rejects mixed-shape `token_range` leaf
-   expressions that carry stray operator, child, list, subquery, function,
-   window, cast, case, boolean-chain, temporal, extract, or predicate
-   metadata.
+   Generated expression validation now rejects mixed-shape `token_range`,
+   temporal literal, and current temporal leaf expressions that carry stray
+   operator, child, list, subquery, function, window, cast, case,
+   boolean-chain, extract, or predicate metadata.
    Set-operation reads now classify as their own generated read family and
    dispatch to the native set-operation lowerer after validating the generated
    left-query, operator, `UNION ALL`, right-query projection/source, and
