@@ -961,6 +961,8 @@ fn generatedExpressionAstHasMetadata(expression: generated_parser.GeneratedSqlEx
         expression.over_partition_tokens != null or
         expression.over_order_tokens != null or
         expression.over_frame_tokens != null or
+        expression.over_frame_start_expression_tokens != null or
+        expression.over_frame_end_expression_tokens != null or
         expression.array_tokens != null or
         expression.cast_expression_tokens != null or
         expression.cast_type_tokens != null or
@@ -997,6 +999,8 @@ fn generatedExpressionAstHasMetadata(expression: generated_parser.GeneratedSqlEx
         expression.filter_expression != null or
         expression.escape_expression != null or
         expression.cast_expression != null or
+        expression.over_frame_start_expression != null or
+        expression.over_frame_end_expression != null or
         expression.case_first_condition != null or
         expression.case_first_result != null or
         expression.case_else_expression != null or
@@ -1134,7 +1138,9 @@ fn validateGeneratedFunctionOverMetadata(expression: generated_parser.GeneratedS
         if (expression.over_name_tokens != null or expression.over_definition_tokens != null or
             expression.over_partition_tokens != null or expression.over_partition_items.count != 0 or
             expression.over_order_tokens != null or expression.over_order_items.count != 0 or
-            expression.over_frame_tokens != null)
+            expression.over_frame_tokens != null or expression.over_frame_start_expression_tokens != null or
+            expression.over_frame_start_expression != null or expression.over_frame_end_expression_tokens != null or
+            expression.over_frame_end_expression != null)
         {
             return error.UnsupportedSqlShape;
         }
@@ -1147,7 +1153,9 @@ fn validateGeneratedFunctionOverMetadata(expression: generated_parser.GeneratedS
         if (name_tokens.start <= over_tokens.start or name_tokens.end != over_tokens.end) return error.UnsupportedSqlShape;
         if (expression.over_partition_tokens != null or expression.over_partition_items.count != 0 or
             expression.over_order_tokens != null or expression.over_order_items.count != 0 or
-            expression.over_frame_tokens != null)
+            expression.over_frame_tokens != null or expression.over_frame_start_expression_tokens != null or
+            expression.over_frame_start_expression != null or expression.over_frame_end_expression_tokens != null or
+            expression.over_frame_end_expression != null)
         {
             return error.UnsupportedSqlShape;
         }
@@ -1165,6 +1173,24 @@ fn validateGeneratedFunctionOverMetadata(expression: generated_parser.GeneratedS
         if (expression.over_order_items.count == 0) return error.UnsupportedSqlShape;
     } else if (expression.over_order_items.count != 0) {
         return error.UnsupportedSqlShape;
+    }
+    if (expression.over_frame_tokens == null) {
+        if (expression.over_frame_start_expression_tokens != null or expression.over_frame_start_expression != null or
+            expression.over_frame_end_expression_tokens != null or expression.over_frame_end_expression != null)
+        {
+            return error.UnsupportedSqlShape;
+        }
+    } else {
+        try validateGeneratedExpressionAstOptionalChild(
+            expression.over_frame_start_expression_kind,
+            expression.over_frame_start_expression_tokens,
+            expression.over_frame_start_expression,
+        );
+        try validateGeneratedExpressionAstOptionalChild(
+            expression.over_frame_end_expression_kind,
+            expression.over_frame_end_expression_tokens,
+            expression.over_frame_end_expression,
+        );
     }
 }
 
@@ -1381,6 +1407,8 @@ fn validateGeneratedExpressionAstRanges(
         expression.over_partition_tokens,
         expression.over_order_tokens,
         expression.over_frame_tokens,
+        expression.over_frame_start_expression_tokens,
+        expression.over_frame_end_expression_tokens,
         expression.array_tokens,
         expression.cast_expression_tokens,
         expression.cast_type_tokens,
@@ -1415,6 +1443,8 @@ fn validateGeneratedExpressionAstRanges(
     if (expression.filter_expression) |filter| try validateGeneratedExpressionAstRanges(tokens, read_ast, filter.*);
     if (expression.escape_expression) |escape| try validateGeneratedExpressionAstRanges(tokens, read_ast, escape.*);
     if (expression.cast_expression) |cast_expression| try validateGeneratedExpressionAstRanges(tokens, read_ast, cast_expression.*);
+    if (expression.over_frame_start_expression) |frame_start_expression| try validateGeneratedExpressionAstRanges(tokens, read_ast, frame_start_expression.*);
+    if (expression.over_frame_end_expression) |frame_end_expression| try validateGeneratedExpressionAstRanges(tokens, read_ast, frame_end_expression.*);
     if (expression.case_first_condition) |case_first_condition| try validateGeneratedExpressionAstRanges(tokens, read_ast, case_first_condition.*);
     if (expression.case_first_result) |case_first_result| try validateGeneratedExpressionAstRanges(tokens, read_ast, case_first_result.*);
     if (expression.case_else_expression) |case_else_expression| try validateGeneratedExpressionAstRanges(tokens, read_ast, case_else_expression.*);
@@ -1477,6 +1507,12 @@ fn validateGeneratedExpressionAstRanges(
             if (frame.start < definition.start or frame.end > definition.end) return error.UnsupportedSqlShape;
             if (!tokens[frame.start].matchesKeywordTag(.rows) and !tokens[frame.start].matchesKeywordTag(.range)) {
                 return error.UnsupportedSqlShape;
+            }
+            if (expression.over_frame_start_expression_tokens) |frame_expression| {
+                if (frame_expression.start < frame.start or frame_expression.end > frame.end) return error.UnsupportedSqlShape;
+            }
+            if (expression.over_frame_end_expression_tokens) |frame_expression| {
+                if (frame_expression.start < frame.start or frame_expression.end > frame.end) return error.UnsupportedSqlShape;
             }
         }
     }
@@ -1547,6 +1583,26 @@ fn validateGeneratedWindowAstListRanges(
             if (!tokens[frame_tokens.start].matchesKeywordTag(.rows) and !tokens[frame_tokens.start].matchesKeywordTag(.range)) {
                 return error.UnsupportedSqlShape;
             }
+            if (window.frame_start_expression_tokens) |frame_expression| {
+                try validateGeneratedReadTokenRange(tokens, read_ast, frame_expression);
+                if (frame_expression.start < frame_tokens.start or frame_expression.end > frame_tokens.end) return error.UnsupportedSqlShape;
+                try requireGeneratedExpressionAstChild(window.frame_start_expression_kind, window.frame_start_expression_tokens, window.frame_start_expression);
+                try validateGeneratedExpressionAstRanges(tokens, read_ast, window.frame_start_expression.?.*);
+            } else if (window.frame_start_expression != null) {
+                return error.UnsupportedSqlShape;
+            }
+            if (window.frame_end_expression_tokens) |frame_expression| {
+                try validateGeneratedReadTokenRange(tokens, read_ast, frame_expression);
+                if (frame_expression.start < frame_tokens.start or frame_expression.end > frame_tokens.end) return error.UnsupportedSqlShape;
+                try requireGeneratedExpressionAstChild(window.frame_end_expression_kind, window.frame_end_expression_tokens, window.frame_end_expression);
+                try validateGeneratedExpressionAstRanges(tokens, read_ast, window.frame_end_expression.?.*);
+            } else if (window.frame_end_expression != null) {
+                return error.UnsupportedSqlShape;
+            }
+        } else if (window.frame_start_expression_tokens != null or window.frame_start_expression != null or
+            window.frame_end_expression_tokens != null or window.frame_end_expression != null)
+        {
+            return error.UnsupportedSqlShape;
         }
     }
 }
@@ -2699,6 +2755,22 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_inline_window_parsed_sql, malformed_inline_window_read_ast),
+    );
+
+    var malformed_inline_window_frame_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id, count(*) OVER (ORDER BY amount ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) AS current_and_next FROM usage_records",
+    );
+    defer malformed_inline_window_frame_parsed_sql.deinit(alloc);
+    const malformed_inline_window_frame_generated_raw = malformed_inline_window_frame_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_inline_window_frame_read_ast = switch (malformed_inline_window_frame_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_inline_window_frame_read_ast.projection_items.expressions[1].over_frame_end_expression = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_inline_window_frame_parsed_sql, malformed_inline_window_frame_read_ast),
     );
 
     var cte_parsed_sql = try tokenized.ParsedSql.initAlloc(

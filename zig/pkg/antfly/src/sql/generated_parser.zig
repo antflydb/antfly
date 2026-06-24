@@ -300,6 +300,12 @@ pub const GeneratedSqlExpressionAst = struct {
     over_order_tokens: ?GeneratedSqlTokenRange = null,
     over_order_items: GeneratedSqlListAst = .{},
     over_frame_tokens: ?GeneratedSqlTokenRange = null,
+    over_frame_start_expression_tokens: ?GeneratedSqlTokenRange = null,
+    over_frame_start_expression_kind: ?GeneratedSqlExpressionKind = null,
+    over_frame_start_expression: ?*GeneratedSqlExpressionAst = null,
+    over_frame_end_expression_tokens: ?GeneratedSqlTokenRange = null,
+    over_frame_end_expression_kind: ?GeneratedSqlExpressionKind = null,
+    over_frame_end_expression: ?*GeneratedSqlExpressionAst = null,
     array_tokens: ?GeneratedSqlTokenRange = null,
     array_items: GeneratedSqlListAst = .{},
     cast_expression_tokens: ?GeneratedSqlTokenRange = null,
@@ -376,6 +382,14 @@ pub const GeneratedSqlExpressionAst = struct {
         if (self.cast_expression) |cast_expression| {
             cast_expression.deinit(alloc);
             alloc.destroy(cast_expression);
+        }
+        if (self.over_frame_start_expression) |frame_start_expression| {
+            frame_start_expression.deinit(alloc);
+            alloc.destroy(frame_start_expression);
+        }
+        if (self.over_frame_end_expression) |frame_end_expression| {
+            frame_end_expression.deinit(alloc);
+            alloc.destroy(frame_end_expression);
         }
         if (self.case_first_condition) |case_first_condition| {
             case_first_condition.deinit(alloc);
@@ -501,10 +515,24 @@ pub const GeneratedSqlWindowAst = struct {
     order_tokens: ?GeneratedSqlTokenRange = null,
     order_items: GeneratedSqlListAst = .{},
     frame_tokens: ?GeneratedSqlTokenRange = null,
+    frame_start_expression_tokens: ?GeneratedSqlTokenRange = null,
+    frame_start_expression_kind: ?GeneratedSqlExpressionKind = null,
+    frame_start_expression: ?*GeneratedSqlExpressionAst = null,
+    frame_end_expression_tokens: ?GeneratedSqlTokenRange = null,
+    frame_end_expression_kind: ?GeneratedSqlExpressionKind = null,
+    frame_end_expression: ?*GeneratedSqlExpressionAst = null,
 
     pub fn deinit(self: *GeneratedSqlWindowAst, alloc: std.mem.Allocator) void {
         self.partition_items.deinit(alloc);
         self.order_items.deinit(alloc);
+        if (self.frame_start_expression) |frame_start_expression| {
+            frame_start_expression.deinit(alloc);
+            alloc.destroy(frame_start_expression);
+        }
+        if (self.frame_end_expression) |frame_end_expression| {
+            frame_end_expression.deinit(alloc);
+            alloc.destroy(frame_end_expression);
+        }
         self.* = undefined;
     }
 };
@@ -2218,8 +2246,58 @@ fn buildGeneratedWindowAst(
     }
     if (frame_index) |idx| {
         ast.frame_tokens = .{ .start = idx, .end = definition.end };
+        if (generatedWindowFrameExpressionRanges(tokens, ast.frame_tokens.?)) |frame_expressions| {
+            if (frame_expressions.start_expression_tokens) |expression_tokens| {
+                ast.frame_start_expression_tokens = expression_tokens;
+                ast.frame_start_expression_kind = generatedExpressionKindForRange(tokens, expression_tokens);
+                ast.frame_start_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, expression_tokens);
+            }
+            if (frame_expressions.end_expression_tokens) |expression_tokens| {
+                ast.frame_end_expression_tokens = expression_tokens;
+                ast.frame_end_expression_kind = generatedExpressionKindForRange(tokens, expression_tokens);
+                ast.frame_end_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, expression_tokens);
+            }
+        }
     }
     return ast;
+}
+
+const GeneratedWindowFrameExpressionRanges = struct {
+    start_expression_tokens: ?GeneratedSqlTokenRange = null,
+    end_expression_tokens: ?GeneratedSqlTokenRange = null,
+};
+
+fn generatedWindowFrameExpressionRanges(
+    tokens: []const token_mod.Token,
+    frame_tokens: GeneratedSqlTokenRange,
+) ?GeneratedWindowFrameExpressionRanges {
+    if (frame_tokens.start + 1 >= frame_tokens.end or frame_tokens.end > tokens.len) return null;
+    if (!tokens[frame_tokens.start].matchesKeywordTag(.rows) and !tokens[frame_tokens.start].matchesKeywordTag(.range)) return null;
+    const body_start = frame_tokens.start + 1;
+    if (tokens[body_start].matchesKeywordTag(.between)) {
+        const and_index = findTopLevelKeyword(tokens, body_start + 1, frame_tokens.end, .@"and") orelse return null;
+        return .{
+            .start_expression_tokens = generatedWindowFrameBoundExpressionTokens(tokens, body_start + 1, and_index),
+            .end_expression_tokens = generatedWindowFrameBoundExpressionTokens(tokens, and_index + 1, frame_tokens.end),
+        };
+    }
+    return .{
+        .start_expression_tokens = generatedWindowFrameBoundExpressionTokens(tokens, body_start, frame_tokens.end),
+    };
+}
+
+fn generatedWindowFrameBoundExpressionTokens(
+    tokens: []const token_mod.Token,
+    start: usize,
+    end: usize,
+) ?GeneratedSqlTokenRange {
+    if (start >= end or end > tokens.len) return null;
+    if (tokens[start].matchesKeywordTag(.unbounded) or tokens[start].matchesKeywordTag(.current)) return null;
+    const preceding_index = findTopLevelKeyword(tokens, start, end, .preceding);
+    const following_index = findTopLevelKeyword(tokens, start, end, .following);
+    const bound_index = firstOptionalIndex(&[_]?usize{ preceding_index, following_index }) orelse return null;
+    if (start >= bound_index) return null;
+    return .{ .start = start, .end = bound_index };
 }
 
 fn generatedReadProjectionStartInRange(
@@ -3096,6 +3174,20 @@ fn buildGeneratedExpressionAst(alloc: std.mem.Allocator, tokens: []const token_m
             ast.over_order_items = try buildTopLevelListAst(alloc, tokens, order_tokens, .{ .order_modifiers = true });
         }
         ast.over_frame_tokens = function_call.over_frame_tokens;
+        if (function_call.over_frame_tokens) |frame_tokens| {
+            if (generatedWindowFrameExpressionRanges(tokens, frame_tokens)) |frame_expressions| {
+                if (frame_expressions.start_expression_tokens) |expression_tokens| {
+                    ast.over_frame_start_expression_tokens = expression_tokens;
+                    ast.over_frame_start_expression_kind = generatedExpressionKindForRange(tokens, expression_tokens);
+                    ast.over_frame_start_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, expression_tokens);
+                }
+                if (frame_expressions.end_expression_tokens) |expression_tokens| {
+                    ast.over_frame_end_expression_tokens = expression_tokens;
+                    ast.over_frame_end_expression_kind = generatedExpressionKindForRange(tokens, expression_tokens);
+                    ast.over_frame_end_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, expression_tokens);
+                }
+            }
+        }
         return ast;
     }
     if (generatedArrayConstructorExpression(tokens, range)) |array_constructor| {
@@ -6398,6 +6490,27 @@ test "generated SQL parser facade builds extended read AST spans" {
             try std.testing.expectEqual(@as(usize, 1), window_expression.over_order_items.count);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, window_expression.over_order_items.items[0]);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 18 }, window_expression.over_frame_tokens.?);
+            try std.testing.expect(window_expression.over_frame_start_expression_tokens == null);
+            try std.testing.expect(window_expression.over_frame_end_expression_tokens == null);
+            try std.testing.expect(window_expression.over_frame_start_expression == null);
+            try std.testing.expect(window_expression.over_frame_end_expression == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const offset_framed_window_read_sql = "SELECT id, count(*) OVER (ORDER BY amount ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) AS current_and_next FROM usage_records";
+    const offset_framed_window_read_result = try parseSqlAlloc(alloc, offset_framed_window_read_sql);
+    switch (offset_framed_window_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.window, read.kind);
+            const window_expression = read.projection_items.expressions[1];
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.function_call, window_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 19 }, window_expression.over_frame_tokens.?);
+            try std.testing.expect(window_expression.over_frame_start_expression_tokens == null);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 17, .end = 18 }, window_expression.over_frame_end_expression_tokens.?);
+            try std.testing.expect(window_expression.over_frame_end_expression_kind == null);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, window_expression.over_frame_end_expression.?.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 17, .end = 18 }, window_expression.over_frame_end_expression.?.tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -6412,6 +6525,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 16, .end = 26 }, read.window_items[0].definition_tokens);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 18, .end = 19 }, read.window_items[0].order_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 19, .end = 26 }, read.window_items[0].frame_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 21, .end = 22 }, read.window_items[0].frame_start_expression_tokens.?);
+            try std.testing.expect(read.window_items[0].frame_start_expression_kind == null);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.window_items[0].frame_start_expression.?.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 21, .end = 22 }, read.window_items[0].frame_start_expression.?.tokens.?);
+            try std.testing.expect(read.window_items[0].frame_end_expression_tokens == null);
+            try std.testing.expect(read.window_items[0].frame_end_expression == null);
         },
         else => return error.TestUnexpectedResult,
     }

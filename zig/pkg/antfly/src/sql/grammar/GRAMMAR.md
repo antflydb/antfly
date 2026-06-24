@@ -416,9 +416,10 @@ Unsupported DDL remains on the existing parser until
    name/definition, partition-list, order-list, and frame-tail expression
    metadata, named windows carry generated AST items with name, definition,
    partition-list, order-list, and frame-tail ranges, seed `ROWS`/`RANGE` frame
-   tails are accepted in inline and named windows, CTE body named windows carry
-   the same generated metadata, and generated window reads dispatch to the typed
-   window lowerer after range validation.
+   tails are accepted in inline and named windows with owned expression
+   payloads for bounded frame offsets, CTE body named windows carry the same
+   generated metadata, and generated window reads dispatch to the typed window
+   lowerer after range validation.
    Plain `DISTINCT` and `DISTINCT ON (...)` reads now carry generated distinct
    ranges, `DISTINCT ON` expression-list AST items for top-level and CTE body
    reads, and preserve the production aggregate/query-family split.
