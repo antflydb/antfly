@@ -93,8 +93,9 @@ read classifier. Simple query, aggregate, join, and lateral reads now validate
 generated clause ranges before calling their typed read-plan lowerers directly;
 basic `OVER (PARTITION BY ... ORDER BY ...)` window reads now classify as a
 generated window family, minimal named `WINDOW ... AS (PARTITION BY ... ORDER
-BY ...)` clauses are accepted and ranged, and window reads dispatch directly
-after validating projection/source ranges;
+BY ...)` clauses are accepted and ranged, seed `ROWS`/`RANGE` frame tails are
+accepted, and window reads dispatch directly after validating projection/source
+ranges;
 plain `DISTINCT` and `DISTINCT ON (...)` reads now carry generated distinct
 ranges and match the production aggregate/query-family split;
 generated set-operation reads now classify as a distinct read family and
@@ -221,8 +222,9 @@ Suggested migration order:
    AST-to-read-family dispatch boundaries after clause-range validation.
    Basic `OVER (PARTITION BY ... ORDER BY ...)` and named
    `WINDOW ... AS (PARTITION BY ... ORDER BY ...)` reads now classify as
-   generated window reads and dispatch to the typed window lowerer after range
-   validation.
+   generated window reads, seed `ROWS`/`RANGE` frame tails are accepted in
+   inline and named windows, and generated window reads dispatch to the typed
+   window lowerer after range validation.
    Plain `DISTINCT` and `DISTINCT ON (...)` reads now carry generated distinct
    ranges and preserve the production aggregate/query-family split.
    Set-operation reads now classify as their own generated read family and
