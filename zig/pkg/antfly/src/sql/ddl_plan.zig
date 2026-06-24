@@ -15,7 +15,9 @@
 const std = @import("std");
 const binder = @import("binder.zig");
 const catalog_resources = @import("../api/catalog_resources.zig");
+const classifier = @import("classifier.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const generated_parser = @import("generated_parser.zig");
 const grammar = @import("grammar.zig");
 const lower_expr = @import("lower_expr.zig");
 const plan_mod = @import("plan.zig");
@@ -2904,6 +2906,89 @@ pub fn deallocatePreparedStatementPlanFromSyntaxAlloc(
     if (syntax.all) return .{ .all = true };
     const statement_name = syntax.name orelse return error.UnsupportedSqlShape;
     return .{ .statement_name = try alloc.dupe(u8, statement_name) };
+}
+
+pub fn preparedStatementPlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlPreparedAst,
+) !PreparedStatementPlan {
+    return switch (ast.kind) {
+        .prepare => .{ .prepare = try prepareStatementPlanFromGeneratedAstAlloc(alloc, tokens, ast) },
+        .execute => .{ .execute = try executePreparedStatementPlanFromGeneratedAstAlloc(alloc, tokens, ast) },
+        .deallocate => .{ .deallocate = try deallocatePreparedStatementPlanFromGeneratedAstAlloc(alloc, tokens, ast) },
+    };
+}
+
+pub fn prepareStatementPlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlPreparedAst,
+) !PrepareStatementPlan {
+    const statement_name = try generatedSingleIdentifierText(tokens, ast.name_tokens orelse return error.UnsupportedSqlShape);
+    const inner = ast.inner_statement_tokens orelse return error.UnsupportedSqlShape;
+    const statement_family = classifier.classifyPreparedStatementStatementKind(tokens, inner.start) orelse return error.UnsupportedSqlShape;
+    return .{
+        .statement_name = try alloc.dupe(u8, statement_name),
+        .parameter_count = 0,
+        .statement_kind = preparedStatementSubjectKindFromSyntax(classifier.preparedStatementSubjectKindFromStatementKind(statement_family)),
+        .statement_family = preparedStatementStatementKindFromSyntax(statement_family),
+    };
+}
+
+pub fn executePreparedStatementPlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlPreparedAst,
+) !ExecutePreparedStatementPlan {
+    const statement_name = try generatedSingleIdentifierText(tokens, ast.name_tokens orelse return error.UnsupportedSqlShape);
+    const argument_count = if (ast.argument_tokens) |argument_tokens|
+        try countGeneratedPreparedArguments(tokens, argument_tokens)
+    else
+        0;
+    return .{
+        .statement_name = try alloc.dupe(u8, statement_name),
+        .argument_count = argument_count,
+    };
+}
+
+pub fn deallocatePreparedStatementPlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlPreparedAst,
+) !DeallocatePreparedStatementPlan {
+    const statement_name = try generatedSingleIdentifierText(tokens, ast.name_tokens orelse return error.UnsupportedSqlShape);
+    return .{ .statement_name = try alloc.dupe(u8, statement_name) };
+}
+
+fn generatedSingleIdentifierText(tokens: []const grammar.Token, range: generated_parser.GeneratedSqlTokenRange) ![]const u8 {
+    if (range.end != range.start + 1 or range.end > tokens.len) return error.UnsupportedSqlShape;
+    if (tokens[range.start].kind != .identifier) return error.UnsupportedSqlShape;
+    return tokens[range.start].text;
+}
+
+fn countGeneratedPreparedArguments(tokens: []const grammar.Token, range: generated_parser.GeneratedSqlTokenRange) !usize {
+    if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    if (tokens[range.start].kind != .lparen or tokens[range.end - 1].kind != .rparen) return error.UnsupportedSqlShape;
+    if (range.start + 1 == range.end - 1) return 0;
+
+    var count: usize = 1;
+    var depth: usize = 0;
+    for (tokens[range.start + 1 .. range.end - 1]) |token| {
+        switch (token.kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth == 0) return error.UnsupportedSqlShape;
+                depth -= 1;
+            },
+            .comma => {
+                if (depth == 0) count += 1;
+            },
+            else => {},
+        }
+    }
+    if (depth != 0) return error.UnsupportedSqlShape;
+    return count;
 }
 
 pub fn closeCursorPortalPlanFromSyntaxAlloc(
@@ -11797,6 +11882,77 @@ test "sql adapter ddl plan lowers prepared statement cursor and savepoint ddl pl
             else => return error.TestUnexpectedResult,
         }
     }
+}
+
+test "sql adapter generated prepared AST lowers to prepared statement plans" {
+    const alloc = std.testing.allocator;
+
+    var generated_prepare = try generatedPreparedStatementPlanForTestAlloc(alloc, "PREPARE usage_plan AS SELECT id FROM usage_records;");
+    defer generated_prepare.deinit(alloc);
+    var legacy_prepare = try lowerDdlPlanForTestAlloc(alloc, "PREPARE usage_plan AS SELECT id FROM usage_records;");
+    defer legacy_prepare.deinit(alloc);
+    switch (generated_prepare) {
+        .prepare => |generated| switch (legacy_prepare) {
+            .prepared_statement => |legacy_plan| switch (legacy_plan) {
+                .prepare => |legacy| {
+                    try std.testing.expectEqualStrings(legacy.statement_name, generated.statement_name);
+                    try std.testing.expectEqual(legacy.parameter_count, generated.parameter_count);
+                    try std.testing.expectEqual(legacy.statement_kind, generated.statement_kind);
+                    try std.testing.expectEqual(legacy.statement_family, generated.statement_family);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var generated_execute = try generatedPreparedStatementPlanForTestAlloc(alloc, "EXECUTE usage_plan('open', 10);");
+    defer generated_execute.deinit(alloc);
+    var legacy_execute = try lowerDdlPlanForTestAlloc(alloc, "EXECUTE usage_plan('open', 10);");
+    defer legacy_execute.deinit(alloc);
+    switch (generated_execute) {
+        .execute => |generated| switch (legacy_execute) {
+            .prepared_statement => |legacy_plan| switch (legacy_plan) {
+                .execute => |legacy| {
+                    try std.testing.expectEqualStrings(legacy.statement_name, generated.statement_name);
+                    try std.testing.expectEqual(legacy.argument_count, generated.argument_count);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var generated_deallocate = try generatedPreparedStatementPlanForTestAlloc(alloc, "DEALLOCATE usage_plan;");
+    defer generated_deallocate.deinit(alloc);
+    var legacy_deallocate = try lowerDdlPlanForTestAlloc(alloc, "DEALLOCATE usage_plan;");
+    defer legacy_deallocate.deinit(alloc);
+    switch (generated_deallocate) {
+        .deallocate => |generated| switch (legacy_deallocate) {
+            .prepared_statement => |legacy_plan| switch (legacy_plan) {
+                .deallocate => |legacy| {
+                    try std.testing.expectEqual(legacy.all, generated.all);
+                    try std.testing.expectEqualStrings(legacy.statement_name orelse return error.TestUnexpectedResult, generated.statement_name orelse return error.TestUnexpectedResult);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+fn generatedPreparedStatementPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !PreparedStatementPlan {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    const generated_raw = parsed.generated_statement orelse return error.UnsupportedSqlShape;
+    const prepared_ast = switch (generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .prepared => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    return try preparedStatementPlanFromGeneratedAstAlloc(alloc, parsed.items(), prepared_ast);
 }
 
 test "sql adapter ddl plan lowers routine expression bindings into ddl plans" {

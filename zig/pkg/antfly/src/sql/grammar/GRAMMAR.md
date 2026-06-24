@@ -41,18 +41,20 @@ node and uses it for the first migrated statement variants. Session,
 transaction, and prepared statements now require generated parser success;
 they also carry the first generated AST payload with source spans and token
 ranges for command names, values, prepared-statement arguments, and nested
-prepared statements. This AST is retained by `ParsedSql` but still lowers
-through the existing token-based control paths until plan parity tests cover the
-generated AST boundary directly. Simple DDL has generated-parser corpus coverage
-but still falls back to the existing parser when the seed grammar does not yet
-cover the shape. Simple DML now has generated-parser corpus coverage and
-retained generated raw nodes for covered write statements, but unsupported DML
-still falls back until plan parity is proven. Representative read queries now
-have generated-parser corpus coverage and retained generated raw nodes for
-covered read statements, while unsupported read shapes still fall back until
-read-plan parity is proven. The generated parser now also treats seed graph DDL
-as a distinct graph statement family and `ParsedSql` retains those generated
-nodes, but graph execution still routes through the existing DDL variant until
+prepared statements. This AST is retained by `ParsedSql`; prepared statements
+now have an AST-to-plan conversion path with parity coverage against the
+existing token-based lowerer. Session and transaction statements still lower
+through the existing token-based control paths until their generated AST plan
+parity tests exist. Simple DDL has generated-parser corpus coverage but still
+falls back to the existing parser when the seed grammar does not yet cover the
+shape. Simple DML now has generated-parser corpus coverage and retained
+generated raw nodes for covered write statements, but unsupported DML still
+falls back until plan parity is proven. Representative read queries now have
+generated-parser corpus coverage and retained generated raw nodes for covered
+read statements, while unsupported read shapes still fall back until read-plan
+parity is proven. The generated parser now also treats seed graph DDL as a
+distinct graph statement family and `ParsedSql` retains those generated nodes,
+but graph execution still routes through the existing DDL variant until
 graph-specific raw AST and lowering parity exist. The generated facade now
 returns closed statement-family nodes for the covered families; full production
 AST construction remains the next migration boundary for larger DDL, query,
@@ -217,7 +219,8 @@ variants for:
   value token ranges
 - transaction statement, including a generated AST payload for command spans
 - prepared statement, including a generated AST payload for command, name,
-  argument, and nested-statement token ranges
+  argument, and nested-statement token ranges, plus generated AST-to-plan parity
+  for `PREPARE`, `EXECUTE`, and `DEALLOCATE`
 - DDL statement
 - DML statement
 - read statement
@@ -253,7 +256,9 @@ Generated grammar work needs evidence at multiple levels:
   placeholders, casts, operators, and nested statements. The first AST shape
   test covers generated session, transaction, and prepared statement payloads.
 - Plan parity tests showing generated ASTs lower to the same typed plans as the
-  current parser for migrated statement families.
+  current parser for migrated statement families. Prepared statements have the
+  first generated AST-to-plan parity test for `PREPARE`, `EXECUTE`, and
+  `DEALLOCATE`.
 - SQL/API parity tests showing SQL and native API requests reach the same
   service contracts.
 - Fuzz or mutation tests for scanner/parser crash resistance and bounded error
