@@ -152,8 +152,9 @@ generated CTE reads now fail closed on malformed list counts, first/last
 compatibility fields, column-alias lists, materialization hints, and body
 enclosure metadata; each generated CTE item also carries body read-kind and
 body clause-span metadata for the first body query, including set-operation
-tails, plus owned body projection/group/order lists and predicate expression
-metadata, body pagination expression metadata for `LIMIT`, `OFFSET`, and
+tails, plus owned body projection/group/order lists, predicate expression
+metadata, generated body join-tree metadata with first-join compatibility
+fields, body pagination expression metadata for `LIMIT`, `OFFSET`, and
 `FETCH`, and the lowerer validates those body payloads before dispatch;
 recursive CTE reads carry an explicit generated recursive flag, and simple
 non-recursive CTE reads dispatch directly when those ranges validate; recursive
@@ -381,7 +382,8 @@ Suggested migration order:
    materialization hint payloads, and parenthesized body spans; each generated
    CTE item now carries body read-kind and first-query clause-span metadata,
    including set-operation tails, plus owned body projection/group/order list
-   payloads, body predicate expression payloads, and body pagination
+   payloads, body predicate expression payloads, generated body join-tree
+   metadata with first-join compatibility fields, and body pagination
    expression payloads for `LIMIT`, `OFFSET`, and `FETCH`; generated CTE
    lowering validates those body payloads. Recursive CTE reads carry an
    explicit recursive flag; and simple non-recursive CTE reads dispatch to the
@@ -409,8 +411,8 @@ Suggested migration order:
    planning/lowering, remaining specialized expression operators, richer
    inline window-expression planning beyond named-window clause metadata,
    recursive full CTE body planning beyond the current body
-   clause/list/expression/window and pagination metadata, direct generated
-   read-plan lowering, and
+   clause/list/expression/join/window and pagination metadata, direct
+   generated read-plan lowering, and
    unsupported-shape diagnostics.
 5. Advanced DML: `INSERT ... SELECT`, `UPDATE ... FROM`, `DELETE ... USING`,
    `TRUNCATE`, and `MERGE`.

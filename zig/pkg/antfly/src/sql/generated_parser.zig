@@ -391,6 +391,16 @@ pub const GeneratedSqlCteAst = struct {
     body_distinct_on_items: GeneratedSqlListAst = .{},
     body_projection_tokens: ?GeneratedSqlTokenRange = null,
     body_source_tokens: ?GeneratedSqlTokenRange = null,
+    body_join_tokens: ?GeneratedSqlTokenRange = null,
+    body_join_operator_tokens: ?GeneratedSqlTokenRange = null,
+    body_join_kind: ?GeneratedSqlJoinKind = null,
+    body_join_left_tokens: ?GeneratedSqlTokenRange = null,
+    body_join_right_tokens: ?GeneratedSqlTokenRange = null,
+    body_join_predicate_tokens: ?GeneratedSqlTokenRange = null,
+    body_join_predicate_expression: GeneratedSqlExpressionAst = .{},
+    body_join_items: []GeneratedSqlJoinAst = &.{},
+    body_join_tree_root_index: ?usize = null,
+    body_join_tree_depth: usize = 0,
     body_where_tokens: ?GeneratedSqlTokenRange = null,
     body_group_tokens: ?GeneratedSqlTokenRange = null,
     body_having_tokens: ?GeneratedSqlTokenRange = null,
@@ -425,6 +435,9 @@ pub const GeneratedSqlCteAst = struct {
         self.body_projection_items.deinit(alloc);
         self.body_projection_first_expression.deinit(alloc);
         self.body_projection_last_expression.deinit(alloc);
+        self.body_join_predicate_expression.deinit(alloc);
+        for (self.body_join_items) |*join| join.deinit(alloc);
+        if (self.body_join_items.len > 0) alloc.free(self.body_join_items);
         self.body_where_expression.deinit(alloc);
         self.body_group_items.deinit(alloc);
         self.body_group_first_expression.deinit(alloc);
@@ -1562,7 +1575,26 @@ fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.
     }
     if (from_index) |idx| {
         const source_end = firstOptionalIndex(&[_]?usize{ where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
-        if (idx + 1 < source_end) cte.body_source_tokens = .{ .start = idx + 1, .end = source_end };
+        if (idx + 1 < source_end) {
+            const source_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = source_end };
+            cte.body_source_tokens = source_tokens;
+            cte.body_join_items = try buildGeneratedJoinItemsAst(alloc, tokens, source_tokens);
+            if (cte.body_join_items.len > 0) {
+                cte.body_join_tree_root_index = cte.body_join_items.len - 1;
+                cte.body_join_tree_depth = cte.body_join_items.len;
+
+                const first = cte.body_join_items[0];
+                cte.body_join_tokens = source_tokens;
+                cte.body_join_operator_tokens = first.operator_tokens;
+                cte.body_join_kind = first.kind;
+                cte.body_join_left_tokens = first.left_tokens;
+                cte.body_join_right_tokens = first.right_tokens;
+                cte.body_join_predicate_tokens = first.predicate_tokens;
+                if (first.predicate_tokens) |predicate_tokens| {
+                    cte.body_join_predicate_expression = try buildGeneratedExpressionAst(alloc, tokens, predicate_tokens);
+                }
+            }
+        }
     }
     if (where_index) |idx| {
         const where_end = firstOptionalIndex(&[_]?usize{ group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
@@ -1786,6 +1818,29 @@ fn classifyReadKindInRange(tokens: []const token_mod.Token, range: GeneratedSqlT
 }
 
 fn buildReadJoinAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, source_tokens: GeneratedSqlTokenRange, ast: *GeneratedSqlReadAst) !void {
+    ast.join_items = try buildGeneratedJoinItemsAst(alloc, tokens, source_tokens);
+    if (ast.join_items.len == 0) return;
+
+    ast.join_tree_root_index = ast.join_items.len - 1;
+    ast.join_tree_depth = ast.join_items.len;
+
+    const first = ast.join_items[0];
+    ast.join_tokens = source_tokens;
+    ast.join_operator_tokens = first.operator_tokens;
+    ast.join_kind = first.kind;
+    ast.join_left_tokens = first.left_tokens;
+    ast.join_right_tokens = first.right_tokens;
+    ast.join_predicate_tokens = first.predicate_tokens;
+    if (first.predicate_tokens) |predicate_tokens| {
+        ast.join_predicate_expression = try buildGeneratedExpressionAst(alloc, tokens, predicate_tokens);
+    }
+}
+
+fn buildGeneratedJoinItemsAst(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    source_tokens: GeneratedSqlTokenRange,
+) ![]GeneratedSqlJoinAst {
     var items: std.ArrayListUnmanaged(GeneratedSqlJoinAst) = .empty;
     var items_owned = false;
     defer if (!items_owned) {
@@ -1795,13 +1850,13 @@ fn buildReadJoinAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, s
 
     var scan = source_tokens.start;
     while (findTopLevelKeyword(tokens, scan, source_tokens.end, .join)) |join_index| {
-        const condition = generatedJoinCondition(tokens, join_index + 1, source_tokens.end) orelse return;
-        const operator = generatedJoinOperator(tokens, source_tokens, join_index) orelse return;
-        if (source_tokens.start >= operator.tokens.start or join_index + 1 >= condition.keyword_index) return;
+        const condition = generatedJoinCondition(tokens, join_index + 1, source_tokens.end) orelse return &.{};
+        const operator = generatedJoinOperator(tokens, source_tokens, join_index) orelse return &.{};
+        if (source_tokens.start >= operator.tokens.start or join_index + 1 >= condition.keyword_index) return &.{};
 
         const next_join_index = findTopLevelKeyword(tokens, condition.end, source_tokens.end, .join);
         const item_end = if (next_join_index) |next_join|
-            (generatedJoinOperator(tokens, source_tokens, next_join) orelse return).tokens.start
+            (generatedJoinOperator(tokens, source_tokens, next_join) orelse return &.{}).tokens.start
         else
             condition.end;
 
@@ -1836,23 +1891,10 @@ fn buildReadJoinAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, s
         if (scan >= source_tokens.end) break;
     }
 
-    if (items.items.len == 0) return;
-
-    ast.join_items = try items.toOwnedSlice(alloc);
+    if (items.items.len == 0) return &.{};
+    const owned = try items.toOwnedSlice(alloc);
     items_owned = true;
-    ast.join_tree_root_index = ast.join_items.len - 1;
-    ast.join_tree_depth = ast.join_items.len;
-
-    const first = ast.join_items[0];
-    ast.join_tokens = source_tokens;
-    ast.join_operator_tokens = first.operator_tokens;
-    ast.join_kind = first.kind;
-    ast.join_left_tokens = first.left_tokens;
-    ast.join_right_tokens = first.right_tokens;
-    ast.join_predicate_tokens = first.predicate_tokens;
-    if (first.predicate_tokens) |predicate_tokens| {
-        ast.join_predicate_expression = try buildGeneratedExpressionAst(alloc, tokens, predicate_tokens);
-    }
+    return owned;
 }
 
 const GeneratedJoinCondition = struct {
@@ -5169,6 +5211,35 @@ test "generated SQL parser facade builds read AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.cte_items[0].body_projection_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read.cte_items[0].body_source_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 15, .end = 16 }, read.cte_items[0].body_order_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const cte_join_body_read_sql = "WITH joined_rows AS (SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id JOIN tenants ON accounts.tenant_id = tenants.id) SELECT id FROM joined_rows";
+    const cte_join_body_read_result = try parseSqlAlloc(alloc, cte_join_body_read_sql);
+    switch (cte_join_body_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.cte, read.kind);
+            try std.testing.expectEqual(@as(usize, 1), read.cte_items.len);
+            try std.testing.expectEqual(GeneratedSqlReadKind.join, read.cte_items[0].body_kind.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 20 }, read.cte_items[0].body_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 20 }, read.cte_items[0].body_source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 20 }, read.cte_items[0].body_join_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.cte_items[0].body_join_operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlJoinKind.inner, read.cte_items[0].body_join_kind.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.cte_items[0].body_join_left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.cte_items[0].body_join_right_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 14 }, read.cte_items[0].body_join_predicate_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.cte_items[0].body_join_predicate_expression.kind);
+            try std.testing.expectEqual(@as(usize, 2), read.cte_items[0].body_join_items.len);
+            try std.testing.expectEqual(@as(?usize, 1), read.cte_items[0].body_join_tree_root_index);
+            try std.testing.expectEqual(@as(usize, 2), read.cte_items[0].body_join_tree_depth);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 14 }, read.cte_items[0].body_join_items[0].tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 14 }, read.cte_items[0].body_join_items[0].predicate_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 20 }, read.cte_items[0].body_join_items[1].tokens);
+            try std.testing.expectEqual(@as(?usize, 0), read.cte_items[0].body_join_items[1].left_child_index);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 14, .end = 15 }, read.cte_items[0].body_join_items[1].operator_tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 17, .end = 20 }, read.cte_items[0].body_join_items[1].predicate_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

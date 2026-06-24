@@ -318,6 +318,11 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: gen
         if (cte.body_distinct_tokens) |body_distinct_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_distinct_tokens);
         if (cte.body_projection_tokens) |body_projection_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_projection_tokens);
         if (cte.body_source_tokens) |body_source_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_source_tokens);
+        if (cte.body_join_tokens) |body_join_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_join_tokens);
+        if (cte.body_join_operator_tokens) |body_join_operator_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_join_operator_tokens);
+        if (cte.body_join_left_tokens) |body_join_left_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_join_left_tokens);
+        if (cte.body_join_right_tokens) |body_join_right_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_join_right_tokens);
+        if (cte.body_join_predicate_tokens) |body_join_predicate_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_join_predicate_tokens);
         if (cte.body_where_tokens) |body_where_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_where_tokens);
         if (cte.body_group_tokens) |body_group_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_group_tokens);
         if (cte.body_having_tokens) |body_having_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_having_tokens);
@@ -333,6 +338,7 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: gen
         try validateGeneratedReadListAstRanges(tokens, read_ast, cte.body_projection_items);
         try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, cte.body_projection_first_expression);
         try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, cte.body_projection_last_expression);
+        try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, cte.body_join_predicate_expression);
         try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, cte.body_where_expression);
         try validateGeneratedReadListAstRanges(tokens, read_ast, cte.body_group_items);
         try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, cte.body_group_first_expression);
@@ -345,6 +351,7 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: gen
         try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, cte.body_limit_expression);
         try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, cte.body_offset_expression);
         try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, cte.body_fetch_count_expression);
+        try validateGeneratedJoinAstRanges(tokens, read_ast, cte.body_join_items);
     }
     try validateGeneratedCteListMetadata(tokens, read_ast);
     for (read_ast.join_items) |join| {
@@ -358,6 +365,7 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: gen
         try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, join.predicate_expression);
         try validateGeneratedReadListAstRanges(tokens, read_ast, join.using_columns);
     }
+    try validateGeneratedJoinAstRanges(tokens, read_ast, read_ast.join_items);
     try validateGeneratedJoinTreeMetadata(read_ast);
 
     switch (read_ast.kind) {
@@ -464,6 +472,11 @@ fn validateGeneratedCteBodyMetadata(cte: generated_parser.GeneratedSqlCteAst) !v
         cte.body_distinct_tokens,
         cte.body_projection_tokens,
         cte.body_source_tokens,
+        cte.body_join_tokens,
+        cte.body_join_operator_tokens,
+        cte.body_join_left_tokens,
+        cte.body_join_right_tokens,
+        cte.body_join_predicate_tokens,
         cte.body_where_tokens,
         cte.body_group_tokens,
         cte.body_having_tokens,
@@ -492,6 +505,24 @@ fn validateGeneratedCteBodyMetadata(cte: generated_parser.GeneratedSqlCteAst) !v
     }
     if (cte.body_source_tokens) |source_tokens| {
         if (source_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
+        try validateGeneratedJoinTreeMetadataForSource(
+            source_tokens,
+            cte.body_join_items,
+            cte.body_join_tree_root_index,
+            cte.body_join_tree_depth,
+            cte.body_join_tokens,
+            cte.body_join_operator_tokens,
+            cte.body_join_kind,
+            cte.body_join_left_tokens,
+            cte.body_join_right_tokens,
+            cte.body_join_predicate_tokens,
+        );
+    } else if (cte.body_join_items.len != 0 or cte.body_join_tree_root_index != null or cte.body_join_tree_depth != 0 or
+        cte.body_join_tokens != null or cte.body_join_operator_tokens != null or cte.body_join_kind != null or
+        cte.body_join_left_tokens != null or cte.body_join_right_tokens != null or cte.body_join_predicate_tokens != null or
+        generatedExpressionAstHasMetadata(cte.body_join_predicate_expression))
+    {
+        return error.UnsupportedSqlShape;
     }
     if (cte.body_where_tokens) |where_tokens| {
         if (where_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
@@ -561,7 +592,7 @@ fn validateGeneratedCteBodyMetadata(cte: generated_parser.GeneratedSqlCteAst) !v
         .query => if (cte.body_set_operation_tokens != null or cte.body_group_tokens != null or cte.body_having_tokens != null) {
             return error.UnsupportedSqlShape;
         },
-        .join => if (cte.body_source_tokens == null) return error.UnsupportedSqlShape,
+        .join => if (cte.body_source_tokens == null or cte.body_join_items.len == 0) return error.UnsupportedSqlShape,
         .lateral => if (cte.body_source_tokens == null) return error.UnsupportedSqlShape,
         .window => if (cte.body_source_tokens == null) return error.UnsupportedSqlShape,
         .cte => return error.UnsupportedSqlShape,
@@ -569,25 +600,56 @@ fn validateGeneratedCteBodyMetadata(cte: generated_parser.GeneratedSqlCteAst) !v
 }
 
 fn validateGeneratedJoinTreeMetadata(read_ast: generated_parser.GeneratedSqlReadAst) !void {
-    if (read_ast.join_items.len == 0) {
-        if (read_ast.join_tree_root_index != null or read_ast.join_tree_depth != 0) return error.UnsupportedSqlShape;
+    return validateGeneratedJoinTreeMetadataForSource(
+        read_ast.source_tokens,
+        read_ast.join_items,
+        read_ast.join_tree_root_index,
+        read_ast.join_tree_depth,
+        read_ast.join_tokens,
+        read_ast.join_operator_tokens,
+        read_ast.join_kind,
+        read_ast.join_left_tokens,
+        read_ast.join_right_tokens,
+        read_ast.join_predicate_tokens,
+    );
+}
+
+fn validateGeneratedJoinTreeMetadataForSource(
+    source_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    join_items: []const generated_parser.GeneratedSqlJoinAst,
+    join_tree_root_index: ?usize,
+    join_tree_depth: usize,
+    join_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    join_operator_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    join_kind: ?generated_parser.GeneratedSqlJoinKind,
+    join_left_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    join_right_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    join_predicate_tokens: ?generated_parser.GeneratedSqlTokenRange,
+) !void {
+    if (join_items.len == 0) {
+        if (join_tree_root_index != null or join_tree_depth != 0 or join_tokens != null or
+            join_operator_tokens != null or join_kind != null or join_left_tokens != null or
+            join_right_tokens != null or join_predicate_tokens != null)
+        {
+            return error.UnsupportedSqlShape;
+        }
         return;
     }
 
-    const source = read_ast.source_tokens orelse return error.UnsupportedSqlShape;
-    const root_index = read_ast.join_tree_root_index orelse return error.UnsupportedSqlShape;
-    if (root_index != read_ast.join_items.len - 1) return error.UnsupportedSqlShape;
-    if (read_ast.join_tree_depth != read_ast.join_items.len) return error.UnsupportedSqlShape;
+    const source = source_tokens orelse return error.UnsupportedSqlShape;
+    const root_index = join_tree_root_index orelse return error.UnsupportedSqlShape;
+    if (root_index != join_items.len - 1) return error.UnsupportedSqlShape;
+    if (join_tree_depth != join_items.len) return error.UnsupportedSqlShape;
 
-    const first = read_ast.join_items[0];
-    if (!std.meta.eql(read_ast.join_tokens orelse return error.UnsupportedSqlShape, source)) return error.UnsupportedSqlShape;
-    if (!std.meta.eql(read_ast.join_operator_tokens orelse return error.UnsupportedSqlShape, first.operator_tokens)) return error.UnsupportedSqlShape;
-    if ((read_ast.join_kind orelse return error.UnsupportedSqlShape) != first.kind) return error.UnsupportedSqlShape;
-    if (!std.meta.eql(read_ast.join_left_tokens orelse return error.UnsupportedSqlShape, first.left_tokens)) return error.UnsupportedSqlShape;
-    if (!std.meta.eql(read_ast.join_right_tokens orelse return error.UnsupportedSqlShape, first.right_tokens)) return error.UnsupportedSqlShape;
-    if (!optionalGeneratedTokenRangeEql(read_ast.join_predicate_tokens, first.predicate_tokens)) return error.UnsupportedSqlShape;
+    const first = join_items[0];
+    if (!std.meta.eql(join_tokens orelse return error.UnsupportedSqlShape, source)) return error.UnsupportedSqlShape;
+    if (!std.meta.eql(join_operator_tokens orelse return error.UnsupportedSqlShape, first.operator_tokens)) return error.UnsupportedSqlShape;
+    if ((join_kind orelse return error.UnsupportedSqlShape) != first.kind) return error.UnsupportedSqlShape;
+    if (!std.meta.eql(join_left_tokens orelse return error.UnsupportedSqlShape, first.left_tokens)) return error.UnsupportedSqlShape;
+    if (!std.meta.eql(join_right_tokens orelse return error.UnsupportedSqlShape, first.right_tokens)) return error.UnsupportedSqlShape;
+    if (!optionalGeneratedTokenRangeEql(join_predicate_tokens, first.predicate_tokens)) return error.UnsupportedSqlShape;
 
-    for (read_ast.join_items, 0..) |join, index| {
+    for (join_items, 0..) |join, index| {
         if (join.tree_index != index) return error.UnsupportedSqlShape;
         if (join.tree_depth != index + 1) return error.UnsupportedSqlShape;
         if (join.tokens.start != source.start or join.tokens.end > source.end) return error.UnsupportedSqlShape;
@@ -595,7 +657,7 @@ fn validateGeneratedJoinTreeMetadata(read_ast: generated_parser.GeneratedSqlRead
             if (join.left_child_index != null) return error.UnsupportedSqlShape;
             if (join.left_tokens.start != source.start) return error.UnsupportedSqlShape;
         } else {
-            const expected_left = read_ast.join_items[index - 1];
+            const expected_left = join_items[index - 1];
             if (join.left_child_index == null or join.left_child_index.? != index - 1) return error.UnsupportedSqlShape;
             if (!std.meta.eql(join.left_tokens, expected_left.tokens)) return error.UnsupportedSqlShape;
         }
@@ -632,6 +694,25 @@ fn validateGeneratedJoinTreeMetadata(read_ast: generated_parser.GeneratedSqlRead
                 if (join.using_columns.count == 0) return error.UnsupportedSqlShape;
             },
         }
+    }
+}
+
+fn validateGeneratedJoinAstRanges(
+    tokens: []const tokenized.Token,
+    read_ast: generated_parser.GeneratedSqlReadAst,
+    join_items: []const generated_parser.GeneratedSqlJoinAst,
+) !void {
+    for (join_items) |join| {
+        try validateGeneratedReadTokenRange(tokens, read_ast, join.tokens);
+        try validateGeneratedReadTokenRange(tokens, read_ast, join.operator_tokens);
+        try validateGeneratedReadTokenRange(tokens, read_ast, join.left_tokens);
+        try validateGeneratedReadTokenRange(tokens, read_ast, join.right_tokens);
+        try validateGeneratedReadTokenRange(tokens, read_ast, join.condition_tokens);
+        if (join.predicate_tokens) |predicate_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, predicate_tokens);
+        if (join.using_tokens) |using_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, using_tokens);
+        if (join.using_column_tokens) |using_column_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, using_column_tokens);
+        try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, join.predicate_expression);
+        try validateGeneratedReadListAstRanges(tokens, read_ast, join.using_columns);
     }
 }
 
@@ -2190,6 +2271,22 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_cte_body_distinct_on_parsed_sql, malformed_cte_body_distinct_on_read_ast),
+    );
+
+    var malformed_cte_body_join_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH joined_rows AS (SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id JOIN tenants ON accounts.tenant_id = tenants.id) SELECT id FROM joined_rows",
+    );
+    defer malformed_cte_body_join_parsed_sql.deinit(alloc);
+    const malformed_cte_body_join_generated_raw = malformed_cte_body_join_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_cte_body_join_read_ast = switch (malformed_cte_body_join_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_cte_body_join_read_ast.cte_items[0].body_join_items[1].left_child_index = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_cte_body_join_parsed_sql, malformed_cte_body_join_read_ast),
     );
 
     var malformed_cte_body_window_parsed_sql = try tokenized.ParsedSql.initAlloc(
