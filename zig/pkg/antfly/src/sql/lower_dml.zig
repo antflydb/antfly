@@ -12472,6 +12472,14 @@ pub fn lowerWritePlanFromGeneratedDmlAstAlloc(
         lowered.sync_level = options.sync_level;
         return .{ .truncate_source = lowered };
     }
+    if (dml_ast.kind == .merge) {
+        if (mergeMutationFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast, schema, params, options)) |merge| {
+            return .{ .merge_mutation = merge };
+        } else |err| switch (err) {
+            error.UnsupportedSqlShape => {},
+            else => return err,
+        }
+    }
     return try lowerWritePlanParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, options);
 }
 
@@ -12977,6 +12985,60 @@ fn validateGeneratedJoinedTailRanges(
         if (!tokens[returning_range.start - 1].matchesKeywordTag(.returning)) return error.UnsupportedSqlShape;
         if (where_range.end != returning_range.start - 1 or returning_range.end != end) return error.UnsupportedSqlShape;
     } else if (where_range.end != end) return error.UnsupportedSqlShape;
+}
+
+fn mergeMutationFromGeneratedDmlAstAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    ast: generated_parser.GeneratedSqlDmlAst,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+) !plan_mod.LoweredMergeMutationPlan {
+    if (ast.kind != .merge) return error.UnsupportedSqlShape;
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    const source_schema = options.joined_source_schema orelse schema;
+    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    const tokens = parsed_sql.items();
+    const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    try validateGeneratedMergeRanges(tokens, ast, end);
+
+    const parser_context = @import("parser_context.zig");
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens,
+        .schema = schema,
+        .joined_source_schema = source_schema,
+        .params = params,
+    };
+    var lowered = try parseMergeMutationPlanAlloc(
+        alloc,
+        tokens,
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.mergeMutationParserOptions(&parser_state),
+    );
+    errdefer lowered.deinit(alloc);
+    if (!generatedDmlParserConsumedStatement(tokens, end, parser_state.pos)) return error.UnsupportedSqlShape;
+    lowered.sync_level = options.sync_level;
+    return lowered;
+}
+
+fn validateGeneratedMergeRanges(
+    tokens: []const Token,
+    ast: generated_parser.GeneratedSqlDmlAst,
+    end: usize,
+) !void {
+    if (end < 10 or !tokens[0].matchesKeywordTag(.merge) or !tokens[1].matchesKeywordTag(.into)) return error.UnsupportedSqlShape;
+    const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, 2, end);
+    const source_range = ast.source_tokens orelse return error.UnsupportedSqlShape;
+    if (source_range.start == 0 or source_range.start >= source_range.end or source_range.end > end) return error.UnsupportedSqlShape;
+    if (!tokens[source_range.start - 1].matchesKeywordTag(.using)) return error.UnsupportedSqlShape;
+    if (source_range.start - 1 < target_range.end) return error.UnsupportedSqlShape;
+    const body_range = ast.where_tokens orelse return error.UnsupportedSqlShape;
+    if (body_range.start == 0 or body_range.start >= body_range.end or body_range.end != end) return error.UnsupportedSqlShape;
+    if (!tokens[body_range.start - 1].matchesKeywordTag(.on)) return error.UnsupportedSqlShape;
+    if (body_range.start - 1 != source_range.end) return error.UnsupportedSqlShape;
 }
 
 fn updatePointFromGeneratedDmlAstAlloc(
@@ -13852,6 +13914,66 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
     try std.testing.expectEqual(@as(usize, 1), generated_joined_delete.mutation.req.join.on.len);
     try std.testing.expect(generated_joined_delete.mutation.req.join.left.row_claim != null);
     try std.testing.expectEqual(@as(usize, 1), generated_joined_delete.mutation.req.returning.len);
+
+    var parsed_generated_merge = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "MERGE INTO usage_records USING usage_records AS source ON usage_records.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status WHEN NOT MATCHED THEN INSERT (id, status, quantity) VALUES (source.id, source.status, source.quantity) RETURNING id, status",
+    );
+    defer parsed_generated_merge.deinit(alloc);
+    const generated_merge_ast = switch ((parsed_generated_merge.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_merge = try mergeMutationFromGeneratedDmlAstAlloc(
+        alloc,
+        &parsed_generated_merge,
+        generated_merge_ast,
+        schema,
+        &.{},
+        options,
+    );
+    defer generated_merge.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", generated_merge.target_table_name);
+    try std.testing.expectEqualStrings("usage_records", generated_merge.source_table_name);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, generated_merge.sync_level);
+    try std.testing.expectEqual(@as(usize, 1), generated_merge.match_fields.len);
+    try std.testing.expectEqualStrings("id", generated_merge.match_fields[0].target_field);
+    try std.testing.expectEqualStrings("id", generated_merge.match_fields[0].source_field);
+    try std.testing.expectEqual(@as(usize, 1), generated_merge.matched_arms.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_merge.matched_arms[0].update.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_merge.not_matched_arms.len);
+    try std.testing.expectEqual(@as(usize, 3), generated_merge.not_matched_arms[0].insert.len);
+    try std.testing.expectEqual(@as(usize, 2), generated_merge.returning.fields.len);
+
+    var parsed_generated_cross_merge = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "MERGE INTO usage_records AS target USING archived_records AS source ON target.id = source.archive_id WHEN MATCHED THEN UPDATE SET status = source.archive_status WHEN NOT MATCHED THEN INSERT (id, status, quantity) VALUES (source.archive_id, source.archive_status, source.archive_quantity) RETURNING target.id, target.status",
+    );
+    defer parsed_generated_cross_merge.deinit(alloc);
+    const generated_cross_merge_ast = switch ((parsed_generated_cross_merge.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_cross_merge = try mergeMutationFromGeneratedDmlAstAlloc(
+        alloc,
+        &parsed_generated_cross_merge,
+        generated_cross_merge_ast,
+        schema,
+        &.{},
+        cross_source_options,
+    );
+    defer generated_cross_merge.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", generated_cross_merge.target_table_name);
+    try std.testing.expectEqualStrings("archived_records", generated_cross_merge.source_table_name);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, generated_cross_merge.sync_level);
+    try std.testing.expectEqual(@as(usize, 1), generated_cross_merge.match_fields.len);
+    try std.testing.expectEqualStrings("id", generated_cross_merge.match_fields[0].target_field);
+    try std.testing.expectEqualStrings("archive_id", generated_cross_merge.match_fields[0].source_field);
+    try std.testing.expectEqual(@as(usize, 1), generated_cross_merge.matched_arms.len);
+    try std.testing.expectEqualStrings("archive_status", generated_cross_merge.matched_arms[0].update[0].source_field);
+    try std.testing.expectEqual(@as(usize, 1), generated_cross_merge.not_matched_arms.len);
+    try std.testing.expectEqual(@as(usize, 3), generated_cross_merge.not_matched_arms[0].insert.len);
+    try std.testing.expectEqual(@as(usize, 2), generated_cross_merge.returning.fields.len);
 
     const default_schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword","default":"u_default"},"status":{"type":"keyword","default":"active"},"quantity":{"type":"numeric","default":1}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
