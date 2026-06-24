@@ -889,6 +889,8 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
         .{ .sql = "SELECT DISTINCT status FROM usage_records ORDER BY status", .generated = .aggregate, .read = .aggregate },
         .{ .sql = "SELECT DISTINCT ON (organization_id) organization_id, id FROM usage_records ORDER BY organization_id ASC, created_at DESC", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records ORDER BY id LIMIT ALL OFFSET 2 ROWS", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records FETCH FIRST ROWS ONLY", .generated = .query, .read = .query },
         .{ .sql = "SELECT status FROM usage_records GROUP BY status HAVING status = 'open'", .generated = .aggregate, .read = .aggregate },
         .{ .sql = "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id", .generated = .join, .read = .join },
         .{ .sql = "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id JOIN tenants ON accounts.tenant_id = tenants.id", .generated = .join, .read = .join },
@@ -1148,6 +1150,18 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read_ast.fetch_count_tokens.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.token_range, read_ast.fetch_count_expression.kind);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read_ast.fetch_count_expression.tokens.?);
+                } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records ORDER BY id LIMIT ALL OFFSET 2 ROWS")) {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read_ast.order_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read_ast.limit_tokens.?);
+                    try std.testing.expect(read_ast.limit_all);
+                    try std.testing.expect(read_ast.limit_expression.tokens == null);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 10, .end = 12 }, read_ast.offset_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.token_range, read_ast.offset_expression.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read_ast.offset_expression.tokens.?);
+                } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records FETCH FIRST ROWS ONLY")) {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 8 }, read_ast.fetch_tokens.?);
+                    try std.testing.expect(read_ast.fetch_count_tokens == null);
+                    try std.testing.expect(read_ast.fetch_count_expression.tokens == null);
                 } else if (std.mem.eql(u8, case.sql, "SELECT DISTINCT ON (organization_id) organization_id, id FROM usage_records ORDER BY organization_id ASC, created_at DESC")) {
                     try std.testing.expect(read_ast.distinct_tokens != null);
                     try std.testing.expect(read_ast.projection_tokens != null);

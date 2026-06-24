@@ -418,6 +418,7 @@ pagination_clause_list:
 
 pagination_clause:
     LIMIT expression
+  | LIMIT ALL
   | OFFSET expression row_rows_opt
   | FETCH fetch_first_next fetch_count_opt row_rows ONLY
   ;

@@ -330,6 +330,7 @@ pub const GeneratedSqlReadAst = struct {
     order_last_expression: GeneratedSqlExpressionAst = .{},
     limit_tokens: ?GeneratedSqlTokenRange = null,
     limit_expression: GeneratedSqlExpressionAst = .{},
+    limit_all: bool = false,
     offset_tokens: ?GeneratedSqlTokenRange = null,
     offset_expression: GeneratedSqlExpressionAst = .{},
     fetch_tokens: ?GeneratedSqlTokenRange = null,
@@ -501,6 +502,8 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT DISTINCT status FROM usage_records ORDER BY status", .kind = .read },
     .{ .sql = "SELECT DISTINCT ON (organization_id) organization_id, id FROM usage_records ORDER BY organization_id ASC, created_at DESC", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records ORDER BY id LIMIT ALL OFFSET 2 ROWS", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records FETCH FIRST ROWS ONLY", .kind = .read },
     .{ .sql = "SELECT status FROM usage_records GROUP BY status HAVING status = 'open'", .kind = .read },
     .{ .sql = "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id", .kind = .read },
     .{ .sql = "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id JOIN tenants ON accounts.tenant_id = tenants.id", .kind = .read },
@@ -1058,7 +1061,11 @@ fn buildReadAst(
         if (idx + 1 < limit_end) {
             const limit_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = limit_end };
             ast.limit_tokens = limit_tokens;
-            ast.limit_expression = try buildGeneratedExpressionAst(alloc, tokens, limit_tokens);
+            if (limit_tokens.end == limit_tokens.start + 1 and tokens[limit_tokens.start].matchesKeywordTag(.all)) {
+                ast.limit_all = true;
+            } else {
+                ast.limit_expression = try buildGeneratedExpressionAst(alloc, tokens, limit_tokens);
+            }
         }
     }
     if (offset_index) |idx| {
@@ -2801,6 +2808,38 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.fetch_count_tokens.?);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.fetch_count_expression.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.fetch_count_expression.tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const limit_all_read_sql = "SELECT id FROM usage_records ORDER BY id LIMIT ALL OFFSET 2 ROWS";
+    const limit_all_read_result = try parseSqlAlloc(alloc, limit_all_read_sql);
+    switch (limit_all_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.projection_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.order_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.limit_tokens.?);
+            try std.testing.expect(read.limit_all);
+            try std.testing.expect(read.limit_expression.tokens == null);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 12 }, read.offset_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.offset_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.offset_expression.tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const fetch_default_read_sql = "SELECT id FROM usage_records FETCH FIRST ROWS ONLY";
+    const fetch_default_read_result = try parseSqlAlloc(alloc, fetch_default_read_sql);
+    switch (fetch_default_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.projection_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 8 }, read.fetch_tokens.?);
+            try std.testing.expect(read.fetch_count_tokens == null);
+            try std.testing.expect(read.fetch_count_expression.tokens == null);
         },
         else => return error.TestUnexpectedResult,
     }

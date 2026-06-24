@@ -293,14 +293,17 @@ Suggested migration order:
    ranges; recursive CTE reads carry an explicit recursive flag; and simple
    non-recursive CTE reads dispatch to the typed read lowerer after validating
    those ranges.
-   Generated pagination coverage now accepts and ranges `LIMIT`, `OFFSET`, and
-   `FETCH FIRST`/`FETCH NEXT` tails with generated expression metadata for
-   `LIMIT`, `OFFSET`, and explicit fetch counts.
+   Generated pagination coverage now accepts and ranges expression and
+   PostgreSQL-compatible `ALL`/`NULL` `LIMIT` tails, `OFFSET` with optional
+   `ROW`/`ROWS`, and `FETCH FIRST`/`FETCH NEXT` tails with optional fetch
+   counts; generated metadata records limit expressions, the `LIMIT ALL`
+   marker, offset expressions, and explicit fetch-count expressions.
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression AST semantics beyond the current owned
    expression item arrays, full join planning/lowering and richer join-tree
-   semantics beyond the current left-associative item arrays, full pagination AST/lowering coverage, broader expression AST
+   semantics beyond the current left-associative item arrays, pagination
+   lowering/cutover beyond the current generated AST metadata, broader expression AST
    nodes beyond the current recursive predicate/operator metadata, broader function
    coverage, broader boolean expression-tree coverage, quantified subquery and
    array predicate coverage, recursive CTE planning, direct generated read-plan lowering, and
