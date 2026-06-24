@@ -318,6 +318,7 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
     if (raw_statement.token_start >= raw_statement.token_end or raw_statement.token_end > tokens.len) return false;
     if (tokens[raw_statement.token_end - 1].kind == .eq or tokens[raw_statement.token_end - 1].kind == .comma) return false;
     if (tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .to) or tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .as)) return false;
+    if (isGeneratedGraphDdlHead(tokens, raw_statement)) return false;
 
     const first = tokens[raw_statement.token_start];
     if (tokenMatchesKeyword(first, .set)) return raw_statement.token_end > raw_statement.token_start + 2;
@@ -336,6 +337,13 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
         .insert, .update, .delete, .truncate, .merge, .ddl => true,
         .select, .with => false,
     };
+}
+
+fn isGeneratedGraphDdlHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
+    const start = raw_statement.token_start;
+    if (start + 1 >= raw_statement.token_end or raw_statement.token_end > tokens.len) return false;
+    return (tokenMatchesKeyword(tokens[start], .create) or tokenMatchesKeyword(tokens[start], .alter)) and
+        tokenMatchesKeyword(tokens[start + 1], .graph);
 }
 
 fn parseStatement(
@@ -636,6 +644,8 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
 
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SET search_path TO"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "PREPARE read_stmt AS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE GRAPH INDEX docs_edge_graph ON"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER GRAPH INDEX docs_edge_graph ADD"));
 
     var complex_ddl = try ParsedSql.initAlloc(alloc, "ALTER TABLE audit_log ALTER COLUMN amount TYPE numeric USING amount + 1;");
     defer complex_ddl.deinit(alloc);
@@ -2072,7 +2082,7 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
     try std.testing.expectEqual(classifier.SqlReadStatementKind.query, generated_distinct_on.readStatementKind().?);
 }
 
-test "sql adapter parsed sql retains generated graph nodes as DDL until graph cutover" {
+test "sql adapter parsed sql retains generated graph nodes as DDL" {
     const alloc = std.testing.allocator;
 
     const cases = [_]struct {

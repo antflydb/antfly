@@ -460,13 +460,9 @@ pub const DB = struct {
     }
 
     pub fn rollDenseAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
-        try self.finishDenseAutoBulkIngestSessionWithOptionsInternal(options, true);
-        try self.beginDenseAutoBulkIngestSession();
-    }
-
-    fn finishDenseAutoBulkIngestSessionWithOptionsInternal(self: *DB, options: backend_types.BulkIngestFinishOptions, notify_executor: bool) !void {
         try ha_replication_impl.enforceDBWriteGate(self);
-        return try write_path_impl.finishDenseAutoBulkIngestSessionWithOptionsAfterGate(self, options, notify_executor);
+        try write_path_impl.finishDenseAutoBulkIngestSessionWithOptionsAfterGate(self, options, true);
+        try self.beginDenseAutoBulkIngestSession();
     }
 
     pub fn abortDenseAutoBulkIngestSession(self: *DB) void {
@@ -1925,34 +1921,6 @@ pub const DB = struct {
         return try derived_async_impl.rebuildDenseIndexesFromStoredEmbeddingArtifacts(self, alloc);
     }
 
-    fn rebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(
-        self: *DB,
-        alloc: Allocator,
-        resume_from: ?[]const u8,
-        rebuild_targets: ?[]const DenseArtifactRebuildTarget,
-        target_sequence_override: ?u64,
-        progress_ctx: ?*anyopaque,
-        progress_hook: ?ReplayProgressHook,
-        resume_ctx: ?*anyopaque,
-        resume_hook: ?derived_async_impl.DenseArtifactRebuildResumeHook,
-        rebuild_chunk_size: usize,
-        rebuild_progress_interval: usize,
-    ) !usize {
-        return try derived_async_impl.rebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(
-            self,
-            alloc,
-            resume_from,
-            rebuild_targets,
-            target_sequence_override,
-            progress_ctx,
-            progress_hook,
-            resume_ctx,
-            resume_hook,
-            rebuild_chunk_size,
-            rebuild_progress_interval,
-        );
-    }
-
     pub fn rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(self: *DB, alloc: Allocator) !usize {
         return try derived_async_impl.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(self, alloc);
     }
@@ -2435,10 +2403,6 @@ pub const DB = struct {
 
     pub fn diagnosticStats(self: *DB, alloc: Allocator) !types.DBStats {
         return try lifecycle_impl.diagnosticStats(self, alloc);
-    }
-
-    fn graphMetricRuntimeStats(self: *DB) types.GraphMetricRuntimeStats {
-        return lifecycle_impl.graphMetricRuntimeStats(self);
     }
 
     pub fn primaryDocCount(self: *DB, alloc: Allocator) !u64 {
@@ -2998,16 +2962,6 @@ pub const DB = struct {
 
     const RelationalRowsPredicateImplications = relational_rows.PredicateImplications;
 
-    fn resolveRelationalRowsQueryCandidateSetAlloc(
-        self: *DB,
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        req: types.RelationalRowsQueryRequest,
-        generation: ?u64,
-    ) !?doc_set.ResolvedDocSet {
-        return try relational_rows_impl.resolveRelationalRowsQueryCandidateSetAlloc(self, alloc, runtime_schema, req, generation);
-    }
-
     fn appendRelationalRowsPlannedCandidateSetAlloc(
         alloc: Allocator,
         planned_sets: *std.ArrayListUnmanaged(RelationalRowsPlannedCandidateSet),
@@ -3524,16 +3478,6 @@ pub const DB = struct {
         return try search_runtime_impl.collectExplicitBackgroundTextStats(self, alloc, requests);
     }
 
-    fn resolveRelationalFilterQueryDocSetAlloc(
-        self: *DB,
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        query: search_mod.SearchQuery,
-        generation: ?u64,
-    ) anyerror!?doc_set.ResolvedDocSet {
-        return try search_runtime_impl.resolveRelationalFilterQueryDocSetAlloc(self, alloc, runtime_schema, query, generation);
-    }
-
     const relationalArrayColumnValueContains = relational_rows.arrayColumnValueContains;
 
     const relationalArrayColumnValueContainsAll = relational_rows.arrayColumnValueContainsAll;
@@ -3542,27 +3486,10 @@ pub const DB = struct {
 
     const RelationalFilterCombineMode = relational_rows.FilterCombineMode;
 
-    fn relationalColumnIndexUsableForQuery(
-        self: *DB,
-        alloc: Allocator,
-        column: schema_mod.RelationalColumn,
-        implications: RelationalRowsPredicateImplications,
-    ) !bool {
-        return try search_runtime_impl.relationalColumnIndexUsableForQuery(self, alloc, column, implications);
-    }
-
     const relationalColumnForField = relational_rows.columnForField;
 
     pub fn searchDenseProfiled(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
         return try search_runtime_impl.searchDenseProfiled(self, alloc, req, dense);
-    }
-
-    fn resolvedDocFilterForRequestNativeConstraintsAlloc(
-        self: *DB,
-        alloc: Allocator,
-        req: types.SearchRequest,
-    ) !?doc_set.ResolvedDocFilter {
-        return try search_runtime_impl.resolvedDocFilterForRequestNativeConstraintsAlloc(self, alloc, req);
     }
 
     pub fn lookupLiveDocOrdinalForInternalRead(
@@ -7392,7 +7319,7 @@ test "db resolved doc filter normalizes doc keys before composing native ids" {
     };
     defer doc_key_filter.deinit(alloc);
 
-    var composed = (try db.resolvedDocFilterForRequestNativeConstraintsAlloc(alloc, .{
+    var composed = (try DB.search_runtime_impl.resolvedDocFilterForRequestNativeConstraintsAlloc(&db, alloc, .{
         .resolved_doc_filter = &doc_key_filter,
         .filter_doc_ids_positive = true,
         .filter_doc_ids = &.{"doc:b"},
@@ -7411,7 +7338,7 @@ test "db resolved doc filter normalizes doc keys before composing native ids" {
         .include = try doc_set.cloneDocKeysAlloc(alloc, &.{ "doc:a", "missing" }),
     };
     defer partial_doc_key_filter.deinit(alloc);
-    try std.testing.expect((try db.resolvedDocFilterForRequestNativeConstraintsAlloc(alloc, .{
+    try std.testing.expect((try DB.search_runtime_impl.resolvedDocFilterForRequestNativeConstraintsAlloc(&db, alloc, .{
         .resolved_doc_filter = &partial_doc_key_filter,
         .filter_doc_ids_positive = true,
         .filter_doc_ids = &.{"doc:a"},
@@ -21691,7 +21618,7 @@ test "db graph metric runtime starts automatically and drains notified backgroun
     try std.testing.expect(fresh);
 
     {
-        const runtime_stats = db.graphMetricRuntimeStats();
+        const runtime_stats = DB.lifecycle_impl.graphMetricRuntimeStats(&db);
         try std.testing.expect(runtime_stats.enabled);
         try std.testing.expectEqual(types.GraphMetricRuntimeRole.combined, runtime_stats.role.?);
         try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-auto-degree"), runtime_stats.runtime_id_hash);
@@ -21808,7 +21735,7 @@ test "db graph metric runtime open-configured split owners publish degree" {
 
             const tick = try coordinator.graph_metric_runtime.?.runOnceDetailed();
             coordinator_total.add(tick);
-            const stats = coordinator.graphMetricRuntimeStats();
+            const stats = DB.lifecycle_impl.graphMetricRuntimeStats(&coordinator);
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.coordinator, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "open-configured-coordinator"), stats.runtime_id_hash);
@@ -21846,7 +21773,7 @@ test "db graph metric runtime open-configured split owners publish degree" {
 
             const tick = try worker_pool.graph_metric_runtime.?.runOnceDetailed();
             worker_total.add(tick);
-            const stats = worker_pool.graphMetricRuntimeStats();
+            const stats = DB.lifecycle_impl.graphMetricRuntimeStats(&worker_pool);
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "open-configured-worker-pool"), stats.runtime_id_hash);
@@ -23616,7 +23543,7 @@ test "db graph metric runtime open-configured pagerank worker pool survives sepa
             defer worker_pool.close();
 
             const tick = try worker_pool.graph_metric_runtime.?.runOnceDetailed();
-            const stats = worker_pool.graphMetricRuntimeStats();
+            const stats = DB.lifecycle_impl.graphMetricRuntimeStats(&worker_pool);
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-pagerank-pool-worker-owner"), stats.runtime_id_hash);
@@ -23654,7 +23581,7 @@ test "db graph metric runtime open-configured pagerank worker pool survives sepa
                 try std.testing.expect(!duplicate_tick.durableProgressed());
                 try std.testing.expectEqual(@as(usize, 0), duplicate_tick.worker_steps);
                 try std.testing.expectEqual(@as(usize, 0), duplicate_tick.pages_completed);
-                const duplicate_stats = duplicate_worker_pool.graphMetricRuntimeStats();
+                const duplicate_stats = DB.lifecycle_impl.graphMetricRuntimeStats(&duplicate_worker_pool);
                 try std.testing.expect(duplicate_stats.enabled);
                 try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, duplicate_stats.role.?);
                 try std.testing.expect(duplicate_stats.lease_owned);
@@ -23691,7 +23618,7 @@ test "db graph metric runtime open-configured pagerank worker pool survives sepa
             defer coordinator.close();
 
             const tick = try coordinator.graph_metric_runtime.?.runOnceDetailed();
-            const stats = coordinator.graphMetricRuntimeStats();
+            const stats = DB.lifecycle_impl.graphMetricRuntimeStats(&coordinator);
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.coordinator, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-pagerank-pool-coordinator-owner"), stats.runtime_id_hash);
@@ -23836,7 +23763,7 @@ test "db graph metric runtime open-configured eigenvector worker pool survives s
             defer worker_pool.close();
 
             const tick = try worker_pool.graph_metric_runtime.?.runOnceDetailed();
-            const stats = worker_pool.graphMetricRuntimeStats();
+            const stats = DB.lifecycle_impl.graphMetricRuntimeStats(&worker_pool);
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-eigenvector-pool-worker-owner"), stats.runtime_id_hash);
@@ -23874,7 +23801,7 @@ test "db graph metric runtime open-configured eigenvector worker pool survives s
                 try std.testing.expect(!duplicate_tick.durableProgressed());
                 try std.testing.expectEqual(@as(usize, 0), duplicate_tick.worker_steps);
                 try std.testing.expectEqual(@as(usize, 0), duplicate_tick.pages_completed);
-                const duplicate_stats = duplicate_worker_pool.graphMetricRuntimeStats();
+                const duplicate_stats = DB.lifecycle_impl.graphMetricRuntimeStats(&duplicate_worker_pool);
                 try std.testing.expect(duplicate_stats.enabled);
                 try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, duplicate_stats.role.?);
                 try std.testing.expect(duplicate_stats.lease_owned);
@@ -23911,7 +23838,7 @@ test "db graph metric runtime open-configured eigenvector worker pool survives s
             defer coordinator.close();
 
             const tick = try coordinator.graph_metric_runtime.?.runOnceDetailed();
-            const stats = coordinator.graphMetricRuntimeStats();
+            const stats = DB.lifecycle_impl.graphMetricRuntimeStats(&coordinator);
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.coordinator, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-eigenvector-pool-coordinator-owner"), stats.runtime_id_hash);
@@ -24053,7 +23980,7 @@ test "db graph metric runtime open-configured hits worker pool survives separate
             defer worker_pool.close();
 
             const tick = try worker_pool.graph_metric_runtime.?.runOnceDetailed();
-            const stats = worker_pool.graphMetricRuntimeStats();
+            const stats = DB.lifecycle_impl.graphMetricRuntimeStats(&worker_pool);
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-hits-pool-worker-owner"), stats.runtime_id_hash);
@@ -24091,7 +24018,7 @@ test "db graph metric runtime open-configured hits worker pool survives separate
                 try std.testing.expect(!duplicate_tick.durableProgressed());
                 try std.testing.expectEqual(@as(usize, 0), duplicate_tick.worker_steps);
                 try std.testing.expectEqual(@as(usize, 0), duplicate_tick.pages_completed);
-                const duplicate_stats = duplicate_worker_pool.graphMetricRuntimeStats();
+                const duplicate_stats = DB.lifecycle_impl.graphMetricRuntimeStats(&duplicate_worker_pool);
                 try std.testing.expect(duplicate_stats.enabled);
                 try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, duplicate_stats.role.?);
                 try std.testing.expect(duplicate_stats.lease_owned);
@@ -24128,7 +24055,7 @@ test "db graph metric runtime open-configured hits worker pool survives separate
             defer coordinator.close();
 
             const tick = try coordinator.graph_metric_runtime.?.runOnceDetailed();
-            const stats = coordinator.graphMetricRuntimeStats();
+            const stats = DB.lifecycle_impl.graphMetricRuntimeStats(&coordinator);
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.coordinator, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-hits-pool-coordinator-owner"), stats.runtime_id_hash);
@@ -34292,7 +34219,8 @@ test "db dense artifact rebuild resumes from persisted state" {
 
         try std.testing.expectError(
             error.TestInjectedFailure,
-            interrupted.rebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(
+            DB.derived_async_impl.rebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(
+                &interrupted,
                 alloc,
                 null,
                 null,
@@ -34504,7 +34432,8 @@ test "db chunk-backed dense artifact rebuild stays pending until all chunk artif
 
         try std.testing.expectError(
             error.TestInjectedFailure,
-            interrupted.rebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(
+            DB.derived_async_impl.rebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(
+                &interrupted,
                 alloc,
                 null,
                 null,
@@ -34643,7 +34572,8 @@ test "db dense artifact rebuild does not let resumed targets skip fresh targets"
 
         try std.testing.expectError(
             error.TestInjectedFailure,
-            interrupted.rebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(
+            DB.derived_async_impl.rebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(
+                &interrupted,
                 alloc,
                 null,
                 &targets,
@@ -44244,7 +44174,8 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
 
     // Finish the implicit bulk publish, but hold the deferred executor wake so
     // the test can prove the replay catch-up itself publishes fresh visibility.
-    try db.finishDenseAutoBulkIngestSessionWithOptionsInternal(.{ .compact = false }, false);
+    try DB.ha_replication_impl.enforceDBWriteGate(&db);
+    try DB.write_path_impl.finishDenseAutoBulkIngestSessionWithOptionsAfterGate(&db, .{ .compact = false }, false);
     hook_ctx = .{};
 
     flushDeferredExternalBulkExecutorNotification(db.async_context, db.executor);
@@ -48258,12 +48189,12 @@ test "relational column filter pushdown declines stale identity generations" {
     });
     const current_generation = db.core.nextDerivedSequence();
 
-    const stale = try db.resolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, .{
+    const stale = try DB.search_runtime_impl.resolveRelationalFilterQueryDocSetAlloc(&db, alloc, runtime_schema, .{
         .term = .{ .field = "status", .term = "active" },
     }, active_generation);
     try std.testing.expect(stale == null);
 
-    var current = (try db.resolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, .{
+    var current = (try DB.search_runtime_impl.resolveRelationalFilterQueryDocSetAlloc(&db, alloc, runtime_schema, .{
         .term = .{ .field = "status", .term = "archived" },
     }, current_generation)) orelse return error.TestExpectedEqual;
     defer current.deinit(alloc);
@@ -48409,7 +48340,7 @@ test "relational rows query uses indexed candidates and authoritative base rows"
         .field = "status",
         .values_json = "[\"closed\"]",
     }};
-    var in_set = (try db.resolveRelationalRowsQueryCandidateSetAlloc(alloc, runtime_schema, .{
+    var in_set = (try DB.relational_rows_impl.resolveRelationalRowsQueryCandidateSetAlloc(&db, alloc, runtime_schema, .{
         .in_predicates = in_predicates[0..],
     }, null)) orelse return error.TestExpectedEqual;
     defer in_set.deinit(alloc);
@@ -50935,11 +50866,11 @@ test "relational expression partial predicates maintain indexes and unique owner
         .op = .eq,
         .rhs = active_expression_rhs[0..],
     }};
-    try std.testing.expect(!(try db.relationalColumnIndexUsableForQuery(alloc, runtime_schema.relational_columns[1], .{
+    try std.testing.expect(!(try DB.search_runtime_impl.relationalColumnIndexUsableForQuery(&db, alloc, runtime_schema.relational_columns[1], .{
         .predicates = &.{},
         .expressions = &.{},
     })));
-    try std.testing.expect(try db.relationalColumnIndexUsableForQuery(alloc, runtime_schema.relational_columns[1], .{
+    try std.testing.expect(try DB.search_runtime_impl.relationalColumnIndexUsableForQuery(&db, alloc, runtime_schema.relational_columns[1], .{
         .predicates = &.{},
         .expressions = active_expression_predicates[0..],
     }));
@@ -50957,7 +50888,7 @@ test "relational expression partial predicates maintain indexes and unique owner
             .value_json = "\"ACTIVE\"",
         },
     };
-    try std.testing.expect(try db.relationalColumnIndexUsableForQuery(alloc, runtime_schema.relational_columns[1], .{
+    try std.testing.expect(try DB.search_runtime_impl.relationalColumnIndexUsableForQuery(&db, alloc, runtime_schema.relational_columns[1], .{
         .predicates = semantic_index_predicates[0..],
         .expressions = &.{},
     }));
@@ -54810,7 +54741,7 @@ test "relational indexed array_any filters use array element indexes" {
     try std.testing.expectEqual(@as(usize, 1), indexed_hot_ids.len);
     try std.testing.expectEqualStrings("row:a", indexed_hot_ids[0]);
 
-    var direct_resolved = (try db.resolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, .{
+    var direct_resolved = (try DB.search_runtime_impl.resolveRelationalFilterQueryDocSetAlloc(&db, alloc, runtime_schema, .{
         .array_any = .{ .field = "tags", .value = parsed_hot.value },
     }, null)) orelse return error.TestExpectedEqual;
     defer direct_resolved.deinit(alloc);
@@ -54900,7 +54831,7 @@ test "relational indexed json_contains filters use json value indexes" {
     try std.testing.expectEqual(@as(usize, 1), indexed_ids.len);
     try std.testing.expectEqualStrings("row:a", indexed_ids[0]);
 
-    var direct_resolved = (try db.resolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, .{
+    var direct_resolved = (try DB.search_runtime_impl.resolveRelationalFilterQueryDocSetAlloc(&db, alloc, runtime_schema, .{
         .json_contains = .{ .field = "attrs", .value = wanted.value },
     }, null)) orelse return error.TestExpectedEqual;
     defer direct_resolved.deinit(alloc);

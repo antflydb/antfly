@@ -209,7 +209,9 @@ statement family and `ParsedSql` retains those generated raw and AST nodes.
 Seed and rich `CREATE GRAPH INDEX`, `CREATE GRAPH METRIC`, and
 `ALTER GRAPH INDEX ... ADD METRIC` statements now have graph-specific generated
 AST-to-plan wrappers that lower to typed index plans instead of only routing
-through the generic DDL family. The generated
+through the generic DDL family, and `ParsedSql` now requires generated-parser
+success for `CREATE GRAPH` and `ALTER GRAPH` statement heads instead of falling
+back to the legacy DDL classifier on malformed graph DDL. The generated
 facade now returns closed statement-family nodes for the covered families and
 explicit unsupported statement nodes for seed `ANALYZE`, bulk I/O `COPY`,
 maintenance `VACUUM`/`REINDEX`, utility/control statements such as `CLUSTER`,
@@ -510,6 +512,9 @@ Unsupported DDL remains on the existing parser until
    `ALTER GRAPH INDEX ... ADD METRIC` statements now have generated
    graph-family corpus coverage, retained generated AST nodes, and generated
    AST-to-plan wrappers for typed graph index and graph metric index plans.
+   Runtime parsing requires generated-parser success for migrated `CREATE GRAPH`
+   and `ALTER GRAPH` DDL heads, so incomplete graph DDL fails closed instead of
+   falling back to the legacy DDL classifier.
    Canonical `antfly.*` query table-function sources now have generated
    grammar coverage, named-argument coverage, source/name/argument AST ranges,
    owned named-argument item/name/operator/value ranges, list-based Antfly
@@ -721,7 +726,8 @@ Generated grammar work needs evidence at multiple levels:
   malformed subquery tail validation.
   Graph DDL has generated AST-to-plan parity for graph index and graph metric
   index plans, including rich graph index declarations and
-  `ALTER GRAPH INDEX ... ADD METRIC`, and generated read AST tests cover canonical
+  `ALTER GRAPH INDEX ... ADD METRIC`, malformed graph DDL is rejected through
+  the generated parser instead of legacy DDL fallback, and generated read AST tests cover canonical
   `antfly.*` table-function source ranges and named-argument item ranges,
   including joined graph sources, plus fail-closed malformed Antfly and
   graph-source validation.
