@@ -24,6 +24,121 @@ pub const JoinSide = enum {
     right,
 };
 
+pub const QueryOrderKey = union(enum) {
+    missing,
+    null,
+    bool: bool,
+    number: f64,
+    string: []const u8,
+    json: []const u8,
+};
+
+pub const ScalarComparison = enum { lt, eq, gt };
+
+pub fn cloneQueryOrderKeysAlloc(
+    alloc: Allocator,
+    source: []const QueryOrderKey,
+) ![]QueryOrderKey {
+    if (source.len == 0) return &.{};
+    const keys = try alloc.alloc(QueryOrderKey, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeQueryOrderKeys(alloc, keys[0..initialized]);
+        alloc.free(keys);
+    }
+    for (source) |key| {
+        keys[initialized] = switch (key) {
+            .missing => .missing,
+            .null => .null,
+            .bool => |value| .{ .bool = value },
+            .number => |value| .{ .number = value },
+            .string => |value| .{ .string = try alloc.dupe(u8, value) },
+            .json => |value| .{ .json = try alloc.dupe(u8, value) },
+        };
+        initialized += 1;
+    }
+    return keys;
+}
+
+pub fn freeQueryOrderKeys(alloc: Allocator, keys: []const QueryOrderKey) void {
+    for (keys) |key| switch (key) {
+        .string, .json => |text| alloc.free(text),
+        else => {},
+    };
+}
+
+pub fn freeQueryOrderKeySlice(alloc: Allocator, keys: []const QueryOrderKey) void {
+    freeQueryOrderKeys(alloc, keys);
+    if (keys.len > 0) alloc.free(keys);
+}
+
+pub fn compareQueryOrderKeys(lhs: QueryOrderKey, rhs: QueryOrderKey) ScalarComparison {
+    const left_rank = queryOrderKeyRank(lhs);
+    const right_rank = queryOrderKeyRank(rhs);
+    if (left_rank != right_rank) return if (left_rank < right_rank) .lt else .gt;
+    return switch (lhs) {
+        .missing, .null => .eq,
+        .bool => |left| blk: {
+            const right = rhs.bool;
+            if (left == right) break :blk .eq;
+            break :blk if (!left and right) .lt else .gt;
+        },
+        .number => |left| blk: {
+            const right = rhs.number;
+            if (left < right) break :blk .lt;
+            if (left > right) break :blk .gt;
+            break :blk .eq;
+        },
+        .string => |left| switch (std.mem.order(u8, left, rhs.string)) {
+            .lt => .lt,
+            .eq => .eq,
+            .gt => .gt,
+        },
+        .json => |left| switch (std.mem.order(u8, left, rhs.json)) {
+            .lt => .lt,
+            .eq => .eq,
+            .gt => .gt,
+        },
+    };
+}
+
+pub fn queryOrderKeysEqual(lhs: []const QueryOrderKey, rhs: []const QueryOrderKey) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |left, right| {
+        if (compareQueryOrderKeys(left, right) != .eq) return false;
+    }
+    return true;
+}
+
+pub fn queryOrderedCandidatesLessThan(
+    order_by: []const types.RelationalRowsQueryOrder,
+    lhs_order_keys: []const QueryOrderKey,
+    lhs_ordinal: usize,
+    rhs_order_keys: []const QueryOrderKey,
+    rhs_ordinal: usize,
+) bool {
+    for (order_by, 0..) |order, i| {
+        const comparison = compareQueryOrderKeys(lhs_order_keys[i], rhs_order_keys[i]);
+        if (comparison == .eq) continue;
+        return switch (order.direction) {
+            .asc => comparison == .lt,
+            .desc => comparison == .gt,
+        };
+    }
+    return lhs_ordinal < rhs_ordinal;
+}
+
+fn queryOrderKeyRank(key: QueryOrderKey) u8 {
+    return switch (key) {
+        .bool => 0,
+        .number => 1,
+        .string => 2,
+        .json => 3,
+        .null => 4,
+        .missing => 5,
+    };
+}
+
 pub const MaterializedCte = struct {
     name: []const u8,
     output_fields: []const []const u8 = &.{},
@@ -1265,6 +1380,405 @@ fn validateJoinedMutationReturningExpressionCondition(
 ) anyerror!void {
     try validateJoinedMutationReturningExpression(target_schema, source_schema, condition.lhs);
     for (condition.rhs) |rhs| try validateJoinedMutationReturningExpression(target_schema, source_schema, rhs);
+}
+
+pub fn validateJoinedMutationTargetSideRequest(
+    target_schema: schema_mod.TableSchema,
+    req: types.RelationalRowsJoinedMutationSourceRequest,
+) !types.RowClaimRequest {
+    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidArgument;
+    if (req.join.on.len == 0) return error.InvalidQueryRequest;
+    if (req.join.join_type != .inner) return error.UnsupportedQueryRequest;
+    if (req.join.select.len != 0) return error.UnsupportedQueryRequest;
+
+    const target = joinedMutationTargetQuery(req);
+    const source = joinedMutationSourceQuery(req);
+    const claim = target.row_claim orelse return error.InvalidQueryRequest;
+    if (claim.txn_id == null) return error.InvalidQueryRequest;
+    if (!claim.mode.isExclusiveWriteClaim()) return error.InvalidQueryRequest;
+    if (source.row_claim != null) return error.InvalidQueryRequest;
+    try validateJoinedMutationCteReferences(req);
+    if (target.doc_key_range != null or source.doc_key_range != null) return error.UnsupportedQueryRequest;
+    if (queryHasDistinctOn(target) or queryHasDistinctOn(source)) return error.UnsupportedQueryRequest;
+    try validateJoinedMutationJoinFieldsForSide(target_schema, req, joinedMutationTargetJoinSide(req));
+    if (req.kind == .update and req.source_assignments.len == 0 and req.operations.len == 0 and req.patch_expressions.len == 0 and req.increment_expressions.len == 0 and req.json_set_expressions.len == 0) return error.InvalidQueryRequest;
+    if (req.kind == .delete and (req.rewrite_identity or req.source_assignments.len != 0 or req.operations.len != 0 or req.patch_expressions.len != 0 or req.increment_expressions.len != 0 or req.json_set_expressions.len != 0)) return error.InvalidQueryRequest;
+    try validateMutationUpdateTargetPaths(req.operations, req.patch_expressions, req.increment_expressions, req.json_set_expressions, req.source_assignments);
+    const touches_primary_key = joinedMutationTouchesPrimaryKey(target_schema.primary_key.?, req);
+    if (touches_primary_key != req.rewrite_identity) return error.InvalidQueryRequest;
+    if (req.rewrite_identity and target_schema.primary_key.?.without_overlaps_period != null) return error.UnsupportedQueryRequest;
+    try validateMutationReturningRequestOutputs(target_schema, req.returning, req.returning_all, req.returning_expressions);
+    for (req.source_assignments) |assignment| {
+        if (assignment.source_side == req.target_side) return error.InvalidQueryRequest;
+        _ = findColumn(target_schema.relational_columns, assignment.field) orelse return error.InvalidQueryRequest;
+    }
+    return claim;
+}
+
+pub fn validateJoinedMutationSourceSideRequest(
+    source_schema: schema_mod.TableSchema,
+    req: types.RelationalRowsJoinedMutationSourceRequest,
+) !void {
+    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidArgument;
+    if (req.join.on.len == 0) return error.InvalidQueryRequest;
+    if (req.join.join_type != .inner) return error.UnsupportedQueryRequest;
+    if (req.join.select.len != 0) return error.UnsupportedQueryRequest;
+
+    const target = joinedMutationTargetQuery(req);
+    const source = joinedMutationSourceQuery(req);
+    const claim = target.row_claim orelse return error.InvalidQueryRequest;
+    if (claim.txn_id == null) return error.InvalidQueryRequest;
+    if (!claim.mode.isExclusiveWriteClaim()) return error.InvalidQueryRequest;
+    if (source.row_claim != null) return error.InvalidQueryRequest;
+    try validateJoinedMutationCteReferences(req);
+    if (target.doc_key_range != null or source.doc_key_range != null) return error.UnsupportedQueryRequest;
+    if (queryHasDistinctOn(target) or queryHasDistinctOn(source)) return error.UnsupportedQueryRequest;
+    try validateJoinedMutationJoinFieldsForSide(source_schema, req, joinedMutationSourceJoinSide(req));
+    if (req.kind == .update and req.source_assignments.len == 0 and req.operations.len == 0 and req.patch_expressions.len == 0 and req.increment_expressions.len == 0 and req.json_set_expressions.len == 0) return error.InvalidQueryRequest;
+    if (req.kind == .delete and (req.rewrite_identity or req.source_assignments.len != 0 or req.operations.len != 0 or req.patch_expressions.len != 0 or req.increment_expressions.len != 0 or req.json_set_expressions.len != 0)) return error.InvalidQueryRequest;
+    try validateMutationUpdateTargetPaths(req.operations, req.patch_expressions, req.increment_expressions, req.json_set_expressions, req.source_assignments);
+
+    for (req.source_assignments) |assignment| {
+        if (assignment.source_side == req.target_side) return error.InvalidQueryRequest;
+        _ = findColumn(source_schema.relational_columns, assignment.source_field) orelse return error.InvalidQueryRequest;
+    }
+}
+
+pub fn validateJoinedMutationSourceRequest(
+    alloc: Allocator,
+    runtime_schema: schema_mod.TableSchema,
+    req: types.RelationalRowsJoinedMutationSourceRequest,
+) !types.RowClaimRequest {
+    return try validateJoinedMutationSourceRequestWithSchemas(alloc, runtime_schema, runtime_schema, req);
+}
+
+pub fn validateJoinedMutationSourceRequestWithSchemas(
+    alloc: Allocator,
+    target_schema: schema_mod.TableSchema,
+    source_schema: schema_mod.TableSchema,
+    req: types.RelationalRowsJoinedMutationSourceRequest,
+) !types.RowClaimRequest {
+    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidArgument;
+    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidArgument;
+    if (req.join.on.len == 0) return error.InvalidQueryRequest;
+    if (req.join.join_type != .inner) return error.UnsupportedQueryRequest;
+    if (req.join.select.len != 0) return error.UnsupportedQueryRequest;
+
+    const target = joinedMutationTargetQuery(req);
+    const source = joinedMutationSourceQuery(req);
+    const claim = target.row_claim orelse return error.InvalidQueryRequest;
+    if (claim.txn_id == null) return error.InvalidQueryRequest;
+    if (!claim.mode.isExclusiveWriteClaim()) return error.InvalidQueryRequest;
+    if (source.row_claim != null) return error.InvalidQueryRequest;
+    try validateJoinedMutationCteReferences(req);
+    if (target.doc_key_range != null or source.doc_key_range != null) return error.UnsupportedQueryRequest;
+    if (queryHasDistinctOn(target) or queryHasDistinctOn(source)) return error.UnsupportedQueryRequest;
+
+    var planned_ctes: []PlannedCte = &.{};
+    defer if (planned_ctes.len != 0) deinitPlannedCtes(alloc, planned_ctes);
+    const source_output_fields: ?[]const []const u8 = if (req.ctes.len != 0) blk: {
+        planned_ctes = try planCteOutputsAlloc(alloc, source_schema, req.ctes);
+        try validateJoinAgainstPlannedCteOutput(planned_ctes, req.join);
+        break :blk plannedSourceCteOutputFields(planned_ctes, source) orelse return error.InvalidQueryRequest;
+    } else null;
+
+    try validateBaseQueryRequestAgainstSchema(target_schema, target);
+    if (source_output_fields) |fields| {
+        try validateQueryAgainstCteOutput(source, fields);
+        try validateBaseQueryRequestAgainstOutputFields(fields, source);
+    } else {
+        try validateBaseQueryRequestAgainstSchema(source_schema, source);
+    }
+    try validateJoinedMutationJoinFieldsForSide(target_schema, req, joinedMutationTargetJoinSide(req));
+    if (source_output_fields) |fields| {
+        try validateJoinedMutationJoinFieldsForOutputFields(fields, req, joinedMutationSourceJoinSide(req));
+    } else {
+        try validateJoinedMutationJoinFieldsForSide(source_schema, req, joinedMutationSourceJoinSide(req));
+    }
+    if (req.kind == .update and req.source_assignments.len == 0 and req.operations.len == 0 and req.patch_expressions.len == 0 and req.increment_expressions.len == 0 and req.json_set_expressions.len == 0) return error.InvalidQueryRequest;
+    if (req.kind == .delete and (req.rewrite_identity or req.source_assignments.len != 0 or req.operations.len != 0 or req.patch_expressions.len != 0 or req.increment_expressions.len != 0 or req.json_set_expressions.len != 0)) return error.InvalidQueryRequest;
+    try validateMutationUpdateTargetPaths(req.operations, req.patch_expressions, req.increment_expressions, req.json_set_expressions, req.source_assignments);
+    const touches_primary_key = joinedMutationTouchesPrimaryKey(target_schema.primary_key.?, req);
+    if (touches_primary_key != req.rewrite_identity) return error.InvalidQueryRequest;
+    if (req.rewrite_identity and target_schema.primary_key.?.without_overlaps_period != null) return error.UnsupportedQueryRequest;
+    try validateMutationReturningRequestOutputs(target_schema, req.returning, req.returning_all, req.returning_expressions);
+    try validateJoinedMutationReturningExpressions(target_schema, source_schema, req.returning_expressions);
+    try validateJoinedMutationMatchExpressions(target_schema, source_schema, req);
+    for (req.patch_expressions) |assignment| {
+        try validateJoinedMutationReturningExpression(target_schema, source_schema, assignment.expression);
+    }
+    for (req.increment_expressions) |assignment| {
+        try validateJoinedMutationReturningExpression(target_schema, source_schema, assignment.expression);
+    }
+    for (req.json_set_expressions) |assignment| {
+        try validateJoinedMutationReturningExpression(target_schema, source_schema, assignment.expression);
+    }
+    for (req.source_assignments) |assignment| {
+        if (assignment.source_side == req.target_side) return error.InvalidQueryRequest;
+        const target_column = findColumn(target_schema.relational_columns, assignment.field) orelse return error.InvalidQueryRequest;
+        if (source_output_fields) |fields| {
+            try validateOutputField(fields, assignment.source_field);
+        } else {
+            const source_column = findColumn(source_schema.relational_columns, assignment.source_field) orelse return error.InvalidQueryRequest;
+            if (target_column.field_type != source_column.field_type) return error.InvalidQueryRequest;
+        }
+    }
+    return claim;
+}
+
+fn joinedMutationTouchesPrimaryKey(primary_key: schema_mod.PrimaryKey, req: types.RelationalRowsJoinedMutationSourceRequest) bool {
+    for (primary_key.columns) |column| {
+        for (req.operations) |op| {
+            if (mutationPathTouchesField(op.path, column)) return true;
+        }
+        for (req.patch_expressions) |assignment| {
+            if (mutationPathTouchesField(assignment.field, column)) return true;
+        }
+        for (req.increment_expressions) |assignment| {
+            if (mutationPathTouchesField(assignment.field, column)) return true;
+        }
+        for (req.json_set_expressions) |assignment| {
+            if (mutationPathTouchesField(assignment.field, column)) return true;
+        }
+        for (req.source_assignments) |assignment| {
+            if (mutationPathTouchesField(assignment.field, column)) return true;
+        }
+    }
+    return false;
+}
+
+fn mutationPathTouchesField(path: []const u8, field: []const u8) bool {
+    return std.mem.eql(u8, path, field) or
+        (path.len > field.len and std.mem.startsWith(u8, path, field) and path[field.len] == '.');
+}
+
+pub fn validateInsertSourceRequest(
+    runtime_schema: schema_mod.TableSchema,
+    req: types.RelationalRowsInsertSourceRequest,
+) !void {
+    return validateInsertSourceRequestWithSchemas(runtime_schema, runtime_schema, req);
+}
+
+pub fn validateInsertSourceRequestWithSchemas(
+    target_schema: schema_mod.TableSchema,
+    source_schema: schema_mod.TableSchema,
+    req: types.RelationalRowsInsertSourceRequest,
+) !void {
+    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidArgument;
+    if (source_schema.storage_mode != .relational) return error.InvalidArgument;
+    if (source_schema.primary_key == null and req.source.source_cte.len == 0) return error.InvalidArgument;
+    if (req.source.row_claim != null) return error.InvalidQueryRequest;
+    if (req.source.doc_key_range != null and req.source.source_cte.len != 0) return error.InvalidQueryRequest;
+    if (queryHasDistinctOn(req.source)) return error.UnsupportedQueryRequest;
+    if (req.assignments.len == 0) return error.InvalidQueryRequest;
+    try validateBaseQueryRequestAgainstSchema(source_schema, req.source);
+    for (req.assignments, 0..) |assignment, i| {
+        if (assignment.field.len == 0) return error.InvalidQueryRequest;
+        _ = findColumn(target_schema.relational_columns, assignment.field) orelse return error.InvalidQueryRequest;
+        for (req.assignments[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.field, assignment.field)) return error.InvalidQueryRequest;
+        }
+        try validateInsertSourceExpression(source_schema, assignment.expression);
+    }
+    if (req.on_conflict) |conflict| try validateOnConflict(target_schema, conflict);
+    try validateMutationReturningRequestOutputs(target_schema, req.returning, req.returning_all, req.returning_expressions);
+    try validateMutationReturningTargetExpressions(target_schema, req.returning_expressions);
+}
+
+fn validateInsertSourceExpression(
+    source_schema: schema_mod.TableSchema,
+    expression: types.RelationalRowsExpression,
+) anyerror!void {
+    if (expression.kind == .field) {
+        if (expression.field_source == .existing or expression.field_source == .proposed) return error.InvalidQueryRequest;
+        _ = findColumn(source_schema.relational_columns, expression.field) orelse return error.InvalidQueryRequest;
+    }
+    for (expression.operands) |operand| try validateInsertSourceExpression(source_schema, operand);
+    for (expression.case_branches) |branch| {
+        try validateInsertSourceExpressionCondition(source_schema, branch.when);
+        try validateInsertSourceExpression(source_schema, branch.then);
+    }
+    for (expression.case_else) |case_else| try validateInsertSourceExpression(source_schema, case_else);
+}
+
+fn validateInsertSourceExpressionCondition(
+    source_schema: schema_mod.TableSchema,
+    condition: types.RelationalRowsExpressionCondition,
+) anyerror!void {
+    try validateInsertSourceExpression(source_schema, condition.lhs);
+    for (condition.rhs) |rhs| try validateInsertSourceExpression(source_schema, rhs);
+}
+
+fn validateOnConflict(
+    runtime_schema: schema_mod.TableSchema,
+    conflict: types.RelationalRowsOnConflict,
+) anyerror!void {
+    switch (conflict.target.kind) {
+        .primary => {
+            if (conflict.target.unique_name.len != 0 or
+                conflict.target.unique_predicates.len != 0 or
+                conflict.target.unique_predicate_expressions.len != 0) return error.InvalidQueryRequest;
+        },
+        .unique => {
+            if (conflict.target.unique_name.len == 0) return error.InvalidQueryRequest;
+            const constraint = findUniqueConstraintByName(runtime_schema.unique_constraints, conflict.target.unique_name) orelse return error.InvalidQueryRequest;
+            if (constraint.validation_state != .enforced) return error.InvalidQueryRequest;
+            try validateConflictTargetPredicates(conflict.target.unique_predicates, constraint);
+            try validateConflictTargetExpressionPredicates(runtime_schema, conflict.target.unique_predicate_expressions, constraint);
+        },
+    }
+    switch (conflict.action) {
+        .nothing => {
+            if (conflict.operations.len != 0 or
+                conflict.patch_expressions.len != 0 or
+                conflict.increment_expressions.len != 0 or
+                conflict.json_set_expressions.len != 0 or
+                conflict.where_expression != null or
+                conflict.where_expressions.len != 0 or
+                conflict.where_any.len != 0 or
+                conflict.where_not.len != 0) return error.InvalidQueryRequest;
+        },
+        .update => {
+            if (conflict.operations.len == 0 and conflict.patch_expressions.len == 0 and conflict.increment_expressions.len == 0 and conflict.json_set_expressions.len == 0) return error.InvalidQueryRequest;
+            try validateMutationUpdateTargetPaths(conflict.operations, conflict.patch_expressions, conflict.increment_expressions, conflict.json_set_expressions, &.{});
+            for (conflict.patch_expressions) |assignment| try validateConflictExpression(runtime_schema, assignment.expression);
+            for (conflict.increment_expressions) |assignment| try validateConflictExpression(runtime_schema, assignment.expression);
+            for (conflict.json_set_expressions) |assignment| try validateConflictExpression(runtime_schema, assignment.expression);
+            if (conflict.where_expression) |condition| try validateConflictExpressionCondition(runtime_schema, condition);
+            for (conflict.where_expressions) |condition| try validateConflictExpressionCondition(runtime_schema, condition);
+            try validateConflictExpressionPredicateGroups(runtime_schema, conflict.where_any);
+            try validateConflictExpressionPredicateGroups(runtime_schema, conflict.where_not);
+        },
+    }
+}
+
+fn validateConflictExpressionPredicateGroups(
+    runtime_schema: schema_mod.TableSchema,
+    groups: []const types.RelationalRowsExpressionPredicateGroup,
+) !void {
+    for (groups) |group| {
+        if (group.conditions.len == 0) return error.InvalidQueryRequest;
+        for (group.conditions) |condition| try validateConflictExpressionCondition(runtime_schema, condition);
+    }
+}
+
+fn validateConflictExpression(
+    runtime_schema: schema_mod.TableSchema,
+    expression: types.RelationalRowsExpression,
+) anyerror!void {
+    if (expression.kind == .field) {
+        if (expression.field_source != .existing and expression.field_source != .proposed) return error.InvalidQueryRequest;
+        _ = findColumn(runtime_schema.relational_columns, expression.field) orelse return error.InvalidQueryRequest;
+    }
+    for (expression.operands) |operand| try validateConflictExpression(runtime_schema, operand);
+    for (expression.case_branches) |branch| {
+        try validateConflictExpressionCondition(runtime_schema, branch.when);
+        try validateConflictExpression(runtime_schema, branch.then);
+    }
+    for (expression.case_else) |case_else| try validateConflictExpression(runtime_schema, case_else);
+}
+
+fn validateConflictExpressionCondition(
+    runtime_schema: schema_mod.TableSchema,
+    condition: types.RelationalRowsExpressionCondition,
+) anyerror!void {
+    try validateConflictExpression(runtime_schema, condition.lhs);
+    for (condition.rhs) |rhs| try validateConflictExpression(runtime_schema, rhs);
+}
+
+fn validateConflictTargetPredicates(
+    predicates: []const schema_mod.RelationalCheck,
+    constraint: schema_mod.UniqueConstraint,
+) !void {
+    if (predicates.len != constraint.where.len) return error.InvalidQueryRequest;
+    for (predicates, constraint.where) |actual, expected| {
+        if (!std.mem.eql(u8, actual.field, expected.field)) return error.InvalidQueryRequest;
+        if (!uniquePredicateOpMatchesCheck(actual.op, expected.op)) return error.InvalidQueryRequest;
+        if (expected.value_json) |expected_json| {
+            const actual_json = actual.value_json orelse return error.InvalidQueryRequest;
+            if (!std.mem.eql(u8, actual_json, expected_json)) return error.InvalidQueryRequest;
+        } else if (actual.value_json != null) {
+            return error.InvalidQueryRequest;
+        }
+    }
+}
+
+fn validateConflictTargetExpressionPredicates(
+    runtime_schema: schema_mod.TableSchema,
+    predicates: []const types.RelationalRowsExpressionCondition,
+    constraint: schema_mod.UniqueConstraint,
+) !void {
+    if (!expressionConditionSlicesEqual(predicates, constraint.where_expressions)) return error.InvalidQueryRequest;
+    for (predicates) |condition| try validateExpressionConditionAgainstSchema(runtime_schema, condition);
+}
+
+fn uniquePredicateOpMatchesCheck(actual: schema_mod.RelationalCheckOp, expected: schema_mod.UniquePredicateOp) bool {
+    return switch (expected) {
+        .is_null => actual == .is_null,
+        .is_not_null => actual == .is_not_null,
+        .eq => actual == .eq,
+        .ne => actual == .ne,
+    };
+}
+
+fn findUniqueConstraintByName(unique_constraints: []const schema_mod.UniqueConstraint, name: []const u8) ?schema_mod.UniqueConstraint {
+    for (unique_constraints) |constraint| {
+        if (std.mem.eql(u8, constraint.name, name)) return constraint;
+    }
+    return null;
+}
+
+pub fn expressionConditionSlicesEqual(
+    a: []const types.RelationalRowsExpressionCondition,
+    b: []const types.RelationalRowsExpressionCondition,
+) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!expressionConditionEqual(left, right)) return false;
+    }
+    return true;
+}
+
+pub fn expressionConditionEqual(
+    lhs: types.RelationalRowsExpressionCondition,
+    rhs: types.RelationalRowsExpressionCondition,
+) bool {
+    if (lhs.op != rhs.op or lhs.rhs.len != rhs.rhs.len) return false;
+    if (!expressionEqual(lhs.lhs, rhs.lhs)) return false;
+    for (lhs.rhs, rhs.rhs) |lhs_rhs, rhs_rhs| {
+        if (!expressionEqual(lhs_rhs, rhs_rhs)) return false;
+    }
+    return true;
+}
+
+pub fn expressionEqual(
+    lhs: types.RelationalRowsExpression,
+    rhs: types.RelationalRowsExpression,
+) bool {
+    if (lhs.kind != rhs.kind or
+        lhs.field_source != rhs.field_source or
+        lhs.json_as_text != rhs.json_as_text or
+        lhs.cast_type != rhs.cast_type or
+        !std.mem.eql(u8, lhs.field, rhs.field) or
+        !std.mem.eql(u8, lhs.value_json, rhs.value_json) or
+        !std.mem.eql(u8, lhs.json_path, rhs.json_path) or
+        lhs.operands.len != rhs.operands.len or
+        lhs.case_branches.len != rhs.case_branches.len or
+        lhs.case_else.len != rhs.case_else.len)
+    {
+        return false;
+    }
+    for (lhs.operands, rhs.operands) |lhs_operand, rhs_operand| {
+        if (!expressionEqual(lhs_operand, rhs_operand)) return false;
+    }
+    for (lhs.case_branches, rhs.case_branches) |lhs_branch, rhs_branch| {
+        if (!expressionConditionEqual(lhs_branch.when, rhs_branch.when)) return false;
+        if (!expressionEqual(lhs_branch.then, rhs_branch.then)) return false;
+    }
+    for (lhs.case_else, rhs.case_else) |lhs_fallback, rhs_fallback| {
+        if (!expressionEqual(lhs_fallback, rhs_fallback)) return false;
+    }
+    return true;
 }
 
 fn findColumn(columns: []const schema_mod.RelationalColumn, name: []const u8) ?schema_mod.RelationalColumn {

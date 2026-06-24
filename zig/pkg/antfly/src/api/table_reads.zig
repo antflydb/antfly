@@ -87,7 +87,7 @@ fn nativeCatalogTableNameAlloc(
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
     _ = tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse return error.TableNotFound;
-    return try catalog_resources.tableResourceNameAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+    return try catalog_resources.storageTableNameForTargetAlloc(alloc, target);
 }
 const ParsedJsonPathValue = json_helpers.ParsedJsonPathValue;
 const parseJsonValueAlloc = json_helpers.parseJsonValueAlloc;

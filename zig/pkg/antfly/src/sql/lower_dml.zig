@@ -12415,13 +12415,18 @@ fn insertValuesFromGeneratedDmlAstAlloc(
 ) !plan_mod.LoweredInsert {
     if (ast.kind != .insert_values) return error.UnsupportedSqlShape;
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (ast.returning_tokens != null or ast.source_tokens != null) return error.UnsupportedSqlShape;
+    if (ast.source_tokens != null) return error.UnsupportedSqlShape;
     const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     if (end < 5 or !tokens[0].matchesKeywordTag(.insert) or !tokens[1].matchesKeywordTag(.into)) return error.UnsupportedSqlShape;
     const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, 2, end);
     const table_name = try generatedDmlTableReferenceIdentifierAlloc(alloc, tokens, target_range);
     var table_transferred = false;
     errdefer if (!table_transferred) alloc.free(table_name);
+    const body_end = if (ast.returning_tokens) |returning_range| blk: {
+        if (returning_range.start == 0 or returning_range.start > returning_range.end or returning_range.end > end) return error.UnsupportedSqlShape;
+        if (!tokens[returning_range.start - 1].matchesKeywordTag(.returning)) return error.UnsupportedSqlShape;
+        break :blk returning_range.start - 1;
+    } else end;
 
     var columns: []const []const u8 = &.{};
     var owns_columns = false;
@@ -12439,7 +12444,7 @@ fn insertValuesFromGeneratedDmlAstAlloc(
     var default_rows = [_][]const []const u8{default_row[0..]};
     if (ast.default_values) {
         if (ast.insert_columns_tokens != null or ast.values_tokens != null) return error.UnsupportedSqlShape;
-        if (end != 5 or !tokens[3].matchesKeywordTag(.default) or !tokens[4].matchesKeywordTag(.values)) return error.UnsupportedSqlShape;
+        if (body_end != 5 or !tokens[3].matchesKeywordTag(.default) or !tokens[4].matchesKeywordTag(.values)) return error.UnsupportedSqlShape;
         rows = default_rows[0..];
     } else {
         const column_range = ast.insert_columns_tokens orelse return error.UnsupportedSqlShape;
@@ -12451,7 +12456,15 @@ fn insertValuesFromGeneratedDmlAstAlloc(
         rows = try generatedInsertValueRowsAlloc(alloc, tokens, values_range, columns, schema, params);
         owns_rows = true;
     }
-    const body_json = try insertBodyJsonAlloc(alloc, columns, rows, &.{}, .{});
+    var returning: plan_mod.ReturningProjection = .{};
+    defer returning.deinit(alloc);
+    if (ast.returning_tokens) |returning_range| {
+        returning = try generatedReturningProjectionAlloc(alloc, tokens, returning_range, schema, table_name);
+    }
+    const returning_expression_count = returning.expressions.len;
+    const returning_all = returning.returnsAll();
+
+    const body_json = try insertBodyJsonAlloc(alloc, columns, rows, &.{}, returning);
     defer alloc.free(body_json);
     var batch = try relational_rows.parseRowsBatchRequest(alloc, body_json, schema);
     errdefer batch.deinit(alloc);
@@ -12473,6 +12486,57 @@ fn insertValuesFromGeneratedDmlAstAlloc(
         .table_name = table_name,
         .batch = batch,
         .sync_level = options.sync_level,
+        .returning_expression_count = returning_expression_count,
+        .returning_all = returning_all,
+    };
+}
+
+fn generatedReturningProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    schema: runtime_schema.TableSchema,
+    table_name: []const u8,
+) !plan_mod.ReturningProjection {
+    if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    const scoped_tokens = tokens[0..range.end];
+    const returning_qualifiers = [_][]const u8{table_name};
+    var fields = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (fields.items) |field| alloc.free(field);
+        fields.deinit(alloc);
+    }
+
+    var saw_all = false;
+    var index = range.start;
+    while (index < range.end) {
+        if (parser.matchToken(scoped_tokens, &index, .star) != null or try binder.matchQualifiedReturningAll(alloc, scoped_tokens, &index, &returning_qualifiers)) {
+            if (saw_all or fields.items.len != 0) return error.UnsupportedSqlShape;
+            const field = try alloc.dupe(u8, "*");
+            var field_transferred = false;
+            errdefer if (!field_transferred) alloc.free(field);
+            try fields.append(alloc, field);
+            field_transferred = true;
+            saw_all = true;
+        } else {
+            if (saw_all or index >= range.end or tokens[index].kind != .identifier) return error.UnsupportedSqlShape;
+            const field = try binder.normalizeReturningFieldAlloc(alloc, schema, tokens[index].text, &returning_qualifiers);
+            var field_transferred = false;
+            errdefer if (!field_transferred) alloc.free(field);
+            index += 1;
+            try fields.append(alloc, field);
+            field_transferred = true;
+        }
+
+        if (index == range.end) break;
+        if (tokens[index].kind != .comma) return error.UnsupportedSqlShape;
+        index += 1;
+        if (index == range.end) return error.UnsupportedSqlShape;
+    }
+    if (fields.items.len == 0) return error.UnsupportedSqlShape;
+    return .{
+        .fields = try fields.toOwnedSlice(alloc),
+        .expressions = &.{},
     };
 }
 
@@ -12811,6 +12875,26 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
         else => return error.TestUnexpectedResult,
     }
 
+    var generated_insert_returning = try lowerGeneratedDmlWritePlanForDmlTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, organization_id, quantity) VALUES ('u5', 'ready', 'o3', 10) RETURNING id, status",
+        schema,
+        &.{},
+        resolver_free_options,
+    );
+    defer generated_insert_returning.deinit(alloc);
+    switch (generated_insert_returning) {
+        .insert => |insert| {
+            try std.testing.expectEqualStrings("usage_records", insert.table_name);
+            try std.testing.expectEqual(@as(usize, 0), insert.returning_expression_count);
+            try std.testing.expect(!insert.returning_all);
+            try std.testing.expectEqual(@as(u32, 1), insert.batch.inserted);
+            try std.testing.expectEqual(@as(usize, 1), insert.batch.returning_rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"u5\",\"status\":\"ready\"}", insert.batch.returning_rows[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const default_schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword","default":"u_default"},"status":{"type":"keyword","default":"active"},"quantity":{"type":"numeric","default":1}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;
@@ -12830,6 +12914,26 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
             try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, insert.batch.req.sync_level);
             try std.testing.expectEqual(@as(u32, 1), insert.batch.inserted);
             try std.testing.expectEqual(@as(usize, 1), insert.batch.req.writes.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var generated_default_insert_returning = try lowerGeneratedDmlWritePlanForDmlTestAlloc(
+        alloc,
+        "INSERT INTO usage_records DEFAULT VALUES RETURNING id, status, quantity",
+        default_schema,
+        &.{},
+        resolver_free_options,
+    );
+    defer generated_default_insert_returning.deinit(alloc);
+    switch (generated_default_insert_returning) {
+        .insert => |insert| {
+            try std.testing.expectEqualStrings("usage_records", insert.table_name);
+            try std.testing.expectEqual(@as(usize, 0), insert.returning_expression_count);
+            try std.testing.expect(!insert.returning_all);
+            try std.testing.expectEqual(@as(u32, 1), insert.batch.inserted);
+            try std.testing.expectEqual(@as(usize, 1), insert.batch.returning_rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"u_default\",\"status\":\"active\",\"quantity\":1}", insert.batch.returning_rows[0]);
         },
         else => return error.TestUnexpectedResult,
     }
