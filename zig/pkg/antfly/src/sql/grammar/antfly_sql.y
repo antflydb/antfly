@@ -225,7 +225,46 @@ graph_statement:
 
 unsupported_statement:
     ANALYZE unsupported_tail_opt
-  | EXPLAIN statement
+  | EXPLAIN explain_options_opt explain_subject_opt
+  ;
+
+explain_options_opt:
+    /* empty */
+  | ANALYZE
+  | LPAREN explain_option_list RPAREN
+  ;
+
+explain_option_list:
+    explain_option
+  | explain_option_list COMMA explain_option
+  ;
+
+explain_option:
+    explain_option_name explain_option_value_opt
+  ;
+
+explain_option_name:
+    IDENT
+  | ANALYZE
+  ;
+
+explain_option_value_opt:
+    /* empty */
+  | explain_option_value
+  ;
+
+explain_option_value:
+    IDENT
+  | ON
+  | TRUE
+  | FALSE
+  | NUMBER
+  | STRING
+  ;
+
+explain_subject_opt:
+    /* empty */
+  | statement
   ;
 
 column_definition_list:

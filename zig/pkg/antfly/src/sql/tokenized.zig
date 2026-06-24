@@ -740,6 +740,15 @@ test "sql adapter parsed sql owns typed statement variants" {
             try std.testing.expect(statement.wal);
             try std.testing.expect(statement.inner_token_start != null);
             try std.testing.expect(statement.inner_token_end != null);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.unsupported, explain_options.generatedStatementKind().?);
+            switch (explain_options.generated_statement.?.ast.?) {
+                .unsupported => |unsupported| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.explain, unsupported.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedReason.explain_not_planned_by_generated_parser, unsupported.reason);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = statement.inner_token_start.?, .end = statement.inner_token_end.? }, unsupported.subject_tokens.?);
+                },
+                else => return error.TestUnexpectedResult,
+            }
         },
         else => return error.TestUnexpectedResult,
     }
@@ -750,6 +759,15 @@ test "sql adapter parsed sql owns typed statement variants" {
         .explain => |statement| {
             try std.testing.expect(statement.analyze);
             try std.testing.expectEqualStrings("INSERT", explain_analyze.items()[statement.inner_token_start.?].text);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.unsupported, explain_analyze.generatedStatementKind().?);
+            switch (explain_analyze.generated_statement.?.ast.?) {
+                .unsupported => |unsupported| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.explain, unsupported.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedReason.explain_not_planned_by_generated_parser, unsupported.reason);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = statement.inner_token_start.?, .end = statement.inner_token_end.? }, unsupported.subject_tokens.?);
+                },
+                else => return error.TestUnexpectedResult,
+            }
         },
         else => return error.TestUnexpectedResult,
     }
@@ -760,6 +778,15 @@ test "sql adapter parsed sql owns typed statement variants" {
         .explain => |statement| {
             try std.testing.expect(statement.inner_token_start == null);
             try std.testing.expect(statement.inner_token_end == null);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.unsupported, invalid_explain.generatedStatementKind().?);
+            switch (invalid_explain.generated_statement.?.ast.?) {
+                .unsupported => |unsupported| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.explain, unsupported.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedReason.explain_not_planned_by_generated_parser, unsupported.reason);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 7 }, unsupported.subject_tokens.?);
+                },
+                else => return error.TestUnexpectedResult,
+            }
         },
         else => return error.TestUnexpectedResult,
     }
@@ -770,6 +797,15 @@ test "sql adapter parsed sql owns typed statement variants" {
         .explain => |statement| {
             try std.testing.expect(statement.inner_token_start == null);
             try std.testing.expect(statement.inner_token_end == null);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.unsupported, empty_explain.generatedStatementKind().?);
+            switch (empty_explain.generated_statement.?.ast.?) {
+                .unsupported => |unsupported| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.explain, unsupported.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedReason.explain_not_planned_by_generated_parser, unsupported.reason);
+                    try std.testing.expect(unsupported.subject_tokens == null);
+                },
+                else => return error.TestUnexpectedResult,
+            }
         },
         else => return error.TestUnexpectedResult,
     }

@@ -877,7 +877,11 @@ pub const simple_graph_corpus = [_]GeneratedSqlCorpusCase{
 
 pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "ANALYZE", .kind = .unsupported },
+    .{ .sql = "EXPLAIN", .kind = .unsupported },
     .{ .sql = "EXPLAIN SELECT id FROM usage_records", .kind = .unsupported },
+    .{ .sql = "EXPLAIN ANALYZE INSERT INTO usage_records (id) VALUES ('u1')", .kind = .unsupported },
+    .{ .sql = "EXPLAIN (FORMAT JSON, VERBOSE, COSTS OFF, ANALYZE ON, BUFFERS, TIMING OFF, SUMMARY OFF, SETTINGS ON, WAL) SELECT id FROM usage_records", .kind = .unsupported },
+    .{ .sql = "EXPLAIN (FORMAT YAML) SELECT 1", .kind = .unsupported },
 };
 
 pub fn parseSqlAlloc(alloc: std.mem.Allocator, sql: []const u8) !GeneratedSqlParseResult {
@@ -1128,7 +1132,6 @@ fn buildUnsupportedAst(
     statement_span: token_mod.SourceSpan,
     command_span: token_mod.SourceSpan,
 ) GeneratedSqlUnsupportedAst {
-    _ = tokens;
     var ast = GeneratedSqlUnsupportedAst{
         .kind = kind,
         .reason = switch (kind) {
@@ -1138,8 +1141,24 @@ fn buildUnsupportedAst(
         .statement_span = statement_span,
         .command_span = command_span,
     };
-    if (kind == .explain and end > 1) ast.subject_tokens = .{ .start = 1, .end = end };
+    if (kind == .explain) {
+        if (generatedExplainSubjectStart(tokens, end)) |subject_start| {
+            ast.subject_tokens = .{ .start = subject_start, .end = end };
+        }
+    }
     return ast;
+}
+
+fn generatedExplainSubjectStart(tokens: []const token_mod.Token, end: usize) ?usize {
+    if (end <= 1 or end > tokens.len) return null;
+    var index: usize = 1;
+    if (tokens[index].matchesKeywordTag(.analyze)) {
+        index += 1;
+    } else if (tokens[index].kind == .lparen) {
+        const close = findMatchingParen(tokens, index, end) orelse return null;
+        index = close + 1;
+    }
+    return if (index < end) index else null;
 }
 
 fn buildGeneratedAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, statement: GeneratedSqlStatement) !?GeneratedSqlAst {
@@ -5896,6 +5915,39 @@ test "generated SQL parser facade builds extended read AST spans" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    const empty_explain_sql = "EXPLAIN";
+    const empty_explain_result = try parseSqlAlloc(alloc, empty_explain_sql);
+    switch (empty_explain_result.ast.?) {
+        .unsupported => |unsupported| {
+            try std.testing.expectEqual(GeneratedSqlUnsupportedKind.explain, unsupported.kind);
+            try std.testing.expectEqual(GeneratedSqlUnsupportedReason.explain_not_planned_by_generated_parser, unsupported.reason);
+            try std.testing.expectEqualStrings("EXPLAIN", spanText(empty_explain_sql, unsupported.statement_span));
+            try std.testing.expect(unsupported.subject_tokens == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const explain_options_sql = "EXPLAIN (FORMAT JSON, VERBOSE, COSTS OFF, ANALYZE ON, BUFFERS, TIMING OFF, SUMMARY OFF, SETTINGS ON, WAL) SELECT id FROM usage_records";
+    const explain_options_result = try parseSqlAlloc(alloc, explain_options_sql);
+    switch (explain_options_result.ast.?) {
+        .unsupported => |unsupported| {
+            try std.testing.expectEqual(GeneratedSqlUnsupportedKind.explain, unsupported.kind);
+            try std.testing.expectEqual(GeneratedSqlUnsupportedReason.explain_not_planned_by_generated_parser, unsupported.reason);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 26, .end = 30 }, unsupported.subject_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const explain_analyze_sql = "EXPLAIN ANALYZE INSERT INTO usage_records (id) VALUES ('u1')";
+    const explain_analyze_result = try parseSqlAlloc(alloc, explain_analyze_sql);
+    switch (explain_analyze_result.ast.?) {
+        .unsupported => |unsupported| {
+            try std.testing.expectEqual(GeneratedSqlUnsupportedKind.explain, unsupported.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 12 }, unsupported.subject_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "generated SQL parser facade builds unary arithmetic expression spans" {
@@ -6197,7 +6249,7 @@ test "generated SQL parser reports bounded diagnostics for malformed corpus" {
         "WITH source_rows AS (SELECT id FROM usage_records SELECT id FROM source_rows",
         "CREATE TABLE usage_records (id text",
         "INSERT INTO usage_records (id VALUES ('u1')",
-        "EXPLAIN",
+        "EXPLAIN (FORMAT",
     };
 
     for (cases) |sql| {
