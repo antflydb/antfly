@@ -1884,6 +1884,101 @@ fn validateGeneratedFunctionOverMetadata(expression: generated_parser.GeneratedS
     }
 }
 
+fn validateGeneratedFunctionCallClauseMetadata(
+    tokens: []const tokenized.Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
+    const name_tokens = expression.function_name_tokens orelse return error.UnsupportedSqlShape;
+    if (name_tokens.start != expression_tokens.start or name_tokens.start >= name_tokens.end) return error.UnsupportedSqlShape;
+    if (name_tokens.end + 1 >= tokens.len or tokens[name_tokens.end].kind != .lparen) return error.UnsupportedSqlShape;
+
+    const close_index = if (expression.argument_tokens) |argument_tokens| blk: {
+        if (argument_tokens.start != name_tokens.end + 1) return error.UnsupportedSqlShape;
+        if (argument_tokens.start > argument_tokens.end) return error.UnsupportedSqlShape;
+        if (argument_tokens.end >= tokens.len or tokens[argument_tokens.end].kind != .rparen) return error.UnsupportedSqlShape;
+        break :blk argument_tokens.end;
+    } else blk: {
+        if (expression.argument_distinct_tokens != null or expression.argument_value_tokens != null or
+            expression.argument_order_tokens != null or expression.argument_items.count != 0 or
+            expression.argument_order_items.count != 0)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        const empty_close = name_tokens.end + 1;
+        if (empty_close >= tokens.len or tokens[empty_close].kind != .rparen) return error.UnsupportedSqlShape;
+        break :blk empty_close;
+    };
+
+    if (expression.argument_tokens) |argument_tokens| {
+        const value_tokens = expression.argument_value_tokens orelse return error.UnsupportedSqlShape;
+        if (value_tokens.start < argument_tokens.start or value_tokens.end > argument_tokens.end) return error.UnsupportedSqlShape;
+        if (expression.argument_distinct_tokens) |distinct_tokens| {
+            if (distinct_tokens.start != argument_tokens.start or distinct_tokens.end != distinct_tokens.start + 1) return error.UnsupportedSqlShape;
+            if (!tokens[distinct_tokens.start].matchesKeywordTag(.distinct)) return error.UnsupportedSqlShape;
+            if (value_tokens.start != distinct_tokens.end) return error.UnsupportedSqlShape;
+        } else if (value_tokens.start != argument_tokens.start) {
+            return error.UnsupportedSqlShape;
+        }
+        if (expression.argument_order_tokens) |order_tokens| {
+            if (order_tokens.end != argument_tokens.end) return error.UnsupportedSqlShape;
+            if (value_tokens.end + 2 != order_tokens.start) return error.UnsupportedSqlShape;
+            if (!tokens[value_tokens.end].matchesKeywordTag(.order) or !tokens[value_tokens.end + 1].matchesKeywordTag(.by)) {
+                return error.UnsupportedSqlShape;
+            }
+        } else if (value_tokens.end != argument_tokens.end) {
+            return error.UnsupportedSqlShape;
+        }
+    }
+
+    var cursor = close_index + 1;
+    if (expression.within_group_tokens) |within_group_tokens| {
+        const order_tokens = expression.within_group_order_tokens orelse return error.UnsupportedSqlShape;
+        if (within_group_tokens.start != cursor or within_group_tokens.end > expression_tokens.end) return error.UnsupportedSqlShape;
+        if (within_group_tokens.end <= within_group_tokens.start + 6) return error.UnsupportedSqlShape;
+        if (!tokens[within_group_tokens.start].matchesKeywordTag(.within) or
+            !tokens[within_group_tokens.start + 1].matchesKeywordTag(.group) or
+            tokens[within_group_tokens.start + 2].kind != .lparen or
+            !tokens[within_group_tokens.start + 3].matchesKeywordTag(.order) or
+            !tokens[within_group_tokens.start + 4].matchesKeywordTag(.by) or
+            tokens[within_group_tokens.end - 1].kind != .rparen)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        if (order_tokens.start != within_group_tokens.start + 5 or order_tokens.end != within_group_tokens.end - 1) {
+            return error.UnsupportedSqlShape;
+        }
+        cursor = within_group_tokens.end;
+    } else if (expression.within_group_order_tokens != null or expression.within_group_order_items.count != 0) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (expression.filter_tokens) |filter_tokens| {
+        const predicate_tokens = expression.filter_predicate_tokens orelse return error.UnsupportedSqlShape;
+        if (filter_tokens.start != cursor or filter_tokens.end > expression_tokens.end) return error.UnsupportedSqlShape;
+        if (filter_tokens.end <= filter_tokens.start + 4) return error.UnsupportedSqlShape;
+        if (!tokens[filter_tokens.start].matchesKeywordTag(.filter) or
+            tokens[filter_tokens.start + 1].kind != .lparen or
+            !tokens[filter_tokens.start + 2].matchesKeywordTag(.where) or
+            tokens[filter_tokens.end - 1].kind != .rparen)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        if (predicate_tokens.start != filter_tokens.start + 3 or predicate_tokens.end != filter_tokens.end - 1) {
+            return error.UnsupportedSqlShape;
+        }
+        cursor = filter_tokens.end;
+    } else if (expression.filter_predicate_tokens != null or expression.filter_expression != null or expression.filter_expression_kind != null) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (expression.over_tokens) |over_tokens| {
+        if (over_tokens.start != cursor or over_tokens.end != expression_tokens.end) return error.UnsupportedSqlShape;
+    } else if (cursor != expression_tokens.end) {
+        return error.UnsupportedSqlShape;
+    }
+}
+
 fn validateGeneratedExpressionAstStructure(expression: generated_parser.GeneratedSqlExpressionAst) !void {
     switch (expression.kind) {
         .token_range => {
@@ -2140,6 +2235,7 @@ fn validateGeneratedExpressionAstRanges(
     for (ranges) |range| {
         if (range) |value| try validateGeneratedReadTokenRange(tokens, read_ast, value);
     }
+    if (expression.kind == .function_call) try validateGeneratedFunctionCallClauseMetadata(tokens, expression);
     if (expression.inner_expression) |inner| try validateGeneratedExpressionAstRanges(tokens, read_ast, inner.*);
     if (expression.left_expression) |left| try validateGeneratedExpressionAstRanges(tokens, read_ast, left.*);
     if (expression.right_expression) |right| try validateGeneratedExpressionAstRanges(tokens, read_ast, right.*);
@@ -3583,6 +3679,57 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_function_argument_list_parsed_sql, malformed_function_argument_list_read_ast),
+    );
+
+    var malformed_function_argument_order_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT array_agg(DISTINCT status ORDER BY id DESC) AS statuses FROM usage_records WHERE kind = 'order'",
+    );
+    defer malformed_function_argument_order_parsed_sql.deinit(alloc);
+    const malformed_function_argument_order_generated_raw = malformed_function_argument_order_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_function_argument_order_read_ast = switch (malformed_function_argument_order_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_function_argument_order_read_ast.projection_items.expressions[0].argument_order_tokens =
+        malformed_function_argument_order_read_ast.projection_items.expressions[0].argument_value_tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_function_argument_order_parsed_sql, malformed_function_argument_order_read_ast),
+    );
+
+    var malformed_function_filter_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT count(*) FILTER (WHERE status = 'open') AS open_count FROM usage_records WHERE kind = 'order'",
+    );
+    defer malformed_function_filter_parsed_sql.deinit(alloc);
+    const malformed_function_filter_generated_raw = malformed_function_filter_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_function_filter_read_ast = switch (malformed_function_filter_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_function_filter_read_ast.projection_items.expressions[0].filter_predicate_tokens =
+        malformed_function_filter_read_ast.projection_items.expressions[0].filter_tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_function_filter_parsed_sql, malformed_function_filter_read_ast),
+    );
+
+    var malformed_function_within_group_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY id DESC) AS median_id FROM usage_records WHERE kind = 'order'",
+    );
+    defer malformed_function_within_group_parsed_sql.deinit(alloc);
+    const malformed_function_within_group_generated_raw = malformed_function_within_group_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_function_within_group_read_ast = switch (malformed_function_within_group_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_function_within_group_read_ast.projection_items.expressions[0].within_group_order_tokens =
+        malformed_function_within_group_read_ast.projection_items.expressions[0].within_group_tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_function_within_group_parsed_sql, malformed_function_within_group_read_ast),
     );
 
     var malformed_comparison_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
