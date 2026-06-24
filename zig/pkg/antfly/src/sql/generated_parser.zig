@@ -530,6 +530,13 @@ pub const GeneratedSqlJoinAst = struct {
     }
 };
 
+pub const GeneratedSqlGraphTableFunctionAst = struct {
+    tokens: GeneratedSqlTokenRange,
+    name_tokens: GeneratedSqlTokenRange,
+    argument_tokens: GeneratedSqlTokenRange,
+    kind: GeneratedSqlGraphTableFunctionKind,
+};
+
 pub const GeneratedSqlWindowAst = struct {
     tokens: GeneratedSqlTokenRange,
     name_tokens: GeneratedSqlTokenRange,
@@ -733,6 +740,8 @@ pub const GeneratedSqlReadAst = struct {
     source_graph_function_name_tokens: ?GeneratedSqlTokenRange = null,
     source_graph_function_argument_tokens: ?GeneratedSqlTokenRange = null,
     source_graph_function_kind: ?GeneratedSqlGraphTableFunctionKind = null,
+    source_graph_function_items: []GeneratedSqlGraphTableFunctionAst = &.{},
+    source_graph_function_count: usize = 0,
     join_tokens: ?GeneratedSqlTokenRange = null,
     join_operator_tokens: ?GeneratedSqlTokenRange = null,
     join_kind: ?GeneratedSqlJoinKind = null,
@@ -772,6 +781,7 @@ pub const GeneratedSqlReadAst = struct {
     pub fn deinit(self: *GeneratedSqlReadAst, alloc: std.mem.Allocator) void {
         for (self.cte_items) |*cte| cte.deinit(alloc);
         if (self.cte_items.len > 0) alloc.free(self.cte_items);
+        if (self.source_graph_function_items.len > 0) alloc.free(self.source_graph_function_items);
         for (self.join_items) |*join| join.deinit(alloc);
         if (self.join_items.len > 0) alloc.free(self.join_items);
         self.distinct_on_items.deinit(alloc);
@@ -1670,7 +1680,7 @@ fn buildReadAst(
         if (idx + 1 < source_end) {
             const source_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = source_end };
             ast.source_tokens = source_tokens;
-            buildGeneratedReadGraphSourceAst(tokens, source_tokens, &ast);
+            try buildGeneratedReadGraphSourceAst(alloc, tokens, source_tokens, &ast);
             try buildReadJoinAst(alloc, tokens, source_tokens, &ast);
         }
     }
@@ -2466,23 +2476,65 @@ fn generatedGraphTableFunctionKind(token: token_mod.Token) ?GeneratedSqlGraphTab
 }
 
 fn buildGeneratedReadGraphSourceAst(
+    alloc: std.mem.Allocator,
     tokens: []const token_mod.Token,
     source_tokens: GeneratedSqlTokenRange,
     ast: *GeneratedSqlReadAst,
-) void {
-    if (source_tokens.start >= source_tokens.end or source_tokens.end > tokens.len) return;
-    var function_start = source_tokens.start;
-    if (tokens[function_start].matchesKeywordTag(.lateral)) {
-        if (function_start + 1 >= source_tokens.end) return;
-        function_start += 1;
+) !void {
+    ast.source_graph_function_items = try buildGeneratedGraphTableFunctionItemsAst(alloc, tokens, source_tokens);
+    ast.source_graph_function_count = ast.source_graph_function_items.len;
+    if (ast.source_graph_function_items.len == 0) return;
+
+    const first = ast.source_graph_function_items[0];
+    ast.source_graph_function_tokens = first.tokens;
+    ast.source_graph_function_name_tokens = first.name_tokens;
+    ast.source_graph_function_argument_tokens = first.argument_tokens;
+    ast.source_graph_function_kind = first.kind;
+}
+
+fn buildGeneratedGraphTableFunctionItemsAst(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    source_tokens: GeneratedSqlTokenRange,
+) ![]GeneratedSqlGraphTableFunctionAst {
+    if (source_tokens.start >= source_tokens.end or source_tokens.end > tokens.len) return &.{};
+    var items: std.ArrayListUnmanaged(GeneratedSqlGraphTableFunctionAst) = .empty;
+    errdefer items.deinit(alloc);
+
+    var index = source_tokens.start;
+    var depth: usize = 0;
+    while (index < source_tokens.end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen => {
+                depth += 1;
+                continue;
+            },
+            .rparen => {
+                depth -|= 1;
+                continue;
+            },
+            else => {},
+        }
+        if (depth != 0) continue;
+        var function_start = index;
+        if (tokens[function_start].matchesKeywordTag(.lateral)) {
+            if (function_start + 1 >= source_tokens.end) continue;
+            function_start += 1;
+        }
+        const kind = generatedGraphTableFunctionKind(tokens[function_start]) orelse continue;
+        if (function_start + 1 >= source_tokens.end or tokens[function_start + 1].kind != .lparen) continue;
+        const close_index = findMatchingParen(tokens, function_start + 1, source_tokens.end) orelse continue;
+        try items.append(alloc, .{
+            .tokens = .{ .start = function_start, .end = close_index + 1 },
+            .name_tokens = .{ .start = function_start, .end = function_start + 1 },
+            .argument_tokens = .{ .start = function_start + 2, .end = close_index },
+            .kind = kind,
+        });
+        index = close_index;
     }
-    const kind = generatedGraphTableFunctionKind(tokens[function_start]) orelse return;
-    if (function_start + 1 >= source_tokens.end or tokens[function_start + 1].kind != .lparen) return;
-    const close_index = findMatchingParen(tokens, function_start + 1, source_tokens.end) orelse return;
-    ast.source_graph_function_tokens = .{ .start = function_start, .end = close_index + 1 };
-    ast.source_graph_function_name_tokens = .{ .start = function_start, .end = function_start + 1 };
-    ast.source_graph_function_argument_tokens = .{ .start = function_start + 2, .end = close_index };
-    ast.source_graph_function_kind = kind;
+
+    if (items.items.len == 0) return &.{};
+    return try items.toOwnedSlice(alloc);
 }
 
 fn buildReadJoinAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, source_tokens: GeneratedSqlTokenRange, ast: *GeneratedSqlReadAst) !void {
@@ -4709,7 +4761,11 @@ test "generated SQL parser facade builds read AST spans" {
     switch (graph_source_read_result.ast.?) {
         .read => |read| {
             try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(@as(usize, 1), read.source_graph_function_count);
+            try std.testing.expectEqual(@as(usize, 1), read.source_graph_function_items.len);
             try std.testing.expectEqual(GeneratedSqlGraphTableFunctionKind.match, read.source_graph_function_kind.?);
+            try std.testing.expectEqual(GeneratedSqlGraphTableFunctionKind.match, read.source_graph_function_items[0].kind);
+            try std.testing.expect(std.meta.eql(read.source_graph_function_tokens.?, read.source_graph_function_items[0].tokens));
             try std.testing.expectEqualStrings(
                 "antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b')",
                 tokenRangeText(graph_source_read_sql, graph_source_tokens.items, read.source_graph_function_tokens.?),
@@ -4721,6 +4777,30 @@ test "generated SQL parser facade builds read AST spans" {
             try std.testing.expectEqualStrings(
                 "table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b'",
                 tokenRangeText(graph_source_read_sql, graph_source_tokens.items, read.source_graph_function_argument_tokens.?),
+            );
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const joined_graph_source_read_sql = "SELECT gm.id, ranked.score FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b') AS gm JOIN antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 5) AS ranked ON gm.id = ranked.id";
+    var joined_graph_source_tokens = try lexer.tokenizeAlloc(alloc, joined_graph_source_read_sql);
+    defer lexer.freeTokens(alloc, &joined_graph_source_tokens);
+    const joined_graph_source_read_result = try parseTokensAlloc(alloc, joined_graph_source_tokens.items);
+    switch (joined_graph_source_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.join, read.kind);
+            try std.testing.expectEqual(@as(usize, 2), read.source_graph_function_count);
+            try std.testing.expectEqual(@as(usize, 2), read.source_graph_function_items.len);
+            try std.testing.expectEqual(GeneratedSqlGraphTableFunctionKind.match, read.source_graph_function_items[0].kind);
+            try std.testing.expectEqual(GeneratedSqlGraphTableFunctionKind.metric, read.source_graph_function_items[1].kind);
+            try std.testing.expect(std.meta.eql(read.source_graph_function_tokens.?, read.source_graph_function_items[0].tokens));
+            try std.testing.expectEqualStrings(
+                "antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b')",
+                tokenRangeText(joined_graph_source_read_sql, joined_graph_source_tokens.items, read.source_graph_function_items[0].tokens),
+            );
+            try std.testing.expectEqualStrings(
+                "antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 5)",
+                tokenRangeText(joined_graph_source_read_sql, joined_graph_source_tokens.items, read.source_graph_function_items[1].tokens),
             );
         },
         else => return error.TestUnexpectedResult,

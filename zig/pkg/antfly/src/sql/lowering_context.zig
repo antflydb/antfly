@@ -1068,19 +1068,50 @@ fn validateGeneratedGraphSourceMetadata(
     tokens: []const tokenized.Token,
     read_ast: generated_parser.GeneratedSqlReadAst,
 ) !void {
-    const function_tokens = read_ast.source_graph_function_tokens orelse {
-        if (read_ast.source_graph_function_name_tokens != null or
+    if (read_ast.source_graph_function_items.len != read_ast.source_graph_function_count) return error.UnsupportedSqlShape;
+    if (read_ast.source_graph_function_items.len == 0) {
+        if (read_ast.source_graph_function_count != 0 or
+            read_ast.source_graph_function_tokens != null or
+            read_ast.source_graph_function_name_tokens != null or
             read_ast.source_graph_function_argument_tokens != null or
             read_ast.source_graph_function_kind != null)
         {
             return error.UnsupportedSqlShape;
         }
         return;
-    };
-    const source_tokens = read_ast.source_tokens orelse return error.UnsupportedSqlShape;
+    }
+
+    const first = read_ast.source_graph_function_items[0];
+    const function_tokens = read_ast.source_graph_function_tokens orelse return error.UnsupportedSqlShape;
     const name_tokens = read_ast.source_graph_function_name_tokens orelse return error.UnsupportedSqlShape;
     const argument_tokens = read_ast.source_graph_function_argument_tokens orelse return error.UnsupportedSqlShape;
     const kind = read_ast.source_graph_function_kind orelse return error.UnsupportedSqlShape;
+    if (!std.meta.eql(function_tokens, first.tokens) or
+        !std.meta.eql(name_tokens, first.name_tokens) or
+        !std.meta.eql(argument_tokens, first.argument_tokens) or
+        kind != first.kind)
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    var previous_end: usize = read_ast.source_tokens.?.start;
+    for (read_ast.source_graph_function_items) |item| {
+        if (item.tokens.start < previous_end) return error.UnsupportedSqlShape;
+        try validateGeneratedGraphSourceItemMetadata(tokens, read_ast, item);
+        previous_end = item.tokens.end;
+    }
+}
+
+fn validateGeneratedGraphSourceItemMetadata(
+    tokens: []const tokenized.Token,
+    read_ast: generated_parser.GeneratedSqlReadAst,
+    item: generated_parser.GeneratedSqlGraphTableFunctionAst,
+) !void {
+    const source_tokens = read_ast.source_tokens orelse return error.UnsupportedSqlShape;
+    const function_tokens = item.tokens;
+    const name_tokens = item.name_tokens;
+    const argument_tokens = item.argument_tokens;
+    const kind = item.kind;
     if (function_tokens.start < source_tokens.start or function_tokens.end > source_tokens.end) return error.UnsupportedSqlShape;
     if (function_tokens.end > tokens.len or function_tokens.end < function_tokens.start + 3) return error.UnsupportedSqlShape;
     if (!std.meta.eql(name_tokens, generated_parser.GeneratedSqlTokenRange{ .start = function_tokens.start, .end = function_tokens.start + 1 })) return error.UnsupportedSqlShape;
@@ -2746,6 +2777,15 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         else => return error.UnsupportedSqlShape,
     };
     malformed_graph_source_read_ast.source_graph_function_kind = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_graph_source_parsed_sql, malformed_graph_source_read_ast),
+    );
+    malformed_graph_source_read_ast = switch (malformed_graph_source_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_graph_source_read_ast.source_graph_function_count += 1;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_graph_source_parsed_sql, malformed_graph_source_read_ast),
