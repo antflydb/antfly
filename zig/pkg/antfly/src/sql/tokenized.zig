@@ -920,6 +920,10 @@ test "sql adapter parsed sql owns typed statement variants" {
         .extension_index => |extension_index_ast| {
             try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_index, extension_index_ast.kind);
             try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, extension_index_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 4, .end = 5 }, extension_index_ast.index_table_tokens.?);
+            try std.testing.expect(extension_index_ast.index_method_tokens == null);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 7 }, extension_index_ast.index_elements_tokens.?);
+            try std.testing.expect(extension_index_ast.index_options_tokens == null);
         },
         else => return error.TestUnexpectedResult,
     }

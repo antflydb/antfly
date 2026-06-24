@@ -569,6 +569,10 @@ pub const GeneratedSqlDdlAst = struct {
     object_name_tokens: ?GeneratedSqlTokenRange = null,
     schema_name_tokens: ?GeneratedSqlTokenRange = null,
     version_tokens: ?GeneratedSqlTokenRange = null,
+    index_table_tokens: ?GeneratedSqlTokenRange = null,
+    index_method_tokens: ?GeneratedSqlTokenRange = null,
+    index_elements_tokens: ?GeneratedSqlTokenRange = null,
+    index_options_tokens: ?GeneratedSqlTokenRange = null,
     if_not_exists: bool = false,
     if_exists: bool = false,
     cascade: bool = false,
@@ -1363,6 +1367,25 @@ fn buildDdlAst(
         .create_index => {
             ast.if_not_exists = consumeGeneratedIfNotExists(tokens, &index, end);
             ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
+            if (ast.object_name_tokens) |name_range| index = name_range.end;
+            if (index < end and tokens[index].matchesKeywordTag(.on)) {
+                index += 1;
+                ast.index_table_tokens = generatedQualifiedNameRange(tokens, index, end);
+                if (ast.index_table_tokens) |table_range| index = table_range.end;
+                if (index + 1 < end and tokens[index].matchesKeywordTag(.using)) {
+                    ast.index_method_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index + 1, end);
+                    if (ast.index_method_tokens) |method_range| index = method_range.end;
+                }
+                if (index < end and tokens[index].kind == .lparen) {
+                    if (findMatchingParen(tokens, index, end)) |close_index| {
+                        ast.index_elements_tokens = .{ .start = index + 1, .end = close_index };
+                        index = close_index + 1;
+                    }
+                }
+                if (index < end and tokens[index].matchesKeywordTag(.with)) {
+                    ast.index_options_tokens = .{ .start = index, .end = end };
+                }
+            }
         },
         .drop_database => {
             ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
@@ -2384,6 +2407,10 @@ fn consumeGeneratedIfExists(tokens: []const token_mod.Token, index: *usize, end:
 fn generatedSingleTokenRangeIfIdentifier(tokens: []const token_mod.Token, index: usize, end: usize) ?GeneratedSqlTokenRange {
     if (index >= end or tokens[index].kind != .identifier) return null;
     return .{ .start = index, .end = index + 1 };
+}
+
+fn generatedQualifiedNameRange(tokens: []const token_mod.Token, index: usize, end: usize) ?GeneratedSqlTokenRange {
+    return generatedSingleTokenRangeIfIdentifier(tokens, index, end);
 }
 
 const GeneratedSqlListOptions = struct {
@@ -3709,6 +3736,20 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, ddl.object_name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, ddl.schema_name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, ddl.version_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const create_index_sql = "CREATE INDEX docs_body_fts ON docs USING antfly_full_text (body) WITH (analyzer = 'standard')";
+    const create_index_result = try parseSqlAlloc(alloc, create_index_sql);
+    switch (create_index_result.ast.?) {
+        .extension_index => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.create_index, ddl.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl.index_table_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, ddl.index_method_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, ddl.index_elements_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 16 }, ddl.index_options_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

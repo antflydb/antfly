@@ -551,7 +551,9 @@ variants for:
   backed by validated wrappers into the current typed read lowerers
 - extension/index statement, including a closed generated family for
   `CREATE INDEX`, `DROP INDEX`, `CREATE EXTENSION`, and `DROP EXTENSION` with
-  DDL-compatible AST payloads for object names, options, and drop behavior
+  DDL-compatible AST payloads for object names, index target tables, index
+  methods, index element lists, index options, extension options, and drop
+  behavior
 - graph statement, including a generated AST payload for command spans and
   graph-specific AST-to-plan wrappers for seed graph index and graph metric DDL
 - unsupported statement, including generated AST payloads for seed `ANALYZE`,
