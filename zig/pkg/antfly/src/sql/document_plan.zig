@@ -3318,6 +3318,13 @@ test "document SQL matches numeric algebraic aggregate materializations" {
     try std.testing.expectEqualStrings("alg", avg_lowered.index_name.?);
     try std.testing.expectEqualStrings("avg_by_status", avg_lowered.materialization_name.?);
 
+    const sum_and_count_only_indexes_json =
+        \\{"alg":{"type":"algebraic","materializations":[{"name":"count_by_status","op":"count","group_by":["status"]},{"name":"sum_by_status","op":"sum","group_by":["status"],"measure":"amount"}]}}
+    ;
+    var avg_without_native = try tokenized.ParsedSql.initAlloc(alloc, "SELECT avg(amount) AS avg_amount FROM docs GROUP BY status LIMIT 5");
+    defer avg_without_native.deinit(alloc);
+    try std.testing.expectError(error.DocumentSqlRequiresBoundedScan, lowerDocumentAggregatePlanWithOptionalIndexesJsonParsedSqlAlloc(alloc, &avg_without_native, schema, sum_and_count_only_indexes_json));
+
     var wrong_measure = try tokenized.ParsedSql.initAlloc(alloc, "SELECT min(amount) AS min_amount FROM docs GROUP BY status LIMIT 5");
     defer wrong_measure.deinit(alloc);
     try std.testing.expectError(error.DocumentSqlRequiresBoundedScan, lowerDocumentAggregatePlanWithOptionalIndexesJsonParsedSqlAlloc(alloc, &wrong_measure, schema, indexes_json));

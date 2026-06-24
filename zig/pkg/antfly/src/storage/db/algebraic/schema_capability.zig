@@ -339,9 +339,10 @@ pub fn configJsonFromPlanAlloc(alloc: Allocator, table_name: []const u8, plan: P
 /// per-group counts are emitted and the rest is left to adaptive materialization.
 const max_default_materializations: usize = 64;
 
-/// Default measure ops materialized per (group field, measure field). avg is
-/// derived from sum + count by the planner, so it is not materialized directly.
-const default_measure_ops = [_][]const u8{ "sum", "min", "max" };
+/// Default measure ops materialized per (group field, measure field). avg uses
+/// the algebraic avg law's sum/count state so SQL null semantics stay tied to
+/// present measure values instead of a broader row count.
+const default_measure_ops = [_][]const u8{ "sum", "avg", "min", "max" };
 
 fn appendMaterializationEntry(
     alloc: Allocator,
@@ -380,7 +381,7 @@ fn appendMaterializationEntry(
 /// Emit a bounded set of default materializations so common group-by
 /// aggregations are served from precomputed rollups immediately, rather than
 /// waiting for adaptive observation to build them: a `count` per group field,
-/// and sum/min/max per (group field, measure field). Bounded by
+/// and sum/avg/min/max per (group field, measure field). Bounded by
 /// `max_default_materializations`; a group field that is also the measure is
 /// skipped for the measure ops (a degenerate self-grouped metric).
 fn appendDefaultMaterializations(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), plan: Plan) !void {
@@ -1016,9 +1017,9 @@ test "schema capability plan emits default materializations from group and measu
     try std.testing.expectEqual(@as(usize, 3), parsed_config.value.group_fields.len);
     try std.testing.expectEqual(@as(usize, 1), parsed_config.value.measure_fields.len);
     try std.testing.expectEqual(@as(usize, 1), parsed_config.value.time_fields.len);
-    // 3 per-group counts + sum/min/max for (kind,amount) and (created_at,amount)
-    // (amount x amount is skipped as a self-grouped metric) = 3 + 6 = 9.
-    try std.testing.expectEqual(@as(usize, 9), parsed_config.value.materializations.len);
+    // 3 per-group counts + sum/avg/min/max for (kind,amount) and (created_at,amount)
+    // (amount x amount is skipped as a self-grouped metric) = 3 + 8 = 11.
+    try std.testing.expectEqual(@as(usize, 11), parsed_config.value.materializations.len);
     // The derived config (with its default materializations) must validate.
     try index_mod.validateConfig(parsed_config.value);
 }
@@ -1050,8 +1051,8 @@ test "schema capability config can compile directly from schema json" {
     try std.testing.expectEqualStrings("orders", parsed_config.value.table);
     try std.testing.expectEqual(@as(usize, 2), parsed_config.value.group_fields.len);
     try std.testing.expectEqual(@as(usize, 1), parsed_config.value.measure_fields.len);
-    // 2 per-group counts + sum/min/max for (tenant,amount) = 2 + 3 = 5.
-    try std.testing.expectEqual(@as(usize, 5), parsed_config.value.materializations.len);
+    // 2 per-group counts + sum/avg/min/max for (tenant,amount) = 2 + 4 = 6.
+    try std.testing.expectEqual(@as(usize, 6), parsed_config.value.materializations.len);
 }
 
 test "schema capability config derives from a relational schema for auto-created index" {
@@ -1075,9 +1076,9 @@ test "schema capability config derives from a relational schema for auto-created
     try std.testing.expectEqual(@as(usize, 4), parsed_config.value.group_fields.len);
     try std.testing.expectEqual(@as(usize, 1), parsed_config.value.measure_fields.len);
     try std.testing.expectEqual(@as(usize, 1), parsed_config.value.time_fields.len);
-    // 4 per-group counts + sum/min/max for (tenant,amount), (status,amount),
-    // (created,amount) [amount x amount skipped] = 4 + 9 = 13.
-    try std.testing.expectEqual(@as(usize, 13), parsed_config.value.materializations.len);
+    // 4 per-group counts + sum/avg/min/max for (tenant,amount), (status,amount),
+    // (created,amount) [amount x amount skipped] = 4 + 12 = 16.
+    try std.testing.expectEqual(@as(usize, 16), parsed_config.value.materializations.len);
     try std.testing.expect(parsed_config.value.adaptive.observe);
     // The derived config must validate.
     try index_mod.validateConfig(parsed_config.value);

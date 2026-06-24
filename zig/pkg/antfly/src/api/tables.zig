@@ -4772,6 +4772,7 @@ test "schema-derived algebraic indexes expand into explicit capability config" {
     try std.testing.expect(std.mem.indexOf(u8, expanded, "\"materializations\":[]") == null);
     try std.testing.expect(std.mem.indexOf(u8, expanded, "\"op\":\"count\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, expanded, "\"op\":\"sum\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "\"op\":\"avg\"") != null);
     // No user-named materializations are injected.
     try std.testing.expect(std.mem.indexOf(u8, expanded, "\"sum_by_customer\"") == null);
 }
@@ -4811,6 +4812,7 @@ test "single schema-derived algebraic index expands into explicit capability con
     // Default materializations are derived from the schema's group/measure fields.
     try std.testing.expect(std.mem.indexOf(u8, expanded, "\"materializations\":[]") == null);
     try std.testing.expect(std.mem.indexOf(u8, expanded, "\"op\":\"count\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded, "\"op\":\"avg\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, expanded, "\"sum_by_customer\"") == null);
 }
 

@@ -992,7 +992,10 @@ bounded-producer rule and return `NULL` for groups whose matching rows have no
 non-null numeric measure. Configured local algebraic materializations for
 unfiltered `COUNT(*)`, `SUM(path)`, `AVG(path)`, `MIN(path)`, and `MAX(path)`
 can now execute through the document SQL source boundary when the materialized
-`op`, `group_by`, and `measure` exactly match the SQL plan. Filtered
+`op`, `group_by`, and `measure` exactly match the SQL plan. Schema-derived
+algebraic configs emit native `avg` materializations for common group/measure
+pairs; SQL must not rewrite `AVG(path)` to `SUM(path) / COUNT(*)` because
+missing and JSON-null measure values are ignored by SQL `AVG`. Filtered
 materialized aggregates, distributed materialization merging, and adaptive
 partial/result execution still fail closed until their producer-specific
 executors are implemented.
