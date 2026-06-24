@@ -19,6 +19,7 @@ const binder = @import("binder.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const grammar = @import("grammar.zig");
+const generated_parser = @import("generated_parser.zig");
 const lexer = @import("lexer.zig");
 const plan_mod = @import("plan.zig");
 const parser = @import("parser.zig");
@@ -80,6 +81,7 @@ pub const SelectParserOptions = struct {
     field_source: db_mod.types.RelationalRowsExpressionFieldSource = .row,
     allow_select_set_boundary: bool = false,
     allow_select_set_result_tail_boundary: bool = false,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst = null,
     context_hooks: SelectParserContextHooks,
     select_item_options: SelectItemParserOptions,
     row_expression_hooks: RowExpressionParserHooks,
@@ -92,6 +94,64 @@ pub const SelectParserOptions = struct {
     order_expression_hooks: OrderExpressionParserOptions,
     realtime_ns: u64,
 };
+
+const GeneratedLimitValue = struct {
+    value: ?u32,
+};
+
+fn parseGeneratedLimitValueForClause(
+    tokens: []const Token,
+    keyword_index: usize,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !?GeneratedLimitValue {
+    const read = generated_read_ast orelse return null;
+    if (keyword_index >= tokens.len or !tokens[keyword_index].matchesKeywordTag(.limit)) return null;
+    const range = read.limit_tokens orelse return error.UnsupportedSqlShape;
+    if (range.start != pos.* or range.end > tokens.len) return error.UnsupportedSqlShape;
+    var generated_pos = range.start;
+    const limit = try value_mod.parseLimitValue(tokens, &generated_pos, params);
+    if (generated_pos != range.end) return error.UnsupportedSqlShape;
+    pos.* = range.end;
+    return .{ .value = limit };
+}
+
+fn parseGeneratedOffsetValueForClause(
+    tokens: []const Token,
+    keyword_index: usize,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !?u32 {
+    const read = generated_read_ast orelse return null;
+    if (keyword_index >= tokens.len or !tokens[keyword_index].matchesKeywordTag(.offset)) return null;
+    const range = read.offset_tokens orelse return error.UnsupportedSqlShape;
+    if (range.start != pos.* or range.end > tokens.len) return error.UnsupportedSqlShape;
+    var generated_pos = range.start;
+    const offset = try value_mod.parseOffsetValue(tokens, &generated_pos, params);
+    if (generated_pos != range.end) return error.UnsupportedSqlShape;
+    pos.* = range.end;
+    return offset;
+}
+
+fn parseGeneratedFetchLimitValueForClause(
+    tokens: []const Token,
+    keyword_index: usize,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !?GeneratedLimitValue {
+    const read = generated_read_ast orelse return null;
+    if (keyword_index >= tokens.len or !tokens[keyword_index].matchesKeywordTag(.fetch)) return null;
+    const range = read.fetch_tokens orelse return error.UnsupportedSqlShape;
+    if (range.start != pos.* or range.end > tokens.len) return error.UnsupportedSqlShape;
+    var generated_pos = range.start;
+    const limit = try value_mod.parseFetchLimitValue(tokens, &generated_pos, params);
+    if (generated_pos != range.end) return error.UnsupportedSqlShape;
+    pos.* = range.end;
+    return .{ .value = limit };
+}
 
 pub const WindowParserOptions = struct {
     params: []const value_mod.SqlValue = &.{},
@@ -15706,11 +15766,25 @@ pub fn parseSelectAlloc(
             );
             if (distinct_on.len > 0) try validateDistinctOnOrder(distinct_on, order_by.items);
         } else if (parser.matchKeyword(tokens, pos, "limit")) {
-            limit = try value_mod.parseLimitValue(tokens, pos, options.params);
+            const keyword_index = pos.* - 1;
+            if (try parseGeneratedLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_limit| {
+                limit = generated_limit.value;
+            } else {
+                limit = try value_mod.parseLimitValue(tokens, pos, options.params);
+            }
         } else if (parser.matchKeyword(tokens, pos, "offset")) {
-            offset = try value_mod.parseOffsetValue(tokens, pos, options.params);
+            const keyword_index = pos.* - 1;
+            offset = if (try parseGeneratedOffsetValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_offset|
+                generated_offset
+            else
+                try value_mod.parseOffsetValue(tokens, pos, options.params);
         } else if (parser.matchKeyword(tokens, pos, "fetch")) {
-            limit = try value_mod.parseFetchLimitValue(tokens, pos, options.params);
+            const keyword_index = pos.* - 1;
+            if (try parseGeneratedFetchLimitValueForClause(tokens, keyword_index, pos, options.params, options.generated_read_ast)) |generated_limit| {
+                limit = generated_limit.value;
+            } else {
+                limit = try value_mod.parseFetchLimitValue(tokens, pos, options.params);
+            }
         } else if (parser.matchKeyword(tokens, pos, "for")) {
             const allowed_targets = [_][]const u8{ table_ref.name, table_ref.alias };
             row_claim = sqlRowClaimForClause(try grammar.parseCheckedForRowClaimClauseAlloc(alloc, tokens, pos, &allowed_targets));
@@ -24899,6 +24973,18 @@ fn runtimeSchemaFromJsonForLowerExprTestAlloc(alloc: std.mem.Allocator, schema_j
     return try schema_api.deriveRuntimeTableSchema(alloc, parsed);
 }
 
+fn generatedQueryReadAstForParsedSql(parsed_sql: *const tokenized.ParsedSql) ?*const generated_parser.GeneratedSqlReadAst {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            return switch (generated_ast.*) {
+                .read => |*read| if (read.kind == .query and read.set_operation_tokens == null and read.cte_tokens == null) read else null,
+                else => null,
+            };
+        }
+    }
+    return null;
+}
+
 fn lowerQueryPlanForLowerExprTestAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
@@ -24915,11 +25001,21 @@ fn lowerQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
     params: []const value_mod.SqlValue,
     function_bindings: SqlFunctionBindings,
 ) !plan_mod.LoweredQueryPlan {
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(alloc, &parsed_sql, schema, params, function_bindings);
+}
+
+fn lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+    function_bindings: SqlFunctionBindings,
+) !plan_mod.LoweredQueryPlan {
     const parser_context = @import("parser_context.zig");
 
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
-    defer parsed_sql.deinit(alloc);
     const tokens = parsed_sql.items();
     const cte_adapter_shape = parser.tokensStartWithKeywordTag(tokens, .with);
 
@@ -24929,6 +25025,7 @@ fn lowerQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
         .schema = schema,
         .params = params,
         .function_bindings = function_bindings,
+        .generated_read_ast = generatedQueryReadAstForParsedSql(parsed_sql),
     };
     var lowered = parseQueryPlanAlloc(
         alloc,
@@ -28384,6 +28481,27 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms" {
     defer fetch_query.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 3), fetch_query.plan.query.limit.?);
     try std.testing.expectEqual(@as(u32, 2), fetch_query.plan.query.offset);
+
+    var malformed_generated_pagination = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records LIMIT 5",
+    );
+    defer malformed_generated_pagination.deinit(alloc);
+    if (malformed_generated_pagination.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |*read| read.limit_tokens = .{ .start = 3, .end = 4 },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_pagination,
+        schema,
+        &.{},
+        .{},
+    ));
 
     var aggregate = try lowerAggregateForLowerExprTestAlloc(
         alloc,

@@ -15,6 +15,7 @@
 const std = @import("std");
 
 const ddl_plan = @import("ddl_plan.zig");
+const generated_parser = @import("generated_parser.zig");
 const lower_dml = @import("lower_dml.zig");
 const lower_expr = @import("lower_expr.zig");
 const plan = @import("plan.zig");
@@ -53,6 +54,7 @@ pub const ParserState = struct {
     saw_primary_key_assignment: bool = false,
     allow_select_set_boundary: bool = false,
     allow_select_set_result_tail_boundary: bool = false,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst = null,
 };
 
 pub fn ParserContextAccessors(comptime ParserType: type) type {
@@ -640,6 +642,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .field_source = lower_expr.rowExpressionFieldSourceOrDefault(ptr.row_expression_field_source_override),
                 .allow_select_set_boundary = ptr.allow_select_set_boundary,
                 .allow_select_set_result_tail_boundary = ptr.allow_select_set_result_tail_boundary,
+                .generated_read_ast = ptr.generated_read_ast,
                 .context_hooks = Accessors.selectParserContextHooks(ptr),
                 .select_item_options = Accessors.selectItemParserOptions(ptr),
                 .row_expression_hooks = Accessors.rowExpressionParserHooks(ptr),

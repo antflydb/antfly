@@ -608,6 +608,18 @@ pub const validateSqlDatabaseSettingValue = sql_adapter.validateSqlDatabaseSetti
 pub const applyOwnedSessionCatalogPlanAlloc = sql_adapter.applyOwnedSessionCatalogPlanAlloc;
 pub const applySessionCatalogPlanAlloc = sql_adapter.applySessionCatalogPlanAlloc;
 
+fn generatedQueryReadAstForParsedSql(parsed_sql: *const sql_adapter.ParsedSql) ?*const sql_adapter.generated_parser.GeneratedSqlReadAst {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            return switch (generated_ast.*) {
+                .read => |*read| if (read.kind == .query and read.set_operation_tokens == null and read.cte_tokens == null) read else null,
+                else => null,
+            };
+        }
+    }
+    return null;
+}
+
 pub fn lowerSelectAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
@@ -634,6 +646,7 @@ pub fn lowerSelectParsedSqlAlloc(
         .tokens = tokens,
         .schema = schema,
         .params = params,
+        .generated_read_ast = generatedQueryReadAstForParsedSql(parsed_sql),
     };
     var lowered = sql_adapter.parseQueryPlanAlloc(
         alloc,
@@ -716,6 +729,7 @@ pub fn lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(
         .schema = schema,
         .params = params,
         .function_bindings = function_bindings,
+        .generated_read_ast = generatedQueryReadAstForParsedSql(parsed_sql),
     };
     var lowered = sql_adapter.parseQueryPlanAlloc(
         alloc,

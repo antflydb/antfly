@@ -342,7 +342,9 @@ Suggested migration order:
    PostgreSQL-compatible `ALL`/`NULL` `LIMIT` tails, `OFFSET` with optional
    `ROW`/`ROWS`, and `FETCH FIRST`/`FETCH NEXT` tails with optional fetch
    counts; generated metadata records limit expressions, the `LIMIT ALL`
-   marker, offset expressions, and explicit fetch-count expressions.
+   marker, offset expressions, and explicit fetch-count expressions, and simple
+   query pagination now uses generated range-validated lowering when generated
+   read metadata is available.
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression AST semantics beyond the current owned
