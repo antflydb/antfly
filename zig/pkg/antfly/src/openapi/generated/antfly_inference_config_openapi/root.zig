@@ -61,5 +61,7 @@ pub const ToolCallDelta = types.ToolCallDelta;
 pub const ToolCallFunctionDelta = types.ToolCallFunctionDelta;
 pub const ModelKind = types.ModelKind;
 pub const ModelBackend = types.ModelBackend;
+pub const ModelFormat = types.ModelFormat;
+pub const ModelQuantization = types.ModelQuantization;
 pub const ModelRef = types.ModelRef;
 pub const Config = types.Config;

@@ -123,6 +123,8 @@ pub const WarmModel = struct {
     kind: WarmModelKind = .generator,
     name: []const u8,
     backend: ?backends_mod.BackendType = null,
+    format: ?[]const u8 = null,
+    quantization: ?[]const u8 = null,
 };
 
 pub const ai_api_prefix = "/ai/v1";
@@ -136,12 +138,12 @@ const GenerateBackendSelection = struct {
 };
 
 fn parseGenerateBackendSelection(
-    backend_value: ?api.GenerateBackendOverride,
+    backend_value: ?api.ModelBackend,
     mode_value: ?[]const u8,
     compiled_target_value: ?[]const u8,
 ) !GenerateBackendSelection {
     const choice = if (backend_value) |value|
-        generateBackendOverrideToChoice(value)
+        modelBackendToNativeChoice(value)
     else
         native_backend_choice.Choice.auto;
     try native_backend_choice.validate(choice);
@@ -173,7 +175,7 @@ fn parseGenerateBackendSelection(
     };
 }
 
-fn generateBackendOverrideToChoice(value: api.GenerateBackendOverride) native_backend_choice.Choice {
+fn modelBackendToNativeChoice(value: api.ModelBackend) native_backend_choice.Choice {
     return switch (value) {
         .auto => .auto,
         .onnx => .onnx,
@@ -181,7 +183,7 @@ fn generateBackendOverrideToChoice(value: api.GenerateBackendOverride) native_ba
         .metal => .metal,
         .cuda => .cuda,
         .xla => .xla,
-        .webgpu => .webgpu,
+        .webgpu, .wasm => .webgpu,
     };
 }
 

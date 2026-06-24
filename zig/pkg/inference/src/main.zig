@@ -43,6 +43,8 @@ const RunConfig = struct {
         kind: []const u8,
         name: []const u8,
         backend: ?[]const u8 = null,
+        format: ?[]const u8 = null,
+        quantization: ?[]const u8 = null,
     };
 
     models_dir: ?[]const u8 = null,
@@ -71,8 +73,15 @@ fn parseBackendType(value: []const u8) ?inference.backends.BackendType {
     if (std.mem.eql(u8, value, "onnx")) return .onnx;
     if (std.mem.eql(u8, value, "metal")) return .metal;
     if (std.mem.eql(u8, value, "cuda")) return .cuda;
+    if (std.mem.eql(u8, value, "xla") or std.mem.eql(u8, value, "pjrt")) return .pjrt;
     if (std.mem.eql(u8, value, "wasm") or std.mem.eql(u8, value, "webgpu")) return .wasm;
     return null;
+}
+
+fn parseOptionalBackendType(value: ?[]const u8) !?inference.backends.BackendType {
+    const raw = value orelse return null;
+    if (std.mem.eql(u8, raw, "auto")) return null;
+    return parseBackendType(raw) orelse error.InvalidArguments;
 }
 
 fn parsePreloadModelKind(value: []const u8) ?inference.server.WarmModelKind {
@@ -97,6 +106,8 @@ fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
         .kind = parsePreloadModelKind(kind_name) orelse return error.InvalidArguments,
         .name = model_name,
         .backend = backend,
+        .format = null,
+        .quantization = null,
     };
 }
 
@@ -108,7 +119,9 @@ fn preloadModelsFromConfig(allocator: std.mem.Allocator, values: []const RunConf
         out[i] = .{
             .kind = parsePreloadModelKind(value.kind) orelse return error.InvalidArguments,
             .name = value.name,
-            .backend = if (value.backend) |backend| parseBackendType(backend) orelse return error.InvalidArguments else null,
+            .backend = try parseOptionalBackendType(value.backend),
+            .format = value.format,
+            .quantization = value.quantization,
         };
     }
     return out;
@@ -458,7 +471,7 @@ test "run config parses shared scraping fields and ignores api_url" {
         \\    "endpoint": "s3.amazonaws.com"
         \\  },
         \\  "preload": [
-        \\    { "kind": "generator", "name": "gemma-e2b", "backend": "metal" }
+        \\    { "kind": "generator", "name": "antflydb/gemma-e2b", "backend": "metal", "format": "gguf", "quantization": "q4_k" }
         \\  ],
         \\  "max_loaded_models": 8,
         \\  "pool_size": 4
@@ -476,8 +489,10 @@ test "run config parses shared scraping fields and ignores api_url" {
     try std.testing.expectEqualStrings("s3.amazonaws.com", parsed.value.s3_credentials.?.endpoint.?);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.preload.len);
     try std.testing.expectEqualStrings("generator", parsed.value.preload[0].kind);
-    try std.testing.expectEqualStrings("gemma-e2b", parsed.value.preload[0].name);
+    try std.testing.expectEqualStrings("antflydb/gemma-e2b", parsed.value.preload[0].name);
     try std.testing.expectEqualStrings("metal", parsed.value.preload[0].backend.?);
+    try std.testing.expectEqualStrings("gguf", parsed.value.preload[0].format.?);
+    try std.testing.expectEqualStrings("q4_k", parsed.value.preload[0].quantization.?);
     try std.testing.expectEqual(@as(?usize, 8), parsed.value.max_loaded_models);
     try std.testing.expectEqual(@as(?usize, 4), parsed.value.pool_size);
 }

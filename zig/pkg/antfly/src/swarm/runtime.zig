@@ -2079,6 +2079,8 @@ fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
         .kind = parsePreloadModelKind(kind_name) orelse return error.InvalidArguments,
         .name = model_name,
         .backend = backend,
+        .format = null,
+        .quantization = null,
     };
 }
 
@@ -2843,7 +2845,9 @@ fn resolveInferenceWarmModels(
         out[i] = .{
             .kind = parsePreloadModelKind(model.kind) orelse return error.InvalidConfig,
             .name = model.name,
-            .backend = if (model.backend) |backend| antfly.inference_runtime.parseBackendType(backend) orelse return error.InvalidConfig else null,
+            .backend = antfly.inference_runtime.parseOptionalBackendType(model.backend) catch return error.InvalidConfig,
+            .format = model.format,
+            .quantization = model.quantization,
         };
     }
     return .{ .items = out, .owned = true };
@@ -4136,8 +4140,10 @@ test "inference config falls back to common config" {
             .preload = try alloc.dupe(antfly.common.config.Config.InferenceConfig.WarmModelConfig, &.{
                 .{
                     .kind = try alloc.dupe(u8, "generator"),
-                    .name = try alloc.dupe(u8, "gemma-e2b"),
+                    .name = try alloc.dupe(u8, "antflydb/gemma-e2b"),
                     .backend = try alloc.dupe(u8, "metal"),
+                    .format = try alloc.dupe(u8, "gguf"),
+                    .quantization = try alloc.dupe(u8, "q4_k"),
                 },
             }),
         },
@@ -4150,8 +4156,10 @@ test "inference config falls back to common config" {
     defer warm_models.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), warm_models.items.len);
     try std.testing.expectEqual(inference.server.WarmModelKind.generator, warm_models.items[0].kind);
-    try std.testing.expectEqualStrings("gemma-e2b", warm_models.items[0].name);
+    try std.testing.expectEqualStrings("antflydb/gemma-e2b", warm_models.items[0].name);
     try std.testing.expectEqual(inference.backends.BackendType.metal, warm_models.items[0].backend.?);
+    try std.testing.expectEqualStrings("gguf", warm_models.items[0].format.?);
+    try std.testing.expectEqualStrings("q4_k", warm_models.items[0].quantization.?);
 }
 
 test "swarm runtime resolves paths from common storage base dir" {

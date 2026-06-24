@@ -84,8 +84,15 @@ pub fn parseBackendType(value: []const u8) ?inference.backends.BackendType {
     if (std.mem.eql(u8, value, "onnx")) return .onnx;
     if (std.mem.eql(u8, value, "metal")) return .metal;
     if (std.mem.eql(u8, value, "cuda")) return .cuda;
+    if (std.mem.eql(u8, value, "xla") or std.mem.eql(u8, value, "pjrt")) return .pjrt;
     if (std.mem.eql(u8, value, "wasm") or std.mem.eql(u8, value, "webgpu")) return .wasm;
     return null;
+}
+
+pub fn parseOptionalBackendType(value: ?[]const u8) !?inference.backends.BackendType {
+    const raw = value orelse return null;
+    if (std.mem.eql(u8, raw, "auto")) return null;
+    return parseBackendType(raw) orelse error.InvalidArguments;
 }
 
 fn parsePreloadModelKind(value: []const u8) ?inference.server.WarmModelKind {
@@ -110,6 +117,8 @@ fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
         .kind = parsePreloadModelKind(kind_name) orelse return error.InvalidArguments,
         .name = model_name,
         .backend = backend,
+        .format = null,
+        .quantization = null,
     };
 }
 
@@ -474,5 +483,6 @@ test "inference runtime module compiles" {
 test "parseBackendType accepts warm generator backends" {
     try std.testing.expectEqual(inference.backends.BackendType.metal, parseBackendType("metal").?);
     try std.testing.expectEqual(inference.backends.BackendType.wasm, parseBackendType("webgpu").?);
-    try std.testing.expect(parseBackendType("xla") == null);
+    try std.testing.expectEqual(inference.backends.BackendType.pjrt, parseBackendType("xla").?);
+    try std.testing.expect(try parseOptionalBackendType("auto") == null);
 }

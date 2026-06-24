@@ -2540,7 +2540,7 @@ components:
             Selects a subset of keys and fits new values via OLS to preserve attention behavior.
             0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
         backend:
-          $ref: '#/components/schemas/GenerateBackendOverride'
+          $ref: '#/components/schemas/ModelBackend'
         mode:
           type: string
           enum:
@@ -2765,35 +2765,40 @@ components:
         - reader
         - transcriber
         - extractor
-    GenerateBackendOverride:
+    ModelBackend:
       type: string
       description: |
-        Optional backend override for this request.
+        Optional backend preference for model loading or request execution.
         `auto` keeps the node default behavior.
-        `onnx` forces ONNX generation when the model/package supports it.
-        `native`, `metal`, and `cuda` force the native host backend choice.
-        `xla` runs native generation with explicit PJRT/XLA compiled graph partitions and
-        requires a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`,
-        `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
+        `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via
+        `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`,
+        `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
         `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with
-        `mode: "compiled"` to request WebGPU graph partition execution.
+        `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
       enum:
         - auto
-        - onnx
         - native
+        - onnx
         - metal
         - cuda
         - xla
         - webgpu
-    ModelBackend:
-      type: string
-      description: Optional backend preference for loading a model.
-      enum:
-        - native
-        - onnx
-        - metal
-        - cuda
         - wasm
+    ModelFormat:
+      type: string
+      description: Optional artifact format preference for loading a model.
+      enum:
+        - gguf
+        - onnx
+        - safetensors
+        - hybrid
+    ModelQuantization:
+      type: string
+      description: Optional quantization preference for loading a model.
+      enum:
+        - q4_k
+        - q8
+        - fp16
     BackendPriorityEntry:
       type: string
       description: |
@@ -2825,9 +2830,14 @@ components:
           $ref: '#/components/schemas/ModelKind'
         name:
           type: string
-          description: Model name to resolve within the registry for the selected kind.
+          description: Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
+          example: antflydb/gemma-e2b
         backend:
           $ref: '#/components/schemas/ModelBackend'
+        format:
+          $ref: '#/components/schemas/ModelFormat'
+        quantization:
+          $ref: '#/components/schemas/ModelQuantization'
     Config:
       type: object
       required:
@@ -2952,8 +2962,10 @@ components:
             $ref: '#/components/schemas/ModelRef'
           example:
             - kind: generator
-              name: gemma-e2b
+              name: antflydb/gemma-e2b
               backend: metal
+              format: gguf
+              quantization: q4_k
         max_memory_mb:
           type: integer
           description: |
