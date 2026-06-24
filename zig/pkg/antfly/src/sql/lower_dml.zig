@@ -12385,6 +12385,14 @@ pub fn lowerWritePlanFromGeneratedDmlAstAlloc(
 ) !plan_mod.LoweredWritePlan {
     const write_kind = parsed_sql.writeStatementKind() orelse return error.UnsupportedSqlShape;
     if (!generatedDmlAstMatchesWriteKind(dml_ast.kind, write_kind)) return error.UnsupportedSqlShape;
+    if (dml_ast.kind == .insert_values) {
+        if (insertValuesFromGeneratedDmlAstAlloc(alloc, parsed_sql.items(), dml_ast, schema, params, options)) |insert| {
+            return .{ .insert = insert };
+        } else |err| switch (err) {
+            error.UnsupportedSqlShape => {},
+            else => return err,
+        }
+    }
     if (dml_ast.kind == .truncate) {
         if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
         const row_claim = options.row_claim orelse return error.UnsupportedRowsQuery;
@@ -12395,6 +12403,151 @@ pub fn lowerWritePlanFromGeneratedDmlAstAlloc(
         return .{ .truncate_source = lowered };
     }
     return try lowerWritePlanParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, options);
+}
+
+fn insertValuesFromGeneratedDmlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    ast: generated_parser.GeneratedSqlDmlAst,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+) !plan_mod.LoweredInsert {
+    if (ast.kind != .insert_values) return error.UnsupportedSqlShape;
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (ast.returning_tokens != null or ast.source_tokens != null) return error.UnsupportedSqlShape;
+    const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    if (end < 6 or !tokens[0].matchesKeywordTag(.insert) or !tokens[1].matchesKeywordTag(.into)) return error.UnsupportedSqlShape;
+    const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, 2, end);
+    const table_name = try generatedDmlTableReferenceIdentifierAlloc(alloc, tokens, target_range);
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+
+    const column_range = ast.insert_columns_tokens orelse return error.UnsupportedSqlShape;
+    const columns = try generatedInsertColumnsAlloc(alloc, tokens, column_range, schema);
+    errdefer {
+        for (columns) |column| alloc.free(column);
+        alloc.free(columns);
+    }
+    try validateSqlInsertColumnsUnique(schema, columns);
+
+    const values_range = ast.values_tokens orelse return error.UnsupportedSqlShape;
+    const rows = try generatedInsertValueRowsAlloc(alloc, tokens, values_range, columns, schema, params);
+    errdefer {
+        freeInsertValueRows(alloc, rows);
+        alloc.free(rows);
+    }
+
+    const body_json = try insertBodyJsonAlloc(alloc, columns, rows, &.{}, .{});
+    defer alloc.free(body_json);
+    var batch = try relational_rows.parseRowsBatchRequest(alloc, body_json, schema);
+    errdefer batch.deinit(alloc);
+    batch.req.sync_level = options.sync_level;
+
+    for (columns) |column| alloc.free(column);
+    alloc.free(columns);
+    freeInsertValueRows(alloc, rows);
+    alloc.free(rows);
+
+    table_transferred = true;
+    return .{
+        .table_name = table_name,
+        .batch = batch,
+        .sync_level = options.sync_level,
+    };
+}
+
+fn generatedInsertColumnsAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    schema: runtime_schema.TableSchema,
+) ![]const []const u8 {
+    if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    if (tokens[range.start].kind != .lparen or tokens[range.end - 1].kind != .rparen) return error.UnsupportedSqlShape;
+    var columns = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (columns.items) |column| alloc.free(column);
+        columns.deinit(alloc);
+    }
+    var index = range.start + 1;
+    while (index < range.end - 1) {
+        const column = try generatedDmlIdentifierAtAlloc(alloc, tokens, index);
+        var column_transferred = false;
+        errdefer if (!column_transferred) alloc.free(column);
+        if (binder.relationalColumnForField(schema, column, null) == null) return error.InvalidSqlCatalog;
+        try columns.append(alloc, column);
+        column_transferred = true;
+        index += 1;
+        if (index == range.end - 1) break;
+        if (tokens[index].kind != .comma) return error.UnsupportedSqlShape;
+        index += 1;
+    }
+    if (columns.items.len == 0) return error.UnsupportedSqlShape;
+    return try columns.toOwnedSlice(alloc);
+}
+
+fn generatedInsertValueRowsAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    columns: []const []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+) ![][]const []const u8 {
+    if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    var rows = std.ArrayListUnmanaged([]const []const u8).empty;
+    errdefer {
+        freeInsertValueRows(alloc, rows.items);
+        rows.deinit(alloc);
+    }
+    var index = range.start;
+    while (index < range.end) {
+        if (tokens[index].kind != .lparen) return error.UnsupportedSqlShape;
+        index += 1;
+        var row = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer {
+            for (row.items) |value| alloc.free(value);
+            row.deinit(alloc);
+        }
+        for (columns, 0..) |column_name, column_i| {
+            const column = binder.relationalColumnForField(schema, column_name, null) orelse return error.InvalidSqlCatalog;
+            const value_json = try sql_value.parseSqlColumnValueAlloc(alloc, tokens, &index, params, column, sql_value.currentRealtimeNs());
+            var value_transferred = false;
+            errdefer if (!value_transferred) alloc.free(value_json);
+            try row.append(alloc, value_json);
+            value_transferred = true;
+            if (column_i + 1 < columns.len) {
+                if (index >= range.end or tokens[index].kind != .comma) return error.UnsupportedSqlShape;
+                index += 1;
+            }
+        }
+        if (index >= range.end or tokens[index].kind != .rparen) return error.UnsupportedSqlShape;
+        index += 1;
+        const owned_row = try row.toOwnedSlice(alloc);
+        var row_transferred = false;
+        errdefer if (!row_transferred) {
+            for (owned_row) |value| alloc.free(value);
+            alloc.free(owned_row);
+        };
+        row = .empty;
+        try rows.append(alloc, owned_row);
+        row_transferred = true;
+        if (index == range.end) break;
+        if (tokens[index].kind != .comma) return error.UnsupportedSqlShape;
+        index += 1;
+    }
+    if (rows.items.len == 0) return error.UnsupportedSqlShape;
+    return try rows.toOwnedSlice(alloc);
+}
+
+fn generatedDmlIdentifierAtAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    index: usize,
+) ![]const u8 {
+    if (index >= tokens.len or tokens[index].kind != .identifier) return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, tokens[index].text);
 }
 
 fn truncateSyntaxFromGeneratedDmlAstAlloc(
@@ -12614,6 +12767,29 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
         var generated = try lowerGeneratedDmlWritePlanForDmlTestAlloc(alloc, sql, schema, &.{}, options);
         defer generated.deinit(alloc);
         try std.testing.expectEqual(std.meta.activeTag(legacy), std.meta.activeTag(generated));
+    }
+
+    const resolver_free_options = plan_mod.LowerWritePlanOptions{
+        .row_claim = claim,
+        .sync_level = .full_text,
+    };
+    var generated_insert = try lowerGeneratedDmlWritePlanForDmlTestAlloc(
+        alloc,
+        "INSERT INTO public.usage_records (id, status, organization_id, quantity) VALUES ('u3', 'active', 'o1', 8), ('u4', 'pending', 'o2', 9)",
+        schema,
+        &.{},
+        resolver_free_options,
+    );
+    defer generated_insert.deinit(alloc);
+    switch (generated_insert) {
+        .insert => |insert| {
+            try std.testing.expectEqualStrings("usage_records", insert.table_name);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, insert.sync_level);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, insert.batch.req.sync_level);
+            try std.testing.expectEqual(@as(u32, 2), insert.batch.inserted);
+            try std.testing.expectEqual(@as(usize, 2), insert.batch.req.operations.len);
+        },
+        else => return error.TestUnexpectedResult,
     }
 
     var generated_truncate = try lowerGeneratedDmlWritePlanForDmlTestAlloc(
