@@ -81,7 +81,10 @@ joined mutation-source statements now validate generated target, source,
 predicate, and returning ranges before direct joined mutation-source lowering,
 non-CTE `MERGE` statements now validate generated target, source, and
 `ON`/arm ranges before direct merge-plan lowering, and `TRUNCATE` lowers
-directly from generated AST ranges into mutation-source plans. Other DML shapes still use an initial generated
+directly from generated AST ranges into mutation-source plans. Incomplete
+migrated DML statements that stop at required generated clause boundaries now
+fail closed through the generated parser instead of falling back to the legacy
+write classifier. Other DML shapes still use an initial generated
 AST-to-plan wrapper that fails closed if the generated DML family does not
 match the existing write classifier before delegating to the current typed DML
 lowerer. Unsupported DML still falls back, and deeper DML cutover still
@@ -317,6 +320,9 @@ Unsupported DDL remains on the existing parser until
    DML ASTs when the generated parser covers the statement, using direct
    generated AST-to-plan lowerers where available and falling back to the
    classifier path only for generated shapes that are not direct-lowered yet.
+   Incomplete migrated DML clause-boundary shapes for insert, update, delete,
+   truncate, and merge now use generated fail-closed diagnostics instead of
+   classifier fallback.
    Switching the full DML family from fallback to required generated parsing
    still requires generated command-body ASTs for broader insert-select source bodies,
    semijoin/exists joined mutation bodies, full merge arms, and CTE/recursive

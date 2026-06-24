@@ -319,6 +319,7 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
     if (tokens[raw_statement.token_end - 1].kind == .eq or tokens[raw_statement.token_end - 1].kind == .comma) return false;
     if (tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .to) or tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .as)) return false;
     if (isGeneratedGraphDdlHead(tokens, raw_statement)) return false;
+    if (isIncompleteGeneratedDmlBoundary(tokens, raw_statement)) return false;
 
     const first = tokens[raw_statement.token_start];
     if (tokenMatchesKeyword(first, .set)) return raw_statement.token_end > raw_statement.token_start + 2;
@@ -344,6 +345,59 @@ fn isGeneratedGraphDdlHead(tokens: []const Token, raw_statement: RawSqlStatement
     if (start + 1 >= raw_statement.token_end or raw_statement.token_end > tokens.len) return false;
     return (tokenMatchesKeyword(tokens[start], .create) or tokenMatchesKeyword(tokens[start], .alter)) and
         tokenMatchesKeyword(tokens[start + 1], .graph);
+}
+
+fn isIncompleteGeneratedDmlBoundary(tokens: []const Token, raw_statement: RawSqlStatement) bool {
+    const start = raw_statement.token_start;
+    const end = raw_statement.token_end;
+    if (start >= end or end > tokens.len) return false;
+    const first = tokens[start];
+    const last = tokens[end - 1];
+    if (end == start + 1) {
+        return tokenMatchesKeyword(first, .insert) or
+            tokenMatchesKeyword(first, .update) or
+            tokenMatchesKeyword(first, .delete) or
+            tokenMatchesKeyword(first, .truncate) or
+            tokenMatchesKeyword(first, .merge);
+    }
+    if (tokenMatchesKeyword(first, .insert)) {
+        return tokenMatchesKeyword(last, .into) or
+            tokenMatchesKeyword(last, .default) or
+            tokenMatchesKeyword(last, .values) or
+            tokenMatchesKeyword(last, .select) or
+            tokenMatchesKeyword(last, .on) or
+            tokenMatchesKeyword(last, .conflict) or
+            tokenMatchesKeyword(last, .returning);
+    }
+    if (tokenMatchesKeyword(first, .update)) {
+        return tokenMatchesKeyword(last, .set) or
+            tokenMatchesKeyword(last, .from) or
+            tokenMatchesKeyword(last, .where) or
+            tokenMatchesKeyword(last, .returning);
+    }
+    if (tokenMatchesKeyword(first, .delete)) {
+        return tokenMatchesKeyword(last, .from) or
+            tokenMatchesKeyword(last, .using) or
+            tokenMatchesKeyword(last, .where) or
+            tokenMatchesKeyword(last, .returning);
+    }
+    if (tokenMatchesKeyword(first, .truncate)) {
+        return tokenMatchesKeyword(last, .table) or
+            tokenMatchesKeyword(last, .restart) or
+            tokenMatchesKeyword(last, .@"continue");
+    }
+    if (tokenMatchesKeyword(first, .merge)) {
+        return tokenMatchesKeyword(last, .into) or
+            tokenMatchesKeyword(last, .using) or
+            tokenMatchesKeyword(last, .on) or
+            tokenMatchesKeyword(last, .when) or
+            tokenMatchesKeyword(last, .matched) or
+            tokenMatchesKeyword(last, .then) or
+            tokenMatchesKeyword(last, .update) or
+            tokenMatchesKeyword(last, .delete) or
+            tokenMatchesKeyword(last, .set);
+    }
+    return false;
 }
 
 fn parseStatement(
@@ -646,6 +700,11 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "PREPARE read_stmt AS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE GRAPH INDEX docs_edge_graph ON"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER GRAPH INDEX docs_edge_graph ADD"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "INSERT INTO usage_records VALUES"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "UPDATE usage_records SET"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DELETE FROM usage_records WHERE"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "TRUNCATE TABLE"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "MERGE INTO usage_records USING source_rows ON"));
 
     var complex_ddl = try ParsedSql.initAlloc(alloc, "ALTER TABLE audit_log ALTER COLUMN amount TYPE numeric USING amount + 1;");
     defer complex_ddl.deinit(alloc);
