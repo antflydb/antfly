@@ -12438,15 +12438,22 @@ fn insertValuesFromGeneratedDmlAstAlloc(
     const table_name = try generatedDmlTableReferenceIdentifierAlloc(alloc, tokens, target_range);
     var table_transferred = false;
     errdefer if (!table_transferred) alloc.free(table_name);
-    const body_end = if (ast.returning_tokens) |returning_range| blk: {
+    const returning_start = if (ast.returning_tokens) |returning_range| blk: {
         if (returning_range.start == 0 or returning_range.start > returning_range.end or returning_range.end > end) return error.UnsupportedSqlShape;
         if (!tokens[returning_range.start - 1].matchesKeywordTag(.returning)) return error.UnsupportedSqlShape;
         break :blk returning_range.start - 1;
-    } else if (ast.conflict_tokens) |conflict_range| blk: {
+    } else null;
+    const conflict_start = if (ast.conflict_tokens) |conflict_range| blk: {
         if (conflict_range.start == 0 or conflict_range.start > conflict_range.end or conflict_range.end > end) return error.UnsupportedSqlShape;
         if (!tokens[conflict_range.start - 1].matchesKeywordTag(.on) or !tokens[conflict_range.start].matchesKeywordTag(.conflict)) return error.UnsupportedSqlShape;
         break :blk conflict_range.start - 1;
-    } else end;
+    } else null;
+    const body_end = conflict_start orelse returning_start orelse end;
+    if (returning_start) |start| {
+        if (conflict_start) |conflict| {
+            if (conflict >= start) return error.UnsupportedSqlShape;
+        }
+    }
     if (ast.conflict_tokens) |conflict_range| {
         if (conflict_range.start == 0 or conflict_range.start > conflict_range.end or conflict_range.end > end) return error.UnsupportedSqlShape;
         if (!tokens[conflict_range.start - 1].matchesKeywordTag(.on) or !tokens[conflict_range.start].matchesKeywordTag(.conflict)) return error.UnsupportedSqlShape;
@@ -12470,7 +12477,6 @@ fn insertValuesFromGeneratedDmlAstAlloc(
     var default_row = [_][]const u8{};
     var default_rows = [_][]const []const u8{default_row[0..]};
     if (ast.default_values) {
-        if (ast.conflict_tokens != null) return error.UnsupportedSqlShape;
         if (ast.insert_columns_tokens != null or ast.values_tokens != null) return error.UnsupportedSqlShape;
         if (body_end != 5 or !tokens[3].matchesKeywordTag(.default) or !tokens[4].matchesKeywordTag(.values)) return error.UnsupportedSqlShape;
         rows = default_rows[0..];
@@ -13302,6 +13308,37 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var default_conflict_resolver = TestPrimaryResolver{ .row_json = "{\"id\":\"u_default\",\"status\":\"existing\",\"quantity\":9}", .version = 3 };
+    const default_conflict_options = plan_mod.LowerWritePlanOptions{
+        .unique_resolver = default_conflict_resolver.resolver(),
+        .sync_level = .full_text,
+    };
+    var parsed_generated_default_conflict = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records DEFAULT VALUES ON CONFLICT (id) DO UPDATE SET status = excluded.status, quantity = excluded.quantity RETURNING id, status, quantity",
+    );
+    defer parsed_generated_default_conflict.deinit(alloc);
+    const generated_default_conflict_ast = switch ((parsed_generated_default_conflict.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_default_conflict = try insertValuesFromGeneratedDmlAstAlloc(
+        alloc,
+        parsed_generated_default_conflict.items(),
+        generated_default_conflict_ast,
+        default_schema,
+        &.{},
+        default_conflict_options,
+    );
+    defer generated_default_conflict.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", generated_default_conflict.table_name);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, generated_default_conflict.sync_level);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, generated_default_conflict.batch.req.sync_level);
+    try std.testing.expectEqual(@as(u32, 0), generated_default_conflict.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), generated_default_conflict.batch.transformed);
+    try std.testing.expectEqual(@as(usize, 1), generated_default_conflict.batch.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"u_default\",\"status\":\"active\",\"quantity\":1}", generated_default_conflict.batch.returning_rows[0]);
 
     var generated_truncate = try lowerGeneratedDmlWritePlanForDmlTestAlloc(
         alloc,
