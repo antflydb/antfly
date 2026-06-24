@@ -1033,6 +1033,24 @@ fn validateGeneratedExpressionAstBinaryStructure(expression: generated_parser.Ge
     try requireGeneratedExpressionAstChild(expression.right_expression_kind, expression.right_tokens, expression.right_expression);
 }
 
+fn validateGeneratedExistsSubqueryExpressionAstStructure(
+    expression: generated_parser.GeneratedSqlExpressionAst,
+    require_negation: bool,
+) !void {
+    if (expression.tokens == null or expression.operator_tokens == null or expression.right_tokens == null) {
+        return error.UnsupportedSqlShape;
+    }
+    if (expression.left_tokens != null or expression.left_expression != null or expression.left_expression_kind != null) {
+        return error.UnsupportedSqlShape;
+    }
+    if (require_negation) {
+        if (expression.negation_tokens == null) return error.UnsupportedSqlShape;
+    } else if (expression.negation_tokens != null) {
+        return error.UnsupportedSqlShape;
+    }
+    try requireGeneratedExpressionAstChild(.subquery, expression.right_tokens, expression.right_expression);
+}
+
 fn validateGeneratedFunctionOverMetadata(expression: generated_parser.GeneratedSqlExpressionAst) !void {
     if (expression.over_tokens == null) {
         if (expression.over_name_tokens != null or expression.over_definition_tokens != null or
@@ -1153,6 +1171,8 @@ fn validateGeneratedExpressionAstStructure(expression: generated_parser.Generate
             }
             try requireGeneratedExpressionAstChild(expression.right_expression_kind, expression.right_tokens, expression.right_expression);
         },
+        .exists_subquery => try validateGeneratedExistsSubqueryExpressionAstStructure(expression, false),
+        .not_exists_subquery => try validateGeneratedExistsSubqueryExpressionAstStructure(expression, true),
         .is_null,
         .is_not_null,
         .is_true,
@@ -2231,6 +2251,22 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_comparison_child_parsed_sql, malformed_comparison_child_read_ast),
+    );
+
+    var malformed_exists_subquery_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE EXISTS (SELECT 1 FROM thresholds WHERE active IS TRUE)",
+    );
+    defer malformed_exists_subquery_parsed_sql.deinit(alloc);
+    const malformed_exists_subquery_generated_raw = malformed_exists_subquery_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_exists_subquery_read_ast = switch (malformed_exists_subquery_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_exists_subquery_read_ast.where_expression.right_expression_kind = .token_range;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_exists_subquery_parsed_sql, malformed_exists_subquery_read_ast),
     );
 
     var malformed_distinct_on_parsed_sql = try tokenized.ParsedSql.initAlloc(

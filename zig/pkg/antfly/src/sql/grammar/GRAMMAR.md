@@ -107,6 +107,8 @@ classified in generated expression metadata along with their `NOT` negated
 forms. `ANY`/`ALL`/`SOME` quantified comparison predicates over parenthesized
 expression lists and parenthesized read subqueries are also accepted and
 classified with explicit quantifier token ranges and subquery token spans.
+`EXISTS` and `NOT EXISTS` read-subquery predicates are accepted with explicit
+operator, negation, and subquery token spans.
 `IS NULL` and `IS NOT NULL` predicates are accepted and
 classified as explicit null-test expression kinds, `IS TRUE`/`IS FALSE`/
 `IS UNKNOWN` boolean-test predicates are accepted with their `IS NOT` variants,
@@ -305,6 +307,8 @@ Suggested migration order:
    `ANY`/`ALL`/`SOME` quantified comparison predicates over parenthesized
    expression lists and parenthesized read subqueries are accepted and
    classified with explicit quantifier token ranges and subquery token spans,
+   `EXISTS` and `NOT EXISTS` read-subquery predicates are accepted with
+   explicit operator, negation, and subquery token spans,
    and quantified predicates over typed array constructors such as
    `= ANY(ARRAY[...]::text[])` carry generated array-constructor metadata after
    public tokenization normalizes cast suffixes. PostgreSQL-style quantified
@@ -414,8 +418,8 @@ Suggested migration order:
    validated left-associative generated join nodes, expression AST
    planning/lowering beyond the current recursive
    predicate/operator metadata and structural checks, broader function
-   coverage, broader boolean expression-tree coverage, quantified subquery
-   planning/lowering, remaining specialized expression operators, richer
+   coverage, broader boolean expression-tree coverage, quantified and `EXISTS`
+   subquery planning/lowering, remaining specialized expression operators, richer
    inline window-expression semantic planning beyond current generated `OVER`
    clause metadata,
    recursive full CTE body planning beyond the current body
