@@ -200,10 +200,10 @@ such as `antfly.full_text_search`, `antfly.semantic_search`,
 `antfly.vector_search`, `antfly.hybrid_search`, `antfly.graph_traverse`,
 `antfly.graph_match`, and `antfly.graph_metric` are now accepted as generated
 read sources with named `=`/`=>` arguments, retained source/name/argument token
-ranges, list-based Antfly function kind metadata across joined sources, graph
-function subset metadata, and fail-closed range validation in the generated
-read lowering boundary. The generated parser now also treats seed graph DDL as
-a distinct
+ranges, owned named-argument item/name/operator/value ranges, list-based
+Antfly function kind metadata across joined sources, graph function subset
+metadata, and fail-closed range validation in the generated read lowering
+boundary. The generated parser now also treats seed graph DDL as a distinct
 graph statement family and `ParsedSql` retains those generated raw and AST
 nodes. Seed graph index and graph metric statements now have graph-specific
 generated AST-to-plan wrappers that lower to typed index plans instead of only
@@ -505,8 +505,9 @@ Unsupported DDL remains on the existing parser until
    AST-to-plan wrappers for typed graph index and graph metric index plans.
    Canonical `antfly.*` query table-function sources now have generated
    grammar coverage, named-argument coverage, source/name/argument AST ranges,
-   list-based Antfly function kind metadata across joined sources, graph
-   function subset metadata, and fail-closed generated-read validation.
+   owned named-argument item/name/operator/value ranges, list-based Antfly
+   function kind metadata across joined sources, graph function subset metadata,
+   and fail-closed generated-read validation.
    Broader graph traversal, graph metric query planning, and graph DSL cutover
    still require graph-specific semantic AST payloads and unsupported-shape
    diagnostics beyond the current table-function source metadata.
@@ -706,8 +707,9 @@ Generated grammar work needs evidence at multiple levels:
   including escaped `LIKE`/`ILIKE` pattern metadata.
   Seed graph DDL has generated AST-to-plan parity for graph index and graph
   metric index plans, and generated read AST tests cover canonical
-  `antfly.*` table-function source ranges, including joined graph sources,
-  plus fail-closed malformed Antfly and graph-source validation.
+  `antfly.*` table-function source ranges and named-argument item ranges,
+  including joined graph sources, plus fail-closed malformed Antfly and
+  graph-source validation.
 - SQL/API parity tests showing SQL and native API requests reach the same
   service contracts.
 - Fuzz or mutation tests for scanner/parser crash resistance and bounded error

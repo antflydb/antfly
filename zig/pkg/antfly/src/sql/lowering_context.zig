@@ -1114,6 +1114,28 @@ fn validateGeneratedAntflySourceItemMetadata(
     if (!std.meta.eql(argument_tokens, generated_parser.GeneratedSqlTokenRange{ .start = function_tokens.start + 2, .end = function_tokens.end - 1 })) return error.UnsupportedSqlShape;
     if (tokens[function_tokens.start + 1].kind != .lparen or tokens[function_tokens.end - 1].kind != .rparen) return error.UnsupportedSqlShape;
     if (generatedAntflyTableFunctionKindForToken(tokens[name_tokens.start]) != item.kind) return error.UnsupportedSqlShape;
+    try validateGeneratedAntflySourceArgumentItems(tokens, item);
+}
+
+fn validateGeneratedAntflySourceArgumentItems(
+    tokens: []const tokenized.Token,
+    item: generated_parser.GeneratedSqlAntflyTableFunctionAst,
+) !void {
+    if (item.argument_items.len != item.argument_count) return error.UnsupportedSqlShape;
+    var previous_end: usize = item.argument_tokens.start;
+    for (item.argument_items) |argument| {
+        if (argument.tokens.start < previous_end) return error.UnsupportedSqlShape;
+        if (argument.tokens.start < item.argument_tokens.start or argument.tokens.end > item.argument_tokens.end) return error.UnsupportedSqlShape;
+        if (!std.meta.eql(argument.name_tokens, generated_parser.GeneratedSqlTokenRange{ .start = argument.tokens.start, .end = argument.tokens.start + 1 })) return error.UnsupportedSqlShape;
+        if (argument.operator_tokens.start != argument.name_tokens.end or argument.operator_tokens.end > argument.value_tokens.start) return error.UnsupportedSqlShape;
+        if (argument.value_tokens.start < argument.operator_tokens.end or argument.value_tokens.end != argument.tokens.end) return error.UnsupportedSqlShape;
+        if (argument.value_tokens.start >= argument.value_tokens.end) return error.UnsupportedSqlShape;
+        if (tokens[argument.name_tokens.start].kind != .identifier) return error.UnsupportedSqlShape;
+        if (tokens[argument.operator_tokens.start].kind != .eq) return error.UnsupportedSqlShape;
+        if (argument.operator_tokens.end == argument.operator_tokens.start + 2 and tokens[argument.operator_tokens.start + 1].kind != .gt) return error.UnsupportedSqlShape;
+        if (argument.operator_tokens.end != argument.operator_tokens.start + 1 and argument.operator_tokens.end != argument.operator_tokens.start + 2) return error.UnsupportedSqlShape;
+        previous_end = argument.tokens.end;
+    }
 }
 
 fn generatedGraphSourceItemMatchesAntflyItem(
@@ -2856,6 +2878,15 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         else => return error.UnsupportedSqlShape,
     };
     malformed_graph_source_read_ast.source_antfly_function_count += 1;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_graph_source_parsed_sql, malformed_graph_source_read_ast),
+    );
+    malformed_graph_source_read_ast = switch (malformed_graph_source_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_graph_source_read_ast.source_antfly_function_items[0].argument_count += 1;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_graph_source_parsed_sql, malformed_graph_source_read_ast),

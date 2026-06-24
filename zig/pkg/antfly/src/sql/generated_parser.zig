@@ -551,11 +551,25 @@ pub const GeneratedSqlGraphTableFunctionAst = struct {
     kind: GeneratedSqlGraphTableFunctionKind,
 };
 
+pub const GeneratedSqlNamedArgumentAst = struct {
+    tokens: GeneratedSqlTokenRange,
+    name_tokens: GeneratedSqlTokenRange,
+    operator_tokens: GeneratedSqlTokenRange,
+    value_tokens: GeneratedSqlTokenRange,
+};
+
 pub const GeneratedSqlAntflyTableFunctionAst = struct {
     tokens: GeneratedSqlTokenRange,
     name_tokens: GeneratedSqlTokenRange,
     argument_tokens: GeneratedSqlTokenRange,
     kind: GeneratedSqlAntflyTableFunctionKind,
+    argument_items: []GeneratedSqlNamedArgumentAst = &.{},
+    argument_count: usize = 0,
+
+    pub fn deinit(self: *GeneratedSqlAntflyTableFunctionAst, alloc: std.mem.Allocator) void {
+        if (self.argument_items.len > 0) alloc.free(self.argument_items);
+        self.* = undefined;
+    }
 };
 
 pub const GeneratedSqlWindowAst = struct {
@@ -804,6 +818,7 @@ pub const GeneratedSqlReadAst = struct {
     pub fn deinit(self: *GeneratedSqlReadAst, alloc: std.mem.Allocator) void {
         for (self.cte_items) |*cte| cte.deinit(alloc);
         if (self.cte_items.len > 0) alloc.free(self.cte_items);
+        for (self.source_antfly_function_items) |*item| item.deinit(alloc);
         if (self.source_antfly_function_items.len > 0) alloc.free(self.source_antfly_function_items);
         if (self.source_graph_function_items.len > 0) alloc.free(self.source_graph_function_items);
         for (self.join_items) |*join| join.deinit(alloc);
@@ -2556,7 +2571,11 @@ fn buildGeneratedAntflyTableFunctionItemsAst(
 ) ![]GeneratedSqlAntflyTableFunctionAst {
     if (source_tokens.start >= source_tokens.end or source_tokens.end > tokens.len) return &.{};
     var items: std.ArrayListUnmanaged(GeneratedSqlAntflyTableFunctionAst) = .empty;
-    errdefer items.deinit(alloc);
+    var items_owned = false;
+    defer if (!items_owned) {
+        for (items.items) |*item| item.deinit(alloc);
+        items.deinit(alloc);
+    };
 
     var index = source_tokens.start;
     var depth: usize = 0;
@@ -2581,17 +2600,94 @@ fn buildGeneratedAntflyTableFunctionItemsAst(
         const kind = generatedAntflyTableFunctionKind(tokens[function_start]) orelse continue;
         if (function_start + 1 >= source_tokens.end or tokens[function_start + 1].kind != .lparen) continue;
         const close_index = findMatchingParen(tokens, function_start + 1, source_tokens.end) orelse continue;
-        try items.append(alloc, .{
+        const argument_tokens = GeneratedSqlTokenRange{ .start = function_start + 2, .end = close_index };
+        try items.ensureUnusedCapacity(alloc, 1);
+        var item = GeneratedSqlAntflyTableFunctionAst{
             .tokens = .{ .start = function_start, .end = close_index + 1 },
             .name_tokens = .{ .start = function_start, .end = function_start + 1 },
-            .argument_tokens = .{ .start = function_start + 2, .end = close_index },
+            .argument_tokens = argument_tokens,
             .kind = kind,
-        });
+            .argument_items = try buildGeneratedNamedArgumentItemsAst(alloc, tokens, argument_tokens),
+        };
+        item.argument_count = item.argument_items.len;
+        items.appendAssumeCapacity(item);
         index = close_index;
     }
 
     if (items.items.len == 0) return &.{};
+    const owned = try items.toOwnedSlice(alloc);
+    items_owned = true;
+    return owned;
+}
+
+fn buildGeneratedNamedArgumentItemsAst(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    range: GeneratedSqlTokenRange,
+) ![]GeneratedSqlNamedArgumentAst {
+    if (range.start >= range.end) return &.{};
+    var items: std.ArrayListUnmanaged(GeneratedSqlNamedArgumentAst) = .empty;
+    errdefer items.deinit(alloc);
+
+    var item_start = range.start;
+    var depth: usize = 0;
+    var index = range.start;
+    while (index < range.end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth == 0) return error.UnsupportedSqlShape;
+                depth -= 1;
+            },
+            .comma => if (depth == 0) {
+                try appendGeneratedNamedArgumentItemAst(alloc, &items, tokens, .{ .start = item_start, .end = index });
+                item_start = index + 1;
+            },
+            else => {},
+        }
+    }
+    if (depth != 0) return error.UnsupportedSqlShape;
+    try appendGeneratedNamedArgumentItemAst(alloc, &items, tokens, .{ .start = item_start, .end = range.end });
+
+    if (items.items.len == 0) return &.{};
     return try items.toOwnedSlice(alloc);
+}
+
+fn appendGeneratedNamedArgumentItemAst(
+    alloc: std.mem.Allocator,
+    items: *std.ArrayListUnmanaged(GeneratedSqlNamedArgumentAst),
+    tokens: []const token_mod.Token,
+    range: GeneratedSqlTokenRange,
+) !void {
+    if (range.start >= range.end) return error.UnsupportedSqlShape;
+    var depth: usize = 0;
+    var operator_start: ?usize = null;
+    var index = range.start;
+    while (index < range.end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth == 0) return error.UnsupportedSqlShape;
+                depth -= 1;
+            },
+            .eq => if (depth == 0) {
+                operator_start = index;
+                break;
+            },
+            else => {},
+        }
+    }
+    const eq_index = operator_start orelse return error.UnsupportedSqlShape;
+    if (eq_index != range.start + 1 or tokens[range.start].kind != .identifier) return error.UnsupportedSqlShape;
+    var value_start = eq_index + 1;
+    if (value_start < range.end and tokens[value_start].kind == .gt) value_start += 1;
+    if (value_start >= range.end) return error.UnsupportedSqlShape;
+    try items.append(alloc, .{
+        .tokens = range,
+        .name_tokens = .{ .start = range.start, .end = eq_index },
+        .operator_tokens = .{ .start = eq_index, .end = value_start },
+        .value_tokens = .{ .start = value_start, .end = range.end },
+    });
 }
 
 fn buildGeneratedGraphTableFunctionItemsAst(
@@ -4869,6 +4965,20 @@ test "generated SQL parser facade builds read AST spans" {
             try std.testing.expectEqual(@as(usize, 1), read.source_antfly_function_items.len);
             try std.testing.expectEqual(@as(usize, 0), read.source_graph_function_count);
             try std.testing.expectEqual(GeneratedSqlAntflyTableFunctionKind.full_text_search, read.source_antfly_function_items[0].kind);
+            try std.testing.expectEqual(@as(usize, 3), read.source_antfly_function_items[0].argument_count);
+            try std.testing.expectEqual(@as(usize, 3), read.source_antfly_function_items[0].argument_items.len);
+            try std.testing.expectEqualStrings(
+                "index",
+                tokenRangeText(full_text_source_read_sql, full_text_source_tokens.items, read.source_antfly_function_items[0].argument_items[0].name_tokens),
+            );
+            try std.testing.expectEqualStrings(
+                "=>",
+                tokenRangeText(full_text_source_read_sql, full_text_source_tokens.items, read.source_antfly_function_items[0].argument_items[0].operator_tokens),
+            );
+            try std.testing.expectEqualStrings(
+                "'docs_body_fts'",
+                tokenRangeText(full_text_source_read_sql, full_text_source_tokens.items, read.source_antfly_function_items[0].argument_items[0].value_tokens),
+            );
             try std.testing.expectEqualStrings(
                 "antfly.full_text_search(index => 'docs_body_fts', query => 'refund', limit => 10)",
                 tokenRangeText(full_text_source_read_sql, full_text_source_tokens.items, read.source_antfly_function_items[0].tokens),
@@ -4890,6 +5000,8 @@ test "generated SQL parser facade builds read AST spans" {
             try std.testing.expectEqual(@as(usize, 2), read.source_graph_function_items.len);
             try std.testing.expectEqual(GeneratedSqlAntflyTableFunctionKind.graph_match, read.source_antfly_function_items[0].kind);
             try std.testing.expectEqual(GeneratedSqlAntflyTableFunctionKind.graph_metric, read.source_antfly_function_items[1].kind);
+            try std.testing.expectEqual(@as(usize, 5), read.source_antfly_function_items[0].argument_count);
+            try std.testing.expectEqual(@as(usize, 4), read.source_antfly_function_items[1].argument_count);
             try std.testing.expectEqual(GeneratedSqlGraphTableFunctionKind.match, read.source_graph_function_items[0].kind);
             try std.testing.expectEqual(GeneratedSqlGraphTableFunctionKind.metric, read.source_graph_function_items[1].kind);
             try std.testing.expect(std.meta.eql(read.source_graph_function_tokens.?, read.source_graph_function_items[0].tokens));
