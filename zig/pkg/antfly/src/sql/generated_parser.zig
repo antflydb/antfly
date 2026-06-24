@@ -130,6 +130,7 @@ pub const GeneratedSqlUnsupportedKind = enum {
     cluster,
     comment,
     copy,
+    create_materialized_view,
     declare,
     explain,
     fetch,
@@ -145,6 +146,7 @@ pub const GeneratedSqlUnsupportedKind = enum {
     revoke,
     savepoint,
     security_label,
+    drop_materialized_view,
     unlisten,
     vacuum,
 };
@@ -157,6 +159,7 @@ pub const GeneratedSqlUnsupportedReason = enum {
     cluster_not_planned_by_generated_parser,
     comment_not_planned_by_generated_parser,
     copy_not_planned_by_generated_parser,
+    create_materialized_view_not_planned_by_generated_parser,
     declare_not_planned_by_generated_parser,
     explain_not_planned_by_generated_parser,
     fetch_not_planned_by_generated_parser,
@@ -172,6 +175,7 @@ pub const GeneratedSqlUnsupportedReason = enum {
     revoke_not_planned_by_generated_parser,
     savepoint_not_planned_by_generated_parser,
     security_label_not_planned_by_generated_parser,
+    drop_materialized_view_not_planned_by_generated_parser,
     unlisten_not_planned_by_generated_parser,
     vacuum_not_planned_by_generated_parser,
 };
@@ -1159,6 +1163,7 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CLUSTER usage_records USING usage_status_idx", .kind = .unsupported },
     .{ .sql = "COMMENT ON TABLE usage_records IS 'billing rows'", .kind = .unsupported },
     .{ .sql = "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)", .kind = .unsupported },
+    .{ .sql = "CREATE MATERIALIZED VIEW usage_summary AS SELECT status, count(*) FROM usage_records GROUP BY status", .kind = .unsupported },
     .{ .sql = "DECLARE usage_cursor NO SCROLL CURSOR FOR SELECT id FROM usage_records", .kind = .unsupported },
     .{ .sql = "EXPLAIN", .kind = .unsupported },
     .{ .sql = "EXPLAIN SELECT id FROM usage_records", .kind = .unsupported },
@@ -1179,6 +1184,7 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "REVOKE SELECT ON TABLE usage_records FROM readonly", .kind = .unsupported },
     .{ .sql = "SAVEPOINT usage_batch", .kind = .unsupported },
     .{ .sql = "SECURITY LABEL ON TABLE usage_records IS 'internal'", .kind = .unsupported },
+    .{ .sql = "DROP MATERIALIZED VIEW IF EXISTS usage_summary CASCADE", .kind = .unsupported },
     .{ .sql = "UNLISTEN *", .kind = .unsupported },
 };
 
@@ -1371,6 +1377,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
             if (tokens[2].matchesKeywordTag(.index)) return .{ .graph = .create_index };
             if (tokens[2].matchesKeywordTag(.metric)) return .{ .graph = .create_metric };
         }
+        if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .unsupported = .create_materialized_view };
         if (second.matchesKeywordTag(.extension)) return .{ .extension_index = .create_extension };
     }
     if (first.matchesKeywordTag(.alter) and tokens.len > 2 and tokens[1].matchesKeywordTag(.graph) and tokens[2].matchesKeywordTag(.index)) {
@@ -1386,6 +1393,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.schema)) return .{ .ddl = .drop_schema };
         if (second.matchesKeywordTag(.database)) return .{ .ddl = .drop_database };
         if (second.matchesKeywordTag(.extension)) return .{ .extension_index = .drop_extension };
+        if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .unsupported = .drop_materialized_view };
     }
     if (first.matchesKeywordTag(.insert)) {
         for (tokens) |token| {
@@ -1466,6 +1474,7 @@ fn buildUnsupportedAst(
             .cluster => .cluster_not_planned_by_generated_parser,
             .comment => .comment_not_planned_by_generated_parser,
             .copy => .copy_not_planned_by_generated_parser,
+            .create_materialized_view => .create_materialized_view_not_planned_by_generated_parser,
             .declare => .declare_not_planned_by_generated_parser,
             .explain => .explain_not_planned_by_generated_parser,
             .fetch => .fetch_not_planned_by_generated_parser,
@@ -1481,6 +1490,7 @@ fn buildUnsupportedAst(
             .revoke => .revoke_not_planned_by_generated_parser,
             .savepoint => .savepoint_not_planned_by_generated_parser,
             .security_label => .security_label_not_planned_by_generated_parser,
+            .drop_materialized_view => .drop_materialized_view_not_planned_by_generated_parser,
             .unlisten => .unlisten_not_planned_by_generated_parser,
             .vacuum => .vacuum_not_planned_by_generated_parser,
         },
@@ -4751,6 +4761,7 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .cluster }, (try parseSqlAlloc(alloc, "CLUSTER usage_records USING usage_status_idx")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .comment }, (try parseSqlAlloc(alloc, "COMMENT ON TABLE usage_records IS 'billing rows'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .copy }, (try parseSqlAlloc(alloc, "COPY usage_records FROM STDIN")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_materialized_view }, (try parseSqlAlloc(alloc, "CREATE MATERIALIZED VIEW usage_summary AS SELECT status FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .declare }, (try parseSqlAlloc(alloc, "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .explain }, (try parseSqlAlloc(alloc, "EXPLAIN SELECT id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .fetch }, (try parseSqlAlloc(alloc, "FETCH FROM usage_cursor")).statement);
@@ -4767,6 +4778,7 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .revoke }, (try parseSqlAlloc(alloc, "REVOKE SELECT ON TABLE usage_records FROM readonly")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .savepoint }, (try parseSqlAlloc(alloc, "SAVEPOINT usage_batch")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .security_label }, (try parseSqlAlloc(alloc, "SECURITY LABEL ON TABLE usage_records IS 'internal'")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_materialized_view }, (try parseSqlAlloc(alloc, "DROP MATERIALIZED VIEW usage_summary")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .unlisten }, (try parseSqlAlloc(alloc, "UNLISTEN *")).statement);
 }
 
@@ -7606,6 +7618,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 6 },
         },
         .{
+            .sql = "CREATE MATERIALIZED VIEW usage_summary AS SELECT status FROM usage_records",
+            .kind = .create_materialized_view,
+            .reason = .create_materialized_view_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 9 },
+        },
+        .{
             .sql = "DECLARE usage_cursor NO SCROLL CURSOR FOR SELECT id FROM usage_records",
             .kind = .declare,
             .reason = .declare_not_planned_by_generated_parser,
@@ -7657,6 +7675,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .sql = "SECURITY LABEL ON TABLE usage_records IS 'internal'",
             .kind = .security_label,
             .reason = .security_label_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 7 },
+        },
+        .{
+            .sql = "DROP MATERIALIZED VIEW IF EXISTS usage_summary CASCADE",
+            .kind = .drop_materialized_view,
+            .reason = .drop_materialized_view_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 7 },
         },
         .{

@@ -240,6 +240,8 @@ graph_statement:
 unsupported_statement:
     ANALYZE unsupported_tail_opt
   | EXPLAIN explain_options_opt explain_subject_opt
+  | CREATE MATERIALIZED VIEW diagnostic_tail_opt
+  | DROP MATERIALIZED VIEW diagnostic_tail_opt
   | CALL diagnostic_tail_opt
   | CHECKPOINT diagnostic_tail_opt
   | CLOSE diagnostic_tail_opt
@@ -1050,6 +1052,8 @@ diagnostic_token:
   | ALL
   | ALTER
   | ANALYZE
+  | AS
+  | BY
   | CASCADE
   | CALL
   | CHECKPOINT
@@ -1070,6 +1074,7 @@ diagnostic_token:
   | FULL
   | GRAPH
   | GRANT
+  | GROUP
   | IF
   | INCLUDE
   | IN

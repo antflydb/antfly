@@ -224,6 +224,10 @@ simple cursor and transaction-control statements such as `CLOSE`, `DECLARE`,
 `FETCH`, `MOVE`, `SAVEPOINT`, and `RELEASE`, plus simple `EXPLAIN` forms with stable reason metadata; full production AST construction
 remains the next migration boundary for larger DDL, query, DML, and Antfly
 extension families.
+Unsupported generated diagnostics also cover PostgreSQL materialized-view DDL
+entry points, including `CREATE MATERIALIZED VIEW` and
+`DROP MATERIALIZED VIEW`, so these common unsupported DDL shapes have stable
+unsupported AST reasons instead of generic parser fallback.
 
 ## Compatibility Policy
 
@@ -648,7 +652,8 @@ variants for:
   `COPY`, `VACUUM`, `REINDEX`, `CLUSTER`, `COMMENT`, `GRANT`, `REVOKE`,
   `LISTEN`, `NOTIFY`, `LOCK`, `CALL`, `CHECKPOINT`, `LOAD`, `REFRESH`,
   `SECURITY LABEL`, `UNLISTEN`, `CLOSE`, `DECLARE`, `FETCH`, `MOVE`,
-  `SAVEPOINT`, and `RELEASE`, plus bare, simple, optioned, and
+  `SAVEPOINT`, `RELEASE`, `CREATE MATERIALIZED VIEW`, and
+  `DROP MATERIALIZED VIEW`, plus bare, simple, optioned, and
   `EXPLAIN ANALYZE` forms with command spans, subject ranges where present,
   and stable unsupported reason metadata
 

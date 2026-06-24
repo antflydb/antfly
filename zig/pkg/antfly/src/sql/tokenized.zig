@@ -916,6 +916,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .copy_not_planned_by_generated_parser,
         },
         .{
+            .sql = "CREATE MATERIALIZED VIEW usage_summary AS SELECT status FROM usage_records",
+            .kind = .create_materialized_view,
+            .reason = .create_materialized_view_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "DECLARE usage_cursor NO SCROLL CURSOR FOR SELECT id FROM usage_records",
             .kind = .declare,
             .reason = .declare_not_planned_by_generated_parser,
@@ -989,6 +994,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "SECURITY LABEL ON TABLE usage_records IS 'internal'",
             .kind = .security_label,
             .reason = .security_label_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "DROP MATERIALIZED VIEW IF EXISTS usage_summary CASCADE",
+            .kind = .drop_materialized_view,
+            .reason = .drop_materialized_view_not_planned_by_generated_parser,
         },
         .{
             .sql = "UNLISTEN *",
