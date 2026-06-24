@@ -51,10 +51,12 @@ generated-covered `BEGIN`, `COMMIT`, and `ROLLBACK` adapter-noop boundaries.
 Simple DDL has generated-parser corpus coverage but still falls back to the
 existing parser when the seed grammar does not yet cover the shape; generated
 simple DDL ASTs now have AST-to-plan parity for database, schema, and extension
-create/drop catalog plans. Simple DML now has generated-parser corpus coverage
-and retained generated raw nodes for covered write statements, but unsupported
-DML still falls back until plan parity is proven. Representative read queries
-now have generated-parser corpus coverage and retained generated raw nodes for
+create/drop catalog plans, plus generated AST-to-plan parity for seed
+`CREATE TABLE` and `CREATE INDEX` forms using the same parser options as the
+existing lowerer. Simple DML now has generated-parser corpus coverage and
+retained generated raw nodes for covered write statements, but unsupported DML
+still falls back until plan parity is proven. Representative read queries now
+have generated-parser corpus coverage and retained generated raw nodes for
 covered read statements, while unsupported read shapes still fall back until
 read-plan parity is proven. The generated parser now also treats seed graph DDL
 as a distinct graph statement family and `ParsedSql` retains those generated
@@ -230,7 +232,7 @@ variants for:
   for typed `PREPARE`, `EXECUTE`, and `DEALLOCATE`
 - DDL statement, including a generated AST payload for command spans, plus
   generated AST-to-plan parity for database, schema, and extension create/drop
-  catalog plans
+  catalog plans and seed `CREATE TABLE` / `CREATE INDEX` plans
 - DML statement
 - read statement
 - graph statement
@@ -267,8 +269,8 @@ Generated grammar work needs evidence at multiple levels:
 - Plan parity tests showing generated ASTs lower to the same typed plans as the
   current parser for migrated statement families. Session catalog commands,
   transaction boundaries, prepared statements, and simple DDL database/schema/
-  extension catalog plans have generated AST-to-plan parity tests for their
-  generated-covered forms.
+  extension catalog plans plus seed `CREATE TABLE` / `CREATE INDEX` plans have
+  generated AST-to-plan parity tests for their generated-covered forms.
 - SQL/API parity tests showing SQL and native API requests reach the same
   service contracts.
 - Fuzz or mutation tests for scanner/parser crash resistance and bounded error

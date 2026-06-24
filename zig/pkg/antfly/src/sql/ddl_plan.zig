@@ -3033,6 +3033,21 @@ pub fn simpleDdlPlanFromGeneratedAstAlloc(
     };
 }
 
+pub fn ddlPlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+    options: DdlPlanParserOptions,
+) !LoweredDdlPlan {
+    const tail = generatedStatementTail(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    var pos: usize = 0;
+    return switch (ast.kind) {
+        .create_table => .{ .create_table = try parseCreateTablePlanAlloc(alloc, tail, &pos, options.column_definition_options) },
+        .create_index => .{ .create_index = try parseCreateIndexPlanAlloc(alloc, tail, &pos, false, options.create_index_options) },
+        else => try simpleDdlPlanFromGeneratedAstAlloc(alloc, tokens, ast),
+    };
+}
+
 fn setSessionCatalogPlanFromGeneratedTailAlloc(alloc: std.mem.Allocator, tail: []const grammar.Token) !SessionCatalogPlan {
     var pos: usize = 0;
     if (parseSetSearchPathPlanTailAlloc(alloc, tail, &pos)) |plan| {
@@ -11898,6 +11913,52 @@ test "sql adapter generated simple DDL AST lowers to catalog plans" {
     }
 }
 
+test "sql adapter generated create table and index AST lowers to DDL plans" {
+    const alloc = std.testing.allocator;
+
+    var generated_table = try generatedDdlPlanForTestAlloc(alloc, "CREATE TABLE usage_records (id text PRIMARY KEY, status text NOT NULL);");
+    defer generated_table.deinit(alloc);
+    var legacy_table = try lowerDdlPlanForTestAlloc(alloc, "CREATE TABLE usage_records (id text PRIMARY KEY, status text NOT NULL);");
+    defer legacy_table.deinit(alloc);
+    switch (generated_table) {
+        .create_table => |generated| switch (legacy_table) {
+            .create_table => |legacy| {
+                try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
+                try std.testing.expectEqual(legacy.if_not_exists, generated.if_not_exists);
+                try std.testing.expectEqual(legacy.columns.len, generated.columns.len);
+                try std.testing.expectEqualStrings(legacy.columns[0].name, generated.columns[0].name);
+                try std.testing.expectEqual(legacy.columns[0].nullable, generated.columns[0].nullable);
+                try std.testing.expectEqualStrings(legacy.columns[1].name, generated.columns[1].name);
+                try std.testing.expectEqual(legacy.columns[1].nullable, generated.columns[1].nullable);
+                try std.testing.expect(legacy.primary_key != null);
+                try std.testing.expect(generated.primary_key != null);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var generated_index = try generatedDdlPlanForTestAlloc(alloc, "CREATE INDEX usage_records_status_idx ON usage_records (status);");
+    defer generated_index.deinit(alloc);
+    var legacy_index = try lowerDdlPlanForTestAlloc(alloc, "CREATE INDEX usage_records_status_idx ON usage_records (status);");
+    defer legacy_index.deinit(alloc);
+    switch (generated_index) {
+        .create_index => |generated| switch (legacy_index) {
+            .create_index => |legacy| {
+                try std.testing.expectEqualStrings(legacy.index_name, generated.index_name);
+                try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
+                try std.testing.expectEqual(legacy.if_not_exists, generated.if_not_exists);
+                try std.testing.expectEqual(legacy.unique, generated.unique);
+                try std.testing.expectEqual(legacy.method, generated.method);
+                try std.testing.expectEqual(legacy.columns.len, generated.columns.len);
+                try std.testing.expectEqualStrings(legacy.columns[0], generated.columns[0]);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "sql adapter ddl plan lowers prepared transaction ddl plans" {
     const alloc = std.testing.allocator;
 
@@ -12227,6 +12288,30 @@ fn generatedSimpleDdlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8)
         else => return error.UnsupportedSqlShape,
     };
     return try simpleDdlPlanFromGeneratedAstAlloc(alloc, parsed.items(), ddl_ast);
+}
+
+fn generatedDdlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !LoweredDdlPlan {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    const generated_raw = parsed.generated_statement orelse return error.UnsupportedSqlShape;
+    const ddl_ast = switch (generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .ddl => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    var state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = parsed.items(),
+    };
+    return try ddlPlanFromGeneratedAstAlloc(alloc, parsed.items(), ddl_ast, .{
+        .schema = state.schema,
+        .field_expression_qualifiers = state.field_expression_qualifiers,
+        .returning_expression_qualifiers = state.returning_expression_qualifiers,
+        .defer_row_expression_field_validation = state.defer_row_expression_field_validation,
+        .column_definition_options = parser_context.ParserState.ContextAccessors.ddlColumnDefinitionOptions(&state),
+        .domain_options = parser_context.ParserState.ContextAccessors.ddlDomainOptions(&state),
+        .create_index_options = parser_context.ParserState.ContextAccessors.createIndexOptions(&state),
+        .row_security_policy_options = parser_context.ParserState.ContextAccessors.rowSecurityPolicyOptions(&state),
+    });
 }
 
 test "sql adapter ddl plan lowers routine expression bindings into ddl plans" {
