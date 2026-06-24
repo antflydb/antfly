@@ -1000,6 +1000,7 @@ fn generatedExpressionAstHasMetadata(expression: generated_parser.GeneratedSqlEx
         expression.boolean_first_condition != null or
         expression.boolean_last_condition != null or
         expression.subquery_where_expression != null or
+        expression.subquery_set_operation != null or
         expression.boolean_condition_count != 0 or
         expression.boolean_condition_items.count != 0 or
         expression.argument_items.count != 0 or
@@ -1410,6 +1411,11 @@ fn validateGeneratedExpressionAstRanges(
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.array_items);
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.boolean_condition_items);
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.subquery_projection_items);
+    if (expression.subquery_set_operation) |subquery_set_operation| {
+        try validateGeneratedSetOperationAstRanges(tokens, read_ast, expression.subquery_set_operation_tokens, subquery_set_operation.*);
+    } else if (expression.subquery_set_operation_tokens != null) {
+        return error.UnsupportedSqlShape;
+    }
     if (expression.subquery_where_expression) |subquery_where_expression| {
         try validateGeneratedExpressionAstRanges(tokens, read_ast, subquery_where_expression.*);
     }
@@ -1434,6 +1440,10 @@ fn validateGeneratedExpressionAstRanges(
         }
         if (expression.subquery_set_operation_tokens) |set_operation_tokens| {
             if (set_operation_tokens.start <= projection_tokens.end or set_operation_tokens.end > inner.end) return error.UnsupportedSqlShape;
+            const set_operation = expression.subquery_set_operation orelse return error.UnsupportedSqlShape;
+            try validateGeneratedSetOperationMetadata(expression.subquery_set_operation_tokens, set_operation.*);
+        } else if (expression.subquery_set_operation != null) {
+            return error.UnsupportedSqlShape;
         }
     }
     if (expression.over_definition_tokens) |definition| {
@@ -2477,6 +2487,22 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_exists_subquery_projection_parsed_sql, malformed_exists_subquery_projection_read_ast),
+    );
+
+    var malformed_subquery_set_operation_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE EXISTS (SELECT id FROM thresholds UNION SELECT id FROM archived_thresholds)",
+    );
+    defer malformed_subquery_set_operation_parsed_sql.deinit(alloc);
+    const malformed_subquery_set_operation_generated_raw = malformed_subquery_set_operation_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_subquery_set_operation_read_ast = switch (malformed_subquery_set_operation_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_subquery_set_operation_read_ast.where_expression.right_expression.?.subquery_set_operation.?.right_projection_items.count = 0;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_subquery_set_operation_parsed_sql, malformed_subquery_set_operation_read_ast),
     );
 
     var malformed_in_subquery_parsed_sql = try tokenized.ParsedSql.initAlloc(
