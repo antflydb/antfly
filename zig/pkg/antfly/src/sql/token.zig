@@ -144,6 +144,7 @@ pub const TokenKeyword = enum {
     format,
     foreign,
     freshness,
+    full,
     full_text_search,
     function,
     from,
@@ -466,6 +467,7 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.now, keywordFromIdentifier("NOW").?);
     try std.testing.expectEqual(TokenKeyword.next, keywordFromIdentifier("NEXT").?);
     try std.testing.expectEqual(TokenKeyword.following, keywordFromIdentifier("FOLLOWING").?);
+    try std.testing.expectEqual(TokenKeyword.full, keywordFromIdentifier("FULL").?);
     try std.testing.expectEqual(TokenKeyword.placing, keywordFromIdentifier("PLACING").?);
     try std.testing.expectEqual(TokenKeyword.procedure, keywordFromIdentifier("PROCEDURE").?);
     try std.testing.expectEqual(TokenKeyword.preceding, keywordFromIdentifier("PRECEDING").?);
