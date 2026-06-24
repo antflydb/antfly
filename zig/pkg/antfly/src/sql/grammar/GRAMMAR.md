@@ -94,12 +94,12 @@ generated clause ranges before calling their typed read-plan lowerers directly;
 generated set-operation reads now classify as a distinct read family and
 validate the left query and set-operation tail before calling the set-operation
 lowerer directly;
-covered CTE reads still delegate to the current typed read lowerer until CTE
-body payloads are generated. Unsupported read shapes
+simple non-recursive CTE reads now expose generated CTE name and body ranges
+and dispatch directly when those ranges validate. Unsupported read shapes
 still fall back, and deeper read cutover still requires full generated
 query-body AST payloads for expression-level projections and predicates,
-structured joins, complete CTE bodies, aggregates, windows, ordering,
-pagination, and direct generated read-plan lowering. The generated parser now also treats seed
+structured joins, complete multi-CTE and recursive CTE bodies, aggregates,
+windows, ordering, pagination, and direct generated read-plan lowering. The generated parser now also treats seed
 graph DDL as a distinct graph statement family and `ParsedSql` retains those
 generated raw and AST nodes. Seed graph index and graph metric statements now
 have graph-specific generated AST-to-plan wrappers that lower to typed index
@@ -213,7 +213,9 @@ Suggested migration order:
    AST-to-read-family dispatch boundaries after clause-range validation.
    Set-operation reads now classify as their own generated read family and
    dispatch to the native set-operation lowerer after validating the generated
-   left-query and set-operation-tail ranges. Switching reads from fallback to required generated parsing still requires
+   left-query and set-operation-tail ranges. Simple non-recursive CTE reads now
+   carry generated CTE name and body ranges and dispatch to the typed read
+   lowerer after validating those ranges. Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, expression-level and
    join-level generated query-body ASTs, direct generated read-plan lowering,
    and unsupported-shape diagnostics.

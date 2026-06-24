@@ -226,7 +226,14 @@ pub fn lowerReadPlanFromGeneratedReadAstAlloc(
                 context.function_bindings,
             ) };
         },
-        .cte => try context.lowerParsed(parsed_sql),
+        .cte => blk: {
+            if (validateGeneratedCteReadAst(parsed_sql.items(), read_ast)) |_| {
+                break :blk try lowerGeneratedCteReadPlanAlloc(context, parsed_sql, read_kind);
+            } else |err| switch (err) {
+                error.UnsupportedSqlShape => break :blk try context.lowerParsed(parsed_sql),
+                else => return err,
+            }
+        },
     };
 }
 
@@ -250,6 +257,8 @@ fn generatedReadAstMatchesReadKind(
 fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: generated_parser.GeneratedSqlReadAst) !void {
     const ranges = [_]?generated_parser.GeneratedSqlTokenRange{
         read_ast.cte_tokens,
+        read_ast.cte_name_tokens,
+        read_ast.cte_body_tokens,
         read_ast.projection_tokens,
         read_ast.source_tokens,
         read_ast.where_tokens,
@@ -335,6 +344,76 @@ fn validateGeneratedSetOperationReadAst(read_ast: generated_parser.GeneratedSqlR
     if (read_ast.projection_tokens == null or read_ast.source_tokens == null or read_ast.set_operation_tokens == null) {
         return error.UnsupportedSqlShape;
     }
+}
+
+fn validateGeneratedCteReadAst(tokens: []const tokenized.Token, read_ast: generated_parser.GeneratedSqlReadAst) !void {
+    const cte = read_ast.cte_tokens orelse return error.UnsupportedSqlShape;
+    const name = read_ast.cte_name_tokens orelse return error.UnsupportedSqlShape;
+    const body = read_ast.cte_body_tokens orelse return error.UnsupportedSqlShape;
+    if (tokens.len == 0 or !tokens[0].matchesKeywordTag(.with)) return error.UnsupportedSqlShape;
+    if (cte.start != 1 or name.start != cte.start or name.end != name.start + 1) return error.UnsupportedSqlShape;
+    if (name.end >= body.start or !tokens[name.end].matchesKeywordTag(.as)) return error.UnsupportedSqlShape;
+    if (body.start == 0 or tokens[body.start - 1].kind != .lparen) return error.UnsupportedSqlShape;
+    if (body.end >= tokens.len or tokens[body.end].kind != .rparen) return error.UnsupportedSqlShape;
+    if (body.end + 1 >= tokens.len or !tokens[body.end + 1].matchesKeywordTag(.select)) return error.UnsupportedSqlShape;
+    if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return error.UnsupportedSqlShape;
+}
+
+fn lowerGeneratedCteReadPlanAlloc(
+    context: *ReadPlanLoweringContext,
+    parsed_sql: *const tokenized.ParsedSql,
+    read_kind: classifier.SqlReadStatementKind,
+) !plan.LoweredReadPlan {
+    return switch (read_kind) {
+        .query => .{ .query = try context.callbacks.lower_query_plan(
+            context.alloc,
+            parsed_sql,
+            context.schema,
+            context.params,
+            context.function_bindings,
+        ) },
+        .aggregate => .{ .aggregate = try context.callbacks.lower_aggregate_plan(
+            context.alloc,
+            parsed_sql,
+            context.schema,
+            context.params,
+        ) },
+        .join => .{ .join = try context.callbacks.lower_join_with_schemas(
+            context.alloc,
+            parsed_sql,
+            context.schema,
+            context.source_schema orelse context.schema,
+            context.params,
+        ) },
+        .lateral => .{ .lateral = try context.callbacks.lower_lateral_with_schemas(
+            context.alloc,
+            parsed_sql,
+            context.schema,
+            context.source_schema orelse context.schema,
+            context.params,
+        ) },
+        .window => .{ .window = try context.callbacks.lower_window(
+            context.alloc,
+            parsed_sql,
+            context.schema,
+            context.params,
+        ) },
+        .set_operation => .{ .set_operation = try context.callbacks.lower_set_operation_optional_source_schema(
+            context.alloc,
+            parsed_sql,
+            context.schema,
+            context.source_schema,
+            context.params,
+            context.function_bindings,
+        ) },
+        .recursive_cte => .{ .recursive_cte = try context.callbacks.lower_recursive_cte_plan(
+            context.alloc,
+            parsed_sql,
+            context.schema,
+            context.params,
+            context.function_bindings,
+        ) },
+    };
 }
 
 fn validateGeneratedReadTokenRange(
@@ -895,6 +974,22 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &parsed_sql, read_ast),
+    );
+
+    var cte_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows",
+    );
+    defer cte_parsed_sql.deinit(alloc);
+    const cte_generated_raw = cte_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var cte_read_ast = switch (cte_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    cte_read_ast.cte_body_tokens = .{ .start = 4, .end = 4 };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &cte_parsed_sql, cte_read_ast),
     );
 }
 

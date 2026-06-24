@@ -870,6 +870,8 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                     try std.testing.expect(read_ast.having_tokens != null);
                 } else if (case.generated == .cte) {
                     try std.testing.expect(read_ast.cte_tokens != null);
+                    try std.testing.expect(read_ast.cte_name_tokens != null);
+                    try std.testing.expect(read_ast.cte_body_tokens != null);
                     try std.testing.expect(read_ast.projection_tokens != null);
                 } else if (case.generated == .set_operation) {
                     try std.testing.expect(read_ast.set_operation_tokens != null);

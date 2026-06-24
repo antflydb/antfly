@@ -163,6 +163,8 @@ pub const GeneratedSqlReadAst = struct {
     statement_span: token_mod.SourceSpan,
     command_span: token_mod.SourceSpan,
     cte_tokens: ?GeneratedSqlTokenRange = null,
+    cte_name_tokens: ?GeneratedSqlTokenRange = null,
+    cte_body_tokens: ?GeneratedSqlTokenRange = null,
     projection_tokens: ?GeneratedSqlTokenRange = null,
     source_tokens: ?GeneratedSqlTokenRange = null,
     where_tokens: ?GeneratedSqlTokenRange = null,
@@ -678,6 +680,7 @@ fn buildReadAst(
     const select_index = findTopLevelKeyword(tokens, 0, end, .select) orelse return ast;
     if (select_index > 0 and tokens[0].matchesKeywordTag(.with)) {
         ast.cte_tokens = .{ .start = 1, .end = select_index };
+        buildReadCteAst(tokens, select_index, &ast);
     }
 
     const body_end = firstTopLevelSetOperation(tokens, select_index + 1, end) orelse end;
@@ -735,6 +738,16 @@ fn buildReadAst(
     }
 
     return ast;
+}
+
+fn buildReadCteAst(tokens: []const token_mod.Token, final_select_index: usize, ast: *GeneratedSqlReadAst) void {
+    if (final_select_index < 5 or !tokens[0].matchesKeywordTag(.with)) return;
+    if (tokens[1].kind != .identifier) return;
+    if (!tokens[2].matchesKeywordTag(.as) or tokens[3].kind != .lparen) return;
+    const close = findMatchingParen(tokens, 3, final_select_index) orelse return;
+    if (close + 1 != final_select_index) return;
+    ast.cte_name_tokens = .{ .start = 1, .end = 2 };
+    if (4 < close) ast.cte_body_tokens = .{ .start = 4, .end = close };
 }
 
 fn buildInsertDmlAst(tokens: []const token_mod.Token, end: usize, ast: *GeneratedSqlDmlAst) void {
@@ -1220,6 +1233,8 @@ test "generated SQL parser facade builds control AST spans" {
         .read => |read| {
             try std.testing.expectEqual(GeneratedSqlReadKind.cte, read.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 9 }, read.cte_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.cte_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 8 }, read.cte_body_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.projection_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read.source_tokens.?);
         },
