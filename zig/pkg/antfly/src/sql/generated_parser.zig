@@ -271,8 +271,11 @@ pub const GeneratedSqlExpressionAst = struct {
     subquery_read_kind: ?GeneratedSqlReadKind = null,
     subquery_select_tokens: ?GeneratedSqlTokenRange = null,
     subquery_projection_tokens: ?GeneratedSqlTokenRange = null,
+    subquery_projection_items: GeneratedSqlListAst = .{},
     subquery_source_tokens: ?GeneratedSqlTokenRange = null,
     subquery_where_tokens: ?GeneratedSqlTokenRange = null,
+    subquery_where_expression_kind: ?GeneratedSqlExpressionKind = null,
+    subquery_where_expression: ?*GeneratedSqlExpressionAst = null,
     subquery_set_operation_tokens: ?GeneratedSqlTokenRange = null,
     function_name_tokens: ?GeneratedSqlTokenRange = null,
     argument_tokens: ?GeneratedSqlTokenRange = null,
@@ -388,6 +391,11 @@ pub const GeneratedSqlExpressionAst = struct {
         if (self.boolean_last_condition) |boolean_last_condition| {
             boolean_last_condition.deinit(alloc);
             alloc.destroy(boolean_last_condition);
+        }
+        self.subquery_projection_items.deinit(alloc);
+        if (self.subquery_where_expression) |subquery_where_expression| {
+            subquery_where_expression.deinit(alloc);
+            alloc.destroy(subquery_where_expression);
         }
         self.boolean_condition_items.deinit(alloc);
         self.argument_items.deinit(alloc);
@@ -1773,10 +1781,11 @@ fn buildGeneratedReadResultTailAst(
 }
 
 fn buildGeneratedSubqueryExpressionAst(
+    alloc: std.mem.Allocator,
     tokens: []const token_mod.Token,
     inner_range: GeneratedSqlTokenRange,
     ast: *GeneratedSqlExpressionAst,
-) void {
+) !void {
     if (inner_range.start >= inner_range.end or inner_range.end > tokens.len) return;
     ast.subquery_read_kind = classifyReadKindInRange(tokens, inner_range);
     const select_index = findTopLevelKeyword(tokens, inner_range.start, inner_range.end, .select) orelse return;
@@ -1803,6 +1812,7 @@ fn buildGeneratedSubqueryExpressionAst(
     const projection_end = firstOptionalIndex(&[_]?usize{ from_index, where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
     if (projection_start < projection_end) {
         ast.subquery_projection_tokens = .{ .start = projection_start, .end = projection_end };
+        ast.subquery_projection_items = try buildTopLevelListAst(alloc, tokens, ast.subquery_projection_tokens.?, .{ .bare_alias = true });
     }
     if (from_index) |idx| {
         const source_end = firstOptionalIndex(&[_]?usize{ where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
@@ -1810,7 +1820,11 @@ fn buildGeneratedSubqueryExpressionAst(
     }
     if (where_index) |idx| {
         const where_end = firstOptionalIndex(&[_]?usize{ group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
-        if (idx + 1 < where_end) ast.subquery_where_tokens = .{ .start = idx + 1, .end = where_end };
+        if (idx + 1 < where_end) {
+            ast.subquery_where_tokens = .{ .start = idx + 1, .end = where_end };
+            ast.subquery_where_expression_kind = generatedExpressionKindForRange(tokens, ast.subquery_where_tokens.?);
+            ast.subquery_where_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, ast.subquery_where_tokens.?);
+        }
     }
 }
 
@@ -2891,7 +2905,7 @@ fn buildGeneratedExpressionAst(alloc: std.mem.Allocator, tokens: []const token_m
     if (generatedSubqueryExpressionInnerRange(tokens, range)) |inner_range| {
         ast.kind = .subquery;
         ast.inner_tokens = inner_range;
-        buildGeneratedSubqueryExpressionAst(tokens, inner_range, &ast);
+        try buildGeneratedSubqueryExpressionAst(alloc, tokens, inner_range, &ast);
         return ast;
     }
     if (generatedWrappedExpressionInnerRange(tokens, range)) |inner_range| {
@@ -5014,6 +5028,9 @@ test "generated SQL parser facade builds quantified predicate AST spans" {
             try std.testing.expectEqual(GeneratedSqlReadKind.query, subquery.subquery_read_kind.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, subquery.subquery_select_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, subquery.subquery_projection_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), subquery.subquery_projection_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, subquery.subquery_projection_items.items[0]);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, subquery.subquery_projection_items.expressions[0].kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, subquery.subquery_source_tokens.?);
         },
         else => return error.TestUnexpectedResult,
@@ -5037,8 +5054,14 @@ test "generated SQL parser facade builds quantified predicate AST spans" {
             try std.testing.expectEqual(GeneratedSqlReadKind.query, subquery.subquery_read_kind.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, subquery.subquery_select_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, subquery.subquery_projection_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), subquery.subquery_projection_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, subquery.subquery_projection_items.items[0]);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, subquery.subquery_projection_items.expressions[0].kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, subquery.subquery_source_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 15 }, subquery.subquery_where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.is_true, subquery.subquery_where_expression_kind.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.is_true, subquery.subquery_where_expression.?.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 15 }, subquery.subquery_where_expression.?.tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -5061,8 +5084,12 @@ test "generated SQL parser facade builds quantified predicate AST spans" {
             try std.testing.expectEqual(GeneratedSqlReadKind.query, subquery.subquery_read_kind.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, subquery.subquery_select_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, subquery.subquery_projection_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), subquery.subquery_projection_items.count);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, subquery.subquery_projection_items.expressions[0].kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 12 }, subquery.subquery_source_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 16 }, subquery.subquery_where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.is_true, subquery.subquery_where_expression_kind.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.is_true, subquery.subquery_where_expression.?.kind);
         },
         else => return error.TestUnexpectedResult,
     }

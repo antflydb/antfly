@@ -949,6 +949,7 @@ fn generatedExpressionAstHasMetadata(expression: generated_parser.GeneratedSqlEx
         expression.argument_tokens != null or
         expression.argument_distinct_tokens != null or
         expression.argument_value_tokens != null or
+        expression.subquery_projection_items.count != 0 or
         expression.argument_order_tokens != null or
         expression.within_group_tokens != null or
         expression.within_group_order_tokens != null or
@@ -998,6 +999,7 @@ fn generatedExpressionAstHasMetadata(expression: generated_parser.GeneratedSqlEx
         expression.case_else_expression != null or
         expression.boolean_first_condition != null or
         expression.boolean_last_condition != null or
+        expression.subquery_where_expression != null or
         expression.boolean_condition_count != 0 or
         expression.boolean_condition_items.count != 0 or
         expression.argument_items.count != 0 or
@@ -1172,10 +1174,19 @@ fn validateGeneratedExpressionAstStructure(expression: generated_parser.Generate
                 expression.inner_tokens == null or
                 expression.subquery_read_kind == null or
                 expression.subquery_select_tokens == null or
-                expression.subquery_projection_tokens == null)
+                expression.subquery_projection_tokens == null or
+                expression.subquery_projection_items.count == 0)
             {
                 return error.UnsupportedSqlShape;
             }
+            if (expression.subquery_where_tokens != null and expression.subquery_where_expression == null) {
+                return error.UnsupportedSqlShape;
+            }
+            try validateGeneratedExpressionAstOptionalChild(
+                expression.subquery_where_expression_kind,
+                expression.subquery_where_tokens,
+                expression.subquery_where_expression,
+            );
         },
         .grouped => {
             if (expression.tokens == null or expression.inner_tokens == null) return error.UnsupportedSqlShape;
@@ -1398,17 +1409,28 @@ fn validateGeneratedExpressionAstRanges(
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.over_order_items);
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.array_items);
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.boolean_condition_items);
+    try validateGeneratedReadListAstRanges(tokens, read_ast, expression.subquery_projection_items);
+    if (expression.subquery_where_expression) |subquery_where_expression| {
+        try validateGeneratedExpressionAstRanges(tokens, read_ast, subquery_where_expression.*);
+    }
     if (expression.kind == .subquery) {
         const inner = expression.inner_tokens orelse return error.UnsupportedSqlShape;
         const select_tokens = expression.subquery_select_tokens orelse return error.UnsupportedSqlShape;
         const projection_tokens = expression.subquery_projection_tokens orelse return error.UnsupportedSqlShape;
         if (select_tokens.start < inner.start or select_tokens.end > inner.end) return error.UnsupportedSqlShape;
         if (projection_tokens.start < select_tokens.end or projection_tokens.end > inner.end) return error.UnsupportedSqlShape;
+        if (expression.subquery_projection_items.count == 0) return error.UnsupportedSqlShape;
+        for (expression.subquery_projection_items.items) |item| {
+            if (item.start < projection_tokens.start or item.end > projection_tokens.end) return error.UnsupportedSqlShape;
+        }
         if (expression.subquery_source_tokens) |source_tokens| {
             if (source_tokens.start < projection_tokens.end or source_tokens.end > inner.end) return error.UnsupportedSqlShape;
         }
         if (expression.subquery_where_tokens) |where_tokens| {
             if (where_tokens.start <= projection_tokens.end or where_tokens.end > inner.end) return error.UnsupportedSqlShape;
+            const where_expression = expression.subquery_where_expression orelse return error.UnsupportedSqlShape;
+            const where_expression_tokens = where_expression.tokens orelse return error.UnsupportedSqlShape;
+            if (!std.meta.eql(where_expression_tokens, where_tokens)) return error.UnsupportedSqlShape;
         }
         if (expression.subquery_set_operation_tokens) |set_operation_tokens| {
             if (set_operation_tokens.start <= projection_tokens.end or set_operation_tokens.end > inner.end) return error.UnsupportedSqlShape;
@@ -2432,6 +2454,26 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         else => return error.UnsupportedSqlShape,
     };
     malformed_exists_subquery_projection_read_ast.where_expression.right_expression.?.subquery_projection_tokens = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_exists_subquery_projection_parsed_sql, malformed_exists_subquery_projection_read_ast),
+    );
+
+    malformed_exists_subquery_projection_read_ast = switch (malformed_exists_subquery_projection_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_exists_subquery_projection_read_ast.where_expression.right_expression.?.subquery_projection_items.count = 0;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_exists_subquery_projection_parsed_sql, malformed_exists_subquery_projection_read_ast),
+    );
+
+    malformed_exists_subquery_projection_read_ast = switch (malformed_exists_subquery_projection_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_exists_subquery_projection_read_ast.where_expression.right_expression.?.subquery_where_expression_kind = .comparison;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_exists_subquery_projection_parsed_sql, malformed_exists_subquery_projection_read_ast),

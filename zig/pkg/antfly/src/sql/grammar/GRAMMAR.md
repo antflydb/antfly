@@ -118,7 +118,8 @@ ranges, array-constructor metadata, and subquery token spans.
 `EXISTS` and `NOT EXISTS` read-subquery predicates are accepted with explicit
 operator, negation, and subquery token spans. Generated subquery expression
 metadata now records subquery read kind plus first-query `SELECT`, projection,
-source, `WHERE`, and set-operation ranges for later direct subquery planning.
+source, `WHERE`, and set-operation ranges plus owned projection-list and
+`WHERE` predicate expression payloads for later direct subquery planning.
 `IS NULL` and `IS NOT NULL` predicates are accepted and
 classified as explicit null-test expression kinds, `IS TRUE`/`IS FALSE`/
 `IS UNKNOWN` boolean-test predicates are accepted with their `IS NOT` variants,
@@ -336,7 +337,8 @@ Unsupported DDL remains on the existing parser until
    `EXISTS` and `NOT EXISTS` read-subquery predicates are accepted with
    explicit operator, negation, and subquery token spans, and generated
    subquery expression metadata now carries subquery read kind plus first-query
-   `SELECT`, projection, source, `WHERE`, and set-operation ranges,
+   `SELECT`, projection, source, `WHERE`, and set-operation ranges plus owned
+   projection-list and `WHERE` predicate expression payloads,
    and quantified predicates over typed array constructors such as
    `= ANY(ARRAY[...]::text[])` carry generated array-constructor metadata after
    public tokenization normalizes cast suffixes. `IN` and `NOT IN` predicates
