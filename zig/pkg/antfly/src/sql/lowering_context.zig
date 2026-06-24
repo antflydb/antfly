@@ -257,11 +257,8 @@ pub fn lowerReadPlanFromGeneratedReadAstAlloc(
             ) };
         },
         .cte => blk: {
-            if (validateGeneratedCteReadAst(parsed_sql.items(), read_ast)) |_| {
-                break :blk try lowerGeneratedCteReadPlanAlloc(context, parsed_sql, read_kind);
-            } else |err| switch (err) {
-                error.UnsupportedSqlShape => break :blk try context.lowerParsedWithClassifier(parsed_sql),
-            }
+            try validateGeneratedCteReadAst(parsed_sql.items(), read_ast);
+            break :blk try lowerGeneratedCteReadPlanAlloc(context, parsed_sql, read_kind);
         },
     };
 }

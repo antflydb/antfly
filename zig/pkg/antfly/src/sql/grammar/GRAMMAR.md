@@ -170,7 +170,8 @@ last-CTE name/body ranges plus owned per-CTE name/body item arrays, optional
 column-alias lists, and `MATERIALIZED` / `NOT MATERIALIZED` hint metadata;
 generated CTE reads now fail closed on malformed list counts, first/last
 compatibility fields, column-alias lists, materialization hints, and body
-enclosure metadata; each generated CTE item also carries body read-kind and
+enclosure metadata instead of falling back to classifier parsing after generated
+validation rejects a covered CTE; each generated CTE item also carries body read-kind and
 body clause-span metadata for the first body query, including set-operation
 tails, plus owned body projection/group/order lists, predicate expression
 metadata, generated body join-tree metadata with first-join compatibility
@@ -443,7 +444,8 @@ Unsupported DDL remains on the existing parser until
    ranges, optional column-alias lists, and `MATERIALIZED` / `NOT MATERIALIZED`
    hint metadata; generated CTE reads reject malformed CTE-list counts,
    first/last compatibility fields, column-alias list payloads,
-   materialization hint payloads, and parenthesized body spans; each generated
+   materialization hint payloads, and parenthesized body spans without
+   re-entering classifier fallback; each generated
    CTE item now carries body read-kind and first-query clause-span metadata,
    including set-operation tails with generated operator and right-query
    payloads, plus owned body projection/group/order list payloads, body
