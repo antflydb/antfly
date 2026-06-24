@@ -207,6 +207,7 @@ pub const GeneratedSqlExpressionKind = enum {
     array_constructor,
     cast,
     case_expression,
+    interval_literal,
 };
 
 pub const GeneratedSqlBetweenModifier = enum {
@@ -253,6 +254,7 @@ pub const GeneratedSqlExpressionAst = struct {
     case_else_expression_tokens: ?GeneratedSqlTokenRange = null,
     case_else_expression_kind: ?GeneratedSqlExpressionKind = null,
     case_else_expression: ?*GeneratedSqlExpressionAst = null,
+    interval_value_tokens: ?GeneratedSqlTokenRange = null,
     left_tokens: ?GeneratedSqlTokenRange = null,
     left_expression_kind: ?GeneratedSqlExpressionKind = null,
     left_expression: ?*GeneratedSqlExpressionAst = null,
@@ -612,6 +614,7 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT metadata #>> '{billing,plan}' AS plan FROM usage_records WHERE metadata #> '{flags}' = $1::jsonb", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE metadata #>> '{billing,plan}' = 'pro'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status = ANY($1::text[])", .kind = .read },
+    .{ .sql = "SELECT date_bin(INTERVAL '1 hour', amount, 0) AS amount_bucket FROM usage_records WHERE date_bin(INTERVAL '1 day', amount, 0) = $1", .kind = .read },
     .{ .sql = "SELECT CASE WHEN email IS NULL THEN 'missing' WHEN email = 'blocked@example.test' THEN 'blocked' ELSE lower(status) END AS email_bucket FROM usage_records WHERE id = 'u1'", .kind = .read },
     .{ .sql = "SELECT CASE WHEN email IS NULL THEN NULL ELSE email END AS maybe_email FROM usage_records WHERE id = 'u1'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status LIKE 'open%'", .kind = .read },
@@ -2008,6 +2011,11 @@ fn buildGeneratedExpressionAst(alloc: std.mem.Allocator, tokens: []const token_m
         }
         return ast;
     }
+    if (generatedIntervalLiteralExpression(tokens, range)) |value_tokens| {
+        ast.kind = .interval_literal;
+        ast.interval_value_tokens = value_tokens;
+        return ast;
+    }
     if (generatedFunctionCallExpression(tokens, range)) |function_call| {
         ast.kind = .function_call;
         ast.function_name_tokens = function_call.name_tokens;
@@ -2108,6 +2116,7 @@ fn generatedExpressionKindForRange(tokens: []const token_mod.Token, range: Gener
     if (generatedWrappedExpressionInnerRange(tokens, range) != null) return .grouped;
     if (generatedCastExpression(tokens, range) != null) return .cast;
     if (generatedCaseExpression(tokens, range) != null) return .case_expression;
+    if (generatedIntervalLiteralExpression(tokens, range) != null) return .interval_literal;
     if (generatedFunctionCallExpression(tokens, range) != null) return .function_call;
     if (generatedArrayConstructorExpression(tokens, range) != null) return .array_constructor;
     return if (findTopLevelExpressionOperator(tokens, range)) |operator| operator.kind else null;
@@ -2118,6 +2127,13 @@ fn generatedSubqueryExpressionInnerRange(tokens: []const token_mod.Token, range:
     if (inner_range.start >= inner_range.end or inner_range.end > tokens.len) return null;
     if (tokens[inner_range.start].matchesKeywordTag(.select) or tokens[inner_range.start].matchesKeywordTag(.with)) return inner_range;
     return null;
+}
+
+fn generatedIntervalLiteralExpression(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?GeneratedSqlTokenRange {
+    if (range.end > tokens.len or range.start + 2 != range.end) return null;
+    if (!tokens[range.start].matchesKeywordTag(.interval)) return null;
+    if (tokens[range.start + 1].kind != .string) return null;
+    return .{ .start = range.start + 1, .end = range.end };
 }
 
 const GeneratedFunctionCallExpression = struct {
@@ -4813,6 +4829,37 @@ test "generated SQL parser exposes JSON path operator AST metadata" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, path_left.right_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.where_expression.operator_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.where_expression.right_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "generated SQL parser exposes interval literal AST metadata" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const interval_read_sql = "SELECT date_bin(INTERVAL '1 hour', amount, 0) AS amount_bucket FROM usage_records WHERE date_bin(INTERVAL '1 day', amount, 0) = $1";
+    const interval_read_result = try parseSqlAlloc(alloc, interval_read_sql);
+    switch (interval_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.function_call, read.projection_first_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.projection_first_expression.function_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 9 }, read.projection_first_expression.argument_tokens.?);
+            try std.testing.expectEqual(@as(usize, 3), read.projection_first_expression.argument_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 5 }, read.projection_first_expression.argument_items.items[0]);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.interval_literal, read.projection_first_expression.argument_items.expressions[0].kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, read.projection_first_expression.argument_items.expressions[0].interval_value_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.function_call, read.where_expression.left_expression_kind.?);
+            const predicate_call = read.where_expression.left_expression orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 17, .end = 23 }, predicate_call.argument_tokens.?);
+            try std.testing.expectEqual(@as(usize, 3), predicate_call.argument_items.count);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.interval_literal, predicate_call.argument_items.expressions[0].kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 18, .end = 19 }, predicate_call.argument_items.expressions[0].interval_value_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 24, .end = 25 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 25, .end = 26 }, read.where_expression.right_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
