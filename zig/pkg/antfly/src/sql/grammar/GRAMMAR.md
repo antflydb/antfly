@@ -97,7 +97,8 @@ projection functions with comma-separated arguments, and positive `LIKE`,
 classified in generated expression metadata along with their `NOT` negated
 forms. `ANY`/`ALL`/`SOME` quantified comparison predicates over parenthesized
 expression lists are also accepted and classified with explicit quantifier
-token ranges,
+token ranges. `IS NULL` and `IS NOT NULL` predicates are accepted and
+classified as explicit null-test expression kinds,
 and an initial generated AST-to-plan wrapper that validates those ranges and
 fails closed if the generated read family is incompatible with the existing
 read classifier. Simple query, aggregate, join, and lateral reads now validate
@@ -239,7 +240,8 @@ Suggested migration order:
    in generated expression metadata along with their `NOT` negated forms.
    `ANY`/`ALL`/`SOME` quantified comparison predicates over parenthesized
    expression lists are accepted and classified with explicit quantifier token
-   ranges.
+   ranges. `IS NULL` and `IS NOT NULL` predicates are accepted and classified
+   as explicit null-test expression kinds.
    Generated read ASTs now have a validated wrapper
    into the current typed read lowerer for representative covered read plans
    that rejects malformed generated range payloads. Simple query reads now have

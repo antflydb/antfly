@@ -134,6 +134,8 @@ pub const GeneratedSqlExpressionKind = enum {
     not_in_list,
     not_between,
     quantified_comparison,
+    is_null,
+    is_not_null,
 };
 
 pub const GeneratedSqlExpressionAst = struct {
@@ -343,6 +345,8 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT id FROM usage_records WHERE score = ANY (1, 2)", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE score <> ALL (1, 2)", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE score > SOME (1, 2)", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE deleted_at IS NULL", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE deleted_at IS NOT NULL", .kind = .read },
     .{ .sql = "SELECT concat_ws(',', status), id FROM usage_records ORDER BY status, id", .kind = .read },
     .{ .sql = "SELECT id, row_number() OVER (PARTITION BY tenant, account ORDER BY id) AS rn FROM usage_records ORDER BY id, tenant", .kind = .read },
     .{ .sql = "SELECT DISTINCT status FROM usage_records ORDER BY status", .kind = .read },
@@ -1213,6 +1217,12 @@ fn findTopLevelExpressionOperator(tokens: []const token_mod.Token, range: Genera
                 if (tokens[index].matchesKeywordTag(.ilike)) return .{ .kind = .ilike, .index = index };
                 if (tokens[index].matchesKeywordTag(.in)) return .{ .kind = .in_list, .index = index };
                 if (tokens[index].matchesKeywordTag(.between)) return .{ .kind = .between, .index = index };
+                if (tokens[index].matchesKeywordTag(.is) and index + 1 < range.end) {
+                    if (tokens[index + 1].matchesKeywordTag(.null)) return .{ .kind = .is_null, .index = index };
+                    if (index + 2 < range.end and tokens[index + 1].matchesKeywordTag(.not) and tokens[index + 2].matchesKeywordTag(.null)) {
+                        return .{ .kind = .is_not_null, .index = index };
+                    }
+                }
             },
         }
     }
@@ -1692,6 +1702,34 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.where_expression.operator_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.where_expression.quantifier_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 13 }, read.where_expression.right_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const is_null_read_sql = "SELECT id FROM usage_records WHERE deleted_at IS NULL";
+    const is_null_read_result = try parseSqlAlloc(alloc, is_null_read_sql);
+    switch (is_null_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 8 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.is_null, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.where_expression.right_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const is_not_null_read_sql = "SELECT id FROM usage_records WHERE deleted_at IS NOT NULL";
+    const is_not_null_read_result = try parseSqlAlloc(alloc, is_not_null_read_sql);
+    switch (is_not_null_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 9 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.is_not_null, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 9 }, read.where_expression.right_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
