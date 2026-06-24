@@ -1575,7 +1575,18 @@ fn validateGeneratedReadListAstBoundaryExpressions(
     if (!std.meta.eql(last_tokens, list.expression_items[list.count - 1])) return error.UnsupportedSqlShape;
 }
 
-fn validateGeneratedExpressionAstBinaryStructure(expression: generated_parser.GeneratedSqlExpressionAst) !void {
+const GeneratedExpressionBinaryPayloadOptions = struct {
+    negation: bool = false,
+    quantifier: bool = false,
+    between: bool = false,
+    escape: bool = false,
+    boolean_chain: bool = false,
+};
+
+fn validateGeneratedExpressionAstBinaryStructure(
+    expression: generated_parser.GeneratedSqlExpressionAst,
+    options: GeneratedExpressionBinaryPayloadOptions,
+) !void {
     if (expression.tokens == null or
         expression.left_tokens == null or
         expression.operator_tokens == null or
@@ -1585,6 +1596,44 @@ fn validateGeneratedExpressionAstBinaryStructure(expression: generated_parser.Ge
     }
     try requireGeneratedExpressionAstChild(expression.left_expression_kind, expression.left_tokens, expression.left_expression);
     try requireGeneratedExpressionAstChild(expression.right_expression_kind, expression.right_tokens, expression.right_expression);
+
+    var payload = expression;
+    payload.tokens = null;
+    payload.left_tokens = null;
+    payload.left_expression_kind = null;
+    payload.left_expression = null;
+    payload.operator_tokens = null;
+    payload.right_tokens = null;
+    payload.right_expression_kind = null;
+    payload.right_expression = null;
+    if (options.negation) payload.negation_tokens = null;
+    if (options.quantifier) payload.quantifier_tokens = null;
+    if (options.between) {
+        payload.between_modifier_tokens = null;
+        payload.between_modifier = null;
+        payload.between_lower_tokens = null;
+        payload.between_lower_expression_kind = null;
+        payload.between_lower_expression = null;
+        payload.between_upper_tokens = null;
+        payload.between_upper_expression_kind = null;
+        payload.between_upper_expression = null;
+    }
+    if (options.escape) {
+        payload.escape_tokens = null;
+        payload.escape_expression_kind = null;
+        payload.escape_expression = null;
+    }
+    if (options.boolean_chain) {
+        payload.boolean_condition_count = 0;
+        payload.boolean_first_condition_tokens = null;
+        payload.boolean_first_condition_kind = null;
+        payload.boolean_first_condition = null;
+        payload.boolean_last_condition_tokens = null;
+        payload.boolean_last_condition_kind = null;
+        payload.boolean_last_condition = null;
+        payload.boolean_condition_items = .{};
+    }
+    try validateGeneratedExpressionAstHasNoUnexpectedPayload(payload);
 }
 
 fn validateGeneratedExpressionOperatorTokens(
@@ -1952,7 +2001,7 @@ fn validateGeneratedSubqueryTailAstRanges(
 }
 
 fn validateGeneratedBooleanChainExpressionAstStructure(expression: generated_parser.GeneratedSqlExpressionAst) !void {
-    try validateGeneratedExpressionAstBinaryStructure(expression);
+    try validateGeneratedExpressionAstBinaryStructure(expression, .{ .boolean_chain = true });
     if (expression.boolean_condition_count < 2 or
         expression.boolean_first_condition_tokens == null or
         expression.boolean_last_condition_tokens == null or
@@ -2382,28 +2431,36 @@ fn validateGeneratedExpressionAstStructure(expression: generated_parser.Generate
         .not_between,
         => {
             if (expression.negation_tokens == null) return error.UnsupportedSqlShape;
-            try validateGeneratedExpressionAstBinaryStructure(expression);
+            try validateGeneratedExpressionAstBinaryStructure(expression, .{
+                .negation = true,
+                .quantifier = expression.kind == .not_like or expression.kind == .not_ilike,
+                .between = expression.kind == .not_between,
+                .escape = expression.kind == .not_like or expression.kind == .not_ilike,
+            });
             if (expression.kind == .not_between) {
                 if (expression.between_modifier_tokens != null and expression.between_modifier == null) return error.UnsupportedSqlShape;
                 if (expression.between_lower_tokens == null or expression.between_upper_tokens == null) return error.UnsupportedSqlShape;
                 try requireGeneratedExpressionAstChild(expression.between_lower_expression_kind, expression.between_lower_tokens, expression.between_lower_expression);
                 try requireGeneratedExpressionAstChild(expression.between_upper_expression_kind, expression.between_upper_tokens, expression.between_upper_expression);
+            } else if (expression.kind == .not_like or expression.kind == .not_ilike) {
+                if (expression.escape_tokens != null and expression.escape_expression == null) return error.UnsupportedSqlShape;
+                try validateGeneratedExpressionAstOptionalChild(expression.escape_expression_kind, null, expression.escape_expression);
             }
         },
         .quantified_comparison => {
             if (expression.quantifier_tokens == null) return error.UnsupportedSqlShape;
-            try validateGeneratedExpressionAstBinaryStructure(expression);
+            try validateGeneratedExpressionAstBinaryStructure(expression, .{ .quantifier = true });
         },
         .like,
         .ilike,
         => {
-            try validateGeneratedExpressionAstBinaryStructure(expression);
+            try validateGeneratedExpressionAstBinaryStructure(expression, .{ .quantifier = true, .escape = true });
             if (expression.escape_tokens != null and expression.escape_expression == null) return error.UnsupportedSqlShape;
             try validateGeneratedExpressionAstOptionalChild(expression.escape_expression_kind, null, expression.escape_expression);
         },
         .between => {
             if (expression.between_modifier_tokens != null and expression.between_modifier == null) return error.UnsupportedSqlShape;
-            try validateGeneratedExpressionAstBinaryStructure(expression);
+            try validateGeneratedExpressionAstBinaryStructure(expression, .{ .between = true });
             if (expression.between_lower_tokens == null or expression.between_upper_tokens == null) return error.UnsupportedSqlShape;
             try requireGeneratedExpressionAstChild(expression.between_lower_expression_kind, expression.between_lower_tokens, expression.between_lower_expression);
             try requireGeneratedExpressionAstChild(expression.between_upper_expression_kind, expression.between_upper_tokens, expression.between_upper_expression);
@@ -2431,7 +2488,7 @@ fn validateGeneratedExpressionAstStructure(expression: generated_parser.Generate
         .json_text_access,
         .json_path_access,
         .json_path_text_access,
-        => try validateGeneratedExpressionAstBinaryStructure(expression),
+        => try validateGeneratedExpressionAstBinaryStructure(expression, .{ .negation = expression.kind == .is_not_distinct_from }),
         .logical_or,
         .logical_and,
         => try validateGeneratedBooleanChainExpressionAstStructure(expression),
@@ -4091,6 +4148,50 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_comparison_expression_parsed_sql, malformed_comparison_expression_read_ast),
+    );
+    malformed_comparison_expression_read_ast = switch (malformed_comparison_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_comparison_expression_read_ast.where_expression.function_name_tokens =
+        malformed_comparison_expression_read_ast.where_expression.left_tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_comparison_expression_parsed_sql, malformed_comparison_expression_read_ast),
+    );
+
+    var malformed_not_like_payload_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status NOT LIKE 'op%'",
+    );
+    defer malformed_not_like_payload_parsed_sql.deinit(alloc);
+    const malformed_not_like_payload_generated_raw = malformed_not_like_payload_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_not_like_payload_read_ast = switch (malformed_not_like_payload_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_not_like_payload_read_ast.where_expression.argument_tokens =
+        malformed_not_like_payload_read_ast.where_expression.right_tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_not_like_payload_parsed_sql, malformed_not_like_payload_read_ast),
+    );
+
+    var malformed_quantified_comparison_payload_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = ANY(ARRAY['active','pending']::text[])",
+    );
+    defer malformed_quantified_comparison_payload_parsed_sql.deinit(alloc);
+    const malformed_quantified_comparison_payload_generated_raw = malformed_quantified_comparison_payload_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_quantified_comparison_payload_read_ast = switch (malformed_quantified_comparison_payload_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_quantified_comparison_payload_read_ast.where_expression.filter_tokens =
+        malformed_quantified_comparison_payload_read_ast.where_expression.right_tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_quantified_comparison_payload_parsed_sql, malformed_quantified_comparison_payload_read_ast),
     );
 
     var malformed_is_true_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
