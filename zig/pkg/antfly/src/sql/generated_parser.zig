@@ -629,6 +629,7 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT date_part('hour', amount) AS amount_hour, EXTRACT(dow FROM amount) AS amount_dow FROM usage_records WHERE EXTRACT(dow FROM amount) = $1 ORDER BY date_part('month', amount) ASC LIMIT 5", .kind = .read },
     .{ .sql = "SELECT CURRENT_TIMESTAMP(6) AS planned_at_ns FROM users WHERE id = $1", .kind = .read },
     .{ .sql = "SELECT CURRENT_DATE AS planned_day_ns FROM users WHERE id = $1", .kind = .read },
+    .{ .sql = "SELECT lower(p.valid_at) AS valid_start, upper(p.valid_at) AS valid_end FROM price_intervals AS p WHERE lower(p.valid_at) >= 1 AND upper(p.valid_at) IS NOT NULL ORDER BY upper(p.valid_at) DESC LIMIT 5", .kind = .read },
     .{ .sql = "SELECT CASE WHEN email IS NULL THEN 'missing' WHEN email = 'blocked@example.test' THEN 'blocked' ELSE lower(status) END AS email_bucket FROM usage_records WHERE id = 'u1'", .kind = .read },
     .{ .sql = "SELECT CASE WHEN email IS NULL THEN NULL ELSE email END AS maybe_email FROM usage_records WHERE id = 'u1'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status LIKE 'open%'", .kind = .read },
@@ -5078,6 +5079,39 @@ test "generated SQL parser exposes temporal function read metadata" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 31, .end = 32 }, read.order_first_expression.function_name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 33, .end = 36 }, read.order_first_expression.argument_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 37, .end = 38 }, read.order_items.direction_items[0].?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "generated SQL parser exposes range helper function metadata" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const range_helper_sql = "SELECT lower(p.valid_at) AS valid_start, upper(p.valid_at) AS valid_end FROM price_intervals AS p WHERE lower(p.valid_at) >= 1 AND upper(p.valid_at) IS NOT NULL ORDER BY upper(p.valid_at) DESC LIMIT 5";
+    const range_helper_result = try parseSqlAlloc(alloc, range_helper_sql);
+    switch (range_helper_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(@as(usize, 2), read.projection_items.count);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.function_call, read.projection_items.expressions[0].kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.projection_items.expressions[0].function_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read.projection_items.expressions[0].argument_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.function_call, read.projection_items.expressions[1].kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.projection_items.expressions[1].function_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.projection_items.expressions[1].argument_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 15, .end = 18 }, read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.logical_and, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 19, .end = 25 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.left_expression_kind.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 26, .end = 33 }, read.where_expression.right_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.is_not_null, read.where_expression.right_expression_kind.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.function_call, read.order_first_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 35, .end = 36 }, read.order_first_expression.function_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 37, .end = 38 }, read.order_first_expression.argument_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 39, .end = 40 }, read.order_items.direction_items[0].?);
+            try std.testing.expectEqual(GeneratedSqlOrderDirection.desc, read.order_items.directions[0].?);
         },
         else => return error.TestUnexpectedResult,
     }
