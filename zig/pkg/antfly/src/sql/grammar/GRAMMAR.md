@@ -736,11 +736,14 @@ Generated grammar work needs evidence at multiple levels:
   consistency and postfix `ISNULL`/`NOTNULL` shape checks, generated function
   call metadata now fails closed when argument `DISTINCT`/`ORDER BY`, `WITHIN
   GROUP`, or `FILTER (WHERE ...)` clause ranges disagree with their keywords
-  and parentheses, generated projection/group/order alias metadata now fails
-  closed when `AS name` or bare alias ranges disagree with the underlying
-  list-item tokens, and generated ordering lists now fail closed when typed
-  `ASC`/`DESC`, `USING` operator, or `NULLS FIRST`/`LAST` metadata disagrees
-  with the underlying order-item tokens. Subquery expression tests cover generated
+  and parentheses, generated grouped, `CAST(... AS ...)`, and `CASE
+  WHEN ... THEN ... ELSE ... END` expression metadata now fails closed when
+  child ranges disagree with clause keywords and enclosure tokens, generated
+  projection/group/order alias metadata now fails closed when `AS name` or
+  bare alias ranges disagree with the underlying list-item tokens, and
+  generated ordering lists now fail closed when typed `ASC`/`DESC`, `USING`
+  operator, or `NULLS FIRST`/`LAST` metadata disagrees with the underlying
+  order-item tokens. Subquery expression tests cover generated
   `ORDER BY`, `LIMIT`, `OFFSET`, and `FETCH` tail payloads plus fail-closed
   malformed subquery tail validation.
   Graph DDL has generated AST-to-plan parity for graph index and graph metric

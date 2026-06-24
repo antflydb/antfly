@@ -1979,6 +1979,98 @@ fn validateGeneratedFunctionCallClauseMetadata(
     }
 }
 
+fn validateGeneratedGroupedExpressionClauseMetadata(
+    tokens: []const tokenized.Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
+    const inner_tokens = expression.inner_tokens orelse return error.UnsupportedSqlShape;
+    if (expression_tokens.end <= expression_tokens.start + 1) return error.UnsupportedSqlShape;
+    if (tokens[expression_tokens.start].kind != .lparen or tokens[expression_tokens.end - 1].kind != .rparen) {
+        return error.UnsupportedSqlShape;
+    }
+    if (inner_tokens.start != expression_tokens.start + 1 or inner_tokens.end != expression_tokens.end - 1) {
+        return error.UnsupportedSqlShape;
+    }
+}
+
+fn validateGeneratedCastExpressionClauseMetadata(
+    tokens: []const tokenized.Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
+    const value_tokens = expression.cast_expression_tokens orelse return error.UnsupportedSqlShape;
+    const type_tokens = expression.cast_type_tokens orelse return error.UnsupportedSqlShape;
+    if (expression_tokens.end <= expression_tokens.start + 5) return error.UnsupportedSqlShape;
+    if (!tokens[expression_tokens.start].matchesKeywordTag(.cast) or
+        tokens[expression_tokens.start + 1].kind != .lparen or
+        tokens[expression_tokens.end - 1].kind != .rparen)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    if (value_tokens.start != expression_tokens.start + 2) return error.UnsupportedSqlShape;
+    if (value_tokens.end + 1 != type_tokens.start) return error.UnsupportedSqlShape;
+    if (!tokens[value_tokens.end].matchesKeywordTag(.as)) return error.UnsupportedSqlShape;
+    if (type_tokens.end != expression_tokens.end - 1) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedCaseExpressionClauseMetadata(
+    tokens: []const tokenized.Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
+    if (expression_tokens.end <= expression_tokens.start + 4) return error.UnsupportedSqlShape;
+    if (!tokens[expression_tokens.start].matchesKeywordTag(.case) or
+        !tokens[expression_tokens.end - 1].matchesKeywordTag(.end))
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    const first_when = expression.case_first_when_tokens orelse return error.UnsupportedSqlShape;
+    if (first_when.start != expression_tokens.start + 1 or !tokens[first_when.start].matchesKeywordTag(.when)) {
+        return error.UnsupportedSqlShape;
+    }
+    const first_condition = expression.case_first_condition_tokens orelse return error.UnsupportedSqlShape;
+    const first_result = expression.case_first_result_tokens orelse return error.UnsupportedSqlShape;
+    if (first_condition.start != first_when.start + 1) return error.UnsupportedSqlShape;
+    if (first_condition.end + 1 != first_result.start) return error.UnsupportedSqlShape;
+    if (!tokens[first_condition.end].matchesKeywordTag(.then)) return error.UnsupportedSqlShape;
+    if (first_result.end > first_when.end) return error.UnsupportedSqlShape;
+
+    if (expression.case_branch_count == 1) {
+        if (first_when.end != first_result.end) return error.UnsupportedSqlShape;
+        if (expression.case_last_when_tokens != null and !std.meta.eql(expression.case_last_when_tokens.?, first_when)) {
+            return error.UnsupportedSqlShape;
+        }
+    } else {
+        const last_when = expression.case_last_when_tokens orelse return error.UnsupportedSqlShape;
+        if (last_when.start <= first_when.start or last_when.end > expression_tokens.end - 1) return error.UnsupportedSqlShape;
+        if (!tokens[last_when.start].matchesKeywordTag(.when)) return error.UnsupportedSqlShape;
+    }
+
+    if (expression.case_else_tokens) |else_tokens| {
+        const else_expression_tokens = expression.case_else_expression_tokens orelse return error.UnsupportedSqlShape;
+        if (else_tokens.end != expression_tokens.end - 1) return error.UnsupportedSqlShape;
+        if (else_expression_tokens.start != else_tokens.start + 1 or else_expression_tokens.end != else_tokens.end) {
+            return error.UnsupportedSqlShape;
+        }
+        if (!tokens[else_tokens.start].matchesKeywordTag(.@"else")) return error.UnsupportedSqlShape;
+    } else if (expression.case_else_expression_tokens != null or expression.case_else_expression != null or expression.case_else_expression_kind != null) {
+        return error.UnsupportedSqlShape;
+    }
+
+    var previous_end = first_when.start;
+    for (expression.case_condition_items.items, expression.case_result_items.items) |condition, result| {
+        if (condition.start <= previous_end or condition.end >= result.start) return error.UnsupportedSqlShape;
+        if (condition.start == 0 or !tokens[condition.start - 1].matchesKeywordTag(.when)) return error.UnsupportedSqlShape;
+        if (condition.end >= tokens.len or !tokens[condition.end].matchesKeywordTag(.then)) return error.UnsupportedSqlShape;
+        if (result.start != condition.end + 1) return error.UnsupportedSqlShape;
+        previous_end = result.end;
+    }
+    const end_before_case_end = if (expression.case_else_tokens) |else_tokens| else_tokens.start else expression_tokens.end - 1;
+    if (previous_end != end_before_case_end) return error.UnsupportedSqlShape;
+}
+
 fn validateGeneratedExpressionAstStructure(expression: generated_parser.GeneratedSqlExpressionAst) !void {
     switch (expression.kind) {
         .token_range => {
@@ -2235,7 +2327,13 @@ fn validateGeneratedExpressionAstRanges(
     for (ranges) |range| {
         if (range) |value| try validateGeneratedReadTokenRange(tokens, read_ast, value);
     }
-    if (expression.kind == .function_call) try validateGeneratedFunctionCallClauseMetadata(tokens, expression);
+    switch (expression.kind) {
+        .grouped => try validateGeneratedGroupedExpressionClauseMetadata(tokens, expression),
+        .cast => try validateGeneratedCastExpressionClauseMetadata(tokens, expression),
+        .case_expression => try validateGeneratedCaseExpressionClauseMetadata(tokens, expression),
+        .function_call => try validateGeneratedFunctionCallClauseMetadata(tokens, expression),
+        else => {},
+    }
     if (expression.inner_expression) |inner| try validateGeneratedExpressionAstRanges(tokens, read_ast, inner.*);
     if (expression.left_expression) |left| try validateGeneratedExpressionAstRanges(tokens, read_ast, left.*);
     if (expression.right_expression) |right| try validateGeneratedExpressionAstRanges(tokens, read_ast, right.*);
@@ -3870,6 +3968,40 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_boolean_chain_parsed_sql, malformed_boolean_chain_read_ast),
     );
 
+    var malformed_grouped_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE (status = 'open')",
+    );
+    defer malformed_grouped_expression_parsed_sql.deinit(alloc);
+    const malformed_grouped_expression_generated_raw = malformed_grouped_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_grouped_expression_read_ast = switch (malformed_grouped_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_grouped_expression_read_ast.where_expression.inner_tokens =
+        malformed_grouped_expression_read_ast.where_expression.tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_grouped_expression_parsed_sql, malformed_grouped_expression_read_ast),
+    );
+
+    var malformed_cast_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT CAST(id AS text) AS id_text FROM usage_records WHERE kind = 'order'",
+    );
+    defer malformed_cast_expression_parsed_sql.deinit(alloc);
+    const malformed_cast_expression_generated_raw = malformed_cast_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_cast_expression_read_ast = switch (malformed_cast_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_cast_expression_read_ast.projection_items.expressions[0].cast_type_tokens =
+        malformed_cast_expression_read_ast.projection_items.expressions[0].cast_expression_tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_cast_expression_parsed_sql, malformed_cast_expression_read_ast),
+    );
+
     var malformed_unary_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
         "SELECT -id AS neg_id FROM usage_records WHERE kind = 'order'",
@@ -4074,6 +4206,16 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         else => return error.UnsupportedSqlShape,
     };
     malformed_case_expression_read_ast.projection_items.expressions[0].case_condition_items.count = 0;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_case_expression_parsed_sql, malformed_case_expression_read_ast),
+    );
+    malformed_case_expression_read_ast = switch (malformed_case_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_case_expression_read_ast.projection_items.expressions[0].case_else_expression_tokens =
+        malformed_case_expression_read_ast.projection_items.expressions[0].case_else_tokens;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_case_expression_parsed_sql, malformed_case_expression_read_ast),
