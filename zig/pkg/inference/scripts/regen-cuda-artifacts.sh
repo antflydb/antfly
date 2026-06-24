@@ -92,6 +92,8 @@ trap 'rm -f "$tmp_ptx" "$tmp_fatbin" "$tmp_sm89"' EXIT
 
 required_symbols=(
   termite_fill_f32
+  termite_copy_f32
+  termite_copy_u8
   termite_f32_to_bf16
   termite_linear_bf16_weight_f32_tiled
   termite_embedding_lookup_bf16_weight_f32
@@ -110,7 +112,10 @@ required_symbols=(
   termite_gliner_gather_concat_relu_f32
   termite_split_last_dim3_f32
   termite_rope_per_item_f32
+  termite_rope_decode_scalars_f32
+  termite_rope_scaled_decode_scalars_f32
   termite_rms_norm_heads_rope_decode_scalars_f32
+  termite_activation_multiply_slice_last_dim_f32
   termite_gqa_attention_decode_scalars_f32
   termite_kv_write_suffix_decode_scalars_f32
   termite_gqa_attention_decode_turboquant_f32
@@ -122,6 +127,8 @@ required_symbols=(
   termite_linear_q4_k_argmax_rows_stage1_tile4
   termite_argmax_reduce_rows_pairs_f32
   termite_linear_q8_0_f32_tile4_r2
+  termite_linear_q6_k_f32_tile4
+  termite_linear_q6_k_gated_down_f32_tile4
   termite_linear_q8_0_bias_f32_tile4_r2
   termite_linear_q8_0_bias_gelu_f32_tile4_r2
   termite_linear_q8_0_bias_add_f32_tile4_r2
@@ -161,6 +168,8 @@ required_symbols=(
   termite_linear_bf16_weight_f32_qkv_nobias_tiled
   termite_linear_q4_k_q4_k_f32_qkv_nobias_tiled
   termite_embedding_lookup_i32_q4_k_f32
+  termite_embedding_lookup_q6_k_f32
+  termite_embedding_lookup_i32_q6_k_f32
 )
 
 check_required_symbols() {

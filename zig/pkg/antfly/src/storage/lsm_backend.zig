@@ -1389,7 +1389,10 @@ pub const Backend = struct {
         manager.observeUsage(
             .lsm_in_memory_state,
             &self.tracked_in_memory_state_bytes,
-            stats.mutable_bytes +| stats.immutable_bytes +| stats.bulk_ingest_current_scan_clone_active_bytes,
+            stats.mutable_bytes +|
+                stats.immutable_bytes +|
+                stats.bulk_ingest_current_scan_clone_active_bytes +|
+                self.mutableReadSnapshotBytesLocked(),
         );
     }
 
@@ -1420,6 +1423,18 @@ pub const Backend = struct {
             bytes +|= estimateStateBytes(state);
         }
         bytes +|= self.bulk_ingest_current_scan_clone_active_bytes;
+        bytes +|= self.mutableReadSnapshotBytesLocked();
+        return bytes;
+    }
+
+    fn mutableReadSnapshotBytesLocked(self: *const Backend) u64 {
+        var bytes: u64 = 0;
+        if (self.mutable_read_snapshot) |snapshot| {
+            bytes +|= estimateStateBytes(snapshot);
+        }
+        for (self.retired_mutable_snapshots.items) |snapshot| {
+            bytes +|= estimateStateBytes(snapshot);
+        }
         return bytes;
     }
 
@@ -1593,7 +1608,7 @@ pub const Backend = struct {
     }
 
     fn cloneMutableStateWithReason(self: *Backend, reason: MutableSnapshotReason) !State {
-        var snapshot = try self.mutable.clone(self.allocator);
+        var snapshot = try self.mutable.cloneArena(self.allocator);
         errdefer snapshot.deinit(self.allocator);
         const snapshot_bytes = estimateStateBytes(&snapshot);
         self.mutable_snapshot_clone_calls +|= 1;
@@ -1615,6 +1630,7 @@ pub const Backend = struct {
         errdefer snapshot.deinit(self.allocator);
         try self.retired_mutable_snapshots.ensureUnusedCapacity(self.allocator, 1);
         self.mutable_read_snapshot = snapshot;
+        self.syncTrackedInMemoryStateUsageCurrentLocked();
         return snapshot;
     }
 
@@ -1670,6 +1686,7 @@ pub const Backend = struct {
         const snapshot = self.mutable_read_snapshot orelse return;
         self.mutable_read_snapshot = null;
         self.retireMutableSnapshot(snapshot);
+        self.syncTrackedInMemoryStateUsageCurrentLocked();
     }
 
     fn destroyImmutableMemtable(self: *Backend, state: *State) void {
@@ -1713,6 +1730,7 @@ pub const Backend = struct {
             self.destroyMutableSnapshot(state);
         }
         self.retired_mutable_snapshots.clearRetainingCapacity();
+        self.syncTrackedInMemoryStateUsageCurrentLocked();
     }
 
     fn compactImmutableMemtableQueue(self: *Backend) void {
@@ -10996,6 +11014,49 @@ test "lsm backend reuses mutable read snapshot until writes invalidate it" {
     try std.testing.expectEqualStrings("B", try read_c.get(.{ .name = "docs" }, "doc:b"));
     try std.testing.expect(backend.mutable_read_snapshot != null);
     try std.testing.expect(first_snapshot != backend.mutable_read_snapshot.?);
+}
+
+test "lsm backend resource manager accounts pinned mutable read snapshots" {
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    var backend = Backend.init(std.testing.allocator, .{ .resource_manager = &manager });
+    defer backend.close();
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:a", "A");
+        try txn.commit();
+    }
+
+    const base_bytes = manager.sliceStats(.lsm_in_memory_state).used_bytes;
+    try std.testing.expect(base_bytes > 0);
+
+    var read_a = try backend.beginRead();
+    var read_a_open = true;
+    defer if (read_a_open) read_a.abort();
+    try std.testing.expectEqualStrings("A", try read_a.get(.{ .name = "docs" }, "doc:a"));
+
+    const with_snapshot = manager.sliceStats(.lsm_in_memory_state).used_bytes;
+    try std.testing.expect(with_snapshot > base_bytes);
+
+    {
+        var txn = try backend.beginWrite();
+        try txn.put(.{ .name = "docs" }, "doc:b", "B");
+        try txn.commit();
+    }
+
+    const with_retired = manager.sliceStats(.lsm_in_memory_state).used_bytes;
+    try std.testing.expect(with_retired >= with_snapshot);
+    try std.testing.expectEqual(@as(?*State, null), backend.mutable_read_snapshot);
+    try std.testing.expectEqual(@as(usize, 1), backend.retired_mutable_snapshots.items.len);
+
+    read_a.abort();
+    read_a_open = false;
+
+    const after_release = manager.sliceStats(.lsm_in_memory_state).used_bytes;
+    const maintenance = backend.snapshotMaintenanceStats();
+    try std.testing.expect(after_release < with_retired);
+    try std.testing.expectEqual(@as(usize, 0), backend.retired_mutable_snapshots.items.len);
+    try std.testing.expectEqual(maintenance.mutable_bytes +| maintenance.immutable_bytes, after_release);
 }
 
 test "lsm backend rotates large mutable state for read snapshots instead of cloning" {

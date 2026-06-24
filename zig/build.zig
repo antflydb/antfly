@@ -3026,6 +3026,7 @@ pub fn build(b: *std.Build) void {
         "data runtime data changes mark provisioned startup catch-up dirty",
         "data runtime structural changes preserve writer-published runtime status",
         "data runtime startup catch-up prefers cached admin snapshot",
+        "data runtime startup catch-up clears no-debt busy writer groups",
         "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
         "data runtime background maintenance is due for dense posting cadence without lsm debt",
         "data runtime local split fallback preserves source identity namespace",
@@ -5801,6 +5802,8 @@ pub fn build(b: *std.Build) void {
     replay_bench_root_mod.addImport("bloom", bloom_mod);
     replay_bench_root_mod.addImport("antfly_vector", vector_mod);
     replay_bench_root_mod.addImport("antfly_vectorindex", vectorindex_mod);
+    replay_bench_root_mod.addImport("antfly_matcher", matcher_mod);
+    replay_bench_root_mod.addImport("antfly_resolver", resolver_mod);
     replay_bench_root_mod.addImport("antfly_vellum", vellum_mod);
     replay_bench_root_mod.addImport("antfly_regex", regex_mod);
     replay_bench_root_mod.addImport("antfly_reranking", reranking_mod);

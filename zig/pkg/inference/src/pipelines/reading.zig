@@ -616,11 +616,11 @@ pub const ReadingPipeline = struct {
             var capture_graph = false;
             if (florenceCudaGraphEnabled()) {
                 if (suppress_tokens.len == 0) {
-                    if (try cb.debugCudaGraphPrepareFinalHiddenReplayInput(hidden.*)) |prepared| {
+                    if (try cb.debugCudaGraphPrepareFinalHiddenReplayInput("florence.lm_head_argmax", hidden.*)) |prepared| {
                         cb.free(hidden.*);
                         hidden.* = prepared;
                         hidden_live.* = true;
-                        _ = try cb.debugCudaGraphPrepareDecodeScalars(0, 0, 0, 0);
+                        _ = try cb.debugCudaGraphPrepareDecodeScalars(0, 0, 0, 0, 0);
                         if (try cb.debugCudaGraphReplayFinalHidden(hidden.*)) |token_tensor| {
                             defer cb.free(token_tensor);
                             cb.free(hidden.*);

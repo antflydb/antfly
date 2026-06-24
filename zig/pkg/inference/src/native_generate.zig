@@ -60,6 +60,14 @@ const ExecutionMode = enum {
 
 const CompiledTarget = graph_mod.compiled_backend.AttachmentTarget;
 
+fn shouldSkipAutoMtpDraftLoad(opts: Options, draft_cfg: gpt_mod.Config) bool {
+    if (opts.speculation_policy != .auto) return false;
+    if (!draft_cfg.gemma4_mtp_assistant) return false;
+    if (opts.speculation_calibration == .none) return true;
+    const requested_max_tokens: usize = @intCast(@max(opts.max_tokens, 1));
+    return requested_max_tokens < generation.gemma4MtpAutoMinGenerationTokens();
+}
+
 const Options = struct {
     model_dir: []const u8,
     prompt: []const u8,
@@ -365,16 +373,23 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     if (effective_draft_model != null and (opts.image_count > 0 or opts.audio_count > 0)) {
         return error.MultimodalSpeculativeDecodingNotSupported;
     }
+    var draft_gpt_config: ?gpt_mod.Config = null;
     const draft_model = if (effective_draft_model) |draft_model_dir| blk: {
+        if (opts.speculation_policy == .auto) {
+            var draft_manifest = try manifest_mod.loadFromDir(allocator, draft_model_dir);
+            defer draft_manifest.deinit();
+            const draft_cfg = try session_factory.loadGptConfigFromModelDir(allocator, draft_model_dir, draft_manifest);
+            if (shouldSkipAutoMtpDraftLoad(opts, draft_cfg)) {
+                draft_gpt_config = draft_cfg;
+                break :blk null;
+            }
+        }
         const loaded = try model_manager.loadFromDir(draft_model_dir);
         const draft_cfg = session_factory.getGptConfig(loaded.session) orelse return error.InvalidDraftModelForGeneration;
         try validateDraftTokenizerCompatibility(tokenizer, loaded.getTokenizer(), gpt_config, draft_cfg);
+        draft_gpt_config = draft_cfg;
         break :blk loaded;
     } else null;
-    const draft_gpt_config: ?@import("models/gpt.zig").Config = if (draft_model) |loaded|
-        session_factory.getGptConfig(loaded.session).?
-    else
-        null;
 
     const apply_chat_template = !opts.raw_prompt and !opts.no_chat_template and model.chat_tmpl != null;
     const rendered_prompt = if (opts.raw_prompt)
@@ -509,10 +524,20 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .onnx => return error.UnexpectedOnnxBackend,
         .wasm => return error.UnexpectedWasmBackend,
     };
-    const kv_dtype = if (opts.cache_dtype) |name|
+    const requested_kv_dtype = if (opts.cache_dtype) |name|
         runtime.kv.pool.parseKvDType(name) orelse return error.InvalidCacheDtype
     else
         session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
+    const kv_dtype = effectiveGenerationKvDType(
+        requested_kv_dtype,
+        backend_kind,
+        gpt_config,
+        prompt_tokens,
+        @intCast(@max(opts.max_tokens, 1)),
+    );
+    if (opts.print_timing and kv_dtype != requested_kv_dtype) {
+        print("cache_dtype_effective: requested={s} effective={s}\n", .{ @tagName(requested_kv_dtype), @tagName(kv_dtype) });
+    }
     const budget_backend_class: runtime.tier.memory.BackendClass = switch (backend_kind) {
         .native => .cpu,
         else => .gpu,
@@ -541,25 +566,37 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         return err;
     };
     const draft_kv_dtype = if (draft_model) |loaded| blk: {
-        break :blk if (opts.cache_dtype) |name|
+        const requested_draft_kv_dtype = if (opts.cache_dtype) |name|
             runtime.kv.pool.parseKvDType(name) orelse return error.InvalidCacheDtype
         else
             session_factory.recommendedKvDTypeForSession(loaded.session, backend_kind);
+        break :blk if (draft_gpt_config) |draft_cfg|
+            effectiveGenerationKvDType(
+                requested_draft_kv_dtype,
+                backend_kind,
+                draft_cfg,
+                prompt_tokens,
+                @intCast(@max(opts.max_tokens, 1)),
+            )
+        else
+            requested_draft_kv_dtype;
     } else null;
-    if (draft_gpt_config) |draft_cfg| {
-        run_budget.reserveEstimate(runtime.tier.memory.estimateGptGeneration(
-            backend_kind,
-            draft_kv_dtype.?,
-            draft_cfg,
-            prompt_tokens,
-            @intCast(@max(opts.max_tokens, 1)),
-            admission_prefill_chunk,
-        )) catch |err| {
-            if (err == error.MemoryBudgetExceeded) {
-                printBudgetExceeded(draft_model.?.session, &run_budget);
-            }
-            return err;
-        };
+    if (draft_model != null) {
+        if (draft_gpt_config) |draft_cfg| {
+            run_budget.reserveEstimate(runtime.tier.memory.estimateGptGeneration(
+                backend_kind,
+                draft_kv_dtype.?,
+                draft_cfg,
+                prompt_tokens,
+                @intCast(@max(opts.max_tokens, 1)),
+                admission_prefill_chunk,
+            )) catch |err| {
+                if (err == error.MemoryBudgetExceeded) {
+                    printBudgetExceeded(draft_model.?.session, &run_budget);
+                }
+                return err;
+            };
+        }
     }
     var cb = session_factory.getComputeBackendWithBudget(model.session, allocator, &run_budget) catch |err| {
         if (err == error.MemoryBudgetExceeded) {
@@ -621,26 +658,28 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     defer if (draft_kv_manager) |*manager| manager.deinit();
     var draft_decode_state: ?generation.NativeDecodeState = null;
     defer if (draft_decode_state) |*state| state.deinit();
-    if (draft_gpt_config) |draft_cfg| {
-        draft_kv_manager = runtime.kv.manager.KvManager.init(allocator);
-        const draft_sliding_window_size: ?u32 = if (draft_cfg.position_encoding == .absolute)
-            null
-        else if (draft_cfg.sliding_window > 0)
-            draft_cfg.sliding_window
-        else if (draft_cfg.max_position_embeddings > 0)
-            draft_cfg.max_position_embeddings
-        else
-            null;
-        const draft_pool_id = try draft_kv_manager.?.addPool(.{
-            .backend = backend_kind,
-            .dtype = draft_kv_dtype.?,
-            .page_size_tokens = 16,
-            .num_layers_packed = @intCast(draft_cfg.num_hidden_layers),
-            .num_kv_heads = draft_cfg.maxKvHeads(),
-            .head_dim = draft_cfg.maxHeadDim(),
-            .sliding_window_size = draft_sliding_window_size,
-        });
-        draft_decode_state = generation.NativeDecodeState.initPaged(allocator, &draft_kv_manager.?, draft_pool_id, null);
+    if (draft_model != null) {
+        if (draft_gpt_config) |draft_cfg| {
+            draft_kv_manager = runtime.kv.manager.KvManager.init(allocator);
+            const draft_sliding_window_size: ?u32 = if (draft_cfg.position_encoding == .absolute)
+                null
+            else if (draft_cfg.sliding_window > 0)
+                draft_cfg.sliding_window
+            else if (draft_cfg.max_position_embeddings > 0)
+                draft_cfg.max_position_embeddings
+            else
+                null;
+            const draft_pool_id = try draft_kv_manager.?.addPool(.{
+                .backend = backend_kind,
+                .dtype = draft_kv_dtype.?,
+                .page_size_tokens = 16,
+                .num_layers_packed = @intCast(draft_cfg.num_hidden_layers),
+                .num_kv_heads = draft_cfg.maxKvHeads(),
+                .head_dim = draft_cfg.maxHeadDim(),
+                .sliding_window_size = draft_sliding_window_size,
+            });
+            draft_decode_state = generation.NativeDecodeState.initPaged(allocator, &draft_kv_manager.?, draft_pool_id, null);
+        }
     }
     if (native_generate_lease) |lease| {
         if (config.prefill_chunk_size == 0) {
@@ -4453,6 +4492,28 @@ fn graphModeEnabled() bool {
 
 fn nativeGenerateSchedulerEnabled() bool {
     return !getenvBool("TERMITE_DISABLE_NATIVE_GENERATE_SCHEDULER");
+}
+
+fn effectiveGenerationKvDType(
+    requested: runtime.kv.pool.KvDType,
+    backend_kind: runtime.kv.pool.BackendKind,
+    config: gpt_mod.Config,
+    prompt_tokens: usize,
+    max_tokens: usize,
+) runtime.kv.pool.KvDType {
+    if (backend_kind != .cuda or config.family != .gemma) return requested;
+    switch (requested) {
+        .polar4, .turbo3 => {},
+        else => return requested,
+    }
+    const min_tokens = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TURBOQUANT_MIN_TOKENS") orelse 256;
+    if (min_tokens == 0) return requested;
+    const total_tokens = prompt_tokens + max_tokens;
+    if (total_tokens < min_tokens) return .f32;
+    if (requested == .turbo3 and !platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_ENABLE_TURBO3_KV")) {
+        return .polar4;
+    }
+    return requested;
 }
 
 fn getenvBool(comptime name: [*:0]const u8) bool {

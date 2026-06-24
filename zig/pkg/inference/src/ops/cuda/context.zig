@@ -21,6 +21,7 @@ const CUdevice = driver_mod.CUdevice;
 const CUgraph = driver_mod.CUgraph;
 const CUgraphExec = driver_mod.CUgraphExec;
 const CUgraphExecUpdateResult = driver_mod.CUgraphExecUpdateResult;
+const CUgraphInstantiateResult = driver_mod.CUgraphInstantiateResult;
 const CUgraphNode = driver_mod.CUgraphNode;
 const CUevent = driver_mod.CUevent;
 const CUstream = driver_mod.CUstream;
@@ -43,6 +44,18 @@ pub const RuntimeStats = struct {
     kernel_launches: usize = 0,
     stream_syncs: usize = 0,
 };
+
+fn graphInstantiateResultName(result: CUgraphInstantiateResult) []const u8 {
+    return switch (result) {
+        driver_mod.CUDA_GRAPH_INSTANTIATE_SUCCESS => "success",
+        driver_mod.CUDA_GRAPH_INSTANTIATE_ERROR => "error",
+        driver_mod.CUDA_GRAPH_INSTANTIATE_INVALID_STRUCTURE => "invalid_structure",
+        driver_mod.CUDA_GRAPH_INSTANTIATE_NODE_OPERATION_NOT_SUPPORTED => "node_operation_not_supported",
+        driver_mod.CUDA_GRAPH_INSTANTIATE_MULTIPLE_CTXS_NOT_SUPPORTED => "multiple_contexts_not_supported",
+        driver_mod.CUDA_GRAPH_INSTANTIATE_CONDITIONAL_HANDLE_UNUSED => "conditional_handle_unused",
+        else => "unknown",
+    };
+}
 
 pub const ProfileEventPair = struct {
     start: CUevent = null,
@@ -184,7 +197,21 @@ pub const CudaContext = struct {
     pub fn instantiateGraph(self: *CudaContext, graph: CUgraph) driver_mod.Error!CUgraphExec {
         try self.makeCurrent();
         var exec: CUgraphExec = null;
-        try self.driver.check(self.driver.fns.cuGraphInstantiate(&exec, graph, 0));
+        if (self.driver.fns.cuGraphInstantiateWithParams) |instantiate_with_params| {
+            var params = driver_mod.CUDA_GRAPH_INSTANTIATE_PARAMS{};
+            const result = instantiate_with_params(&exec, graph, &params);
+            if (result != driver_mod.CUDA_SUCCESS or params.result_out != driver_mod.CUDA_GRAPH_INSTANTIATE_SUCCESS) {
+                std.log.warn("cuda_graph_capture_probe: instantiate_with_params_failed cuda={s} result={s} err_node=0x{x}", .{
+                    self.driver.errorName(result),
+                    graphInstantiateResultName(params.result_out),
+                    @intFromPtr(params.hErrNode_out),
+                });
+                try self.driver.check(result);
+                return error.CudaDriverError;
+            }
+        } else {
+            try self.driver.check(self.driver.fns.cuGraphInstantiate(&exec, graph, 0));
+        }
         if (exec == null) return error.InvalidCudaState;
         return exec;
     }

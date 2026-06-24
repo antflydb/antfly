@@ -320,6 +320,8 @@ fn encodeUnifiedDirectAudio(
     const frame_ct = try cb.fromFloat32Shape(frames, &frame_shape);
     defer cb.free(frame_ct);
 
+    // Direct unified audio projects RMS-normalized raw waveform chunks, matching
+    // llama.cpp's Gemma4UnifiedMultimodalEmbedder graph.
     const normed = try rmsNormNoScaleCt(cb, allocator, frame_ct, token_count, cfg.raw_samples_per_token, cfg.layer_norm_eps);
     defer cb.free(normed);
     const projection_w = try loadLinearWeightCt(cb, allocator, store, "mm.a.input_projection.weight", cfg.raw_samples_per_token, cfg.text_hidden);
@@ -359,6 +361,28 @@ fn prepareGemma4RawAudioFrames(
     @memset(out, 0.0);
     if (real_samples > 0) @memcpy(out[0..real_samples], resampled[0..real_samples]);
     return out;
+}
+
+test "gemma4 direct audio frames preserve raw waveform samples" {
+    const allocator = std.testing.allocator;
+    const samples = [_]f32{ 0.0, 0.25, -0.5, 0.75, -0.25 };
+    const wav_bytes = try audio.wav.encodeMono(allocator, &samples, .{
+        .audio_format = 1,
+        .sample_rate = 16_000,
+        .bits_per_sample = 16,
+    });
+    defer allocator.free(wav_bytes);
+
+    const frames = try prepareGemma4RawAudioFrames(allocator, wav_bytes, 4, 4);
+    defer allocator.free(frames);
+
+    try std.testing.expectEqual(@as(usize, 8), frames.len);
+    for (samples, 0..) |expected, idx| {
+        try std.testing.expectApproxEqAbs(expected, frames[idx], 1.0 / 32768.0);
+    }
+    try std.testing.expectEqual(@as(f32, 0.0), frames[5]);
+    try std.testing.expectEqual(@as(f32, 0.0), frames[6]);
+    try std.testing.expectEqual(@as(f32, 0.0), frames[7]);
 }
 
 const AudioFeatures = struct {
@@ -1579,28 +1603,28 @@ fn positionEmbeddingValue(
     hidden_first: bool,
 ) f32 {
     return if (hidden_first)
-        data[(axis * positions_per_axis + position) * hidden + h]
+        data[(h * positions_per_axis + position) * 2 + axis]
     else
-        data[(h * positions_per_axis + position) * 2 + axis];
+        data[(axis * positions_per_axis + position) * hidden + h];
 }
 
-test "gemma4 position embedding indexes hidden-first and axis-first layouts" {
+test "gemma4 position embedding indexes GGUF-normalized layouts" {
     const hidden: usize = 3;
     const positions: usize = 4;
-    const hidden_first = [_]f32{
+    const axis_hidden_raw = [_]f32{
         100, 101, 102, 110, 111, 112, 120, 121, 122, 130, 131, 132,
         200, 201, 202, 210, 211, 212, 220, 221, 222, 230, 231, 232,
     };
-    try std.testing.expectEqual(@as(f32, 111), positionEmbeddingValue(&hidden_first, hidden, positions, 0, 1, 1, true));
-    try std.testing.expectEqual(@as(f32, 221), positionEmbeddingValue(&hidden_first, hidden, positions, 1, 2, 1, true));
+    try std.testing.expectEqual(@as(f32, 111), positionEmbeddingValue(&axis_hidden_raw, hidden, positions, 0, 1, 1, false));
+    try std.testing.expectEqual(@as(f32, 221), positionEmbeddingValue(&axis_hidden_raw, hidden, positions, 1, 2, 1, false));
 
-    const axis_first = [_]f32{
+    const hidden_axis_raw = [_]f32{
         100, 200, 110, 210, 120, 220, 130, 230,
         101, 201, 111, 211, 121, 221, 131, 231,
         102, 202, 112, 212, 122, 222, 132, 232,
     };
-    try std.testing.expectEqual(@as(f32, 111), positionEmbeddingValue(&axis_first, hidden, positions, 0, 1, 1, false));
-    try std.testing.expectEqual(@as(f32, 221), positionEmbeddingValue(&axis_first, hidden, positions, 1, 2, 1, false));
+    try std.testing.expectEqual(@as(f32, 111), positionEmbeddingValue(&hidden_axis_raw, hidden, positions, 0, 1, 1, true));
+    try std.testing.expectEqual(@as(f32, 221), positionEmbeddingValue(&hidden_axis_raw, hidden, positions, 1, 2, 1, true));
 }
 
 test "gemma4 12b real mmproj optional projector smoke" {
