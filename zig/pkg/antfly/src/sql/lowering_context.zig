@@ -324,9 +324,18 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: gen
     try validateGeneratedReadListAstBoundaryExpressions(tokens, read_ast, read_ast.order_items, read_ast.order_first_expression, read_ast.order_last_expression);
     try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, read_ast.where_expression);
     try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, read_ast.having_expression);
-    try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, read_ast.limit_expression);
-    try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, read_ast.offset_expression);
-    try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, read_ast.fetch_count_expression);
+    try validateGeneratedReadPaginationPayloads(
+        tokens,
+        read_ast,
+        read_ast.limit_tokens,
+        read_ast.limit_expression,
+        read_ast.limit_all,
+        read_ast.offset_tokens,
+        read_ast.offset_expression,
+        read_ast.fetch_tokens,
+        read_ast.fetch_count_tokens,
+        read_ast.fetch_count_expression,
+    );
     try validateGeneratedWindowAstListRanges(tokens, read_ast, read_ast.window_tokens, read_ast.window_items, read_ast.window_count);
     try validateGeneratedSetOperationAstRanges(tokens, read_ast, read_ast.set_operation_tokens, read_ast.set_operation);
     for (read_ast.cte_items) |cte| {
@@ -370,9 +379,18 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: gen
         try validateGeneratedReadListAstRanges(tokens, read_ast, cte.body_order_items);
         try validateGeneratedReadListAstContainedByOptionalRange(cte.body_order_items, cte.body_order_tokens);
         try validateGeneratedReadListAstBoundaryExpressions(tokens, read_ast, cte.body_order_items, cte.body_order_first_expression, cte.body_order_last_expression);
-        try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, cte.body_limit_expression);
-        try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, cte.body_offset_expression);
-        try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, cte.body_fetch_count_expression);
+        try validateGeneratedReadPaginationPayloads(
+            tokens,
+            read_ast,
+            cte.body_limit_tokens,
+            cte.body_limit_expression,
+            cte.body_limit_all,
+            cte.body_offset_tokens,
+            cte.body_offset_expression,
+            cte.body_fetch_tokens,
+            cte.body_fetch_count_tokens,
+            cte.body_fetch_count_expression,
+        );
         try validateGeneratedJoinAstRanges(tokens, read_ast, cte.body_join_items);
         try validateGeneratedSetOperationAstRanges(tokens, read_ast, cte.body_set_operation_tokens, cte.body_set_operation);
     }
@@ -1032,6 +1050,62 @@ fn validateGeneratedExpressionAstRangesIfPresent(
 ) !void {
     if (!generatedExpressionAstHasMetadata(expression)) return;
     try validateGeneratedExpressionAstRanges(tokens, read_ast, expression);
+}
+
+fn validateGeneratedOptionalExpressionAstContainedByRange(
+    tokens: []const tokenized.Token,
+    read_ast: generated_parser.GeneratedSqlReadAst,
+    range: generated_parser.GeneratedSqlTokenRange,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    if (!generatedExpressionAstHasMetadata(expression)) return error.UnsupportedSqlShape;
+    try validateGeneratedExpressionAstRanges(tokens, read_ast, expression);
+    const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
+    if (expression_tokens.start < range.start or expression_tokens.end > range.end) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedReadPaginationPayloads(
+    tokens: []const tokenized.Token,
+    read_ast: generated_parser.GeneratedSqlReadAst,
+    limit_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    limit_expression: generated_parser.GeneratedSqlExpressionAst,
+    limit_all: bool,
+    offset_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    offset_expression: generated_parser.GeneratedSqlExpressionAst,
+    fetch_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    fetch_count_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    fetch_count_expression: generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    if (limit_tokens) |range| {
+        if (limit_all) {
+            if (generatedExpressionAstHasMetadata(limit_expression)) return error.UnsupportedSqlShape;
+        } else {
+            try validateGeneratedOptionalExpressionAstContainedByRange(tokens, read_ast, range, limit_expression);
+            const expression_tokens = limit_expression.tokens orelse return error.UnsupportedSqlShape;
+            if (!std.meta.eql(expression_tokens, range)) return error.UnsupportedSqlShape;
+        }
+    } else if (limit_all or generatedExpressionAstHasMetadata(limit_expression)) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (offset_tokens) |range| {
+        try validateGeneratedOptionalExpressionAstContainedByRange(tokens, read_ast, range, offset_expression);
+    } else if (generatedExpressionAstHasMetadata(offset_expression)) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (fetch_tokens) |range| {
+        if (fetch_count_tokens) |count_tokens| {
+            if (count_tokens.start < range.start or count_tokens.end > range.end) return error.UnsupportedSqlShape;
+            try validateGeneratedOptionalExpressionAstContainedByRange(tokens, read_ast, count_tokens, fetch_count_expression);
+            const expression_tokens = fetch_count_expression.tokens orelse return error.UnsupportedSqlShape;
+            if (!std.meta.eql(expression_tokens, count_tokens)) return error.UnsupportedSqlShape;
+        } else if (generatedExpressionAstHasMetadata(fetch_count_expression)) {
+            return error.UnsupportedSqlShape;
+        }
+    } else if (fetch_count_tokens != null or generatedExpressionAstHasMetadata(fetch_count_expression)) {
+        return error.UnsupportedSqlShape;
+    }
 }
 
 fn validateGeneratedExpressionAstChild(
@@ -2622,6 +2696,73 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_order_list_containment_parsed_sql, malformed_order_list_containment_read_ast),
+    );
+
+    var malformed_limit_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records LIMIT 5",
+    );
+    defer malformed_limit_expression_parsed_sql.deinit(alloc);
+    const malformed_limit_expression_generated_raw = malformed_limit_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_limit_expression_read_ast = switch (malformed_limit_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_limit_expression_read_ast.limit_expression = .{};
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_limit_expression_parsed_sql, malformed_limit_expression_read_ast),
+    );
+
+    var malformed_limit_all_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records LIMIT ALL",
+    );
+    defer malformed_limit_all_expression_parsed_sql.deinit(alloc);
+    const malformed_limit_all_expression_generated_raw = malformed_limit_all_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_limit_all_expression_read_ast = switch (malformed_limit_all_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_limit_all_expression_read_ast.limit_expression =
+        malformed_limit_all_expression_read_ast.projection_first_expression;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_limit_all_expression_parsed_sql, malformed_limit_all_expression_read_ast),
+    );
+
+    var malformed_offset_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records OFFSET 2 ROWS",
+    );
+    defer malformed_offset_expression_parsed_sql.deinit(alloc);
+    const malformed_offset_expression_generated_raw = malformed_offset_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_offset_expression_read_ast = switch (malformed_offset_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_offset_expression_read_ast.offset_expression.tokens =
+        malformed_offset_expression_read_ast.projection_items.expression_items[0];
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_offset_expression_parsed_sql, malformed_offset_expression_read_ast),
+    );
+
+    var malformed_fetch_count_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records FETCH FIRST 3 ROWS ONLY",
+    );
+    defer malformed_fetch_count_expression_parsed_sql.deinit(alloc);
+    const malformed_fetch_count_expression_generated_raw = malformed_fetch_count_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_fetch_count_expression_read_ast = switch (malformed_fetch_count_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_fetch_count_expression_read_ast.fetch_count_expression.tokens =
+        malformed_fetch_count_expression_read_ast.projection_items.expression_items[0];
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_fetch_count_expression_parsed_sql, malformed_fetch_count_expression_read_ast),
     );
 
     var malformed_projection_alias_parsed_sql = try tokenized.ParsedSql.initAlloc(

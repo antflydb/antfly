@@ -462,7 +462,10 @@ Unsupported DDL remains on the existing parser until
    marker, offset expressions, and explicit fetch-count expressions, and
    simple query, aggregate, join, lateral, set-operation, window, and
    non-recursive CTE final-read pagination now use generated range-validated
-   lowering when generated read metadata is available.
+   lowering when generated read metadata is available. Generated read validation
+   rejects pagination payloads that are missing required expressions, attach
+   expressions to `LIMIT ALL`, place expression spans outside their owning
+   pagination tail, or mismatch explicit `FETCH` count spans.
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current
