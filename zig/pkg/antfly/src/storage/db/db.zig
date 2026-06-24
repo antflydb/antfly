@@ -13158,7 +13158,7 @@ pub const DB = struct {
         if (req.row_claim != null) return error.UnsupportedQueryRequest;
         if (ranges.len > 0 and req.doc_key_range != null) return error.InvalidQueryRequest;
         try relational_rows.validateBaseQueryRequestAgainstSchema(runtime_schema, req);
-        try validateRelationalRowsDocKeyRanges(ranges);
+        try relational_rows.validateDocKeyRanges(ranges);
 
         lockApplyShared(self);
         var apply_shared_held = true;
@@ -13198,7 +13198,7 @@ pub const DB = struct {
         if (runtime_schema.storage_mode != .relational or runtime_schema.primary_key == null) return error.InvalidArgument;
         try relational_rows.validateQueryPlanRequest(plan);
         try relational_rows.validateQueryPlanCteReferences(plan);
-        const planned_ctes = try planRelationalRowsCteOutputsAlloc(alloc, runtime_schema, plan.ctes);
+        const planned_ctes = try relational_rows.planCteOutputsAlloc(alloc, runtime_schema, plan.ctes);
         defer relational_rows.deinitPlannedCtes(alloc, planned_ctes);
         try relational_rows.validateQueryAgainstPlannedCteOutput(planned_ctes, plan.query);
 
@@ -13262,8 +13262,8 @@ pub const DB = struct {
             try validateRelationalRowsInsertSourceExpression(source_schema, assignment.expression);
         }
         if (req.on_conflict) |conflict| try validateRelationalRowsOnConflict(target_schema, conflict);
-        try validateRelationalRowsMutationReturningRequestOutputs(target_schema, req.returning, req.returning_all, req.returning_expressions);
-        try validateRelationalRowsMutationReturningTargetExpressions(target_schema, req.returning_expressions);
+        try relational_rows.validateMutationReturningRequestOutputs(target_schema, req.returning, req.returning_all, req.returning_expressions);
+        try relational_rows.validateMutationReturningTargetExpressions(target_schema, req.returning_expressions);
     }
 
     pub fn planRelationalRowsMutationSourceAlloc(
@@ -13363,7 +13363,7 @@ pub const DB = struct {
     ) ![]RelationalRowsMutationSourceCandidate {
         if (ranges.len == 0) return try self.collectRelationalRowsMutationSourceCandidatesAlloc(alloc, runtime_schema, req, null);
         if (req.source.doc_key_range != null) return error.InvalidQueryRequest;
-        try validateRelationalRowsDocKeyRanges(ranges);
+        try relational_rows.validateDocKeyRanges(ranges);
 
         var candidates = std.ArrayListUnmanaged(RelationalRowsMutationSourceCandidate).empty;
         errdefer {
@@ -13735,12 +13735,12 @@ pub const DB = struct {
         target_ranges: []const types.RelationalRowsDocKeyRange,
         source_ranges: []const types.RelationalRowsDocKeyRange,
     ) ![]RelationalRowsJoinedMutationSourceCandidate {
-        const target_query = relationalRowsJoinedMutationTargetQuery(req);
-        const source_query = relationalRowsJoinedMutationSourceQuery(req);
+        const target_query = relational_rows.joinedMutationTargetQuery(req);
+        const source_query = relational_rows.joinedMutationSourceQuery(req);
         if (target_query.doc_key_range != null or source_query.doc_key_range != null) return error.InvalidQueryRequest;
         _ = try validateRelationalRowsJoinedMutationSourceRequestWithSchemas(alloc, target_schema, source_schema, req);
-        try validateRelationalRowsDocKeyRanges(target_ranges);
-        try validateRelationalRowsDocKeyRanges(source_ranges);
+        try relational_rows.validateDocKeyRanges(target_ranges);
+        try relational_rows.validateDocKeyRanges(source_ranges);
 
         var target_candidates = std.ArrayListUnmanaged(RelationalRowsMutationSourceCandidate).empty;
         errdefer {
@@ -13820,7 +13820,7 @@ pub const DB = struct {
     ) ![]RelationalRowsMutationSourceCandidate {
         _ = try validateRelationalRowsJoinedMutationTargetSideRequest(runtime_schema, req);
 
-        var target_source = relationalRowsJoinedMutationTargetSource(req);
+        var target_source = relational_rows.joinedMutationTargetSource(req);
         if (target_doc_key_range) |range| target_source.doc_key_range = range;
         target_source.order_by = req.join.order_by;
 
@@ -13870,23 +13870,23 @@ pub const DB = struct {
         if (req.join.join_type != .inner) return error.UnsupportedQueryRequest;
         if (req.join.select.len != 0) return error.UnsupportedQueryRequest;
 
-        const target = relationalRowsJoinedMutationTargetQuery(req);
-        const source = relationalRowsJoinedMutationSourceQuery(req);
+        const target = relational_rows.joinedMutationTargetQuery(req);
+        const source = relational_rows.joinedMutationSourceQuery(req);
         const claim = target.row_claim orelse return error.InvalidQueryRequest;
         if (claim.txn_id == null) return error.InvalidQueryRequest;
         if (!claim.mode.isExclusiveWriteClaim()) return error.InvalidQueryRequest;
         if (source.row_claim != null) return error.InvalidQueryRequest;
-        try validateRelationalRowsJoinedMutationCteReferences(req);
+        try relational_rows.validateJoinedMutationCteReferences(req);
         if (target.doc_key_range != null or source.doc_key_range != null) return error.UnsupportedQueryRequest;
         if (relational_rows.queryHasDistinctOn(target) or relational_rows.queryHasDistinctOn(source)) return error.UnsupportedQueryRequest;
-        try validateRelationalRowsJoinedMutationJoinFieldsForSide(target_schema, req, relationalRowsJoinedMutationTargetJoinSide(req));
+        try relational_rows.validateJoinedMutationJoinFieldsForSide(target_schema, req, relational_rows.joinedMutationTargetJoinSide(req));
         if (req.kind == .update and req.source_assignments.len == 0 and req.operations.len == 0 and req.patch_expressions.len == 0 and req.increment_expressions.len == 0 and req.json_set_expressions.len == 0) return error.InvalidQueryRequest;
         if (req.kind == .delete and (req.rewrite_identity or req.source_assignments.len != 0 or req.operations.len != 0 or req.patch_expressions.len != 0 or req.increment_expressions.len != 0 or req.json_set_expressions.len != 0)) return error.InvalidQueryRequest;
         try relational_rows.validateMutationUpdateTargetPaths(req.operations, req.patch_expressions, req.increment_expressions, req.json_set_expressions, req.source_assignments);
         const touches_primary_key = relationalRowsJoinedMutationTouchesPrimaryKey(target_schema.primary_key.?, req);
         if (touches_primary_key != req.rewrite_identity) return error.InvalidQueryRequest;
         if (req.rewrite_identity and target_schema.primary_key.?.without_overlaps_period != null) return error.UnsupportedQueryRequest;
-        try validateRelationalRowsMutationReturningRequestOutputs(target_schema, req.returning, req.returning_all, req.returning_expressions);
+        try relational_rows.validateMutationReturningRequestOutputs(target_schema, req.returning, req.returning_all, req.returning_expressions);
         for (req.source_assignments) |assignment| {
             if (assignment.source_side == req.target_side) return error.InvalidQueryRequest;
             _ = relationalRowsFindColumn(target_schema.relational_columns, assignment.field) orelse return error.InvalidQueryRequest;
@@ -13928,14 +13928,14 @@ pub const DB = struct {
         source_ranges: []const types.RelationalRowsDocKeyRange,
     ) !types.RelationalRowsQueryResult {
         try validateRelationalRowsJoinedMutationSourceSideRequest(source_schema, req);
-        try validateRelationalRowsDocKeyRanges(source_ranges);
-        const source_source = relationalRowsJoinedMutationSourceSide(req);
+        try relational_rows.validateDocKeyRanges(source_ranges);
+        const source_source = relational_rows.joinedMutationSourceSide(req);
         if (req.ctes.len == 0) {
             if (source_ranges.len > 0) return try self.queryRelationalRowsAcrossRanges(alloc, source_schema, source_source, source_ranges);
             return try self.queryRelationalRows(alloc, source_schema, source_source);
         }
 
-        const planned_ctes = try planRelationalRowsCteOutputsAlloc(alloc, source_schema, req.ctes);
+        const planned_ctes = try relational_rows.planCteOutputsAlloc(alloc, source_schema, req.ctes);
         defer relational_rows.deinitPlannedCtes(alloc, planned_ctes);
         try relational_rows.validateJoinAgainstPlannedCteOutput(planned_ctes, req.join);
 
@@ -13957,16 +13957,16 @@ pub const DB = struct {
         if (req.join.join_type != .inner) return error.UnsupportedQueryRequest;
         if (req.join.select.len != 0) return error.UnsupportedQueryRequest;
 
-        const target = relationalRowsJoinedMutationTargetQuery(req);
-        const source = relationalRowsJoinedMutationSourceQuery(req);
+        const target = relational_rows.joinedMutationTargetQuery(req);
+        const source = relational_rows.joinedMutationSourceQuery(req);
         const claim = target.row_claim orelse return error.InvalidQueryRequest;
         if (claim.txn_id == null) return error.InvalidQueryRequest;
         if (!claim.mode.isExclusiveWriteClaim()) return error.InvalidQueryRequest;
         if (source.row_claim != null) return error.InvalidQueryRequest;
-        try validateRelationalRowsJoinedMutationCteReferences(req);
+        try relational_rows.validateJoinedMutationCteReferences(req);
         if (target.doc_key_range != null or source.doc_key_range != null) return error.UnsupportedQueryRequest;
         if (relational_rows.queryHasDistinctOn(target) or relational_rows.queryHasDistinctOn(source)) return error.UnsupportedQueryRequest;
-        try validateRelationalRowsJoinedMutationJoinFieldsForSide(source_schema, req, relationalRowsJoinedMutationSourceJoinSide(req));
+        try relational_rows.validateJoinedMutationJoinFieldsForSide(source_schema, req, relational_rows.joinedMutationSourceJoinSide(req));
         if (req.kind == .update and req.source_assignments.len == 0 and req.operations.len == 0 and req.patch_expressions.len == 0 and req.increment_expressions.len == 0 and req.json_set_expressions.len == 0) return error.InvalidQueryRequest;
         if (req.kind == .delete and (req.rewrite_identity or req.source_assignments.len != 0 or req.operations.len != 0 or req.patch_expressions.len != 0 or req.increment_expressions.len != 0 or req.json_set_expressions.len != 0)) return error.InvalidQueryRequest;
         try relational_rows.validateMutationUpdateTargetPaths(req.operations, req.patch_expressions, req.increment_expressions, req.json_set_expressions, req.source_assignments);
@@ -13977,9 +13977,9 @@ pub const DB = struct {
         }
     }
 
-    fn validateRelationalRowsJoinedMutationCteReferences(req: types.RelationalRowsJoinedMutationSourceRequest) !void {
-        const target = relationalRowsJoinedMutationTargetQuery(req);
-        const source = relationalRowsJoinedMutationSourceQuery(req);
+    fn relational_rows.validateJoinedMutationCteReferences(req: types.RelationalRowsJoinedMutationSourceRequest) !void {
+        const target = relational_rows.joinedMutationTargetQuery(req);
+        const source = relational_rows.joinedMutationSourceQuery(req);
         if (target.source_cte.len != 0) return error.UnsupportedQueryRequest;
         if (req.ctes.len == 0) {
             if (source.source_cte.len != 0) return error.InvalidQueryRequest;
@@ -13990,7 +13990,7 @@ pub const DB = struct {
         try relational_rows.validateFinalCteReference(req.ctes, source.source_cte);
     }
 
-    fn validateRelationalRowsJoinedMutationJoinFieldsForSide(
+    fn relational_rows.validateJoinedMutationJoinFieldsForSide(
         runtime_schema: schema_mod.TableSchema,
         req: types.RelationalRowsJoinedMutationSourceRequest,
         side: RelationalRowsJoinSide,
@@ -14004,7 +14004,7 @@ pub const DB = struct {
         }
     }
 
-    fn validateRelationalRowsJoinedMutationJoinFieldsForOutputFields(
+    fn relational_rows.validateJoinedMutationJoinFieldsForOutputFields(
         output_fields: []const []const u8,
         req: types.RelationalRowsJoinedMutationSourceRequest,
         side: RelationalRowsJoinSide,
@@ -14026,7 +14026,7 @@ pub const DB = struct {
     ) ![]RelationalRowsJoinedMutationSourceCandidate {
         var source_index = std.StringArrayHashMapUnmanaged(RelationalRowsJoinRightList).empty;
         defer deinitRelationalRowsJoinRightIndex(alloc, &source_index);
-        const source_join_side = relationalRowsJoinedMutationSourceJoinSide(req);
+        const source_join_side = relational_rows.joinedMutationSourceJoinSide(req);
         for (source_rows, 0..) |source_row, source_index_id| {
             var parsed_source = std.json.parseFromSlice(std.json.Value, alloc, source_row, .{}) catch return error.InvalidQueryRequest;
             defer parsed_source.deinit();
@@ -14049,7 +14049,7 @@ pub const DB = struct {
             for (candidates.items) |*candidate| candidate.deinit(alloc);
             candidates.deinit(alloc);
         }
-        const target_join_side = relationalRowsJoinedMutationTargetJoinSide(req);
+        const target_join_side = relational_rows.joinedMutationTargetJoinSide(req);
         for (target_candidates.*) |*target_row| {
             var parsed_target = std.json.parseFromSlice(std.json.Value, alloc, target_row.json, .{}) catch return error.InvalidQueryRequest;
             defer parsed_target.deinit();
@@ -14102,7 +14102,7 @@ pub const DB = struct {
         else
             items.len - start;
 
-        const claim = relationalRowsJoinedMutationClaim(req) orelse return error.InvalidQueryRequest;
+        const claim = relational_rows.joinedMutationClaim(req) orelse return error.InvalidQueryRequest;
         const scan_end = if (claim.effectiveSkipLocked()) items.len else start + limited_len;
         var selected = std.ArrayListUnmanaged(RelationalRowsJoinedMutationSourceCandidate).empty;
         errdefer {
@@ -14837,8 +14837,8 @@ pub const DB = struct {
         if (touches_primary_key != req.rewrite_identity) return error.InvalidQueryRequest;
         if (req.rewrite_identity and runtime_schema.primary_key.?.without_overlaps_period != null) return error.UnsupportedQueryRequest;
         if (req.temporal_portion) |portion| try validateRelationalRowsTemporalPortionRequest(alloc, runtime_schema, portion, req);
-        try validateRelationalRowsMutationReturningRequestOutputs(runtime_schema, req.returning, req.returning_all, req.returning_expressions);
-        try validateRelationalRowsMutationReturningTargetExpressions(runtime_schema, req.returning_expressions);
+        try relational_rows.validateMutationReturningRequestOutputs(runtime_schema, req.returning, req.returning_all, req.returning_expressions);
+        try relational_rows.validateMutationReturningTargetExpressions(runtime_schema, req.returning_expressions);
         return claim;
     }
 
@@ -14930,20 +14930,20 @@ pub const DB = struct {
         if (req.join.join_type != .inner) return error.UnsupportedQueryRequest;
         if (req.join.select.len != 0) return error.UnsupportedQueryRequest;
 
-        const target = relationalRowsJoinedMutationTargetQuery(req);
-        const source = relationalRowsJoinedMutationSourceQuery(req);
+        const target = relational_rows.joinedMutationTargetQuery(req);
+        const source = relational_rows.joinedMutationSourceQuery(req);
         const claim = target.row_claim orelse return error.InvalidQueryRequest;
         if (claim.txn_id == null) return error.InvalidQueryRequest;
         if (!claim.mode.isExclusiveWriteClaim()) return error.InvalidQueryRequest;
         if (source.row_claim != null) return error.InvalidQueryRequest;
-        try validateRelationalRowsJoinedMutationCteReferences(req);
+        try relational_rows.validateJoinedMutationCteReferences(req);
         if (target.doc_key_range != null or source.doc_key_range != null) return error.UnsupportedQueryRequest;
         if (relational_rows.queryHasDistinctOn(target) or relational_rows.queryHasDistinctOn(source)) return error.UnsupportedQueryRequest;
 
         var planned_ctes: []relational_rows.PlannedCte = &.{};
         defer if (planned_ctes.len != 0) relational_rows.deinitPlannedCtes(alloc, planned_ctes);
         const source_output_fields: ?[]const []const u8 = if (req.ctes.len != 0) blk: {
-            planned_ctes = try planRelationalRowsCteOutputsAlloc(alloc, source_schema, req.ctes);
+            planned_ctes = try relational_rows.planCteOutputsAlloc(alloc, source_schema, req.ctes);
             try relational_rows.validateJoinAgainstPlannedCteOutput(planned_ctes, req.join);
             break :blk relational_rows.plannedSourceCteOutputFields(planned_ctes, source) orelse return error.InvalidQueryRequest;
         } else null;
@@ -14955,11 +14955,11 @@ pub const DB = struct {
         } else {
             try relational_rows.validateBaseQueryRequestAgainstSchema(source_schema, source);
         }
-        try validateRelationalRowsJoinedMutationJoinFieldsForSide(target_schema, req, relationalRowsJoinedMutationTargetJoinSide(req));
+        try relational_rows.validateJoinedMutationJoinFieldsForSide(target_schema, req, relational_rows.joinedMutationTargetJoinSide(req));
         if (source_output_fields) |fields| {
-            try validateRelationalRowsJoinedMutationJoinFieldsForOutputFields(fields, req, relationalRowsJoinedMutationSourceJoinSide(req));
+            try relational_rows.validateJoinedMutationJoinFieldsForOutputFields(fields, req, relational_rows.joinedMutationSourceJoinSide(req));
         } else {
-            try validateRelationalRowsJoinedMutationJoinFieldsForSide(source_schema, req, relationalRowsJoinedMutationSourceJoinSide(req));
+            try relational_rows.validateJoinedMutationJoinFieldsForSide(source_schema, req, relational_rows.joinedMutationSourceJoinSide(req));
         }
         if (req.kind == .update and req.source_assignments.len == 0 and req.operations.len == 0 and req.patch_expressions.len == 0 and req.increment_expressions.len == 0 and req.json_set_expressions.len == 0) return error.InvalidQueryRequest;
         if (req.kind == .delete and (req.rewrite_identity or req.source_assignments.len != 0 or req.operations.len != 0 or req.patch_expressions.len != 0 or req.increment_expressions.len != 0 or req.json_set_expressions.len != 0)) return error.InvalidQueryRequest;
@@ -14967,17 +14967,17 @@ pub const DB = struct {
         const touches_primary_key = relationalRowsJoinedMutationTouchesPrimaryKey(target_schema.primary_key.?, req);
         if (touches_primary_key != req.rewrite_identity) return error.InvalidQueryRequest;
         if (req.rewrite_identity and target_schema.primary_key.?.without_overlaps_period != null) return error.UnsupportedQueryRequest;
-        try validateRelationalRowsMutationReturningRequestOutputs(target_schema, req.returning, req.returning_all, req.returning_expressions);
-        try validateRelationalRowsJoinedMutationReturningExpressions(target_schema, source_schema, req.returning_expressions);
-        try validateRelationalRowsJoinedMutationMatchExpressions(target_schema, source_schema, req);
+        try relational_rows.validateMutationReturningRequestOutputs(target_schema, req.returning, req.returning_all, req.returning_expressions);
+        try relational_rows.validateJoinedMutationReturningExpressions(target_schema, source_schema, req.returning_expressions);
+        try relational_rows.validateJoinedMutationMatchExpressions(target_schema, source_schema, req);
         for (req.patch_expressions) |assignment| {
-            try validateRelationalRowsJoinedMutationReturningExpression(target_schema, source_schema, assignment.expression);
+            try relational_rows.validateJoinedMutationReturningExpression(target_schema, source_schema, assignment.expression);
         }
         for (req.increment_expressions) |assignment| {
-            try validateRelationalRowsJoinedMutationReturningExpression(target_schema, source_schema, assignment.expression);
+            try relational_rows.validateJoinedMutationReturningExpression(target_schema, source_schema, assignment.expression);
         }
         for (req.json_set_expressions) |assignment| {
-            try validateRelationalRowsJoinedMutationReturningExpression(target_schema, source_schema, assignment.expression);
+            try relational_rows.validateJoinedMutationReturningExpression(target_schema, source_schema, assignment.expression);
         }
         for (req.source_assignments) |assignment| {
             if (assignment.source_side == req.target_side) return error.InvalidQueryRequest;
@@ -14992,7 +14992,7 @@ pub const DB = struct {
         return claim;
     }
 
-    fn validateRelationalRowsJoinedMutationMatchExpressions(
+    fn relational_rows.validateJoinedMutationMatchExpressions(
         target_schema: schema_mod.TableSchema,
         source_schema: schema_mod.TableSchema,
         req: types.RelationalRowsJoinedMutationSourceRequest,
@@ -15042,7 +15042,7 @@ pub const DB = struct {
         for (expression.case_else) |case_else| try validateRelationalRowsJoinedMutationMatchExpression(target_schema, source_schema, case_else);
     }
 
-    fn validateRelationalRowsMutationReturningRequestOutputs(
+    fn relational_rows.validateMutationReturningRequestOutputs(
         runtime_schema: schema_mod.TableSchema,
         fields: []const []const u8,
         returning_all: bool,
@@ -15065,7 +15065,7 @@ pub const DB = struct {
         }
     }
 
-    fn validateRelationalRowsMutationReturningTargetExpressions(
+    fn relational_rows.validateMutationReturningTargetExpressions(
         runtime_schema: schema_mod.TableSchema,
         expressions: []const types.RelationalRowsExpressionProjection,
     ) !void {
@@ -15096,17 +15096,17 @@ pub const DB = struct {
         for (expression.case_else) |case_else| try validateRelationalRowsMutationReturningTargetExpression(runtime_schema, case_else);
     }
 
-    fn validateRelationalRowsJoinedMutationReturningExpressions(
+    fn relational_rows.validateJoinedMutationReturningExpressions(
         target_schema: schema_mod.TableSchema,
         source_schema: schema_mod.TableSchema,
         expressions: []const types.RelationalRowsExpressionProjection,
     ) !void {
         for (expressions) |projection| {
-            try validateRelationalRowsJoinedMutationReturningExpression(target_schema, source_schema, projection.expression);
+            try relational_rows.validateJoinedMutationReturningExpression(target_schema, source_schema, projection.expression);
         }
     }
 
-    fn validateRelationalRowsJoinedMutationReturningExpression(
+    fn relational_rows.validateJoinedMutationReturningExpression(
         target_schema: schema_mod.TableSchema,
         source_schema: schema_mod.TableSchema,
         expression: types.RelationalRowsExpression,
@@ -15116,21 +15116,21 @@ pub const DB = struct {
             const schema = if (expression.field_source == .source) source_schema else target_schema;
             _ = relationalRowsFindColumn(schema.relational_columns, expression.field) orelse return error.InvalidQueryRequest;
         }
-        for (expression.operands) |operand| try validateRelationalRowsJoinedMutationReturningExpression(target_schema, source_schema, operand);
+        for (expression.operands) |operand| try relational_rows.validateJoinedMutationReturningExpression(target_schema, source_schema, operand);
         for (expression.case_branches) |branch| {
-            try validateRelationalRowsJoinedMutationReturningExpressionCondition(target_schema, source_schema, branch.when);
-            try validateRelationalRowsJoinedMutationReturningExpression(target_schema, source_schema, branch.then);
+            try relational_rows.validateJoinedMutationReturningExpressionCondition(target_schema, source_schema, branch.when);
+            try relational_rows.validateJoinedMutationReturningExpression(target_schema, source_schema, branch.then);
         }
-        for (expression.case_else) |case_else| try validateRelationalRowsJoinedMutationReturningExpression(target_schema, source_schema, case_else);
+        for (expression.case_else) |case_else| try relational_rows.validateJoinedMutationReturningExpression(target_schema, source_schema, case_else);
     }
 
-    fn validateRelationalRowsJoinedMutationReturningExpressionCondition(
+    fn relational_rows.validateJoinedMutationReturningExpressionCondition(
         target_schema: schema_mod.TableSchema,
         source_schema: schema_mod.TableSchema,
         condition: types.RelationalRowsExpressionCondition,
     ) anyerror!void {
-        try validateRelationalRowsJoinedMutationReturningExpression(target_schema, source_schema, condition.lhs);
-        for (condition.rhs) |rhs| try validateRelationalRowsJoinedMutationReturningExpression(target_schema, source_schema, rhs);
+        try relational_rows.validateJoinedMutationReturningExpression(target_schema, source_schema, condition.lhs);
+        for (condition.rhs) |rhs| try relational_rows.validateJoinedMutationReturningExpression(target_schema, source_schema, rhs);
     }
 
     fn validateRelationalRowsInsertSourceExpression(
@@ -15278,7 +15278,7 @@ pub const DB = struct {
         if (runtime_schema.storage_mode != .relational or runtime_schema.primary_key == null) return error.InvalidArgument;
         try relational_rows.validateWindowRequestAlloc(alloc, plan.window);
         try relational_rows.validateWindowPlanCteReferences(plan);
-        const planned_ctes = try planRelationalRowsCteOutputsAlloc(alloc, runtime_schema, plan.ctes);
+        const planned_ctes = try relational_rows.planCteOutputsAlloc(alloc, runtime_schema, plan.ctes);
         defer relational_rows.deinitPlannedCtes(alloc, planned_ctes);
         try relational_rows.validateWindowAgainstPlannedCteOutput(planned_ctes, plan.window);
         try relational_rows.validateWindowOutputReferencesAgainstPlannedCtesAlloc(alloc, runtime_schema, planned_ctes, plan.window);
@@ -15306,7 +15306,7 @@ pub const DB = struct {
         try relational_rows.validateWindowAgainstSchema(runtime_schema, req);
         try relational_rows.validateWindowOutputReferencesAlloc(alloc, runtime_schema, &.{}, req);
 
-        const source = relationalRowsWindowSourceQuery(req, source_order);
+        const source = relational_rows.windowSourceQuery(req, source_order);
         var source_rows = try self.queryRelationalRowsAcrossRanges(alloc, runtime_schema, source, ranges);
         defer source_rows.deinit(alloc);
 
@@ -15628,32 +15628,6 @@ pub const DB = struct {
         return try relational_rows.relationalRowsSetOperationRowsAlloc(alloc, operation, left, right);
     }
 
-    fn planRelationalRowsCteOutputsAlloc(
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        ctes: []const types.RelationalRowsCte,
-    ) ![]relational_rows.PlannedCte {
-        var planned = std.ArrayListUnmanaged(relational_rows.PlannedCte).empty;
-        errdefer {
-            for (planned.items) |*cte| cte.deinit(alloc);
-            planned.deinit(alloc);
-        }
-        for (ctes) |cte| {
-            if (cte.table_function != null and cte.query.source_cte.len != 0) return error.InvalidQueryRequest;
-            try relational_rows.validateQueryAgainstPlannedCteOutput(planned.items, cte.query);
-            const output_fields = if (cte.table_function) |table_function|
-                try relational_rows.tableFunctionOutputFieldsAlloc(alloc, table_function, cte.query)
-            else
-                try relational_rows.plannedQueryOutputFieldsAlloc(alloc, runtime_schema, planned.items, cte.query);
-            errdefer freeOwnedConstStringSlice(alloc, output_fields);
-            try planned.append(alloc, .{
-                .name = cte.name,
-                .output_fields = output_fields,
-            });
-        }
-        return try planned.toOwnedSlice(alloc);
-    }
-
     fn queryRelationalRowsWithMaterializedCtesAlloc(
         self: *DB,
         alloc: Allocator,
@@ -15693,7 +15667,7 @@ pub const DB = struct {
         try relational_rows.validateBaseQueryRequestAgainstSchema(runtime_schema, req);
         if (ranges.len == 0) return try self.queryRelationalRows(alloc, runtime_schema, req);
         if (req.doc_key_range != null) return error.InvalidQueryRequest;
-        try validateRelationalRowsDocKeyRanges(ranges);
+        try relational_rows.validateDocKeyRanges(ranges);
 
         lockApplyShared(self);
         var apply_shared_held = true;
@@ -16067,7 +16041,7 @@ pub const DB = struct {
         if (req.source.source_cte.len == 0) try relational_rows.validateWindowAgainstSchema(runtime_schema, req);
         try relational_rows.validateWindowOutputReferencesAlloc(alloc, runtime_schema, materialized_ctes, req);
 
-        const source = relationalRowsWindowSourceQuery(req, source_order);
+        const source = relational_rows.windowSourceQuery(req, source_order);
         var source_rows = try self.queryRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes, ranges, source);
         defer source_rows.deinit(alloc);
 
@@ -16084,7 +16058,7 @@ pub const DB = struct {
         const source_order = try relational_rows.validateWindowRequestAndSourceOrderAlloc(alloc, req);
         defer alloc.free(source_order);
 
-        const source = relationalRowsWindowSourceQuery(req, source_order);
+        const source = relational_rows.windowSourceQuery(req, source_order);
         var ordered_source_rows = try self.queryRelationalRowsFromSourceRowsAlloc(alloc, source_name, source_rows, source);
         defer ordered_source_rows.deinit(alloc);
 
@@ -16100,29 +16074,11 @@ pub const DB = struct {
         const source_order = try relational_rows.validateWindowRequestAndSourceOrderAlloc(alloc, req);
         defer alloc.free(source_order);
 
-        const source = relationalRowsWindowSourceQuery(req, source_order);
+        const source = relational_rows.windowSourceQuery(req, source_order);
         var ordered_source_rows = try queryRelationalRowsFromSourceRowsStaticAlloc(alloc, source_name, source_rows, source);
         defer ordered_source_rows.deinit(alloc);
 
         return try windowRelationalRowsFromSourceRowsAlloc(alloc, req, ordered_source_rows.rows);
-    }
-
-    fn relationalRowsWindowSourceQuery(
-        req: types.RelationalRowsWindowRequest,
-        source_order: []const types.RelationalRowsQueryOrder,
-    ) types.RelationalRowsQueryRequest {
-        var source = req.source;
-        source.select = &.{};
-        source.json_extract = &.{};
-        source.array_length = &.{};
-        source.coalesce = &.{};
-        source.field_aliases = &.{};
-        source.select_all = true;
-        source.order_by = source_order;
-        source.limit = null;
-        source.offset = 0;
-        source.row_claim = null;
-        return source;
     }
 
     fn windowRelationalRowsFromSourceRowsAlloc(
@@ -17691,20 +17647,6 @@ pub const DB = struct {
         try writer.writeAll("null");
     }
 
-    fn validateRelationalRowsDocKeyRanges(ranges: []const types.RelationalRowsDocKeyRange) !void {
-        var previous_end: ?[]const u8 = null;
-        for (ranges, 0..) |range, i| {
-            if (range.start.len == 0 and range.end.len == 0) return error.InvalidQueryRequest;
-            if (range.start.len > 0 and range.end.len > 0 and std.mem.order(u8, range.start, range.end) != .lt) return error.InvalidQueryRequest;
-            if (i > 0 and range.start.len == 0) return error.InvalidQueryRequest;
-            if (previous_end) |end| {
-                if (end.len == 0) return error.InvalidQueryRequest;
-                if (std.mem.order(u8, range.start, end) == .lt) return error.InvalidQueryRequest;
-            }
-            previous_end = range.end;
-        }
-    }
-
     fn applyRelationalRowsClaimToSelectedCandidatesAlloc(
         self: *DB,
         alloc: Allocator,
@@ -17759,7 +17701,7 @@ pub const DB = struct {
         try relational_rows.validateAggregateRequest(plan.aggregate);
         try relational_rows.validateAggregateOutputReferencesAlloc(alloc, plan.aggregate);
         try relational_rows.validateAggregatePlanCteReferences(plan);
-        const planned_ctes = try planRelationalRowsCteOutputsAlloc(alloc, runtime_schema, plan.ctes);
+        const planned_ctes = try relational_rows.planCteOutputsAlloc(alloc, runtime_schema, plan.ctes);
         defer relational_rows.deinitPlannedCtes(alloc, planned_ctes);
         try relational_rows.validateAggregateAgainstPlannedCteOutput(planned_ctes, plan.aggregate);
         var materialized_ctes = std.ArrayListUnmanaged(relational_rows.MaterializedCte).empty;
@@ -17783,7 +17725,7 @@ pub const DB = struct {
         try relational_rows.validateAggregateOutputReferencesAlloc(alloc, req);
         try relational_rows.validateAggregateAgainstSchema(runtime_schema, req);
 
-        const source = relationalRowsAggregateSourceQuery(req);
+        const source = relational_rows.aggregateSourceQuery(req);
         var source_rows = try self.queryRelationalRowsAcrossRanges(alloc, runtime_schema, source, ranges);
         defer source_rows.deinit(alloc);
 
@@ -17813,22 +17755,12 @@ pub const DB = struct {
         if (req.source.source_cte.len == 0) try relational_rows.validateAggregateAgainstSchema(runtime_schema, req);
         try relational_rows.validateAggregateOutputReferencesAlloc(alloc, req);
 
-        const source = relationalRowsAggregateSourceQuery(req);
+        const source = relational_rows.aggregateSourceQuery(req);
 
         var source_rows = try self.queryRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes, ranges, source);
         defer source_rows.deinit(alloc);
 
         return try aggregateRelationalRowsFromSourceRowsAlloc(alloc, req, source_rows.rows);
-    }
-
-    fn relationalRowsAggregateSourceQuery(req: types.RelationalRowsAggregateRequest) types.RelationalRowsQueryRequest {
-        var source = req.source;
-        source.select = &.{};
-        source.select_all = true;
-        source.order_by = &.{};
-        source.limit = null;
-        source.offset = 0;
-        return source;
     }
 
     pub fn aggregateRelationalRowsFromSourceRowsAlloc(
@@ -18527,7 +18459,7 @@ pub const DB = struct {
         try relational_rows.validateJoinRequest(plan.join);
         try relational_rows.validateJoinOutputReferencesAlloc(alloc, plan.join);
         try relational_rows.validateJoinPlanCteReferences(plan);
-        const planned_ctes = try planRelationalRowsCteOutputsAlloc(alloc, runtime_schema, plan.ctes);
+        const planned_ctes = try relational_rows.planCteOutputsAlloc(alloc, runtime_schema, plan.ctes);
         defer relational_rows.deinitPlannedCtes(alloc, planned_ctes);
         try relational_rows.validateJoinAgainstPlannedCteOutput(planned_ctes, plan.join);
         try relational_rows.validateJoinAgainstSchema(runtime_schema, plan.join);
@@ -18536,7 +18468,7 @@ pub const DB = struct {
             for (materialized_ctes.items) |*cte| cte.deinit(alloc);
             materialized_ctes.deinit(alloc);
         }
-        const cte_ranges = try relationalRowsPlanRangesForJoinAlloc(alloc, plan.left_ranges, plan.right_ranges);
+        const cte_ranges = try relational_rows.planRangesForJoinAlloc(alloc, plan.left_ranges, plan.right_ranges);
         defer if (cte_ranges.len > 0) alloc.free(cte_ranges);
         try self.appendRelationalRowsMaterializedCtesAlloc(alloc, runtime_schema, cte_ranges, plan.ctes, &materialized_ctes);
         return try self.joinRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes.items, plan.left_ranges, plan.right_ranges, plan.join);
@@ -18556,8 +18488,8 @@ pub const DB = struct {
         try relational_rows.validateJoinOutputReferencesAlloc(alloc, req);
         try relational_rows.validateJoinAgainstSchema(runtime_schema, req);
 
-        const left_source = relationalRowsJoinSideSource(req.left);
-        const right_source = relationalRowsJoinSideSource(req.right);
+        const left_source = relational_rows.joinSideSource(req.left);
+        const right_source = relational_rows.joinSideSource(req.right);
 
         var left_rows = try self.queryRelationalRowsAcrossRanges(alloc, runtime_schema, left_source, left_ranges);
         defer left_rows.deinit(alloc);
@@ -18578,7 +18510,7 @@ pub const DB = struct {
         try relational_rows.validateLateralRequest(plan.lateral);
         try relational_rows.validateLateralOutputReferencesAlloc(alloc, plan.lateral);
         try relational_rows.validateLateralPlanCteReferences(plan);
-        const planned_ctes = try planRelationalRowsCteOutputsAlloc(alloc, runtime_schema, plan.ctes);
+        const planned_ctes = try relational_rows.planCteOutputsAlloc(alloc, runtime_schema, plan.ctes);
         defer relational_rows.deinitPlannedCtes(alloc, planned_ctes);
         try relational_rows.validateLateralAgainstPlannedCteOutput(planned_ctes, plan.lateral);
         try relational_rows.validateLateralAgainstSchema(runtime_schema, plan.lateral);
@@ -18587,7 +18519,7 @@ pub const DB = struct {
             for (materialized_ctes.items) |*cte| cte.deinit(alloc);
             materialized_ctes.deinit(alloc);
         }
-        const cte_ranges = try relationalRowsPlanRangesForJoinAlloc(alloc, plan.left_ranges, plan.right_ranges);
+        const cte_ranges = try relational_rows.planRangesForJoinAlloc(alloc, plan.left_ranges, plan.right_ranges);
         defer if (cte_ranges.len > 0) alloc.free(cte_ranges);
         try self.appendRelationalRowsMaterializedCtesAlloc(alloc, runtime_schema, cte_ranges, plan.ctes, &materialized_ctes);
         return try self.lateralRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes.items, plan.left_ranges, plan.right_ranges, plan.lateral);
@@ -18607,7 +18539,7 @@ pub const DB = struct {
         try relational_rows.validateLateralOutputReferencesAlloc(alloc, req);
         try relational_rows.validateLateralAgainstSchema(runtime_schema, req);
 
-        const left_source = relationalRowsLateralLeftSource(req.left);
+        const left_source = relational_rows.lateralLeftSource(req.left);
         var left_rows = try self.queryRelationalRowsAcrossRanges(alloc, runtime_schema, left_source, left_ranges);
         defer left_rows.deinit(alloc);
 
@@ -18639,8 +18571,8 @@ pub const DB = struct {
         try relational_rows.validateJoinAgainstSchema(runtime_schema, req);
         try relational_rows.validateJoinOutputReferencesAlloc(alloc, req);
 
-        const left_source = relationalRowsJoinSideSource(req.left);
-        const right_source = relationalRowsJoinSideSource(req.right);
+        const left_source = relational_rows.joinSideSource(req.left);
+        const right_source = relational_rows.joinSideSource(req.right);
 
         var left_rows = try self.queryRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes, left_ranges, left_source);
         defer left_rows.deinit(alloc);
@@ -18648,63 +18580,6 @@ pub const DB = struct {
         defer right_rows.deinit(alloc);
 
         return try joinRelationalRowsFromSourceRowsAlloc(alloc, req, left_rows.rows, right_rows.rows);
-    }
-
-    fn relationalRowsJoinSideSource(source_req: types.RelationalRowsQueryRequest) types.RelationalRowsQueryRequest {
-        var source = source_req;
-        source.select = &.{};
-        source.select_all = true;
-        return source;
-    }
-
-    fn relationalRowsJoinedMutationTargetQuery(req: types.RelationalRowsJoinedMutationSourceRequest) types.RelationalRowsQueryRequest {
-        return switch (req.target_side) {
-            .left => req.join.left,
-            .right => req.join.right,
-        };
-    }
-
-    fn relationalRowsJoinedMutationSourceQuery(req: types.RelationalRowsJoinedMutationSourceRequest) types.RelationalRowsQueryRequest {
-        return switch (req.target_side) {
-            .left => req.join.right,
-            .right => req.join.left,
-        };
-    }
-
-    fn relationalRowsJoinedMutationTargetSource(req: types.RelationalRowsJoinedMutationSourceRequest) types.RelationalRowsQueryRequest {
-        var source = relationalRowsJoinedMutationTargetQuery(req);
-        source.select = &.{};
-        source.select_all = true;
-        source.row_claim = null;
-        source.limit = null;
-        source.offset = 0;
-        return source;
-    }
-
-    fn relationalRowsJoinedMutationSourceSide(req: types.RelationalRowsJoinedMutationSourceRequest) types.RelationalRowsQueryRequest {
-        var source = relationalRowsJoinedMutationSourceQuery(req);
-        source.select = &.{};
-        source.select_all = true;
-        source.row_claim = null;
-        return source;
-    }
-
-    fn relationalRowsJoinedMutationClaim(req: types.RelationalRowsJoinedMutationSourceRequest) ?types.RowClaimRequest {
-        return relationalRowsJoinedMutationTargetQuery(req).row_claim;
-    }
-
-    fn relationalRowsJoinedMutationTargetJoinSide(req: types.RelationalRowsJoinedMutationSourceRequest) RelationalRowsJoinSide {
-        return switch (req.target_side) {
-            .left => .left,
-            .right => .right,
-        };
-    }
-
-    fn relationalRowsJoinedMutationSourceJoinSide(req: types.RelationalRowsJoinedMutationSourceRequest) RelationalRowsJoinSide {
-        return switch (req.target_side) {
-            .left => .right,
-            .right => .left,
-        };
     }
 
     pub fn joinRelationalRowsFromSourceRowsAlloc(
@@ -18779,10 +18654,10 @@ pub const DB = struct {
                         try joined.append(alloc, row_json);
                         row_transferred = true;
                     }
-                    if (on_matched or req.join_type != .left or relationalRowsJoinHasMatchPredicates(req)) continue;
+                    if (on_matched or req.join_type != .left or relational_rows.joinHasMatchPredicates(req)) continue;
                 }
             }
-            if (req.join_type == .left and !relationalRowsJoinHasMatchPredicates(req)) {
+            if (req.join_type == .left and !relational_rows.joinHasMatchPredicates(req)) {
                 const row_json = try relationalRowsJoinedRowJsonAlloc(alloc, left_row, null, req.select);
                 var row_transferred = false;
                 errdefer if (!row_transferred) alloc.free(row_json);
@@ -18873,7 +18748,7 @@ pub const DB = struct {
                         if (!(try relationalRowsJoinMatchPredicatesPass(alloc, parsed_left.value, right_row, req))) continue;
                         try appendRelationalRowsJoinedRowAlloc(alloc, &joined, left_row, right_row, req.select);
                     }
-                    if (!on_matched and req.join_type == .left and !relationalRowsJoinHasMatchPredicates(req)) {
+                    if (!on_matched and req.join_type == .left and !relational_rows.joinHasMatchPredicates(req)) {
                         try appendRelationalRowsJoinedRowAlloc(alloc, &joined, left_row, null, req.select);
                     }
                 }
@@ -18947,7 +18822,7 @@ pub const DB = struct {
         req: types.RelationalRowsJoinRequest,
         left_row: []const u8,
     ) !void {
-        if (req.join_type != .left or relationalRowsJoinHasMatchPredicates(req)) return;
+        if (req.join_type != .left or relational_rows.joinHasMatchPredicates(req)) return;
         try appendRelationalRowsJoinedRowAlloc(alloc, joined, left_row, null, req.select);
     }
 
@@ -18996,27 +18871,13 @@ pub const DB = struct {
         };
     }
 
-    fn relationalRowsJoinHasMatchPredicates(req: types.RelationalRowsJoinRequest) bool {
-        return req.match_expression_predicates.len != 0 or
-            req.match_expression_or_predicates.len != 0 or
-            req.match_expression_not_predicates.len != 0 or
-            req.match_expression_array_contains.len != 0;
-    }
-
-    fn relationalRowsJoinHasOnExpressionPredicates(req: types.RelationalRowsJoinRequest) bool {
-        return req.on_expression_predicates.len != 0 or
-            req.on_expression_or_predicates.len != 0 or
-            req.on_expression_not_predicates.len != 0 or
-            req.on_expression_array_contains.len != 0;
-    }
-
     fn relationalRowsJoinOnExpressionPredicatesPass(
         alloc: Allocator,
         left_row: std.json.Value,
         right_row_json: []const u8,
         req: types.RelationalRowsJoinRequest,
     ) !bool {
-        if (!relationalRowsJoinHasOnExpressionPredicates(req)) return true;
+        if (!relational_rows.joinHasOnExpressionPredicates(req)) return true;
 
         var parsed_right = std.json.parseFromSlice(std.json.Value, alloc, right_row_json, .{}) catch return error.InvalidQueryRequest;
         defer parsed_right.deinit();
@@ -19038,7 +18899,7 @@ pub const DB = struct {
         right_row_json: []const u8,
         req: types.RelationalRowsJoinRequest,
     ) !bool {
-        if (!relationalRowsJoinHasMatchPredicates(req)) return true;
+        if (!relational_rows.joinHasMatchPredicates(req)) return true;
 
         var parsed_right = std.json.parseFromSlice(std.json.Value, alloc, right_row_json, .{}) catch return error.InvalidQueryRequest;
         defer parsed_right.deinit();
@@ -19079,7 +18940,7 @@ pub const DB = struct {
         try relational_rows.validateLateralAgainstSchema(runtime_schema, req);
         try relational_rows.validateLateralOutputReferencesAlloc(alloc, req);
 
-        const left_source = relationalRowsLateralLeftSource(req.left);
+        const left_source = relational_rows.lateralLeftSource(req.left);
         var left_rows = try self.queryRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes, left_ranges, left_source);
         defer left_rows.deinit(alloc);
 
@@ -19119,13 +18980,6 @@ pub const DB = struct {
         ranges: []const types.RelationalRowsDocKeyRange,
         source_rows: []const []const u8,
     };
-
-    fn relationalRowsLateralLeftSource(source_req: types.RelationalRowsQueryRequest) types.RelationalRowsQueryRequest {
-        var source = source_req;
-        source.select = &.{};
-        source.select_all = true;
-        return source;
-    }
 
     fn lateralRelationalRowsFromLeftRowsAlloc(
         self: *DB,
@@ -19178,7 +19032,7 @@ pub const DB = struct {
                     matched = true;
                 }
             }
-            if (!matched and !relationalRowsLateralHasMatchPredicates(req)) {
+            if (!matched and !relational_rows.lateralHasMatchPredicates(req)) {
                 const row_json = try relationalRowsJoinedRowJsonAlloc(alloc, left_row, null, req.select);
                 var row_transferred = false;
                 errdefer if (!row_transferred) alloc.free(row_json);
@@ -19258,7 +19112,7 @@ pub const DB = struct {
                     matched = true;
                 }
             }
-            if (!matched and !relationalRowsLateralHasMatchPredicates(req)) {
+            if (!matched and !relational_rows.lateralHasMatchPredicates(req)) {
                 const row_json = try relationalRowsJoinedRowJsonAlloc(alloc, left_row, null, req.select);
                 var row_transferred = false;
                 errdefer if (!row_transferred) alloc.free(row_json);
@@ -19289,20 +19143,13 @@ pub const DB = struct {
         };
     }
 
-    fn relationalRowsLateralHasMatchPredicates(req: types.RelationalRowsLateralRequest) bool {
-        return req.match_expression_predicates.len != 0 or
-            req.match_expression_or_predicates.len != 0 or
-            req.match_expression_not_predicates.len != 0 or
-            req.match_expression_array_contains.len != 0;
-    }
-
     fn relationalRowsLateralMatchPredicatesPass(
         alloc: Allocator,
         left_row: std.json.Value,
         right_row_json: []const u8,
         req: types.RelationalRowsLateralRequest,
     ) !bool {
-        if (!relationalRowsLateralHasMatchPredicates(req)) return true;
+        if (!relational_rows.lateralHasMatchPredicates(req)) return true;
 
         var parsed_right = std.json.parseFromSlice(std.json.Value, alloc, right_row_json, .{}) catch return error.InvalidQueryRequest;
         defer parsed_right.deinit();
@@ -19333,63 +19180,7 @@ pub const DB = struct {
         };
     }
 
-    fn relationalRowsPlanRangesForJoinAlloc(
-        alloc: Allocator,
-        left_ranges: []const types.RelationalRowsDocKeyRange,
-        right_ranges: []const types.RelationalRowsDocKeyRange,
-    ) ![]const types.RelationalRowsDocKeyRange {
-        if ((left_ranges.len == 0) != (right_ranges.len == 0)) return error.InvalidQueryRequest;
-        if (left_ranges.len == 0) return &.{};
-        try validateRelationalRowsDocKeyRanges(left_ranges);
-        try validateRelationalRowsDocKeyRanges(right_ranges);
-        const sorted = try alloc.alloc(types.RelationalRowsDocKeyRange, left_ranges.len + right_ranges.len);
-        defer alloc.free(sorted);
-        @memcpy(sorted[0..left_ranges.len], left_ranges);
-        @memcpy(sorted[left_ranges.len..], right_ranges);
-        std.sort.pdq(types.RelationalRowsDocKeyRange, sorted, {}, relationalRowsDocKeyRangeLessThan);
-
-        var out = std.ArrayListUnmanaged(types.RelationalRowsDocKeyRange).empty;
-        errdefer out.deinit(alloc);
-        for (sorted) |range| {
-            if (out.items.len == 0) {
-                try out.append(alloc, range);
-                continue;
-            }
-            const last = &out.items[out.items.len - 1];
-            if (relationalRowsDocKeyRangesOverlapOrTouch(last.*, range)) {
-                last.end = relationalRowsDocKeyRangeMaxEnd(last.end, range.end);
-            } else {
-                try out.append(alloc, range);
-            }
-        }
-        return try out.toOwnedSlice(alloc);
-    }
-
-    fn relationalRowsDocKeyRangesOverlapOrTouch(lhs: types.RelationalRowsDocKeyRange, rhs: types.RelationalRowsDocKeyRange) bool {
-        if (lhs.end.len == 0) return true;
-        if (rhs.start.len == 0) return true;
-        return std.mem.order(u8, rhs.start, lhs.end) != .gt;
-    }
-
-    fn relationalRowsDocKeyRangeMaxEnd(lhs: []const u8, rhs: []const u8) []const u8 {
-        if (lhs.len == 0 or rhs.len == 0) return "";
-        return if (std.mem.order(u8, lhs, rhs) == .lt) rhs else lhs;
-    }
-
-    fn relationalRowsDocKeyRangeLessThan(_: void, lhs: types.RelationalRowsDocKeyRange, rhs: types.RelationalRowsDocKeyRange) bool {
-        if (lhs.start.len == 0) return rhs.start.len != 0;
-        if (rhs.start.len == 0) return false;
-        const start_order = std.mem.order(u8, lhs.start, rhs.start);
-        if (start_order != .eq) return start_order == .lt;
-        if (lhs.end.len == 0) return false;
-        if (rhs.end.len == 0) return true;
-        return std.mem.order(u8, lhs.end, rhs.end) == .lt;
-    }
-
-    const RelationalRowsJoinSide = enum {
-        left,
-        right,
-    };
+    const RelationalRowsJoinSide = relational_rows.JoinSide;
 
     const RelationalRowsJoinRightList = struct {
         indexes: std.ArrayListUnmanaged(usize) = .empty,

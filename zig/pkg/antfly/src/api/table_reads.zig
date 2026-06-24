@@ -2422,7 +2422,7 @@ pub const BoundTableReadSource = struct {
                 .lookup = lookup,
                 .scan = scan,
                 .query = query,
-                .document_algebraic_aggregate = documentAlgebraicAggregate,
+                .document_algebraic_aggregate = ProvisionedTableReadSource.documentAlgebraicAggregate,
                 .preflight_query = preflightQuery,
                 .preflight_query_group_local = preflightQueryGroupLocal,
                 .lookup_group_local = lookupGroupLocal,
@@ -3102,6 +3102,69 @@ fn documentAlgebraicAggregateValueJsonAlloc(
     return try out.toOwnedSlice();
 }
 
+fn documentAlgebraicAggregateProvisionedHostedLocal(
+    replica_root_dir: []const u8,
+    catalog: table_catalog.CatalogSource,
+    requester: raft_mod.ReadableLeaseRequester,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lsm_root_generation: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    req: document_sql_runtime.AlgebraicAggregateRequest,
+    consistency: raft_mod.ReadConsistency,
+) !?document_sql_runtime.AlgebraicAggregateResponse {
+    return documentAlgebraicAggregateLocal(
+        replica_root_dir,
+        catalog,
+        requester,
+        alloc,
+        group_id,
+        lsm_root_generation,
+        backend_runtime,
+        table_name,
+        req,
+        consistency,
+    ) catch |err| switch (err) {
+        error.NotLeader => if (consistency == .stale) err else try documentAlgebraicAggregateLocal(
+            replica_root_dir,
+            catalog,
+            requester,
+            alloc,
+            group_id,
+            lsm_root_generation,
+            backend_runtime,
+            table_name,
+            req,
+            .stale,
+        ),
+        else => err,
+    };
+}
+
+fn documentAlgebraicAggregateLocal(
+    replica_root_dir: []const u8,
+    catalog: table_catalog.CatalogSource,
+    requester: raft_mod.ReadableLeaseRequester,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lsm_root_generation: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    req: document_sql_runtime.AlgebraicAggregateRequest,
+    consistency: raft_mod.ReadConsistency,
+) !document_sql_runtime.AlgebraicAggregateResponse {
+    var reads = raft_mod.FeatureDBReads.init(group_id, requester);
+    try reads.reads.prepareScanWithConsistency(group_id, "", "", .{}, consistency);
+
+    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
+    defer alloc.free(path);
+    var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, catalog, table_name, group_id, lsm_root_generation, backend_runtime);
+    defer db.close();
+
+    return try documentAlgebraicAggregateFromDbAlloc(alloc, &db, req);
+}
+
 pub const ProvisionedTableReadSource = struct {
     replica_root_dir: []const u8,
     catalog: table_catalog.CatalogSource,
@@ -3191,6 +3254,7 @@ pub const ProvisionedTableReadSource = struct {
                 .scan = scan,
                 .query = query,
                 .query_catalog = queryCatalogNative,
+                .document_algebraic_aggregate = HostedProvisionedTableReadSource.documentAlgebraicAggregate,
                 .preflight_query = preflightQuery,
                 .preflight_query_group_local = preflightQueryGroupLocal,
                 .lookup_group_local = lookupGroupLocal,
@@ -3423,6 +3487,35 @@ pub const ProvisionedTableReadSource = struct {
         const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
         defer alloc.free(table_name);
         return try query(ptr, alloc, table_name, req, consistency);
+    }
+
+    fn documentAlgebraicAggregate(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: document_sql_runtime.AlgebraicAggregateRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?document_sql_runtime.AlgebraicAggregateResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try self.ensureHAReadAllowed(consistency);
+        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
+        const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
+        defer alloc.free(group_ids);
+        if (group_ids.len == 0) return null;
+        try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
+        if (group_ids.len != 1) return error.DocumentSqlIndexUnavailable;
+        return try documentAlgebraicAggregateProvisionedHostedLocal(
+            self.replica_root_dir,
+            self.catalog,
+            self.requester,
+            alloc,
+            group_ids[0],
+            self.visibleRootGeneration(group_ids[0]),
+            self.backend_runtime,
+            table_name,
+            req,
+            consistency,
+        );
     }
 
     fn preflightQuery(
@@ -4026,6 +4119,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 .scan = scan,
                 .query = query,
                 .query_catalog = queryCatalogNative,
+                .document_algebraic_aggregate = documentAlgebraicAggregate,
                 .preflight_query = preflightQuery,
                 .preflight_query_group_local = preflightQueryGroupLocal,
                 .lookup_group_local = lookupGroupLocal,
@@ -4109,6 +4203,38 @@ pub const HostedProvisionedTableReadSource = struct {
         const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
         defer alloc.free(table_name);
         return try query(ptr, alloc, table_name, req, consistency);
+    }
+
+    fn documentAlgebraicAggregate(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: document_sql_runtime.AlgebraicAggregateRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?document_sql_runtime.AlgebraicAggregateResponse {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
+        defer alloc.free(group_ids);
+        if (group_ids.len == 0) return null;
+        try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
+        if (group_ids.len != 1) return error.DocumentSqlIndexUnavailable;
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_ids[0], routePolicyForConsistency(consistency))) orelse return null;
+        defer route.deinit(alloc);
+        return switch (route) {
+            .local => try documentAlgebraicAggregateProvisionedHostedLocal(
+                self.replica_root_dir,
+                self.catalog,
+                self.requester,
+                alloc,
+                group_ids[0],
+                self.visibleRootGeneration(group_ids[0]),
+                self.backend_runtime,
+                table_name,
+                req,
+                consistency,
+            ),
+            .remote => error.DocumentSqlIndexUnavailable,
+        };
     }
 
     fn lookupViaRoute(

@@ -19,6 +19,11 @@ const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
 
+pub const JoinSide = enum {
+    left,
+    right,
+};
+
 pub const MaterializedCte = struct {
     name: []const u8,
     output_fields: []const []const u8 = &.{},
@@ -345,6 +350,32 @@ pub fn plannedQueryOutputFieldsAlloc(
     }
     try appendQueryProjectionOutputFieldsAlloc(alloc, &fields, req);
     return try fields.toOwnedSlice(alloc);
+}
+
+pub fn planCteOutputsAlloc(
+    alloc: Allocator,
+    runtime_schema: schema_mod.TableSchema,
+    ctes: []const types.RelationalRowsCte,
+) ![]PlannedCte {
+    var planned = std.ArrayListUnmanaged(PlannedCte).empty;
+    errdefer {
+        for (planned.items) |*cte| cte.deinit(alloc);
+        planned.deinit(alloc);
+    }
+    for (ctes) |cte| {
+        if (cte.table_function != null and cte.query.source_cte.len != 0) return error.InvalidQueryRequest;
+        try validateQueryAgainstPlannedCteOutput(planned.items, cte.query);
+        const output_fields = if (cte.table_function) |table_function|
+            try tableFunctionOutputFieldsAlloc(alloc, table_function, cte.query)
+        else
+            try plannedQueryOutputFieldsAlloc(alloc, runtime_schema, planned.items, cte.query);
+        errdefer freeOwnedConstStringSlice(alloc, output_fields);
+        try planned.append(alloc, .{
+            .name = cte.name,
+            .output_fields = output_fields,
+        });
+    }
+    return try planned.toOwnedSlice(alloc);
 }
 
 pub fn queryOutputFieldsAlloc(
@@ -944,11 +975,311 @@ fn validateJoinMatchExpressionAgainstOutputFields(
     for (expression.case_else) |fallback| try validateJoinMatchExpressionAgainstOutputFields(left_output, right_output, fallback);
 }
 
-fn joinSideSource(source_req: types.RelationalRowsQueryRequest) types.RelationalRowsQueryRequest {
+pub fn joinSideSource(source_req: types.RelationalRowsQueryRequest) types.RelationalRowsQueryRequest {
     var source = source_req;
     source.select = &.{};
     source.select_all = true;
     return source;
+}
+
+pub fn lateralLeftSource(source_req: types.RelationalRowsQueryRequest) types.RelationalRowsQueryRequest {
+    return joinSideSource(source_req);
+}
+
+pub fn aggregateSourceQuery(req: types.RelationalRowsAggregateRequest) types.RelationalRowsQueryRequest {
+    var source = req.source;
+    source.select = &.{};
+    source.select_all = true;
+    source.order_by = &.{};
+    source.limit = null;
+    source.offset = 0;
+    return source;
+}
+
+pub fn windowSourceQuery(
+    req: types.RelationalRowsWindowRequest,
+    source_order: []const types.RelationalRowsQueryOrder,
+) types.RelationalRowsQueryRequest {
+    var source = req.source;
+    source.select = &.{};
+    source.json_extract = &.{};
+    source.array_length = &.{};
+    source.coalesce = &.{};
+    source.field_aliases = &.{};
+    source.select_all = true;
+    source.order_by = source_order;
+    source.limit = null;
+    source.offset = 0;
+    source.row_claim = null;
+    return source;
+}
+
+pub fn joinedMutationTargetQuery(req: types.RelationalRowsJoinedMutationSourceRequest) types.RelationalRowsQueryRequest {
+    return switch (req.target_side) {
+        .left => req.join.left,
+        .right => req.join.right,
+    };
+}
+
+pub fn joinedMutationSourceQuery(req: types.RelationalRowsJoinedMutationSourceRequest) types.RelationalRowsQueryRequest {
+    return switch (req.target_side) {
+        .left => req.join.right,
+        .right => req.join.left,
+    };
+}
+
+pub fn joinedMutationTargetSource(req: types.RelationalRowsJoinedMutationSourceRequest) types.RelationalRowsQueryRequest {
+    var source = joinedMutationTargetQuery(req);
+    source.select = &.{};
+    source.select_all = true;
+    source.row_claim = null;
+    source.limit = null;
+    source.offset = 0;
+    return source;
+}
+
+pub fn joinedMutationSourceSide(req: types.RelationalRowsJoinedMutationSourceRequest) types.RelationalRowsQueryRequest {
+    var source = joinedMutationSourceQuery(req);
+    source.select = &.{};
+    source.select_all = true;
+    source.row_claim = null;
+    return source;
+}
+
+pub fn joinedMutationClaim(req: types.RelationalRowsJoinedMutationSourceRequest) ?types.RowClaimRequest {
+    return joinedMutationTargetQuery(req).row_claim;
+}
+
+pub fn joinedMutationTargetJoinSide(req: types.RelationalRowsJoinedMutationSourceRequest) JoinSide {
+    return switch (req.target_side) {
+        .left => .left,
+        .right => .right,
+    };
+}
+
+pub fn joinedMutationSourceJoinSide(req: types.RelationalRowsJoinedMutationSourceRequest) JoinSide {
+    return switch (req.target_side) {
+        .left => .right,
+        .right => .left,
+    };
+}
+
+pub fn joinHasMatchPredicates(req: types.RelationalRowsJoinRequest) bool {
+    return req.match_expression_predicates.len != 0 or
+        req.match_expression_or_predicates.len != 0 or
+        req.match_expression_not_predicates.len != 0 or
+        req.match_expression_array_contains.len != 0;
+}
+
+pub fn joinHasOnExpressionPredicates(req: types.RelationalRowsJoinRequest) bool {
+    return req.on_expression_predicates.len != 0 or
+        req.on_expression_or_predicates.len != 0 or
+        req.on_expression_not_predicates.len != 0 or
+        req.on_expression_array_contains.len != 0;
+}
+
+pub fn lateralHasMatchPredicates(req: types.RelationalRowsLateralRequest) bool {
+    return req.match_expression_predicates.len != 0 or
+        req.match_expression_or_predicates.len != 0 or
+        req.match_expression_not_predicates.len != 0 or
+        req.match_expression_array_contains.len != 0;
+}
+
+pub fn validateJoinedMutationCteReferences(req: types.RelationalRowsJoinedMutationSourceRequest) !void {
+    const target = joinedMutationTargetQuery(req);
+    const source = joinedMutationSourceQuery(req);
+    if (target.source_cte.len != 0) return error.UnsupportedQueryRequest;
+    if (req.ctes.len == 0) {
+        if (source.source_cte.len != 0) return error.InvalidQueryRequest;
+        return;
+    }
+    if (source.source_cte.len == 0) return error.InvalidQueryRequest;
+    try validateMaterializedCtes(req.ctes, &.{});
+    try validateFinalCteReference(req.ctes, source.source_cte);
+}
+
+pub fn validateJoinedMutationJoinFieldsForSide(
+    runtime_schema: schema_mod.TableSchema,
+    req: types.RelationalRowsJoinedMutationSourceRequest,
+    side: JoinSide,
+) !void {
+    for (req.join.on) |predicate| {
+        const field = switch (side) {
+            .left => predicate.left_field,
+            .right => predicate.right_field,
+        };
+        _ = findColumn(runtime_schema.relational_columns, field) orelse return error.InvalidQueryRequest;
+    }
+}
+
+pub fn validateJoinedMutationJoinFieldsForOutputFields(
+    output_fields: []const []const u8,
+    req: types.RelationalRowsJoinedMutationSourceRequest,
+    side: JoinSide,
+) !void {
+    for (req.join.on) |predicate| {
+        const field = switch (side) {
+            .left => predicate.left_field,
+            .right => predicate.right_field,
+        };
+        try validateOutputField(output_fields, field);
+    }
+}
+
+pub fn validateJoinedMutationMatchExpressions(
+    target_schema: schema_mod.TableSchema,
+    source_schema: schema_mod.TableSchema,
+    req: types.RelationalRowsJoinedMutationSourceRequest,
+) !void {
+    for (req.match_expression_predicates) |condition| {
+        try validateJoinedMutationMatchExpressionCondition(target_schema, source_schema, condition);
+    }
+    for (req.match_expression_or_predicates) |group| {
+        for (group.conditions) |condition| {
+            try validateJoinedMutationMatchExpressionCondition(target_schema, source_schema, condition);
+        }
+    }
+    for (req.match_expression_not_predicates) |group| {
+        for (group.conditions) |condition| {
+            try validateJoinedMutationMatchExpressionCondition(target_schema, source_schema, condition);
+        }
+    }
+    for (req.match_expression_array_contains) |predicate| {
+        try validateJoinedMutationMatchExpression(target_schema, source_schema, predicate.expression);
+    }
+}
+
+fn validateJoinedMutationMatchExpressionCondition(
+    target_schema: schema_mod.TableSchema,
+    source_schema: schema_mod.TableSchema,
+    condition: types.RelationalRowsExpressionCondition,
+) anyerror!void {
+    try validateJoinedMutationMatchExpression(target_schema, source_schema, condition.lhs);
+    for (condition.rhs) |rhs| try validateJoinedMutationMatchExpression(target_schema, source_schema, rhs);
+}
+
+fn validateJoinedMutationMatchExpression(
+    target_schema: schema_mod.TableSchema,
+    source_schema: schema_mod.TableSchema,
+    expression: types.RelationalRowsExpression,
+) anyerror!void {
+    if (expression.kind == .field) {
+        if (expression.field_source == .existing or expression.field_source == .proposed) return error.InvalidQueryRequest;
+        const schema = if (expression.field_source == .source) source_schema else target_schema;
+        _ = findColumn(schema.relational_columns, expression.field) orelse return error.InvalidQueryRequest;
+    }
+    for (expression.operands) |operand| try validateJoinedMutationMatchExpression(target_schema, source_schema, operand);
+    for (expression.case_branches) |branch| {
+        try validateJoinedMutationMatchExpressionCondition(target_schema, source_schema, branch.when);
+        try validateJoinedMutationMatchExpression(target_schema, source_schema, branch.then);
+    }
+    for (expression.case_else) |case_else| try validateJoinedMutationMatchExpression(target_schema, source_schema, case_else);
+}
+
+pub fn validateMutationReturningRequestOutputs(
+    runtime_schema: schema_mod.TableSchema,
+    fields: []const []const u8,
+    returning_all: bool,
+    expressions: []const types.RelationalRowsExpressionProjection,
+) !void {
+    if (returning_all and fields.len != 0) return error.InvalidQueryRequest;
+    for (fields) |field| {
+        if (field.len == 0) return error.InvalidQueryRequest;
+        if (findColumn(runtime_schema.relational_columns, field) == null and
+            !jsonColumnSubpathIsValid(runtime_schema.relational_columns, field))
+        {
+            return error.InvalidQueryRequest;
+        }
+        if (mutationReturningOutputCount(fields, expressions, field) > 1) return error.InvalidQueryRequest;
+    }
+    for (expressions) |projection| {
+        if (projection.output.len == 0) return error.InvalidQueryRequest;
+        if (returning_all and findColumn(runtime_schema.relational_columns, projection.output) != null) return error.InvalidQueryRequest;
+        if (mutationReturningOutputCount(fields, expressions, projection.output) > 1) return error.InvalidQueryRequest;
+    }
+}
+
+pub fn validateMutationReturningTargetExpressions(
+    runtime_schema: schema_mod.TableSchema,
+    expressions: []const types.RelationalRowsExpressionProjection,
+) !void {
+    for (expressions) |projection| try validateMutationReturningTargetExpression(runtime_schema, projection.expression);
+}
+
+fn validateMutationReturningTargetExpressionCondition(
+    runtime_schema: schema_mod.TableSchema,
+    condition: types.RelationalRowsExpressionCondition,
+) anyerror!void {
+    try validateMutationReturningTargetExpression(runtime_schema, condition.lhs);
+    for (condition.rhs) |rhs| try validateMutationReturningTargetExpression(runtime_schema, rhs);
+}
+
+fn validateMutationReturningTargetExpression(
+    runtime_schema: schema_mod.TableSchema,
+    expression: types.RelationalRowsExpression,
+) anyerror!void {
+    if (expression.kind == .field) {
+        if (expression.field_source == .source or expression.field_source == .proposed) return error.InvalidQueryRequest;
+        _ = findColumn(runtime_schema.relational_columns, expression.field) orelse return error.InvalidQueryRequest;
+    }
+    for (expression.operands) |operand| try validateMutationReturningTargetExpression(runtime_schema, operand);
+    for (expression.case_branches) |branch| {
+        try validateMutationReturningTargetExpressionCondition(runtime_schema, branch.when);
+        try validateMutationReturningTargetExpression(runtime_schema, branch.then);
+    }
+    for (expression.case_else) |case_else| try validateMutationReturningTargetExpression(runtime_schema, case_else);
+}
+
+pub fn validateJoinedMutationReturningExpressions(
+    target_schema: schema_mod.TableSchema,
+    source_schema: schema_mod.TableSchema,
+    expressions: []const types.RelationalRowsExpressionProjection,
+) !void {
+    for (expressions) |projection| {
+        try validateJoinedMutationReturningExpression(target_schema, source_schema, projection.expression);
+    }
+}
+
+pub fn validateJoinedMutationReturningExpression(
+    target_schema: schema_mod.TableSchema,
+    source_schema: schema_mod.TableSchema,
+    expression: types.RelationalRowsExpression,
+) anyerror!void {
+    if (expression.kind == .field) {
+        if (expression.field_source == .existing or expression.field_source == .proposed) return error.InvalidQueryRequest;
+        const schema = if (expression.field_source == .source) source_schema else target_schema;
+        _ = findColumn(schema.relational_columns, expression.field) orelse return error.InvalidQueryRequest;
+    }
+    for (expression.operands) |operand| try validateJoinedMutationReturningExpression(target_schema, source_schema, operand);
+    for (expression.case_branches) |branch| {
+        try validateJoinedMutationReturningExpressionCondition(target_schema, source_schema, branch.when);
+        try validateJoinedMutationReturningExpression(target_schema, source_schema, branch.then);
+    }
+    for (expression.case_else) |case_else| try validateJoinedMutationReturningExpression(target_schema, source_schema, case_else);
+}
+
+fn validateJoinedMutationReturningExpressionCondition(
+    target_schema: schema_mod.TableSchema,
+    source_schema: schema_mod.TableSchema,
+    condition: types.RelationalRowsExpressionCondition,
+) anyerror!void {
+    try validateJoinedMutationReturningExpression(target_schema, source_schema, condition.lhs);
+    for (condition.rhs) |rhs| try validateJoinedMutationReturningExpression(target_schema, source_schema, rhs);
+}
+
+fn findColumn(columns: []const schema_mod.RelationalColumn, name: []const u8) ?schema_mod.RelationalColumn {
+    for (columns) |column| {
+        if (std.mem.eql(u8, column.path, name) or std.mem.eql(u8, column.name, name)) return column;
+    }
+    return null;
+}
+
+fn jsonColumnSubpathIsValid(columns: []const schema_mod.RelationalColumn, field: []const u8) bool {
+    const dot = std.mem.indexOfScalar(u8, field, '.') orelse return false;
+    if (dot == 0 or dot + 1 >= field.len) return false;
+    const root = field[0..dot];
+    const column = findColumn(columns, root) orelse return false;
+    return column.field_type == .json;
 }
 
 pub fn validateAggregateAgainstSchema(
@@ -1214,6 +1545,73 @@ pub fn validateExpressionAgainstSchema(
 
 pub fn validateSchemaField(runtime_schema: schema_mod.TableSchema, field: []const u8) !void {
     if (field.len == 0 or !schemaCoversField(runtime_schema, field)) return error.InvalidQueryRequest;
+}
+
+pub fn validateDocKeyRanges(ranges: []const types.RelationalRowsDocKeyRange) !void {
+    var previous_end: ?[]const u8 = null;
+    for (ranges, 0..) |range, i| {
+        if (range.start.len == 0 and range.end.len == 0) return error.InvalidQueryRequest;
+        if (range.start.len > 0 and range.end.len > 0 and std.mem.order(u8, range.start, range.end) != .lt) return error.InvalidQueryRequest;
+        if (i > 0 and range.start.len == 0) return error.InvalidQueryRequest;
+        if (previous_end) |end| {
+            if (end.len == 0) return error.InvalidQueryRequest;
+            if (std.mem.order(u8, range.start, end) == .lt) return error.InvalidQueryRequest;
+        }
+        previous_end = range.end;
+    }
+}
+
+pub fn planRangesForJoinAlloc(
+    alloc: Allocator,
+    left_ranges: []const types.RelationalRowsDocKeyRange,
+    right_ranges: []const types.RelationalRowsDocKeyRange,
+) ![]const types.RelationalRowsDocKeyRange {
+    if ((left_ranges.len == 0) != (right_ranges.len == 0)) return error.InvalidQueryRequest;
+    if (left_ranges.len == 0) return &.{};
+    try validateDocKeyRanges(left_ranges);
+    try validateDocKeyRanges(right_ranges);
+    const sorted = try alloc.alloc(types.RelationalRowsDocKeyRange, left_ranges.len + right_ranges.len);
+    defer alloc.free(sorted);
+    @memcpy(sorted[0..left_ranges.len], left_ranges);
+    @memcpy(sorted[left_ranges.len..], right_ranges);
+    std.sort.pdq(types.RelationalRowsDocKeyRange, sorted, {}, docKeyRangeLessThan);
+
+    var out = std.ArrayListUnmanaged(types.RelationalRowsDocKeyRange).empty;
+    errdefer out.deinit(alloc);
+    for (sorted) |range| {
+        if (out.items.len == 0) {
+            try out.append(alloc, range);
+            continue;
+        }
+        const last = &out.items[out.items.len - 1];
+        if (docKeyRangesOverlapOrTouch(last.*, range)) {
+            last.end = docKeyRangeMaxEnd(last.end, range.end);
+        } else {
+            try out.append(alloc, range);
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn docKeyRangesOverlapOrTouch(lhs: types.RelationalRowsDocKeyRange, rhs: types.RelationalRowsDocKeyRange) bool {
+    if (lhs.end.len == 0) return true;
+    if (rhs.start.len == 0) return true;
+    return std.mem.order(u8, rhs.start, lhs.end) != .gt;
+}
+
+fn docKeyRangeMaxEnd(lhs: []const u8, rhs: []const u8) []const u8 {
+    if (lhs.len == 0 or rhs.len == 0) return "";
+    return if (std.mem.order(u8, lhs, rhs) == .lt) rhs else lhs;
+}
+
+fn docKeyRangeLessThan(_: void, lhs: types.RelationalRowsDocKeyRange, rhs: types.RelationalRowsDocKeyRange) bool {
+    if (lhs.start.len == 0) return rhs.start.len != 0;
+    if (rhs.start.len == 0) return false;
+    const start_order = std.mem.order(u8, lhs.start, rhs.start);
+    if (start_order != .eq) return start_order == .lt;
+    if (lhs.end.len == 0) return false;
+    if (rhs.end.len == 0) return true;
+    return std.mem.order(u8, lhs.end, rhs.end) == .lt;
 }
 
 fn schemaCoversField(runtime_schema: schema_mod.TableSchema, field: []const u8) bool {

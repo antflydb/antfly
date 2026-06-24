@@ -147,6 +147,7 @@ dml_statement:
 
 insert_statement:
     INSERT INTO qualified_name insert_columns_opt VALUES value_tuple_list returning_clause_opt
+  | INSERT INTO qualified_name DEFAULT VALUES returning_clause_opt
   | INSERT INTO qualified_name insert_columns_opt read_statement returning_clause_opt
   ;
 

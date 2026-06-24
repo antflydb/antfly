@@ -151,6 +151,7 @@ pub const GeneratedSqlDmlAst = struct {
     where_tokens: ?GeneratedSqlTokenRange = null,
     returning_tokens: ?GeneratedSqlTokenRange = null,
     additional_target_tokens: ?GeneratedSqlTokenRange = null,
+    default_values: bool = false,
     restart_identity: bool = false,
     cascade: bool = false,
 };
@@ -654,6 +655,12 @@ fn buildInsertDmlAst(tokens: []const token_mod.Token, end: usize, ast: *Generate
     if (end < 4 or !tokens[1].matchesKeywordTag(.into)) return;
     ast.target_table_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 2, end);
     var index: usize = 3;
+    if (index + 1 < end and tokens[index].matchesKeywordTag(.default) and tokens[index + 1].matchesKeywordTag(.values)) {
+        ast.default_values = true;
+        const returning_index = findTopLevelKeyword(tokens, index + 2, end, .returning) orelse end;
+        if (returning_index < end) ast.returning_tokens = .{ .start = returning_index + 1, .end = end };
+        return;
+    }
     if (index < end and tokens[index].kind == .lparen) {
         if (findMatchingParen(tokens, index, end)) |close| {
             ast.insert_columns_tokens = .{ .start = index, .end = close + 1 };
@@ -871,6 +878,7 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_table }, (try parseSqlAlloc(std.testing.allocator, "CREATE TABLE usage_records (id text)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_schema }, (try parseSqlAlloc(std.testing.allocator, "DROP SCHEMA analytics CASCADE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .insert_values }, (try parseSqlAlloc(std.testing.allocator, "INSERT INTO usage_records (id) VALUES ('u1')")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .insert_values }, (try parseSqlAlloc(std.testing.allocator, "INSERT INTO usage_records DEFAULT VALUES")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .update }, (try parseSqlAlloc(std.testing.allocator, "UPDATE usage_records SET status = 'done' WHERE id = 'u1'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .read = .query }, (try parseSqlAlloc(std.testing.allocator, "SELECT id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .read = .cte }, (try parseSqlAlloc(std.testing.allocator, "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows")).statement);
@@ -970,6 +978,19 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, dml.target_table_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 6 }, dml.assignments_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 10 }, dml.where_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const default_insert_sql = "INSERT INTO usage_records DEFAULT VALUES";
+    const default_insert_result = try parseSqlAlloc(alloc, default_insert_sql);
+    switch (default_insert_result.ast.?) {
+        .dml => |dml| {
+            try std.testing.expectEqual(GeneratedSqlDmlKind.insert_values, dml.kind);
+            try std.testing.expect(dml.default_values);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, dml.target_table_tokens.?);
+            try std.testing.expect(dml.insert_columns_tokens == null);
+            try std.testing.expect(dml.values_tokens == null);
         },
         else => return error.TestUnexpectedResult,
     }

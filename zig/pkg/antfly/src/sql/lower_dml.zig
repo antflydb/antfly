@@ -12417,37 +12417,56 @@ fn insertValuesFromGeneratedDmlAstAlloc(
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     if (ast.returning_tokens != null or ast.source_tokens != null) return error.UnsupportedSqlShape;
     const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
-    if (end < 6 or !tokens[0].matchesKeywordTag(.insert) or !tokens[1].matchesKeywordTag(.into)) return error.UnsupportedSqlShape;
+    if (end < 5 or !tokens[0].matchesKeywordTag(.insert) or !tokens[1].matchesKeywordTag(.into)) return error.UnsupportedSqlShape;
     const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, 2, end);
     const table_name = try generatedDmlTableReferenceIdentifierAlloc(alloc, tokens, target_range);
     var table_transferred = false;
     errdefer if (!table_transferred) alloc.free(table_name);
 
-    const column_range = ast.insert_columns_tokens orelse return error.UnsupportedSqlShape;
-    const columns = try generatedInsertColumnsAlloc(alloc, tokens, column_range, schema);
-    errdefer {
+    var columns: []const []const u8 = &.{};
+    var owns_columns = false;
+    errdefer if (owns_columns) {
         for (columns) |column| alloc.free(column);
         alloc.free(columns);
-    }
-    try validateSqlInsertColumnsUnique(schema, columns);
-
-    const values_range = ast.values_tokens orelse return error.UnsupportedSqlShape;
-    const rows = try generatedInsertValueRowsAlloc(alloc, tokens, values_range, columns, schema, params);
-    errdefer {
+    };
+    var rows: []const []const []const u8 = &.{};
+    var owns_rows = false;
+    errdefer if (owns_rows) {
         freeInsertValueRows(alloc, rows);
         alloc.free(rows);
-    }
+    };
+    var default_row = [_][]const u8{};
+    var default_rows = [_][]const []const u8{default_row[0..]};
+    if (ast.default_values) {
+        if (ast.insert_columns_tokens != null or ast.values_tokens != null) return error.UnsupportedSqlShape;
+        if (end != 5 or !tokens[3].matchesKeywordTag(.default) or !tokens[4].matchesKeywordTag(.values)) return error.UnsupportedSqlShape;
+        rows = default_rows[0..];
+    } else {
+        const column_range = ast.insert_columns_tokens orelse return error.UnsupportedSqlShape;
+        columns = try generatedInsertColumnsAlloc(alloc, tokens, column_range, schema);
+        owns_columns = true;
+        try validateSqlInsertColumnsUnique(schema, columns);
 
+        const values_range = ast.values_tokens orelse return error.UnsupportedSqlShape;
+        rows = try generatedInsertValueRowsAlloc(alloc, tokens, values_range, columns, schema, params);
+        owns_rows = true;
+    }
     const body_json = try insertBodyJsonAlloc(alloc, columns, rows, &.{}, .{});
     defer alloc.free(body_json);
     var batch = try relational_rows.parseRowsBatchRequest(alloc, body_json, schema);
     errdefer batch.deinit(alloc);
     batch.req.sync_level = options.sync_level;
 
-    for (columns) |column| alloc.free(column);
-    alloc.free(columns);
-    freeInsertValueRows(alloc, rows);
-    alloc.free(rows);
+    if (owns_columns) {
+        for (columns) |column| alloc.free(column);
+        alloc.free(columns);
+        owns_columns = false;
+    }
+    if (owns_rows) {
+        freeInsertValueRows(alloc, rows);
+        alloc.free(rows);
+        owns_rows = false;
+    }
 
     table_transferred = true;
     return .{
@@ -12788,6 +12807,29 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
             try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, insert.batch.req.sync_level);
             try std.testing.expectEqual(@as(u32, 2), insert.batch.inserted);
             try std.testing.expectEqual(@as(usize, 2), insert.batch.req.writes.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const default_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword","default":"u_default"},"status":{"type":"keyword","default":"active"},"quantity":{"type":"numeric","default":1}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const default_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, default_schema_json);
+    defer runtime_schema.freeSchema(alloc, default_schema);
+    var generated_default_insert = try lowerGeneratedDmlWritePlanForDmlTestAlloc(
+        alloc,
+        "INSERT INTO usage_records DEFAULT VALUES",
+        default_schema,
+        &.{},
+        resolver_free_options,
+    );
+    defer generated_default_insert.deinit(alloc);
+    switch (generated_default_insert) {
+        .insert => |insert| {
+            try std.testing.expectEqualStrings("usage_records", insert.table_name);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, insert.batch.req.sync_level);
+            try std.testing.expectEqual(@as(u32, 1), insert.batch.inserted);
+            try std.testing.expectEqual(@as(usize, 1), insert.batch.req.writes.len);
         },
         else => return error.TestUnexpectedResult,
     }
