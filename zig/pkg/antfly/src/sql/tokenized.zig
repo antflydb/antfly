@@ -339,6 +339,7 @@ fn parseStatement(
             .prepared => return .{ .prepared = .{ .raw = raw_statement } },
             .ddl => return .{ .ddl = .{ .raw = raw_statement } },
             .dml => if (tokenized_sql.write_statement_kind) |kind| return .{ .write = .{ .kind = kind, .raw = raw_statement } },
+            .read => if (tokenized_sql.read_statement_kind) |kind| return .{ .read = .{ .kind = kind, .raw = raw_statement } },
             .other => {},
         }
     }
@@ -459,6 +460,14 @@ fn matchKeywordTag(tokens: []const Token, index: *usize, end: usize, keyword: To
     if (!tokens[index.*].matchesKeywordTag(keyword)) return false;
     index.* += 1;
     return true;
+}
+
+fn tokenMatchesKeyword(token: Token, keyword: TokenKeyword) bool {
+    return token.matchesKeywordTag(keyword);
+}
+
+fn tokenMatchesText(token: Token, text: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(token.text, text);
 }
 
 fn matchToken(tokens: []const Token, index: *usize, end: usize, kind: token_mod.TokenKind) bool {
@@ -802,4 +811,40 @@ test "sql adapter parsed sql retains generated DML nodes for covered write corpu
             else => return error.TestUnexpectedResult,
         }
     }
+}
+
+test "sql adapter parsed sql retains generated read nodes for covered query corpus" {
+    const alloc = std.testing.allocator;
+
+    const cases = [_]struct {
+        sql: []const u8,
+        generated: generated_parser.GeneratedSqlReadKind,
+        read: classifier.SqlReadStatementKind,
+    }{
+        .{ .sql = "SELECT id, status FROM usage_records WHERE status = 'open' ORDER BY id LIMIT 10", .generated = .query, .read = .query },
+        .{ .sql = "SELECT status FROM usage_records GROUP BY status HAVING status = 'open'", .generated = .aggregate, .read = .aggregate },
+        .{ .sql = "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id", .generated = .join, .read = .join },
+        .{ .sql = "SELECT id FROM LATERAL (SELECT id FROM usage_records) AS source_rows", .generated = .lateral, .read = .lateral },
+        .{ .sql = "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows", .generated = .cte, .read = .query },
+    };
+
+    for (cases) |case| {
+        var parsed = try ParsedSql.initAlloc(alloc, case.sql);
+        defer parsed.deinit(alloc);
+        try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, parsed.generatedStatementKind().?);
+        try std.testing.expectEqual(case.read, parsed.readStatementKind().?);
+        switch (parsed.generated_statement.?.statement) {
+            .read => |kind| try std.testing.expectEqual(case.generated, kind),
+            else => return error.TestUnexpectedResult,
+        }
+        switch (parsed.statement) {
+            .read => |statement| try std.testing.expectEqual(case.read, statement.kind),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    var unsupported_read = try ParsedSql.initAlloc(alloc, "SELECT DISTINCT ON (organization_id) organization_id, id FROM usage_records ORDER BY organization_id ASC, created_at DESC");
+    defer unsupported_read.deinit(alloc);
+    try std.testing.expect(unsupported_read.generated_statement == null);
+    try std.testing.expectEqual(classifier.SqlReadStatementKind.query, unsupported_read.readStatementKind().?);
 }

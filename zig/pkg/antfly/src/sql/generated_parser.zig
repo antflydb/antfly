@@ -24,6 +24,7 @@ pub const GeneratedSqlStatementKind = enum {
     prepared,
     ddl,
     dml,
+    read,
     other,
 };
 
@@ -71,12 +72,21 @@ pub const GeneratedSqlDmlKind = enum {
     merge,
 };
 
+pub const GeneratedSqlReadKind = enum {
+    query,
+    aggregate,
+    join,
+    lateral,
+    cte,
+};
+
 pub const GeneratedSqlStatement = union(GeneratedSqlStatementKind) {
     session: GeneratedSqlSessionKind,
     transaction: GeneratedSqlTransactionKind,
     prepared: GeneratedSqlPreparedKind,
     ddl: GeneratedSqlDdlKind,
     dml: GeneratedSqlDmlKind,
+    read: GeneratedSqlReadKind,
     other: void,
 };
 
@@ -146,6 +156,14 @@ pub const simple_dml_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status", .kind = .dml },
 };
 
+pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
+    .{ .sql = "SELECT id, status FROM usage_records WHERE status = 'open' ORDER BY id LIMIT 10", .kind = .read },
+    .{ .sql = "SELECT status FROM usage_records GROUP BY status HAVING status = 'open'", .kind = .read },
+    .{ .sql = "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id", .kind = .read },
+    .{ .sql = "SELECT id FROM LATERAL (SELECT id FROM usage_records) AS source_rows", .kind = .read },
+    .{ .sql = "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows", .kind = .read },
+};
+
 pub fn parseSqlAlloc(alloc: std.mem.Allocator, sql: []const u8) !GeneratedSqlParseResult {
     var tokens = try lexer.tokenizeAlloc(alloc, sql);
     defer lexer.freeTokens(alloc, &tokens);
@@ -169,7 +187,7 @@ pub fn parseGeneratedGateTokensAlloc(alloc: std.mem.Allocator, tokens: []const t
     const kind = classifyTokens(tokens);
     if (kind == .other) return null;
     return parseTokensAlloc(alloc, tokens) catch |err| switch (err) {
-        error.UnsupportedSqlShape, error.UnexpectedToken => if (kind == .ddl or kind == .dml) null else err,
+        error.UnsupportedSqlShape, error.UnexpectedToken => if (kind == .ddl or kind == .dml or kind == .read) null else err,
         else => err,
     };
 }
@@ -344,7 +362,24 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.delete)) return .{ .dml = .delete };
     if (first.matchesKeywordTag(.truncate)) return .{ .dml = .truncate };
     if (first.matchesKeywordTag(.merge)) return .{ .dml = .merge };
+    if (first.matchesKeywordTag(.select) or first.matchesKeywordTag(.with)) {
+        return .{ .read = classifyReadKind(tokens) };
+    }
     return .other;
+}
+
+fn classifyReadKind(tokens: []const token_mod.Token) GeneratedSqlReadKind {
+    if (tokens.len > 0 and tokens[0].matchesKeywordTag(.with)) return .cte;
+    for (tokens) |token| {
+        if (token.matchesKeywordTag(.lateral)) return .lateral;
+    }
+    for (tokens) |token| {
+        if (token.matchesKeywordTag(.join)) return .join;
+    }
+    for (tokens) |token| {
+        if (token.matchesKeywordTag(.group) or token.matchesKeywordTag(.having)) return .aggregate;
+    }
+    return .query;
 }
 
 test "generated SQL parser accepts session and control statements" {
@@ -355,7 +390,7 @@ test "generated SQL parser accepts session and control statements" {
 }
 
 test "generated SQL parser facade classifies gated corpus" {
-    const corpus = first_family_corpus ++ simple_ddl_corpus ++ simple_dml_corpus;
+    const corpus = first_family_corpus ++ simple_ddl_corpus ++ simple_dml_corpus ++ simple_read_corpus;
     for (corpus) |case| {
         const generated_result = try parseSqlAlloc(std.testing.allocator, case.sql);
         try std.testing.expectEqual(case.kind, generated_result.kind);
@@ -370,6 +405,8 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_schema }, (try parseSqlAlloc(std.testing.allocator, "DROP SCHEMA analytics CASCADE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .insert_values }, (try parseSqlAlloc(std.testing.allocator, "INSERT INTO usage_records (id) VALUES ('u1')")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .update }, (try parseSqlAlloc(std.testing.allocator, "UPDATE usage_records SET status = 'done' WHERE id = 'u1'")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .read = .query }, (try parseSqlAlloc(std.testing.allocator, "SELECT id FROM usage_records")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .read = .cte }, (try parseSqlAlloc(std.testing.allocator, "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows")).statement);
 }
 
 test "generated SQL parser reports source-aware diagnostics" {

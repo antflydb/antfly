@@ -43,9 +43,12 @@ simple DDL has generated-parser corpus coverage but still falls back to the
 existing parser when the seed grammar does not yet cover the shape. Simple DML
 now has generated-parser corpus coverage and retained generated raw nodes for
 covered write statements, but unsupported DML still falls back until plan parity
-is proven. The generated facade now returns closed statement-family nodes for
-the covered families; full production AST construction remains the next
-migration boundary for larger DDL, query, and DML families.
+is proven. Representative read queries now have generated-parser corpus
+coverage and retained generated raw nodes for covered read statements, while
+unsupported read shapes still fall back until read-plan parity is proven. The
+generated facade now returns closed statement-family nodes for the covered
+families; full production AST construction remains the next migration boundary
+for larger DDL, query, and DML families.
 
 ## Compatibility Policy
 
@@ -114,6 +117,11 @@ Suggested migration order:
    lowering parity and broader unsupported-shape diagnostics.
 4. Read queries: projections, predicates, joins, CTEs, aggregates, windows,
    set operations, lateral, ordering, limits, and document-table sources.
+   Initial generated-parser coverage now retains raw read nodes for
+   representative projection/filter/order/limit, grouped, join, lateral, and
+   non-recursive CTE query shapes; switching reads from fallback to required
+   generated parsing still requires broader PostgreSQL-compatible grammar
+   coverage and plan parity.
 5. Advanced DML: `INSERT ... SELECT`, `UPDATE ... FROM`, `DELETE ... USING`,
    `TRUNCATE`, and `MERGE`.
 6. Antfly extensions: graph traversal DSL, graph metric query surfaces,
@@ -220,9 +228,9 @@ Generated grammar work needs evidence at multiple levels:
 
 - Corpus tests for accepted PostgreSQL-compatible syntax. The initial checked
   corpus covers session commands, transaction commands, prepared statements,
-  simple database/schema/table/index/extension DDL, and representative DML.
-  Runtime parsing also enforces generated parser success for the session,
-  transaction, and prepared statement corpus.
+  simple database/schema/table/index/extension DDL, representative DML, and
+  representative read queries. Runtime parsing also enforces generated parser
+  success for the session, transaction, and prepared statement corpus.
 - Corpus tests for accepted Antfly-specific syntax.
 - Corpus tests for intentionally unsupported PostgreSQL syntax with stable
   diagnostics.
