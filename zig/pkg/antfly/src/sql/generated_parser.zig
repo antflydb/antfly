@@ -116,6 +116,16 @@ pub const GeneratedSqlTokenRange = struct {
     end: usize,
 };
 
+pub const GeneratedSqlOrderDirection = enum {
+    asc,
+    desc,
+};
+
+pub const GeneratedSqlNullsOrder = enum {
+    first,
+    last,
+};
+
 pub const GeneratedSqlListAst = struct {
     first_tokens: ?GeneratedSqlTokenRange = null,
     last_tokens: ?GeneratedSqlTokenRange = null,
@@ -123,12 +133,20 @@ pub const GeneratedSqlListAst = struct {
     expression_items: []GeneratedSqlTokenRange = &.{},
     alias_items: []?GeneratedSqlTokenRange = &.{},
     alias_name_items: []?GeneratedSqlTokenRange = &.{},
+    direction_items: []?GeneratedSqlTokenRange = &.{},
+    directions: []?GeneratedSqlOrderDirection = &.{},
+    nulls_order_items: []?GeneratedSqlTokenRange = &.{},
+    nulls_orders: []?GeneratedSqlNullsOrder = &.{},
     expressions: []GeneratedSqlExpressionAst = &.{},
     count: usize = 0,
 
     pub fn deinit(self: *GeneratedSqlListAst, alloc: std.mem.Allocator) void {
         for (self.expressions) |*expression| expression.deinit(alloc);
         if (self.expressions.len > 0) alloc.free(self.expressions);
+        if (self.nulls_orders.len > 0) alloc.free(self.nulls_orders);
+        if (self.nulls_order_items.len > 0) alloc.free(self.nulls_order_items);
+        if (self.directions.len > 0) alloc.free(self.directions);
+        if (self.direction_items.len > 0) alloc.free(self.direction_items);
         if (self.alias_name_items.len > 0) alloc.free(self.alias_name_items);
         if (self.alias_items.len > 0) alloc.free(self.alias_items);
         if (self.expression_items.len > 0) alloc.free(self.expression_items);
@@ -540,6 +558,7 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT DISTINCT ON (organization_id) organization_id, id FROM usage_records ORDER BY organization_id ASC, created_at DESC", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records ORDER BY id LIMIT ALL OFFSET 2 ROWS", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records ORDER BY created_at DESC NULLS LAST, score ASC NULLS FIRST", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records FETCH FIRST ROWS ONLY", .kind = .read },
     .{ .sql = "SELECT status FROM usage_records GROUP BY status HAVING status = 'open'", .kind = .read },
     .{ .sql = "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id", .kind = .read },
@@ -1093,7 +1112,7 @@ fn buildReadAst(
         if (order_start < order_end) {
             const order_tokens = GeneratedSqlTokenRange{ .start = order_start, .end = order_end };
             ast.order_tokens = order_tokens;
-            ast.order_items = try buildTopLevelListAst(alloc, tokens, order_tokens, .{});
+            ast.order_items = try buildTopLevelListAst(alloc, tokens, order_tokens, .{ .order_modifiers = true });
             if (generatedListExpressionTokens(ast.order_items, 0)) |first_tokens| {
                 ast.order_first_expression = try buildGeneratedExpressionAst(alloc, tokens, first_tokens);
             }
@@ -1492,6 +1511,7 @@ fn generatedSingleTokenRangeIfIdentifier(tokens: []const token_mod.Token, index:
 
 const GeneratedSqlListOptions = struct {
     bare_alias: bool = false,
+    order_modifiers: bool = false,
 };
 
 fn buildTopLevelListAst(
@@ -1547,11 +1567,35 @@ fn buildTopLevelListAst(
             alloc.free(ast.alias_name_items);
             ast.alias_name_items = &.{};
         }
+        ast.direction_items = try alloc.alloc(?GeneratedSqlTokenRange, ast.items.len);
+        errdefer {
+            alloc.free(ast.direction_items);
+            ast.direction_items = &.{};
+        }
+        ast.directions = try alloc.alloc(?GeneratedSqlOrderDirection, ast.items.len);
+        errdefer {
+            alloc.free(ast.directions);
+            ast.directions = &.{};
+        }
+        ast.nulls_order_items = try alloc.alloc(?GeneratedSqlTokenRange, ast.items.len);
+        errdefer {
+            alloc.free(ast.nulls_order_items);
+            ast.nulls_order_items = &.{};
+        }
+        ast.nulls_orders = try alloc.alloc(?GeneratedSqlNullsOrder, ast.items.len);
+        errdefer {
+            alloc.free(ast.nulls_orders);
+            ast.nulls_orders = &.{};
+        }
         for (ast.items, 0..) |item, item_index| {
             const aliased = generatedAliasedListItem(tokens, item, options);
             ast.expression_items[item_index] = aliased.expression_tokens;
             ast.alias_items[item_index] = aliased.alias_tokens;
             ast.alias_name_items[item_index] = aliased.alias_name_tokens;
+            ast.direction_items[item_index] = aliased.direction_tokens;
+            ast.directions[item_index] = aliased.direction;
+            ast.nulls_order_items[item_index] = aliased.nulls_order_tokens;
+            ast.nulls_orders[item_index] = aliased.nulls_order;
         }
         ast.expressions = try alloc.alloc(GeneratedSqlExpressionAst, ast.items.len);
         var expression_count: usize = 0;
@@ -1572,6 +1616,10 @@ const GeneratedAliasedListItem = struct {
     expression_tokens: GeneratedSqlTokenRange,
     alias_tokens: ?GeneratedSqlTokenRange = null,
     alias_name_tokens: ?GeneratedSqlTokenRange = null,
+    direction_tokens: ?GeneratedSqlTokenRange = null,
+    direction: ?GeneratedSqlOrderDirection = null,
+    nulls_order_tokens: ?GeneratedSqlTokenRange = null,
+    nulls_order: ?GeneratedSqlNullsOrder = null,
 };
 
 fn generatedAliasedListItem(
@@ -1581,6 +1629,34 @@ fn generatedAliasedListItem(
 ) GeneratedAliasedListItem {
     var result = GeneratedAliasedListItem{ .expression_tokens = range };
     if (range.end <= range.start + 1 or range.end > tokens.len) return result;
+
+    if (options.order_modifiers) {
+        var expression_end = range.end;
+        if (expression_end >= range.start + 2 and
+            tokens[expression_end - 2].matchesKeywordTag(.nulls))
+        {
+            if (tokens[expression_end - 1].matchesKeywordTag(.first)) {
+                result.nulls_order_tokens = .{ .start = expression_end - 2, .end = expression_end };
+                result.nulls_order = .first;
+                expression_end -= 2;
+            } else if (tokens[expression_end - 1].matchesKeywordTag(.last)) {
+                result.nulls_order_tokens = .{ .start = expression_end - 2, .end = expression_end };
+                result.nulls_order = .last;
+                expression_end -= 2;
+            }
+        }
+        if (expression_end > range.start and tokens[expression_end - 1].matchesKeywordTag(.asc)) {
+            result.direction_tokens = .{ .start = expression_end - 1, .end = expression_end };
+            result.direction = .asc;
+            expression_end -= 1;
+        } else if (expression_end > range.start and tokens[expression_end - 1].matchesKeywordTag(.desc)) {
+            result.direction_tokens = .{ .start = expression_end - 1, .end = expression_end };
+            result.direction = .desc;
+            expression_end -= 1;
+        }
+        if (expression_end > range.start) result.expression_tokens = .{ .start = range.start, .end = expression_end };
+        return result;
+    }
 
     var depth: usize = 0;
     var index = range.start;
@@ -3279,6 +3355,33 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 6 }, read.distinct_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 9 }, read.projection_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.source_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const order_nulls_read_sql = "SELECT id FROM usage_records ORDER BY created_at DESC NULLS LAST, score ASC NULLS FIRST";
+    const order_nulls_read_result = try parseSqlAlloc(alloc, order_nulls_read_sql);
+    switch (order_nulls_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 15 }, read.order_tokens.?);
+            try std.testing.expectEqual(@as(usize, 2), read.order_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 10 }, read.order_items.items[0]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.order_items.expression_items[0]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.order_items.direction_items[0].?);
+            try std.testing.expectEqual(GeneratedSqlOrderDirection.desc, read.order_items.directions[0].?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 10 }, read.order_items.nulls_order_items[0].?);
+            try std.testing.expectEqual(GeneratedSqlNullsOrder.last, read.order_items.nulls_orders[0].?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 15 }, read.order_items.items[1]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 12 }, read.order_items.expression_items[1]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read.order_items.direction_items[1].?);
+            try std.testing.expectEqual(GeneratedSqlOrderDirection.asc, read.order_items.directions[1].?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 15 }, read.order_items.nulls_order_items[1].?);
+            try std.testing.expectEqual(GeneratedSqlNullsOrder.first, read.order_items.nulls_orders[1].?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.order_first_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.order_first_expression.tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.order_last_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 12 }, read.order_last_expression.tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

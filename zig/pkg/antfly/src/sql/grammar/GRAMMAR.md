@@ -90,7 +90,8 @@ window clauses, ordering, pagination, set-operation tails, and CTE prefixes,
 owned list item and expression arrays plus first/last expression metadata for
 top-level projection, grouping, ordering, and function argument lists, explicit
 projection expression/alias token splits for explicit `AS` aliases and
-PostgreSQL-style bare aliases, and first-join generated metadata for
+PostgreSQL-style bare aliases, generated ordering direction and `NULLS`
+ordering token splits, and first-join generated metadata for
 join operator/type, left input, right input, and join predicate ranges, plus simple top-level
 comparison expression metadata for covered `WHERE`, `HAVING`, and join
 predicates. Normal function-call argument
@@ -253,7 +254,8 @@ Suggested migration order:
    top-level projection, grouping, ordering, and function argument lists with
    first/last expression metadata for those lists, explicit projection
    expression/alias token splits for explicit `AS` aliases and
-   PostgreSQL-style bare aliases, and owned join item arrays
+   PostgreSQL-style bare aliases, generated ordering direction and `NULLS`
+   ordering token splits, and owned join item arrays
    with first-join compatibility metadata for join operator/type, left input,
    right input, and join predicate ranges, plus simple top-level comparison
    expression metadata for covered `WHERE`, `HAVING`, and join predicates; and

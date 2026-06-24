@@ -906,6 +906,7 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
         .{ .sql = "SELECT DISTINCT ON (organization_id) organization_id, id FROM usage_records ORDER BY organization_id ASC, created_at DESC", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records ORDER BY id LIMIT ALL OFFSET 2 ROWS", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records ORDER BY created_at DESC NULLS LAST, score ASC NULLS FIRST", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records FETCH FIRST ROWS ONLY", .generated = .query, .read = .query },
         .{ .sql = "SELECT status FROM usage_records GROUP BY status HAVING status = 'open'", .generated = .aggregate, .read = .aggregate },
         .{ .sql = "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id", .generated = .join, .read = .join },
@@ -1314,6 +1315,21 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                 } else if (std.mem.eql(u8, case.sql, "SELECT DISTINCT ON (organization_id) organization_id, id FROM usage_records ORDER BY organization_id ASC, created_at DESC")) {
                     try std.testing.expect(read_ast.distinct_tokens != null);
                     try std.testing.expect(read_ast.projection_tokens != null);
+                } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records ORDER BY created_at DESC NULLS LAST, score ASC NULLS FIRST")) {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 15 }, read_ast.order_tokens.?);
+                    try std.testing.expectEqual(@as(usize, 2), read_ast.order_items.count);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 10 }, read_ast.order_items.items[0]);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read_ast.order_items.expression_items[0]);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read_ast.order_items.direction_items[0].?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlOrderDirection.desc, read_ast.order_items.directions[0].?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 8, .end = 10 }, read_ast.order_items.nulls_order_items[0].?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlNullsOrder.last, read_ast.order_items.nulls_orders[0].?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 11, .end = 15 }, read_ast.order_items.items[1]);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 11, .end = 12 }, read_ast.order_items.expression_items[1]);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read_ast.order_items.direction_items[1].?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlOrderDirection.asc, read_ast.order_items.directions[1].?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 13, .end = 15 }, read_ast.order_items.nulls_order_items[1].?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlNullsOrder.first, read_ast.order_items.nulls_orders[1].?);
                 } else if (case.generated == .join) {
                     if (std.mem.indexOf(u8, case.sql, " JOIN tenants ")) |_| {
                         try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 16 }, read_ast.join_tokens.?);
