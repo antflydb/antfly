@@ -15,9 +15,11 @@
 const std = @import("std");
 
 const binder = @import("binder.zig");
+const classifier = @import("classifier.zig");
 const corpus = @import("corpus.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
+const generated_parser = @import("generated_parser.zig");
 const grammar = @import("grammar.zig");
 const lower_expr = @import("lower_expr.zig");
 const lowering_context = @import("lowering_context.zig");
@@ -12314,6 +12316,23 @@ fn lowerWritePlanForDmlTestAlloc(
     return try lowerWritePlanParsedSqlForDmlTestAlloc(alloc, &parsed_sql, schema, params, options);
 }
 
+fn lowerGeneratedDmlWritePlanForDmlTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+) !plan_mod.LoweredWritePlan {
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    const generated_raw = parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    const dml_ast = switch (generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .dml => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    return try lowerWritePlanFromGeneratedDmlAstAlloc(alloc, &parsed_sql, dml_ast, schema, params, options);
+}
+
 fn lowerWritePlanParsedSqlForDmlTestAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
@@ -12346,6 +12365,39 @@ fn lowerWritePlanParsedSqlForDmlTestAlloc(
         },
     };
     return try context.lowerParsed(parsed_sql, options);
+}
+
+pub fn lowerWritePlanFromGeneratedDmlAstAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    dml_ast: generated_parser.GeneratedSqlDmlAst,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+) !plan_mod.LoweredWritePlan {
+    const write_kind = parsed_sql.writeStatementKind() orelse return error.UnsupportedSqlShape;
+    if (!generatedDmlAstMatchesWriteKind(dml_ast.kind, write_kind)) return error.UnsupportedSqlShape;
+    return try lowerWritePlanParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, options);
+}
+
+fn generatedDmlAstMatchesWriteKind(
+    generated_kind: generated_parser.GeneratedSqlDmlKind,
+    write_kind: classifier.SqlWriteStatementKind,
+) bool {
+    return switch (generated_kind) {
+        .insert_values => write_kind == .insert,
+        .insert_select => write_kind == .insert_source,
+        .update => switch (write_kind) {
+            .update, .update_source, .update_joined_source => true,
+            else => false,
+        },
+        .delete => switch (write_kind) {
+            .delete, .delete_source, .delete_joined_source => true,
+            else => false,
+        },
+        .truncate => write_kind == .truncate,
+        .merge => write_kind == .merge,
+    };
 }
 
 fn lowerWritePlanWithCatalogForDmlTestAlloc(
@@ -12408,6 +12460,46 @@ fn unsupportedRecursiveMergeMutationForDmlTestAlloc(
 }
 
 const TestPrimaryResolver = test_support.TestPrimaryResolver;
+
+test "sql adapter lower dml lowers generated DML AST through typed write plans" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"kind":{"type":"keyword"},"source_id":{"type":"keyword"},"status":{"type":"keyword"},"organization_id":{"type":"keyword"},"quantity":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"status\":\"active\",\"organization_id\":\"o1\",\"quantity\":1}", .version = 9 };
+    const txn_id = [_]u8{ 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f };
+    const claim: db_mod.types.RowClaimRequest = .{
+        .mode = .for_update,
+        .owner_id = "sql-generated-dml",
+        .txn_id = txn_id,
+    };
+    const options = plan_mod.LowerWritePlanOptions{
+        .unique_resolver = resolver_ctx.resolver(),
+        .row_claim = claim,
+        .sync_level = .full_text,
+    };
+
+    const cases = [_][]const u8{
+        "INSERT INTO usage_records (id, status, organization_id, quantity) VALUES ('u2', 'active', 'o1', 7) RETURNING id",
+        "INSERT INTO usage_records (id, status, quantity) SELECT id, status, quantity FROM usage_records WHERE status = 'ready'",
+        "UPDATE usage_records SET status = 'disabled' WHERE id = 'u1' RETURNING id",
+        "UPDATE usage_records SET status = 'disabled' WHERE organization_id = 'o1' RETURNING id",
+        "DELETE FROM usage_records WHERE id = 'u1' RETURNING id",
+        "DELETE FROM usage_records WHERE organization_id = 'o1' RETURNING id",
+        "TRUNCATE usage_records",
+        "MERGE INTO usage_records USING usage_records AS source ON usage_records.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status",
+    };
+
+    for (cases) |sql| {
+        var legacy = try lowerWritePlanForDmlTestAlloc(alloc, sql, schema, &.{}, options);
+        defer legacy.deinit(alloc);
+        var generated = try lowerGeneratedDmlWritePlanForDmlTestAlloc(alloc, sql, schema, &.{}, options);
+        defer generated.deinit(alloc);
+        try std.testing.expectEqual(std.meta.activeTag(legacy), std.meta.activeTag(generated));
+    }
+}
 
 test "sql adapter lower dml routes write sql through typed plan families" {
     const alloc = std.testing.allocator;

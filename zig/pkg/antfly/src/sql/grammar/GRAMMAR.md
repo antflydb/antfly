@@ -53,10 +53,13 @@ existing parser when the seed grammar does not yet cover the shape; generated
 simple DDL ASTs now have AST-to-plan parity for database, schema, and extension
 create/drop catalog plans, plus generated AST-to-plan parity for seed
 `CREATE TABLE` and `CREATE INDEX` forms using the same parser options as the
-existing lowerer. Simple DML now has generated-parser corpus coverage and
-retained generated raw and AST nodes for covered write statements, but
-unsupported DML still falls back and DML execution still uses the existing
-token-based lowerers until plan parity is proven. Representative read queries
+existing lowerer. Simple DML now has generated-parser corpus coverage, retained
+generated raw and AST nodes for covered write statements, and an initial
+generated AST-to-plan wrapper that fails closed if the generated DML family does
+not match the existing write classifier before delegating to the current typed
+DML lowerer. Unsupported DML still falls back, and deeper DML cutover still
+requires replacing token-based command-body parsing with generated AST payloads
+for each write shape. Representative read queries
 now have generated-parser corpus coverage and retained generated raw and AST
 nodes for covered read statements, while unsupported read shapes still fall back
 until read-plan parity is proven. The generated parser now also treats seed
@@ -129,10 +132,12 @@ Suggested migration order:
    parser until each shape has raw AST parity.
 3. Simple DML: `INSERT ... VALUES`, primary-key `UPDATE`, primary-key
    `DELETE`, `RETURNING`, and `ON CONFLICT`. Initial generated-parser coverage
-   now retains raw DML nodes for representative `INSERT ... VALUES`,
+   now retains raw and AST DML nodes for representative `INSERT ... VALUES`,
    `INSERT ... SELECT`, `UPDATE`, `DELETE`, `TRUNCATE`, and `MERGE` statements;
-   switching DML from fallback to required generated parsing still requires
-   lowering parity and broader unsupported-shape diagnostics.
+   generated DML ASTs now have a validated wrapper into the current typed DML
+   lowerer for representative generated-covered write plans. Switching DML from
+   fallback to required generated parsing still requires generated command-body
+   ASTs and broader unsupported-shape diagnostics.
 4. Read queries: projections, predicates, joins, CTEs, aggregates, windows,
    set operations, lateral, ordering, limits, and document-table sources.
    Initial generated-parser coverage now retains raw read nodes for
@@ -235,7 +240,8 @@ variants for:
 - DDL statement, including a generated AST payload for command spans, plus
   generated AST-to-plan parity for database, schema, and extension create/drop
   catalog plans and seed `CREATE TABLE` / `CREATE INDEX` plans
-- DML statement, including a generated AST payload for command spans
+- DML statement, including a generated AST payload for command spans and an
+  initial AST-to-plan wrapper for generated-covered write statements
 - read statement, including a generated AST payload for command spans
 - graph statement, including a generated AST payload for command spans
 
@@ -273,7 +279,9 @@ Generated grammar work needs evidence at multiple levels:
   current parser for migrated statement families. Session catalog commands,
   transaction boundaries, prepared statements, and simple DDL database/schema/
   extension catalog plans plus seed `CREATE TABLE` / `CREATE INDEX` plans have
-  generated AST-to-plan parity tests for their generated-covered forms.
+  generated AST-to-plan parity tests for their generated-covered forms. Simple
+  DML has initial generated AST-to-plan parity through a generated-family
+  validation wrapper over representative write plans.
 - SQL/API parity tests showing SQL and native API requests reach the same
   service contracts.
 - Fuzz or mutation tests for scanner/parser crash resistance and bounded error
