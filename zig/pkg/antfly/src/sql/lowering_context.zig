@@ -2285,6 +2285,22 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_in_subquery_parsed_sql, malformed_in_subquery_read_ast),
     );
 
+    var malformed_like_any_subquery_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE lower(status) LIKE ANY (SELECT pattern FROM active_patterns)",
+    );
+    defer malformed_like_any_subquery_parsed_sql.deinit(alloc);
+    const malformed_like_any_subquery_generated_raw = malformed_like_any_subquery_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_like_any_subquery_read_ast = switch (malformed_like_any_subquery_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_like_any_subquery_read_ast.where_expression.right_expression_kind = .token_range;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_like_any_subquery_parsed_sql, malformed_like_any_subquery_read_ast),
+    );
+
     var malformed_distinct_on_parsed_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
         "SELECT DISTINCT ON (organization_id) organization_id, id FROM usage_records ORDER BY organization_id ASC, created_at DESC",
