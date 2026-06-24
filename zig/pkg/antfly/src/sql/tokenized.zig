@@ -294,10 +294,7 @@ fn parseGeneratedRawStatementAlloc(
     tokens: []const Token,
     raw_statement: RawSqlStatement,
 ) !?GeneratedRawSqlStatement {
-    const result = generated_parser.parseGeneratedGateTokensAlloc(alloc, tokens) catch |err| switch (err) {
-        error.UnsupportedSqlShape, error.UnexpectedToken => null,
-        else => return err,
-    };
+    const result = try generated_parser.parseGeneratedGateTokensAlloc(alloc, tokens);
     if (result) |parsed| {
         return .{ .raw = raw_statement, .statement = parsed.statement };
     }
@@ -582,6 +579,18 @@ test "sql adapter parsed sql does not require generated grammar parity" {
     var select = try ParsedSql.initAlloc(alloc, "SELECT id FROM docs WHERE status = 'active' LIMIT 5");
     defer select.deinit(alloc);
     try std.testing.expectEqual(classifier.SqlReadStatementKind.query, select.readStatementKind().?);
+}
+
+test "sql adapter parsed sql requires generated grammar for first migrated control family" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SET search_path TO"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "PREPARE read_stmt AS"));
+
+    var complex_ddl = try ParsedSql.initAlloc(alloc, "ALTER TABLE audit_log ALTER COLUMN amount TYPE numeric USING amount + 1;");
+    defer complex_ddl.deinit(alloc);
+    try std.testing.expect(complex_ddl.generated_statement == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .ddl), std.meta.activeTag(complex_ddl.statement));
 }
 
 test "sql adapter parsed sql builds non-contiguous child statements from parent tokens" {

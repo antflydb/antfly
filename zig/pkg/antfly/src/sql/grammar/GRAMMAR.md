@@ -37,12 +37,13 @@ generates conflict-free parser metadata. The first runtime integration observes
 the generated parser on the `ParsedSql` path but does not require grammar parity
 before the existing parser can handle a statement. When the generated parser
 accepts a statement, `ParsedSql` retains a source-span-bearing generated raw
-node and uses it for the first migrated statement variants. Dedicated
-generated-parser tests enforce session, transaction, prepared statement, and
-simple DDL corpus coverage. The generated facade now returns closed
-statement-family nodes for the covered families; full production AST
-construction remains the next migration boundary for larger DDL, query, and DML
-families.
+node and uses it for the first migrated statement variants. Session,
+transaction, and prepared statements now require generated parser success;
+simple DDL has generated-parser corpus coverage but still falls back to the
+existing parser when the seed grammar does not yet cover the shape. The
+generated facade now returns closed statement-family nodes for the covered
+families; full production AST construction remains the next migration boundary
+for larger DDL, query, and DML families.
 
 ## Compatibility Policy
 
@@ -213,7 +214,9 @@ Generated grammar work needs evidence at multiple levels:
 
 - Corpus tests for accepted PostgreSQL-compatible syntax. The initial checked
   corpus covers session commands, transaction commands, prepared statements,
-  and simple database/schema/table/index/extension DDL.
+  simple database/schema/table/index/extension DDL. Runtime parsing also
+  enforces generated parser success for the session, transaction, and prepared
+  statement corpus.
 - Corpus tests for accepted Antfly-specific syntax.
 - Corpus tests for intentionally unsupported PostgreSQL syntax with stable
   diagnostics.
