@@ -104,6 +104,12 @@ pub const GeneratedSqlTokenRange = struct {
     end: usize,
 };
 
+pub const GeneratedSqlListAst = struct {
+    first_tokens: ?GeneratedSqlTokenRange = null,
+    last_tokens: ?GeneratedSqlTokenRange = null,
+    count: usize = 0,
+};
+
 pub const GeneratedSqlSessionAst = struct {
     kind: GeneratedSqlSessionKind,
     statement_span: token_mod.SourceSpan,
@@ -173,12 +179,15 @@ pub const GeneratedSqlReadAst = struct {
     cte_recursive: bool = false,
     distinct_tokens: ?GeneratedSqlTokenRange = null,
     projection_tokens: ?GeneratedSqlTokenRange = null,
+    projection_items: GeneratedSqlListAst = .{},
     source_tokens: ?GeneratedSqlTokenRange = null,
     where_tokens: ?GeneratedSqlTokenRange = null,
     group_tokens: ?GeneratedSqlTokenRange = null,
+    group_items: GeneratedSqlListAst = .{},
     having_tokens: ?GeneratedSqlTokenRange = null,
     window_tokens: ?GeneratedSqlTokenRange = null,
     order_tokens: ?GeneratedSqlTokenRange = null,
+    order_items: GeneratedSqlListAst = .{},
     limit_tokens: ?GeneratedSqlTokenRange = null,
     offset_tokens: ?GeneratedSqlTokenRange = null,
     fetch_tokens: ?GeneratedSqlTokenRange = null,
@@ -271,6 +280,7 @@ pub const simple_dml_corpus = [_]GeneratedSqlCorpusCase{
 
 pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT id, status FROM usage_records WHERE status = 'open' ORDER BY id LIMIT 10", .kind = .read },
+    .{ .sql = "SELECT id, row_number() OVER (PARTITION BY tenant, account ORDER BY id) AS rn FROM usage_records ORDER BY id, tenant", .kind = .read },
     .{ .sql = "SELECT DISTINCT status FROM usage_records ORDER BY status", .kind = .read },
     .{ .sql = "SELECT DISTINCT ON (organization_id) organization_id, id FROM usage_records ORDER BY organization_id ASC, created_at DESC", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY", .kind = .read },
@@ -723,7 +733,11 @@ fn buildReadAst(
     const fetch_index = findTopLevelKeyword(tokens, projection_start, body_end, .fetch);
 
     const projection_end = firstOptionalIndex(&[_]?usize{ from_index, where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
-    if (projection_start < projection_end) ast.projection_tokens = .{ .start = projection_start, .end = projection_end };
+    if (projection_start < projection_end) {
+        const projection_tokens = GeneratedSqlTokenRange{ .start = projection_start, .end = projection_end };
+        ast.projection_tokens = projection_tokens;
+        ast.projection_items = buildTopLevelListAst(tokens, projection_tokens);
+    }
 
     if (from_index) |idx| {
         const source_end = firstOptionalIndex(&[_]?usize{ where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
@@ -736,7 +750,11 @@ fn buildReadAst(
     if (group_index) |idx| {
         const group_start = if (idx + 1 < body_end and tokens[idx + 1].matchesKeywordTag(.by)) idx + 2 else idx + 1;
         const group_end = firstOptionalIndex(&[_]?usize{ having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
-        if (group_start < group_end) ast.group_tokens = .{ .start = group_start, .end = group_end };
+        if (group_start < group_end) {
+            const group_tokens = GeneratedSqlTokenRange{ .start = group_start, .end = group_end };
+            ast.group_tokens = group_tokens;
+            ast.group_items = buildTopLevelListAst(tokens, group_tokens);
+        }
     }
     if (having_index) |idx| {
         const having_end = firstOptionalIndex(&[_]?usize{ window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
@@ -749,7 +767,11 @@ fn buildReadAst(
     if (order_index) |idx| {
         const order_start = if (idx + 1 < body_end and tokens[idx + 1].matchesKeywordTag(.by)) idx + 2 else idx + 1;
         const order_end = firstOptionalIndex(&[_]?usize{ limit_index, offset_index, fetch_index }) orelse body_end;
-        if (order_start < order_end) ast.order_tokens = .{ .start = order_start, .end = order_end };
+        if (order_start < order_end) {
+            const order_tokens = GeneratedSqlTokenRange{ .start = order_start, .end = order_end };
+            ast.order_tokens = order_tokens;
+            ast.order_items = buildTopLevelListAst(tokens, order_tokens);
+        }
     }
     if (limit_index) |idx| {
         const limit_end = firstOptionalIndex(&[_]?usize{ offset_index, fetch_index }) orelse body_end;
@@ -986,6 +1008,38 @@ fn consumeGeneratedIfExists(tokens: []const token_mod.Token, index: *usize, end:
 fn generatedSingleTokenRangeIfIdentifier(tokens: []const token_mod.Token, index: usize, end: usize) ?GeneratedSqlTokenRange {
     if (index >= end or tokens[index].kind != .identifier) return null;
     return .{ .start = index, .end = index + 1 };
+}
+
+fn buildTopLevelListAst(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) GeneratedSqlListAst {
+    var ast = GeneratedSqlListAst{};
+    if (range.start >= range.end or range.end > tokens.len) return ast;
+
+    var item_start = range.start;
+    var depth: usize = 0;
+    var index = range.start;
+    while (index < range.end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth == 0) return ast;
+                depth -= 1;
+            },
+            .comma => if (depth == 0) {
+                recordGeneratedListItem(&ast, .{ .start = item_start, .end = index });
+                item_start = index + 1;
+            },
+            else => {},
+        }
+    }
+    recordGeneratedListItem(&ast, .{ .start = item_start, .end = range.end });
+    return ast;
+}
+
+fn recordGeneratedListItem(ast: *GeneratedSqlListAst, range: GeneratedSqlTokenRange) void {
+    if (range.start >= range.end) return;
+    if (ast.count == 0) ast.first_tokens = range;
+    ast.last_tokens = range;
+    ast.count += 1;
 }
 
 fn findKeyword(tokens: []const token_mod.Token, start: usize, end: usize, keyword: token_mod.TokenKeyword) ?usize {
@@ -1278,12 +1332,36 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqualStrings("SELECT id, status FROM usage_records WHERE status = 'open' ORDER BY id LIMIT 10", spanText(read_sql, read.statement_span));
             try std.testing.expectEqualStrings("SELECT", spanText(read_sql, read.command_span));
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 4 }, read.projection_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.projection_items.first_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read.projection_items.last_tokens.?);
+            try std.testing.expectEqual(@as(usize, 2), read.projection_items.count);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.source_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 10 }, read.where_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read.order_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read.order_items.first_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read.order_items.last_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), read.order_items.count);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 14, .end = 15 }, read.limit_tokens.?);
             try std.testing.expect(read.group_tokens == null);
             try std.testing.expect(read.having_tokens == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const nested_list_read_sql = "SELECT id, row_number() OVER (PARTITION BY tenant, account ORDER BY id) AS rn FROM usage_records ORDER BY id, tenant";
+    const nested_list_read_result = try parseSqlAlloc(alloc, nested_list_read_sql);
+    switch (nested_list_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.window, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 19 }, read.projection_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.projection_items.first_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 19 }, read.projection_items.last_tokens.?);
+            try std.testing.expectEqual(@as(usize, 2), read.projection_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 20, .end = 21 }, read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 23, .end = 26 }, read.order_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 23, .end = 24 }, read.order_items.first_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 25, .end = 26 }, read.order_items.last_tokens.?);
+            try std.testing.expectEqual(@as(usize, 2), read.order_items.count);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -1296,6 +1374,9 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.projection_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read.source_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.group_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.group_items.first_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.group_items.last_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), read.group_items.count);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 11 }, read.having_tokens.?);
         },
         else => return error.TestUnexpectedResult,
