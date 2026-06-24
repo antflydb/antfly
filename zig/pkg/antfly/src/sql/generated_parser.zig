@@ -149,6 +149,7 @@ pub const GeneratedSqlExpressionKind = enum {
     json_text_access,
     json_path_access,
     json_path_text_access,
+    function_call,
 };
 
 pub const GeneratedSqlExpressionAst = struct {
@@ -156,6 +157,9 @@ pub const GeneratedSqlExpressionAst = struct {
     tokens: ?GeneratedSqlTokenRange = null,
     inner_tokens: ?GeneratedSqlTokenRange = null,
     inner_expression_kind: ?GeneratedSqlExpressionKind = null,
+    function_name_tokens: ?GeneratedSqlTokenRange = null,
+    argument_tokens: ?GeneratedSqlTokenRange = null,
+    argument_items: GeneratedSqlListAst = .{},
     left_tokens: ?GeneratedSqlTokenRange = null,
     left_expression_kind: ?GeneratedSqlExpressionKind = null,
     negation_tokens: ?GeneratedSqlTokenRange = null,
@@ -372,6 +376,7 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT id FROM usage_records WHERE score + bonus > 10", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE score * weight > 10", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE payload ->> 'status' = 'open'", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE lower(status) = 'open'", .kind = .read },
     .{ .sql = "SELECT concat_ws(',', status), id FROM usage_records ORDER BY status, id", .kind = .read },
     .{ .sql = "SELECT id, row_number() OVER (PARTITION BY tenant, account ORDER BY id) AS rn FROM usage_records ORDER BY id, tenant", .kind = .read },
     .{ .sql = "SELECT DISTINCT status FROM usage_records ORDER BY status", .kind = .read },
@@ -1196,6 +1201,15 @@ fn buildGeneratedExpressionAst(tokens: []const token_mod.Token, range: Generated
         ast.inner_expression_kind = generatedExpressionKindForRange(tokens, inner_range);
         return ast;
     }
+    if (generatedFunctionCallExpression(tokens, range)) |function_call| {
+        ast.kind = .function_call;
+        ast.function_name_tokens = function_call.name_tokens;
+        ast.argument_tokens = function_call.argument_tokens;
+        if (function_call.argument_tokens) |argument_tokens| {
+            ast.argument_items = buildTopLevelListAst(tokens, argument_tokens);
+        }
+        return ast;
+    }
     const operator = findTopLevelExpressionOperator(tokens, range) orelse return ast;
     ast.kind = operator.kind;
     if (!operator.prefix) {
@@ -1221,7 +1235,62 @@ fn buildGeneratedExpressionAst(tokens: []const token_mod.Token, range: Generated
 
 fn generatedExpressionKindForRange(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?GeneratedSqlExpressionKind {
     if (generatedWrappedExpressionInnerRange(tokens, range) != null) return .grouped;
+    if (generatedFunctionCallExpression(tokens, range) != null) return .function_call;
     return if (findTopLevelExpressionOperator(tokens, range)) |operator| operator.kind else null;
+}
+
+const GeneratedFunctionCallExpression = struct {
+    name_tokens: GeneratedSqlTokenRange,
+    argument_tokens: ?GeneratedSqlTokenRange = null,
+};
+
+fn generatedFunctionCallExpression(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?GeneratedFunctionCallExpression {
+    if (range.start + 2 > range.end or range.end > tokens.len) return null;
+    if (tokens[range.end - 1].kind != .rparen) return null;
+
+    var depth: usize = 0;
+    var lparen_index: ?usize = null;
+    var index = range.start;
+    while (index < range.end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen => {
+                if (depth == 0 and lparen_index == null) lparen_index = index;
+                depth += 1;
+            },
+            .rparen => {
+                if (depth == 0) return null;
+                depth -= 1;
+                if (depth == 0 and index + 1 != range.end) return null;
+            },
+            else => {},
+        }
+    }
+    if (depth != 0) return null;
+    const open_index = lparen_index orelse return null;
+    if (open_index <= range.start) return null;
+    if (isGeneratedFunctionCallBlockedName(tokens[open_index - 1])) return null;
+    if (!isGeneratedQualifiedNameRange(tokens, .{ .start = range.start, .end = open_index })) return null;
+    return .{
+        .name_tokens = .{ .start = range.start, .end = open_index },
+        .argument_tokens = if (open_index + 1 < range.end - 1) .{ .start = open_index + 1, .end = range.end - 1 } else null,
+    };
+}
+
+fn isGeneratedFunctionCallBlockedName(token: token_mod.Token) bool {
+    return token.matchesKeywordTag(.in) or
+        token.matchesKeywordTag(.not) or
+        token.matchesKeywordTag(.any) or
+        token.matchesKeywordTag(.all) or
+        token.matchesKeywordTag(.some);
+}
+
+fn isGeneratedQualifiedNameRange(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) bool {
+    if (range.start >= range.end or range.end > tokens.len) return false;
+    var index = range.start;
+    while (index < range.end) : (index += 1) {
+        if (tokens[index].kind != .identifier) return false;
+    }
+    return true;
 }
 
 fn generatedWrappedExpressionInnerRange(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?GeneratedSqlTokenRange {
@@ -1997,6 +2066,31 @@ test "generated SQL parser facade builds control AST spans" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    const function_comparison_read_sql = "SELECT id FROM usage_records WHERE lower(status) = 'open'";
+    const function_comparison_read_result = try parseSqlAlloc(alloc, function_comparison_read_sql);
+    switch (function_comparison_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 11 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 9 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.function_call, read.where_expression.left_expression_kind.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.where_expression.right_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var function_tokens = try lexer.tokenizeAlloc(alloc, "lower(status, fallback)");
+    defer lexer.freeTokens(alloc, &function_tokens);
+    const function_expression = buildGeneratedExpressionAst(function_tokens.items, .{ .start = 0, .end = function_tokens.items.len });
+    try std.testing.expectEqual(GeneratedSqlExpressionKind.function_call, function_expression.kind);
+    try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 0, .end = 1 }, function_expression.function_name_tokens.?);
+    try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 5 }, function_expression.argument_tokens.?);
+    try std.testing.expectEqual(@as(usize, 2), function_expression.argument_items.count);
+    try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, function_expression.argument_items.first_tokens.?);
+    try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, function_expression.argument_items.last_tokens.?);
 
     const nested_list_read_sql = "SELECT id, row_number() OVER (PARTITION BY tenant, account ORDER BY id) AS rn FROM usage_records ORDER BY id, tenant";
     const nested_list_read_result = try parseSqlAlloc(alloc, nested_list_read_sql);
