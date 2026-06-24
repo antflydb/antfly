@@ -225,6 +225,7 @@ pub const TokenKeyword = enum {
     outer,
     overlay,
     over,
+    partition,
     percentile_cont,
     percentile_disc,
     period,
@@ -468,6 +469,7 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.to_jsonb, keywordFromIdentifier("TO_JSONB").?);
     try std.testing.expectEqual(TokenKeyword.verbose, keywordFromIdentifier("VERBOSE").?);
     try std.testing.expectEqual(TokenKeyword.wal, keywordFromIdentifier("WAL").?);
+    try std.testing.expectEqual(TokenKeyword.partition, keywordFromIdentifier("PARTITION").?);
     try std.testing.expectEqual(TokenKeyword.window, keywordFromIdentifier("WINDOW").?);
     try std.testing.expectEqual(TokenKeyword.yes, keywordFromIdentifier("YES").?);
     try std.testing.expectEqual(TokenKeyword.off, keywordFromIdentifier("OFF").?);
