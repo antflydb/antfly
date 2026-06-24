@@ -594,6 +594,10 @@ comparison_expression:
   | additive_expression comparison_operator quantified_operator LPAREN expression_list RPAREN
   | additive_expression IS NULL
   | additive_expression IS NOT NULL
+  | additive_expression IS TRUE
+  | additive_expression IS FALSE
+  | additive_expression IS NOT TRUE
+  | additive_expression IS NOT FALSE
   ;
 
 comparison_operator:

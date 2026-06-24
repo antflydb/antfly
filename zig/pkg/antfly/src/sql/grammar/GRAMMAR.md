@@ -98,12 +98,14 @@ classified in generated expression metadata along with their `NOT` negated
 forms. `ANY`/`ALL`/`SOME` quantified comparison predicates over parenthesized
 expression lists are also accepted and classified with explicit quantifier
 token ranges. `IS NULL` and `IS NOT NULL` predicates are accepted and
-classified as explicit null-test expression kinds. Top-level `AND` and `OR`
-predicates are classified as logical-expression metadata with left and right
-token ranges and child expression-kind summaries, while `BETWEEN ... AND ...`
-remains classified as a range predicate. Prefix `NOT` predicates are accepted
-and classified with right-side expression-kind summaries. Parenthesized
-expression groups carry inner token ranges and inner expression-kind summaries,
+classified as explicit null-test expression kinds, and `IS TRUE`/`IS FALSE`
+boolean-test predicates are accepted with their `IS NOT` variants. Top-level
+`AND` and `OR` predicates are classified as logical-expression metadata with
+left and right token ranges and child expression-kind summaries, while
+`BETWEEN ... AND ...` remains classified as a range predicate. Prefix `NOT`
+predicates are accepted and classified with right-side expression-kind
+summaries. Parenthesized expression groups carry inner token ranges and inner
+expression-kind summaries,
 and comparison operands can expose additive and multiplicative child
 expression-kind summaries, including JSON/path postfix operator summaries,
 function-call child summaries, and direct function-call name and argument-list
@@ -250,11 +252,13 @@ Suggested migration order:
    `ANY`/`ALL`/`SOME` quantified comparison predicates over parenthesized
    expression lists are accepted and classified with explicit quantifier token
    ranges. `IS NULL` and `IS NOT NULL` predicates are accepted and classified
-   as explicit null-test expression kinds. Top-level `AND` and `OR` predicates
-   are classified as logical-expression metadata with left and right token
-   ranges and child expression-kind summaries, while `BETWEEN ... AND ...`
-   remains classified as a range predicate. Prefix `NOT` predicates are
-   accepted and classified with right-side expression-kind summaries.
+   as explicit null-test expression kinds, and `IS TRUE`/`IS FALSE`
+   boolean-test predicates are accepted with their `IS NOT` variants. Top-level
+   `AND` and `OR` predicates are classified as logical-expression metadata with
+   left and right token ranges and child expression-kind summaries, while
+   `BETWEEN ... AND ...` remains classified as a range predicate. Prefix `NOT`
+   predicates are accepted and classified with right-side expression-kind
+   summaries.
    Parenthesized expression groups carry inner token ranges and inner
    expression-kind summaries, and comparison operands can expose additive and
    multiplicative child expression-kind summaries, including JSON/path postfix
