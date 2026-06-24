@@ -144,10 +144,12 @@ pub const GeneratedSqlExpressionAst = struct {
     kind: GeneratedSqlExpressionKind = .token_range,
     tokens: ?GeneratedSqlTokenRange = null,
     left_tokens: ?GeneratedSqlTokenRange = null,
+    left_expression_kind: ?GeneratedSqlExpressionKind = null,
     negation_tokens: ?GeneratedSqlTokenRange = null,
     operator_tokens: ?GeneratedSqlTokenRange = null,
     quantifier_tokens: ?GeneratedSqlTokenRange = null,
     right_tokens: ?GeneratedSqlTokenRange = null,
+    right_expression_kind: ?GeneratedSqlExpressionKind = null,
 };
 
 pub const GeneratedSqlSessionAst = struct {
@@ -1175,6 +1177,9 @@ fn buildGeneratedExpressionAst(tokens: []const token_mod.Token, range: Generated
     if (range.start >= left_end) return ast;
     ast.kind = operator.kind;
     ast.left_tokens = .{ .start = range.start, .end = left_end };
+    if (operator.kind == .logical_or or operator.kind == .logical_and) {
+        ast.left_expression_kind = generatedExpressionKindForRange(tokens, ast.left_tokens.?);
+    }
     if (operator.negation_index) |negation_index| ast.negation_tokens = .{ .start = negation_index, .end = negation_index + 1 };
     ast.operator_tokens = .{ .start = operator.index, .end = operator.index + 1 };
     const right_start = if (operator.quantifier_index) |quantifier_index| blk: {
@@ -1183,7 +1188,14 @@ fn buildGeneratedExpressionAst(tokens: []const token_mod.Token, range: Generated
     } else operator.index + 1;
     if (right_start >= range.end) return ast;
     ast.right_tokens = .{ .start = right_start, .end = range.end };
+    if (operator.kind == .logical_or or operator.kind == .logical_and) {
+        ast.right_expression_kind = generatedExpressionKindForRange(tokens, ast.right_tokens.?);
+    }
     return ast;
+}
+
+fn generatedExpressionKindForRange(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?GeneratedSqlExpressionKind {
+    return if (findTopLevelExpressionOperator(tokens, range)) |operator| operator.kind else null;
 }
 
 const GeneratedSqlExpressionOperator = struct {
@@ -1781,8 +1793,10 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 12 }, read.where_tokens.?);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.logical_or, read.where_expression.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 8 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.left_expression_kind.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.where_expression.operator_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 12 }, read.where_expression.right_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.is_null, read.where_expression.right_expression_kind.?);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -1795,8 +1809,10 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 12 }, read.where_tokens.?);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.logical_and, read.where_expression.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 8 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.left_expression_kind.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.where_expression.operator_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 12 }, read.where_expression.right_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.is_null, read.where_expression.right_expression_kind.?);
         },
         else => return error.TestUnexpectedResult,
     }
