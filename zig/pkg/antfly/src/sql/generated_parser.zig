@@ -290,7 +290,22 @@ pub const GeneratedSqlJoinAst = struct {
 
 pub const GeneratedSqlCteAst = struct {
     name_tokens: GeneratedSqlTokenRange,
+    column_tokens: ?GeneratedSqlTokenRange = null,
+    column_name_tokens: ?GeneratedSqlTokenRange = null,
+    column_names: GeneratedSqlListAst = .{},
+    materialization_tokens: ?GeneratedSqlTokenRange = null,
+    materialization: ?GeneratedSqlCteMaterialization = null,
     body_tokens: ?GeneratedSqlTokenRange = null,
+
+    pub fn deinit(self: *GeneratedSqlCteAst, alloc: std.mem.Allocator) void {
+        self.column_names.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const GeneratedSqlCteMaterialization = enum {
+    materialized,
+    not_materialized,
 };
 
 pub const GeneratedSqlSessionAst = struct {
@@ -399,6 +414,7 @@ pub const GeneratedSqlReadAst = struct {
     set_operation_tokens: ?GeneratedSqlTokenRange = null,
 
     pub fn deinit(self: *GeneratedSqlReadAst, alloc: std.mem.Allocator) void {
+        for (self.cte_items) |*cte| cte.deinit(alloc);
         if (self.cte_items.len > 0) alloc.free(self.cte_items);
         for (self.join_items) |*join| join.deinit(alloc);
         if (self.join_items.len > 0) alloc.free(self.join_items);
@@ -597,6 +613,8 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT id, row_number() OVER usage_window AS rn FROM usage_records WINDOW usage_window AS (ORDER BY id RANGE BETWEEN 1 PRECEDING AND CURRENT ROW)", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records UNION SELECT id FROM usage_archive", .kind = .read },
     .{ .sql = "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows", .kind = .read },
+    .{ .sql = "WITH source_rows AS MATERIALIZED (SELECT id FROM usage_records) SELECT id FROM source_rows", .kind = .read },
+    .{ .sql = "WITH source_rows(source_id) AS NOT MATERIALIZED (SELECT id FROM usage_records) SELECT source_id FROM source_rows", .kind = .read },
     .{ .sql = "WITH first_rows AS (SELECT id FROM usage_records), second_rows AS (SELECT id FROM first_rows) SELECT id FROM second_rows", .kind = .read },
     .{ .sql = "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows", .kind = .read },
 };
@@ -1234,32 +1252,65 @@ fn buildReadCteAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, fi
 
     var items: std.ArrayListUnmanaged(GeneratedSqlCteAst) = .empty;
     var items_owned = false;
-    defer if (!items_owned) items.deinit(alloc);
+    defer if (!items_owned) {
+        for (items.items) |*item| item.deinit(alloc);
+        items.deinit(alloc);
+    };
     var count: usize = 0;
     while (index < final_select_index) {
         if (tokens[index].kind != .identifier) return;
         if (index + 2 >= final_select_index) return;
-        if (!tokens[index + 1].matchesKeywordTag(.as) or tokens[index + 2].kind != .lparen) return;
-        const close = findMatchingParen(tokens, index + 2, final_select_index) orelse return;
-        if (close >= final_select_index) return;
 
         const name_tokens = GeneratedSqlTokenRange{ .start = index, .end = index + 1 };
-        const body_tokens: ?GeneratedSqlTokenRange = if (index + 3 < close)
-            .{ .start = index + 3, .end = close }
+        var cte = GeneratedSqlCteAst{ .name_tokens = name_tokens };
+        var cte_owned = false;
+        errdefer if (!cte_owned) cte.deinit(alloc);
+
+        var cursor = index + 1;
+        if (cursor < final_select_index and tokens[cursor].kind == .lparen) {
+            const column_close = findMatchingParen(tokens, cursor, final_select_index) orelse return;
+            if (column_close >= final_select_index) return;
+            cte.column_tokens = .{ .start = cursor, .end = column_close + 1 };
+            if (cursor + 1 < column_close) {
+                cte.column_name_tokens = .{ .start = cursor + 1, .end = column_close };
+                cte.column_names = try buildTopLevelListAst(alloc, tokens, cte.column_name_tokens.?, .{});
+            }
+            cursor = column_close + 1;
+        }
+
+        if (cursor >= final_select_index or !tokens[cursor].matchesKeywordTag(.as)) return;
+        cursor += 1;
+
+        if (cursor < final_select_index and tokens[cursor].matchesKeywordTag(.materialized)) {
+            cte.materialization_tokens = .{ .start = cursor, .end = cursor + 1 };
+            cte.materialization = .materialized;
+            cursor += 1;
+        } else if (cursor + 1 < final_select_index and
+            tokens[cursor].matchesKeywordTag(.not) and
+            tokens[cursor + 1].matchesKeywordTag(.materialized))
+        {
+            cte.materialization_tokens = .{ .start = cursor, .end = cursor + 2 };
+            cte.materialization = .not_materialized;
+            cursor += 2;
+        }
+
+        if (cursor >= final_select_index or tokens[cursor].kind != .lparen) return;
+        const close = findMatchingParen(tokens, cursor, final_select_index) orelse return;
+        if (close >= final_select_index) return;
+        cte.body_tokens = if (cursor + 1 < close)
+            .{ .start = cursor + 1, .end = close }
         else
             null;
 
-        try items.append(alloc, .{
-            .name_tokens = name_tokens,
-            .body_tokens = body_tokens,
-        });
+        try items.append(alloc, cte);
+        cte_owned = true;
         count += 1;
         if (count == 1) {
             ast.cte_name_tokens = name_tokens;
-            ast.cte_body_tokens = body_tokens;
+            ast.cte_body_tokens = cte.body_tokens;
         }
         ast.cte_last_name_tokens = name_tokens;
-        ast.cte_last_body_tokens = body_tokens;
+        ast.cte_last_body_tokens = cte.body_tokens;
 
         index = close + 1;
         if (index == final_select_index) break;
@@ -3738,6 +3789,44 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expect(!read.cte_recursive);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.projection_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read.source_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const materialized_cte_read_sql = "WITH source_rows AS MATERIALIZED (SELECT id FROM usage_records) SELECT id FROM source_rows";
+    const materialized_cte_read_result = try parseSqlAlloc(alloc, materialized_cte_read_sql);
+    switch (materialized_cte_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.cte, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 10 }, read.cte_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), read.cte_count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.cte_items[0].name_tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read.cte_items[0].materialization_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlCteMaterialization.materialized, read.cte_items[0].materialization.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 9 }, read.cte_items[0].body_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 12 }, read.projection_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 14 }, read.source_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const aliased_cte_read_sql = "WITH source_rows(source_id) AS NOT MATERIALIZED (SELECT id FROM usage_records) SELECT source_id FROM source_rows";
+    const aliased_cte_read_result = try parseSqlAlloc(alloc, aliased_cte_read_sql);
+    switch (aliased_cte_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.cte, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 14 }, read.cte_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), read.cte_count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.cte_items[0].name_tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 5 }, read.cte_items[0].column_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read.cte_items[0].column_name_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), read.cte_items[0].column_names.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read.cte_items[0].column_names.items[0]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 8 }, read.cte_items[0].materialization_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlCteMaterialization.not_materialized, read.cte_items[0].materialization.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 13 }, read.cte_items[0].body_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 15, .end = 16 }, read.projection_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 17, .end = 18 }, read.source_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

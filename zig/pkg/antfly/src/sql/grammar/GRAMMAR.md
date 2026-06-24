@@ -135,9 +135,10 @@ generated set-operation reads now classify as a distinct read family and
 validate the left query and set-operation tail before calling the set-operation
 lowerer directly;
 single- and multi-CTE reads now expose generated CTE-list, first-CTE, and
-last-CTE name/body ranges plus owned per-CTE name/body item arrays, recursive
-CTE reads carry an explicit generated recursive flag, and simple non-recursive
-CTE reads dispatch directly when those ranges validate; generated pagination
+last-CTE name/body ranges plus owned per-CTE name/body item arrays, optional
+column-alias lists, and `MATERIALIZED` / `NOT MATERIALIZED` hint metadata;
+recursive CTE reads carry an explicit generated recursive flag, and simple
+non-recursive CTE reads dispatch directly when those ranges validate; generated pagination
 grammar now covers `LIMIT`, `OFFSET`, and `FETCH FIRST`/`FETCH NEXT` query
 tails with count expression metadata.
 Unsupported read shapes
@@ -311,10 +312,11 @@ Suggested migration order:
    Set-operation reads now classify as their own generated read family and
    dispatch to the native set-operation lowerer after validating the generated
    left-query and set-operation-tail ranges. Single- and multi-CTE reads now
-   carry generated CTE-list, first-CTE, last-CTE, and owned per-CTE name/body
-   ranges; recursive CTE reads carry an explicit recursive flag; and simple
-   non-recursive CTE reads dispatch to the typed read lowerer after validating
-   those ranges.
+   carry generated CTE-list, first-CTE, last-CTE, owned per-CTE name/body
+   ranges, optional column-alias lists, and `MATERIALIZED` / `NOT MATERIALIZED`
+   hint metadata; recursive CTE reads carry an explicit recursive flag; and
+   simple non-recursive CTE reads dispatch to the typed read lowerer after
+   validating those ranges.
    Generated pagination coverage now accepts and ranges expression and
    PostgreSQL-compatible `ALL`/`NULL` `LIMIT` tails, `OFFSET` with optional
    `ROW`/`ROWS`, and `FETCH FIRST`/`FETCH NEXT` tails with optional fetch
