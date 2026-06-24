@@ -39,20 +39,24 @@ before the existing parser can handle a statement. When the generated parser
 accepts a statement, `ParsedSql` retains a source-span-bearing generated raw
 node and uses it for the first migrated statement variants. Session,
 transaction, and prepared statements now require generated parser success;
-simple DDL has generated-parser corpus coverage but still falls back to the
-existing parser when the seed grammar does not yet cover the shape. Simple DML
-now has generated-parser corpus coverage and retained generated raw nodes for
-covered write statements, but unsupported DML still falls back until plan parity
-is proven. Representative read queries now have generated-parser corpus
-coverage and retained generated raw nodes for covered read statements, while
-unsupported read shapes still fall back until read-plan parity is proven. The
-generated parser now also treats seed graph DDL as a distinct graph statement
-family and `ParsedSql` retains those generated nodes, but graph execution still
-routes through the existing DDL variant until graph-specific raw AST and
-lowering parity exist. The generated facade now returns closed statement-family
-nodes for the covered families; full production AST construction remains the
-next migration boundary for larger DDL, query, DML, and Antfly extension
-families.
+they also carry the first generated AST payload with source spans and token
+ranges for command names, values, prepared-statement arguments, and nested
+prepared statements. This AST is retained by `ParsedSql` but still lowers
+through the existing token-based control paths until plan parity tests cover the
+generated AST boundary directly. Simple DDL has generated-parser corpus coverage
+but still falls back to the existing parser when the seed grammar does not yet
+cover the shape. Simple DML now has generated-parser corpus coverage and
+retained generated raw nodes for covered write statements, but unsupported DML
+still falls back until plan parity is proven. Representative read queries now
+have generated-parser corpus coverage and retained generated raw nodes for
+covered read statements, while unsupported read shapes still fall back until
+read-plan parity is proven. The generated parser now also treats seed graph DDL
+as a distinct graph statement family and `ParsedSql` retains those generated
+nodes, but graph execution still routes through the existing DDL variant until
+graph-specific raw AST and lowering parity exist. The generated facade now
+returns closed statement-family nodes for the covered families; full production
+AST construction remains the next migration boundary for larger DDL, query,
+DML, and Antfly extension families.
 
 ## Compatibility Policy
 
@@ -209,16 +213,18 @@ an AST node before switching the family to the generated parser.
 The generated parser facade currently produces source-span-bearing closed
 variants for:
 
-- session statement
-- transaction statement
-- prepared statement
+- session statement, including a generated AST payload for command, name, and
+  value token ranges
+- transaction statement, including a generated AST payload for command spans
+- prepared statement, including a generated AST payload for command, name,
+  argument, and nested-statement token ranges
 - DDL statement
+- DML statement
+- read statement
+- graph statement
 
 Later statement-family cutovers should add closed variants for:
 
-- read query
-- DML statement
-- graph statement
 - extension/index statement
 - unsupported PostgreSQL-compatible statement with diagnostic reason
 
@@ -244,7 +250,8 @@ Generated grammar work needs evidence at multiple levels:
 - Corpus tests for intentionally unsupported PostgreSQL syntax with stable
   diagnostics.
 - AST shape tests for source spans, identifier normalization, literals,
-  placeholders, casts, operators, and nested statements.
+  placeholders, casts, operators, and nested statements. The first AST shape
+  test covers generated session, transaction, and prepared statement payloads.
 - Plan parity tests showing generated ASTs lower to the same typed plans as the
   current parser for migrated statement families.
 - SQL/API parity tests showing SQL and native API requests reach the same

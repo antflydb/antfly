@@ -97,9 +97,44 @@ pub const GeneratedSqlStatement = union(GeneratedSqlStatementKind) {
     other: void,
 };
 
+pub const GeneratedSqlTokenRange = struct {
+    start: usize,
+    end: usize,
+};
+
+pub const GeneratedSqlSessionAst = struct {
+    kind: GeneratedSqlSessionKind,
+    statement_span: token_mod.SourceSpan,
+    command_span: token_mod.SourceSpan,
+    name_tokens: ?GeneratedSqlTokenRange = null,
+    value_tokens: ?GeneratedSqlTokenRange = null,
+};
+
+pub const GeneratedSqlTransactionAst = struct {
+    kind: GeneratedSqlTransactionKind,
+    statement_span: token_mod.SourceSpan,
+    command_span: token_mod.SourceSpan,
+};
+
+pub const GeneratedSqlPreparedAst = struct {
+    kind: GeneratedSqlPreparedKind,
+    statement_span: token_mod.SourceSpan,
+    command_span: token_mod.SourceSpan,
+    name_tokens: ?GeneratedSqlTokenRange = null,
+    argument_tokens: ?GeneratedSqlTokenRange = null,
+    inner_statement_tokens: ?GeneratedSqlTokenRange = null,
+};
+
+pub const GeneratedSqlAst = union(enum) {
+    session: GeneratedSqlSessionAst,
+    transaction: GeneratedSqlTransactionAst,
+    prepared: GeneratedSqlPreparedAst,
+};
+
 pub const GeneratedSqlParseResult = struct {
     kind: GeneratedSqlStatementKind,
     statement: GeneratedSqlStatement,
+    ast: ?GeneratedSqlAst = null,
 };
 
 pub const GeneratedSqlDiagnostic = struct {
@@ -187,7 +222,11 @@ pub fn parseTokensAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Toke
     defer alloc.free(token_ids);
     try generated.parse(alloc, token_ids);
     const statement = classifyStatement(tokens);
-    return .{ .kind = std.meta.activeTag(statement), .statement = statement };
+    return .{
+        .kind = std.meta.activeTag(statement),
+        .statement = statement,
+        .ast = buildControlAst(tokens, statement),
+    };
 }
 
 pub fn parseFirstFamilyTokensAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token) !?GeneratedSqlParseResult {
@@ -394,6 +433,109 @@ fn classifyReadKind(tokens: []const token_mod.Token) GeneratedSqlReadKind {
     return .query;
 }
 
+fn buildControlAst(tokens: []const token_mod.Token, statement: GeneratedSqlStatement) ?GeneratedSqlAst {
+    const end = statementTokenEnd(tokens);
+    if (end == 0) return null;
+    const statement_span = sourceSpanForTokenRange(tokens, .{ .start = 0, .end = end }) orelse return null;
+    const command_span = tokens[0].sourceSpan();
+    return switch (statement) {
+        .session => |kind| .{ .session = buildSessionAst(tokens, end, kind, statement_span, command_span) },
+        .transaction => |kind| .{ .transaction = .{
+            .kind = kind,
+            .statement_span = statement_span,
+            .command_span = command_span,
+        } },
+        .prepared => |kind| .{ .prepared = buildPreparedAst(tokens, end, kind, statement_span, command_span) },
+        else => null,
+    };
+}
+
+fn buildSessionAst(
+    tokens: []const token_mod.Token,
+    end: usize,
+    kind: GeneratedSqlSessionKind,
+    statement_span: token_mod.SourceSpan,
+    command_span: token_mod.SourceSpan,
+) GeneratedSqlSessionAst {
+    var ast = GeneratedSqlSessionAst{
+        .kind = kind,
+        .statement_span = statement_span,
+        .command_span = command_span,
+    };
+    switch (kind) {
+        .set => {
+            const value_start = findSetValueStart(tokens, end) orelse end;
+            if (value_start > 1) ast.name_tokens = .{ .start = 1, .end = value_start - 1 };
+            if (value_start < end) ast.value_tokens = .{ .start = value_start, .end = end };
+        },
+        .reset, .show => {
+            if (end > 1) ast.name_tokens = .{ .start = 1, .end = end };
+        },
+        .discard_all => {},
+    }
+    return ast;
+}
+
+fn findSetValueStart(tokens: []const token_mod.Token, end: usize) ?usize {
+    var index: usize = 1;
+    while (index < end) : (index += 1) {
+        if (tokens[index].kind == .eq or tokens[index].matchesKeywordTag(.to)) return index + 1;
+    }
+    return if (end > 2) 2 else null;
+}
+
+fn buildPreparedAst(
+    tokens: []const token_mod.Token,
+    end: usize,
+    kind: GeneratedSqlPreparedKind,
+    statement_span: token_mod.SourceSpan,
+    command_span: token_mod.SourceSpan,
+) GeneratedSqlPreparedAst {
+    var ast = GeneratedSqlPreparedAst{
+        .kind = kind,
+        .statement_span = statement_span,
+        .command_span = command_span,
+    };
+    switch (kind) {
+        .prepare => {
+            if (end > 1) ast.name_tokens = .{ .start = 1, .end = 2 };
+            if (findKeyword(tokens, 2, end, .as)) |as_index| {
+                if (as_index + 1 < end) ast.inner_statement_tokens = .{ .start = as_index + 1, .end = end };
+            }
+        },
+        .execute => {
+            if (end > 1) ast.name_tokens = .{ .start = 1, .end = 2 };
+            if (end > 2) ast.argument_tokens = .{ .start = 2, .end = end };
+        },
+        .deallocate => {
+            if (end > 1) ast.name_tokens = .{ .start = 1, .end = end };
+        },
+    }
+    return ast;
+}
+
+fn findKeyword(tokens: []const token_mod.Token, start: usize, end: usize, keyword: token_mod.TokenKeyword) ?usize {
+    var index = start;
+    while (index < end) : (index += 1) {
+        if (tokens[index].matchesKeywordTag(keyword)) return index;
+    }
+    return null;
+}
+
+fn statementTokenEnd(tokens: []const token_mod.Token) usize {
+    var end = tokens.len;
+    while (end > 0 and tokens[end - 1].kind == .semicolon) end -= 1;
+    return end;
+}
+
+fn sourceSpanForTokenRange(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?token_mod.SourceSpan {
+    if (range.start >= range.end or range.end > tokens.len) return null;
+    return .{
+        .start = tokens[range.start].source_start,
+        .end = tokens[range.end - 1].source_end,
+    };
+}
+
 test "generated SQL parser accepts session and control statements" {
     for (first_family_corpus) |case| {
         const result = try parseSqlAlloc(std.testing.allocator, case.sql);
@@ -423,6 +565,50 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .create_metric }, (try parseSqlAlloc(std.testing.allocator, "CREATE GRAPH METRIC docs_pagerank ON doc_edges")).statement);
 }
 
+test "generated SQL parser facade builds control AST spans" {
+    const alloc = std.testing.allocator;
+
+    const set_sql = "  SET antfly.sync_level = 'write';";
+    var set_tokens = try lexer.tokenizeAlloc(alloc, set_sql);
+    defer lexer.freeTokens(alloc, &set_tokens);
+    const set_result = try parseTokensAlloc(alloc, set_tokens.items);
+    switch (set_result.ast.?) {
+        .session => |session| {
+            try std.testing.expectEqual(GeneratedSqlSessionKind.set, session.kind);
+            try std.testing.expectEqualStrings("SET antfly.sync_level = 'write'", spanText(set_sql, session.statement_span));
+            try std.testing.expectEqualStrings("SET", spanText(set_sql, session.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, session.name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, session.value_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const transaction_sql = "ROLLBACK;";
+    const transaction_result = try parseSqlAlloc(alloc, transaction_sql);
+    switch (transaction_result.ast.?) {
+        .transaction => |transaction| {
+            try std.testing.expectEqual(GeneratedSqlTransactionKind.rollback, transaction.kind);
+            try std.testing.expectEqualStrings("ROLLBACK", spanText(transaction_sql, transaction.statement_span));
+            try std.testing.expectEqualStrings("ROLLBACK", spanText(transaction_sql, transaction.command_span));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const prepare_sql = "PREPARE read_stmt AS SELECT id FROM usage_records";
+    var prepare_tokens = try lexer.tokenizeAlloc(alloc, prepare_sql);
+    defer lexer.freeTokens(alloc, &prepare_tokens);
+    const prepare_result = try parseTokensAlloc(alloc, prepare_tokens.items);
+    switch (prepare_result.ast.?) {
+        .prepared => |prepared| {
+            try std.testing.expectEqual(GeneratedSqlPreparedKind.prepare, prepared.kind);
+            try std.testing.expectEqualStrings("PREPARE", spanText(prepare_sql, prepared.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, prepared.name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 7 }, prepared.inner_statement_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "generated SQL parser reports source-aware diagnostics" {
     var tokens = try lexer.tokenizeAlloc(std.testing.allocator, "CREATE TABLE usage_records (id)");
     defer lexer.freeTokens(std.testing.allocator, &tokens);
@@ -435,4 +621,8 @@ test "generated SQL parser reports source-aware diagnostics" {
 
 test "generated SQL parser rejects unsupported token shapes" {
     try std.testing.expectError(error.UnsupportedSqlShape, parseSqlAlloc(std.testing.allocator, "SELECT a @> b"));
+}
+
+fn spanText(sql: []const u8, span: token_mod.SourceSpan) []const u8 {
+    return sql[span.start..span.end];
 }

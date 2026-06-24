@@ -86,6 +86,7 @@ pub const ParsedSessionStatement = struct {
 pub const GeneratedRawSqlStatement = struct {
     raw: RawSqlStatement,
     statement: generated_parser.GeneratedSqlStatement,
+    ast: ?generated_parser.GeneratedSqlAst = null,
 
     pub fn kind(self: GeneratedRawSqlStatement) generated_parser.GeneratedSqlStatementKind {
         return std.meta.activeTag(self.statement);
@@ -302,7 +303,7 @@ fn parseGeneratedRawStatementAlloc(
         else => return err,
     };
     if (result) |parsed| {
-        return .{ .raw = raw_statement, .statement = parsed.statement };
+        return .{ .raw = raw_statement, .statement = parsed.statement, .ast = parsed.ast };
     }
     return null;
 }
@@ -756,6 +757,14 @@ test "sql adapter parsed sql owns typed statement variants" {
     var session = try ParsedSql.initAlloc(alloc, "SET search_path TO public");
     defer session.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.session, session.generatedStatementKind().?);
+    switch (session.generated_statement.?.ast.?) {
+        .session => |generated_session| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlSessionKind.set, generated_session.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = 2 }, generated_session.name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 4 }, generated_session.value_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
     switch (session.statement) {
         .session => {},
         else => return error.TestUnexpectedResult,
