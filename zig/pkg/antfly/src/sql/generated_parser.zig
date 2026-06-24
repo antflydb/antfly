@@ -1042,6 +1042,28 @@ test "generated SQL parser facade builds control AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const partial_conflict_sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'ready') ON CONFLICT (id) WHERE status = 'ready' DO NOTHING";
+    const partial_conflict_result = try parseSqlAlloc(alloc, partial_conflict_sql);
+    switch (partial_conflict_result.ast.?) {
+        .dml => |dml| {
+            try std.testing.expectEqual(GeneratedSqlDmlKind.insert_values, dml.kind);
+            try std.testing.expect(dml.conflict_tokens != null);
+            try std.testing.expect(dml.returning_tokens == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const named_conflict_sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'ready') ON CONFLICT ON CONSTRAINT usage_records_pkey DO NOTHING";
+    const named_conflict_result = try parseSqlAlloc(alloc, named_conflict_sql);
+    switch (named_conflict_result.ast.?) {
+        .dml => |dml| {
+            try std.testing.expectEqual(GeneratedSqlDmlKind.insert_values, dml.kind);
+            try std.testing.expect(dml.conflict_tokens != null);
+            try std.testing.expect(dml.returning_tokens == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const truncate_sql = "TRUNCATE TABLE public.usage_records, usage_archive RESTART IDENTITY CASCADE";
     const truncate_result = try parseSqlAlloc(alloc, truncate_sql);
     switch (truncate_result.ast.?) {

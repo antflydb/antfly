@@ -159,8 +159,9 @@ Suggested migration order:
    `INSERT ... SELECT`, `UPDATE`, `DELETE`, `TRUNCATE`, and `MERGE` statements;
    generated DML ASTs now carry structured body ranges and conflict ranges.
    Explicit-column `INSERT ... VALUES` has direct generated AST-to-plan
-   lowerers for supported row batches, including conflict actions and field,
-   all-field, and expression `RETURNING` lists; no-conflict
+   lowerers for supported row batches, including column-list, partial, and
+   named constraint conflict targets, conflict actions, and field, all-field,
+   and expression `RETURNING` lists; no-conflict
    `INSERT ... DEFAULT VALUES` has a direct resolver-free generated AST-to-plan
    lowerer for default row batches; single-table point `UPDATE` and `DELETE`
    have direct generated AST-to-plan lowerers for generated primary/unique
@@ -332,10 +333,11 @@ Generated grammar work needs evidence at multiple levels:
   Simple DML has generated field-level checks for update and truncate body
   ranges, direct generated AST-to-plan parity for truncate mutation-source
   plans, direct resolver-free generated AST-to-plan coverage for supported
-  explicit-column insert-values row batches with conflict actions and returning
-  lists, default-values row batches with returning lists, direct generated
-  AST-to-plan coverage for single-table point update/delete batches with
-  returning lists, and initial generated AST-to-plan parity through a
+  explicit-column insert-values row batches with column-list, partial, and
+  named constraint conflict targets, conflict actions, and returning lists,
+  default-values row batches with returning lists, direct generated AST-to-plan
+  coverage for single-table point update/delete batches with returning lists,
+  and initial generated AST-to-plan parity through a
   generated-family validation wrapper over other
   representative write plans. Read plans have initial
   generated AST-to-plan parity through a generated-family validation wrapper
