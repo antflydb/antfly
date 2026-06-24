@@ -567,12 +567,16 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT id FROM usage_records WHERE status ILIKE 'open%'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status LIKE 'op!_%' ESCAPE '!'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE lower(status) ILIKE 'op!_%' ESCAPE '!'", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE lower(status) LIKE ANY(ARRAY['op%', 'ready%'])", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE status LIKE SOME(ARRAY['op%', 'ready%'])", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE name ILIKE ALL(ARRAY['ada%', 'grace%'])", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE id IN ('u1', 'u2')", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE score BETWEEN 1 AND 10", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status NOT LIKE 'closed%'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status NOT ILIKE 'closed%'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status NOT LIKE 'cl!_%' ESCAPE '!'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE lower(status) NOT ILIKE 'cl!_%' ESCAPE '!'", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE lower(name) NOT ILIKE ALL(ARRAY['bot%', 'sys%'])", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE id NOT IN ('u1', 'u2')", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE score NOT BETWEEN 1 AND 10", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE score = ANY (1, 2)", .kind = .read },
@@ -2275,13 +2279,33 @@ fn findTopLevelExpressionOperator(tokens: []const token_mod.Token, range: Genera
             .regex_not_imatch => if (depth == 0 and index > range.start and index + 1 < range.end) return .{ .kind = .regex_not_imatch, .index = index },
             else => if (depth == 0) {
                 if (tokens[index].matchesKeywordTag(.not) and index + 1 < range.end) {
-                    if (tokens[index + 1].matchesKeywordTag(.like)) return .{ .kind = .not_like, .index = index + 1, .negation_index = index };
-                    if (tokens[index + 1].matchesKeywordTag(.ilike)) return .{ .kind = .not_ilike, .index = index + 1, .negation_index = index };
+                    if (tokens[index + 1].matchesKeywordTag(.like)) {
+                        if (index + 2 < range.end and isGeneratedQuantifiedOperator(tokens[index + 2])) {
+                            return .{ .kind = .not_like, .index = index + 1, .negation_index = index, .quantifier_index = index + 2 };
+                        }
+                        return .{ .kind = .not_like, .index = index + 1, .negation_index = index };
+                    }
+                    if (tokens[index + 1].matchesKeywordTag(.ilike)) {
+                        if (index + 2 < range.end and isGeneratedQuantifiedOperator(tokens[index + 2])) {
+                            return .{ .kind = .not_ilike, .index = index + 1, .negation_index = index, .quantifier_index = index + 2 };
+                        }
+                        return .{ .kind = .not_ilike, .index = index + 1, .negation_index = index };
+                    }
                     if (tokens[index + 1].matchesKeywordTag(.in)) return .{ .kind = .not_in_list, .index = index + 1, .negation_index = index };
                     if (tokens[index + 1].matchesKeywordTag(.between)) return .{ .kind = .not_between, .index = index + 1, .negation_index = index };
                 }
-                if (tokens[index].matchesKeywordTag(.like)) return .{ .kind = .like, .index = index };
-                if (tokens[index].matchesKeywordTag(.ilike)) return .{ .kind = .ilike, .index = index };
+                if (tokens[index].matchesKeywordTag(.like)) {
+                    if (index + 1 < range.end and isGeneratedQuantifiedOperator(tokens[index + 1])) {
+                        return .{ .kind = .like, .index = index, .quantifier_index = index + 1 };
+                    }
+                    return .{ .kind = .like, .index = index };
+                }
+                if (tokens[index].matchesKeywordTag(.ilike)) {
+                    if (index + 1 < range.end and isGeneratedQuantifiedOperator(tokens[index + 1])) {
+                        return .{ .kind = .ilike, .index = index, .quantifier_index = index + 1 };
+                    }
+                    return .{ .kind = .ilike, .index = index };
+                }
                 if (tokens[index].matchesKeywordTag(.in)) return .{ .kind = .in_list, .index = index };
                 if (tokens[index].matchesKeywordTag(.between)) return .{ .kind = .between, .index = index };
                 if (tokens[index].matchesKeywordTag(.is) and index + 1 < range.end) {
@@ -2839,6 +2863,26 @@ test "generated SQL parser facade builds control AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const like_any_read_sql = "SELECT id FROM usage_records WHERE lower(status) LIKE ANY(ARRAY['op%', 'ready%'])";
+    const like_any_read_result = try parseSqlAlloc(alloc, like_any_read_sql);
+    switch (like_any_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 19 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.like, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 9 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.where_expression.quantifier_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 19 }, read.where_expression.right_tokens.?);
+            const grouped = read.where_expression.right_expression orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.grouped, grouped.kind);
+            const array_constructor = grouped.inner_expression orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.array_constructor, array_constructor.kind);
+            try std.testing.expectEqual(@as(usize, 2), array_constructor.array_items.count);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const in_list_read_sql = "SELECT id FROM usage_records WHERE id IN ('u1', 'u2')";
     const in_list_read_result = try parseSqlAlloc(alloc, in_list_read_sql);
     switch (in_list_read_result.ast.?) {
@@ -2929,6 +2973,27 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 14 }, read.where_expression.escape_tokens.?);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.where_expression.escape_expression.?.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 14 }, read.where_expression.escape_expression.?.tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const not_ilike_all_read_sql = "SELECT id FROM usage_records WHERE lower(name) NOT ILIKE ALL(ARRAY['bot%', 'sys%'])";
+    const not_ilike_all_read_result = try parseSqlAlloc(alloc, not_ilike_all_read_sql);
+    switch (not_ilike_all_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 20 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.not_ilike, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 9 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.where_expression.negation_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 12 }, read.where_expression.quantifier_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 20 }, read.where_expression.right_tokens.?);
+            const grouped = read.where_expression.right_expression orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.grouped, grouped.kind);
+            const array_constructor = grouped.inner_expression orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.array_constructor, array_constructor.kind);
+            try std.testing.expectEqual(@as(usize, 2), array_constructor.array_items.count);
         },
         else => return error.TestUnexpectedResult,
     }

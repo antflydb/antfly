@@ -657,10 +657,14 @@ comparison_expression:
   | concat_expression REGEX_NOT_IMATCH concat_expression
   | concat_expression LIKE concat_expression like_escape_opt
   | concat_expression ILIKE concat_expression like_escape_opt
+  | concat_expression LIKE quantified_operator quantified_rhs
+  | concat_expression ILIKE quantified_operator quantified_rhs
   | concat_expression IN LPAREN expression_list RPAREN
   | concat_expression BETWEEN concat_expression AND concat_expression
   | concat_expression NOT LIKE concat_expression like_escape_opt
   | concat_expression NOT ILIKE concat_expression like_escape_opt
+  | concat_expression NOT LIKE quantified_operator quantified_rhs
+  | concat_expression NOT ILIKE quantified_operator quantified_rhs
   | concat_expression NOT IN LPAREN expression_list RPAREN
   | concat_expression NOT BETWEEN concat_expression AND concat_expression
   | concat_expression comparison_operator quantified_operator quantified_rhs

@@ -277,8 +277,11 @@ Suggested migration order:
    classified with explicit quantifier token ranges and subquery token spans,
    and quantified predicates over typed array constructors such as
    `= ANY(ARRAY[...]::text[])` carry generated array-constructor metadata after
-   public tokenization normalizes cast suffixes. Array/range containment and
-   overlap predicates using `@>` and `&&` are accepted and classified with
+   public tokenization normalizes cast suffixes. PostgreSQL-style quantified
+   pattern predicates such as `LIKE ANY(...)`, `LIKE SOME(...)`, `ILIKE ALL(...)`,
+   and their `NOT` variants are also accepted and carry the same generated
+   quantifier and right-side array-constructor metadata. Array/range containment
+   and overlap predicates using `@>` and `&&` are accepted and classified with
    generated operator ranges and right-side array-constructor metadata.
    PostgreSQL JSON key predicates using `?`, `?|`, and `?&` are accepted and
    classified with generated operator ranges and array-constructor metadata for
