@@ -62,8 +62,10 @@ inserts, and truncate options. Supported explicit-column `INSERT ... VALUES`
 plans, including `ON CONFLICT` actions and field/all-field/expression
 `RETURNING` lists, and `INSERT ... DEFAULT VALUES` plans, including
 `ON CONFLICT` actions and returning lists, now lower directly from generated
-AST ranges into relational row batches. Single-table point `UPDATE` and
-`DELETE` statements with generated
+AST ranges into relational row batches. Supported explicit-column
+`INSERT ... SELECT` plans, including `ON CONFLICT` actions and returning lists,
+now validate generated source, conflict, and returning ranges before direct
+insert-source lowering. Single-table point `UPDATE` and `DELETE` statements with generated
 `WHERE` ranges and field/all-field/expression `RETURNING` lists now also lower
 directly from generated AST ranges into relational row batches. Table-wide and
 single-table source `UPDATE` and `DELETE` statements without joined
@@ -74,8 +76,8 @@ AST-to-plan wrapper that fails closed if the generated DML family does not
 match the existing write classifier before delegating to the current typed DML
 lowerer. Unsupported DML still falls back, and deeper DML cutover still
 requires replacing token-based command-body parsing with complete generated AST
-payloads for `INSERT ... SELECT` with `ON CONFLICT`, joined `UPDATE`, joined
-`DELETE`, and `MERGE` bodies.
+payloads for broader `INSERT ... SELECT` source bodies, joined `UPDATE`,
+joined `DELETE`, and `MERGE` bodies.
 Representative
 read queries now have generated-parser corpus coverage, retained generated raw
 and AST nodes for covered read statements, and an initial generated AST-to-plan
@@ -165,7 +167,10 @@ Suggested migration order:
    named constraint conflict targets, conflict actions, and field, all-field,
    and expression `RETURNING` lists; `INSERT ... DEFAULT VALUES` has a direct
    generated AST-to-plan lowerer for default row batches with conflict actions
-   and returning lists; single-table point `UPDATE` and `DELETE` have direct
+   and returning lists; supported explicit-column `INSERT ... SELECT` has a
+   generated range-validated direct insert-source lowerer for same-table and
+   configured cross-table sources, conflict actions, and returning lists;
+   single-table point `UPDATE` and `DELETE` have direct
    generated AST-to-plan lowerers for generated primary/unique selector ranges
    with field, all-field, and expression returning lists; table-wide and
    single-table source `UPDATE`/`DELETE` without joined sources have generated
@@ -175,7 +180,7 @@ Suggested migration order:
    Other DML still has a validated wrapper into the current typed DML lowerer
    for representative generated-covered write plans. Switching the full DML
    family from fallback to required generated parsing still requires generated
-   command-body ASTs for insert-select and insert-select conflict bodies,
+   command-body ASTs for broader insert-select source bodies,
    joined update/delete bodies, and merge arms, plus broader unsupported-shape
    diagnostics.
 4. Read queries: projections, predicates, joins, CTEs, aggregates, windows,
@@ -340,8 +345,10 @@ Generated grammar work needs evidence at multiple levels:
   explicit-column insert-values row batches with column-list, partial, and
   named constraint conflict targets, conflict actions, and returning lists,
   default-values row batches with conflict actions and returning lists, direct
-  generated AST-to-plan coverage for single-table point update/delete batches
-  with returning lists, direct generated AST-to-plan coverage for table-wide and
+  generated AST-to-plan coverage for supported same-table and cross-table
+  insert-select requests with conflict and returning lists, direct generated
+  AST-to-plan coverage for single-table point update/delete batches with
+  returning lists, direct generated AST-to-plan coverage for table-wide and
   single-table source update/delete mutation-source requests without joined
   sources, and initial generated AST-to-plan parity through a generated-family
   validation wrapper over other representative write plans. Read plans have initial

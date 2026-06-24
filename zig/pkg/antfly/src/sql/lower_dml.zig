@@ -12393,6 +12393,14 @@ pub fn lowerWritePlanFromGeneratedDmlAstAlloc(
             else => return err,
         }
     }
+    if (dml_ast.kind == .insert_select) {
+        if (insertSourceFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast, schema, params, options)) |insert_source| {
+            return .{ .insert_source = insert_source };
+        } else |err| switch (err) {
+            error.UnsupportedSqlShape => {},
+            else => return err,
+        }
+    }
     if (dml_ast.kind == .update) {
         switch (write_kind) {
             .update => switch (try classifyUpdateSelectorParsedSqlAlloc(alloc, parsed_sql, schema, params, options.unique_resolver)) {
@@ -12622,6 +12630,82 @@ fn insertValuesFromGeneratedDmlAstAlloc(
         .returning_all = returning_all,
         .conflict_where = conflict_where,
     };
+}
+
+fn insertSourceFromGeneratedDmlAstAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    ast: generated_parser.GeneratedSqlDmlAst,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+) !plan_mod.LoweredInsertSource {
+    if (ast.kind != .insert_select) return error.UnsupportedSqlShape;
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    const unique_resolver = options.unique_resolver orelse return error.UnsupportedRowsSelector;
+    const source_schema = options.insert_source_schema orelse schema;
+    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    const tokens = parsed_sql.items();
+    const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    try validateGeneratedInsertSourceRanges(tokens, ast, end);
+
+    const parser_context = @import("parser_context.zig");
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens,
+        .schema = schema,
+        .joined_source_schema = options.insert_source_schema,
+        .insert_source_allows_different_table = options.insert_source_schema != null,
+        .params = params,
+        .unique_resolver = unique_resolver,
+    };
+    var lowered = try parseInsertSourceAlloc(
+        alloc,
+        tokens,
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.insertSourceParserHooks(&parser_state),
+    ) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        else => return err,
+    };
+    errdefer lowered.deinit(alloc);
+    if (!generatedDmlParserConsumedStatement(tokens, end, parser_state.pos)) return error.UnsupportedSqlShape;
+    lowered.sync_level = options.sync_level;
+    return lowered;
+}
+
+fn validateGeneratedInsertSourceRanges(
+    tokens: []const Token,
+    ast: generated_parser.GeneratedSqlDmlAst,
+    end: usize,
+) !void {
+    if (end < 6 or !tokens[0].matchesKeywordTag(.insert) or !tokens[1].matchesKeywordTag(.into)) return error.UnsupportedSqlShape;
+    const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, 2, end);
+    const column_range = ast.insert_columns_tokens orelse return error.UnsupportedSqlShape;
+    if (column_range.start != target_range.end or column_range.end <= column_range.start + 1 or column_range.end > end) return error.UnsupportedSqlShape;
+    if (tokens[column_range.start].kind != .lparen or tokens[column_range.end - 1].kind != .rparen) return error.UnsupportedSqlShape;
+    if (ast.values_tokens != null or ast.default_values) return error.UnsupportedSqlShape;
+    const source_range = ast.source_tokens orelse return error.UnsupportedSqlShape;
+    if (source_range.start != column_range.end or source_range.start >= source_range.end or source_range.end > end) return error.UnsupportedSqlShape;
+    if (!tokens[source_range.start].matchesKeywordTag(.select)) return error.UnsupportedSqlShape;
+
+    const returning_keyword = if (ast.returning_tokens) |returning_range| blk: {
+        if (returning_range.start == 0 or returning_range.start > returning_range.end or returning_range.end > end) return error.UnsupportedSqlShape;
+        if (!tokens[returning_range.start - 1].matchesKeywordTag(.returning)) return error.UnsupportedSqlShape;
+        if (returning_range.end != end) return error.UnsupportedSqlShape;
+        break :blk returning_range.start - 1;
+    } else null;
+    if (ast.conflict_tokens) |conflict_range| {
+        if (conflict_range.start == 0 or conflict_range.start > conflict_range.end or conflict_range.end > end) return error.UnsupportedSqlShape;
+        if (!tokens[conflict_range.start - 1].matchesKeywordTag(.on) or !tokens[conflict_range.start].matchesKeywordTag(.conflict)) return error.UnsupportedSqlShape;
+        if (source_range.end != conflict_range.start - 1) return error.UnsupportedSqlShape;
+        if (returning_keyword) |returning_start| {
+            if (conflict_range.end != returning_start) return error.UnsupportedSqlShape;
+        } else if (conflict_range.end != end) return error.UnsupportedSqlShape;
+    } else if (returning_keyword) |returning_start| {
+        if (source_range.end != returning_start) return error.UnsupportedSqlShape;
+    } else if (source_range.end != end) return error.UnsupportedSqlShape;
 }
 
 fn updateSourceFromGeneratedDmlAstAlloc(
@@ -13269,6 +13353,11 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
     ;
     const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
     defer runtime_schema.freeSchema(alloc, schema);
+    const source_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"archive_id":{"type":"keyword"},"archive_status":{"type":"keyword"},"archive_quantity":{"type":"numeric"}},"required":["archive_id"],"additionalProperties":false}}},"primary_key":{"columns":["archive_id"]}}
+    ;
+    const source_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, source_schema_json);
+    defer runtime_schema.freeSchema(alloc, source_schema);
     var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"status\":\"active\",\"organization_id\":\"o1\",\"quantity\":1}", .version = 9 };
     const txn_id = [_]u8{ 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f };
     const claim: db_mod.types.RowClaimRequest = .{
@@ -13369,6 +13458,67 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
     try std.testing.expectEqual(@as(u32, 1), generated_conflict.batch.transformed);
     try std.testing.expectEqual(@as(usize, 1), generated_conflict.batch.returning_rows.len);
     try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"ready\"}", generated_conflict.batch.returning_rows[0]);
+
+    var parsed_generated_insert_source = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) SELECT id, status FROM usage_records WHERE status = 'ready' ON CONFLICT (id) DO UPDATE SET status = excluded.status RETURNING id, lower(status) AS status_key",
+    );
+    defer parsed_generated_insert_source.deinit(alloc);
+    const generated_insert_source_ast = switch ((parsed_generated_insert_source.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_insert_source = try insertSourceFromGeneratedDmlAstAlloc(
+        alloc,
+        &parsed_generated_insert_source,
+        generated_insert_source_ast,
+        schema,
+        &.{},
+        options,
+    );
+    defer generated_insert_source.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", generated_insert_source.table_name);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, generated_insert_source.sync_level);
+    try std.testing.expectEqualStrings("usage_records", generated_insert_source.insert_source.req.source_table);
+    try std.testing.expectEqual(@as(usize, 2), generated_insert_source.insert_source.req.assignments.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_insert_source.insert_source.req.source.predicates.len);
+    try std.testing.expect(generated_insert_source.insert_source.req.on_conflict != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsConflictAction.update, generated_insert_source.insert_source.req.on_conflict.?.action);
+    try std.testing.expectEqual(@as(usize, 1), generated_insert_source.returning_expression_count);
+    try std.testing.expect(!generated_insert_source.returning_all);
+
+    const cross_source_options = plan_mod.LowerWritePlanOptions{
+        .unique_resolver = resolver_ctx.resolver(),
+        .row_claim = claim,
+        .insert_source_schema = source_schema,
+        .sync_level = .full_text,
+    };
+    var parsed_generated_cross_insert_source = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, quantity) SELECT archive_id, archive_status, archive_quantity FROM archived_records WHERE archive_status = 'ready' RETURNING id, status",
+    );
+    defer parsed_generated_cross_insert_source.deinit(alloc);
+    const generated_cross_insert_source_ast = switch ((parsed_generated_cross_insert_source.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_cross_insert_source = try insertSourceFromGeneratedDmlAstAlloc(
+        alloc,
+        &parsed_generated_cross_insert_source,
+        generated_cross_insert_source_ast,
+        schema,
+        &.{},
+        cross_source_options,
+    );
+    defer generated_cross_insert_source.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", generated_cross_insert_source.table_name);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, generated_cross_insert_source.sync_level);
+    try std.testing.expectEqualStrings("archived_records", generated_cross_insert_source.insert_source.req.source_table);
+    try std.testing.expectEqual(@as(usize, 3), generated_cross_insert_source.insert_source.req.assignments.len);
+    try std.testing.expectEqualStrings("id", generated_cross_insert_source.insert_source.req.assignments[0].field);
+    try std.testing.expectEqualStrings("archive_id", generated_cross_insert_source.insert_source.req.assignments[0].expression.field);
+    try std.testing.expectEqual(@as(usize, 1), generated_cross_insert_source.insert_source.req.source.predicates.len);
+    try std.testing.expectEqualStrings("archive_status", generated_cross_insert_source.insert_source.req.source.predicates[0].field);
 
     var parsed_generated_update = try tokenized.ParsedSql.initAlloc(
         alloc,
