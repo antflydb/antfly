@@ -323,6 +323,17 @@ pub fn build(b: *std.Build) void {
     );
     metal_gemma4_e2b_bench_step.dependOn(&metal_gemma4_e2b_bench.step);
 
+    const metal_gemma4_e4b_bench = b.addSystemCommand(&.{
+        "bash",
+        "scripts/bench_metal_gemma4_e4b.sh",
+    });
+    metal_gemma4_e4b_bench.step.dependOn(b.getInstallStep());
+    const metal_gemma4_e4b_bench_step = b.step(
+        "bench-metal-gemma4-e4b",
+        "Run the canonical local Metal Gemma4 E4B Q4_K/Q6_K throughput benchmark",
+    );
+    metal_gemma4_e4b_bench_step.dependOn(&metal_gemma4_e4b_bench.step);
+
     const metal_prefill_bucket_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-metal-prefill-buckets-bench",
         .root_module = b.createModule(.{

@@ -33,6 +33,7 @@ pub const ChatWireFlavor = enum {
 pub const ChatRequestOptions = struct {
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
+    max_tokens: ?i64 = null,
 };
 
 pub fn chatRequestJsonAlloc(
@@ -68,6 +69,11 @@ pub fn chatRequestJsonWithOptionsAlloc(
     if (options.tool_choice_json) |tool_choice_json| {
         try out.appendSlice(alloc, ",\"tool_choice\":");
         try out.appendSlice(alloc, tool_choice_json);
+    }
+    if (options.max_tokens) |max_tokens| {
+        const fragment = try std.fmt.allocPrint(alloc, ",\"max_tokens\":{d}", .{max_tokens});
+        defer alloc.free(fragment);
+        try out.appendSlice(alloc, fragment);
     }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
@@ -425,6 +431,14 @@ test "openai compatible chat serialization converts image media urls" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"media\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"image_url\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"url\":\"https://example.test/image.png\"") != null);
+}
+
+test "chat serialization includes max_tokens when configured" {
+    const alloc = std.testing.allocator;
+    const messages = [_]ChatMessage{.{ .role = .user, .content = .{ .text = "hello" } }};
+    const body = try chatRequestJsonWithOptionsAlloc(alloc, "gemma4", &messages, .openai_compatible, .{ .max_tokens = 256 });
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":256") != null);
 }
 
 test "forced tool call synthesis normalizes plain JSON content" {

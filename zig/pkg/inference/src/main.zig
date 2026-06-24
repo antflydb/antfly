@@ -39,10 +39,19 @@ fn defaultMlDir(allocator: std.mem.Allocator) []const u8 {
 }
 
 const RunConfig = struct {
+    const WarmModelConfig = struct {
+        kind: []const u8,
+        name: []const u8,
+        backend: ?[]const u8 = null,
+        format: ?[]const u8 = null,
+        quantization: ?[]const u8 = null,
+    };
+
     models_dir: ?[]const u8 = null,
     ml_dir: ?[]const u8 = null,
     content_security: ?inference.scraping.ContentSecurityConfig = null,
     s3_credentials: ?inference.scraping.S3CredentialsConfig = null,
+    preload: []const WarmModelConfig = &.{},
     keep_alive_ms: ?u64 = null,
     max_loaded_models: ?usize = null,
     max_concurrent_requests: ?usize = null,
@@ -57,6 +66,65 @@ fn loadRunConfig(allocator: std.mem.Allocator, path: []const u8) !RunConfig {
         .ignore_unknown_fields = true,
     });
     return parsed.value;
+}
+
+fn parseBackendType(value: []const u8) ?inference.backends.BackendType {
+    if (std.mem.eql(u8, value, "native")) return .native;
+    if (std.mem.eql(u8, value, "onnx")) return .onnx;
+    if (std.mem.eql(u8, value, "metal")) return .metal;
+    if (std.mem.eql(u8, value, "cuda")) return .cuda;
+    if (std.mem.eql(u8, value, "xla") or std.mem.eql(u8, value, "pjrt")) return .pjrt;
+    if (std.mem.eql(u8, value, "wasm") or std.mem.eql(u8, value, "webgpu")) return .wasm;
+    return null;
+}
+
+fn parseOptionalBackendType(value: ?[]const u8) !?inference.backends.BackendType {
+    const raw = value orelse return null;
+    if (std.mem.eql(u8, raw, "auto")) return null;
+    return parseBackendType(raw) orelse error.InvalidArguments;
+}
+
+fn parsePreloadModelKind(value: []const u8) ?inference.server.WarmModelKind {
+    inline for (std.meta.fields(inference.server.WarmModelKind)) |field| {
+        if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+    }
+    return null;
+}
+
+fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
+    const separator = std.mem.indexOfScalar(u8, value, ':') orelse return error.InvalidArguments;
+    const kind_name = value[0..separator];
+    var model_name = value[separator + 1 ..];
+    var backend: ?inference.backends.BackendType = null;
+    if (std.mem.indexOfScalar(u8, model_name, ':')) |backend_separator| {
+        const backend_name = model_name[0..backend_separator];
+        backend = parseBackendType(backend_name) orelse return error.InvalidArguments;
+        model_name = model_name[backend_separator + 1 ..];
+    }
+    if (model_name.len == 0) return error.InvalidArguments;
+    return .{
+        .kind = parsePreloadModelKind(kind_name) orelse return error.InvalidArguments,
+        .name = model_name,
+        .backend = backend,
+        .format = null,
+        .quantization = null,
+    };
+}
+
+fn preloadModelsFromConfig(allocator: std.mem.Allocator, values: []const RunConfig.WarmModelConfig) ![]inference.server.WarmModel {
+    if (values.len == 0) return &.{};
+    const out = try allocator.alloc(inference.server.WarmModel, values.len);
+    errdefer allocator.free(out);
+    for (values, 0..) |value, i| {
+        out[i] = .{
+            .kind = parsePreloadModelKind(value.kind) orelse return error.InvalidArguments,
+            .name = value.name,
+            .backend = try parseOptionalBackendType(value.backend),
+            .format = value.format,
+            .quantization = value.quantization,
+        };
+    }
+    return out;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -160,6 +228,8 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var config_path: ?[]const u8 = null;
     var models_overridden = false;
     var ml_overridden = false;
+    var preload_models = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
+    defer preload_models.deinit(allocator);
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -179,6 +249,9 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--config") and i + 1 < args.len) {
             config_path = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--preload-model") and i + 1 < args.len) {
+            try preload_models.append(allocator, try parsePreloadModelFlag(args[i + 1]));
             i += 1;
         }
     }
@@ -203,19 +276,26 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     });
     print("ai models: {s}\n", .{models_dir});
     print("ml models: {s}\n", .{ml_dir});
-    print("listening on {s}:{d}\n", .{ host, port });
 
     // Leave SIGINT/SIGTERM on the default OS behavior for now. The previous
     // signal-context stop path could close the listener while accept() was in
     // flight, which panicked under Zig's threaded IO backend.
 
+    var config_preload_models: []inference.server.WarmModel = &.{};
+    defer if (config_preload_models.len > 0) allocator.free(config_preload_models);
+
     var node_cfg = inference.server.NodeConfig{
         .models_dir = models_dir,
         .ml_dir = ml_dir,
+        .preload = preload_models.items,
     };
     if (loaded_cfg) |cfg| {
         node_cfg.content_security = cfg.content_security;
         node_cfg.s3_credentials = cfg.s3_credentials;
+        if (preload_models.items.len == 0) {
+            config_preload_models = try preloadModelsFromConfig(allocator, cfg.preload);
+            node_cfg.preload = config_preload_models;
+        }
         if (cfg.keep_alive_ms) |value| node_cfg.keep_alive_ms = value;
         if (cfg.max_loaded_models) |value| node_cfg.max_loaded_models = value;
         if (cfg.max_concurrent_requests) |value| node_cfg.max_concurrent_requests = value;
@@ -225,6 +305,8 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var node = try inference.server.Node.init(allocator, node_cfg);
     defer node.deinit();
 
+    try node.warmConfiguredModels(allocator);
+    print("listening on {s}:{d}\n", .{ host, port });
     try node.serve(allocator, io, host, port);
 
     print("server stopped.\n", .{});
@@ -359,6 +441,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  --port <port>     Listen port (default: 8090)
         \\  --models-dir <dir>    AI models directory (default: ~/.antfly/inference/models)
         \\  --ml-dir <dir>        Traditional ML directory (default: ~/.antfly/inference/ml)
+        \\  --preload-model <kind:name|kind:backend:name> Preload and warm a configured model before serving
         \\
         \\Pull options:
         \\  --token <token>   HuggingFace API token (or set HF_TOKEN env var)
@@ -387,6 +470,9 @@ test "run config parses shared scraping fields and ignores api_url" {
         \\  "s3_credentials": {
         \\    "endpoint": "s3.amazonaws.com"
         \\  },
+        \\  "preload": [
+        \\    { "kind": "generator", "name": "antflydb/gemma-e2b", "backend": "metal", "format": "gguf", "quantization": "q4_k" }
+        \\  ],
         \\  "max_loaded_models": 8,
         \\  "pool_size": 4
         \\}
@@ -401,6 +487,12 @@ test "run config parses shared scraping fields and ignores api_url" {
     try std.testing.expectEqualStrings("/tmp/ml", parsed.value.ml_dir.?);
     try std.testing.expectEqual(@as(?bool, true), parsed.value.content_security.?.block_private_ips);
     try std.testing.expectEqualStrings("s3.amazonaws.com", parsed.value.s3_credentials.?.endpoint.?);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.preload.len);
+    try std.testing.expectEqualStrings("generator", parsed.value.preload[0].kind);
+    try std.testing.expectEqualStrings("antflydb/gemma-e2b", parsed.value.preload[0].name);
+    try std.testing.expectEqualStrings("metal", parsed.value.preload[0].backend.?);
+    try std.testing.expectEqualStrings("gguf", parsed.value.preload[0].format.?);
+    try std.testing.expectEqualStrings("q4_k", parsed.value.preload[0].quantization.?);
     try std.testing.expectEqual(@as(?usize, 8), parsed.value.max_loaded_models);
     try std.testing.expectEqual(@as(?usize, 4), parsed.value.pool_size);
 }

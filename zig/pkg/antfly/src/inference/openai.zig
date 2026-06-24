@@ -29,6 +29,7 @@ pub const Provider = struct {
     auth_header: ?[2][]const u8 = null,
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
+    max_tokens: ?i64 = null,
 
     pub fn init(allocator: std.mem.Allocator, http: *httpx.Client, base_url: []const u8) Provider {
         return .{
@@ -63,6 +64,10 @@ pub const Provider = struct {
     pub fn setToolOptions(self: *Provider, tools_json: ?[]const u8, tool_choice_json: ?[]const u8) void {
         self.tools_json = tools_json;
         self.tool_choice_json = tool_choice_json;
+    }
+
+    pub fn setMaxTokens(self: *Provider, max_tokens: i64) void {
+        self.max_tokens = max_tokens;
     }
 
     pub fn embedder(self: *Provider) inference.Embedder {
@@ -149,6 +154,7 @@ pub const Provider = struct {
         const json_body = try inference.chatRequestJsonWithOptionsAlloc(self.allocator, model, messages, .openai_compatible, .{
             .tools_json = self.tools_json,
             .tool_choice_json = self.tool_choice_json,
+            .max_tokens = self.max_tokens,
         });
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });

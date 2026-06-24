@@ -373,6 +373,66 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
     );
     const provider_stats = metal_stats.backend.provider;
     std.debug.print(
+        "metal_active_decode_ms: project={d} span_prep={d} encode={d} apply={d} replace_span={d} attention_span={d} attention_prefix={d} gated_ffn_residual={d} command_wait={d} gpu={d} quant_attention={d} quant_ffn={d}\n",
+        .{
+            @divTrunc(provider_stats.compressed_block_project_nanos, std.time.ns_per_ms),
+            @divTrunc(provider_stats.compressed_block_span_prep_nanos, std.time.ns_per_ms),
+            @divTrunc(provider_stats.compressed_block_encode_nanos, std.time.ns_per_ms),
+            @divTrunc(provider_stats.compressed_block_apply_nanos, std.time.ns_per_ms),
+            @divTrunc(provider_stats.compressed_block_replace_span_nanos, std.time.ns_per_ms),
+            @divTrunc(provider_stats.compressed_block_attention_span_nanos, std.time.ns_per_ms),
+            @divTrunc(provider_stats.compressed_block_attention_prefix_nanos, std.time.ns_per_ms),
+            @divTrunc(provider_stats.compressed_block_gated_ffn_residual_nanos, std.time.ns_per_ms),
+            @divTrunc(provider_stats.compressed_block_command_wait_nanos, std.time.ns_per_ms),
+            @divTrunc(provider_stats.compressed_block_gpu_nanos, std.time.ns_per_ms),
+            @divTrunc(provider_stats.compressed_block_quantized_attention_nanos, std.time.ns_per_ms),
+            @divTrunc(provider_stats.compressed_block_quantized_ffn_nanos, std.time.ns_per_ms),
+        },
+    );
+    std.debug.print(
+        "metal_active_decode_kernels: layers={d} attention_f32={d} quant_linear={d} quant_attention_linear={d} quant_ffn_down_linear={d} quant_ple_linear={d} quant_gate_up_pair={d} rms_norm={d} rms_norm_add={d} layer_norm={d} add={d} head_norm_rope_fused={d} blit_copies={d}\n",
+        .{
+            provider_stats.active_decode_layers,
+            provider_stats.active_decode_attention_f32_kernels,
+            provider_stats.active_decode_quant_linear_kernels,
+            provider_stats.active_decode_quant_attention_linear_kernels,
+            provider_stats.active_decode_quant_ffn_down_linear_kernels,
+            provider_stats.active_decode_quant_ple_linear_kernels,
+            provider_stats.active_decode_quant_gate_up_pair_kernels,
+            provider_stats.active_decode_rms_norm_kernels,
+            provider_stats.active_decode_rms_norm_add_kernels,
+            provider_stats.active_decode_layer_norm_kernels,
+            provider_stats.active_decode_add_kernels,
+            provider_stats.active_decode_head_norm_rope_fused_kernels,
+            provider_stats.active_decode_blit_copies,
+        },
+    );
+    std.debug.print(
+        "metal_active_decode_ops: layer_input_direct={d}/{d} attn_norm={d} q_linear={d} qkv={d} head_norm={d} rope={d} head_norm_rope_fused={d} ple={d} fused_argmax={d} split_argmax={d} frame={d}/{d} disabled={d} scratch_failures={d} fallbacks={d} batch_fallbacks={d} initial_tensor_fallbacks={d} layer_fallbacks={d} tail_fallbacks={d}\n",
+        .{
+            provider_stats.active_decode_layer_input_direct_hits,
+            provider_stats.active_decode_layer_input_direct_attempts,
+            provider_stats.active_decode_attn_norm_ops,
+            provider_stats.active_decode_q_linear_ops,
+            provider_stats.active_decode_qkv_ops,
+            provider_stats.active_decode_head_norm_ops,
+            provider_stats.active_decode_rope_ops,
+            provider_stats.active_decode_head_norm_rope_fused_ops,
+            provider_stats.active_decode_ple_ops,
+            provider_stats.active_decode_final_fused_argmax_ops,
+            provider_stats.active_decode_final_split_argmax_ops,
+            provider_stats.active_decode_frame_successes,
+            provider_stats.active_decode_frame_attempts,
+            provider_stats.active_decode_frame_disabled,
+            provider_stats.active_decode_frame_scratch_failures,
+            provider_stats.active_decode_frame_fallbacks,
+            provider_stats.active_decode_frame_batch_fallbacks,
+            provider_stats.active_decode_frame_initial_tensor_fallbacks,
+            provider_stats.active_decode_frame_layer_fallbacks,
+            provider_stats.active_decode_frame_tail_fallbacks,
+        },
+    );
+    std.debug.print(
         "metal_memory: tensor_device_live_mb={d} tensor_device_peak_mb={d} tensor_device_created={d} tensor_device_released={d} host_mirror_live_mb={d} host_mirror_peak_mb={d} host_mirror_download_mb={d} host_mirror_allocs={d} host_mirror_frees={d} to_host_device_calls={d} quant_slots={d} quant_raw_ref_mb={d} quant_raw_owned_mb={d} quant_prepared_mb={d} quant_runtime_slots={d} quant_runtime_mb={d} dense_host_mb={d} norm_host_mb={d} gathered_entries={d} gathered_device_mb={d} gathered_encoded_host_mb={d}\n",
         .{
             provider_stats.metal_tensor_device_owned_live_bytes / (1024 * 1024),
@@ -410,6 +470,15 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
             provider_stats.metal_provider_quantized_runtime_mapped_attempts,
             provider_stats.metal_provider_quantized_runtime_mapped_fallbacks,
             provider_stats.metal_provider_quantized_runtime_mapped_failures,
+        },
+    );
+    std.debug.print(
+        "metal_runtime_residency_memory: private_mb={d} shared_mb={d} managed_mb={d} embedding_logical_mb={d}\n",
+        .{
+            provider_stats.metal_runtime_private_bytes / (1024 * 1024),
+            provider_stats.metal_runtime_shared_bytes / (1024 * 1024),
+            provider_stats.metal_runtime_managed_bytes / (1024 * 1024),
+            provider_stats.metal_runtime_embedding_logical_bytes / (1024 * 1024),
         },
     );
     std.debug.print(
@@ -578,6 +647,18 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
             provider_stats.metal_runtime_q8_0_linear_mm_f16_input,
             provider_stats.metal_runtime_q8_0_pair_activation_rms_scale_mmv_f16_output,
             provider_stats.metal_runtime_q8_0_linear_mmv_f16_input,
+        },
+    );
+    std.debug.print(
+        "metal_q4_q6_k_dispatch: q4_linear_reduce={d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_in_f16={d}\n",
+        .{
+            provider_stats.metal_runtime_q4_k_linear_reduce,
+            provider_stats.metal_runtime_q4_k_pair_reduce,
+            provider_stats.metal_runtime_q4_k_pair_activation_reduce,
+            provider_stats.metal_runtime_q4_k_pair_activation_reduce_f16_output,
+            provider_stats.metal_runtime_q4_k_activation_rhs_reduce,
+            provider_stats.metal_runtime_q6_k_linear_reduce,
+            provider_stats.metal_runtime_q6_k_linear_reduce_f16_input,
         },
     );
     const q8_family_dispatch = provider_stats.metal_runtime_q8_0_linear_family_dispatch_counts;

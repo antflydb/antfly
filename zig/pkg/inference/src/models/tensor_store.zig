@@ -478,6 +478,7 @@ fn ggufGetTensor(self: *GgufStore, name: []const u8) !weight_source_mod.LoadedWe
                 .allocator = self.allocator,
                 .owns_data = false,
                 .owns_shape = true,
+                .mmap_source_bytes = if (self.mmap_region != null) self.rawData() else null,
             },
             .quantized = false,
             .quantized_storage = quantized_storage,

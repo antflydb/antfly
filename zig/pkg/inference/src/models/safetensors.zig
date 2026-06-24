@@ -221,6 +221,7 @@ pub const MMapReader = struct {
                 .allocator = self.allocator,
                 .owns_data = false,
                 .owns_shape = false,
+                .mmap_source_bytes = self.file_bytes,
             };
         }
 

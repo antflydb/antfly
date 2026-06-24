@@ -6360,7 +6360,7 @@ test "metal partition executor command path runs linear and norms on metal backe
     try std.testing.expect(raw[raw.len - 1] > raw[0]);
 }
 
-test "metal partition executor resident multi op chain matches host" {
+test "metal partition executor eager multi op chain matches host" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
 
@@ -6482,8 +6482,6 @@ test "metal partition executor resident multi op chain matches host" {
     for (logits) |value| denom += @exp(value - max_logit);
     var expected: [dim]f32 = undefined;
     for (&expected, logits) |*value, logit| value.* = @exp(logit - max_logit) / denom;
-
-    try std.testing.expect(metal_compute_mod.MetalCompute.debugHasDeviceTensor(&cb, values[out_index].?));
 
     const raw = try cb.toFloat32(values[out_index].?, allocator);
     defer allocator.free(raw);

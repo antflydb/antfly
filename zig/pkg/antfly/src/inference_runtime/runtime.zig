@@ -68,6 +68,7 @@ const EmbeddedServerConfig = struct {
     content_security: ?common_config.Config.ContentSecurityConfig = null,
     s3_credentials: ?common_config.Config.S3CredentialsConfig = null,
     generation_budget_overrides: ServerBudgetOverrides = .{},
+    preload: []const inference.server.WarmModel = &.{},
 };
 
 const BudgetOverridesMb = struct {
@@ -77,6 +78,49 @@ const BudgetOverridesMb = struct {
     kv_budget_mb: usize = 0,
     scratch_budget_mb: usize = 0,
 };
+
+pub fn parseBackendType(value: []const u8) ?inference.backends.BackendType {
+    if (std.mem.eql(u8, value, "native")) return .native;
+    if (std.mem.eql(u8, value, "onnx")) return .onnx;
+    if (std.mem.eql(u8, value, "metal")) return .metal;
+    if (std.mem.eql(u8, value, "cuda")) return .cuda;
+    if (std.mem.eql(u8, value, "xla") or std.mem.eql(u8, value, "pjrt")) return .pjrt;
+    if (std.mem.eql(u8, value, "wasm") or std.mem.eql(u8, value, "webgpu")) return .wasm;
+    return null;
+}
+
+pub fn parseOptionalBackendType(value: ?[]const u8) !?inference.backends.BackendType {
+    const raw = value orelse return null;
+    if (std.mem.eql(u8, raw, "auto")) return null;
+    return parseBackendType(raw) orelse error.InvalidArguments;
+}
+
+fn parsePreloadModelKind(value: []const u8) ?inference.server.WarmModelKind {
+    inline for (std.meta.fields(inference.server.WarmModelKind)) |field| {
+        if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+    }
+    return null;
+}
+
+fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
+    const separator = std.mem.indexOfScalar(u8, value, ':') orelse return error.InvalidArguments;
+    const kind_name = value[0..separator];
+    var model_name = value[separator + 1 ..];
+    var backend: ?inference.backends.BackendType = null;
+    if (std.mem.indexOfScalar(u8, model_name, ':')) |backend_separator| {
+        const backend_name = model_name[0..backend_separator];
+        backend = parseBackendType(backend_name) orelse return error.InvalidArguments;
+        model_name = model_name[backend_separator + 1 ..];
+    }
+    if (model_name.len == 0) return error.InvalidArguments;
+    return .{
+        .kind = parsePreloadModelKind(kind_name) orelse return error.InvalidArguments,
+        .name = model_name,
+        .backend = backend,
+        .format = null,
+        .quantization = null,
+    };
+}
 
 pub fn run(init: std.process.Init) !void {
     const alloc = init.gpa;
@@ -105,7 +149,21 @@ pub fn runFromIterator(
     } else if (std.mem.eql(u8, command, "classify")) {
         return try inference.native_classify.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "generate")) {
-        return try inference.native_generate.main(alloc, io, try collectArgs(alloc, args));
+        inference.native_generate.main(alloc, io, try collectArgs(alloc, args)) catch |err| switch (err) {
+            error.WarmInferenceServerUnavailable => {
+                std.debug.print(
+                    "warm inference server unavailable; start one with `antfly inference run --preload-model generator:<model>` and pass --server\n",
+                    .{},
+                );
+                std.process.exit(1);
+            },
+            error.UnsupportedServerGenerateOption => {
+                std.debug.print("--require-server does not support one of the requested generate options\n", .{});
+                std.process.exit(1);
+            },
+            else => return err,
+        };
+        return;
     } else if (std.mem.eql(u8, command, "compile-artifact")) {
         return try inference.native_compile.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "export")) {
@@ -149,6 +207,8 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     var models_dir: []const u8 = defaultModelsDir(alloc);
     var ml_dir: []const u8 = defaultMlDir(alloc);
     var budget_overrides_mb = BudgetOverridesMb{};
+    var preload_models = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
+    defer preload_models.deinit(alloc);
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--host")) {
@@ -169,21 +229,25 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
             budget_overrides_mb.kv_budget_mb = try parseBudgetMbArg(args);
         } else if (std.mem.eql(u8, arg, "--scratch-budget-mb")) {
             budget_overrides_mb.scratch_budget_mb = try parseBudgetMbArg(args);
+        } else if (std.mem.eql(u8, arg, "--preload-model")) {
+            try preload_models.append(alloc, try parsePreloadModelFlag(args.next() orelse return error.InvalidArguments));
         }
     }
 
     std.debug.print("antfly inference\n", .{});
     std.debug.print("ai models: {s}\n", .{models_dir});
     std.debug.print("ml models: {s}\n", .{ml_dir});
-    std.debug.print("listening on {s}:{d}\n", .{ host, port });
 
     var node = try inference.server.Node.init(alloc, .{
         .models_dir = models_dir,
         .ml_dir = ml_dir,
         .generation_budget_overrides = budgetOverridesFromMb(budget_overrides_mb),
+        .preload = preload_models.items,
     });
     defer node.deinit();
 
+    try node.warmConfiguredGenerators(alloc);
+    std.debug.print("listening on {s}:{d}\n", .{ host, port });
     try node.serve(alloc, io, host, port);
 }
 
@@ -200,6 +264,7 @@ pub fn spawnServerProcess(
         .models_dir = config.models_dir orelse defaultModelsDir(alloc),
         .ml_dir = config.ml_dir orelse defaultMlDir(alloc),
         .generation_budget_overrides = config.generation_budget_overrides,
+        .preload = config.preload,
     };
     if (config.content_security) |sec| node_cfg.content_security = sec;
     if (config.s3_credentials) |creds| node_cfg.s3_credentials = creds;
@@ -225,6 +290,10 @@ pub fn spawnServerProcess(
 fn serveThread(node: *inference.server.Node, alloc: std.mem.Allocator, host: []const u8, port: u16) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
+    node.warmConfiguredGenerators(alloc) catch |err| {
+        std.debug.print("inference warmup error: {}\n", .{err});
+        return;
+    };
     node.serve(alloc, io_impl.io(), host, port) catch |err| {
         std.debug.print("inference server error: {}\n", .{err});
     };
@@ -391,6 +460,7 @@ fn printUsage() void {
         \\  --combined-budget-mb <n>  Native generation combined budget override
         \\  --kv-budget-mb <n>        Native generation KV cache budget override
         \\  --scratch-budget-mb <n>   Native generation scratch budget override
+        \\  --preload-model <kind:name|kind:backend:name>  Preload and warm a configured model before serving
         \\
         \\Pull options:
         \\  --token <token>  HuggingFace API token (or set HF_TOKEN env var)
@@ -408,4 +478,11 @@ test "inference runtime module compiles" {
     _ = run;
     _ = runFromIterator;
     _ = spawnServerProcess;
+}
+
+test "parseBackendType accepts warm generator backends" {
+    try std.testing.expectEqual(inference.backends.BackendType.metal, parseBackendType("metal").?);
+    try std.testing.expectEqual(inference.backends.BackendType.wasm, parseBackendType("webgpu").?);
+    try std.testing.expectEqual(inference.backends.BackendType.pjrt, parseBackendType("xla").?);
+    try std.testing.expect(try parseOptionalBackendType("auto") == null);
 }

@@ -2508,6 +2508,7 @@ fn generatorConfigFromPublic(cfg: generating_openapi.GeneratorConfig) !generatin
         .project_id = cfg.project_id,
         .location = cfg.location,
         .credentials_path = cfg.credentials_path,
+        .max_tokens = cfg.max_tokens orelse generating.default_max_tokens,
     };
 }
 

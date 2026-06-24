@@ -9088,6 +9088,7 @@ fn decoderRuntimePrepareLinearSlot(
 
 fn decoderRuntimePrepareLinearOp(ctx: *anyopaque, request: *const ops.DecoderRuntimePrepareLinearRequest) anyerror!bool {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    _ = request.dense_fallback_max_bytes;
     const weight = residentTensorForSlot(self, tensorFromCt(request.weight)) orelse {
         self.stats.decoder_runtime_linear_slot_prepare_misses += 1;
         return false;

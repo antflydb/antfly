@@ -314,3 +314,17 @@ test "gemma4 runtime slot layout is stable" {
     try std.testing.expectEqual(@as(usize, 32 * 4), finalNormSlot(32));
     try std.testing.expectEqual(@as(usize, 32 * 4 + 1 + 32), pleProjNormSlot(32));
 }
+
+test "gemma4 whole-frame prefill supports shared kv" {
+    const config = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 1536,
+        .num_hidden_layers = 35,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 4,
+        .num_kv_shared_layers = 5,
+        .intermediate_size = 8960,
+        .ple_hidden_size = 256,
+    };
+    try std.testing.expect(supportsWholeFramePrefill(config, config.num_hidden_layers));
+}

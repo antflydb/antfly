@@ -143,6 +143,12 @@ pub fn prepareLinearNoBiasSlot(
     return prepareLinearNoBiasSlotWithFallback(cb, allocator, slot, weight, in_dim, out_dim, true);
 }
 
+pub const PrepareLinearNoBiasSlotOptions = struct {
+    retain_dense_fallback: bool = true,
+    disable_mapped_quant_weight: bool = false,
+    dense_fallback_max_bytes: ?usize = null,
+};
+
 pub fn prepareLinearNoBiasDenseSlot(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,
@@ -152,27 +158,9 @@ pub fn prepareLinearNoBiasDenseSlot(
     out_dim: usize,
     retain_dense_fallback: bool,
 ) !bool {
-    const started_at = monotonicNowNs();
-    timing_stats.linear_calls += 1;
-    const bias_dense = try zeroBiasTensorGeneric(cb, allocator, out_dim);
-    defer cb.free(bias_dense);
-
-    const prepared = try cb.decoderRuntimePrepareLinear(&.{
-        .slot = slot,
-        .weight = weight,
-        .bias = bias_dense,
-        .in_dim = in_dim,
-        .out_dim = out_dim,
+    return prepareLinearNoBiasSlotWithOptions(cb, allocator, slot, weight, in_dim, out_dim, .{
         .retain_dense_fallback = retain_dense_fallback,
     });
-    const finished_at = monotonicNowNs();
-    timing_stats.linear_dense_calls += 1;
-    if (finished_at > started_at) {
-        const elapsed = finished_at - started_at;
-        timing_stats.linear_nanos += elapsed;
-        timing_stats.linear_dense_nanos += elapsed;
-    }
-    return prepared;
 }
 
 pub fn prepareLinearNoBiasSlotWithFallback(
@@ -183,6 +171,20 @@ pub fn prepareLinearNoBiasSlotWithFallback(
     in_dim: usize,
     out_dim: usize,
     retain_dense_fallback: bool,
+) !bool {
+    return prepareLinearNoBiasSlotWithOptions(cb, allocator, slot, weight, in_dim, out_dim, .{
+        .retain_dense_fallback = retain_dense_fallback,
+    });
+}
+
+pub fn prepareLinearNoBiasSlotWithOptions(
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    slot: usize,
+    weight: ops.CT,
+    in_dim: usize,
+    out_dim: usize,
+    options: PrepareLinearNoBiasSlotOptions,
 ) !bool {
     const started_at = monotonicNowNs();
     timing_stats.linear_calls += 1;
@@ -196,7 +198,9 @@ pub fn prepareLinearNoBiasSlotWithFallback(
             .bias = bias_dense,
             .in_dim = in_dim,
             .out_dim = out_dim,
-            .retain_dense_fallback = retain_dense_fallback,
+            .retain_dense_fallback = options.retain_dense_fallback,
+            .disable_mapped_quant_weight = options.disable_mapped_quant_weight,
+            .dense_fallback_max_bytes = options.dense_fallback_max_bytes,
         });
         const finished_at = monotonicNowNs();
         timing_stats.linear_quantized_calls += 1;
@@ -214,7 +218,9 @@ pub fn prepareLinearNoBiasSlotWithFallback(
         .bias = bias_dense,
         .in_dim = in_dim,
         .out_dim = out_dim,
-        .retain_dense_fallback = retain_dense_fallback,
+        .retain_dense_fallback = options.retain_dense_fallback,
+        .disable_mapped_quant_weight = options.disable_mapped_quant_weight,
+        .dense_fallback_max_bytes = options.dense_fallback_max_bytes,
     });
     const finished_at = monotonicNowNs();
     timing_stats.linear_dense_calls += 1;
