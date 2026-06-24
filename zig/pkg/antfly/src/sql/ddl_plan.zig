@@ -24,6 +24,7 @@ const plan_mod = @import("plan.zig");
 const parser = @import("parser.zig");
 const parser_context = @import("parser_context.zig");
 const runtime_schema = @import("../storage/schema.zig");
+const token_mod = @import("token.zig");
 const tokenized = @import("tokenized.zig");
 const value_mod = @import("value.zig");
 
@@ -2993,6 +2994,86 @@ fn countGeneratedParenthesizedList(tokens: []const grammar.Token, range: generat
     }
     if (depth != 0) return error.UnsupportedSqlShape;
     return count;
+}
+
+pub fn sessionCatalogPlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlSessionAst,
+) !SessionCatalogPlan {
+    const tail = generatedStatementTail(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    return switch (ast.kind) {
+        .set => try setSessionCatalogPlanFromGeneratedTailAlloc(alloc, tail),
+        .reset => try resetSessionCatalogPlanFromGeneratedTailAlloc(alloc, tail),
+        .show => try showSessionCatalogPlanFromGeneratedTail(tail),
+        .discard_all => try discardSessionCatalogPlanFromGeneratedTail(tail),
+    };
+}
+
+pub fn transactionBoundaryPlanFromGeneratedAst(ast: generated_parser.GeneratedSqlTransactionAst) LoweredDdlPlan {
+    _ = ast;
+    return .{ .adapter_noop = .{ .reason = .transaction_control } };
+}
+
+fn setSessionCatalogPlanFromGeneratedTailAlloc(alloc: std.mem.Allocator, tail: []const grammar.Token) !SessionCatalogPlan {
+    var pos: usize = 0;
+    if (parseSetSearchPathPlanTailAlloc(alloc, tail, &pos)) |plan| {
+        return .{ .set_search_path = plan };
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => {},
+        else => return err,
+    }
+
+    pos = 0;
+    if (grammar.parseSetSessionSettingTailAlloc(alloc, tail, &pos)) |plan| {
+        return .{ .set_setting = plan };
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => {},
+        else => return err,
+    }
+
+    return error.UnsupportedSqlShape;
+}
+
+fn resetSessionCatalogPlanFromGeneratedTailAlloc(alloc: std.mem.Allocator, tail: []const grammar.Token) !SessionCatalogPlan {
+    var pos: usize = 0;
+    grammar.parseResetSearchPathTail(tail, &pos) catch |err| switch (err) {
+        error.UnsupportedSqlShape => {},
+        else => return err,
+    };
+    if (pos > 0) {
+        return .reset_search_path;
+    }
+
+    pos = 0;
+    if (grammar.parseResetSessionSettingTailAlloc(alloc, tail, &pos)) |plan| {
+        return .{ .reset_setting = plan };
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => {},
+        else => return err,
+    }
+
+    return error.UnsupportedSqlShape;
+}
+
+fn showSessionCatalogPlanFromGeneratedTail(tail: []const grammar.Token) !SessionCatalogPlan {
+    var pos: usize = 0;
+    try grammar.parseShowSearchPathTail(tail, &pos);
+    return .show_search_path;
+}
+
+fn discardSessionCatalogPlanFromGeneratedTail(tail: []const grammar.Token) !SessionCatalogPlan {
+    var pos: usize = 0;
+    try grammar.parseDiscardAllTail(tail, &pos);
+    return .discard_all;
+}
+
+fn generatedStatementTail(tokens: []const grammar.Token, statement_span: token_mod.SourceSpan) ?[]const grammar.Token {
+    if (tokens.len == 0) return null;
+    var end = tokens.len;
+    while (end > 0 and tokens[end - 1].kind == .semicolon) end -= 1;
+    if (end == 0 or tokens[0].source_start != statement_span.start or tokens[end - 1].source_end != statement_span.end) return null;
+    return tokens[1..end];
 }
 
 pub fn closeCursorPortalPlanFromSyntaxAlloc(
@@ -11540,6 +11621,87 @@ test "sql adapter ddl plan lowers session catalog ddl plans" {
     }
 }
 
+test "sql adapter generated session AST lowers to session catalog plans" {
+    const alloc = std.testing.allocator;
+
+    var generated_search_path = try generatedSessionCatalogPlanForTestAlloc(alloc, "SET search_path TO public;");
+    defer generated_search_path.deinit(alloc);
+    var legacy_search_path = try lowerDdlPlanForTestAlloc(alloc, "SET search_path TO public;");
+    defer legacy_search_path.deinit(alloc);
+    switch (generated_search_path) {
+        .set_search_path => |generated| switch (legacy_search_path) {
+            .session_catalog => |legacy_plan| switch (legacy_plan) {
+                .set_search_path => |legacy| {
+                    try std.testing.expectEqual(legacy.local, generated.local);
+                    try std.testing.expectEqual(legacy.namespaces.len, generated.namespaces.len);
+                    try std.testing.expectEqualStrings(legacy.namespaces[0], generated.namespaces[0]);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var generated_setting = try generatedSessionCatalogPlanForTestAlloc(alloc, "SET app.tenant_id = 'tenant-a';");
+    defer generated_setting.deinit(alloc);
+    var legacy_setting = try lowerDdlPlanForTestAlloc(alloc, "SET app.tenant_id = 'tenant-a';");
+    defer legacy_setting.deinit(alloc);
+    switch (generated_setting) {
+        .set_setting => |generated| switch (legacy_setting) {
+            .session_catalog => |legacy_plan| switch (legacy_plan) {
+                .set_setting => |legacy| {
+                    try std.testing.expectEqualStrings(legacy.name, generated.name);
+                    try std.testing.expectEqualStrings(legacy.value, generated.value);
+                    try std.testing.expectEqual(legacy.kind, generated.kind);
+                    try std.testing.expectEqual(legacy.local, generated.local);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var generated_reset = try generatedSessionCatalogPlanForTestAlloc(alloc, "RESET app.tenant_id;");
+    defer generated_reset.deinit(alloc);
+    var legacy_reset = try lowerDdlPlanForTestAlloc(alloc, "RESET app.tenant_id;");
+    defer legacy_reset.deinit(alloc);
+    switch (generated_reset) {
+        .reset_setting => |generated| switch (legacy_reset) {
+            .session_catalog => |legacy_plan| switch (legacy_plan) {
+                .reset_setting => |legacy| {
+                    try std.testing.expectEqualStrings(legacy.name, generated.name);
+                    try std.testing.expectEqual(legacy.kind, generated.kind);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const tag_cases = [_]struct {
+        sql: []const u8,
+        tag: std.meta.Tag(SessionCatalogPlan),
+    }{
+        .{ .sql = "RESET search_path;", .tag = .reset_search_path },
+        .{ .sql = "SHOW search_path;", .tag = .show_search_path },
+        .{ .sql = "DISCARD ALL;", .tag = .discard_all },
+    };
+    for (tag_cases) |case| {
+        var generated = try generatedSessionCatalogPlanForTestAlloc(alloc, case.sql);
+        defer generated.deinit(alloc);
+        var legacy = try lowerDdlPlanForTestAlloc(alloc, case.sql);
+        defer legacy.deinit(alloc);
+        try std.testing.expectEqual(case.tag, std.meta.activeTag(generated));
+        switch (legacy) {
+            .session_catalog => |legacy_plan| try std.testing.expectEqual(std.meta.activeTag(legacy_plan), std.meta.activeTag(generated)),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
 test "sql adapter ddl plan lowers transaction control and protocol ddl plans" {
     const alloc = std.testing.allocator;
 
@@ -11658,6 +11820,28 @@ test "sql adapter ddl plan lowers transaction control and protocol ddl plans" {
             else => return error.TestUnexpectedResult,
         },
         else => return error.TestUnexpectedResult,
+    }
+}
+
+test "sql adapter generated transaction AST lowers to transaction boundary plans" {
+    const alloc = std.testing.allocator;
+
+    const cases = [_][]const u8{
+        "BEGIN;",
+        "COMMIT;",
+        "ROLLBACK;",
+    };
+    for (cases) |sql| {
+        const generated = try generatedTransactionBoundaryPlanForTestAlloc(alloc, sql);
+        var legacy = try lowerDdlPlanForTestAlloc(alloc, sql);
+        defer legacy.deinit(alloc);
+        switch (generated) {
+            .adapter_noop => |generated_noop| switch (legacy) {
+                .adapter_noop => |legacy_noop| try std.testing.expectEqual(legacy_noop.reason, generated_noop.reason),
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        }
     }
 }
 
@@ -11957,6 +12141,28 @@ fn generatedPreparedStatementPlanForTestAlloc(alloc: std.mem.Allocator, sql: []c
         else => return error.UnsupportedSqlShape,
     };
     return try preparedStatementPlanFromGeneratedAstAlloc(alloc, parsed.items(), prepared_ast);
+}
+
+fn generatedSessionCatalogPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !SessionCatalogPlan {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    const generated_raw = parsed.generated_statement orelse return error.UnsupportedSqlShape;
+    const session_ast = switch (generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .session => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    return try sessionCatalogPlanFromGeneratedAstAlloc(alloc, parsed.items(), session_ast);
+}
+
+fn generatedTransactionBoundaryPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !LoweredDdlPlan {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    const generated_raw = parsed.generated_statement orelse return error.UnsupportedSqlShape;
+    const transaction_ast = switch (generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .transaction => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    return transactionBoundaryPlanFromGeneratedAst(transaction_ast);
 }
 
 test "sql adapter ddl plan lowers routine expression bindings into ddl plans" {

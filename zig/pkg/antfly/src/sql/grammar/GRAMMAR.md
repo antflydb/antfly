@@ -44,13 +44,15 @@ ranges for command names, values, prepared-statement arguments, and nested
 prepared statements. This AST is retained by `ParsedSql`; prepared statements
 now have an AST-to-plan conversion path with parity coverage against the
 existing token-based lowerer, including typed `PREPARE name(type, ...) AS ...`
-parameter lists. Session and transaction statements still lower through the
-existing token-based control paths until their generated AST plan parity tests
-exist. Simple DDL has generated-parser corpus coverage but still falls back to
-the existing parser when the seed grammar does not yet cover the shape. Simple
-DML now has generated-parser corpus coverage and retained generated raw nodes
-for covered write statements, but unsupported DML still falls back until plan
-parity is proven. Representative read queries now have generated-parser corpus
+parameter lists. Session catalog commands now have generated AST-to-plan parity
+for the generated-covered `SET`, `RESET`, `SHOW`, and `DISCARD ALL` forms.
+Transaction boundary commands now have generated AST-to-plan parity for
+generated-covered `BEGIN`, `COMMIT`, and `ROLLBACK` adapter-noop boundaries.
+Simple DDL has generated-parser corpus coverage but still falls back to the
+existing parser when the seed grammar does not yet cover the shape. Simple DML
+now has generated-parser corpus coverage and retained generated raw nodes for
+covered write statements, but unsupported DML still falls back until plan parity
+is proven. Representative read queries now have generated-parser corpus
 coverage and retained generated raw nodes for covered read statements, while
 unsupported read shapes still fall back until read-plan parity is proven. The
 generated parser now also treats seed graph DDL as a distinct graph statement
@@ -217,8 +219,11 @@ The generated parser facade currently produces source-span-bearing closed
 variants for:
 
 - session statement, including a generated AST payload for command, name, and
-  value token ranges
-- transaction statement, including a generated AST payload for command spans
+  value token ranges, plus generated AST-to-plan parity for generated-covered
+  session catalog commands
+- transaction statement, including a generated AST payload for command spans,
+  plus generated AST-to-plan parity for generated-covered transaction boundary
+  commands
 - prepared statement, including a generated AST payload for command, name,
   argument, and nested-statement token ranges, plus generated AST-to-plan parity
   for typed `PREPARE`, `EXECUTE`, and `DEALLOCATE`
@@ -257,9 +262,9 @@ Generated grammar work needs evidence at multiple levels:
   placeholders, casts, operators, and nested statements. The first AST shape
   test covers generated session, transaction, and prepared statement payloads.
 - Plan parity tests showing generated ASTs lower to the same typed plans as the
-  current parser for migrated statement families. Prepared statements have the
-  first generated AST-to-plan parity test for typed `PREPARE`, `EXECUTE`, and
-  `DEALLOCATE`.
+  current parser for migrated statement families. Session catalog commands,
+  transaction boundaries, and prepared statements have generated AST-to-plan
+  parity tests for their generated-covered forms.
 - SQL/API parity tests showing SQL and native API requests reach the same
   service contracts.
 - Fuzz or mutation tests for scanner/parser crash resistance and bounded error
