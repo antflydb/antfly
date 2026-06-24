@@ -837,6 +837,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .copy_not_planned_by_generated_parser,
         },
         .{
+            .sql = "DECLARE usage_cursor NO SCROLL CURSOR FOR SELECT id FROM usage_records",
+            .kind = .declare,
+            .reason = .declare_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "FETCH FROM usage_cursor",
             .kind = .fetch,
             .reason = .fetch_not_planned_by_generated_parser,

@@ -127,6 +127,7 @@ pub const GeneratedSqlUnsupportedKind = enum {
     cluster,
     comment,
     copy,
+    declare,
     explain,
     fetch,
     grant,
@@ -147,6 +148,7 @@ pub const GeneratedSqlUnsupportedReason = enum {
     cluster_not_planned_by_generated_parser,
     comment_not_planned_by_generated_parser,
     copy_not_planned_by_generated_parser,
+    declare_not_planned_by_generated_parser,
     explain_not_planned_by_generated_parser,
     fetch_not_planned_by_generated_parser,
     grant_not_planned_by_generated_parser,
@@ -1140,6 +1142,7 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CLUSTER usage_records USING usage_status_idx", .kind = .unsupported },
     .{ .sql = "COMMENT ON TABLE usage_records IS 'billing rows'", .kind = .unsupported },
     .{ .sql = "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)", .kind = .unsupported },
+    .{ .sql = "DECLARE usage_cursor NO SCROLL CURSOR FOR SELECT id FROM usage_records", .kind = .unsupported },
     .{ .sql = "EXPLAIN", .kind = .unsupported },
     .{ .sql = "EXPLAIN SELECT id FROM usage_records", .kind = .unsupported },
     .{ .sql = "EXPLAIN ANALYZE INSERT INTO usage_records (id) VALUES ('u1')", .kind = .unsupported },
@@ -1378,6 +1381,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.cluster)) return .{ .unsupported = .cluster };
     if (first.matchesKeywordTag(.comment)) return .{ .unsupported = .comment };
     if (first.matchesKeywordTag(.copy)) return .{ .unsupported = .copy };
+    if (first.matchesKeywordTag(.declare)) return .{ .unsupported = .declare };
     if (first.matchesKeywordTag(.explain)) return .{ .unsupported = .explain };
     if (first.matchesKeywordTag(.fetch)) return .{ .unsupported = .fetch };
     if (first.matchesKeywordTag(.grant)) return .{ .unsupported = .grant };
@@ -1430,6 +1434,7 @@ fn buildUnsupportedAst(
             .cluster => .cluster_not_planned_by_generated_parser,
             .comment => .comment_not_planned_by_generated_parser,
             .copy => .copy_not_planned_by_generated_parser,
+            .declare => .declare_not_planned_by_generated_parser,
             .explain => .explain_not_planned_by_generated_parser,
             .fetch => .fetch_not_planned_by_generated_parser,
             .grant => .grant_not_planned_by_generated_parser,
@@ -4707,6 +4712,7 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .cluster }, (try parseSqlAlloc(alloc, "CLUSTER usage_records USING usage_status_idx")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .comment }, (try parseSqlAlloc(alloc, "COMMENT ON TABLE usage_records IS 'billing rows'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .copy }, (try parseSqlAlloc(alloc, "COPY usage_records FROM STDIN")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .declare }, (try parseSqlAlloc(alloc, "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .explain }, (try parseSqlAlloc(alloc, "EXPLAIN SELECT id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .fetch }, (try parseSqlAlloc(alloc, "FETCH FROM usage_cursor")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .grant }, (try parseSqlAlloc(alloc, "GRANT SELECT ON TABLE usage_records TO readonly")).statement);
@@ -7525,6 +7531,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .kind = .comment,
             .reason = .comment_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 6 },
+        },
+        .{
+            .sql = "DECLARE usage_cursor NO SCROLL CURSOR FOR SELECT id FROM usage_records",
+            .kind = .declare,
+            .reason = .declare_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 10 },
         },
         .{
             .sql = "GRANT SELECT ON TABLE usage_records TO readonly",

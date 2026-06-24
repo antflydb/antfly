@@ -1805,50 +1805,6 @@ pub const DB = struct {
         return try lifecycle_impl.listResolvers(self, alloc);
     }
 
-    fn resolveDocSetForIdsAlloc(self: *DB, alloc: Allocator, doc_ids: []const []const u8) !doc_set.ResolvedDocSet {
-        return try internal_impl.resolveDocSetForIdsAlloc(self, alloc, doc_ids);
-    }
-
-    fn resolveDocSetForIdsNoLockAlloc(self: *DB, alloc: Allocator, doc_ids: []const []const u8) !doc_set.ResolvedDocSet {
-        return try internal_impl.resolveDocSetForIdsNoLockAlloc(self, alloc, doc_ids);
-    }
-
-    fn resolveDocSetForIdsNoLockAtGenerationAlloc(
-        self: *DB,
-        alloc: Allocator,
-        doc_ids: []const []const u8,
-        generation: ?u64,
-    ) !doc_set.ResolvedDocSet {
-        return try internal_impl.resolveDocSetForIdsNoLockAtGenerationAlloc(self, alloc, doc_ids, generation);
-    }
-
-    fn resolvedDocFilterForIdsAlloc(
-        self: *DB,
-        include_positive: bool,
-        include_doc_ids: []const []const u8,
-        exclude_doc_ids: []const []const u8,
-        generation: ?u64,
-    ) !doc_set.ResolvedDocFilter {
-        return try internal_impl.resolvedDocFilterForIdsAlloc(self, include_positive, include_doc_ids, exclude_doc_ids, generation);
-    }
-
-    fn docIdsForResolvedDocSetAlloc(self: *DB, alloc: Allocator, set: *const doc_set.ResolvedDocSet) !?[]const []const u8 {
-        return try internal_impl.docIdsForResolvedDocSetAlloc(self, alloc, set);
-    }
-
-    fn docIdsForResolvedDocSetNoLockAlloc(self: *DB, alloc: Allocator, set: *const doc_set.ResolvedDocSet) !?[]const []const u8 {
-        return try internal_impl.docIdsForResolvedDocSetNoLockAlloc(self, alloc, set);
-    }
-
-    fn docIdsForResolvedDocSetNoLockAtGenerationAlloc(
-        self: *DB,
-        alloc: Allocator,
-        set: *const doc_set.ResolvedDocSet,
-        generation: ?u64,
-    ) !?[]const []const u8 {
-        return try internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(self, alloc, set, generation);
-    }
-
     pub fn extractEnrichments(self: *DB, alloc: Allocator, writes: []const types.BatchWrite) !types.ExtractEnrichmentsResult {
         return try write_path_impl.extractEnrichments(self, alloc, writes);
     }
@@ -1861,40 +1817,12 @@ pub const DB = struct {
         return try schema_runtime_impl.deleteIndex(self, name);
     }
 
-    fn refreshManagedIndexWorkersLocked(self: *DB) !void {
-        return try lifecycle_impl.refreshManagedIndexWorkersLocked(self);
-    }
-
-    fn resetManagedIndexAppliedSequences(self: *DB) !void {
-        return try lifecycle_impl.resetManagedIndexAppliedSequences(self);
-    }
-
-    fn rebaseManagedIndexAppliedSequencesIfNeeded(self: *DB) !void {
-        return try lifecycle_impl.rebaseManagedIndexAppliedSequencesIfNeeded(self);
-    }
-
     pub fn deleteEnrichment(self: *DB, kind: types.EnrichmentKind, name: []const u8) !bool {
         return try schema_runtime_impl.deleteEnrichment(self, kind, name);
     }
 
     pub fn pendingWorkStats(self: *DB) db_core.PendingWorkStats {
         return lifecycle_impl.pendingWorkStats(self);
-    }
-
-    fn persistedReplayStageStats(self: *DB, scope_name: []const u8, force_enabled: bool) !types.ReplayStageStats {
-        return try lifecycle_impl.persistedReplayStageStats(self, scope_name, force_enabled);
-    }
-
-    fn resolutionStageStats(self: *DB) types.ReplayStageStats {
-        return lifecycle_impl.resolutionStageStats(self);
-    }
-
-    fn promotionStageStats(self: *DB) types.ReplayStageStats {
-        return lifecycle_impl.promotionStageStats(self);
-    }
-
-    fn persistedEnrichmentStats(self: *DB) !types.EnrichmentStats {
-        return try lifecycle_impl.persistedEnrichmentStats(self);
     }
 
     pub fn runDerivedUntil(self: *DB, sequence: u64) !void {
@@ -1909,10 +1837,6 @@ pub const DB = struct {
         return try lifecycle_impl.runEnrichmentUntil(self, sequence);
     }
 
-    fn noPendingEnrichmentReplayThrough(self: *DB, applied_sequence: u64, sequence: u64) !bool {
-        return try lifecycle_impl.noPendingEnrichmentReplayThrough(self, applied_sequence, sequence);
-    }
-
     pub fn runMaintenanceUntil(self: *DB, sequence: u64, sync_targets: ManagedSyncTargets) !void {
         return try lifecycle_impl.runMaintenanceUntil(self, sequence, sync_targets);
     }
@@ -1921,16 +1845,8 @@ pub const DB = struct {
         return try lifecycle_impl.runMaintenanceUntilTargets(self, sequence, index_names);
     }
 
-    fn syncTargetsIncludeGraph(self: *DB, index_names: []const []const u8) bool {
-        return lifecycle_impl.syncTargetsIncludeGraph(self, index_names);
-    }
-
     pub fn waitForCurrentSyncLevel(self: *DB, sync_level: types.SyncLevel) !void {
         return try lifecycle_impl.waitForCurrentSyncLevel(self, sync_level);
-    }
-
-    fn currentManagedSyncTargets(self: *DB, sync_level: types.SyncLevel) !ManagedSyncTargets {
-        return try lifecycle_impl.currentManagedSyncTargets(self, sync_level);
     }
 
     pub fn catchUpPendingDerivedReplay(self: *DB) !void {
@@ -2087,14 +2003,6 @@ pub const DB = struct {
         return try derived_async_impl.runDensePostingMaintenanceForIdleBestEffort(self);
     }
 
-    fn flushAppliedSequencesForIdle(self: *DB) !void {
-        return try derived_async_impl.flushAppliedSequencesForIdle(self);
-    }
-
-    fn freeDenseArtifactRebuildWrites(alloc: Allocator, writes: *std.ArrayListUnmanaged(mapper.DenseEmbeddingWrite)) void {
-        derived_async_impl.freeDenseArtifactRebuildWrites(alloc, writes);
-    }
-
     pub fn rebuildDenseIndexesFromStoredEmbeddingArtifacts(self: *DB, alloc: Allocator) !usize {
         return try derived_async_impl.rebuildDenseIndexesFromStoredEmbeddingArtifacts(self, alloc);
     }
@@ -2157,20 +2065,6 @@ pub const DB = struct {
         return try schema_runtime_impl.replayGeneratedEnrichmentsFromStoredDocs(self, alloc);
     }
 
-    const IndexStatusSnapshot = lifecycle_mod.IndexStatusSnapshot;
-
-    fn textIndexTermCount(entry: anytype) u64 {
-        return lifecycle_mod.textIndexTermCount(entry);
-    }
-
-    fn loadIndexStatusSnapshot(self: *DB, alloc: Allocator, index_name: []const u8) !?IndexStatusSnapshot {
-        return try lifecycle_mod.loadIndexStatusSnapshot(alloc, self.core.store, index_name);
-    }
-
-    fn applyIndexStatusSnapshot(item: *types.DBIndexStats, status_snapshot: IndexStatusSnapshot) void {
-        lifecycle_mod.applyIndexStatusSnapshot(item, status_snapshot);
-    }
-
     pub fn overlayRuntimeStatusBestEffort(self: *DB, stats_alloc: Allocator, runtime_stats: *types.DBStats) void {
         return lifecycle_impl.overlayRuntimeStatusBestEffort(self, stats_alloc, runtime_stats);
     }
@@ -2191,32 +2085,8 @@ pub const DB = struct {
         return try lifecycle_impl.reassignIdentityNamespaceForInternalTransition(self, namespace);
     }
 
-    fn dbDocIdentityStats(raw: doc_identity.Stats, namespace: doc_identity.Namespace) types.DocIdentityStats {
-        return lifecycle_impl.dbDocIdentityStats(raw, namespace);
-    }
-
-    fn recordResolvedDocSet(self: *DB, set: *const doc_set.ResolvedDocSet, missing_ordinal_coverage: bool) void {
-        internal_impl.recordResolvedDocSet(self, set, missing_ordinal_coverage);
-    }
-
-    fn recordUnsupportedDocSetFilterShape(self: *DB) void {
-        internal_impl.recordUnsupportedDocSetFilterShape(self);
-    }
-
     pub fn currentIdentityReadGenerationForRequest(self: *DB, requested: ?u64) !u64 {
         return try lifecycle_impl.currentIdentityReadGenerationForRequest(self, requested);
-    }
-
-    fn snapshotDocSetPlanningStats(self: *DB) types.DocSetPlanningStats {
-        return lifecycle_impl.snapshotDocSetPlanningStats(self);
-    }
-
-    fn recordForeignKeyIntegrityReport(
-        self: *DB,
-        mode: relational_store_mod.ForeignKeyIntegrityMode,
-        report: relational_store_mod.ForeignKeyIntegrityReport,
-    ) void {
-        relational_integrity_impl.recordForeignKeyIntegrityReport(self, mode, report);
     }
 
     pub fn relationalIntegrityRecordForeignKeyIntegrityReport(
@@ -2224,7 +2094,7 @@ pub const DB = struct {
         mode: relational_store_mod.ForeignKeyIntegrityMode,
         report: relational_store_mod.ForeignKeyIntegrityReport,
     ) void {
-        self.recordForeignKeyIntegrityReport(mode, report);
+        relational_integrity_impl.recordForeignKeyIntegrityReport(self, mode, report);
     }
 
     pub fn relationalIntegrityRecordForeignKeyIntegrityProgressLocked(
@@ -2236,7 +2106,7 @@ pub const DB = struct {
         upper_doc_key: []const u8,
         report: relational_store_mod.ForeignKeyIntegrityReport,
     ) !void {
-        return try self.recordForeignKeyIntegrityProgressLocked(alloc, mode, constraint_name, lower_doc_key, upper_doc_key, report);
+        return try relational_integrity_impl.recordForeignKeyIntegrityProgressLocked(self, alloc, mode, constraint_name, lower_doc_key, upper_doc_key, report);
     }
 
     pub const ForeignKeyIntegrityProgressRecord = relational_integrity_impl.ForeignKeyIntegrityProgressRecord;
@@ -2368,42 +2238,6 @@ pub const DB = struct {
         upper_doc_key: []const u8,
     ) !?UniqueConstraintIntegrityProgressRecord {
         return try relational_integrity_impl.loadUniqueConstraintIntegrityProgressRecord(self, mode, lower_doc_key, upper_doc_key);
-    }
-
-    fn recordForeignKeyIntegrityProgressLocked(
-        self: *DB,
-        alloc: Allocator,
-        mode: relational_store_mod.ForeignKeyIntegrityMode,
-        constraint_name: ?[]const u8,
-        lower_doc_key: []const u8,
-        upper_doc_key: []const u8,
-        report: relational_store_mod.ForeignKeyIntegrityReport,
-    ) !void {
-        return try relational_integrity_impl.recordForeignKeyIntegrityProgressLocked(self, alloc, mode, constraint_name, lower_doc_key, upper_doc_key, report);
-    }
-
-    fn recordForeignKeyIntegrityProgressForPhaseLocked(
-        self: *DB,
-        alloc: Allocator,
-        phase: []const u8,
-        mode: relational_store_mod.ForeignKeyIntegrityMode,
-        constraint_name: ?[]const u8,
-        lower_doc_key: []const u8,
-        upper_doc_key: []const u8,
-        report: relational_store_mod.ForeignKeyIntegrityReport,
-    ) !void {
-        return try relational_integrity_impl.recordForeignKeyIntegrityProgressForPhaseLocked(self, alloc, phase, mode, constraint_name, lower_doc_key, upper_doc_key, report);
-    }
-
-    fn recordUniqueConstraintIntegrityProgressLocked(
-        self: *DB,
-        alloc: Allocator,
-        mode: relational_store_mod.ForeignKeyIntegrityMode,
-        lower_doc_key: []const u8,
-        upper_doc_key: []const u8,
-        report: relational_store_mod.UniqueConstraintIntegrityReport,
-    ) !void {
-        return try relational_integrity_impl.recordUniqueConstraintIntegrityProgressLocked(self, alloc, mode, lower_doc_key, upper_doc_key, report);
     }
 
     pub fn claimForeignKeyIntegrityWorkUnit(
@@ -4464,18 +4298,6 @@ pub const DB = struct {
 
     const relationalColumnForField = relational_rows.columnForField;
 
-    fn allDocsVisibleAtGeneration(self: *DB, generation: ?u64) !bool {
-        return try internal_impl.allDocsVisibleAtGeneration(self, generation);
-    }
-
-    fn allDocsVisibleSummaryFast(self: *DB, generation: ?u64) !bool {
-        return try internal_impl.allDocsVisibleSummaryFast(self, generation);
-    }
-
-    fn allDocsVisibleSummaryFastMaybe(self: *DB, generation: ?u64) !?bool {
-        return try internal_impl.allDocsVisibleSummaryFastMaybe(self, generation);
-    }
-
     pub fn searchDenseProfiled(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
         return try search_runtime_impl.searchDenseProfiled(self, alloc, req, dense);
     }
@@ -4492,40 +4314,13 @@ pub const DB = struct {
         return search_runtime_impl.canUsePublishedDenseSearch(self, req);
     }
 
-    fn lookupLiveDocOrdinalsNoLock(
-        self: *DB,
-        alloc: Allocator,
-        doc_ids: []const []const u8,
-        generation: ?u64,
-    ) ![]?doc_set.DocOrdinal {
-        return try internal_impl.lookupLiveDocOrdinalsNoLock(self, alloc, doc_ids, generation);
-    }
-
-    fn lookupLiveDocOrdinalNoLock(
-        self: *DB,
-        alloc: Allocator,
-        doc_id: []const u8,
-        generation: ?u64,
-    ) !?doc_set.DocOrdinal {
-        return try internal_impl.lookupLiveDocOrdinalNoLock(self, alloc, doc_id, generation);
-    }
-
     pub fn lookupLiveDocOrdinalForInternalRead(
         self: *DB,
         alloc: Allocator,
         doc_id: []const u8,
         generation: ?u64,
     ) !?doc_set.DocOrdinal {
-        return try self.lookupLiveDocOrdinalNoLock(alloc, doc_id, generation);
-    }
-
-    fn annotateSearchHitOrdinalsNoLock(
-        self: *DB,
-        alloc: Allocator,
-        req: types.SearchRequest,
-        hits: []types.SearchHit,
-    ) !void {
-        try internal_impl.annotateSearchHitOrdinalsNoLock(self, alloc, req, hits);
+        return try internal_impl.lookupLiveDocOrdinalNoLock(self, alloc, doc_id, generation);
     }
 
     fn encodeBaseDocumentLookupKeyAlloc(self: *DB, alloc: Allocator, key: []const u8) ![]u8 {
@@ -5082,7 +4877,7 @@ test "db match_all consumes resolved ordinal filter" {
         },
     });
 
-    var include = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:b"});
+    var include = try DB.internal_impl.resolveDocSetForIdsAlloc(&db, alloc, &.{"doc:b"});
     errdefer include.deinit(alloc);
     switch (include) {
         .ordinals => |ordinals| {
@@ -6949,7 +6744,7 @@ test "db batch treats reserved namespace bytes as user document ids" {
     try std.testing.expect(raw != null);
     try std.testing.expect(std.mem.indexOf(u8, raw.?, "\"binary\"") != null);
 
-    var resolved = try db.resolveDocSetForIdsAlloc(alloc, &.{raw_id});
+    var resolved = try DB.internal_impl.resolveDocSetForIdsAlloc(&db, alloc, &.{raw_id});
     defer resolved.deinit(alloc);
     switch (resolved) {
         .ordinals => |ordinals| {
@@ -6959,7 +6754,7 @@ test "db batch treats reserved namespace bytes as user document ids" {
         else => return error.ExpectedOrdinalDocSet,
     }
 
-    const resolved_doc_ids = (try db.docIdsForResolvedDocSetAlloc(alloc, &resolved)).?;
+    const resolved_doc_ids = (try DB.internal_impl.docIdsForResolvedDocSetAlloc(&db, alloc, &resolved)).?;
     defer {
         for (resolved_doc_ids) |doc_id| alloc.free(@constCast(doc_id));
         alloc.free(resolved_doc_ids);
@@ -7014,7 +6809,7 @@ test "db batch and scan round trip adversarial document ids" {
         try std.testing.expectEqualStrings(expected, raw);
     }
 
-    var resolved = try db.resolveDocSetForIdsAlloc(alloc, raw_ids[0..]);
+    var resolved = try DB.internal_impl.resolveDocSetForIdsAlloc(&db, alloc, raw_ids[0..]);
     defer resolved.deinit(alloc);
     switch (resolved) {
         .ordinals => |ordinals| {
@@ -7026,7 +6821,7 @@ test "db batch and scan round trip adversarial document ids" {
         else => return error.ExpectedOrdinalDocSet,
     }
 
-    const resolved_doc_ids = (try db.docIdsForResolvedDocSetAlloc(alloc, &resolved)).?;
+    const resolved_doc_ids = (try DB.internal_impl.docIdsForResolvedDocSetAlloc(&db, alloc, &resolved)).?;
     defer {
         for (resolved_doc_ids) |doc_id| alloc.free(@constCast(doc_id));
         alloc.free(resolved_doc_ids);
@@ -7121,28 +6916,28 @@ test "db resolved doc-set projection honors identity read generation" {
     var resolved = try doc_set.fromOrdinalsAlloc(alloc, &.{ 1, 2 });
     defer resolved.deinit(alloc);
 
-    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &resolved, 1));
-    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &resolved, 2));
-    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &resolved, 3));
-    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &resolved, null));
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &resolved, 1));
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &resolved, 2));
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &resolved, 3));
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &resolved, null));
 
     var created = try doc_set.fromOrdinalsAlloc(alloc, &.{1});
     defer created.deinit(alloc);
-    const visible_doc_ids = (try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &created, 1)) orelse return error.TestUnexpectedResult;
+    const visible_doc_ids = (try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &created, 1)) orelse return error.TestUnexpectedResult;
     defer {
         for (visible_doc_ids) |doc_id| alloc.free(@constCast(doc_id));
         alloc.free(visible_doc_ids);
     }
     try std.testing.expectEqual(@as(usize, 1), visible_doc_ids.len);
     try std.testing.expectEqualStrings("doc:a", visible_doc_ids[0]);
-    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &created, 2));
-    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &created, null));
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &created, 2));
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &created, null));
 
     var future = try doc_set.fromOrdinalsAlloc(alloc, &.{2});
     defer future.deinit(alloc);
-    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &future, 1));
-    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &future, 2));
-    const future_doc_ids = (try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &future, 3)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &future, 1));
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &future, 2));
+    const future_doc_ids = (try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &future, 3)) orelse return error.TestUnexpectedResult;
     defer {
         for (future_doc_ids) |doc_id| alloc.free(@constCast(doc_id));
         alloc.free(future_doc_ids);
@@ -7150,7 +6945,7 @@ test "db resolved doc-set projection honors identity read generation" {
     try std.testing.expectEqual(@as(usize, 1), future_doc_ids.len);
     try std.testing.expectEqualStrings("doc:b", future_doc_ids[0]);
 
-    const current_doc_ids = (try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &future, null)) orelse return error.TestUnexpectedResult;
+    const current_doc_ids = (try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &future, null)) orelse return error.TestUnexpectedResult;
     defer {
         for (current_doc_ids) |doc_id| alloc.free(@constCast(doc_id));
         alloc.free(current_doc_ids);
@@ -7545,9 +7340,9 @@ test "db stats expose document identity coverage and tombstones" {
         },
     });
 
-    var resolved_existing = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:a"});
+    var resolved_existing = try DB.internal_impl.resolveDocSetForIdsAlloc(&db, alloc, &.{"doc:a"});
     defer resolved_existing.deinit(alloc);
-    var resolved_missing = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:missing"});
+    var resolved_missing = try DB.internal_impl.resolveDocSetForIdsAlloc(&db, alloc, &.{"doc:missing"});
     defer resolved_missing.deinit(alloc);
 
     const fast = try db.stats(alloc);
@@ -7880,13 +7675,13 @@ test "db caches identity visibility summary after local writes" {
         .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
     });
     try std.testing.expect(db.identity_visibility_summary_cache != null);
-    try std.testing.expect(try db.allDocsVisibleAtGeneration(db.core.nextDerivedSequence()));
+    try std.testing.expect(try DB.internal_impl.allDocsVisibleAtGeneration(&db, db.core.nextDerivedSequence()));
 
     try db.batch(.{
         .deletes = &.{"doc:a"},
     });
     try std.testing.expect(db.identity_visibility_summary_cache != null);
-    try std.testing.expect(!(try db.allDocsVisibleAtGeneration(db.core.nextDerivedSequence())));
+    try std.testing.expect(!(try DB.internal_impl.allDocsVisibleAtGeneration(&db, db.core.nextDerivedSequence())));
 }
 
 test "db lsm primary compaction preserves doc identity ordinals" {
@@ -8067,7 +7862,7 @@ test "db explicit doc-id filter resolution honors identity generation" {
     );
     try db.core.store.putBatchWithReplay(null, delete_identity.items, &.{}, null);
 
-    var visible_at_create = try db.resolvedDocFilterForIdsAlloc(true, &.{"doc:a"}, &.{}, 1);
+    var visible_at_create = try DB.internal_impl.resolvedDocFilterForIdsAlloc(&db, true, &.{"doc:a"}, &.{}, 1);
     defer visible_at_create.deinit(alloc);
     switch (visible_at_create.include) {
         .ordinals => |ordinals| {
@@ -8077,7 +7872,7 @@ test "db explicit doc-id filter resolution honors identity generation" {
         else => return error.ExpectedOrdinalDocSet,
     }
 
-    var hidden_at_delete = try db.resolvedDocFilterForIdsAlloc(true, &.{"doc:a"}, &.{}, 2);
+    var hidden_at_delete = try DB.internal_impl.resolvedDocFilterForIdsAlloc(&db, true, &.{"doc:a"}, &.{}, 2);
     defer hidden_at_delete.deinit(alloc);
     try std.testing.expectEqual(@as(?usize, 0), hidden_at_delete.include.estimatedCardinality());
 }
@@ -8114,7 +7909,7 @@ test "db doc set planning stats record ordinal bitmap promotion" {
 
     try db.batch(.{ .writes = writes.items });
 
-    var resolved = try db.resolveDocSetForIdsAlloc(alloc, doc_ids.items);
+    var resolved = try DB.internal_impl.resolveDocSetForIdsAlloc(&db, alloc, doc_ids.items);
     defer resolved.deinit(alloc);
     switch (resolved) {
         .ordinal_bitmap => |*bitmap| try std.testing.expectEqual(@as(usize, doc_set.bitmap_min_cardinality), bitmap.cardinality()),
@@ -8156,7 +7951,7 @@ test "db sparse index uses identity ordinals as physical doc nums for primary do
     try std.testing.expectEqual(@as(?u32, 1), try sparse_entry.index.debugDocNumForDocId("doc:a"));
     try std.testing.expectEqual(@as(?u32, 2), try sparse_entry.index.debugDocNumForDocId("doc:b"));
 
-    var include = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:b"});
+    var include = try DB.internal_impl.resolveDocSetForIdsAlloc(&db, alloc, &.{"doc:b"});
     errdefer include.deinit(alloc);
     const ordinal = switch (include) {
         .ordinals => |ordinals| blk: {
@@ -8266,7 +8061,7 @@ test "db dense index stores stable vector ids with ordinal filter mappings" {
         .sync_level = .full_index,
     });
 
-    var include = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:b"});
+    var include = try DB.internal_impl.resolveDocSetForIdsAlloc(&db, alloc, &.{"doc:b"});
     errdefer include.deinit(alloc);
     const ordinal = switch (include) {
         .ordinals => |ordinals| blk: {
@@ -10750,7 +10545,7 @@ test "db refuses resolver removal while resolution or promotion replay is pendin
     // advancing promotion replay. Removing the resolver here would otherwise
     // erase the catalog signal that older retention logic used.
     try std.testing.expectError(error.ResolverReplayPending, db.removeResolver("kg_pending_remove"));
-    try std.testing.expect(db.promotionStageStats().catch_up_required);
+    try std.testing.expect(DB.lifecycle_impl.promotionStageStats(&db).catch_up_required);
 }
 
 /// Thread-safe capturing entity sink for the promotion integration test.
@@ -30419,7 +30214,7 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
             std.mem.eql(u8, chunk_result.hits[0].id, chunk_two),
     );
 
-    var include = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:a"});
+    var include = try DB.internal_impl.resolveDocSetForIdsAlloc(&db, alloc, &.{"doc:a"});
     errdefer include.deinit(alloc);
     const ordinal = switch (include) {
         .ordinals => |ordinals| blk: {
@@ -37657,7 +37452,7 @@ test "db text compaction preserves ordinal filters across reopen" {
             });
         }
 
-        var include = try db.resolveDocSetForIdsAlloc(alloc, &.{"doc:8"});
+        var include = try DB.internal_impl.resolveDocSetForIdsAlloc(&db, alloc, &.{"doc:8"});
         errdefer include.deinit(alloc);
         const resolved_ordinal = switch (include) {
             .ordinals => |ordinals| blk: {
@@ -37700,7 +37495,7 @@ test "db text compaction preserves ordinal filters across reopen" {
         });
         defer reopened.close();
 
-        var include = try reopened.resolveDocSetForIdsAlloc(alloc, &.{"doc:8"});
+        var include = try DB.internal_impl.resolveDocSetForIdsAlloc(&reopened, alloc, &.{"doc:8"});
         errdefer include.deinit(alloc);
         const resolved_ordinal = switch (include) {
             .ordinals => |ordinals| blk: {
@@ -44485,7 +44280,7 @@ test "db transaction-created identity rows remain visible after reopen" {
         try std.testing.expectEqualStrings("{\"title\":\"txn\"}", raw);
 
         const current = try db.searchRequestAtCurrentIdentityGeneration(.{});
-        var resolved = try db.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, &.{"doc:txn_reopen"}, current.identity_read_generation);
+        var resolved = try DB.internal_impl.resolveDocSetForIdsNoLockAtGenerationAlloc(&db, alloc, &.{"doc:txn_reopen"}, current.identity_read_generation);
         defer resolved.deinit(alloc);
         try std.testing.expect(resolved.containsOrdinal(1));
 
@@ -48717,7 +48512,7 @@ test "db dense artifact rebuild write cleanup tolerates artifact-backed empty ve
         .vector = &.{},
     });
 
-    DB.freeDenseArtifactRebuildWrites(alloc, &writes);
+    DB.derived_async_impl.freeDenseArtifactRebuildWrites(alloc, &writes);
     try std.testing.expectEqual(@as(usize, 0), writes.items.len);
 }
 
@@ -49230,7 +49025,7 @@ test "relational column filter pushdown declines stale identity generations" {
         .term = .{ .field = "status", .term = "archived" },
     }, current_generation)) orelse return error.TestExpectedEqual;
     defer current.deinit(alloc);
-    const ids = (try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &current, current_generation)) orelse return error.TestExpectedEqual;
+    const ids = (try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &current, current_generation)) orelse return error.TestExpectedEqual;
     defer {
         for (ids) |id| alloc.free(@constCast(id));
         alloc.free(ids);
@@ -49376,7 +49171,7 @@ test "relational rows query uses indexed candidates and authoritative base rows"
         .in_predicates = in_predicates[0..],
     }, null)) orelse return error.TestExpectedEqual;
     defer in_set.deinit(alloc);
-    const in_ids = (try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &in_set, null)) orelse return error.TestExpectedEqual;
+    const in_ids = (try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &in_set, null)) orelse return error.TestExpectedEqual;
     defer {
         for (in_ids) |id| alloc.free(@constCast(id));
         alloc.free(in_ids);
@@ -55777,7 +55572,7 @@ test "relational indexed array_any filters use array element indexes" {
         .array_any = .{ .field = "tags", .value = parsed_hot.value },
     }, null)) orelse return error.TestExpectedEqual;
     defer direct_resolved.deinit(alloc);
-    const direct_ids = (try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &direct_resolved, null)) orelse return error.TestExpectedEqual;
+    const direct_ids = (try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &direct_resolved, null)) orelse return error.TestExpectedEqual;
     defer {
         for (direct_ids) |id| alloc.free(@constCast(id));
         alloc.free(direct_ids);
@@ -55867,7 +55662,7 @@ test "relational indexed json_contains filters use json value indexes" {
         .json_contains = .{ .field = "attrs", .value = wanted.value },
     }, null)) orelse return error.TestExpectedEqual;
     defer direct_resolved.deinit(alloc);
-    const direct_ids = (try db.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &direct_resolved, null)) orelse return error.TestExpectedEqual;
+    const direct_ids = (try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &direct_resolved, null)) orelse return error.TestExpectedEqual;
     defer {
         for (direct_ids) |id| alloc.free(@constCast(id));
         alloc.free(direct_ids);

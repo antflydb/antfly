@@ -631,8 +631,8 @@ variants for:
   retained as a subset rather than as standalone graph statements
 - unsupported statement, including generated AST payloads for seed `ANALYZE`,
   `COPY`, `VACUUM`, `REINDEX`, `CLUSTER`, `COMMENT`, `GRANT`, `REVOKE`,
-  `LISTEN`, `NOTIFY`, `LOCK`, `CLOSE`, `FETCH`, `MOVE`, `SAVEPOINT`, and
-  `RELEASE`, plus bare, simple, optioned, and
+  `LISTEN`, `NOTIFY`, `LOCK`, `CLOSE`, `DECLARE`, `FETCH`, `MOVE`,
+  `SAVEPOINT`, and `RELEASE`, plus bare, simple, optioned, and
   `EXPLAIN ANALYZE` forms with command spans, subject ranges where present,
   and stable unsupported reason metadata
 
