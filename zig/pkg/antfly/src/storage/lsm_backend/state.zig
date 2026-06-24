@@ -71,6 +71,17 @@ pub const State = struct {
         return out;
     }
 
+    pub fn cloneArena(self: *const State, allocator: Allocator) !State {
+        var out: State = .{};
+        errdefer out.deinit(allocator);
+        try out.entries.ensureTotalCapacity(allocator, self.entries.items.len);
+        const arena_allocator = try out.ensureArenaAllocator(allocator);
+        for (self.entries.items) |entry| {
+            out.entries.appendAssumeCapacity(try initArenaEntry(arena_allocator, namespaceOf(entry), entry.key, entry.value, entry.tombstone));
+        }
+        return out;
+    }
+
     pub fn ensureArenaAllocator(self: *State, allocator: Allocator) !Allocator {
         if (self.arena_owner == null) {
             const arena = try allocator.create(std.heap.ArenaAllocator);
@@ -209,6 +220,18 @@ pub const ActiveMemTable = struct {
         try out.entries.ensureTotalCapacity(allocator, self.entries.items.len);
         for (self.entries.items) |entry| {
             out.entries.appendAssumeCapacity(try cloneEntry(allocator, entry));
+        }
+        sortStateEntries(&out);
+        return out;
+    }
+
+    pub fn cloneArena(self: *const ActiveMemTable, allocator: Allocator) !State {
+        var out: State = .{};
+        errdefer out.deinit(allocator);
+        try out.entries.ensureTotalCapacity(allocator, self.entries.items.len);
+        const arena_allocator = try out.ensureArenaAllocator(allocator);
+        for (self.entries.items) |entry| {
+            out.entries.appendAssumeCapacity(try initArenaEntry(arena_allocator, namespaceOf(entry), entry.key, entry.value, entry.tombstone));
         }
         sortStateEntries(&out);
         return out;

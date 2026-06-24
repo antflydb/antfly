@@ -5414,6 +5414,12 @@ pub const IndexManager = struct {
         vector_id: u64,
     };
 
+    const PendingDenseVectorDelete = struct {
+        doc_key: []const u8,
+        vector_id: u64,
+        ordinal: ?doc_identity.DocOrdinal = null,
+    };
+
     const DenseOrdinalVectorCacheUpdate = struct {
         ordinal: doc_identity.DocOrdinal,
         vector_id: u64,
@@ -8419,26 +8425,36 @@ pub const IndexManager = struct {
         keys: []const []const u8,
         batch_options: StoreBatchOptions,
     ) !void {
+        var pending_deletes = std.ArrayListUnmanaged(PendingDenseVectorDelete).empty;
+        defer pending_deletes.deinit(self.alloc);
+        {
+            var read_txn = try store.beginReadTxn();
+            defer read_txn.abort();
+            for (keys) |key| {
+                const vector_id = (try self.resolveDenseVectorIdForDeleteTxn(&read_txn, entry.config.name, key)) orelse continue;
+                const ordinal = if (entry.chunk_name == null)
+                    (try doc_identity.lookupOrdinalTxn(self.alloc, &read_txn, key)) orelse
+                        try self.lookupDenseVectorOrdinalTxn(&read_txn, entry.config.name, vector_id)
+                else
+                    null;
+                try pending_deletes.append(self.alloc, .{
+                    .doc_key = key,
+                    .vector_id = vector_id,
+                    .ordinal = ordinal,
+                });
+            }
+        }
+        if (pending_deletes.items.len == 0) return;
+
         var store_batch = try store.beginWriteBatchWithOptions(batch_options);
         errdefer store_batch.abort();
         const store_txn = store_batch.asTxn();
         var vector_ids = std.ArrayListUnmanaged(u64).empty;
         defer vector_ids.deinit(self.alloc);
-        var removed_ordinal_vectors = std.ArrayListUnmanaged(DenseOrdinalVectorCacheUpdate).empty;
-        defer removed_ordinal_vectors.deinit(self.alloc);
 
-        for (keys) |key| {
-            const vector_id = (try self.resolveDenseVectorIdForDeleteTxn(store_txn, entry.config.name, key)) orelse continue;
-            try vector_ids.append(self.alloc, vector_id);
-            if (entry.chunk_name == null) {
-                if (try doc_identity.lookupOrdinalTxn(self.alloc, store_txn, key)) |ordinal| {
-                    try removed_ordinal_vectors.append(self.alloc, .{
-                        .ordinal = ordinal,
-                        .vector_id = vector_id,
-                    });
-                }
-            }
-            try self.clearDenseVectorMappingTxn(store_txn, entry.config.name, key, vector_id);
+        for (pending_deletes.items) |pending| {
+            try vector_ids.append(self.alloc, pending.vector_id);
+            try self.clearDenseVectorMappingTxnWithOrdinal(store_txn, entry.config.name, pending.doc_key, pending.vector_id, pending.ordinal);
         }
 
         entry.index.batchApply(&.{}, vector_ids.items) catch |err| switch (err) {
@@ -8446,9 +8462,11 @@ pub const IndexManager = struct {
             else => return err,
         };
         try store_batch.commit();
-        for (removed_ordinal_vectors.items) |removed| {
-            _ = entry.ordinal_vector_ids.remove(removed.ordinal);
-            _ = entry.vector_ordinals.remove(removed.vector_id);
+        for (pending_deletes.items) |pending| {
+            if (pending.ordinal) |ordinal| {
+                _ = entry.ordinal_vector_ids.remove(ordinal);
+                _ = entry.vector_ordinals.remove(pending.vector_id);
+            }
         }
     }
 
@@ -11043,7 +11061,7 @@ pub const IndexManager = struct {
         parent_doc_key: ?[]const u8,
         vector_id: u64,
     ) !void {
-        var mutable_txn = txn;
+        const mutable_txn = txn;
         const doc_map_key = try denseDocMappingKey(self.alloc, index_name, doc_key);
         defer self.alloc.free(doc_map_key);
         const vector_map_key = try denseVectorIdMappingKey(self.alloc, index_name, vector_id);
@@ -11090,6 +11108,20 @@ pub const IndexManager = struct {
     }
 
     fn clearDenseVectorMappingTxn(self: *IndexManager, txn: anytype, index_name: []const u8, doc_key: []const u8, vector_id: u64) !void {
+        const mutable_txn = txn;
+        const ordinal = (try doc_identity.lookupOrdinalTxn(self.alloc, mutable_txn, doc_key)) orelse
+            try self.lookupDenseVectorOrdinalTxn(mutable_txn, index_name, vector_id);
+        try self.clearDenseVectorMappingTxnWithOrdinal(mutable_txn, index_name, doc_key, vector_id, ordinal);
+    }
+
+    fn clearDenseVectorMappingTxnWithOrdinal(
+        self: *IndexManager,
+        txn: anytype,
+        index_name: []const u8,
+        doc_key: []const u8,
+        vector_id: u64,
+        ordinal: ?doc_identity.DocOrdinal,
+    ) !void {
         var mutable_txn = txn;
         const doc_map_key = try denseDocMappingKey(self.alloc, index_name, doc_key);
         defer self.alloc.free(doc_map_key);
@@ -11099,8 +11131,6 @@ pub const IndexManager = struct {
         defer self.alloc.free(legacy_doc_map_key);
         const legacy_vector_map_key = try legacyDenseVectorIdMappingKey(self.alloc, index_name, vector_id);
         defer self.alloc.free(legacy_vector_map_key);
-        const ordinal = (try doc_identity.lookupOrdinalTxn(self.alloc, mutable_txn, doc_key)) orelse
-            try self.lookupDenseVectorOrdinalTxn(mutable_txn, index_name, vector_id);
 
         mutable_txn.delete(doc_map_key) catch |err| switch (err) {
             error.NotFound => {},

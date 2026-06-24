@@ -1593,7 +1593,7 @@ pub const Backend = struct {
     }
 
     fn cloneMutableStateWithReason(self: *Backend, reason: MutableSnapshotReason) !State {
-        var snapshot = try self.mutable.clone(self.allocator);
+        var snapshot = try self.mutable.cloneArena(self.allocator);
         errdefer snapshot.deinit(self.allocator);
         const snapshot_bytes = estimateStateBytes(&snapshot);
         self.mutable_snapshot_clone_calls +|= 1;
