@@ -17,6 +17,7 @@ const std = @import("std");
 const binder = @import("binder.zig");
 const classifier = @import("classifier.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const generated_parser = @import("generated_parser.zig");
 const lower_expr = @import("lower_expr.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
@@ -164,6 +165,32 @@ pub const ReadPlanLoweringContext = struct {
         return try self.callbacks.lower_set_operation_optional_source_schema(self.alloc, self.parsed_sql.?, self.schema, self.source_schema, self.params, self.function_bindings);
     }
 };
+
+pub fn lowerReadPlanFromGeneratedReadAstAlloc(
+    context: *ReadPlanLoweringContext,
+    parsed_sql: *const tokenized.ParsedSql,
+    read_ast: generated_parser.GeneratedSqlReadAst,
+) !plan.LoweredReadPlan {
+    const read_kind = parsed_sql.readStatementKind() orelse return error.UnsupportedSqlShape;
+    if (!generatedReadAstMatchesReadKind(read_ast.kind, read_kind)) return error.UnsupportedSqlShape;
+    return try context.lowerParsed(parsed_sql);
+}
+
+fn generatedReadAstMatchesReadKind(
+    generated_kind: generated_parser.GeneratedSqlReadKind,
+    read_kind: classifier.SqlReadStatementKind,
+) bool {
+    return switch (generated_kind) {
+        .query => read_kind == .query,
+        .aggregate => read_kind == .aggregate,
+        .join => read_kind == .join,
+        .lateral => read_kind == .lateral,
+        .cte => switch (read_kind) {
+            .query, .aggregate, .join, .lateral, .window => true,
+            .set_operation, .recursive_cte => false,
+        },
+    };
+}
 
 pub const CatalogReadPlanLoweringCallbacks = struct {
     lower_document_target: *const fn (
@@ -365,6 +392,38 @@ fn lowerReadPlanForLoweringContextTestAlloc(
     var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
     return try lowerReadPlanWithOptionalSourceSchemaParsedSqlForLoweringContextTestAlloc(alloc, &parsed_sql, schema, null, params, .{});
+}
+
+fn lowerGeneratedReadPlanForLoweringContextTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+) !plan.LoweredReadPlan {
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    const generated_raw = parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    const read_ast = switch (generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    var context = ReadPlanLoweringContext{
+        .alloc = alloc,
+        .schema = schema,
+        .source_schema = null,
+        .params = params,
+        .function_bindings = .{},
+        .callbacks = .{
+            .lower_lateral_with_schemas = lowerLateralWithSchemasParsedSqlForLoweringContextTestAlloc,
+            .lower_window = lowerWindowParsedSqlForLoweringContextTestAlloc,
+            .lower_aggregate_plan = lowerAggregateParsedSqlForLoweringContextTestAlloc,
+            .lower_recursive_cte_plan = unsupportedRecursiveCteParsedSqlForLoweringContextTestAlloc,
+            .lower_join_with_schemas = lowerJoinWithSchemasParsedSqlForLoweringContextTestAlloc,
+            .lower_query_plan = lowerQueryParsedSqlForLoweringContextTestAlloc,
+            .lower_set_operation_optional_source_schema = unsupportedSetOperationParsedSqlForLoweringContextTestAlloc,
+        },
+    };
+    return try lowerReadPlanFromGeneratedReadAstAlloc(&context, &parsed_sql, read_ast);
 }
 
 fn lowerQueryParsedSqlForLoweringContextTestAlloc(
@@ -576,6 +635,31 @@ fn unsupportedSetOperationParsedSqlForLoweringContextTestAlloc(
     _: lower_expr.SqlFunctionBindings,
 ) anyerror!plan.LoweredSetOperationPlan {
     return error.UnsupportedSqlShape;
+}
+
+test "sql adapter lowering context lowers generated read AST through typed read plans" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"id":{"type":"keyword"},"organization_id":{"type":"keyword"},"customer_id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"name":{"type":"keyword"}},"required":["kind","tenant","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","tenant","id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLoweringContextTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    const cases = [_][]const u8{
+        "SELECT id, status FROM usage_records WHERE kind = 'order' ORDER BY created_at DESC LIMIT 5",
+        "SELECT status, SUM(amount) AS total FROM usage_records WHERE kind = 'order' GROUP BY status LIMIT 5",
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant = c.tenant AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' LIMIT 5",
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' ORDER BY 2 DESC LIMIT 1) AS latest ON true WHERE org.kind = 'organization' LIMIT 10",
+        "WITH open_usage AS (SELECT tenant, amount, status FROM usage_records WHERE status = 'open') SELECT tenant, SUM(amount) AS total FROM open_usage GROUP BY tenant LIMIT 5",
+    };
+
+    for (cases) |sql| {
+        var legacy = try lowerReadPlanForLoweringContextTestAlloc(alloc, sql, schema, &.{});
+        defer legacy.deinit(alloc);
+        var generated = try lowerGeneratedReadPlanForLoweringContextTestAlloc(alloc, sql, schema, &.{});
+        defer generated.deinit(alloc);
+        try std.testing.expectEqual(std.meta.activeTag(legacy), std.meta.activeTag(generated));
+    }
 }
 
 test "sql adapter lowering context classifies read sql into typed plan families" {

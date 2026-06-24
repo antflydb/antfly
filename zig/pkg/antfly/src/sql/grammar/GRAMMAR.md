@@ -59,10 +59,14 @@ generated AST-to-plan wrapper that fails closed if the generated DML family does
 not match the existing write classifier before delegating to the current typed
 DML lowerer. Unsupported DML still falls back, and deeper DML cutover still
 requires replacing token-based command-body parsing with generated AST payloads
-for each write shape. Representative read queries
-now have generated-parser corpus coverage and retained generated raw and AST
-nodes for covered read statements, while unsupported read shapes still fall back
-until read-plan parity is proven. The generated parser now also treats seed
+for each write shape. Representative read queries now have generated-parser
+corpus coverage, retained generated raw and AST nodes for covered read
+statements, and an initial generated AST-to-plan wrapper that fails closed if
+the generated read family is incompatible with the existing read classifier
+before delegating to the current typed read lowerer. Unsupported read shapes
+still fall back, and deeper read cutover still requires generated query-body
+AST payloads for projections, predicates, sources, joins, CTE bodies,
+aggregates, windows, ordering, and limits. The generated parser now also treats seed
 graph DDL as a distinct graph statement family and `ParsedSql` retains those
 generated raw and AST nodes, but graph execution still routes through the
 existing DDL variant until graph-specific lowering parity exists. The generated
@@ -140,11 +144,13 @@ Suggested migration order:
    ASTs and broader unsupported-shape diagnostics.
 4. Read queries: projections, predicates, joins, CTEs, aggregates, windows,
    set operations, lateral, ordering, limits, and document-table sources.
-   Initial generated-parser coverage now retains raw read nodes for
+   Initial generated-parser coverage now retains raw and AST read nodes for
    representative projection/filter/order/limit, grouped, join, lateral, and
-   non-recursive CTE query shapes; switching reads from fallback to required
-   generated parsing still requires broader PostgreSQL-compatible grammar
-   coverage and plan parity.
+   non-recursive CTE query shapes; generated read ASTs now have a validated
+   wrapper into the current typed read lowerer for representative covered read
+   plans. Switching reads from fallback to required generated parsing still
+   requires broader PostgreSQL-compatible grammar coverage, generated query-body
+   ASTs, and unsupported-shape diagnostics.
 5. Advanced DML: `INSERT ... SELECT`, `UPDATE ... FROM`, `DELETE ... USING`,
    `TRUNCATE`, and `MERGE`.
 6. Antfly extensions: graph traversal DSL, graph metric query surfaces,
@@ -242,7 +248,8 @@ variants for:
   catalog plans and seed `CREATE TABLE` / `CREATE INDEX` plans
 - DML statement, including a generated AST payload for command spans and an
   initial AST-to-plan wrapper for generated-covered write statements
-- read statement, including a generated AST payload for command spans
+- read statement, including a generated AST payload for command spans and an
+  initial AST-to-plan wrapper for generated-covered read statements
 - graph statement, including a generated AST payload for command spans
 
 Later statement-family cutovers should add closed variants for:
@@ -281,7 +288,10 @@ Generated grammar work needs evidence at multiple levels:
   extension catalog plans plus seed `CREATE TABLE` / `CREATE INDEX` plans have
   generated AST-to-plan parity tests for their generated-covered forms. Simple
   DML has initial generated AST-to-plan parity through a generated-family
-  validation wrapper over representative write plans.
+  validation wrapper over representative write plans. Read plans have initial
+  generated AST-to-plan parity through a generated-family validation wrapper
+  over representative query, aggregate, join, lateral, and non-recursive CTE
+  plans.
 - SQL/API parity tests showing SQL and native API requests reach the same
   service contracts.
 - Fuzz or mutation tests for scanner/parser crash resistance and bounded error
