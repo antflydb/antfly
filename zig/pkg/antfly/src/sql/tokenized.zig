@@ -902,6 +902,7 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
         .{ .sql = "SELECT id FROM usage_records WHERE lower(status) = 'open'", .generated = .query, .read = .query },
         .{ .sql = "SELECT concat_ws(',', status), id FROM usage_records ORDER BY status, id", .generated = .query, .read = .query },
         .{ .sql = "SELECT customer, COUNT(*) FILTER (WHERE status = 'open') AS open_count FROM usage_records GROUP BY customer", .generated = .aggregate, .read = .aggregate },
+        .{ .sql = "SELECT customer, percentile_cont(0.5) WITHIN GROUP (ORDER BY amount DESC NULLS LAST) AS median_amount FROM usage_records GROUP BY customer", .generated = .aggregate, .read = .aggregate },
         .{ .sql = "SELECT id, row_number() OVER (PARTITION BY tenant, account ORDER BY id) AS rn FROM usage_records ORDER BY id, tenant", .generated = .window, .read = .window },
         .{ .sql = "SELECT DISTINCT status FROM usage_records ORDER BY status", .generated = .aggregate, .read = .aggregate },
         .{ .sql = "SELECT DISTINCT ON (organization_id) organization_id, id FROM usage_records ORDER BY organization_id ASC, created_at DESC", .generated = .query, .read = .query },
@@ -1297,6 +1298,19 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                     try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.comparison, read_ast.projection_items.expressions[1].filter_expression_kind.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.comparison, read_ast.projection_items.expressions[1].filter_expression.?.kind);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 20, .end = 21 }, read_ast.group_tokens.?);
+                } else if (std.mem.eql(u8, case.sql, "SELECT customer, percentile_cont(0.5) WITHIN GROUP (ORDER BY amount DESC NULLS LAST) AS median_amount FROM usage_records GROUP BY customer")) {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = 19 }, read_ast.projection_tokens.?);
+                    try std.testing.expectEqual(@as(usize, 2), read_ast.projection_items.count);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 19 }, read_ast.projection_items.items[1]);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 17 }, read_ast.projection_items.expression_items[1]);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.function_call, read_ast.projection_items.expressions[1].kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 17 }, read_ast.projection_items.expressions[1].within_group_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 12, .end = 16 }, read_ast.projection_items.expressions[1].within_group_order_tokens.?);
+                    try std.testing.expectEqual(@as(usize, 1), read_ast.projection_items.expressions[1].within_group_order_items.count);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 12, .end = 16 }, read_ast.projection_items.expressions[1].within_group_order_items.items[0]);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlOrderDirection.desc, read_ast.projection_items.expressions[1].within_group_order_items.directions[0].?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlNullsOrder.last, read_ast.projection_items.expressions[1].within_group_order_items.nulls_orders[0].?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 23, .end = 24 }, read_ast.group_tokens.?);
                 } else if (std.mem.eql(u8, case.sql, "SELECT id, row_number() OVER (PARTITION BY tenant, account ORDER BY id) AS rn FROM usage_records ORDER BY id, tenant")) {
                     try std.testing.expectEqual(@as(usize, 2), read_ast.projection_items.count);
                     try std.testing.expectEqual(@as(usize, 2), read_ast.projection_items.items.len);
