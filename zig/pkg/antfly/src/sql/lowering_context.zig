@@ -175,6 +175,16 @@ pub fn lowerReadPlanFromGeneratedReadAstAlloc(
     const read_kind = parsed_sql.readStatementKind() orelse return error.UnsupportedSqlShape;
     if (!generatedReadAstMatchesReadKind(read_ast.kind, read_kind)) return error.UnsupportedSqlShape;
     try validateGeneratedReadAstRanges(parsed_sql.items(), read_ast);
+    if (read_ast.kind == .query) {
+        try validateGeneratedSimpleQueryReadAst(parsed_sql.items(), read_ast);
+        return .{ .query = try context.callbacks.lower_query_plan(
+            context.alloc,
+            parsed_sql,
+            context.schema,
+            context.params,
+            context.function_bindings,
+        ) };
+    }
     return try context.lowerParsed(parsed_sql);
 }
 
@@ -235,6 +245,26 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: gen
     }
 }
 
+fn validateGeneratedSimpleQueryReadAst(tokens: []const tokenized.Token, read_ast: generated_parser.GeneratedSqlReadAst) !void {
+    if (read_ast.cte_tokens != null or
+        read_ast.group_tokens != null or
+        read_ast.having_tokens != null or
+        read_ast.window_tokens != null or
+        read_ast.set_operation_tokens != null)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    const projection = read_ast.projection_tokens orelse return error.UnsupportedSqlShape;
+    const source = read_ast.source_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedReadRangePrecededByKeyword(tokens, projection, .select);
+    try validateGeneratedReadRangePrecededByKeyword(tokens, source, .from);
+    if (read_ast.where_tokens) |range| try validateGeneratedReadRangePrecededByKeyword(tokens, range, .where);
+    if (read_ast.order_tokens) |range| try validateGeneratedReadOrderRange(tokens, range);
+    if (read_ast.limit_tokens) |range| try validateGeneratedReadRangePrecededByKeyword(tokens, range, .limit);
+    if (read_ast.offset_tokens) |range| try validateGeneratedReadRangePrecededByKeyword(tokens, range, .offset);
+    if (read_ast.fetch_tokens) |range| try validateGeneratedReadRangePrecededByKeyword(tokens, range, .fetch);
+}
+
 fn validateGeneratedReadTokenRange(
     tokens: []const tokenized.Token,
     read_ast: generated_parser.GeneratedSqlReadAst,
@@ -257,6 +287,21 @@ fn validateGeneratedReadRangeContainsKeyword(
         if (tokens[index].matchesKeywordTag(keyword)) return;
     }
     return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedReadRangePrecededByKeyword(
+    tokens: []const tokenized.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    keyword: token_mod.TokenKeyword,
+) !void {
+    if (range.start == 0 or !tokens[range.start - 1].matchesKeywordTag(keyword)) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedReadOrderRange(tokens: []const tokenized.Token, range: generated_parser.GeneratedSqlTokenRange) !void {
+    if (range.start < 2) return error.UnsupportedSqlShape;
+    if (!tokens[range.start - 2].matchesKeywordTag(.order) or !tokens[range.start - 1].matchesKeywordTag(.by)) {
+        return error.UnsupportedSqlShape;
+    }
 }
 
 pub const CatalogReadPlanLoweringCallbacks = struct {
@@ -765,6 +810,16 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
             .lower_set_operation_optional_source_schema = unsupportedSetOperationParsedSqlForLoweringContextTestAlloc,
         },
     };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &parsed_sql, read_ast),
+    );
+
+    read_ast = switch (generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    read_ast.source_tokens = null;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &parsed_sql, read_ast),
