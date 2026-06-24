@@ -968,6 +968,8 @@ fn generatedExpressionAstHasMetadata(expression: generated_parser.GeneratedSqlEx
         expression.case_last_when_tokens != null or
         expression.case_first_condition_tokens != null or
         expression.case_first_result_tokens != null or
+        expression.case_condition_items.count != 0 or
+        expression.case_result_items.count != 0 or
         expression.case_else_tokens != null or
         expression.case_else_expression_tokens != null or
         expression.boolean_first_condition_tokens != null or
@@ -1211,6 +1213,19 @@ fn validateGeneratedExpressionAstStructure(expression: generated_parser.Generate
             if (expression.case_branch_count > 1 and expression.case_last_when_tokens == null) return error.UnsupportedSqlShape;
             try requireGeneratedExpressionAstChild(expression.case_first_condition_kind, expression.case_first_condition_tokens, expression.case_first_condition);
             try requireGeneratedExpressionAstChild(expression.case_first_result_kind, expression.case_first_result_tokens, expression.case_first_result);
+            if (expression.case_condition_items.count != expression.case_branch_count or
+                expression.case_result_items.count != expression.case_branch_count)
+            {
+                return error.UnsupportedSqlShape;
+            }
+            if (!std.meta.eql(
+                expression.case_first_condition_tokens.?,
+                expression.case_condition_items.first_tokens orelse return error.UnsupportedSqlShape,
+            )) return error.UnsupportedSqlShape;
+            if (!std.meta.eql(
+                expression.case_first_result_tokens.?,
+                expression.case_result_items.first_tokens orelse return error.UnsupportedSqlShape,
+            )) return error.UnsupportedSqlShape;
             if (expression.case_else_tokens != null and expression.case_else_expression_tokens == null) return error.UnsupportedSqlShape;
             if (expression.case_else_expression_tokens != null and expression.case_else_tokens == null) return error.UnsupportedSqlShape;
             try validateGeneratedExpressionAstOptionalChild(expression.case_else_expression_kind, expression.case_else_expression_tokens, expression.case_else_expression);
@@ -1409,6 +1424,8 @@ fn validateGeneratedExpressionAstRanges(
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.over_partition_items);
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.over_order_items);
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.array_items);
+    try validateGeneratedReadListAstRanges(tokens, read_ast, expression.case_condition_items);
+    try validateGeneratedReadListAstRanges(tokens, read_ast, expression.case_result_items);
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.boolean_condition_items);
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.subquery_projection_items);
     if (expression.subquery_set_operation) |subquery_set_operation| {
@@ -2563,7 +2580,7 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         .read => |ast| ast,
         else => return error.UnsupportedSqlShape,
     };
-    malformed_case_expression_read_ast.projection_items.expressions[0].case_branch_count = 0;
+    malformed_case_expression_read_ast.projection_items.expressions[0].case_condition_items.count = 0;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_case_expression_parsed_sql, malformed_case_expression_read_ast),

@@ -387,7 +387,8 @@ Unsupported DDL remains on the existing parser until
    temporal function metadata for `date_part`/`date_trunc`-style projection,
    predicate, and ordering expressions, range-bound helper metadata for
    `lower`/`upper`-style projection, predicate, and ordering expressions, and
-   searched `CASE WHEN ... THEN ... ELSE ... END` branch metadata.
+   searched `CASE WHEN ... THEN ... ELSE ... END` branch metadata with owned
+   per-branch condition/result expression lists.
    The read-plan lowering context now dispatches through retained generated
    read ASTs when the generated parser covers the statement, and generated read
    ASTs have a validated wrapper into the current typed read lowerer for

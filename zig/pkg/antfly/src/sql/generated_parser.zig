@@ -315,6 +315,8 @@ pub const GeneratedSqlExpressionAst = struct {
     case_first_result_tokens: ?GeneratedSqlTokenRange = null,
     case_first_result_kind: ?GeneratedSqlExpressionKind = null,
     case_first_result: ?*GeneratedSqlExpressionAst = null,
+    case_condition_items: GeneratedSqlListAst = .{},
+    case_result_items: GeneratedSqlListAst = .{},
     case_else_tokens: ?GeneratedSqlTokenRange = null,
     case_else_expression_tokens: ?GeneratedSqlTokenRange = null,
     case_else_expression_kind: ?GeneratedSqlExpressionKind = null,
@@ -381,6 +383,8 @@ pub const GeneratedSqlExpressionAst = struct {
             case_first_result.deinit(alloc);
             alloc.destroy(case_first_result);
         }
+        self.case_condition_items.deinit(alloc);
+        self.case_result_items.deinit(alloc);
         if (self.case_else_expression) |case_else_expression| {
             case_else_expression.deinit(alloc);
             alloc.destroy(case_else_expression);
@@ -2952,6 +2956,9 @@ fn buildGeneratedExpressionAst(alloc: std.mem.Allocator, tokens: []const token_m
         ast.case_first_result_tokens = case_expression.first_result_tokens;
         ast.case_first_result_kind = generatedExpressionKindForRange(tokens, case_expression.first_result_tokens);
         ast.case_first_result = try buildGeneratedExpressionNodeAlloc(alloc, tokens, case_expression.first_result_tokens);
+        const branch_lists = try buildGeneratedCaseBranchLists(alloc, tokens, range);
+        ast.case_condition_items = branch_lists.conditions;
+        ast.case_result_items = branch_lists.results;
         ast.case_else_tokens = case_expression.else_tokens;
         ast.case_else_expression_tokens = case_expression.else_expression_tokens;
         if (case_expression.else_expression_tokens) |else_expression_tokens| {
@@ -3103,6 +3110,75 @@ fn buildGeneratedExpressionNodeAlloc(
     errdefer alloc.destroy(node);
     node.* = try buildGeneratedExpressionAst(alloc, tokens, range);
     return node;
+}
+
+const GeneratedCaseBranchLists = struct {
+    conditions: GeneratedSqlListAst = .{},
+    results: GeneratedSqlListAst = .{},
+
+    fn deinit(self: *GeneratedCaseBranchLists, alloc: std.mem.Allocator) void {
+        self.conditions.deinit(alloc);
+        self.results.deinit(alloc);
+        self.* = .{};
+    }
+};
+
+fn buildGeneratedExpressionListAstFromRanges(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    ranges: []const GeneratedSqlTokenRange,
+) !GeneratedSqlListAst {
+    var ast = GeneratedSqlListAst{};
+    if (ranges.len == 0) return ast;
+    errdefer ast.deinit(alloc);
+
+    ast.count = ranges.len;
+    ast.first_tokens = ranges[0];
+    ast.last_tokens = ranges[ranges.len - 1];
+    ast.items = try alloc.dupe(GeneratedSqlTokenRange, ranges);
+    ast.expression_items = try alloc.dupe(GeneratedSqlTokenRange, ranges);
+    ast.expressions = try alloc.alloc(GeneratedSqlExpressionAst, ranges.len);
+    @memset(ast.expressions, .{});
+    for (ranges, 0..) |range, index| {
+        ast.expressions[index] = try buildGeneratedExpressionAst(alloc, tokens, range);
+    }
+    return ast;
+}
+
+fn buildGeneratedCaseBranchLists(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    range: GeneratedSqlTokenRange,
+) !GeneratedCaseBranchLists {
+    var condition_ranges: std.ArrayListUnmanaged(GeneratedSqlTokenRange) = .empty;
+    defer condition_ranges.deinit(alloc);
+    var result_ranges: std.ArrayListUnmanaged(GeneratedSqlTokenRange) = .empty;
+    defer result_ranges.deinit(alloc);
+    var lists = GeneratedCaseBranchLists{};
+    errdefer lists.deinit(alloc);
+
+    if (range.start + 5 > range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    if (!tokens[range.start].matchesKeywordTag(.case)) return error.UnsupportedSqlShape;
+    if (!tokens[range.end - 1].matchesKeywordTag(.end)) return error.UnsupportedSqlShape;
+    const body_end = range.end - 1;
+    var cursor = range.start + 1;
+    while (cursor < body_end) {
+        if (tokens[cursor].matchesKeywordTag(.@"else")) break;
+        if (!tokens[cursor].matchesKeywordTag(.when)) return error.UnsupportedSqlShape;
+        const then_index = findTopLevelCaseKeyword(tokens, cursor + 1, body_end, .then) orelse return error.UnsupportedSqlShape;
+        if (cursor + 1 >= then_index) return error.UnsupportedSqlShape;
+        const next_index = findNextTopLevelCaseBoundary(tokens, then_index + 1, body_end) orelse body_end;
+        if (then_index + 1 >= next_index) return error.UnsupportedSqlShape;
+        try condition_ranges.append(alloc, .{ .start = cursor + 1, .end = then_index });
+        try result_ranges.append(alloc, .{ .start = then_index + 1, .end = next_index });
+        cursor = next_index;
+    }
+    if (condition_ranges.items.len == 0 or condition_ranges.items.len != result_ranges.items.len) {
+        return error.UnsupportedSqlShape;
+    }
+    lists.conditions = try buildGeneratedExpressionListAstFromRanges(alloc, tokens, condition_ranges.items);
+    lists.results = try buildGeneratedExpressionListAstFromRanges(alloc, tokens, result_ranges.items);
+    return lists;
 }
 
 fn generatedExpressionKindForRange(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?GeneratedSqlExpressionKind {
@@ -4525,6 +4601,16 @@ test "generated SQL parser facade builds predicate read AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.projection_items.expressions[0].case_first_result_tokens.?);
             try std.testing.expect(read.projection_items.expressions[0].case_first_result_kind == null);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.projection_items.expressions[0].case_first_result.?.kind);
+            try std.testing.expectEqual(@as(usize, 2), read.projection_items.expressions[0].case_condition_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 6 }, read.projection_items.expressions[0].case_condition_items.items[0]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 12 }, read.projection_items.expressions[0].case_condition_items.items[1]);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.is_null, read.projection_items.expressions[0].case_condition_items.expressions[0].kind);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.projection_items.expressions[0].case_condition_items.expressions[1].kind);
+            try std.testing.expectEqual(@as(usize, 2), read.projection_items.expressions[0].case_result_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.projection_items.expressions[0].case_result_items.items[0]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 14 }, read.projection_items.expressions[0].case_result_items.items[1]);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.projection_items.expressions[0].case_result_items.expressions[0].kind);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.projection_items.expressions[0].case_result_items.expressions[1].kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 14, .end = 19 }, read.projection_items.expressions[0].case_else_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 15, .end = 19 }, read.projection_items.expressions[0].case_else_expression_tokens.?);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.function_call, read.projection_items.expressions[0].case_else_expression_kind.?);
@@ -4545,6 +4631,10 @@ test "generated SQL parser facade builds predicate read AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.projection_items.expressions[0].case_first_result_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 10 }, read.projection_items.expressions[0].case_else_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.projection_items.expressions[0].case_else_expression_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), read.projection_items.expressions[0].case_condition_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 6 }, read.projection_items.expressions[0].case_condition_items.items[0]);
+            try std.testing.expectEqual(@as(usize, 1), read.projection_items.expressions[0].case_result_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.projection_items.expressions[0].case_result_items.items[0]);
         },
         else => return error.TestUnexpectedResult,
     }
