@@ -566,8 +566,13 @@ or_expression:
   ;
 
 and_expression:
+    not_expression
+  | and_expression AND not_expression
+  ;
+
+not_expression:
     comparison_expression
-  | and_expression AND comparison_expression
+  | NOT not_expression
   ;
 
 comparison_expression:
