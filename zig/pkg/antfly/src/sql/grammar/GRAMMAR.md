@@ -401,7 +401,11 @@ Unsupported DDL remains on the existing parser until
    expression kinds such as function calls, binary and logical predicates,
    casts, `CASE` expressions, temporal literals, `EXTRACT`, arrays, subqueries,
    and grouped expressions; it also verifies that child expression AST spans
-   and owned list expression AST spans match their parent token metadata.
+   and owned list expression AST spans match their parent token metadata, and
+   expression-owned lists stay inside their owning generated expression clause
+   for function arguments, aggregate-local ordering, `WITHIN GROUP` ordering,
+   inline window partitions/orderings, array elements, `CASE` branches, boolean
+   condition chains, and subquery projections.
    Simple query reads now have
    a direct generated AST-to-query-plan lowering boundary after clause-range
    validation, and aggregate, join, and lateral reads now have direct generated
@@ -457,8 +461,9 @@ Unsupported DDL remains on the existing parser until
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current
-   validated owned expression item arrays, exact child/list expression span
-   checks, and expression-kind structural checks, full multi-join
+   validated owned expression item arrays, exact child/list expression span and
+   expression-owned list containment checks, expression-kind structural checks,
+   full multi-join
    planning/lowering and richer join-tree semantics beyond the current
    validated left-associative generated join nodes, expression AST
    planning/lowering beyond the current recursive
