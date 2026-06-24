@@ -31,6 +31,7 @@
 %token EQ NEQ LT LTE GT GTE PLUS MINUS SLASH PERCENT COLON COLON_COLON
 %token AT_CONTAINS RANGE_OVERLAP QUESTION QUESTION_ANY QUESTION_ALL
 %token ARROW_JSON ARROW_TEXT PATH_ARROW_JSON PATH_ARROW_TEXT
+%token REGEX_MATCH REGEX_IMATCH REGEX_NOT_MATCH REGEX_NOT_IMATCH
 %token ALL ALTER ANALYZE AND ANY ARRAY AS ASC BEGIN BETWEEN BY CASCADE COMMIT CONFLICT CONSTRAINT CONTINUE CURRENT
 %token CREATE DATABASE DEALLOCATE DEFAULT DELETE DESC DISCARD DISTINCT DO DROP EXECUTE
 %token EXPLAIN EXISTS EXTENSION FALSE FETCH FIRST FOLLOWING FROM FULL GRAPH GROUP HAVING IDENTITY IF ILIKE IN INDEX INNER INSERT INTO IS
@@ -601,6 +602,10 @@ comparison_expression:
   | additive_expression QUESTION additive_expression
   | additive_expression QUESTION_ANY additive_expression
   | additive_expression QUESTION_ALL additive_expression
+  | additive_expression REGEX_MATCH additive_expression
+  | additive_expression REGEX_IMATCH additive_expression
+  | additive_expression REGEX_NOT_MATCH additive_expression
+  | additive_expression REGEX_NOT_IMATCH additive_expression
   | additive_expression LIKE additive_expression
   | additive_expression ILIKE additive_expression
   | additive_expression IN LPAREN expression_list RPAREN

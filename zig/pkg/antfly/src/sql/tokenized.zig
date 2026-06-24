@@ -873,6 +873,10 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
         .{ .sql = "SELECT id FROM usage_records WHERE metadata ? 'flags'", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE metadata ?| ARRAY['flags','billing']", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE metadata ?& ARRAY['flags','billing']", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records WHERE status ~ 'op.*'", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records WHERE status ~* 'op.*'", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records WHERE status !~ 'closed.*'", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records WHERE status !~* 'closed.*'", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE deleted_at IS NULL", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE deleted_at IS NOT NULL", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE active IS TRUE", .generated = .query, .read = .query },
@@ -1059,6 +1063,26 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                     const array_constructor = read_ast.where_expression.right_expression orelse return error.TestUnexpectedResult;
                     try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.array_constructor, array_constructor.kind);
                     try std.testing.expectEqual(@as(usize, 2), array_constructor.array_items.count);
+                } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records WHERE status ~ 'op.*'")) {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.regex_match, read_ast.where_expression.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read_ast.where_expression.left_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read_ast.where_expression.operator_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read_ast.where_expression.right_tokens.?);
+                } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records WHERE status ~* 'op.*'")) {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.regex_imatch, read_ast.where_expression.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read_ast.where_expression.left_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read_ast.where_expression.operator_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read_ast.where_expression.right_tokens.?);
+                } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records WHERE status !~ 'closed.*'")) {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.regex_not_match, read_ast.where_expression.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read_ast.where_expression.left_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read_ast.where_expression.operator_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read_ast.where_expression.right_tokens.?);
+                } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records WHERE status !~* 'closed.*'")) {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.regex_not_imatch, read_ast.where_expression.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read_ast.where_expression.left_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read_ast.where_expression.operator_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read_ast.where_expression.right_tokens.?);
                 } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records WHERE deleted_at IS NULL")) {
                     try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.is_null, read_ast.where_expression.kind);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read_ast.where_expression.left_tokens.?);

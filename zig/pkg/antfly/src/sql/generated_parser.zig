@@ -167,6 +167,10 @@ pub const GeneratedSqlExpressionKind = enum {
     json_key_exists,
     json_key_any,
     json_key_all,
+    regex_match,
+    regex_imatch,
+    regex_not_match,
+    regex_not_imatch,
     json_access,
     json_text_access,
     json_path_access,
@@ -495,6 +499,10 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT id FROM usage_records WHERE metadata ? 'flags'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE metadata ?| ARRAY['flags','billing']", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE metadata ?& ARRAY['flags','billing']", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE status ~ 'op.*'", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE status ~* 'op.*'", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE status !~ 'closed.*'", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE status !~* 'closed.*'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE deleted_at IS NULL", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE deleted_at IS NOT NULL", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE active IS TRUE", .kind = .read },
@@ -648,6 +656,10 @@ fn appendTokenIds(alloc: std.mem.Allocator, ids: *std.ArrayListUnmanaged(u16), t
         .question => try appendSymbol(ids, alloc, "QUESTION"),
         .question_any => try appendSymbol(ids, alloc, "QUESTION_ANY"),
         .question_all => try appendSymbol(ids, alloc, "QUESTION_ALL"),
+        .regex_match => try appendSymbol(ids, alloc, "REGEX_MATCH"),
+        .regex_imatch => try appendSymbol(ids, alloc, "REGEX_IMATCH"),
+        .regex_not_match => try appendSymbol(ids, alloc, "REGEX_NOT_MATCH"),
+        .regex_not_imatch => try appendSymbol(ids, alloc, "REGEX_NOT_IMATCH"),
         .lparen => try appendSymbol(ids, alloc, "LPAREN"),
         .rparen => try appendSymbol(ids, alloc, "RPAREN"),
         .lbracket => try appendSymbol(ids, alloc, "LBRACKET"),
@@ -1770,6 +1782,10 @@ fn findTopLevelExpressionOperator(tokens: []const token_mod.Token, range: Genera
             .question => if (depth == 0 and index > range.start and index + 1 < range.end) return .{ .kind = .json_key_exists, .index = index },
             .question_any => if (depth == 0 and index > range.start and index + 1 < range.end) return .{ .kind = .json_key_any, .index = index },
             .question_all => if (depth == 0 and index > range.start and index + 1 < range.end) return .{ .kind = .json_key_all, .index = index },
+            .regex_match => if (depth == 0 and index > range.start and index + 1 < range.end) return .{ .kind = .regex_match, .index = index },
+            .regex_imatch => if (depth == 0 and index > range.start and index + 1 < range.end) return .{ .kind = .regex_imatch, .index = index },
+            .regex_not_match => if (depth == 0 and index > range.start and index + 1 < range.end) return .{ .kind = .regex_not_match, .index = index },
+            .regex_not_imatch => if (depth == 0 and index > range.start and index + 1 < range.end) return .{ .kind = .regex_not_imatch, .index = index },
             else => if (depth == 0) {
                 if (tokens[index].matchesKeywordTag(.not) and index + 1 < range.end) {
                     if (tokens[index + 1].matchesKeywordTag(.like)) return .{ .kind = .not_like, .index = index + 1, .negation_index = index };
@@ -2472,6 +2488,29 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(@as(usize, 2), array_constructor.array_items.count);
         },
         else => return error.TestUnexpectedResult,
+    }
+
+    const regex_cases = [_]struct {
+        sql: []const u8,
+        kind: GeneratedSqlExpressionKind,
+    }{
+        .{ .sql = "SELECT id FROM usage_records WHERE status ~ 'op.*'", .kind = .regex_match },
+        .{ .sql = "SELECT id FROM usage_records WHERE status ~* 'op.*'", .kind = .regex_imatch },
+        .{ .sql = "SELECT id FROM usage_records WHERE status !~ 'closed.*'", .kind = .regex_not_match },
+        .{ .sql = "SELECT id FROM usage_records WHERE status !~* 'closed.*'", .kind = .regex_not_imatch },
+    };
+    for (regex_cases) |case| {
+        const regex_read_result = try parseSqlAlloc(alloc, case.sql);
+        switch (regex_read_result.ast.?) {
+            .read => |read| {
+                try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+                try std.testing.expectEqual(case.kind, read.where_expression.kind);
+                try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.where_expression.left_tokens.?);
+                try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.where_expression.operator_tokens.?);
+                try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.where_expression.right_tokens.?);
+            },
+            else => return error.TestUnexpectedResult,
+        }
     }
 
     const is_null_read_sql = "SELECT id FROM usage_records WHERE deleted_at IS NULL";
@@ -3231,7 +3270,7 @@ test "generated SQL parser reports bounded diagnostics for malformed corpus" {
 }
 
 test "generated SQL parser rejects unsupported token shapes" {
-    try std.testing.expectError(error.UnsupportedSqlShape, parseSqlAlloc(std.testing.allocator, "SELECT a ~ b"));
+    try std.testing.expectError(error.UnsupportedSqlShape, parseSqlAlloc(std.testing.allocator, "SELECT a || b"));
 }
 
 fn spanText(sql: []const u8, span: token_mod.SourceSpan) []const u8 {
