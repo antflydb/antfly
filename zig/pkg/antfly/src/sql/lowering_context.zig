@@ -31,6 +31,7 @@ const table_catalog = @import("../api/table_catalog.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
 const source_binding = @import("source_binding.zig");
+const token_mod = @import("token.zig");
 const tokenized = @import("tokenized.zig");
 const value_mod = @import("value.zig");
 
@@ -173,6 +174,7 @@ pub fn lowerReadPlanFromGeneratedReadAstAlloc(
 ) !plan.LoweredReadPlan {
     const read_kind = parsed_sql.readStatementKind() orelse return error.UnsupportedSqlShape;
     if (!generatedReadAstMatchesReadKind(read_ast.kind, read_kind)) return error.UnsupportedSqlShape;
+    try validateGeneratedReadAstRanges(parsed_sql.items(), read_ast);
     return try context.lowerParsed(parsed_sql);
 }
 
@@ -190,6 +192,71 @@ fn generatedReadAstMatchesReadKind(
             .set_operation, .recursive_cte => false,
         },
     };
+}
+
+fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: generated_parser.GeneratedSqlReadAst) !void {
+    const ranges = [_]?generated_parser.GeneratedSqlTokenRange{
+        read_ast.cte_tokens,
+        read_ast.projection_tokens,
+        read_ast.source_tokens,
+        read_ast.where_tokens,
+        read_ast.group_tokens,
+        read_ast.having_tokens,
+        read_ast.window_tokens,
+        read_ast.order_tokens,
+        read_ast.limit_tokens,
+        read_ast.offset_tokens,
+        read_ast.fetch_tokens,
+        read_ast.set_operation_tokens,
+    };
+    for (ranges) |range| {
+        if (range) |value| try validateGeneratedReadTokenRange(tokens, read_ast, value);
+    }
+
+    switch (read_ast.kind) {
+        .query => {
+            if (read_ast.projection_tokens == null) return error.UnsupportedSqlShape;
+        },
+        .aggregate => {
+            if (read_ast.projection_tokens == null) return error.UnsupportedSqlShape;
+            if (read_ast.group_tokens == null and read_ast.having_tokens == null) return error.UnsupportedSqlShape;
+        },
+        .join => {
+            if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return error.UnsupportedSqlShape;
+            try validateGeneratedReadRangeContainsKeyword(tokens, read_ast.source_tokens.?, .join);
+        },
+        .lateral => {
+            if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return error.UnsupportedSqlShape;
+            try validateGeneratedReadRangeContainsKeyword(tokens, read_ast.source_tokens.?, .lateral);
+        },
+        .cte => {
+            if (read_ast.cte_tokens == null or read_ast.projection_tokens == null) return error.UnsupportedSqlShape;
+        },
+    }
+}
+
+fn validateGeneratedReadTokenRange(
+    tokens: []const tokenized.Token,
+    read_ast: generated_parser.GeneratedSqlReadAst,
+    range: generated_parser.GeneratedSqlTokenRange,
+) !void {
+    if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    const first = tokens[range.start];
+    const last = tokens[range.end - 1];
+    if (first.source_start < read_ast.statement_span.start) return error.UnsupportedSqlShape;
+    if (last.source_end > read_ast.statement_span.end) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedReadRangeContainsKeyword(
+    tokens: []const tokenized.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    keyword: token_mod.TokenKeyword,
+) !void {
+    var index = range.start;
+    while (index < range.end) : (index += 1) {
+        if (tokens[index].matchesKeywordTag(keyword)) return;
+    }
+    return error.UnsupportedSqlShape;
 }
 
 pub const CatalogReadPlanLoweringCallbacks = struct {
@@ -660,6 +727,48 @@ test "sql adapter lowering context lowers generated read AST through typed read 
         defer generated.deinit(alloc);
         try std.testing.expectEqual(std.meta.activeTag(legacy), std.meta.activeTag(generated));
     }
+}
+
+test "sql adapter lowering context rejects malformed generated read AST ranges" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["kind","tenant","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","tenant","id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLoweringContextTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id, status FROM usage_records WHERE kind = 'order'",
+    );
+    defer parsed_sql.deinit(alloc);
+    const generated_raw = parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var read_ast = switch (generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    read_ast.projection_tokens = .{ .start = 2, .end = 2 };
+
+    var context = ReadPlanLoweringContext{
+        .alloc = alloc,
+        .schema = schema,
+        .source_schema = null,
+        .params = &.{},
+        .function_bindings = .{},
+        .callbacks = .{
+            .lower_lateral_with_schemas = lowerLateralWithSchemasParsedSqlForLoweringContextTestAlloc,
+            .lower_window = lowerWindowParsedSqlForLoweringContextTestAlloc,
+            .lower_aggregate_plan = lowerAggregateParsedSqlForLoweringContextTestAlloc,
+            .lower_recursive_cte_plan = unsupportedRecursiveCteParsedSqlForLoweringContextTestAlloc,
+            .lower_join_with_schemas = lowerJoinWithSchemasParsedSqlForLoweringContextTestAlloc,
+            .lower_query_plan = lowerQueryParsedSqlForLoweringContextTestAlloc,
+            .lower_set_operation_optional_source_schema = unsupportedSetOperationParsedSqlForLoweringContextTestAlloc,
+        },
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &parsed_sql, read_ast),
+    );
 }
 
 test "sql adapter lowering context classifies read sql into typed plan families" {
