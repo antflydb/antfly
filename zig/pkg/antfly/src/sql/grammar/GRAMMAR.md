@@ -89,8 +89,9 @@ covered `SELECT` projections, sources, predicates, grouping, having filters,
 window clauses, ordering, pagination, set-operation tails, and CTE prefixes,
 list-level generated metadata for top-level projection, grouping, and ordering
 items, and first-join generated metadata for left input, right input, and join
-predicate ranges, plus simple top-level comparison expression metadata for
-covered `WHERE`, `HAVING`, and join predicates. Normal function-call argument
+predicate ranges, plus first/last projection expression metadata and simple
+top-level comparison expression metadata for covered `WHERE`, `HAVING`, and
+join predicates. Normal function-call argument
 lists are accepted in generated expression grammar, including top-level
 projection functions with comma-separated arguments, and positive `LIKE`,
 `ILIKE`, `IN (...)`, and `BETWEEN ... AND ...` predicates are accepted and
@@ -246,8 +247,9 @@ Suggested migration order:
    `HAVING`, `WINDOW`, `ORDER BY`, `LIMIT`, `OFFSET`, `FETCH`, set-operation,
    and CTE-prefix bodies, plus list-level metadata for top-level projection,
    grouping, and ordering items and first-join metadata for left input, right
-   input, and join predicate ranges, plus simple top-level comparison
-   expression metadata for covered `WHERE`, `HAVING`, and join predicates; and
+   input, and join predicate ranges, plus first/last projection expression
+   metadata and simple top-level comparison expression metadata for covered
+   `WHERE`, `HAVING`, and join predicates; and
    normal function-call argument lists are accepted by the generated expression
    grammar for covered read projections, and positive `LIKE`, `ILIKE`,
    `IN (...)`, and `BETWEEN ... AND ...` predicates are accepted and classified
@@ -291,9 +293,10 @@ Suggested migration order:
    Generated pagination coverage now accepts and ranges `LIMIT`, `OFFSET`, and
    `FETCH FIRST`/`FETCH NEXT` tails.
    Switching reads from fallback to required generated parsing still requires
-   broader PostgreSQL-compatible grammar coverage, expression-level and
-   full join-tree generated query-body ASTs, full expression AST nodes beyond
-   list-level and simple-comparison/operator metadata, broader function
+   broader PostgreSQL-compatible grammar coverage, complete projection
+   expression arrays, full join-tree generated query-body ASTs, full expression
+   AST nodes beyond list-level and simple-comparison/operator metadata,
+   broader function
    coverage, broader boolean expression-tree coverage, quantified subquery and
    array predicate coverage, per-CTE generated body arrays, recursive CTE
    planning, direct generated read-plan lowering, and
