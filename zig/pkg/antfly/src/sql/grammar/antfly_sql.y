@@ -39,6 +39,7 @@
 %token NEXT NOTHING OFFSET ONLY QUERY RANGE RECURSIVE REINDEX RELEASE RESET RESTART RESTRICT RETURNING REVOKE RIGHT ROLLBACK ROW ROWS SAVEPOINT SCHEMA SELECT SET SHOW SOME TABLE TIMESTAMP TIMESTAMPTZ TO TRUNCATE
 %token SYMMETRIC THEN TRUE UNION UNIQUE UNKNOWN UPDATE USING VACUUM VALUES WHEN WHERE WINDOW WITH WITHIN
 %token EXCEPT INTERSECT UNBOUNDED
+%token BASE_WEIGHT FIELD FRESHNESS GRAPH_METRIC KEY KIND METRIC METRIC_FRESHNESS MISSING_SCORE NAME SOURCE SOURCES TYPE WEIGHT
 
 statement:
     session_statement
@@ -425,8 +426,15 @@ table_reference_list:
 table_reference:
     qualified_name
   | qualified_name AS identifier_name
+  | qualified_name LPAREN function_argument_list_opt RPAREN table_function_alias_opt
   | table_reference join_operator table_reference join_condition
   | LATERAL LPAREN read_statement RPAREN AS identifier_name
+  ;
+
+table_function_alias_opt:
+    /* empty */
+  | AS identifier_name
+  | identifier_name
   ;
 
 join_condition:
@@ -672,7 +680,46 @@ function_argument_list_opt:
   ;
 
 function_argument_list:
-    distinct_opt expression_list function_argument_order_opt
+    distinct_opt function_argument_item_list function_argument_order_opt
+  ;
+
+function_argument_item_list:
+    function_argument_item
+  | function_argument_item_list COMMA function_argument_item
+  ;
+
+function_argument_item:
+    expression
+  | function_argument_name function_named_arg_operator expression
+  ;
+
+function_argument_name:
+    identifier_name
+  | BASE_WEIGHT
+  | FIELD
+  | FRESHNESS
+  | GRAPH
+  | GRAPH_METRIC
+  | INDEX
+  | KEY
+  | KIND
+  | LIMIT
+  | METRIC
+  | METRIC_FRESHNESS
+  | MISSING_SCORE
+  | NAME
+  | OFFSET
+  | QUERY
+  | SOURCE
+  | SOURCES
+  | TABLE
+  | TYPE
+  | WEIGHT
+  ;
+
+function_named_arg_operator:
+    EQ
+  | EQ GT
   ;
 
 distinct_opt:
@@ -890,20 +937,34 @@ identifier_list:
 
 identifier_name:
     IDENT
+  | BASE_WEIGHT
   | CLOSE
   | CLUSTER
   | COMMENT
+  | FIELD
+  | FRESHNESS
   | FETCH
+  | GRAPH_METRIC
   | GRANT
   | INCLUDE
+  | KEY
+  | KIND
   | LISTEN
   | LOCK
+  | METRIC
+  | METRIC_FRESHNESS
+  | MISSING_SCORE
   | MOVE
+  | NAME
   | NEXT
   | NOTIFY
   | RELEASE
   | REVOKE
   | SAVEPOINT
+  | SOURCE
+  | SOURCES
+  | TYPE
+  | WEIGHT
   ;
 
 type_name:

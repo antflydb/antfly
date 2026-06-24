@@ -33,8 +33,9 @@ The first generator implementation builds deterministic SLR parser tables:
 grammar parsing, production validation, nullable/FIRST/FOLLOW sets, LR(0)
 states, indexed action/goto tables, source-aware syntax diagnostics, and
 structured conflict reporting. The current broad Antfly SQL seed grammar
-generates conflict-free parser metadata. The first runtime integration observes
-the generated parser on the `ParsedSql` path but does not require grammar parity
+generates deterministic parser metadata with tracked conflict reporting. The
+first runtime integration observes the generated parser on the `ParsedSql` path
+but does not require grammar parity
 before the existing parser can handle a statement. When the generated parser
 accepts a statement, `ParsedSql` retains a source-span-bearing generated raw
 node and uses it for the first migrated statement variants. Session,
@@ -194,11 +195,16 @@ complete multi-join planning and richer join-tree semantics beyond the current
 validated left-associative generated join nodes, complete expression AST nodes,
 complete per-CTE body AST arrays, recursive CTE planning, aggregates, richer
 inline window-expression semantic planning, ordering, remaining pagination cutover, and
-direct generated read-plan lowering. The generated parser now also treats seed
-graph DDL as a distinct graph statement family and `ParsedSql` retains those
-generated raw and AST nodes. Seed graph index and graph metric statements now
-have graph-specific generated AST-to-plan wrappers that lower to typed index
-plans instead of only routing through the generic DDL family. The generated
+direct generated read-plan lowering. Canonical Antfly graph query table
+functions such as `antfly.graph_traverse`, `antfly.graph_match`, and
+`antfly.graph_metric` are now accepted as generated read sources with named
+`=`/`=>` arguments, retained source/name/argument token ranges, graph function
+kind metadata, and fail-closed range validation in the generated read lowering
+boundary. The generated parser now also treats seed graph DDL as a distinct
+graph statement family and `ParsedSql` retains those generated raw and AST
+nodes. Seed graph index and graph metric statements now have graph-specific
+generated AST-to-plan wrappers that lower to typed index plans instead of only
+routing through the generic DDL family. The generated
 facade now returns closed statement-family nodes for the covered families and
 explicit unsupported statement nodes for seed `ANALYZE`, bulk I/O `COPY`,
 maintenance `VACUUM`/`REINDEX`, utility/control statements such as `CLUSTER`,
@@ -494,8 +500,12 @@ Unsupported DDL remains on the existing parser until
    `CREATE GRAPH INDEX` and `CREATE GRAPH METRIC` statements now have generated
    graph-family corpus coverage, retained generated AST nodes, and generated
    AST-to-plan wrappers for typed graph index and graph metric index plans.
-   Broader graph traversal, graph metric query, and graph DSL cutover still
-   requires graph-specific query AST payloads and unsupported-shape diagnostics.
+   Canonical `antfly.graph_*` table-function query sources now have generated
+   grammar coverage, named-argument coverage, source/name/argument AST ranges,
+   graph function kind metadata, and fail-closed generated-read validation.
+   Broader graph traversal, graph metric query planning, and graph DSL cutover
+   still require graph-specific semantic AST payloads and unsupported-shape
+   diagnostics beyond the current table-function source metadata.
 
 ## Generator Performance
 
@@ -606,7 +616,9 @@ variants for:
   behavior, plus generated-first AST-to-plan parity checks for covered
   create-index clauses
 - graph statement, including a generated AST payload for command spans and
-  graph-specific AST-to-plan wrappers for seed graph index and graph metric DDL
+  graph-specific AST-to-plan wrappers for seed graph index and graph metric DDL;
+  canonical `antfly.graph_*` table-function reads are represented on generated
+  read ASTs as graph source metadata rather than as standalone graph statements
 - unsupported statement, including generated AST payloads for seed `ANALYZE`,
   `COPY`, `VACUUM`, `REINDEX`, `CLUSTER`, `COMMENT`, `GRANT`, `REVOKE`,
   `LISTEN`, `NOTIFY`, `LOCK`, `CLOSE`, `FETCH`, `MOVE`, `SAVEPOINT`, and
@@ -684,7 +696,9 @@ Generated grammar work needs evidence at multiple levels:
   positive/negated predicate expression-shape coverage for read predicates,
   including escaped `LIKE`/`ILIKE` pattern metadata.
   Seed graph DDL has generated AST-to-plan parity for graph index and graph
-  metric index plans.
+  metric index plans, and generated read AST tests cover canonical
+  `antfly.graph_*` table-function source ranges plus fail-closed malformed
+  graph-source validation.
 - SQL/API parity tests showing SQL and native API requests reach the same
   service contracts.
 - Fuzz or mutation tests for scanner/parser crash resistance and bounded error

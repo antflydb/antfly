@@ -90,6 +90,16 @@ pub const GeneratedSqlGraphKind = enum {
     create_metric,
 };
 
+pub const GeneratedSqlGraphTableFunctionKind = enum {
+    traverse,
+    neighbors,
+    shortest_path,
+    k_shortest_paths,
+    match,
+    metric,
+    metric_rerank,
+};
+
 pub const GeneratedSqlExtensionIndexKind = enum {
     create_index,
     drop_index,
@@ -719,6 +729,10 @@ pub const GeneratedSqlReadAst = struct {
     projection_first_expression: GeneratedSqlExpressionAst = .{},
     projection_last_expression: GeneratedSqlExpressionAst = .{},
     source_tokens: ?GeneratedSqlTokenRange = null,
+    source_graph_function_tokens: ?GeneratedSqlTokenRange = null,
+    source_graph_function_name_tokens: ?GeneratedSqlTokenRange = null,
+    source_graph_function_argument_tokens: ?GeneratedSqlTokenRange = null,
+    source_graph_function_kind: ?GeneratedSqlGraphTableFunctionKind = null,
     join_tokens: ?GeneratedSqlTokenRange = null,
     join_operator_tokens: ?GeneratedSqlTokenRange = null,
     join_kind: ?GeneratedSqlJoinKind = null,
@@ -1656,6 +1670,7 @@ fn buildReadAst(
         if (idx + 1 < source_end) {
             const source_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = source_end };
             ast.source_tokens = source_tokens;
+            buildGeneratedReadGraphSourceAst(tokens, source_tokens, &ast);
             try buildReadJoinAst(alloc, tokens, source_tokens, &ast);
         }
     }
@@ -2437,6 +2452,37 @@ fn classifyReadKindInRange(tokens: []const token_mod.Token, range: GeneratedSqlT
         if (tokens[index].matchesKeywordTag(.group) or tokens[index].matchesKeywordTag(.having)) return .aggregate;
     }
     return .query;
+}
+
+fn generatedGraphTableFunctionKind(token: token_mod.Token) ?GeneratedSqlGraphTableFunctionKind {
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_traverse)) return .traverse;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_neighbors)) return .neighbors;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_shortest_path)) return .shortest_path;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_k_shortest_paths)) return .k_shortest_paths;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_match)) return .match;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_metric)) return .metric;
+    if (token.matchesQualifiedKeywordTag("antfly", .graph_metric_rerank)) return .metric_rerank;
+    return null;
+}
+
+fn buildGeneratedReadGraphSourceAst(
+    tokens: []const token_mod.Token,
+    source_tokens: GeneratedSqlTokenRange,
+    ast: *GeneratedSqlReadAst,
+) void {
+    if (source_tokens.start >= source_tokens.end or source_tokens.end > tokens.len) return;
+    var function_start = source_tokens.start;
+    if (tokens[function_start].matchesKeywordTag(.lateral)) {
+        if (function_start + 1 >= source_tokens.end) return;
+        function_start += 1;
+    }
+    const kind = generatedGraphTableFunctionKind(tokens[function_start]) orelse return;
+    if (function_start + 1 >= source_tokens.end or tokens[function_start + 1].kind != .lparen) return;
+    const close_index = findMatchingParen(tokens, function_start + 1, source_tokens.end) orelse return;
+    ast.source_graph_function_tokens = .{ .start = function_start, .end = close_index + 1 };
+    ast.source_graph_function_name_tokens = .{ .start = function_start, .end = function_start + 1 };
+    ast.source_graph_function_argument_tokens = .{ .start = function_start + 2, .end = close_index };
+    ast.source_graph_function_kind = kind;
 }
 
 fn buildReadJoinAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, source_tokens: GeneratedSqlTokenRange, ast: *GeneratedSqlReadAst) !void {
@@ -4652,6 +4698,30 @@ test "generated SQL parser facade builds read AST spans" {
             try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.projection_first_expression.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.projection_first_expression.tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.source_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const graph_source_read_sql = "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b') AS gm";
+    var graph_source_tokens = try lexer.tokenizeAlloc(alloc, graph_source_read_sql);
+    defer lexer.freeTokens(alloc, &graph_source_tokens);
+    const graph_source_read_result = try parseTokensAlloc(alloc, graph_source_tokens.items);
+    switch (graph_source_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlGraphTableFunctionKind.match, read.source_graph_function_kind.?);
+            try std.testing.expectEqualStrings(
+                "antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b')",
+                tokenRangeText(graph_source_read_sql, graph_source_tokens.items, read.source_graph_function_tokens.?),
+            );
+            try std.testing.expectEqualStrings(
+                "antfly.graph_match",
+                tokenRangeText(graph_source_read_sql, graph_source_tokens.items, read.source_graph_function_name_tokens.?),
+            );
+            try std.testing.expectEqualStrings(
+                "table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b'",
+                tokenRangeText(graph_source_read_sql, graph_source_tokens.items, read.source_graph_function_argument_tokens.?),
+            );
         },
         else => return error.TestUnexpectedResult,
     }
@@ -7559,4 +7629,8 @@ test "generated SQL parser rejects unsupported token shapes" {
 
 fn spanText(sql: []const u8, span: token_mod.SourceSpan) []const u8 {
     return sql[span.start..span.end];
+}
+
+fn tokenRangeText(sql: []const u8, tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) []const u8 {
+    return sql[tokens[range.start].source_start..tokens[range.end - 1].source_end];
 }
