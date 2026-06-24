@@ -481,9 +481,10 @@ Unsupported DDL remains on the existing parser until
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current
    validated owned expression item arrays, exact child/list expression span and
-   expression- and clause-owned list containment checks, first/last list
-   expression summary checks, expression-kind structural checks, expression
-   operator/kind token consistency checks, full multi-join
+   expression-owned token range containment checks, expression- and
+   clause-owned list containment checks, first/last list expression summary
+   checks, expression-kind structural checks, expression operator/kind token
+   consistency checks, full multi-join
    planning/lowering and richer join-tree semantics beyond the current
    validated left-associative generated join nodes, expression AST
    planning/lowering beyond the current recursive
@@ -706,7 +707,8 @@ Generated grammar work needs evidence at multiple levels:
   fail-closed single-join lowerer validation, and simple comparison plus
   positive/negated predicate expression-shape coverage for read predicates,
   including escaped `LIKE`/`ILIKE` pattern metadata and fail-closed
-  expression operator/kind token consistency validation.
+  expression-owned token range containment plus operator/kind token
+  consistency validation.
   Seed graph DDL has generated AST-to-plan parity for graph index and graph
   metric index plans, and generated read AST tests cover canonical
   `antfly.*` table-function source ranges and named-argument item ranges,
