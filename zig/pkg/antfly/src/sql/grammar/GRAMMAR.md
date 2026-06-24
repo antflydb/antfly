@@ -124,9 +124,10 @@ expression-kind summaries, including JSON/path postfix operator summaries,
 function-call child summaries, and direct function-call name and argument-list
 metadata,
 and an initial generated AST-to-plan wrapper that validates those ranges,
-rejects malformed structural payloads for covered expression kinds, and fails
-closed if the generated read family is incompatible with the existing read
-classifier. Simple query, aggregate, join, and lateral reads now validate
+rejects malformed structural payloads for covered expression kinds, verifies
+child/list expression AST spans against their parent metadata, and fails closed
+if the generated read family is incompatible with the existing read classifier.
+Simple query, aggregate, join, and lateral reads now validate
 generated clause ranges before calling their typed read-plan lowerers directly;
 single binary join reads also validate generated join-tree metadata against the
 typed join lowerer before producing a join plan;
@@ -338,7 +339,9 @@ Suggested migration order:
    range metadata, and malformed structural metadata for covered generated
    expression kinds such as function calls, binary and logical predicates,
    casts, `CASE` expressions, temporal literals, `EXTRACT`, arrays, subqueries,
-   and grouped expressions. Simple query reads now have
+   and grouped expressions; it also verifies that child expression AST spans
+   and owned list expression AST spans match their parent token metadata.
+   Simple query reads now have
    a direct generated AST-to-query-plan lowering boundary after clause-range
    validation, and aggregate, join, and lateral reads now have direct generated
    AST-to-read-family dispatch boundaries after clause-range validation.
@@ -372,8 +375,9 @@ Suggested migration order:
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current
-   validated owned expression item arrays and expression-kind structural
-   checks, full multi-join planning/lowering and richer
+   validated owned expression item arrays, exact child/list expression span
+   checks, and expression-kind structural checks, full multi-join
+   planning/lowering and richer
    join-tree semantics beyond the current validated left-associative generated
    join nodes, expression AST planning/lowering beyond the current recursive
    predicate/operator metadata and structural checks, broader function
