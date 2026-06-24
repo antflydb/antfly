@@ -50,10 +50,11 @@ Transaction boundary commands now have generated AST-to-plan parity for
 generated-covered `BEGIN`, `COMMIT`, and `ROLLBACK` adapter-noop boundaries.
 Simple DDL has generated-parser corpus coverage but still falls back to the
 existing parser when the seed grammar does not yet cover the shape; generated
-simple DDL ASTs now have AST-to-plan parity for database, schema, and extension
-create/drop catalog plans, plus generated AST-to-plan parity for seed
-`CREATE TABLE` and `CREATE INDEX` forms using the same parser options as the
-existing lowerer. Simple DML now has generated-parser corpus coverage, retained
+simple DDL ASTs now carry structured object, option, and behavior fields for
+database, schema, and extension create/drop catalog plans and lower those
+catalog plans directly from generated AST ranges, plus generated AST-to-plan
+parity for seed `CREATE TABLE` and `CREATE INDEX` forms using the same parser
+options as the existing lowerer. Simple DML now has generated-parser corpus coverage, retained
 generated raw and AST nodes for covered write statements, and an initial
 generated AST-to-plan wrapper that fails closed if the generated DML family does
 not match the existing write classifier before delegating to the current typed
@@ -68,8 +69,9 @@ still fall back, and deeper read cutover still requires generated query-body
 AST payloads for projections, predicates, sources, joins, CTE bodies,
 aggregates, windows, ordering, and limits. The generated parser now also treats seed
 graph DDL as a distinct graph statement family and `ParsedSql` retains those
-generated raw and AST nodes, but graph execution still routes through the
-existing DDL variant until graph-specific lowering parity exists. The generated
+generated raw and AST nodes. Seed graph index and graph metric statements now
+have graph-specific generated AST-to-plan wrappers that lower to typed index
+plans instead of only routing through the generic DDL family. The generated
 facade now
 returns closed statement-family nodes for the covered families; full production
 AST construction remains the next migration boundary for larger DDL, query,
@@ -132,8 +134,10 @@ Suggested migration order:
    `DROP`, `CREATE INDEX`, scalar/vector/full-text/graph index forms, graph
    metric declarations, and extension declarations. Simple database, schema,
    table, index, and extension DDL now has generated-parser corpus coverage
-   when it matches the seed grammar; unsupported DDL remains on the existing
-   parser until each shape has raw AST parity.
+   when it matches the seed grammar. Database, schema, and extension create/drop
+   catalog DDL now has structured generated AST payloads and direct generated
+   AST-to-plan lowering. Unsupported DDL remains on the existing parser until
+   each shape has raw AST parity.
 3. Simple DML: `INSERT ... VALUES`, primary-key `UPDATE`, primary-key
    `DELETE`, `RETURNING`, and `ON CONFLICT`. Initial generated-parser coverage
    now retains raw and AST DML nodes for representative `INSERT ... VALUES`,
@@ -157,9 +161,10 @@ Suggested migration order:
    automatic embeddings, full-text ranking, algebraic indexes, enrichment
    clauses, lake/source syntax, and Lite-specific capability checks. Seed
    `CREATE GRAPH INDEX` and `CREATE GRAPH METRIC` statements now have generated
-   graph-family corpus coverage and retained generated nodes; execution remains
-   on the existing DDL path until graph-specific raw AST and lowering parity are
-   complete.
+   graph-family corpus coverage, retained generated AST nodes, and generated
+   AST-to-plan wrappers for typed graph index and graph metric index plans.
+   Broader graph traversal, graph metric query, and graph DSL cutover still
+   requires graph-specific query AST payloads and unsupported-shape diagnostics.
 
 ## Generator Performance
 
@@ -243,14 +248,16 @@ variants for:
 - prepared statement, including a generated AST payload for command, name,
   argument, and nested-statement token ranges, plus generated AST-to-plan parity
   for typed `PREPARE`, `EXECUTE`, and `DEALLOCATE`
-- DDL statement, including a generated AST payload for command spans, plus
-  generated AST-to-plan parity for database, schema, and extension create/drop
-  catalog plans and seed `CREATE TABLE` / `CREATE INDEX` plans
+- DDL statement, including generated AST payloads for command spans, object
+  names, catalog option fields, drop behavior, and generated AST-to-plan parity
+  for database, schema, and extension create/drop catalog plans and seed
+  `CREATE TABLE` / `CREATE INDEX` plans
 - DML statement, including a generated AST payload for command spans and an
   initial AST-to-plan wrapper for generated-covered write statements
 - read statement, including a generated AST payload for command spans and an
   initial AST-to-plan wrapper for generated-covered read statements
-- graph statement, including a generated AST payload for command spans
+- graph statement, including a generated AST payload for command spans and
+  graph-specific AST-to-plan wrappers for seed graph index and graph metric DDL
 
 Later statement-family cutovers should add closed variants for:
 
@@ -286,12 +293,15 @@ Generated grammar work needs evidence at multiple levels:
   current parser for migrated statement families. Session catalog commands,
   transaction boundaries, prepared statements, and simple DDL database/schema/
   extension catalog plans plus seed `CREATE TABLE` / `CREATE INDEX` plans have
-  generated AST-to-plan parity tests for their generated-covered forms. Simple
+  generated AST-to-plan parity tests for their generated-covered forms; simple
+  catalog DDL also has generated field-level checks for object names, option
+  flags, version strings, drop behavior, and fail-closed unsupported clauses. Simple
   DML has initial generated AST-to-plan parity through a generated-family
   validation wrapper over representative write plans. Read plans have initial
   generated AST-to-plan parity through a generated-family validation wrapper
   over representative query, aggregate, join, lateral, and non-recursive CTE
-  plans.
+  plans. Seed graph DDL has generated AST-to-plan parity for graph index and
+  graph metric index plans.
 - SQL/API parity tests showing SQL and native API requests reach the same
   service contracts.
 - Fuzz or mutation tests for scanner/parser crash resistance and bounded error

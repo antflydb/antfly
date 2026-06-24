@@ -106,7 +106,18 @@ create_index_statement:
   ;
 
 create_extension_statement:
-    CREATE EXTENSION if_not_exists_opt qualified_name
+    CREATE EXTENSION if_not_exists_opt qualified_name extension_schema_opt extension_version_opt
+  ;
+
+extension_schema_opt:
+    /* empty */
+  | WITH SCHEMA qualified_name
+  | SCHEMA qualified_name
+  ;
+
+extension_version_opt:
+    /* empty */
+  | IDENT STRING
   ;
 
 alter_table_statement:
@@ -117,8 +128,13 @@ drop_statement:
     DROP TABLE if_exists_opt qualified_name drop_behavior_opt
   | DROP INDEX if_exists_opt qualified_name drop_behavior_opt
   | DROP SCHEMA if_exists_opt qualified_name drop_behavior_opt
-  | DROP DATABASE if_exists_opt qualified_name
+  | DROP DATABASE if_exists_opt qualified_name drop_database_force_opt
   | DROP EXTENSION if_exists_opt qualified_name drop_behavior_opt
+  ;
+
+drop_database_force_opt:
+    /* empty */
+  | WITH LPAREN IDENT RPAREN
   ;
 
 dml_statement:

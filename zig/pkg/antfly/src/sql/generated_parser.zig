@@ -130,6 +130,13 @@ pub const GeneratedSqlDdlAst = struct {
     kind: GeneratedSqlDdlKind,
     statement_span: token_mod.SourceSpan,
     command_span: token_mod.SourceSpan,
+    object_name_tokens: ?GeneratedSqlTokenRange = null,
+    schema_name_tokens: ?GeneratedSqlTokenRange = null,
+    version_tokens: ?GeneratedSqlTokenRange = null,
+    if_not_exists: bool = false,
+    if_exists: bool = false,
+    cascade: bool = false,
+    force: bool = false,
 };
 
 pub const GeneratedSqlDmlAst = struct {
@@ -476,11 +483,7 @@ fn buildGeneratedAst(tokens: []const token_mod.Token, statement: GeneratedSqlSta
             .command_span = command_span,
         } },
         .prepared => |kind| .{ .prepared = buildPreparedAst(tokens, end, kind, statement_span, command_span) },
-        .ddl => |kind| .{ .ddl = .{
-            .kind = kind,
-            .statement_span = statement_span,
-            .command_span = command_span,
-        } },
+        .ddl => |kind| .{ .ddl = buildDdlAst(tokens, end, kind, statement_span, command_span) },
         .dml => |kind| .{ .dml = .{
             .kind = kind,
             .statement_span = statement_span,
@@ -565,10 +568,100 @@ fn buildPreparedAst(
     return ast;
 }
 
+fn buildDdlAst(
+    tokens: []const token_mod.Token,
+    end: usize,
+    kind: GeneratedSqlDdlKind,
+    statement_span: token_mod.SourceSpan,
+    command_span: token_mod.SourceSpan,
+) GeneratedSqlDdlAst {
+    var ast = GeneratedSqlDdlAst{
+        .kind = kind,
+        .statement_span = statement_span,
+        .command_span = command_span,
+    };
+    var index: usize = 2;
+    switch (kind) {
+        .create_database => {
+            ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
+        },
+        .create_schema => {
+            ast.if_not_exists = consumeGeneratedIfNotExists(tokens, &index, end);
+            ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
+        },
+        .create_extension => {
+            ast.if_not_exists = consumeGeneratedIfNotExists(tokens, &index, end);
+            ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
+            if (ast.object_name_tokens) |_| index += 1;
+            if (index < end and tokens[index].matchesKeywordTag(.with)) index += 1;
+            if (index + 1 < end and tokens[index].matchesKeywordTag(.schema)) {
+                ast.schema_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index + 1, end);
+                index += 2;
+            }
+            if (index + 1 < end and tokens[index].matchesKeyword("version") and tokens[index + 1].kind == .string) {
+                ast.version_tokens = .{ .start = index + 1, .end = index + 2 };
+            }
+        },
+        .drop_database => {
+            ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
+            ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
+            if (findKeywordText(tokens, index + 1, end, "force") != null) ast.force = true;
+        },
+        .drop_schema => {
+            ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
+            ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
+            ast.cascade = findKeyword(tokens, index + 1, end, .cascade) != null;
+        },
+        .drop_extension => {
+            ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
+            ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
+            ast.cascade = findKeyword(tokens, index + 1, end, .cascade) != null;
+        },
+        else => {},
+    }
+    return ast;
+}
+
+fn consumeGeneratedIfNotExists(tokens: []const token_mod.Token, index: *usize, end: usize) bool {
+    if (index.* + 2 >= end) return false;
+    if (!tokens[index.*].matchesKeywordTag(.@"if") or
+        !tokens[index.* + 1].matchesKeywordTag(.not) or
+        !tokens[index.* + 2].matchesKeywordTag(.exists))
+    {
+        return false;
+    }
+    index.* += 3;
+    return true;
+}
+
+fn consumeGeneratedIfExists(tokens: []const token_mod.Token, index: *usize, end: usize) bool {
+    if (index.* + 1 >= end) return false;
+    if (!tokens[index.*].matchesKeywordTag(.@"if") or
+        !tokens[index.* + 1].matchesKeywordTag(.exists))
+    {
+        return false;
+    }
+    index.* += 2;
+    return true;
+}
+
+fn generatedSingleTokenRangeIfIdentifier(tokens: []const token_mod.Token, index: usize, end: usize) ?GeneratedSqlTokenRange {
+    if (index >= end or tokens[index].kind != .identifier) return null;
+    return .{ .start = index, .end = index + 1 };
+}
+
 fn findKeyword(tokens: []const token_mod.Token, start: usize, end: usize, keyword: token_mod.TokenKeyword) ?usize {
     var index = start;
     while (index < end) : (index += 1) {
         if (tokens[index].matchesKeywordTag(keyword)) return index;
+    }
+    return null;
+}
+
+fn findKeywordText(tokens: []const token_mod.Token, start: usize, end: usize, keyword: []const u8) ?usize {
+    var index = start;
+    while (index < end) : (index += 1) {
+        if (tokens[index].matchesKeyword(keyword)) return index;
     }
     return null;
 }
@@ -667,6 +760,33 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlDdlKind.create_schema, ddl.kind);
             try std.testing.expectEqualStrings("CREATE SCHEMA IF NOT EXISTS analytics", spanText(ddl_sql, ddl.statement_span));
             try std.testing.expectEqualStrings("CREATE", spanText(ddl_sql, ddl.command_span));
+            try std.testing.expect(ddl.if_not_exists);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, ddl.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const extension_sql = "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public VERSION '1.3'";
+    const extension_result = try parseSqlAlloc(alloc, extension_sql);
+    switch (extension_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.create_extension, ddl.kind);
+            try std.testing.expect(ddl.if_not_exists);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, ddl.schema_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, ddl.version_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const drop_sql = "DROP DATABASE IF EXISTS tenant_ops WITH (FORCE)";
+    const drop_result = try parseSqlAlloc(alloc, drop_sql);
+    switch (drop_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.drop_database, ddl.kind);
+            try std.testing.expect(ddl.if_exists);
+            try std.testing.expect(ddl.force);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl.object_name_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

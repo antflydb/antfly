@@ -398,6 +398,9 @@ pub fn parseDdlPlanAlloc(
         }
         if (cursor.peekKeyword("graph")) {
             if (unique) return error.UnsupportedSqlShape;
+            if (pos.* + 1 < tokens.len and tokens[pos.* + 1].matchesKeyword("metric")) {
+                return .{ .create_index = try parseCreateGraphMetricPlanAlloc(alloc, tokens, pos) };
+            }
             return .{ .create_index = try parseCreateGraphIndexPlanAlloc(alloc, tokens, pos) };
         }
         if (unique) return error.UnsupportedSqlShape;
@@ -3048,6 +3051,19 @@ pub fn ddlPlanFromGeneratedAstAlloc(
     };
 }
 
+pub fn graphDdlPlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlGraphAst,
+) !LoweredDdlPlan {
+    const tail = generatedStatementTail(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    var pos: usize = 0;
+    return switch (ast.kind) {
+        .create_index => .{ .create_index = try parseCreateGraphIndexPlanAlloc(alloc, tail, &pos) },
+        .create_metric => .{ .create_index = try parseCreateGraphMetricPlanAlloc(alloc, tail, &pos) },
+    };
+}
+
 fn setSessionCatalogPlanFromGeneratedTailAlloc(alloc: std.mem.Allocator, tail: []const grammar.Token) !SessionCatalogPlan {
     var pos: usize = 0;
     if (parseSetSearchPathPlanTailAlloc(alloc, tail, &pos)) |plan| {
@@ -3101,11 +3117,248 @@ fn discardSessionCatalogPlanFromGeneratedTail(tail: []const grammar.Token) !Sess
     return .discard_all;
 }
 
-fn generatedStatementTail(tokens: []const grammar.Token, statement_span: token_mod.SourceSpan) ?[]const grammar.Token {
+fn createDatabasePlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+) !CreateDatabasePlan {
+    const end = try requireGeneratedDdlHeader(tokens, ast.statement_span, .create, .database);
+    const name_range = try requireGeneratedTokenRangeAt(ast.object_name_tokens, 2, end);
+    if (name_range.end != end) return error.UnsupportedSqlShape;
+    var syntax = grammar.CreateDatabaseSyntax{
+        .database_name = try generatedIdentifierAlloc(alloc, tokens, name_range),
+    };
+    errdefer syntax.deinit(alloc);
+    return createDatabasePlanFromSyntax(&syntax);
+}
+
+fn createSchemaNamespacePlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+) !CreateSchemaNamespacePlan {
+    const end = try requireGeneratedDdlHeader(tokens, ast.statement_span, .create, .schema);
+    var index: usize = 2;
+    if (ast.if_not_exists) try expectGeneratedIfNotExists(tokens, &index, end);
+    const name_range = try requireGeneratedTokenRangeAt(ast.object_name_tokens, index, end);
+    if (name_range.end != end) return error.UnsupportedSqlShape;
+    var syntax = grammar.CreateSchemaNamespaceSyntax{
+        .schema_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, name_range),
+        .if_not_exists = ast.if_not_exists,
+    };
+    errdefer syntax.deinit(alloc);
+    return createSchemaNamespacePlanFromSyntax(&syntax);
+}
+
+fn createExtensionPlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+    default_namespace_name: []const u8,
+) !CreateExtensionPlan {
+    const end = try requireGeneratedDdlHeader(tokens, ast.statement_span, .create, .extension);
+    var index: usize = 2;
+    if (ast.if_not_exists) try expectGeneratedIfNotExists(tokens, &index, end);
+    const extension_range = try requireGeneratedTokenRangeAt(ast.object_name_tokens, index, end);
+    index = extension_range.end;
+
+    var schema_name: ?[]const u8 = null;
+    var schema_transferred = false;
+    errdefer if (!schema_transferred) if (schema_name) |owned| alloc.free(@constCast(owned));
+    if (ast.schema_name_tokens) |schema_range| {
+        if (index < end and tokens[index].matchesKeywordTag(.with)) index += 1;
+        if (index >= end or !tokens[index].matchesKeywordTag(.schema)) return error.UnsupportedSqlShape;
+        index += 1;
+        if (schema_range.start != index or schema_range.end != index + 1) return error.UnsupportedSqlShape;
+        schema_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, schema_range);
+        index = schema_range.end;
+    }
+
+    var version: ?[]const u8 = null;
+    var version_transferred = false;
+    errdefer if (!version_transferred) if (version) |owned| alloc.free(@constCast(owned));
+    if (ast.version_tokens) |version_range| {
+        if (index >= end or !tokens[index].matchesKeyword("version")) return error.UnsupportedSqlShape;
+        index += 1;
+        if (version_range.start != index or version_range.end != index + 1) return error.UnsupportedSqlShape;
+        version = try generatedStringLiteralValueAlloc(alloc, tokens, version_range);
+        index = version_range.end;
+    }
+    if (index != end) return error.UnsupportedSqlShape;
+
+    var syntax = grammar.CreateExtensionSyntax{
+        .extension_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, extension_range),
+        .schema_name = schema_name,
+        .version = version,
+        .if_not_exists = ast.if_not_exists,
+    };
+    schema_transferred = true;
+    version_transferred = true;
+    defer syntax.deinit(alloc);
+    return try createExtensionPlanFromSyntax(&syntax, default_namespace_name);
+}
+
+fn dropDatabasePlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+) !DropDatabasePlan {
+    const end = try requireGeneratedDdlHeader(tokens, ast.statement_span, .drop, .database);
+    var index: usize = 2;
+    if (ast.if_exists) try expectGeneratedIfExists(tokens, &index, end);
+    const name_range = try requireGeneratedTokenRangeAt(ast.object_name_tokens, index, end);
+    index = name_range.end;
+    if (ast.force) {
+        if (index + 4 > end or
+            !tokens[index].matchesKeywordTag(.with) or
+            tokens[index + 1].kind != .lparen or
+            !tokens[index + 2].matchesKeyword("force") or
+            tokens[index + 3].kind != .rparen)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        index += 4;
+    }
+    if (index != end) return error.UnsupportedSqlShape;
+    var syntax = grammar.DropDatabaseSyntax{
+        .database_name = try generatedIdentifierAlloc(alloc, tokens, name_range),
+        .if_exists = ast.if_exists,
+        .force = ast.force,
+    };
+    errdefer syntax.deinit(alloc);
+    return dropDatabasePlanFromSyntax(&syntax);
+}
+
+fn dropSchemaNamespacePlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+) !DropSchemaNamespacePlan {
+    const end = try requireGeneratedDdlHeader(tokens, ast.statement_span, .drop, .schema);
+    var index: usize = 2;
+    if (ast.if_exists) try expectGeneratedIfExists(tokens, &index, end);
+    const name_range = try requireGeneratedTokenRangeAt(ast.object_name_tokens, index, end);
+    index = name_range.end;
+    if (ast.cascade) {
+        if (index >= end or !tokens[index].matchesKeywordTag(.cascade)) return error.UnsupportedSqlShape;
+        index += 1;
+    } else if (index < end and tokens[index].matchesKeywordTag(.restrict)) {
+        index += 1;
+    }
+    if (index != end) return error.UnsupportedSqlShape;
+    var syntax = grammar.DropSchemaNamespaceSyntax{
+        .schema_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, name_range),
+        .if_exists = ast.if_exists,
+        .cascade = ast.cascade,
+    };
+    errdefer syntax.deinit(alloc);
+    return dropSchemaNamespacePlanFromSyntax(&syntax);
+}
+
+fn dropExtensionPlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+) !DropExtensionPlan {
+    const end = try requireGeneratedDdlHeader(tokens, ast.statement_span, .drop, .extension);
+    var index: usize = 2;
+    if (ast.if_exists) try expectGeneratedIfExists(tokens, &index, end);
+    const name_range = try requireGeneratedTokenRangeAt(ast.object_name_tokens, index, end);
+    index = name_range.end;
+    if (ast.cascade) {
+        if (index >= end or !tokens[index].matchesKeywordTag(.cascade)) return error.UnsupportedSqlShape;
+        index += 1;
+    } else if (index < end and tokens[index].matchesKeywordTag(.restrict)) {
+        index += 1;
+    }
+    if (index != end) return error.UnsupportedSqlShape;
+    var syntax = grammar.DropExtensionSyntax{
+        .extension_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, name_range),
+        .if_exists = ast.if_exists,
+        .cascade = ast.cascade,
+    };
+    errdefer syntax.deinit(alloc);
+    return dropExtensionPlanFromSyntax(&syntax);
+}
+
+fn requireGeneratedDdlHeader(
+    tokens: []const grammar.Token,
+    statement_span: token_mod.SourceSpan,
+    first: token_mod.TokenKeyword,
+    second: token_mod.TokenKeyword,
+) !usize {
+    const end = generatedStatementEnd(tokens, statement_span) orelse return error.UnsupportedSqlShape;
+    if (end < 3 or !tokens[0].matchesKeywordTag(first) or !tokens[1].matchesKeywordTag(second)) return error.UnsupportedSqlShape;
+    return end;
+}
+
+fn requireGeneratedTokenRangeAt(
+    maybe_range: ?generated_parser.GeneratedSqlTokenRange,
+    start: usize,
+    end: usize,
+) !generated_parser.GeneratedSqlTokenRange {
+    const range = maybe_range orelse return error.UnsupportedSqlShape;
+    if (range.start != start or range.end != start + 1 or range.end > end) return error.UnsupportedSqlShape;
+    return range;
+}
+
+fn expectGeneratedIfNotExists(tokens: []const grammar.Token, index: *usize, end: usize) !void {
+    if (index.* + 3 > end or
+        !tokens[index.*].matchesKeywordTag(.@"if") or
+        !tokens[index.* + 1].matchesKeywordTag(.not) or
+        !tokens[index.* + 2].matchesKeywordTag(.exists))
+    {
+        return error.UnsupportedSqlShape;
+    }
+    index.* += 3;
+}
+
+fn expectGeneratedIfExists(tokens: []const grammar.Token, index: *usize, end: usize) !void {
+    if (index.* + 2 > end or
+        !tokens[index.*].matchesKeywordTag(.@"if") or
+        !tokens[index.* + 1].matchesKeywordTag(.exists))
+    {
+        return error.UnsupportedSqlShape;
+    }
+    index.* += 2;
+}
+
+fn generatedIdentifierAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) ![]const u8 {
+    return try alloc.dupe(u8, try generatedSingleIdentifierText(tokens, range));
+}
+
+fn generatedSqlObjectIdentifierAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) ![]const u8 {
+    return try grammar.normalizeSqlObjectIdentifierAlloc(alloc, try generatedSingleIdentifierText(tokens, range));
+}
+
+fn generatedStringLiteralValueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) ![]const u8 {
+    if (range.end != range.start + 1 or range.end > tokens.len) return error.UnsupportedSqlShape;
+    if (tokens[range.start].kind != .string) return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, tokens[range.start].text);
+}
+
+fn generatedStatementEnd(tokens: []const grammar.Token, statement_span: token_mod.SourceSpan) ?usize {
     if (tokens.len == 0) return null;
     var end = tokens.len;
     while (end > 0 and tokens[end - 1].kind == .semicolon) end -= 1;
     if (end == 0 or tokens[0].source_start != statement_span.start or tokens[end - 1].source_end != statement_span.end) return null;
+    return end;
+}
+
+fn generatedStatementTail(tokens: []const grammar.Token, statement_span: token_mod.SourceSpan) ?[]const grammar.Token {
+    const end = generatedStatementEnd(tokens, statement_span) orelse return null;
     return tokens[1..end];
 }
 
@@ -5057,6 +5310,44 @@ pub fn parseAlterGraphIndexAddMetricPlanAlloc(
     };
 }
 
+pub fn parseCreateGraphMetricPlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !CreateIndexPlan {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("graph");
+    try cursor.expectKeyword("metric");
+    const metric_name = try grammar.parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var metric_transferred = false;
+    errdefer if (!metric_transferred) alloc.free(metric_name);
+    try cursor.expectKeyword("on");
+    const graph_index = try grammar.parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    defer alloc.free(graph_index);
+
+    const config_json = try createGraphMetricIndexConfigJsonAlloc(alloc, tokens, pos, graph_index, metric_name);
+    var config_transferred = false;
+    errdefer if (!config_transferred) alloc.free(config_json);
+    try grammar.parseAdapterNoopStatementEnd(tokens, pos);
+
+    const table_name = try alloc.dupe(u8, "");
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+
+    metric_transferred = true;
+    config_transferred = true;
+    table_transferred = true;
+    return .{
+        .index_name = metric_name,
+        .table_name = table_name,
+        .if_not_exists = false,
+        .unique = false,
+        .method = .antfly_graph_metric,
+        .columns = &.{},
+        .derived_index_config_json = config_json,
+    };
+}
+
 pub fn parseCreateIndexPlanAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
@@ -5679,6 +5970,46 @@ fn graphMetricIndexConfigJsonAlloc(
 
     for (options) |option| {
         if (std.ascii.eqlIgnoreCase(option.name, "metric_freshness") or
+            std.ascii.eqlIgnoreCase(option.name, "publish"))
+        {
+            continue;
+        }
+        try appendJsonOptionField(alloc, &out, &first, option);
+    }
+
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn createGraphMetricIndexConfigJsonAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    graph_index: []const u8,
+    metric_name: []const u8,
+) ![]u8 {
+    const options = try parseDerivedIndexOptionsAlloc(alloc, tokens, pos);
+    defer freeDerivedIndexOptions(alloc, options);
+    if (derivedIndexOption(options, "graph_index") != null) return error.UnsupportedSqlShape;
+    if (derivedIndexOption(options, "metric") != null and derivedIndexOption(options, "algorithm") != null) return error.UnsupportedSqlShape;
+    const algorithm = derivedIndexOptionString(options, "metric") orelse
+        derivedIndexOptionString(options, "algorithm") orelse return error.UnsupportedSqlShape;
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '{');
+    var first = true;
+    try appendJsonStringField(alloc, &out, &first, "type", "graph_metric");
+    try appendJsonStringField(alloc, &out, &first, "graph_index", graph_index);
+    try appendJsonStringField(alloc, &out, &first, "metric", metric_name);
+    try appendJsonStringField(alloc, &out, &first, "algorithm", algorithm);
+    try appendJsonStringField(alloc, &out, &first, "metric_freshness", derivedIndexOptionString(options, "metric_freshness") orelse "published");
+    try appendJsonStringField(alloc, &out, &first, "publish", derivedIndexOptionString(options, "publish") orelse "after_max_iterations");
+
+    for (options) |option| {
+        if (std.ascii.eqlIgnoreCase(option.name, "metric") or
+            std.ascii.eqlIgnoreCase(option.name, "algorithm") or
+            std.ascii.eqlIgnoreCase(option.name, "metric_freshness") or
             std.ascii.eqlIgnoreCase(option.name, "publish"))
         {
             continue;
@@ -11911,6 +12242,87 @@ test "sql adapter generated simple DDL AST lowers to catalog plans" {
             else => return error.TestUnexpectedResult,
         }
     }
+
+    var generated_create_database = try generatedSimpleDdlPlanForTestAlloc(alloc, "CREATE DATABASE tenant_ops;");
+    defer generated_create_database.deinit(alloc);
+    switch (generated_create_database) {
+        .database_catalog => |catalog| switch (catalog) {
+            .create => |plan| try std.testing.expectEqualStrings("tenant_ops", plan.database_name),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var generated_drop_database = try generatedSimpleDdlPlanForTestAlloc(alloc, "DROP DATABASE IF EXISTS tenant_ops WITH (FORCE);");
+    defer generated_drop_database.deinit(alloc);
+    switch (generated_drop_database) {
+        .database_catalog => |catalog| switch (catalog) {
+            .drop => |plan| {
+                try std.testing.expectEqualStrings("tenant_ops", plan.database_name);
+                try std.testing.expect(plan.if_exists);
+                try std.testing.expect(plan.force);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var generated_create_schema = try generatedSimpleDdlPlanForTestAlloc(alloc, "CREATE SCHEMA IF NOT EXISTS public.analytics;");
+    defer generated_create_schema.deinit(alloc);
+    switch (generated_create_schema) {
+        .schema_namespace_catalog => |catalog| switch (catalog) {
+            .create => |plan| {
+                try std.testing.expectEqualStrings("analytics", plan.schema_name);
+                try std.testing.expect(plan.if_not_exists);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var generated_drop_schema = try generatedSimpleDdlPlanForTestAlloc(alloc, "DROP SCHEMA IF EXISTS analytics RESTRICT;");
+    defer generated_drop_schema.deinit(alloc);
+    switch (generated_drop_schema) {
+        .schema_namespace_catalog => |catalog| switch (catalog) {
+            .drop => |plan| {
+                try std.testing.expectEqualStrings("analytics", plan.schema_name);
+                try std.testing.expect(plan.if_exists);
+                try std.testing.expect(!plan.cascade);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var generated_create_extension = try generatedSimpleDdlPlanForTestAlloc(alloc, "CREATE EXTENSION postgis VERSION '3.4.0';");
+    defer generated_create_extension.deinit(alloc);
+    switch (generated_create_extension) {
+        .extension_catalog => |catalog| switch (catalog) {
+            .create => |plan| {
+                try std.testing.expectEqualStrings("postgis", plan.extension_name);
+                try std.testing.expectEqualStrings("3.4.0", plan.version.?);
+                try std.testing.expect(!plan.if_not_exists);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var generated_drop_extension = try generatedSimpleDdlPlanForTestAlloc(alloc, "DROP EXTENSION IF EXISTS postgis CASCADE;");
+    defer generated_drop_extension.deinit(alloc);
+    switch (generated_drop_extension) {
+        .extension_catalog => |catalog| switch (catalog) {
+            .drop => |plan| {
+                try std.testing.expectEqualStrings("postgis", plan.extension_name);
+                try std.testing.expect(plan.if_exists);
+                try std.testing.expect(plan.cascade);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.UnsupportedSqlShape, generatedSimpleDdlPlanForTestAlloc(alloc, "CREATE DATABASE tenant_ops WITH OWNER app;"));
 }
 
 test "sql adapter generated create table and index AST lowers to DDL plans" {
@@ -12312,6 +12724,61 @@ fn generatedDdlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !Lowe
         .create_index_options = parser_context.ParserState.ContextAccessors.createIndexOptions(&state),
         .row_security_policy_options = parser_context.ParserState.ContextAccessors.rowSecurityPolicyOptions(&state),
     });
+}
+
+fn generatedGraphDdlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !LoweredDdlPlan {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    const generated_raw = parsed.generated_statement orelse return error.UnsupportedSqlShape;
+    const graph_ast = switch (generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .graph => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    return try graphDdlPlanFromGeneratedAstAlloc(alloc, parsed.items(), graph_ast);
+}
+
+test "sql adapter ddl plan lowers generated graph AST into typed index plans" {
+    const alloc = std.testing.allocator;
+
+    const graph_index_sql = "CREATE GRAPH INDEX docs_edge_graph_syntax ON doc_edges EDGE (source_doc -> target_doc) TYPE edge_type WEIGHT confidence WITH (edge_policy = 'all');";
+    var legacy_graph_index = try lowerDdlPlanForTestAlloc(alloc, graph_index_sql);
+    defer legacy_graph_index.deinit(alloc);
+    var generated_graph_index = try generatedGraphDdlPlanForTestAlloc(alloc, graph_index_sql);
+    defer generated_graph_index.deinit(alloc);
+    switch (generated_graph_index) {
+        .create_index => |generated| switch (legacy_graph_index) {
+            .create_index => |legacy| {
+                try std.testing.expectEqual(legacy.method, generated.method);
+                try std.testing.expectEqualStrings(legacy.index_name, generated.index_name);
+                try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
+                try std.testing.expectEqual(@as(usize, 2), generated.columns.len);
+                try std.testing.expectEqualStrings(legacy.columns[0], generated.columns[0]);
+                try std.testing.expectEqualStrings(legacy.columns[1], generated.columns[1]);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const graph_metric_sql = "CREATE GRAPH METRIC docs_pagerank ON docs_edge_graph WITH (metric = 'pagerank', damping = 0.85, max_iterations = 40);";
+    var generated_graph_metric = try generatedGraphDdlPlanForTestAlloc(alloc, graph_metric_sql);
+    defer generated_graph_metric.deinit(alloc);
+    switch (generated_graph_metric) {
+        .create_index => |generated| {
+            try std.testing.expectEqual(DdlIndexMethod.antfly_graph_metric, generated.method);
+            try std.testing.expectEqualStrings("docs_pagerank", generated.index_name);
+            try std.testing.expectEqualStrings("", generated.table_name);
+            try std.testing.expectEqual(@as(usize, 0), generated.columns.len);
+            const config = generated.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"type\":\"graph_metric\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"graph_index\":\"docs_edge_graph\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"metric\":\"docs_pagerank\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"algorithm\":\"pagerank\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"damping\":0.85") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"max_iterations\":40") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "sql adapter ddl plan lowers routine expression bindings into ddl plans" {
