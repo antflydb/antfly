@@ -130,7 +130,9 @@ if the generated read family is incompatible with the existing read classifier.
 Simple query, aggregate, join, and lateral reads now validate
 generated clause ranges before calling their typed read-plan lowerers directly;
 single binary join reads also validate generated join-tree metadata against the
-typed join lowerer before producing a join plan;
+typed join lowerer before producing a join plan, and generated join reads now
+fail closed on malformed left-associative tree metadata, first-join
+compatibility metadata, and `ON`/`USING` condition payloads;
 basic `OVER (PARTITION BY ... ORDER BY ...)` window reads now classify as a
 generated window family, minimal named `WINDOW ... AS (PARTITION BY ... ORDER
 BY ...)` clauses are accepted and ranged, seed `ROWS`/`RANGE` frame tails are
@@ -346,7 +348,10 @@ Suggested migration order:
    validation, and aggregate, join, and lateral reads now have direct generated
    AST-to-read-family dispatch boundaries after clause-range validation.
    Single binary join reads now validate generated join-tree metadata against
-   the typed join lowerer before producing a join plan.
+   the typed join lowerer before producing a join plan, and generated join
+   reads reject malformed left-associative tree root/depth/index/child
+   metadata, first-join compatibility fields, and `ON`/`USING` condition
+   payloads before invoking typed join lowering.
    Basic `OVER (PARTITION BY ... ORDER BY ...)` and named
    `WINDOW ... AS (PARTITION BY ... ORDER BY ...)` reads now classify as
    generated window reads, seed `ROWS`/`RANGE` frame tails are accepted in
@@ -377,9 +382,9 @@ Suggested migration order:
    grouping, and ordering expression planning semantics beyond the current
    validated owned expression item arrays, exact child/list expression span
    checks, and expression-kind structural checks, full multi-join
-   planning/lowering and richer
-   join-tree semantics beyond the current validated left-associative generated
-   join nodes, expression AST planning/lowering beyond the current recursive
+   planning/lowering and richer join-tree semantics beyond the current
+   validated left-associative generated join nodes, expression AST
+   planning/lowering beyond the current recursive
    predicate/operator metadata and structural checks, broader function
    coverage, broader boolean expression-tree coverage, quantified subquery
    planning/lowering, remaining specialized expression operators, recursive
