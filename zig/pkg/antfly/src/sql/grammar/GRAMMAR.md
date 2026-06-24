@@ -132,7 +132,7 @@ single- and multi-CTE reads now expose generated CTE-list, first-CTE, and
 last-CTE name/body ranges, recursive CTE reads carry an explicit generated
 recursive flag, and simple non-recursive CTE reads dispatch directly when those
 ranges validate; generated pagination grammar now covers `LIMIT`, `OFFSET`,
-and `FETCH FIRST`/`FETCH NEXT` query tails.
+and `FETCH FIRST`/`FETCH NEXT` query tails with count expression metadata.
 Unsupported read shapes
 still fall back, and deeper read cutover still requires full generated
 query-body AST payloads for expression-level projections and predicates,
@@ -291,12 +291,13 @@ Suggested migration order:
    CTE reads carry an explicit recursive flag; and simple non-recursive CTE
    reads dispatch to the typed read lowerer after validating those ranges.
    Generated pagination coverage now accepts and ranges `LIMIT`, `OFFSET`, and
-   `FETCH FIRST`/`FETCH NEXT` tails.
+   `FETCH FIRST`/`FETCH NEXT` tails with generated expression metadata for
+   `LIMIT`, `OFFSET`, and explicit fetch counts.
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, complete projection,
    grouping, and ordering expression arrays, full join-tree generated
-   query-body ASTs, full expression AST nodes beyond list-level and
-   simple-comparison/operator metadata, broader function
+   query-body ASTs, full pagination AST/lowering coverage, full expression AST
+   nodes beyond list-level and simple-comparison/operator metadata, broader function
    coverage, broader boolean expression-tree coverage, quantified subquery and
    array predicate coverage, per-CTE generated body arrays, recursive CTE
    planning, direct generated read-plan lowering, and

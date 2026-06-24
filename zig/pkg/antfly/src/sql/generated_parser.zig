@@ -269,8 +269,12 @@ pub const GeneratedSqlReadAst = struct {
     order_first_expression: GeneratedSqlExpressionAst = .{},
     order_last_expression: GeneratedSqlExpressionAst = .{},
     limit_tokens: ?GeneratedSqlTokenRange = null,
+    limit_expression: GeneratedSqlExpressionAst = .{},
     offset_tokens: ?GeneratedSqlTokenRange = null,
+    offset_expression: GeneratedSqlExpressionAst = .{},
     fetch_tokens: ?GeneratedSqlTokenRange = null,
+    fetch_count_tokens: ?GeneratedSqlTokenRange = null,
+    fetch_count_expression: GeneratedSqlExpressionAst = .{},
     set_operation_tokens: ?GeneratedSqlTokenRange = null,
 };
 
@@ -952,17 +956,57 @@ fn buildReadAst(
     }
     if (limit_index) |idx| {
         const limit_end = firstOptionalIndex(&[_]?usize{ offset_index, fetch_index }) orelse body_end;
-        if (idx + 1 < limit_end) ast.limit_tokens = .{ .start = idx + 1, .end = limit_end };
+        if (idx + 1 < limit_end) {
+            const limit_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = limit_end };
+            ast.limit_tokens = limit_tokens;
+            ast.limit_expression = buildGeneratedExpressionAst(tokens, limit_tokens);
+        }
     }
     if (offset_index) |idx| {
         const offset_end = firstOptionalIndex(&[_]?usize{fetch_index}) orelse body_end;
-        if (idx + 1 < offset_end) ast.offset_tokens = .{ .start = idx + 1, .end = offset_end };
+        if (idx + 1 < offset_end) {
+            const offset_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = offset_end };
+            ast.offset_tokens = offset_tokens;
+            if (generatedOffsetExpressionTokens(tokens, offset_tokens)) |expression_tokens| {
+                ast.offset_expression = buildGeneratedExpressionAst(tokens, expression_tokens);
+            }
+        }
     }
     if (fetch_index) |idx| {
-        if (idx + 1 < body_end) ast.fetch_tokens = .{ .start = idx + 1, .end = body_end };
+        if (idx + 1 < body_end) {
+            const fetch_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = body_end };
+            ast.fetch_tokens = fetch_tokens;
+            if (generatedFetchCountTokens(tokens, fetch_tokens)) |count_tokens| {
+                ast.fetch_count_tokens = count_tokens;
+                ast.fetch_count_expression = buildGeneratedExpressionAst(tokens, count_tokens);
+            }
+        }
     }
 
     return ast;
+}
+
+fn generatedOffsetExpressionTokens(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?GeneratedSqlTokenRange {
+    if (range.start >= range.end or range.end > tokens.len) return null;
+    var end = range.end;
+    if (end > range.start and (tokens[end - 1].matchesKeywordTag(.row) or tokens[end - 1].matchesKeywordTag(.rows))) {
+        end -= 1;
+    }
+    if (range.start >= end) return null;
+    return .{ .start = range.start, .end = end };
+}
+
+fn generatedFetchCountTokens(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?GeneratedSqlTokenRange {
+    if (range.start + 2 > range.end or range.end > tokens.len) return null;
+    if (!tokens[range.start].matchesKeywordTag(.first) and !tokens[range.start].matchesKeywordTag(.next)) return null;
+    var end = range.end;
+    if (end > range.start and tokens[end - 1].matchesKeywordTag(.only)) end -= 1;
+    if (end > range.start and (tokens[end - 1].matchesKeywordTag(.row) or tokens[end - 1].matchesKeywordTag(.rows))) {
+        end -= 1;
+    }
+    const start = range.start + 1;
+    if (start >= end) return null;
+    return .{ .start = start, .end = end };
 }
 
 fn generatedReadProjectionStart(
@@ -1817,6 +1861,8 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read.order_items.last_tokens.?);
             try std.testing.expectEqual(@as(usize, 1), read.order_items.count);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 14, .end = 15 }, read.limit_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.limit_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 14, .end = 15 }, read.limit_expression.tokens.?);
             try std.testing.expect(read.group_tokens == null);
             try std.testing.expect(read.having_tokens == null);
         },
@@ -2363,7 +2409,12 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.projection_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read.source_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 7 }, read.offset_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.offset_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.offset_expression.tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 12 }, read.fetch_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.fetch_count_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.fetch_count_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.fetch_count_expression.tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
