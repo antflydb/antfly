@@ -12475,7 +12475,21 @@ fn insertValuesFromGeneratedDmlAstAlloc(
     var returning: plan_mod.ReturningProjection = .{};
     defer returning.deinit(alloc);
     if (ast.returning_tokens) |returning_range| {
-        returning = try generatedReturningProjectionAlloc(alloc, tokens, returning_range, schema, table_name);
+        const parser_context = @import("parser_context.zig");
+        var parser_state = parser_context.ParserState{
+            .alloc = alloc,
+            .tokens = tokens,
+            .schema = schema,
+            .params = params,
+        };
+        returning = try generatedReturningProjectionAlloc(
+            alloc,
+            tokens,
+            returning_range,
+            schema,
+            table_name,
+            parser_context.ParserState.ContextAccessors.returningProjectionParserOptions(&parser_state),
+        );
     }
     const returning_expression_count = returning.expressions.len;
     const returning_all = returning.returnsAll();
@@ -12620,7 +12634,7 @@ fn updatePointFromGeneratedDmlAstAlloc(
     var returning: plan_mod.ReturningProjection = .{};
     defer returning.deinit(alloc);
     if (ast.returning_tokens) |returning_range| {
-        returning = try generatedReturningProjectionAlloc(alloc, tokens, returning_range, schema, table_name);
+        returning = try generatedReturningProjectionAlloc(alloc, tokens, returning_range, schema, table_name, parser_options.returning_hooks);
     }
     const returning_expression_count = returning.expressions.len;
     const returning_all = returning.returnsAll();
@@ -12705,7 +12719,7 @@ fn deletePointFromGeneratedDmlAstAlloc(
     var returning: plan_mod.ReturningProjection = .{};
     defer returning.deinit(alloc);
     if (ast.returning_tokens) |returning_range| {
-        returning = try generatedReturningProjectionAlloc(alloc, tokens, returning_range, schema, table_name);
+        returning = try generatedReturningProjectionAlloc(alloc, tokens, returning_range, schema, table_name, parser_options.returning_hooks);
     }
     const returning_expression_count = returning.expressions.len;
     const returning_all = returning.returnsAll();
@@ -12736,47 +12750,16 @@ fn generatedReturningProjectionAlloc(
     range: generated_parser.GeneratedSqlTokenRange,
     schema: runtime_schema.TableSchema,
     table_name: []const u8,
+    returning_hooks: lower_expr.ReturningProjectionParserOptions,
 ) !plan_mod.ReturningProjection {
     if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
     const scoped_tokens = tokens[0..range.end];
     const returning_qualifiers = [_][]const u8{table_name};
-    var fields = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer {
-        for (fields.items) |field| alloc.free(field);
-        fields.deinit(alloc);
-    }
-
-    var saw_all = false;
     var index = range.start;
-    while (index < range.end) {
-        if (parser.matchToken(scoped_tokens, &index, .star) != null or try binder.matchQualifiedReturningAll(alloc, scoped_tokens, &index, &returning_qualifiers)) {
-            if (saw_all or fields.items.len != 0) return error.UnsupportedSqlShape;
-            const field = try alloc.dupe(u8, "*");
-            var field_transferred = false;
-            errdefer if (!field_transferred) alloc.free(field);
-            try fields.append(alloc, field);
-            field_transferred = true;
-            saw_all = true;
-        } else {
-            if (saw_all or index >= range.end or tokens[index].kind != .identifier) return error.UnsupportedSqlShape;
-            const field = try binder.normalizeReturningFieldAlloc(alloc, schema, tokens[index].text, &returning_qualifiers);
-            var field_transferred = false;
-            errdefer if (!field_transferred) alloc.free(field);
-            index += 1;
-            try fields.append(alloc, field);
-            field_transferred = true;
-        }
-
-        if (index == range.end) break;
-        if (tokens[index].kind != .comma) return error.UnsupportedSqlShape;
-        index += 1;
-        if (index == range.end) return error.UnsupportedSqlShape;
-    }
-    if (fields.items.len == 0) return error.UnsupportedSqlShape;
-    return .{
-        .fields = try fields.toOwnedSlice(alloc),
-        .expressions = &.{},
-    };
+    var returning = try lower_expr.parseReturningProjectionAlloc(alloc, scoped_tokens, &index, schema, &returning_qualifiers, returning_hooks);
+    errdefer returning.deinit(alloc);
+    if (index != range.end) return error.UnsupportedSqlShape;
+    return returning;
 }
 
 fn generatedInsertColumnsAlloc(
@@ -13116,7 +13099,7 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
 
     var generated_insert_returning = try lowerGeneratedDmlWritePlanForDmlTestAlloc(
         alloc,
-        "INSERT INTO usage_records (id, status, organization_id, quantity) VALUES ('u5', 'ready', 'o3', 10) RETURNING id, status",
+        "INSERT INTO usage_records (id, status, organization_id, quantity) VALUES ('u5', 'ready', 'o3', 10) RETURNING id, lower(status) AS status_key",
         schema,
         &.{},
         resolver_free_options,
@@ -13125,18 +13108,18 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
     switch (generated_insert_returning) {
         .insert => |insert| {
             try std.testing.expectEqualStrings("usage_records", insert.table_name);
-            try std.testing.expectEqual(@as(usize, 0), insert.returning_expression_count);
+            try std.testing.expectEqual(@as(usize, 1), insert.returning_expression_count);
             try std.testing.expect(!insert.returning_all);
             try std.testing.expectEqual(@as(u32, 1), insert.batch.inserted);
             try std.testing.expectEqual(@as(usize, 1), insert.batch.returning_rows.len);
-            try std.testing.expectEqualStrings("{\"id\":\"u5\",\"status\":\"ready\"}", insert.batch.returning_rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"u5\",\"status_key\":\"ready\"}", insert.batch.returning_rows[0]);
         },
         else => return error.TestUnexpectedResult,
     }
 
     var parsed_generated_update = try tokenized.ParsedSql.initAlloc(
         alloc,
-        "UPDATE usage_records SET status = 'disabled' WHERE id = 'u1' RETURNING id",
+        "UPDATE usage_records SET status = 'disabled' WHERE id = 'u1' RETURNING id, lower(status) AS status_key",
     );
     defer parsed_generated_update.deinit(alloc);
     const generated_update_ast = switch ((parsed_generated_update.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
@@ -13155,11 +13138,11 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
     try std.testing.expectEqualStrings("usage_records", generated_update.table_name);
     try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, generated_update.sync_level);
     try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, generated_update.batch.req.sync_level);
-    try std.testing.expectEqual(@as(usize, 0), generated_update.returning_expression_count);
+    try std.testing.expectEqual(@as(usize, 1), generated_update.returning_expression_count);
     try std.testing.expect(!generated_update.returning_all);
     try std.testing.expectEqual(@as(u32, 1), generated_update.batch.transformed);
     try std.testing.expectEqual(@as(usize, 1), generated_update.batch.returning_rows.len);
-    try std.testing.expectEqualStrings("{\"id\":\"u1\"}", generated_update.batch.returning_rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status_key\":\"disabled\"}", generated_update.batch.returning_rows[0]);
 
     var parsed_generated_delete = try tokenized.ParsedSql.initAlloc(
         alloc,
