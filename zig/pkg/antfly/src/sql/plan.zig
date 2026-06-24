@@ -19,6 +19,7 @@ const classifier = @import("classifier.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const grammar = @import("grammar.zig");
+const generated_parser = @import("generated_parser.zig");
 const parser = @import("parser.zig");
 const query_function = @import("query_function.zig");
 const relational_rows = @import("../api/relational_rows.zig");
@@ -66,6 +67,10 @@ pub const SetOperationResultTail = struct {
     order_by: []const db_mod.types.RelationalRowsQueryOrder = &.{},
     limit: ?u32 = null,
     offset: u32 = 0,
+};
+
+const GeneratedLimitValue = struct {
+    value: ?u32,
 };
 
 pub const SelectList = struct {
@@ -1109,6 +1114,60 @@ pub const SimpleSelectSetTailHooks = struct {
     ) anyerror!void,
 };
 
+fn parseGeneratedLimitValueForClause(
+    tokens: []const Token,
+    keyword_index: usize,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !?GeneratedLimitValue {
+    const read = generated_read_ast orelse return null;
+    if (keyword_index >= tokens.len or !tokens[keyword_index].matchesKeywordTag(.limit)) return null;
+    const range = read.limit_tokens orelse return error.UnsupportedSqlShape;
+    if (range.start != pos.* or range.end > tokens.len) return error.UnsupportedSqlShape;
+    var generated_pos = range.start;
+    const limit = try value_mod.parseLimitValue(tokens, &generated_pos, params);
+    if (generated_pos != range.end) return error.UnsupportedSqlShape;
+    pos.* = range.end;
+    return .{ .value = limit };
+}
+
+fn parseGeneratedOffsetValueForClause(
+    tokens: []const Token,
+    keyword_index: usize,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !?u32 {
+    const read = generated_read_ast orelse return null;
+    if (keyword_index >= tokens.len or !tokens[keyword_index].matchesKeywordTag(.offset)) return null;
+    const range = read.offset_tokens orelse return error.UnsupportedSqlShape;
+    if (range.start != pos.* or range.end > tokens.len) return error.UnsupportedSqlShape;
+    var generated_pos = range.start;
+    const offset = try value_mod.parseOffsetValue(tokens, &generated_pos, params);
+    if (generated_pos != range.end) return error.UnsupportedSqlShape;
+    pos.* = range.end;
+    return offset;
+}
+
+fn parseGeneratedFetchLimitValueForClause(
+    tokens: []const Token,
+    keyword_index: usize,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !?GeneratedLimitValue {
+    const read = generated_read_ast orelse return null;
+    if (keyword_index >= tokens.len or !tokens[keyword_index].matchesKeywordTag(.fetch)) return null;
+    const range = read.fetch_tokens orelse return error.UnsupportedSqlShape;
+    if (range.start != pos.* or range.end > tokens.len) return error.UnsupportedSqlShape;
+    var generated_pos = range.start;
+    const limit = try value_mod.parseFetchLimitValue(tokens, &generated_pos, params);
+    if (generated_pos != range.end) return error.UnsupportedSqlShape;
+    pos.* = range.end;
+    return .{ .value = limit };
+}
+
 pub fn parseCtesForPlanAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -1444,6 +1503,7 @@ pub fn parseSetOperationResultTailAlloc(
     tokens: []const Token,
     pos: *usize,
     params: []const value_mod.SqlValue,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
     lowered: LoweredSelect,
     hooks: SimpleSelectSetTailHooks,
 ) !SetOperationResultTail {
@@ -1475,13 +1535,27 @@ pub fn parseSetOperationResultTailAlloc(
             }
         } else if (parser.matchKeywordTag(tokens, pos, .limit)) {
             if (limit != null) return error.UnsupportedSqlShape;
-            limit = try value_mod.parseLimitValue(tokens, pos, params);
+            const keyword_index = pos.* - 1;
+            if (try parseGeneratedLimitValueForClause(tokens, keyword_index, pos, params, generated_read_ast)) |generated_limit| {
+                limit = generated_limit.value;
+            } else {
+                limit = try value_mod.parseLimitValue(tokens, pos, params);
+            }
         } else if (parser.matchKeywordTag(tokens, pos, .offset)) {
             if (offset != 0) return error.UnsupportedSqlShape;
-            offset = try value_mod.parseOffsetValue(tokens, pos, params);
+            const keyword_index = pos.* - 1;
+            offset = if (try parseGeneratedOffsetValueForClause(tokens, keyword_index, pos, params, generated_read_ast)) |generated_offset|
+                generated_offset
+            else
+                try value_mod.parseOffsetValue(tokens, pos, params);
         } else if (parser.matchKeywordTag(tokens, pos, .fetch)) {
             if (limit != null) return error.UnsupportedSqlShape;
-            limit = try value_mod.parseFetchLimitValue(tokens, pos, params);
+            const keyword_index = pos.* - 1;
+            if (try parseGeneratedFetchLimitValueForClause(tokens, keyword_index, pos, params, generated_read_ast)) |generated_limit| {
+                limit = generated_limit.value;
+            } else {
+                limit = try value_mod.parseFetchLimitValue(tokens, pos, params);
+            }
         } else if (parser.matchToken(tokens, pos, .semicolon) != null) {
             if (!parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
         } else {

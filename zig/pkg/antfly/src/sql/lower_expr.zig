@@ -25412,11 +25412,21 @@ fn lowerSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
     params: []const value_mod.SqlValue,
     function_bindings: SqlFunctionBindings,
 ) !plan_mod.LoweredSetOperationPlan {
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerParsedSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(alloc, &parsed_sql, schema, params, function_bindings);
+}
+
+fn lowerParsedSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+    function_bindings: SqlFunctionBindings,
+) !plan_mod.LoweredSetOperationPlan {
     const parser_context = @import("parser_context.zig");
 
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
-    defer parsed_sql.deinit(alloc);
     const tokens = parsed_sql.items();
 
     var parser_state = parser_context.ParserState{
@@ -25424,6 +25434,7 @@ fn lowerSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
         .tokens = tokens,
         .schema = schema,
         .params = params,
+        .generated_read_ast = generatedReadAstForParsedSql(parsed_sql, .set_operation),
         .function_bindings = function_bindings,
     };
     return try plan_mod.parseSetOperationPlanAlloc(
@@ -28667,6 +28678,38 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
         alloc,
         &malformed_generated_pagination,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var set_operation = try lowerSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' UNION SELECT id FROM usage_records WHERE status = 'closed' ORDER BY id ASC LIMIT ALL OFFSET 2 ROWS",
+        schema,
+        &.{},
+        .{},
+    );
+    defer set_operation.deinit(alloc);
+    try std.testing.expect(set_operation.limit == null);
+    try std.testing.expectEqual(@as(u32, 2), set_operation.offset);
+
+    var malformed_generated_set_operation_pagination = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' UNION SELECT id FROM usage_records WHERE status = 'closed' LIMIT 10",
+    );
+    defer malformed_generated_set_operation_pagination.deinit(alloc);
+    if (malformed_generated_set_operation_pagination.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |*read| read.limit_tokens = .{ .start = 3, .end = 4 },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_set_operation_pagination,
         schema,
         &.{},
         .{},

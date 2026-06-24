@@ -993,6 +993,7 @@ fn lowerSetOperationPlanWithOptionalSourceSchemaParsedSqlAlloc(
         .schema = schema,
         .joined_source_schema = source_schema,
         .params = params,
+        .generated_read_ast = generatedReadAstForParsedSql(parsed_sql, .set_operation),
         .function_bindings = function_bindings,
     };
     return try sql_adapter.parseSetOperationPlanAlloc(

@@ -1482,7 +1482,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             lowered: plan.LoweredSelect,
         ) anyerror!plan.SetOperationResultTail {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
-            return try plan.parseSetOperationResultTailAlloc(self.alloc, self.tokens, &self.pos, self.params, lowered, Accessors.simpleSelectSetTailHooks(self));
+            return try plan.parseSetOperationResultTailAlloc(self.alloc, self.tokens, &self.pos, self.params, self.generated_read_ast, lowered, Accessors.simpleSelectSetTailHooks(self));
         }
 
         pub fn parseSimpleSelectSetTailOrderByHook(

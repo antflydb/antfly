@@ -147,8 +147,8 @@ non-recursive CTE reads dispatch directly when those ranges validate; generated 
 grammar now covers `LIMIT`, `OFFSET`, and `FETCH FIRST`/`FETCH NEXT` query
 tails with count expression metadata, and simple query, aggregate, join, and
 window pagination use generated range-validated lowering when generated read
-metadata is available; lateral read pagination now uses the same generated
-range validation on the typed lateral lowerer path.
+metadata is available; lateral and set-operation read pagination now use the
+same generated range validation on their typed lowerer paths.
 Unsupported read shapes
 still fall back, and deeper read cutover still requires full generated
 query-body AST payloads for expression-level projections and predicates,
@@ -355,15 +355,15 @@ Suggested migration order:
    `ROW`/`ROWS`, and `FETCH FIRST`/`FETCH NEXT` tails with optional fetch
    counts; generated metadata records limit expressions, the `LIMIT ALL`
    marker, offset expressions, and explicit fetch-count expressions, and
-   simple query, aggregate, join, lateral, and window pagination now use
-   generated range-validated lowering when generated read metadata is
+   simple query, aggregate, join, lateral, set-operation, and window pagination
+   now use generated range-validated lowering when generated read metadata is
    available.
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression AST semantics beyond the current owned
    expression item arrays, full multi-join planning/lowering and richer
    join-tree semantics beyond the current validated left-associative generated
-   join nodes, pagination cutover for the remaining read families, broader expression AST
+   join nodes, pagination cutover for remaining CTE read paths, broader expression AST
    nodes beyond the current recursive predicate/operator metadata, broader function
    coverage, broader boolean expression-tree coverage, quantified subquery
    planning/lowering, remaining specialized expression operators, recursive
