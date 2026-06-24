@@ -97,7 +97,8 @@ join operator/type, left input, right input, `ON` predicate ranges, and
 comparison expression metadata for covered `WHERE`, `HAVING`, and join
 predicates. Normal function-call argument
 lists are accepted in generated expression grammar, including top-level
-projection functions with comma-separated arguments, and positive `LIKE`,
+projection functions with comma-separated arguments, `*` aggregate arguments,
+and aggregate `FILTER (WHERE ...)` predicate metadata, and positive `LIKE`,
 `ILIKE`, `IN (...)`, and `BETWEEN ... AND ...` predicates are accepted and
 classified in generated expression metadata along with their `NOT` negated
 forms. `ANY`/`ALL`/`SOME` quantified comparison predicates over parenthesized
@@ -261,7 +262,8 @@ Suggested migration order:
    right input, `ON` predicate ranges, and `USING` column-list ranges, plus simple top-level comparison
    expression metadata for covered `WHERE`, `HAVING`, and join predicates; and
    normal function-call argument lists are accepted by the generated expression
-   grammar for covered read projections, and positive `LIKE`, `ILIKE`,
+   grammar for covered read projections, including `*` aggregate arguments and
+   aggregate `FILTER (WHERE ...)` predicate metadata, and positive `LIKE`, `ILIKE`,
    `IN (...)`, and `BETWEEN ... AND ...` predicates are accepted and classified
    in generated expression metadata along with their `NOT` negated forms.
    `ANY`/`ALL`/`SOME` quantified comparison predicates over parenthesized
