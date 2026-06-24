@@ -291,6 +291,20 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: gen
     for (ranges) |range| {
         if (range) |value| try validateGeneratedReadTokenRange(tokens, read_ast, value);
     }
+    try validateGeneratedReadListAstRanges(tokens, read_ast, read_ast.projection_items);
+    try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, read_ast.projection_first_expression);
+    try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, read_ast.projection_last_expression);
+    try validateGeneratedReadListAstRanges(tokens, read_ast, read_ast.group_items);
+    try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, read_ast.group_first_expression);
+    try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, read_ast.group_last_expression);
+    try validateGeneratedReadListAstRanges(tokens, read_ast, read_ast.order_items);
+    try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, read_ast.order_first_expression);
+    try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, read_ast.order_last_expression);
+    try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, read_ast.where_expression);
+    try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, read_ast.having_expression);
+    try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, read_ast.limit_expression);
+    try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, read_ast.offset_expression);
+    try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, read_ast.fetch_count_expression);
     for (read_ast.cte_items) |cte| {
         try validateGeneratedReadTokenRange(tokens, read_ast, cte.name_tokens);
         if (cte.body_tokens) |body_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_tokens);
@@ -301,6 +315,7 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: gen
         try validateGeneratedReadTokenRange(tokens, read_ast, join.left_tokens);
         try validateGeneratedReadTokenRange(tokens, read_ast, join.right_tokens);
         try validateGeneratedReadTokenRange(tokens, read_ast, join.predicate_tokens);
+        try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, join.predicate_expression);
     }
 
     switch (read_ast.kind) {
@@ -510,6 +525,195 @@ fn validateGeneratedReadRangePrecededByKeyword(
     keyword: token_mod.TokenKeyword,
 ) !void {
     if (range.start == 0 or !tokens[range.start - 1].matchesKeywordTag(keyword)) return error.UnsupportedSqlShape;
+}
+
+fn generatedExpressionAstHasMetadata(expression: generated_parser.GeneratedSqlExpressionAst) bool {
+    if (expression.tokens != null or
+        expression.inner_tokens != null or
+        expression.function_name_tokens != null or
+        expression.argument_tokens != null or
+        expression.argument_distinct_tokens != null or
+        expression.argument_value_tokens != null or
+        expression.argument_order_tokens != null or
+        expression.within_group_tokens != null or
+        expression.within_group_order_tokens != null or
+        expression.filter_tokens != null or
+        expression.filter_predicate_tokens != null or
+        expression.array_tokens != null or
+        expression.cast_expression_tokens != null or
+        expression.cast_type_tokens != null or
+        expression.case_first_when_tokens != null or
+        expression.case_last_when_tokens != null or
+        expression.case_first_condition_tokens != null or
+        expression.case_first_result_tokens != null or
+        expression.case_else_tokens != null or
+        expression.case_else_expression_tokens != null or
+        expression.interval_value_tokens != null or
+        expression.timestamp_type_tokens != null or
+        expression.timestamp_value_tokens != null or
+        expression.current_timestamp_precision_tokens != null or
+        expression.extract_field_tokens != null or
+        expression.extract_source_tokens != null or
+        expression.left_tokens != null or
+        expression.negation_tokens != null or
+        expression.operator_tokens != null or
+        expression.between_modifier_tokens != null or
+        expression.quantifier_tokens != null or
+        expression.right_tokens != null or
+        expression.escape_tokens != null)
+    {
+        return true;
+    }
+    return expression.inner_expression != null or
+        expression.left_expression != null or
+        expression.right_expression != null or
+        expression.filter_expression != null or
+        expression.escape_expression != null or
+        expression.cast_expression != null or
+        expression.case_first_condition != null or
+        expression.case_first_result != null or
+        expression.case_else_expression != null or
+        expression.argument_items.count != 0 or
+        expression.argument_order_items.count != 0 or
+        expression.within_group_order_items.count != 0 or
+        expression.array_items.count != 0;
+}
+
+fn validateGeneratedExpressionAstRangesIfPresent(
+    tokens: []const tokenized.Token,
+    read_ast: generated_parser.GeneratedSqlReadAst,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    if (!generatedExpressionAstHasMetadata(expression)) return;
+    try validateGeneratedExpressionAstRanges(tokens, read_ast, expression);
+}
+
+fn validateGeneratedExpressionAstRanges(
+    tokens: []const tokenized.Token,
+    read_ast: generated_parser.GeneratedSqlReadAst,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    const ranges = [_]?generated_parser.GeneratedSqlTokenRange{
+        expression.tokens,
+        expression.inner_tokens,
+        expression.function_name_tokens,
+        expression.argument_tokens,
+        expression.argument_distinct_tokens,
+        expression.argument_value_tokens,
+        expression.argument_order_tokens,
+        expression.within_group_tokens,
+        expression.within_group_order_tokens,
+        expression.filter_tokens,
+        expression.filter_predicate_tokens,
+        expression.array_tokens,
+        expression.cast_expression_tokens,
+        expression.cast_type_tokens,
+        expression.case_first_when_tokens,
+        expression.case_last_when_tokens,
+        expression.case_first_condition_tokens,
+        expression.case_first_result_tokens,
+        expression.case_else_tokens,
+        expression.case_else_expression_tokens,
+        expression.interval_value_tokens,
+        expression.timestamp_type_tokens,
+        expression.timestamp_value_tokens,
+        expression.current_timestamp_precision_tokens,
+        expression.extract_field_tokens,
+        expression.extract_source_tokens,
+        expression.left_tokens,
+        expression.negation_tokens,
+        expression.operator_tokens,
+        expression.between_modifier_tokens,
+        expression.quantifier_tokens,
+        expression.right_tokens,
+        expression.escape_tokens,
+    };
+    for (ranges) |range| {
+        if (range) |value| try validateGeneratedReadTokenRange(tokens, read_ast, value);
+    }
+    if (expression.inner_expression) |inner| try validateGeneratedExpressionAstRanges(tokens, read_ast, inner.*);
+    if (expression.left_expression) |left| try validateGeneratedExpressionAstRanges(tokens, read_ast, left.*);
+    if (expression.right_expression) |right| try validateGeneratedExpressionAstRanges(tokens, read_ast, right.*);
+    if (expression.filter_expression) |filter| try validateGeneratedExpressionAstRanges(tokens, read_ast, filter.*);
+    if (expression.escape_expression) |escape| try validateGeneratedExpressionAstRanges(tokens, read_ast, escape.*);
+    if (expression.cast_expression) |cast_expression| try validateGeneratedExpressionAstRanges(tokens, read_ast, cast_expression.*);
+    if (expression.case_first_condition) |case_first_condition| try validateGeneratedExpressionAstRanges(tokens, read_ast, case_first_condition.*);
+    if (expression.case_first_result) |case_first_result| try validateGeneratedExpressionAstRanges(tokens, read_ast, case_first_result.*);
+    if (expression.case_else_expression) |case_else_expression| try validateGeneratedExpressionAstRanges(tokens, read_ast, case_else_expression.*);
+    try validateGeneratedReadListAstRanges(tokens, read_ast, expression.argument_items);
+    try validateGeneratedReadListAstRanges(tokens, read_ast, expression.argument_order_items);
+    try validateGeneratedReadListAstRanges(tokens, read_ast, expression.within_group_order_items);
+    try validateGeneratedReadListAstRanges(tokens, read_ast, expression.array_items);
+}
+
+fn validateGeneratedReadListAstRanges(
+    tokens: []const tokenized.Token,
+    read_ast: generated_parser.GeneratedSqlReadAst,
+    list: generated_parser.GeneratedSqlListAst,
+) !void {
+    if (list.count == 0) {
+        if (list.items.len != 0 or
+            list.expression_items.len != 0 or
+            list.expressions.len != 0 or
+            list.first_tokens != null or
+            list.last_tokens != null)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        return;
+    }
+    if (list.items.len != list.count or list.expression_items.len != list.count) return error.UnsupportedSqlShape;
+    if (list.expressions.len != 0 and list.expressions.len != list.count) return error.UnsupportedSqlShape;
+    if (list.alias_items.len != 0 and list.alias_items.len != list.count) return error.UnsupportedSqlShape;
+    if (list.alias_name_items.len != 0 and list.alias_name_items.len != list.count) return error.UnsupportedSqlShape;
+    if (list.direction_items.len != 0 and list.direction_items.len != list.count) return error.UnsupportedSqlShape;
+    if (list.directions.len != 0 and list.directions.len != list.count) return error.UnsupportedSqlShape;
+    if (list.order_using_operator_items.len != 0 and list.order_using_operator_items.len != list.count) return error.UnsupportedSqlShape;
+    if (list.nulls_order_items.len != 0 and list.nulls_order_items.len != list.count) return error.UnsupportedSqlShape;
+    if (list.nulls_orders.len != 0 and list.nulls_orders.len != list.count) return error.UnsupportedSqlShape;
+
+    const first = list.first_tokens orelse return error.UnsupportedSqlShape;
+    const last = list.last_tokens orelse return error.UnsupportedSqlShape;
+    if (!std.meta.eql(first, list.items[0])) return error.UnsupportedSqlShape;
+    if (!std.meta.eql(last, list.items[list.items.len - 1])) return error.UnsupportedSqlShape;
+
+    for (list.items, 0..) |item, index| {
+        try validateGeneratedReadTokenRange(tokens, read_ast, item);
+        const expression_item = list.expression_items[index];
+        try validateGeneratedReadTokenRange(tokens, read_ast, expression_item);
+        if (expression_item.start < item.start or expression_item.end > item.end) return error.UnsupportedSqlShape;
+        if (list.alias_items.len != 0) {
+            if (list.alias_items[index]) |alias| {
+                try validateGeneratedReadTokenRange(tokens, read_ast, alias);
+                if (alias.start < item.start or alias.end > item.end) return error.UnsupportedSqlShape;
+            }
+        }
+        if (list.alias_name_items.len != 0) {
+            if (list.alias_name_items[index]) |alias_name| {
+                try validateGeneratedReadTokenRange(tokens, read_ast, alias_name);
+                if (alias_name.start < item.start or alias_name.end > item.end) return error.UnsupportedSqlShape;
+            }
+        }
+        if (list.direction_items.len != 0) {
+            if (list.direction_items[index]) |direction| {
+                try validateGeneratedReadTokenRange(tokens, read_ast, direction);
+                if (direction.start < item.start or direction.end > item.end) return error.UnsupportedSqlShape;
+            }
+        }
+        if (list.order_using_operator_items.len != 0) {
+            if (list.order_using_operator_items[index]) |operator| {
+                try validateGeneratedReadTokenRange(tokens, read_ast, operator);
+                if (operator.start < item.start or operator.end > item.end) return error.UnsupportedSqlShape;
+            }
+        }
+        if (list.nulls_order_items.len != 0) {
+            if (list.nulls_order_items[index]) |nulls_order| {
+                try validateGeneratedReadTokenRange(tokens, read_ast, nulls_order);
+                if (nulls_order.start < item.start or nulls_order.end > item.end) return error.UnsupportedSqlShape;
+            }
+        }
+        if (list.expressions.len != 0) try validateGeneratedExpressionAstRanges(tokens, read_ast, list.expressions[index]);
+    }
 }
 
 fn validateGeneratedReadOrderRange(tokens: []const tokenized.Token, range: generated_parser.GeneratedSqlTokenRange) !void {
@@ -1053,6 +1257,38 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &parsed_sql, read_ast),
+    );
+
+    var malformed_projection_list_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id, status FROM usage_records WHERE kind = 'order'",
+    );
+    defer malformed_projection_list_parsed_sql.deinit(alloc);
+    const malformed_projection_list_generated_raw = malformed_projection_list_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_projection_list_read_ast = switch (malformed_projection_list_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_projection_list_read_ast.projection_items.expression_items[0] = .{ .start = 2, .end = 2 };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_projection_list_parsed_sql, malformed_projection_list_read_ast),
+    );
+
+    var malformed_projection_alias_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id AS order_id, status FROM usage_records WHERE kind = 'order'",
+    );
+    defer malformed_projection_alias_parsed_sql.deinit(alloc);
+    const malformed_projection_alias_generated_raw = malformed_projection_alias_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_projection_alias_read_ast = switch (malformed_projection_alias_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_projection_alias_read_ast.projection_items.alias_items[0] = .{ .start = 1, .end = malformed_projection_alias_read_ast.projection_items.items[0].end + 1 };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_projection_alias_parsed_sql, malformed_projection_alias_read_ast),
     );
 
     var cte_parsed_sql = try tokenized.ParsedSql.initAlloc(

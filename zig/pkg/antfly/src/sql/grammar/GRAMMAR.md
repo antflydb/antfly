@@ -332,7 +332,9 @@ Suggested migration order:
    searched `CASE WHEN ... THEN ... ELSE ... END` branch metadata.
    Generated read ASTs now have a validated wrapper
    into the current typed read lowerer for representative covered read plans
-   that rejects malformed generated range payloads. Simple query reads now have
+   that rejects malformed generated range payloads, including owned
+   projection/group/order list item metadata and nested generated expression
+   range metadata. Simple query reads now have
    a direct generated AST-to-query-plan lowering boundary after clause-range
    validation, and aggregate, join, and lateral reads now have direct generated
    AST-to-read-family dispatch boundaries after clause-range validation.
@@ -365,8 +367,8 @@ Suggested migration order:
    lowering when generated read metadata is available.
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
-   grouping, and ordering expression AST semantics beyond the current owned
-   expression item arrays, full multi-join planning/lowering and richer
+   grouping, and ordering expression planning semantics beyond the current
+   validated owned expression item arrays, full multi-join planning/lowering and richer
    join-tree semantics beyond the current validated left-associative generated
    join nodes, broader expression AST
    nodes beyond the current recursive predicate/operator metadata, broader function
