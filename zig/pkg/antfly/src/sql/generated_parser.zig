@@ -149,6 +149,7 @@ pub const GeneratedSqlDmlAst = struct {
     source_tokens: ?GeneratedSqlTokenRange = null,
     assignments_tokens: ?GeneratedSqlTokenRange = null,
     where_tokens: ?GeneratedSqlTokenRange = null,
+    conflict_tokens: ?GeneratedSqlTokenRange = null,
     returning_tokens: ?GeneratedSqlTokenRange = null,
     additional_target_tokens: ?GeneratedSqlTokenRange = null,
     default_values: bool = false,
@@ -657,7 +658,12 @@ fn buildInsertDmlAst(tokens: []const token_mod.Token, end: usize, ast: *Generate
     var index: usize = 3;
     if (index + 1 < end and tokens[index].matchesKeywordTag(.default) and tokens[index + 1].matchesKeywordTag(.values)) {
         ast.default_values = true;
+        const conflict_index = findTopLevelKeywordSequence(tokens, index + 2, end, .on, .conflict);
         const returning_index = findTopLevelKeyword(tokens, index + 2, end, .returning) orelse end;
+        if (conflict_index) |idx| {
+            const conflict_end = if (returning_index < end) returning_index else end;
+            if (idx + 1 < conflict_end) ast.conflict_tokens = .{ .start = idx + 1, .end = conflict_end };
+        }
         if (returning_index < end) ast.returning_tokens = .{ .start = returning_index + 1, .end = end };
         return;
     }
@@ -668,12 +674,24 @@ fn buildInsertDmlAst(tokens: []const token_mod.Token, end: usize, ast: *Generate
         }
     }
     if (findTopLevelKeyword(tokens, index, end, .values)) |values_index| {
+        const conflict_index = findTopLevelKeywordSequence(tokens, values_index + 1, end, .on, .conflict);
         const returning_index = findTopLevelKeyword(tokens, values_index + 1, end, .returning) orelse end;
-        ast.values_tokens = .{ .start = values_index + 1, .end = returning_index };
+        const values_end = conflict_index orelse returning_index;
+        ast.values_tokens = .{ .start = values_index + 1, .end = values_end };
+        if (conflict_index) |idx| {
+            const conflict_end = if (returning_index < end) returning_index else end;
+            if (idx + 1 < conflict_end) ast.conflict_tokens = .{ .start = idx + 1, .end = conflict_end };
+        }
         if (returning_index < end) ast.returning_tokens = .{ .start = returning_index + 1, .end = end };
     } else if (findTopLevelKeyword(tokens, index, end, .select)) |select_index| {
+        const conflict_index = findTopLevelKeywordSequence(tokens, select_index + 1, end, .on, .conflict);
         const returning_index = findTopLevelKeyword(tokens, select_index + 1, end, .returning) orelse end;
-        ast.source_tokens = .{ .start = select_index, .end = returning_index };
+        const source_end = conflict_index orelse returning_index;
+        ast.source_tokens = .{ .start = select_index, .end = source_end };
+        if (conflict_index) |idx| {
+            const conflict_end = if (returning_index < end) returning_index else end;
+            if (idx + 1 < conflict_end) ast.conflict_tokens = .{ .start = idx + 1, .end = conflict_end };
+        }
         if (returning_index < end) ast.returning_tokens = .{ .start = returning_index + 1, .end = end };
     }
 }
@@ -806,6 +824,22 @@ fn findTopLevelKeyword(tokens: []const token_mod.Token, start: usize, end: usize
                 depth -= 1;
             },
             else => if (depth == 0 and tokens[index].matchesKeywordTag(keyword)) return index,
+        }
+    }
+    return null;
+}
+
+fn findTopLevelKeywordSequence(tokens: []const token_mod.Token, start: usize, end: usize, first: token_mod.TokenKeyword, second: token_mod.TokenKeyword) ?usize {
+    var depth: usize = 0;
+    var index = start;
+    while (index + 1 < end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth == 0) return null;
+                depth -= 1;
+            },
+            else => if (depth == 0 and tokens[index].matchesKeywordTag(first) and tokens[index + 1].matchesKeywordTag(second)) return index,
         }
     }
     return null;
@@ -991,6 +1025,19 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, dml.target_table_tokens.?);
             try std.testing.expect(dml.insert_columns_tokens == null);
             try std.testing.expect(dml.values_tokens == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const conflict_insert_sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'ready') ON CONFLICT (id) DO NOTHING RETURNING id";
+    const conflict_insert_result = try parseSqlAlloc(alloc, conflict_insert_sql);
+    switch (conflict_insert_result.ast.?) {
+        .dml => |dml| {
+            try std.testing.expectEqual(GeneratedSqlDmlKind.insert_values, dml.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 8 }, dml.insert_columns_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 14 }, dml.values_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 15, .end = 21 }, dml.conflict_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 22, .end = 23 }, dml.returning_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

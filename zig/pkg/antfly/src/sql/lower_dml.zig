@@ -12442,7 +12442,18 @@ fn insertValuesFromGeneratedDmlAstAlloc(
         if (returning_range.start == 0 or returning_range.start > returning_range.end or returning_range.end > end) return error.UnsupportedSqlShape;
         if (!tokens[returning_range.start - 1].matchesKeywordTag(.returning)) return error.UnsupportedSqlShape;
         break :blk returning_range.start - 1;
+    } else if (ast.conflict_tokens) |conflict_range| blk: {
+        if (conflict_range.start == 0 or conflict_range.start > conflict_range.end or conflict_range.end > end) return error.UnsupportedSqlShape;
+        if (!tokens[conflict_range.start - 1].matchesKeywordTag(.on) or !tokens[conflict_range.start].matchesKeywordTag(.conflict)) return error.UnsupportedSqlShape;
+        break :blk conflict_range.start - 1;
     } else end;
+    if (ast.conflict_tokens) |conflict_range| {
+        if (conflict_range.start == 0 or conflict_range.start > conflict_range.end or conflict_range.end > end) return error.UnsupportedSqlShape;
+        if (!tokens[conflict_range.start - 1].matchesKeywordTag(.on) or !tokens[conflict_range.start].matchesKeywordTag(.conflict)) return error.UnsupportedSqlShape;
+        if (ast.returning_tokens) |returning_range| {
+            if (conflict_range.end != returning_range.start - 1) return error.UnsupportedSqlShape;
+        } else if (conflict_range.end != end) return error.UnsupportedSqlShape;
+    }
 
     var columns: []const []const u8 = &.{};
     var owns_columns = false;
@@ -12459,6 +12470,7 @@ fn insertValuesFromGeneratedDmlAstAlloc(
     var default_row = [_][]const u8{};
     var default_rows = [_][]const []const u8{default_row[0..]};
     if (ast.default_values) {
+        if (ast.conflict_tokens != null) return error.UnsupportedSqlShape;
         if (ast.insert_columns_tokens != null or ast.values_tokens != null) return error.UnsupportedSqlShape;
         if (body_end != 5 or !tokens[3].matchesKeywordTag(.default) or !tokens[4].matchesKeywordTag(.values)) return error.UnsupportedSqlShape;
         rows = default_rows[0..];
@@ -12471,6 +12483,51 @@ fn insertValuesFromGeneratedDmlAstAlloc(
         const values_range = ast.values_tokens orelse return error.UnsupportedSqlShape;
         rows = try generatedInsertValueRowsAlloc(alloc, tokens, values_range, columns, schema, params);
         owns_rows = true;
+    }
+    var conflicts = std.ArrayListUnmanaged(ConflictClause).empty;
+    errdefer {
+        freeConflictClauses(alloc, conflicts.items);
+        conflicts.deinit(alloc);
+    }
+    var conflict_where = false;
+    if (ast.conflict_tokens) |conflict_range| {
+        const parser_context = @import("parser_context.zig");
+        var parser_state = parser_context.ParserState{
+            .alloc = alloc,
+            .tokens = tokens,
+            .schema = schema,
+            .params = params,
+            .unique_resolver = options.unique_resolver,
+        };
+        const insert_options = parser_context.ParserState.ContextAccessors.insertParserOptions(&parser_state);
+        const conflict_qualifiers = [_][]const u8{table_name};
+        const scoped_tokens = tokens[0..conflict_range.end];
+        var after_conflict_pos: ?usize = null;
+        for (rows) |row| {
+            var conflict_pos = conflict_range.start;
+            const conflict = try parseInsertConflictClauseAlloc(
+                alloc,
+                scoped_tokens,
+                &conflict_pos,
+                table_name,
+                &conflict_qualifiers,
+                columns,
+                row,
+                insert_options,
+            );
+            var conflict_transferred = false;
+            errdefer if (!conflict_transferred) freeConflictClause(alloc, conflict);
+            if (conflict.where_expression != null or conflict.where_expressions.len != 0 or conflict.where_any.len != 0 or conflict.where_not.len != 0) conflict_where = true;
+            try conflicts.append(alloc, conflict);
+            conflict_transferred = true;
+            if (conflict_pos != conflict_range.end) return error.UnsupportedSqlShape;
+            if (after_conflict_pos) |expected_pos| {
+                if (conflict_pos != expected_pos) return error.UnsupportedSqlShape;
+            } else {
+                after_conflict_pos = conflict_pos;
+            }
+        }
+        try rejectDuplicateConflictUpdateTargets(alloc, schema, columns, rows, conflicts.items);
     }
     var returning: plan_mod.ReturningProjection = .{};
     defer returning.deinit(alloc);
@@ -12494,9 +12551,12 @@ fn insertValuesFromGeneratedDmlAstAlloc(
     const returning_expression_count = returning.expressions.len;
     const returning_all = returning.returnsAll();
 
-    const body_json = try insertBodyJsonAlloc(alloc, columns, rows, &.{}, returning);
+    const body_json = try insertBodyJsonAlloc(alloc, columns, rows, conflicts.items, returning);
     defer alloc.free(body_json);
-    var batch = try relational_rows.parseRowsBatchRequest(alloc, body_json, schema);
+    var batch = if (conflicts.items.len != 0)
+        try relational_rows.parseRowsBatchRequestWithResolver(alloc, table_name, body_json, schema, options.unique_resolver orelse return error.UnsupportedRowsSelector)
+    else
+        try relational_rows.parseRowsBatchRequest(alloc, body_json, schema);
     errdefer batch.deinit(alloc);
     batch.req.sync_level = options.sync_level;
 
@@ -12510,6 +12570,8 @@ fn insertValuesFromGeneratedDmlAstAlloc(
         alloc.free(rows);
         owns_rows = false;
     }
+    freeConflictClauses(alloc, conflicts.items);
+    conflicts.deinit(alloc);
 
     table_transferred = true;
     return .{
@@ -12518,6 +12580,7 @@ fn insertValuesFromGeneratedDmlAstAlloc(
         .sync_level = options.sync_level,
         .returning_expression_count = returning_expression_count,
         .returning_all = returning_all,
+        .conflict_where = conflict_where,
     };
 }
 
@@ -13116,6 +13179,32 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var parsed_generated_conflict = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ('u1', 'ready') ON CONFLICT (id) DO UPDATE SET status = excluded.status RETURNING id, status",
+    );
+    defer parsed_generated_conflict.deinit(alloc);
+    const generated_conflict_ast = switch ((parsed_generated_conflict.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_conflict = try insertValuesFromGeneratedDmlAstAlloc(
+        alloc,
+        parsed_generated_conflict.items(),
+        generated_conflict_ast,
+        schema,
+        &.{},
+        options,
+    );
+    defer generated_conflict.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", generated_conflict.table_name);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, generated_conflict.sync_level);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, generated_conflict.batch.req.sync_level);
+    try std.testing.expectEqual(@as(u32, 0), generated_conflict.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), generated_conflict.batch.transformed);
+    try std.testing.expectEqual(@as(usize, 1), generated_conflict.batch.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"ready\"}", generated_conflict.batch.returning_rows[0]);
 
     var parsed_generated_update = try tokenized.ParsedSql.initAlloc(
         alloc,

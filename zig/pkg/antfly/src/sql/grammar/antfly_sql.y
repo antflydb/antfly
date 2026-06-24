@@ -31,10 +31,10 @@
 %token EQ NEQ LT LTE GT GTE PLUS MINUS SLASH PERCENT COLON COLON_COLON
 %token ARROW_JSON ARROW_TEXT PATH_ARROW_JSON PATH_ARROW_TEXT
 %token ALL ALTER ANALYZE AND AS ASC BEGIN BY CASCADE COMMIT CONFLICT CONTINUE
-%token CREATE DATABASE DEALLOCATE DEFAULT DELETE DESC DISCARD DROP EXECUTE
+%token CREATE DATABASE DEALLOCATE DEFAULT DELETE DESC DISCARD DO DROP EXECUTE
 %token EXPLAIN EXISTS EXTENSION FALSE FROM FULL GRAPH GROUP HAVING IDENTITY IF INDEX INSERT INTO
 %token JOIN KEY LATERAL LIMIT MATCHED MERGE METRIC NOT NULL ON OR ORDER PREPARE PRIMARY PUBLIC
-%token QUERY RESET RESTART RESTRICT RETURNING ROLLBACK SCHEMA SELECT SET SHOW TABLE TO TRUNCATE
+%token NOTHING QUERY RESET RESTART RESTRICT RETURNING ROLLBACK SCHEMA SELECT SET SHOW TABLE TO TRUNCATE
 %token THEN TRUE UPDATE USING VALUES WHEN WHERE WITH
 
 statement:
@@ -146,9 +146,9 @@ dml_statement:
   ;
 
 insert_statement:
-    INSERT INTO qualified_name insert_columns_opt VALUES value_tuple_list returning_clause_opt
-  | INSERT INTO qualified_name DEFAULT VALUES returning_clause_opt
-  | INSERT INTO qualified_name insert_columns_opt read_statement returning_clause_opt
+    INSERT INTO qualified_name insert_columns_opt VALUES value_tuple_list conflict_clause_opt returning_clause_opt
+  | INSERT INTO qualified_name DEFAULT VALUES conflict_clause_opt returning_clause_opt
+  | INSERT INTO qualified_name insert_columns_opt read_statement conflict_clause_opt returning_clause_opt
   ;
 
 update_statement:
@@ -327,6 +327,20 @@ limit_clause_opt:
 returning_clause_opt:
     /* empty */
   | RETURNING select_list
+  ;
+
+conflict_clause_opt:
+    /* empty */
+  | ON CONFLICT conflict_target DO conflict_action
+  ;
+
+conflict_target:
+    LPAREN identifier_list RPAREN
+  ;
+
+conflict_action:
+    NOTHING
+  | UPDATE SET assignment_list where_clause_opt
   ;
 
 with_clause:

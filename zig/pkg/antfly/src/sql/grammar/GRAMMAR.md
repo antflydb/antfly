@@ -57,12 +57,12 @@ parity for seed `CREATE TABLE` and `CREATE INDEX` forms using the same parser
 options as the existing lowerer. Simple DML now has generated-parser corpus
 coverage, retained generated raw and AST nodes for covered write statements,
 structured generated DML ranges for target tables, sources, assignments,
-predicates, returning clauses, values lists, default-values inserts, and
-truncate options. Supported explicit-column `INSERT ... VALUES` and
-no-conflict `INSERT ... DEFAULT VALUES` plans, including simple field and
-all-field/expression `RETURNING` lists, now lower directly from generated AST
-ranges into relational row batches without requiring the legacy unique-resolver
-path. Single-table point `UPDATE` and `DELETE` statements with generated
+predicates, conflict clauses, returning clauses, values lists, default-values
+inserts, and truncate options. Supported explicit-column `INSERT ... VALUES`
+plans, including `ON CONFLICT` actions and field/all-field/expression
+`RETURNING` lists, and no-conflict `INSERT ... DEFAULT VALUES` plans now lower
+directly from generated AST ranges into relational row batches. Single-table
+point `UPDATE` and `DELETE` statements with generated
 `WHERE` ranges and field/all-field/expression `RETURNING` lists now also lower
 directly from generated AST ranges into relational row batches, and `TRUNCATE`
 lowers directly from generated AST ranges into mutation-source plans. Other
@@ -71,9 +71,9 @@ AST-to-plan wrapper that fails closed if the generated DML family does not
 match the existing write classifier before delegating to the current typed DML
 lowerer. Unsupported DML still falls back, and deeper DML cutover still
 requires replacing token-based command-body parsing with complete generated AST
-payloads for `DEFAULT VALUES` with `ON CONFLICT`, `ON CONFLICT`,
-`INSERT ... SELECT`, source/joined `UPDATE`, source/joined `DELETE`, and
-`MERGE` bodies.
+payloads for `DEFAULT VALUES` with `ON CONFLICT`, `INSERT ... SELECT` with
+`ON CONFLICT`, source/joined `UPDATE`, source/joined `DELETE`, and `MERGE`
+bodies.
 Representative
 read queries now have generated-parser corpus coverage, retained generated raw
 and AST nodes for covered read statements, and an initial generated AST-to-plan
@@ -157,20 +157,22 @@ Suggested migration order:
    `DELETE`, `RETURNING`, and `ON CONFLICT`. Initial generated-parser coverage
    now retains raw and AST DML nodes for representative `INSERT ... VALUES`,
    `INSERT ... SELECT`, `UPDATE`, `DELETE`, `TRUNCATE`, and `MERGE` statements;
-   generated DML ASTs now carry structured body ranges, explicit-column
-   `INSERT ... VALUES` and no-conflict `INSERT ... DEFAULT VALUES` have direct
-   resolver-free generated AST-to-plan lowerers for supported row batches,
-   including field, all-field, and expression `RETURNING` lists, single-table
-   point `UPDATE` and `DELETE` have direct generated AST-to-plan lowerers for
-   generated primary/unique selector ranges with field, all-field, and
-   expression returning lists, and `TRUNCATE` has a direct generated AST-to-plan
-   lowerer for the supported table-list, identity, and drop-behavior surface.
+   generated DML ASTs now carry structured body ranges and conflict ranges.
+   Explicit-column `INSERT ... VALUES` has direct generated AST-to-plan
+   lowerers for supported row batches, including conflict actions and field,
+   all-field, and expression `RETURNING` lists; no-conflict
+   `INSERT ... DEFAULT VALUES` has a direct resolver-free generated AST-to-plan
+   lowerer for default row batches; single-table point `UPDATE` and `DELETE`
+   have direct generated AST-to-plan lowerers for generated primary/unique
+   selector ranges with field, all-field, and expression returning lists; and
+   `TRUNCATE` has a direct generated AST-to-plan lowerer for the supported
+   table-list, identity, and drop-behavior surface.
    Other DML still has a validated wrapper into the current typed DML lowerer
    for representative generated-covered write plans. Switching the full DML
    family from fallback to required generated parsing still requires generated
-   command-body ASTs for default inserts with conflict clauses, conflict
-   actions, insert-select, source/joined update/delete bodies, and merge arms,
-   plus broader unsupported-shape diagnostics.
+   command-body ASTs for default inserts with conflict clauses, insert-select
+   and insert-select conflict bodies, source/joined update/delete bodies, and
+   merge arms, plus broader unsupported-shape diagnostics.
 4. Read queries: projections, predicates, joins, CTEs, aggregates, windows,
    set operations, lateral, ordering, limits, and document-table sources.
    Initial generated-parser coverage now retains raw and AST read nodes for
@@ -278,12 +280,13 @@ variants for:
   for database, schema, and extension create/drop catalog plans and seed
   `CREATE TABLE` / `CREATE INDEX` plans
 - DML statement, including generated AST payloads for command spans, target
-  tables, source/body ranges, predicates, returning clauses, values lists,
-  default-values inserts, truncate options, direct generated AST-to-plan
+  tables, source/body ranges, predicates, conflict clauses, returning clauses,
+  values lists, default-values inserts, truncate options, direct generated AST-to-plan
   lowerers for supported explicit-column `INSERT ... VALUES`,
-  `INSERT ... DEFAULT VALUES`, insert `RETURNING`, single-table point
-  `UPDATE`/`DELETE` with returning projections, and `TRUNCATE`, and an initial
-  AST-to-plan wrapper for the other generated-covered write statements
+  `INSERT ... VALUES ... ON CONFLICT`, `INSERT ... DEFAULT VALUES`, insert
+  `RETURNING`, single-table point `UPDATE`/`DELETE` with returning projections,
+  and `TRUNCATE`, and an initial AST-to-plan wrapper for the other
+  generated-covered write statements
 - read statement, including a generated AST payload for command spans and an
   initial AST-to-plan wrapper for generated-covered read statements
 - graph statement, including a generated AST payload for command spans and
@@ -329,10 +332,11 @@ Generated grammar work needs evidence at multiple levels:
   Simple DML has generated field-level checks for update and truncate body
   ranges, direct generated AST-to-plan parity for truncate mutation-source
   plans, direct resolver-free generated AST-to-plan coverage for supported
-  explicit-column insert-values and default-values row batches with returning
-  lists, direct generated AST-to-plan coverage for single-table point
-  update/delete batches with returning lists, and initial generated AST-to-plan
-  parity through a generated-family validation wrapper over other
+  explicit-column insert-values row batches with conflict actions and returning
+  lists, default-values row batches with returning lists, direct generated
+  AST-to-plan coverage for single-table point update/delete batches with
+  returning lists, and initial generated AST-to-plan parity through a
+  generated-family validation wrapper over other
   representative write plans. Read plans have initial
   generated AST-to-plan parity through a generated-family validation wrapper
   over representative query, aggregate, join, lateral, and non-recursive CTE
