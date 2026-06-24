@@ -173,7 +173,7 @@ pub fn lowerReadPlanFromGeneratedReadAstAlloc(
     read_ast: generated_parser.GeneratedSqlReadAst,
 ) !plan.LoweredReadPlan {
     const read_kind = parsed_sql.readStatementKind() orelse return error.UnsupportedSqlShape;
-    if (!generatedReadAstMatchesReadKind(read_ast.kind, read_kind)) return error.UnsupportedSqlShape;
+    if (!generatedReadAstMatchesReadKind(read_ast, read_kind)) return error.UnsupportedSqlShape;
     try validateGeneratedReadAstRanges(parsed_sql.items(), read_ast);
     return switch (read_ast.kind) {
         .query => blk: {
@@ -247,10 +247,10 @@ pub fn lowerReadPlanFromGeneratedReadAstAlloc(
 }
 
 fn generatedReadAstMatchesReadKind(
-    generated_kind: generated_parser.GeneratedSqlReadKind,
+    read_ast: generated_parser.GeneratedSqlReadAst,
     read_kind: classifier.SqlReadStatementKind,
 ) bool {
-    return switch (generated_kind) {
+    return switch (read_ast.kind) {
         .query => read_kind == .query,
         .aggregate => read_kind == .aggregate,
         .join => read_kind == .join,
@@ -258,8 +258,9 @@ fn generatedReadAstMatchesReadKind(
         .window => read_kind == .window,
         .set_operation => read_kind == .set_operation,
         .cte => switch (read_kind) {
-            .query, .aggregate, .join, .lateral, .window => true,
-            .set_operation, .recursive_cte => false,
+            .query, .aggregate, .join, .lateral, .window => !read_ast.cte_recursive,
+            .recursive_cte => read_ast.cte_recursive,
+            .set_operation => false,
         },
     };
 }
@@ -398,11 +399,27 @@ fn validateGeneratedCteReadAst(tokens: []const tokenized.Token, read_ast: genera
     const name = read_ast.cte_name_tokens orelse return error.UnsupportedSqlShape;
     const body = read_ast.cte_body_tokens orelse return error.UnsupportedSqlShape;
     if (tokens.len == 0 or !tokens[0].matchesKeywordTag(.with)) return error.UnsupportedSqlShape;
-    if (cte.start != 1 or name.start != cte.start or name.end != name.start + 1) return error.UnsupportedSqlShape;
-    if (name.end >= body.start or !tokens[name.end].matchesKeywordTag(.as)) return error.UnsupportedSqlShape;
+    if (cte.start != 1 or name.end != name.start + 1) return error.UnsupportedSqlShape;
+    if (read_ast.cte_recursive) {
+        if (tokens.len < 2 or !tokens[1].matchesKeywordTag(.recursive) or name.start != 2) return error.UnsupportedSqlShape;
+    } else if (tokens.len > 1 and tokens[1].matchesKeywordTag(.recursive)) {
+        return error.UnsupportedSqlShape;
+    } else if (name.start != cte.start) {
+        return error.UnsupportedSqlShape;
+    }
+    if (name.end >= body.start) return error.UnsupportedSqlShape;
+    var saw_as = false;
+    var index = name.end;
+    while (index < body.start) : (index += 1) {
+        if (tokens[index].matchesKeywordTag(.as)) {
+            saw_as = true;
+            break;
+        }
+    }
+    if (!saw_as) return error.UnsupportedSqlShape;
     if (body.start == 0 or tokens[body.start - 1].kind != .lparen) return error.UnsupportedSqlShape;
     if (body.end >= tokens.len or tokens[body.end].kind != .rparen) return error.UnsupportedSqlShape;
-    if (body.end + 1 >= tokens.len or !tokens[body.end + 1].matchesKeywordTag(.select)) return error.UnsupportedSqlShape;
+    if (cte.end >= tokens.len or !tokens[cte.end].matchesKeywordTag(.select)) return error.UnsupportedSqlShape;
     if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return error.UnsupportedSqlShape;
 }
 
@@ -684,7 +701,7 @@ fn lowerReadPlanWithOptionalSourceSchemaParsedSqlForLoweringContextTestAlloc(
             .lower_lateral_with_schemas = lowerLateralWithSchemasParsedSqlForLoweringContextTestAlloc,
             .lower_window = lowerWindowParsedSqlForLoweringContextTestAlloc,
             .lower_aggregate_plan = lowerAggregateParsedSqlForLoweringContextTestAlloc,
-            .lower_recursive_cte_plan = unsupportedRecursiveCteParsedSqlForLoweringContextTestAlloc,
+            .lower_recursive_cte_plan = lowerRecursiveCteParsedSqlForLoweringContextTestAlloc,
             .lower_join_with_schemas = lowerJoinWithSchemasParsedSqlForLoweringContextTestAlloc,
             .lower_query_plan = lowerQueryParsedSqlForLoweringContextTestAlloc,
             .lower_set_operation_optional_source_schema = unsupportedSetOperationParsedSqlForLoweringContextTestAlloc,
@@ -727,7 +744,7 @@ fn lowerGeneratedReadPlanForLoweringContextTestAlloc(
             .lower_lateral_with_schemas = lowerLateralWithSchemasParsedSqlForLoweringContextTestAlloc,
             .lower_window = lowerWindowParsedSqlForLoweringContextTestAlloc,
             .lower_aggregate_plan = lowerAggregateParsedSqlForLoweringContextTestAlloc,
-            .lower_recursive_cte_plan = unsupportedRecursiveCteParsedSqlForLoweringContextTestAlloc,
+            .lower_recursive_cte_plan = lowerRecursiveCteParsedSqlForLoweringContextTestAlloc,
             .lower_join_with_schemas = lowerJoinWithSchemasParsedSqlForLoweringContextTestAlloc,
             .lower_query_plan = lowerQueryParsedSqlForLoweringContextTestAlloc,
             .lower_set_operation_optional_source_schema = unsupportedSetOperationParsedSqlForLoweringContextTestAlloc,
@@ -926,14 +943,28 @@ fn lowerLateralWithSchemasParsedSqlForLoweringContextTestAlloc(
     return lowered;
 }
 
-fn unsupportedRecursiveCteParsedSqlForLoweringContextTestAlloc(
-    _: std.mem.Allocator,
-    _: *const tokenized.ParsedSql,
-    _: runtime_schema.TableSchema,
-    _: []const value_mod.SqlValue,
-    _: lower_expr.SqlFunctionBindings,
+fn lowerRecursiveCteParsedSqlForLoweringContextTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+    function_bindings: lower_expr.SqlFunctionBindings,
 ) anyerror!plan.LoweredRecursiveCtePlan {
-    return error.UnsupportedSqlShape;
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    const tokens = parsed_sql.items();
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens,
+        .schema = schema,
+        .params = params,
+        .function_bindings = function_bindings,
+    };
+    return try plan.parseRecursiveCtePlanAlloc(
+        alloc,
+        tokens,
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.recursiveCteParserHooks(&parser_state),
+    );
 }
 
 fn unsupportedSetOperationParsedSqlForLoweringContextTestAlloc(
@@ -961,6 +992,7 @@ test "sql adapter lowering context lowers generated read AST through typed read 
         "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant = c.tenant AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' LIMIT 5",
         "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' ORDER BY 2 DESC LIMIT 1) AS latest ON true WHERE org.kind = 'organization' LIMIT 10",
         "WITH open_usage AS (SELECT tenant, amount, status FROM usage_records WHERE status = 'open') SELECT tenant, SUM(amount) AS total FROM open_usage GROUP BY tenant LIMIT 5",
+        "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records WHERE kind = 'order' UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.customer_id = parent.id) SELECT id FROM source_rows",
     };
 
     for (cases) |sql| {
@@ -1002,7 +1034,7 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
             .lower_lateral_with_schemas = lowerLateralWithSchemasParsedSqlForLoweringContextTestAlloc,
             .lower_window = lowerWindowParsedSqlForLoweringContextTestAlloc,
             .lower_aggregate_plan = lowerAggregateParsedSqlForLoweringContextTestAlloc,
-            .lower_recursive_cte_plan = unsupportedRecursiveCteParsedSqlForLoweringContextTestAlloc,
+            .lower_recursive_cte_plan = lowerRecursiveCteParsedSqlForLoweringContextTestAlloc,
             .lower_join_with_schemas = lowerJoinWithSchemasParsedSqlForLoweringContextTestAlloc,
             .lower_query_plan = lowerQueryParsedSqlForLoweringContextTestAlloc,
             .lower_set_operation_optional_source_schema = unsupportedSetOperationParsedSqlForLoweringContextTestAlloc,
@@ -1037,6 +1069,32 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &cte_parsed_sql, cte_read_ast),
+    );
+
+    var recursive_cte_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records WHERE kind = 'order' UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.customer_id = parent.id) SELECT id FROM source_rows",
+    );
+    defer recursive_cte_parsed_sql.deinit(alloc);
+    const recursive_cte_generated_raw = recursive_cte_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var recursive_cte_read_ast = switch (recursive_cte_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    recursive_cte_read_ast.cte_recursive = false;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &recursive_cte_parsed_sql, recursive_cte_read_ast),
+    );
+
+    recursive_cte_read_ast = switch (recursive_cte_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    recursive_cte_read_ast.cte_name_tokens = .{ .start = 1, .end = 2 };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &recursive_cte_parsed_sql, recursive_cte_read_ast),
     );
 }
 
