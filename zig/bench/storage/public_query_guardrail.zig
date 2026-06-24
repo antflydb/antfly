@@ -1002,14 +1002,18 @@ fn runHandlerBench(
     const handler_pipeline = try benchHandlerPipeline(alloc, &server, read_source.source(), query_bodies, cfg);
     std.debug.print("public-query guardrail stage=direct-handler\n", .{});
     const handler_stats = try benchDirectHandler(alloc, server.executor(), query_bodies, cfg);
-    try enforceSymbolicProfileGuardrail(cfg, handler_stats);
+    const profile_stats = if (handler_stats.profile_dense_search_count == 0 and db_stats.profile_dense_search_count > 0)
+        db_stats
+    else
+        handler_stats;
+    try enforceSymbolicProfileGuardrail(cfg, profile_stats);
     try enforceSymbolicResultFillGuardrail(cfg, handler_stats);
     std.debug.print("public-query guardrail stage=handler-concurrent\n", .{});
     const handler_concurrent = try benchConcurrentDirectHandler(alloc, server.executor(), query_bodies, cfg);
 
     const avg_db_ns = db_stats.avgNs();
     const avg_handler_ns = handler_stats.avgNs();
-    const avg_profile_ns = handler_stats.avgProfileNs();
+    const avg_profile_ns = profile_stats.avgProfileNs();
     const handler_overhead_ns = avg_handler_ns -| avg_profile_ns;
 
     std.debug.print(
@@ -1026,13 +1030,13 @@ fn runHandlerBench(
             cfg.search_threads,
             nsToUs(avg_db_ns),
             nsToUs(avg_handler_ns),
-            nsToUs(avg_handler_ns),
+            nsToUs(0),
             nsToUs(handler_stats.avgFirstPassNs()),
             nsToUs(handler_stats.avgLaterPassNs()),
             nsToUs(handler_overhead_ns),
             nsToUs(0),
             nsToUs(avg_profile_ns),
-            nsToUs(if (handler_stats.queries == 0) 0 else handler_stats.profile_hbc_search_ns / handler_stats.queries),
+            nsToUs(if (profile_stats.queries == 0) 0 else profile_stats.profile_hbc_search_ns / profile_stats.queries),
             handler_concurrent.qps(),
             nsToUs(handler_concurrent.avgRequestNs()),
             nsToUs(handler_concurrent.max_request_ns),
@@ -1049,6 +1053,7 @@ fn runHandlerBench(
         avg_db_ns,
         avg_handler_ns,
         handler_stats,
+        profile_stats,
         handler_concurrent,
         .{ .visibility = .{}, .polls = .{} },
         0,
@@ -1069,56 +1074,56 @@ fn runHandlerBench(
     std.debug.print(
         "public_query_hbc_concurrency_profile runtime_txn={d:.3}us scratch_acquire={d:.3}us node_cache_lookup={d:.3}us quantized_cache_lookup={d:.3}us\n",
         .{
-            nsToUs(if (handler_stats.queries == 0) 0 else handler_stats.profile_hbc_runtime_txn_ns / handler_stats.queries),
-            nsToUs(if (handler_stats.queries == 0) 0 else handler_stats.profile_hbc_scratch_acquire_ns / handler_stats.queries),
-            nsToUs(if (handler_stats.queries == 0) 0 else handler_stats.profile_hbc_node_cache_lookup_ns / handler_stats.queries),
-            nsToUs(if (handler_stats.queries == 0) 0 else handler_stats.profile_hbc_quantized_cache_lookup_ns / handler_stats.queries),
+            nsToUs(if (profile_stats.queries == 0) 0 else profile_stats.profile_hbc_runtime_txn_ns / profile_stats.queries),
+            nsToUs(if (profile_stats.queries == 0) 0 else profile_stats.profile_hbc_scratch_acquire_ns / profile_stats.queries),
+            nsToUs(if (profile_stats.queries == 0) 0 else profile_stats.profile_hbc_node_cache_lookup_ns / profile_stats.queries),
+            nsToUs(if (profile_stats.queries == 0) 0 else profile_stats.profile_hbc_quantized_cache_lookup_ns / profile_stats.queries),
         },
     );
     std.debug.print(
         "public_query_rerank_selection approx_candidates={d:.2} rerank_candidates={d:.2} reranked_vectors={d:.2} top_k_count={d:.2} ambiguous_top_k_pairs={d:.2} ambiguous_boundary_pairs={d:.2} ambiguous_distance_over_hits={d:.2} ambiguous_distance_under_hits={d:.2} full_rerank_threshold_rate={d:.4}\n",
         .{
-            avgPerQuery(handler_stats, handler_stats.profile_hbc_approx_candidate_count),
-            avgPerQuery(handler_stats, handler_stats.profile_hbc_rerank_candidate_count),
-            avgPerQuery(handler_stats, handler_stats.profile_hbc_reranked_vectors),
-            avgPerQuery(handler_stats, handler_stats.profile_hbc_top_k_count),
-            avgPerQuery(handler_stats, handler_stats.profile_hbc_ambiguous_top_k_pairs),
-            avgPerQuery(handler_stats, handler_stats.profile_hbc_ambiguous_boundary_pairs),
-            avgPerQuery(handler_stats, handler_stats.profile_hbc_ambiguous_distance_over_hits),
-            avgPerQuery(handler_stats, handler_stats.profile_hbc_ambiguous_distance_under_hits),
-            if (handler_stats.queries == 0) 0 else @as(f64, @floatFromInt(handler_stats.profile_hbc_full_rerank_due_to_threshold)) / @as(f64, @floatFromInt(handler_stats.queries)),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_approx_candidate_count),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_rerank_candidate_count),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_reranked_vectors),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_top_k_count),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_ambiguous_top_k_pairs),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_ambiguous_boundary_pairs),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_ambiguous_distance_over_hits),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_ambiguous_distance_under_hits),
+            if (profile_stats.queries == 0) 0 else @as(f64, @floatFromInt(profile_stats.profile_hbc_full_rerank_due_to_threshold)) / @as(f64, @floatFromInt(profile_stats.queries)),
         },
     );
-    printPublicQuerySymbolicFilterProfile(cfg, handler_stats);
+    printPublicQuerySymbolicFilterProfile(cfg, profile_stats);
     std.debug.print(
         "public_query_rerank_boundary avg_left_distance={d:.6} avg_left_error={d:.6} avg_left_lower={d:.6} avg_left_upper={d:.6} avg_right_distance={d:.6} avg_right_error={d:.6} avg_right_lower={d:.6} avg_right_upper={d:.6} avg_distance_gap={d:.6} avg_interval_gap={d:.6} max_left_error={d:.6} max_right_error={d:.6} boundary_pair_rate={d:.4}\n",
         .{
-            handler_stats.avgBoundary(handler_stats.profile_hbc_boundary_left_distance_sum),
-            handler_stats.avgBoundary(handler_stats.profile_hbc_boundary_left_error_sum),
-            handler_stats.avgBoundary(handler_stats.profile_hbc_boundary_left_lower_sum),
-            handler_stats.avgBoundary(handler_stats.profile_hbc_boundary_left_upper_sum),
-            handler_stats.avgBoundary(handler_stats.profile_hbc_boundary_right_distance_sum),
-            handler_stats.avgBoundary(handler_stats.profile_hbc_boundary_right_error_sum),
-            handler_stats.avgBoundary(handler_stats.profile_hbc_boundary_right_lower_sum),
-            handler_stats.avgBoundary(handler_stats.profile_hbc_boundary_right_upper_sum),
-            handler_stats.avgBoundary(handler_stats.profile_hbc_boundary_distance_gap_sum),
-            handler_stats.avgBoundary(handler_stats.profile_hbc_boundary_interval_gap_sum),
-            handler_stats.profile_hbc_boundary_left_error_max,
-            handler_stats.profile_hbc_boundary_right_error_max,
-            if (handler_stats.queries == 0) 0 else @as(f64, @floatFromInt(handler_stats.profile_hbc_boundary_pair_count)) / @as(f64, @floatFromInt(handler_stats.queries)),
+            profile_stats.avgBoundary(profile_stats.profile_hbc_boundary_left_distance_sum),
+            profile_stats.avgBoundary(profile_stats.profile_hbc_boundary_left_error_sum),
+            profile_stats.avgBoundary(profile_stats.profile_hbc_boundary_left_lower_sum),
+            profile_stats.avgBoundary(profile_stats.profile_hbc_boundary_left_upper_sum),
+            profile_stats.avgBoundary(profile_stats.profile_hbc_boundary_right_distance_sum),
+            profile_stats.avgBoundary(profile_stats.profile_hbc_boundary_right_error_sum),
+            profile_stats.avgBoundary(profile_stats.profile_hbc_boundary_right_lower_sum),
+            profile_stats.avgBoundary(profile_stats.profile_hbc_boundary_right_upper_sum),
+            profile_stats.avgBoundary(profile_stats.profile_hbc_boundary_distance_gap_sum),
+            profile_stats.avgBoundary(profile_stats.profile_hbc_boundary_interval_gap_sum),
+            profile_stats.profile_hbc_boundary_left_error_max,
+            profile_stats.profile_hbc_boundary_right_error_max,
+            if (profile_stats.queries == 0) 0 else @as(f64, @floatFromInt(profile_stats.profile_hbc_boundary_pair_count)) / @as(f64, @floatFromInt(profile_stats.queries)),
         },
     );
     std.debug.print(
         "public_query_rerank_boundary_tail avg_error={d:.6} max_error={d:.6} avg_distance_gap={d:.6} min_distance_gap={d:.6} max_distance_gap={d:.6} avg_interval_gap={d:.6} min_interval_gap={d:.6} max_interval_gap={d:.6}\n",
         .{
-            handler_stats.avgBoundary(handler_stats.profile_hbc_boundary_tail_error_avg_sum),
-            handler_stats.profile_hbc_boundary_tail_error_max,
-            handler_stats.avgBoundary(handler_stats.profile_hbc_boundary_tail_distance_gap_avg_sum),
-            if (handler_stats.profile_hbc_boundary_tail_distance_gap_min == std.math.floatMax(f64)) 0 else handler_stats.profile_hbc_boundary_tail_distance_gap_min,
-            if (handler_stats.profile_hbc_boundary_tail_distance_gap_max == -std.math.floatMax(f64)) 0 else handler_stats.profile_hbc_boundary_tail_distance_gap_max,
-            handler_stats.avgBoundary(handler_stats.profile_hbc_boundary_tail_interval_gap_avg_sum),
-            if (handler_stats.profile_hbc_boundary_tail_interval_gap_min == std.math.floatMax(f64)) 0 else handler_stats.profile_hbc_boundary_tail_interval_gap_min,
-            if (handler_stats.profile_hbc_boundary_tail_interval_gap_max == -std.math.floatMax(f64)) 0 else handler_stats.profile_hbc_boundary_tail_interval_gap_max,
+            profile_stats.avgBoundary(profile_stats.profile_hbc_boundary_tail_error_avg_sum),
+            profile_stats.profile_hbc_boundary_tail_error_max,
+            profile_stats.avgBoundary(profile_stats.profile_hbc_boundary_tail_distance_gap_avg_sum),
+            if (profile_stats.profile_hbc_boundary_tail_distance_gap_min == std.math.floatMax(f64)) 0 else profile_stats.profile_hbc_boundary_tail_distance_gap_min,
+            if (profile_stats.profile_hbc_boundary_tail_distance_gap_max == -std.math.floatMax(f64)) 0 else profile_stats.profile_hbc_boundary_tail_distance_gap_max,
+            profile_stats.avgBoundary(profile_stats.profile_hbc_boundary_tail_interval_gap_avg_sum),
+            if (profile_stats.profile_hbc_boundary_tail_interval_gap_min == std.math.floatMax(f64)) 0 else profile_stats.profile_hbc_boundary_tail_interval_gap_min,
+            if (profile_stats.profile_hbc_boundary_tail_interval_gap_max == -std.math.floatMax(f64)) 0 else profile_stats.profile_hbc_boundary_tail_interval_gap_max,
         },
     );
 }
@@ -1194,7 +1199,11 @@ fn runLocalBench(
     const handler_stats = try benchDirectHandler(alloc, server.executor(), query_bodies, cfg);
     std.debug.print("public-query guardrail stage=http-query\n", .{});
     const http_stats = try benchHttpQuery(alloc, base_uri, query_bodies, cfg);
-    try enforceSymbolicProfileGuardrail(cfg, http_stats);
+    const profile_stats = if (http_stats.profile_dense_search_count == 0 and db_stats.profile_dense_search_count > 0)
+        db_stats
+    else
+        http_stats;
+    try enforceSymbolicProfileGuardrail(cfg, profile_stats);
     try enforceSymbolicResultFillGuardrail(cfg, http_stats);
     std.debug.print("public-query guardrail stage=handler-concurrent\n", .{});
     const handler_concurrent = try benchConcurrentDirectHandler(alloc, server.executor(), query_bodies, cfg);
@@ -1207,7 +1216,7 @@ fn runLocalBench(
     const avg_db_ns = db_stats.avgNs();
     const avg_handler_ns = handler_stats.avgNs();
     const avg_http_ns = http_stats.avgNs();
-    const avg_profile_ns = http_stats.avgProfileNs();
+    const avg_profile_ns = profile_stats.avgProfileNs();
     const handler_overhead_ns = avg_handler_ns -| avg_profile_ns;
     const http_transport_overhead_ns = avg_http_ns -| avg_handler_ns;
 
@@ -1231,7 +1240,7 @@ fn runLocalBench(
             nsToUs(handler_overhead_ns),
             nsToUs(http_transport_overhead_ns),
             nsToUs(avg_profile_ns),
-            nsToUs(if (http_stats.queries == 0) 0 else http_stats.profile_hbc_search_ns / http_stats.queries),
+            nsToUs(if (profile_stats.queries == 0) 0 else profile_stats.profile_hbc_search_ns / profile_stats.queries),
             concurrent.http.qps(),
             nsToUs(concurrent.http.avgRequestNs()),
             nsToUs(concurrent.http.max_request_ns),
@@ -1248,6 +1257,7 @@ fn runLocalBench(
         avg_db_ns,
         avg_handler_ns,
         http_stats,
+        profile_stats,
         concurrent.http,
         .{ .visibility = .{}, .polls = .{} },
         0,
@@ -1268,56 +1278,56 @@ fn runLocalBench(
     std.debug.print(
         "public_query_hbc_concurrency_profile runtime_txn={d:.3}us scratch_acquire={d:.3}us node_cache_lookup={d:.3}us quantized_cache_lookup={d:.3}us\n",
         .{
-            nsToUs(if (http_stats.queries == 0) 0 else http_stats.profile_hbc_runtime_txn_ns / http_stats.queries),
-            nsToUs(if (http_stats.queries == 0) 0 else http_stats.profile_hbc_scratch_acquire_ns / http_stats.queries),
-            nsToUs(if (http_stats.queries == 0) 0 else http_stats.profile_hbc_node_cache_lookup_ns / http_stats.queries),
-            nsToUs(if (http_stats.queries == 0) 0 else http_stats.profile_hbc_quantized_cache_lookup_ns / http_stats.queries),
+            nsToUs(if (profile_stats.queries == 0) 0 else profile_stats.profile_hbc_runtime_txn_ns / profile_stats.queries),
+            nsToUs(if (profile_stats.queries == 0) 0 else profile_stats.profile_hbc_scratch_acquire_ns / profile_stats.queries),
+            nsToUs(if (profile_stats.queries == 0) 0 else profile_stats.profile_hbc_node_cache_lookup_ns / profile_stats.queries),
+            nsToUs(if (profile_stats.queries == 0) 0 else profile_stats.profile_hbc_quantized_cache_lookup_ns / profile_stats.queries),
         },
     );
     std.debug.print(
         "public_query_rerank_selection approx_candidates={d:.2} rerank_candidates={d:.2} reranked_vectors={d:.2} top_k_count={d:.2} ambiguous_top_k_pairs={d:.2} ambiguous_boundary_pairs={d:.2} ambiguous_distance_over_hits={d:.2} ambiguous_distance_under_hits={d:.2} full_rerank_threshold_rate={d:.4}\n",
         .{
-            if (http_stats.queries == 0) 0 else @as(f64, @floatFromInt(http_stats.profile_hbc_approx_candidate_count)) / @as(f64, @floatFromInt(http_stats.queries)),
-            if (http_stats.queries == 0) 0 else @as(f64, @floatFromInt(http_stats.profile_hbc_rerank_candidate_count)) / @as(f64, @floatFromInt(http_stats.queries)),
-            if (http_stats.queries == 0) 0 else @as(f64, @floatFromInt(http_stats.profile_hbc_reranked_vectors)) / @as(f64, @floatFromInt(http_stats.queries)),
-            if (http_stats.queries == 0) 0 else @as(f64, @floatFromInt(http_stats.profile_hbc_top_k_count)) / @as(f64, @floatFromInt(http_stats.queries)),
-            if (http_stats.queries == 0) 0 else @as(f64, @floatFromInt(http_stats.profile_hbc_ambiguous_top_k_pairs)) / @as(f64, @floatFromInt(http_stats.queries)),
-            if (http_stats.queries == 0) 0 else @as(f64, @floatFromInt(http_stats.profile_hbc_ambiguous_boundary_pairs)) / @as(f64, @floatFromInt(http_stats.queries)),
-            if (http_stats.queries == 0) 0 else @as(f64, @floatFromInt(http_stats.profile_hbc_ambiguous_distance_over_hits)) / @as(f64, @floatFromInt(http_stats.queries)),
-            if (http_stats.queries == 0) 0 else @as(f64, @floatFromInt(http_stats.profile_hbc_ambiguous_distance_under_hits)) / @as(f64, @floatFromInt(http_stats.queries)),
-            if (http_stats.queries == 0) 0 else @as(f64, @floatFromInt(http_stats.profile_hbc_full_rerank_due_to_threshold)) / @as(f64, @floatFromInt(http_stats.queries)),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_approx_candidate_count),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_rerank_candidate_count),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_reranked_vectors),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_top_k_count),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_ambiguous_top_k_pairs),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_ambiguous_boundary_pairs),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_ambiguous_distance_over_hits),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_ambiguous_distance_under_hits),
+            if (profile_stats.queries == 0) 0 else @as(f64, @floatFromInt(profile_stats.profile_hbc_full_rerank_due_to_threshold)) / @as(f64, @floatFromInt(profile_stats.queries)),
         },
     );
-    printPublicQuerySymbolicFilterProfile(cfg, http_stats);
+    printPublicQuerySymbolicFilterProfile(cfg, profile_stats);
     std.debug.print(
         "public_query_rerank_boundary avg_left_distance={d:.6} avg_left_error={d:.6} avg_left_lower={d:.6} avg_left_upper={d:.6} avg_right_distance={d:.6} avg_right_error={d:.6} avg_right_lower={d:.6} avg_right_upper={d:.6} avg_distance_gap={d:.6} avg_interval_gap={d:.6} max_left_error={d:.6} max_right_error={d:.6} boundary_pair_rate={d:.4}\n",
         .{
-            http_stats.avgBoundary(http_stats.profile_hbc_boundary_left_distance_sum),
-            http_stats.avgBoundary(http_stats.profile_hbc_boundary_left_error_sum),
-            http_stats.avgBoundary(http_stats.profile_hbc_boundary_left_lower_sum),
-            http_stats.avgBoundary(http_stats.profile_hbc_boundary_left_upper_sum),
-            http_stats.avgBoundary(http_stats.profile_hbc_boundary_right_distance_sum),
-            http_stats.avgBoundary(http_stats.profile_hbc_boundary_right_error_sum),
-            http_stats.avgBoundary(http_stats.profile_hbc_boundary_right_lower_sum),
-            http_stats.avgBoundary(http_stats.profile_hbc_boundary_right_upper_sum),
-            http_stats.avgBoundary(http_stats.profile_hbc_boundary_distance_gap_sum),
-            http_stats.avgBoundary(http_stats.profile_hbc_boundary_interval_gap_sum),
-            http_stats.profile_hbc_boundary_left_error_max,
-            http_stats.profile_hbc_boundary_right_error_max,
-            if (http_stats.queries == 0) 0 else @as(f64, @floatFromInt(http_stats.profile_hbc_boundary_pair_count)) / @as(f64, @floatFromInt(http_stats.queries)),
+            profile_stats.avgBoundary(profile_stats.profile_hbc_boundary_left_distance_sum),
+            profile_stats.avgBoundary(profile_stats.profile_hbc_boundary_left_error_sum),
+            profile_stats.avgBoundary(profile_stats.profile_hbc_boundary_left_lower_sum),
+            profile_stats.avgBoundary(profile_stats.profile_hbc_boundary_left_upper_sum),
+            profile_stats.avgBoundary(profile_stats.profile_hbc_boundary_right_distance_sum),
+            profile_stats.avgBoundary(profile_stats.profile_hbc_boundary_right_error_sum),
+            profile_stats.avgBoundary(profile_stats.profile_hbc_boundary_right_lower_sum),
+            profile_stats.avgBoundary(profile_stats.profile_hbc_boundary_right_upper_sum),
+            profile_stats.avgBoundary(profile_stats.profile_hbc_boundary_distance_gap_sum),
+            profile_stats.avgBoundary(profile_stats.profile_hbc_boundary_interval_gap_sum),
+            profile_stats.profile_hbc_boundary_left_error_max,
+            profile_stats.profile_hbc_boundary_right_error_max,
+            if (profile_stats.queries == 0) 0 else @as(f64, @floatFromInt(profile_stats.profile_hbc_boundary_pair_count)) / @as(f64, @floatFromInt(profile_stats.queries)),
         },
     );
     std.debug.print(
         "public_query_rerank_boundary_tail avg_error={d:.6} max_error={d:.6} avg_distance_gap={d:.6} min_distance_gap={d:.6} max_distance_gap={d:.6} avg_interval_gap={d:.6} min_interval_gap={d:.6} max_interval_gap={d:.6}\n",
         .{
-            http_stats.avgBoundary(http_stats.profile_hbc_boundary_tail_error_avg_sum),
-            http_stats.profile_hbc_boundary_tail_error_max,
-            http_stats.avgBoundary(http_stats.profile_hbc_boundary_tail_distance_gap_avg_sum),
-            if (http_stats.profile_hbc_boundary_tail_distance_gap_min == std.math.floatMax(f64)) 0 else http_stats.profile_hbc_boundary_tail_distance_gap_min,
-            if (http_stats.profile_hbc_boundary_tail_distance_gap_max == -std.math.floatMax(f64)) 0 else http_stats.profile_hbc_boundary_tail_distance_gap_max,
-            http_stats.avgBoundary(http_stats.profile_hbc_boundary_tail_interval_gap_avg_sum),
-            if (http_stats.profile_hbc_boundary_tail_interval_gap_min == std.math.floatMax(f64)) 0 else http_stats.profile_hbc_boundary_tail_interval_gap_min,
-            if (http_stats.profile_hbc_boundary_tail_interval_gap_max == -std.math.floatMax(f64)) 0 else http_stats.profile_hbc_boundary_tail_interval_gap_max,
+            profile_stats.avgBoundary(profile_stats.profile_hbc_boundary_tail_error_avg_sum),
+            profile_stats.profile_hbc_boundary_tail_error_max,
+            profile_stats.avgBoundary(profile_stats.profile_hbc_boundary_tail_distance_gap_avg_sum),
+            if (profile_stats.profile_hbc_boundary_tail_distance_gap_min == std.math.floatMax(f64)) 0 else profile_stats.profile_hbc_boundary_tail_distance_gap_min,
+            if (profile_stats.profile_hbc_boundary_tail_distance_gap_max == -std.math.floatMax(f64)) 0 else profile_stats.profile_hbc_boundary_tail_distance_gap_max,
+            profile_stats.avgBoundary(profile_stats.profile_hbc_boundary_tail_interval_gap_avg_sum),
+            if (profile_stats.profile_hbc_boundary_tail_interval_gap_min == std.math.floatMax(f64)) 0 else profile_stats.profile_hbc_boundary_tail_interval_gap_min,
+            if (profile_stats.profile_hbc_boundary_tail_interval_gap_max == -std.math.floatMax(f64)) 0 else profile_stats.profile_hbc_boundary_tail_interval_gap_max,
         },
     );
 }
@@ -1629,6 +1639,29 @@ fn benchDbSearch(alloc: std.mem.Allocator, db: *db_mod.DB, query_bodies: []const
                 owned.req.primary_text_index_name = try alloc.dupe(u8, text_index_name);
             }
             const started = nowNs();
+            if (profiledDenseBenchQuery(owned.req, cfg.query_shape)) |dense_request| {
+                const dense_req = dense_request.req;
+                const dense = dense_request.query;
+                var profiled = try db.searchDenseProfiled(alloc, dense_req, dense);
+                defer profiled.result.deinit();
+                stats.total_ns += elapsedSince(started);
+                stats.queries += 1;
+                try accumulateDenseProfile(&stats, profiled.profile, body);
+                if (profiled.result.hits.len == 0 and !searchResultHasGraphPayload(profiled.result)) {
+                    const db_stats = try db.stats(alloc);
+                    defer db_mod.types.freeDBStats(alloc, db_stats);
+                    std.debug.print("public-query guardrail empty db result idx={d} query={d}\n", .{
+                        stats.queries,
+                        i,
+                    });
+                    std.debug.print("public-query guardrail db_stats docs={d} indexes={d}\n", .{
+                        db_stats.doc_count,
+                        db_stats.indexes.len,
+                    });
+                    return error.EmptyQueryResult;
+                }
+                continue;
+            }
             var result = try db.search(alloc, owned.req);
             defer result.deinit();
             stats.total_ns += elapsedSince(started);
@@ -1696,6 +1729,38 @@ fn benchDirectHandler(
         }
     }
     return stats;
+}
+
+const ProfiledDenseBenchQuery = struct {
+    req: db_mod.types.SearchRequest,
+    query: db_mod.types.DenseKnnQuery,
+};
+
+fn profiledDenseBenchQuery(req: db_mod.types.SearchRequest, query_shape: QueryShape) ?ProfiledDenseBenchQuery {
+    switch (query_shape) {
+        .dense, .dense_filter, .algebraic_filter => {},
+        .full_text, .sparse_filter, .graph_expand, .hybrid_composed, .hybrid, .hybrid_filter, .hybrid_filter_exclude, .hybrid_filter_exclude_project => return null,
+    }
+    if (req.sparse != null or req.sparse_queries.len > 0) return null;
+    if (req.graph_queries.len > 0) return null;
+    if (req.dense_queries.len > 1) return null;
+    if (req.merge_config != null) return null;
+    if (req.reranker != null) return null;
+    if (req.dense_queries.len == 1) {
+        var dense_req = req;
+        dense_req.index_name = req.dense_queries[0].index_name;
+        dense_req.dense_queries = &.{};
+        return .{
+            .req = dense_req,
+            .query = req.dense_queries[0].query,
+        };
+    }
+    return if (req.dense) |dense|
+        .{ .req = req, .query = dense }
+    else switch (req.query) {
+        .dense_knn => |dense| .{ .req = req, .query = dense },
+        else => null,
+    };
 }
 
 fn benchHandlerPipeline(
@@ -1994,6 +2059,74 @@ fn accumulateParsedResponse(stats: *QueryBenchStats, parsed: QueryResponseWire, 
     }
 }
 
+fn accumulateDenseProfile(stats: *QueryBenchStats, dense: anytype, raw_body: []const u8) !void {
+    stats.profile_response_count += 1;
+    stats.profile_dense_search_count += 1;
+    stats.profile_total_ns += dense.total_ns;
+    stats.profile_hbc_search_ns += dense.hbc_search_ns;
+    stats.profile_hbc_runtime_txn_ns += dense.hbc_runtime_txn_ns;
+    stats.profile_hbc_scratch_acquire_ns += dense.hbc_scratch_acquire_ns;
+    stats.profile_hbc_node_cache_lookup_ns += dense.hbc_node_cache_lookup_ns;
+    stats.profile_hbc_quantized_cache_lookup_ns += dense.hbc_quantized_cache_lookup_ns;
+    stats.profile_hbc_reranked_vectors += dense.hbc_reranked_vectors;
+    stats.profile_hbc_approx_candidate_count += dense.hbc_approx_candidate_count;
+    stats.profile_hbc_rerank_candidate_count += dense.hbc_rerank_candidate_count;
+    stats.profile_hbc_ambiguous_top_k_pairs += dense.hbc_ambiguous_top_k_pairs;
+    stats.profile_hbc_ambiguous_boundary_pairs += dense.hbc_ambiguous_boundary_pairs;
+    stats.profile_hbc_ambiguous_distance_over_hits += dense.hbc_ambiguous_distance_over_hits;
+    stats.profile_hbc_ambiguous_distance_under_hits += dense.hbc_ambiguous_distance_under_hits;
+    stats.profile_hbc_top_k_count += dense.hbc_top_k_count;
+    stats.profile_returned_hit_count += dense.returned_hit_count;
+    stats.response_hit_count += dense.returned_hit_count;
+    if (dense.hbc_full_rerank_due_to_threshold) stats.profile_hbc_full_rerank_due_to_threshold += 1;
+    if (dense.hbc_boundary_pair) |pair| {
+        stats.profile_hbc_boundary_pair_count += 1;
+        stats.profile_hbc_boundary_left_distance_sum += pair.left.distance;
+        stats.profile_hbc_boundary_left_error_sum += pair.left.error_bound;
+        stats.profile_hbc_boundary_left_lower_sum += pair.left.lower_bound;
+        stats.profile_hbc_boundary_left_upper_sum += pair.left.upper_bound;
+        stats.profile_hbc_boundary_right_distance_sum += pair.right.distance;
+        stats.profile_hbc_boundary_right_error_sum += pair.right.error_bound;
+        stats.profile_hbc_boundary_right_lower_sum += pair.right.lower_bound;
+        stats.profile_hbc_boundary_right_upper_sum += pair.right.upper_bound;
+        stats.profile_hbc_boundary_distance_gap_sum += pair.distance_gap;
+        stats.profile_hbc_boundary_interval_gap_sum += pair.interval_gap;
+        stats.profile_hbc_boundary_left_error_max = @max(stats.profile_hbc_boundary_left_error_max, pair.left.error_bound);
+        stats.profile_hbc_boundary_right_error_max = @max(stats.profile_hbc_boundary_right_error_max, pair.right.error_bound);
+    }
+    if (dense.hbc_ambiguous_boundary_pairs > 0) {
+        stats.profile_hbc_boundary_tail_error_avg_sum += dense.hbc_boundary_tail_error_avg;
+        stats.profile_hbc_boundary_tail_error_max = @max(stats.profile_hbc_boundary_tail_error_max, dense.hbc_boundary_tail_error_max);
+        stats.profile_hbc_boundary_tail_distance_gap_avg_sum += dense.hbc_boundary_tail_distance_gap_avg;
+        stats.profile_hbc_boundary_tail_distance_gap_min = @min(stats.profile_hbc_boundary_tail_distance_gap_min, dense.hbc_boundary_tail_distance_gap_min);
+        stats.profile_hbc_boundary_tail_distance_gap_max = @max(stats.profile_hbc_boundary_tail_distance_gap_max, dense.hbc_boundary_tail_distance_gap_max);
+        stats.profile_hbc_boundary_tail_interval_gap_avg_sum += dense.hbc_boundary_tail_interval_gap_avg;
+        stats.profile_hbc_boundary_tail_interval_gap_min = @min(stats.profile_hbc_boundary_tail_interval_gap_min, dense.hbc_boundary_tail_interval_gap_min);
+        stats.profile_hbc_boundary_tail_interval_gap_max = @max(stats.profile_hbc_boundary_tail_interval_gap_max, dense.hbc_boundary_tail_interval_gap_max);
+    }
+    stats.profile_index_lookup_ns += dense.index_lookup_ns;
+    stats.profile_doc_key_ns += dense.doc_key_resolve_ns;
+    stats.profile_project_ns += dense.load_projected_document_ns;
+    stats.profile_postprocess_ns += dense.postprocess_ns;
+    stats.profile_rerank_external_score_ns += dense.hbc_rerank_external_score_ns;
+    stats.profile_rerank_vector_load_ns += dense.hbc_rerank_vector_load_ns;
+    stats.profile_rerank_metadata_lookup_ns += dense.hbc_rerank_metadata_lookup_ns;
+    stats.profile_rerank_artifact_key_ns += dense.hbc_rerank_artifact_key_ns;
+    stats.profile_rerank_artifact_read_ns += dense.hbc_rerank_artifact_read_ns;
+    stats.profile_rerank_artifact_decode_ns += dense.hbc_rerank_artifact_decode_ns;
+    stats.profile_rerank_artifact_distance_ns += dense.hbc_rerank_artifact_distance_ns;
+    stats.profile_rerank_lsm_cache_hits += dense.hbc_rerank_lsm_cache_hits;
+    stats.profile_rerank_lsm_cache_misses += dense.hbc_rerank_lsm_cache_misses;
+    stats.profile_rerank_distance_ns += dense.hbc_rerank_distance_ns;
+    stats.profile_inline_metadata_hits += dense.inline_metadata_hits;
+    stats.profile_fetched_metadata_hits += dense.fetched_metadata_hits;
+    stats.profile_lookup_doc_key_hits += dense.lookup_doc_key_hits;
+    if (dense.returned_hit_count == 0) {
+        std.debug.print("public-query guardrail zero dense returned_hit_count body={s}\n", .{raw_body});
+        return error.EmptyQueryResult;
+    }
+}
+
 fn enforceSymbolicProfileGuardrail(cfg: Config, stats: QueryBenchStats) !void {
     if (!cfg.require_symbolic_profile) return;
     if (!cfg.with_algebraic or !cfg.query_shape.usesFilter()) return;
@@ -2263,6 +2396,7 @@ fn runSwarmBench(
         cfg,
         0,
         0,
+        http_stats,
         http_stats,
         concurrent.http,
         load,
@@ -2540,12 +2674,8 @@ fn seedSwarm(
     defer alloc.free(created_index);
 
     if (cfg.query_shape.usesFullText()) {
-        const create_text_index_body = try std.fmt.allocPrint(alloc, "{{\"name\":\"{s}\",\"type\":\"full_text\"}}", .{text_index_name});
-        defer alloc.free(create_text_index_body);
-        const create_text_index_path = try std.fmt.allocPrint(alloc, "/tables/{s}/indexes/{s}", .{ table_name, text_index_name });
-        defer alloc.free(create_text_index_path);
-        const created_text_index = try postJsonExpect(alloc, executor.executor(), base_uri, create_text_index_path, create_text_index_body, &.{ 200, 201 });
-        defer alloc.free(created_text_index);
+        // Table creation provisions the reserved default full-text index.
+        // The public create-index route rejects creating it a second time.
     }
 
     if (cfg.with_sparse or cfg.query_shape.usesSparse()) {
@@ -3223,7 +3353,9 @@ fn encodeQueryJson(alloc: std.mem.Allocator, vector: []const f32, source_doc_idx
         var wrote_embedding = false;
         if (cfg.query_shape.usesDense()) {
             try out.appendSlice(alloc, "\"" ++ index_name ++ "\":");
-            try appendF32JsonArray(&out, alloc, vector);
+            try out.append(alloc, '"');
+            try appendPackedF32Base64(&out, alloc, vector);
+            try out.append(alloc, '"');
             wrote_embedding = true;
         }
         if (cfg.query_shape.usesSparse()) {
@@ -3410,12 +3542,14 @@ fn printPublicQueryGuardrailSummaryJson(
     db_avg_ns: u64,
     handler_avg_ns: u64,
     http_stats: QueryBenchStats,
+    profile_stats: QueryBenchStats,
     concurrent: ConcurrentStats,
     load: LoadRun,
     load_rss_peak_bytes: usize,
     search_rss_peak_bytes: usize,
     search_memory: MemoryBreakdown,
 ) void {
+    const reports_real_http = !std.mem.eql(u8, mode, "handler");
     std.debug.print(
         "{{\"event\":\"public_query_guardrail_summary\",\"mode\":\"{s}\",\"server\":\"{s}\",\"query_shape\":\"{s}\",\"with_schema\":{},\"with_algebraic\":{},\"with_sparse\":{},\"with_graph\":{},\"docs\":{d},\"dims\":{d},\"queries\":{d},\"repeats\":{d},\"k\":{d},\"threads\":{d}",
         .{
@@ -3439,11 +3573,11 @@ fn printPublicQueryGuardrailSummaryJson(
         .{
             nsToUs(db_avg_ns),
             nsToUs(handler_avg_ns),
-            nsToUs(http_stats.avgNs()),
-            nsToUs(http_stats.avgFirstPassNs()),
-            nsToUs(http_stats.avgLaterPassNs()),
-            nsToUs(http_stats.avgProfileNs()),
-            nsToUs(if (http_stats.queries == 0) 0 else http_stats.profile_hbc_search_ns / http_stats.queries),
+            nsToUs(if (reports_real_http) http_stats.avgNs() else 0),
+            nsToUs(if (reports_real_http) http_stats.avgFirstPassNs() else 0),
+            nsToUs(if (reports_real_http) http_stats.avgLaterPassNs() else 0),
+            nsToUs(profile_stats.avgProfileNs()),
+            nsToUs(if (profile_stats.queries == 0) 0 else profile_stats.profile_hbc_search_ns / profile_stats.queries),
             concurrent.qps(),
             nsToUs(concurrent.avgRequestNs()),
             nsToUs(concurrent.max_request_ns),
@@ -3462,12 +3596,12 @@ fn printPublicQueryGuardrailSummaryJson(
             search_memory.lsm_cache_used_bytes,
             search_memory.rm_full_text_pending_used_bytes,
             search_memory.rm_replay_window_used_bytes,
-            avgPerQuery(http_stats, http_stats.profile_hbc_approx_candidate_count),
-            avgPerQuery(http_stats, http_stats.profile_hbc_rerank_candidate_count),
-            avgPerQuery(http_stats, http_stats.profile_hbc_reranked_vectors),
-            avgPerQuery(http_stats, http_stats.profile_hbc_top_k_count),
-            http_stats.profileResponseRate(),
-            http_stats.denseProfileRate(),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_approx_candidate_count),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_rerank_candidate_count),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_reranked_vectors),
+            avgPerQuery(profile_stats, profile_stats.profile_hbc_top_k_count),
+            profile_stats.profileResponseRate(),
+            profile_stats.denseProfileRate(),
             avgPerQuery(http_stats, http_stats.response_hit_count),
         },
     );
