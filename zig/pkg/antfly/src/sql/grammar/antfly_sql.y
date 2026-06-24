@@ -32,9 +32,9 @@
 %token ARROW_JSON ARROW_TEXT PATH_ARROW_JSON PATH_ARROW_TEXT
 %token ALL ALTER ANALYZE AND AS ASC BEGIN BY CASCADE COMMIT CONFLICT CONSTRAINT CONTINUE
 %token CREATE DATABASE DEALLOCATE DEFAULT DELETE DESC DISCARD DO DROP EXECUTE
-%token EXPLAIN EXISTS EXTENSION FALSE FROM FULL GRAPH GROUP HAVING IDENTITY IF INDEX INSERT INTO
+%token EXPLAIN EXISTS EXTENSION FALSE FETCH FIRST FROM FULL GRAPH GROUP HAVING IDENTITY IF INDEX INSERT INTO
 %token JOIN KEY LATERAL LIMIT MATCHED MERGE METRIC NOT NULL ON OR ORDER PREPARE PRIMARY PUBLIC
-%token NOTHING QUERY RESET RESTART RESTRICT RETURNING ROLLBACK SCHEMA SELECT SET SHOW TABLE TO TRUNCATE
+%token NEXT NOTHING OFFSET ONLY QUERY RESET RESTART RESTRICT RETURNING ROLLBACK ROW ROWS SCHEMA SELECT SET SHOW TABLE TO TRUNCATE
 %token THEN TRUE UNION UPDATE USING VALUES WHEN WHERE WITH
 %token EXCEPT INTERSECT
 
@@ -207,7 +207,7 @@ all_opt:
   ;
 
 select_statement:
-    SELECT select_list from_clause_opt where_clause_opt group_by_clause_opt having_clause_opt order_by_clause_opt limit_clause_opt
+    SELECT select_list from_clause_opt where_clause_opt group_by_clause_opt having_clause_opt order_by_clause_opt pagination_clause_list_opt
   ;
 
 graph_statement:
@@ -336,9 +336,41 @@ order_by_item:
   | expression DESC
   ;
 
-limit_clause_opt:
+pagination_clause_list_opt:
     /* empty */
-  | LIMIT expression
+  | pagination_clause_list
+  ;
+
+pagination_clause_list:
+    pagination_clause
+  | pagination_clause_list pagination_clause
+  ;
+
+pagination_clause:
+    LIMIT expression
+  | OFFSET expression row_rows_opt
+  | FETCH fetch_first_next fetch_count_opt row_rows ONLY
+  ;
+
+fetch_first_next:
+    FIRST
+  | NEXT
+  ;
+
+fetch_count_opt:
+    /* empty */
+  | expression
+  ;
+
+row_rows_opt:
+    /* empty */
+  | ROW
+  | ROWS
+  ;
+
+row_rows:
+    ROW
+  | ROWS
   ;
 
 returning_clause_opt:

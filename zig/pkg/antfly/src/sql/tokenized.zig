@@ -840,6 +840,7 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
         read: classifier.SqlReadStatementKind,
     }{
         .{ .sql = "SELECT id, status FROM usage_records WHERE status = 'open' ORDER BY id LIMIT 10", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY", .generated = .query, .read = .query },
         .{ .sql = "SELECT status FROM usage_records GROUP BY status HAVING status = 'open'", .generated = .aggregate, .read = .aggregate },
         .{ .sql = "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id", .generated = .join, .read = .join },
         .{ .sql = "SELECT id FROM LATERAL (SELECT id FROM usage_records) AS source_rows", .generated = .lateral, .read = .lateral },
@@ -865,6 +866,9 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 10 }, read_ast.where_tokens.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read_ast.order_tokens.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 14, .end = 15 }, read_ast.limit_tokens.?);
+                } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY")) {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 7 }, read_ast.offset_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 8, .end = 12 }, read_ast.fetch_tokens.?);
                 } else if (case.generated == .aggregate) {
                     try std.testing.expect(read_ast.group_tokens != null);
                     try std.testing.expect(read_ast.having_tokens != null);

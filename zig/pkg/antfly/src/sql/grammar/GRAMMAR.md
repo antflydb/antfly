@@ -95,7 +95,9 @@ generated set-operation reads now classify as a distinct read family and
 validate the left query and set-operation tail before calling the set-operation
 lowerer directly;
 simple non-recursive CTE reads now expose generated CTE name and body ranges
-and dispatch directly when those ranges validate. Unsupported read shapes
+and dispatch directly when those ranges validate; generated pagination grammar
+now covers `LIMIT`, `OFFSET`, and `FETCH FIRST`/`FETCH NEXT` query tails.
+Unsupported read shapes
 still fall back, and deeper read cutover still requires full generated
 query-body AST payloads for expression-level projections and predicates,
 structured joins, complete multi-CTE and recursive CTE bodies, aggregates,
@@ -215,7 +217,9 @@ Suggested migration order:
    dispatch to the native set-operation lowerer after validating the generated
    left-query and set-operation-tail ranges. Simple non-recursive CTE reads now
    carry generated CTE name and body ranges and dispatch to the typed read
-   lowerer after validating those ranges. Switching reads from fallback to required generated parsing still requires
+   lowerer after validating those ranges. Generated pagination coverage now
+   accepts and ranges `LIMIT`, `OFFSET`, and `FETCH FIRST`/`FETCH NEXT` tails.
+   Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, expression-level and
    join-level generated query-body ASTs, direct generated read-plan lowering,
    and unsupported-shape diagnostics.
