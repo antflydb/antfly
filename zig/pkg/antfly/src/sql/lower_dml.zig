@@ -9779,9 +9779,12 @@ pub fn truncateMutationSourceFromSyntaxAlloc(
         .row_claim = owned_row_claim,
     };
     owned_row_claim.owner_id = "";
-    defer source.deinit(alloc);
+    var source_deinitialized = false;
+    errdefer if (!source_deinitialized) source.deinit(alloc);
 
     const body_json = try mutationSourceBodyJsonAlloc(alloc, "delete", source, false, null, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, .{});
+    source.deinit(alloc);
+    source_deinitialized = true;
     defer alloc.free(body_json);
     var mutation = try relational_rows.parseRowsMutationSourceRequest(alloc, body_json, schema);
     errdefer mutation.deinit(alloc);
@@ -12466,10 +12469,13 @@ pub fn lowerWritePlanFromGeneratedDmlAstDirectAlloc(
     }
     if (dml_ast.kind == .truncate) {
         if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-        const row_claim = options.row_claim orelse return error.UnsupportedRowsQuery;
+        const options_row_claim = options.row_claim orelse return error.UnsupportedRowsQuery;
+        var row_claim = try mutationRowClaimAlloc(alloc, options_row_claim, false);
+        errdefer if (row_claim.owner_id.len > 0) alloc.free(row_claim.owner_id);
         if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
         var syntax = try truncateSyntaxFromGeneratedDmlAstAlloc(alloc, parsed_sql.items(), dml_ast);
         var lowered = try truncateMutationSourceFromSyntaxAlloc(alloc, &syntax, schema, row_claim);
+        row_claim.owner_id = "";
         lowered.sync_level = options.sync_level;
         return .{ .truncate_source = lowered };
     }

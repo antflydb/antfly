@@ -156,8 +156,9 @@ ranges, `DISTINCT ON` expression-list AST items, and match the production
 aggregate/query-family split;
 generated set-operation reads now classify as a distinct read family and
 validate the left query plus generated set-operation operator, `UNION ALL`,
-right-query projection/source, and right-predicate payloads before calling the
-set-operation lowerer directly;
+right-query projection/source, right-predicate payloads, and parent read
+result-tail ordering/pagination ranges before calling the set-operation lowerer
+directly;
 single- and multi-CTE reads now expose generated CTE-list, first-CTE, and
 last-CTE name/body ranges plus owned per-CTE name/body item arrays, optional
 column-alias lists, and `MATERIALIZED` / `NOT MATERIALIZED` hint metadata;
@@ -410,8 +411,10 @@ Unsupported DDL remains on the existing parser until
    Set-operation reads now classify as their own generated read family and
    dispatch to the native set-operation lowerer after validating the generated
    left-query, operator, `UNION ALL`, right-query projection/source, and
-   right-predicate payload ranges. Single- and multi-CTE reads now
-   carry generated CTE-list, first-CTE, last-CTE, owned per-CTE name/body
+   right-predicate payload ranges; generated set-operation result tails now
+   retain parent read ordering, `LIMIT`, `OFFSET`, and `FETCH` ranges instead
+   of treating those clauses as part of the right query. Single- and multi-CTE
+   reads now carry generated CTE-list, first-CTE, last-CTE, owned per-CTE name/body
    ranges, optional column-alias lists, and `MATERIALIZED` / `NOT MATERIALIZED`
    hint metadata; generated CTE reads reject malformed CTE-list counts,
    first/last compatibility fields, column-alias list payloads,

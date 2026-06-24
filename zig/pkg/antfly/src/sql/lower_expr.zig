@@ -25105,7 +25105,7 @@ fn generatedReadAstForParsedSql(
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
-                .read => |*read| if (read.kind == expected_kind and read.set_operation_tokens == null and read.cte_tokens == null) read else null,
+                .read => |*read| if (read.kind == expected_kind and read.cte_tokens == null and (expected_kind == .set_operation or read.set_operation_tokens == null)) read else null,
                 else => null,
             };
         }
@@ -33043,7 +33043,7 @@ test "sql adapter lower expr assembles boolean predicate groups" {
     const desc_tokens = [_]Token{
         .{ .kind = .identifier, .text = "desc", .source_start = 0, .source_end = 4, .keyword = .desc },
         .{ .kind = .identifier, .text = "nulls", .source_start = 5, .source_end = 10, .keyword = .nulls },
-        .{ .kind = .identifier, .text = "last", .source_start = 11, .source_end = 15 },
+        .{ .kind = .identifier, .text = "last", .source_start = 11, .source_end = 15, .keyword = .last },
     };
     try std.testing.expectEqual(false, (try parseOrderModifiers(desc_tokens[0..], &desc_pos, &desc_order)).?);
     try std.testing.expectEqual(@as(usize, 3), desc_pos);

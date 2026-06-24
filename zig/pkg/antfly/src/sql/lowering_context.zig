@@ -246,7 +246,7 @@ pub fn lowerReadPlanFromGeneratedReadAstAlloc(
             ) };
         },
         .set_operation => blk: {
-            try validateGeneratedSetOperationReadAst(read_ast);
+            try validateGeneratedSetOperationReadAst(parsed_sql.items(), read_ast);
             break :blk .{ .set_operation = try context.callbacks.lower_set_operation_optional_source_schema(
                 context.alloc,
                 parsed_sql,
@@ -813,11 +813,15 @@ fn validateGeneratedWindowReadAst(tokens: []const tokenized.Token, read_ast: gen
     if (read_ast.window_tokens) |range| try validateGeneratedReadRangePrecededByKeyword(tokens, range, .window);
 }
 
-fn validateGeneratedSetOperationReadAst(read_ast: generated_parser.GeneratedSqlReadAst) !void {
+fn validateGeneratedSetOperationReadAst(tokens: []const tokenized.Token, read_ast: generated_parser.GeneratedSqlReadAst) !void {
     if (read_ast.cte_tokens != null) return error.UnsupportedSqlShape;
     if (read_ast.projection_tokens == null or read_ast.source_tokens == null or read_ast.set_operation_tokens == null) {
         return error.UnsupportedSqlShape;
     }
+    if (read_ast.order_tokens) |range| try validateGeneratedReadOrderRange(tokens, range);
+    if (read_ast.limit_tokens) |range| try validateGeneratedReadRangePrecededByKeyword(tokens, range, .limit);
+    if (read_ast.offset_tokens) |range| try validateGeneratedReadRangePrecededByKeyword(tokens, range, .offset);
+    if (read_ast.fetch_tokens) |range| try validateGeneratedReadRangePrecededByKeyword(tokens, range, .fetch);
 }
 
 fn validateGeneratedCteReadAst(tokens: []const tokenized.Token, read_ast: generated_parser.GeneratedSqlReadAst) !void {
