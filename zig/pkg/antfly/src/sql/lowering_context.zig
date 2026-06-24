@@ -1573,10 +1573,39 @@ fn validateGeneratedExpressionOperatorTokens(
         => {
             if (operator_len != 1) return error.UnsupportedSqlShape;
             const operator_token = tokens[operator.start];
-            if (expression.kind == .is_null and operator_token.matchesKeywordTag(.isnull)) return;
-            if (expression.kind == .is_not_null and operator_token.matchesKeywordTag(.notnull)) return;
+            if (expression.kind == .is_null and operator_token.matchesKeywordTag(.isnull)) {
+                if (expression.right_tokens != null or expression.right_expression != null or expression.right_expression_kind != null) return error.UnsupportedSqlShape;
+                if (expression.quantifier_tokens != null or expression.negation_tokens != null) return error.UnsupportedSqlShape;
+                return;
+            }
+            if (expression.kind == .is_not_null and operator_token.matchesKeywordTag(.notnull)) {
+                if (expression.right_tokens != null or expression.right_expression != null or expression.right_expression_kind != null) return error.UnsupportedSqlShape;
+                if (expression.quantifier_tokens != null or expression.negation_tokens != null) return error.UnsupportedSqlShape;
+                return;
+            }
             if (!operator_token.matchesKeywordTag(.is)) return error.UnsupportedSqlShape;
             if (expression.quantifier_tokens != null or expression.negation_tokens != null) return error.UnsupportedSqlShape;
+            const right = expression.right_tokens orelse return error.UnsupportedSqlShape;
+            if (right.start != operator.end) return error.UnsupportedSqlShape;
+            const right_keyword: token_mod.TokenKeyword = switch (expression.kind) {
+                .is_null, .is_not_null => .null,
+                .is_true, .is_not_true => .true,
+                .is_false, .is_not_false => .false,
+                .is_unknown, .is_not_unknown => .unknown,
+                else => unreachable,
+            };
+            const negated = switch (expression.kind) {
+                .is_not_null, .is_not_true, .is_not_false, .is_not_unknown => true,
+                else => false,
+            };
+            if (negated) {
+                if (right.end != right.start + 2) return error.UnsupportedSqlShape;
+                if (!tokens[right.start].matchesKeywordTag(.not)) return error.UnsupportedSqlShape;
+                if (!tokens[right.start + 1].matchesKeywordTag(right_keyword)) return error.UnsupportedSqlShape;
+            } else {
+                if (right.end != right.start + 1) return error.UnsupportedSqlShape;
+                if (!tokens[right.start].matchesKeywordTag(right_keyword)) return error.UnsupportedSqlShape;
+            }
         },
         .is_distinct_from,
         .is_not_distinct_from,
@@ -3579,6 +3608,59 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_comparison_expression_parsed_sql, malformed_comparison_expression_read_ast),
+    );
+
+    var malformed_is_true_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status IS TRUE",
+    );
+    defer malformed_is_true_expression_parsed_sql.deinit(alloc);
+    const malformed_is_true_expression_generated_raw = malformed_is_true_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_is_true_expression_read_ast = switch (malformed_is_true_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_is_true_expression_read_ast.where_expression.kind = .is_false;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_is_true_expression_parsed_sql, malformed_is_true_expression_read_ast),
+    );
+
+    var malformed_is_not_false_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status IS NOT FALSE",
+    );
+    defer malformed_is_not_false_expression_parsed_sql.deinit(alloc);
+    const malformed_is_not_false_expression_generated_raw = malformed_is_not_false_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_is_not_false_expression_read_ast = switch (malformed_is_not_false_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_is_not_false_expression_read_ast.where_expression.kind = .is_false;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_is_not_false_expression_parsed_sql, malformed_is_not_false_expression_read_ast),
+    );
+
+    var malformed_postfix_isnull_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status ISNULL",
+    );
+    defer malformed_postfix_isnull_expression_parsed_sql.deinit(alloc);
+    const malformed_postfix_isnull_expression_generated_raw = malformed_postfix_isnull_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_postfix_isnull_expression_read_ast = switch (malformed_postfix_isnull_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_postfix_isnull_expression_read_ast.where_expression.right_tokens =
+        malformed_postfix_isnull_expression_read_ast.where_expression.left_tokens;
+    malformed_postfix_isnull_expression_read_ast.where_expression.right_expression_kind =
+        malformed_postfix_isnull_expression_read_ast.where_expression.left_expression_kind;
+    malformed_postfix_isnull_expression_read_ast.where_expression.right_expression =
+        malformed_postfix_isnull_expression_read_ast.where_expression.left_expression;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_postfix_isnull_expression_parsed_sql, malformed_postfix_isnull_expression_read_ast),
     );
 
     var malformed_comparison_child_parsed_sql = try tokenized.ParsedSql.initAlloc(
