@@ -368,7 +368,8 @@ Unsupported DDL remains on the existing parser until
    per-condition expression arrays plus chain-level condition-count and
    first/last condition spans for top-level logical chains, while
    `BETWEEN ... AND ...` remains classified as a range predicate with explicit
-   generated metadata for PostgreSQL `SYMMETRIC` and `ASYMMETRIC` modifiers.
+   generated metadata for PostgreSQL `SYMMETRIC` and `ASYMMETRIC` modifiers
+   plus owned lower/upper bound expression payloads.
    Prefix `NOT` predicates are accepted and classified with owned right-side
    expression nodes.
    Parenthesized expression groups carry inner token ranges and owned inner

@@ -350,6 +350,12 @@ pub const GeneratedSqlExpressionAst = struct {
     operator_tokens: ?GeneratedSqlTokenRange = null,
     between_modifier_tokens: ?GeneratedSqlTokenRange = null,
     between_modifier: ?GeneratedSqlBetweenModifier = null,
+    between_lower_tokens: ?GeneratedSqlTokenRange = null,
+    between_lower_expression_kind: ?GeneratedSqlExpressionKind = null,
+    between_lower_expression: ?*GeneratedSqlExpressionAst = null,
+    between_upper_tokens: ?GeneratedSqlTokenRange = null,
+    between_upper_expression_kind: ?GeneratedSqlExpressionKind = null,
+    between_upper_expression: ?*GeneratedSqlExpressionAst = null,
     quantifier_tokens: ?GeneratedSqlTokenRange = null,
     right_tokens: ?GeneratedSqlTokenRange = null,
     right_expression_kind: ?GeneratedSqlExpressionKind = null,
@@ -390,6 +396,14 @@ pub const GeneratedSqlExpressionAst = struct {
         if (self.over_frame_end_expression) |frame_end_expression| {
             frame_end_expression.deinit(alloc);
             alloc.destroy(frame_end_expression);
+        }
+        if (self.between_lower_expression) |between_lower_expression| {
+            between_lower_expression.deinit(alloc);
+            alloc.destroy(between_lower_expression);
+        }
+        if (self.between_upper_expression) |between_upper_expression| {
+            between_upper_expression.deinit(alloc);
+            alloc.destroy(between_upper_expression);
         }
         if (self.case_first_condition) |case_first_condition| {
             case_first_condition.deinit(alloc);
@@ -3126,6 +3140,16 @@ fn buildGeneratedExpressionAst(alloc: std.mem.Allocator, tokens: []const token_m
         ast.right_tokens = .{ .start = operand_start, .end = right_end };
         ast.right_expression_kind = generatedExpressionKindForRange(tokens, ast.right_tokens.?);
         ast.right_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, ast.right_tokens.?);
+        if (isGeneratedBetweenExpressionKind(operator.kind)) {
+            if (generatedBetweenBoundExpressionRanges(tokens, .{ .start = operand_start, .end = right_end })) |bounds| {
+                ast.between_lower_tokens = bounds.lower_tokens;
+                ast.between_lower_expression_kind = generatedExpressionKindForRange(tokens, bounds.lower_tokens);
+                ast.between_lower_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, bounds.lower_tokens);
+                ast.between_upper_tokens = bounds.upper_tokens;
+                ast.between_upper_expression_kind = generatedExpressionKindForRange(tokens, bounds.upper_tokens);
+                ast.between_upper_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, bounds.upper_tokens);
+            }
+        }
         if (try generatedBooleanChainMetadata(alloc, tokens, range, operator.kind)) |boolean_chain| {
             ast.boolean_condition_count = boolean_chain.condition_count;
             ast.boolean_first_condition_tokens = boolean_chain.first_condition_tokens;
@@ -3294,6 +3318,51 @@ fn generatedExpressionKindForRange(tokens: []const token_mod.Token, range: Gener
     if (findTopLevelExpressionOperator(tokens, range)) |operator| return operator.kind;
     if (generatedFunctionCallExpression(tokens, range) != null) return .function_call;
     if (generatedArrayConstructorExpression(tokens, range) != null) return .array_constructor;
+    return null;
+}
+
+const GeneratedBetweenBoundExpressionRanges = struct {
+    lower_tokens: GeneratedSqlTokenRange,
+    upper_tokens: GeneratedSqlTokenRange,
+};
+
+fn generatedBetweenBoundExpressionRanges(
+    tokens: []const token_mod.Token,
+    range: GeneratedSqlTokenRange,
+) ?GeneratedBetweenBoundExpressionRanges {
+    const and_index = findTopLevelBetweenBoundAnd(tokens, range) orelse return null;
+    if (range.start >= and_index or and_index + 1 >= range.end) return null;
+    return .{
+        .lower_tokens = .{ .start = range.start, .end = and_index },
+        .upper_tokens = .{ .start = and_index + 1, .end = range.end },
+    };
+}
+
+fn findTopLevelBetweenBoundAnd(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?usize {
+    if (range.start >= range.end or range.end > tokens.len) return null;
+    var depth: usize = 0;
+    var case_depth: usize = 0;
+    var index = range.start;
+    while (index < range.end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth == 0) return null;
+                depth -= 1;
+            },
+            else => if (depth == 0) {
+                if (tokens[index].matchesKeywordTag(.case)) {
+                    case_depth += 1;
+                } else if (tokens[index].matchesKeywordTag(.end)) {
+                    if (case_depth == 0) return null;
+                    case_depth -= 1;
+                } else if (case_depth == 0 and tokens[index].matchesKeywordTag(.@"and")) {
+                    return index;
+                }
+            },
+        }
+    }
+    if (depth != 0 or case_depth != 0) return null;
     return null;
 }
 
@@ -4891,6 +4960,12 @@ test "generated SQL parser facade builds predicate read AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.where_expression.left_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.where_expression.operator_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 10 }, read.where_expression.right_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.where_expression.between_lower_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.where_expression.between_lower_expression.?.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.where_expression.between_lower_expression.?.tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.where_expression.between_upper_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.where_expression.between_upper_expression.?.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.where_expression.between_upper_expression.?.tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -4907,6 +4982,8 @@ test "generated SQL parser facade builds predicate read AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.where_expression.between_modifier_tokens.?);
             try std.testing.expectEqual(GeneratedSqlBetweenModifier.symmetric, read.where_expression.between_modifier.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 11 }, read.where_expression.right_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.where_expression.between_lower_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.where_expression.between_upper_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -4924,6 +5001,8 @@ test "generated SQL parser facade builds predicate read AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read.where_expression.between_modifier_tokens.?);
             try std.testing.expectEqual(GeneratedSqlBetweenModifier.symmetric, read.where_expression.between_modifier.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 16 }, read.where_expression.right_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 14 }, read.where_expression.between_lower_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 15, .end = 16 }, read.where_expression.between_upper_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -5085,6 +5164,8 @@ test "generated SQL parser facade builds predicate read AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.where_expression.negation_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.where_expression.operator_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 11 }, read.where_expression.right_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.where_expression.between_lower_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.where_expression.between_upper_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

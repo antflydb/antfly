@@ -987,6 +987,8 @@ fn generatedExpressionAstHasMetadata(expression: generated_parser.GeneratedSqlEx
         expression.negation_tokens != null or
         expression.operator_tokens != null or
         expression.between_modifier_tokens != null or
+        expression.between_lower_tokens != null or
+        expression.between_upper_tokens != null or
         expression.quantifier_tokens != null or
         expression.right_tokens != null or
         expression.escape_tokens != null)
@@ -1001,6 +1003,8 @@ fn generatedExpressionAstHasMetadata(expression: generated_parser.GeneratedSqlEx
         expression.cast_expression != null or
         expression.over_frame_start_expression != null or
         expression.over_frame_end_expression != null or
+        expression.between_lower_expression != null or
+        expression.between_upper_expression != null or
         expression.case_first_condition != null or
         expression.case_first_result != null or
         expression.case_else_expression != null or
@@ -1332,6 +1336,12 @@ fn validateGeneratedExpressionAstStructure(expression: generated_parser.Generate
         => {
             if (expression.negation_tokens == null) return error.UnsupportedSqlShape;
             try validateGeneratedExpressionAstBinaryStructure(expression);
+            if (expression.kind == .not_between) {
+                if (expression.between_modifier_tokens != null and expression.between_modifier == null) return error.UnsupportedSqlShape;
+                if (expression.between_lower_tokens == null or expression.between_upper_tokens == null) return error.UnsupportedSqlShape;
+                try requireGeneratedExpressionAstChild(expression.between_lower_expression_kind, expression.between_lower_tokens, expression.between_lower_expression);
+                try requireGeneratedExpressionAstChild(expression.between_upper_expression_kind, expression.between_upper_tokens, expression.between_upper_expression);
+            }
         },
         .quantified_comparison => {
             if (expression.quantifier_tokens == null) return error.UnsupportedSqlShape;
@@ -1347,6 +1357,9 @@ fn validateGeneratedExpressionAstStructure(expression: generated_parser.Generate
         .between => {
             if (expression.between_modifier_tokens != null and expression.between_modifier == null) return error.UnsupportedSqlShape;
             try validateGeneratedExpressionAstBinaryStructure(expression);
+            if (expression.between_lower_tokens == null or expression.between_upper_tokens == null) return error.UnsupportedSqlShape;
+            try requireGeneratedExpressionAstChild(expression.between_lower_expression_kind, expression.between_lower_tokens, expression.between_lower_expression);
+            try requireGeneratedExpressionAstChild(expression.between_upper_expression_kind, expression.between_upper_tokens, expression.between_upper_expression);
         },
         .comparison,
         .in_list,
@@ -1430,6 +1443,8 @@ fn validateGeneratedExpressionAstRanges(
         expression.negation_tokens,
         expression.operator_tokens,
         expression.between_modifier_tokens,
+        expression.between_lower_tokens,
+        expression.between_upper_tokens,
         expression.quantifier_tokens,
         expression.right_tokens,
         expression.escape_tokens,
@@ -1445,6 +1460,8 @@ fn validateGeneratedExpressionAstRanges(
     if (expression.cast_expression) |cast_expression| try validateGeneratedExpressionAstRanges(tokens, read_ast, cast_expression.*);
     if (expression.over_frame_start_expression) |frame_start_expression| try validateGeneratedExpressionAstRanges(tokens, read_ast, frame_start_expression.*);
     if (expression.over_frame_end_expression) |frame_end_expression| try validateGeneratedExpressionAstRanges(tokens, read_ast, frame_end_expression.*);
+    if (expression.between_lower_expression) |between_lower_expression| try validateGeneratedExpressionAstRanges(tokens, read_ast, between_lower_expression.*);
+    if (expression.between_upper_expression) |between_upper_expression| try validateGeneratedExpressionAstRanges(tokens, read_ast, between_upper_expression.*);
     if (expression.case_first_condition) |case_first_condition| try validateGeneratedExpressionAstRanges(tokens, read_ast, case_first_condition.*);
     if (expression.case_first_result) |case_first_result| try validateGeneratedExpressionAstRanges(tokens, read_ast, case_first_result.*);
     if (expression.case_else_expression) |case_else_expression| try validateGeneratedExpressionAstRanges(tokens, read_ast, case_else_expression.*);
@@ -1515,6 +1532,14 @@ fn validateGeneratedExpressionAstRanges(
                 if (frame_expression.start < frame.start or frame_expression.end > frame.end) return error.UnsupportedSqlShape;
             }
         }
+    }
+    if (expression.kind == .between or expression.kind == .not_between) {
+        const right = expression.right_tokens orelse return error.UnsupportedSqlShape;
+        const lower = expression.between_lower_tokens orelse return error.UnsupportedSqlShape;
+        const upper = expression.between_upper_tokens orelse return error.UnsupportedSqlShape;
+        if (lower.start < right.start or lower.end > right.end) return error.UnsupportedSqlShape;
+        if (upper.start < right.start or upper.end > right.end) return error.UnsupportedSqlShape;
+        if (lower.end >= upper.start) return error.UnsupportedSqlShape;
     }
 }
 
@@ -2511,6 +2536,22 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_unary_expression_parsed_sql, malformed_unary_expression_read_ast),
+    );
+
+    var malformed_between_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE score BETWEEN 1 AND 10",
+    );
+    defer malformed_between_expression_parsed_sql.deinit(alloc);
+    const malformed_between_expression_generated_raw = malformed_between_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_between_expression_read_ast = switch (malformed_between_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_between_expression_read_ast.where_expression.between_upper_expression = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_between_expression_parsed_sql, malformed_between_expression_read_ast),
     );
 
     var malformed_exists_subquery_parsed_sql = try tokenized.ParsedSql.initAlloc(
