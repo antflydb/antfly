@@ -609,6 +609,8 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT id FROM usage_records WHERE status || ':' || id = 'open:u1'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE deleted_at IS NULL", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE deleted_at IS NOT NULL", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE status ISNULL", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE lower(status) NOTNULL", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE active IS TRUE", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE active IS NOT FALSE", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE active IS UNKNOWN", .kind = .read },
@@ -1972,7 +1974,8 @@ fn buildGeneratedExpressionAst(alloc: std.mem.Allocator, tokens: []const token_m
     const operator = findTopLevelExpressionOperator(tokens, range) orelse return ast;
     ast.kind = operator.kind;
     if (!operator.prefix) {
-        if (range.start >= operator.index or operator.index + 1 >= range.end) return ast;
+        if (range.start >= operator.index) return ast;
+        if (!operator.postfix and operator.index + 1 >= range.end) return ast;
         const left_end = if (operator.negation_index) |negation_index|
             if (negation_index < operator.index) negation_index else operator.index
         else
@@ -2233,6 +2236,7 @@ const GeneratedSqlExpressionOperator = struct {
     negation_index: ?usize = null,
     quantifier_index: ?usize = null,
     prefix: bool = false,
+    postfix: bool = false,
 };
 
 fn findTopLevelExpressionOperator(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?GeneratedSqlExpressionOperator {
@@ -2328,6 +2332,8 @@ fn findTopLevelExpressionOperator(tokens: []const token_mod.Token, range: Genera
                 }
                 if (tokens[index].matchesKeywordTag(.in)) return .{ .kind = .in_list, .index = index };
                 if (tokens[index].matchesKeywordTag(.between)) return .{ .kind = .between, .index = index };
+                if (tokens[index].matchesKeywordTag(.isnull)) return .{ .kind = .is_null, .index = index, .postfix = true };
+                if (tokens[index].matchesKeywordTag(.notnull)) return .{ .kind = .is_not_null, .index = index, .postfix = true };
                 if (tokens[index].matchesKeywordTag(.is) and index + 1 < range.end) {
                     if (tokens[index + 1].matchesKeywordTag(.null)) return .{ .kind = .is_null, .index = index };
                     if (tokens[index + 1].matchesKeywordTag(.true)) return .{ .kind = .is_true, .index = index };
@@ -3395,6 +3401,35 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.where_expression.left_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.where_expression.operator_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 9 }, read.where_expression.right_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const postfix_isnull_read_sql = "SELECT id FROM usage_records WHERE status ISNULL";
+    const postfix_isnull_read_result = try parseSqlAlloc(alloc, postfix_isnull_read_sql);
+    switch (postfix_isnull_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 7 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.is_null, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.where_expression.operator_tokens.?);
+            try std.testing.expect(read.where_expression.right_tokens == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const postfix_notnull_read_sql = "SELECT id FROM usage_records WHERE lower(status) NOTNULL";
+    const postfix_notnull_read_result = try parseSqlAlloc(alloc, postfix_notnull_read_sql);
+    switch (postfix_notnull_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 10 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.is_not_null, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 9 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.function_call, read.where_expression.left_expression_kind.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.where_expression.operator_tokens.?);
+            try std.testing.expect(read.where_expression.right_tokens == null);
         },
         else => return error.TestUnexpectedResult,
     }

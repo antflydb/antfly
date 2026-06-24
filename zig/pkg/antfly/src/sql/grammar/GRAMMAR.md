@@ -289,8 +289,9 @@ Suggested migration order:
    and `!~*` are accepted and classified with generated operator ranges.
    String concatenation with `||` is accepted and classified with generated
    operator ranges in projections and predicates.
-   `IS NULL` and `IS NOT NULL` predicates are accepted and classified
-   as explicit null-test expression kinds, `IS TRUE`/`IS FALSE`/`IS UNKNOWN`
+   `IS NULL` and `IS NOT NULL` predicates, plus PostgreSQL postfix `ISNULL`
+   and `NOTNULL`, are accepted and classified as explicit null-test expression
+   kinds, `IS TRUE`/`IS FALSE`/`IS UNKNOWN`
    boolean-test predicates are accepted with their `IS NOT` variants, and
    `IS DISTINCT FROM` / `IS NOT DISTINCT FROM` predicates are accepted with
    multi-token operator ranges. Top-level
