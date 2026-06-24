@@ -312,8 +312,10 @@ Suggested migration order:
    lowerer-backed date/time functions such as `date_bin`, generated `TIMESTAMP
    '...'` / `TIMESTAMPTZ '...'` literal type/value ranges, generated
    `CURRENT_DATE` and `CURRENT_TIMESTAMP(...)` temporal keyword ranges,
-   generated `EXTRACT(field FROM expression)` field/source ranges, and searched
-   `CASE WHEN ... THEN ... ELSE ... END` branch metadata.
+   generated `EXTRACT(field FROM expression)` field/source ranges, lowerer-backed
+   temporal function metadata for `date_part`/`date_trunc`-style projection,
+   predicate, and ordering expressions, and searched `CASE WHEN ... THEN ...
+   ELSE ... END` branch metadata.
    Generated read ASTs now have a validated wrapper
    into the current typed read lowerer for representative covered read plans
    that rejects malformed generated range payloads. Simple query reads now have
