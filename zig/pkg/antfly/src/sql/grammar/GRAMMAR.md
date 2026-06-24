@@ -126,9 +126,9 @@ and
 `IS DISTINCT FROM` / `IS NOT DISTINCT FROM` predicates are accepted with
 multi-token operator ranges. Top-level
 `AND` and `OR` predicates are classified as logical-expression metadata with
-left and right token ranges, owned child expression nodes, and chain-level
-condition-count plus first/last condition spans for top-level logical chains,
-while
+left and right token ranges, owned child expression nodes, and owned
+per-condition expression arrays plus chain-level condition-count and
+first/last condition spans for top-level logical chains, while
 `BETWEEN ... AND ...` remains classified as a range predicate. Prefix `NOT`
 predicates are accepted and classified with owned right-side expression nodes.
 Parenthesized expression groups carry inner token ranges and owned inner
@@ -360,9 +360,9 @@ Unsupported DDL remains on the existing parser until
    `IS DISTINCT FROM` / `IS NOT DISTINCT FROM` predicates are accepted with
    multi-token operator ranges. Top-level
    `AND` and `OR` predicates are classified as logical-expression metadata with
-   left and right token ranges, owned child expression nodes, and chain-level
-   condition-count plus first/last condition spans for top-level logical
-   chains, while
+   left and right token ranges, owned child expression nodes, and owned
+   per-condition expression arrays plus chain-level condition-count and
+   first/last condition spans for top-level logical chains, while
    `BETWEEN ... AND ...` remains classified as a range predicate with explicit
    generated metadata for PostgreSQL `SYMMETRIC` and `ASYMMETRIC` modifiers.
    Prefix `NOT` predicates are accepted and classified with owned right-side

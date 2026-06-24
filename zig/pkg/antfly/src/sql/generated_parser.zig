@@ -322,6 +322,7 @@ pub const GeneratedSqlExpressionAst = struct {
     boolean_last_condition_tokens: ?GeneratedSqlTokenRange = null,
     boolean_last_condition_kind: ?GeneratedSqlExpressionKind = null,
     boolean_last_condition: ?*GeneratedSqlExpressionAst = null,
+    boolean_condition_items: GeneratedSqlListAst = .{},
     interval_value_tokens: ?GeneratedSqlTokenRange = null,
     timestamp_type_tokens: ?GeneratedSqlTokenRange = null,
     timestamp_value_tokens: ?GeneratedSqlTokenRange = null,
@@ -388,6 +389,7 @@ pub const GeneratedSqlExpressionAst = struct {
             boolean_last_condition.deinit(alloc);
             alloc.destroy(boolean_last_condition);
         }
+        self.boolean_condition_items.deinit(alloc);
         self.argument_items.deinit(alloc);
         self.argument_order_items.deinit(alloc);
         self.within_group_order_items.deinit(alloc);
@@ -3007,6 +3009,7 @@ fn buildGeneratedExpressionAst(alloc: std.mem.Allocator, tokens: []const token_m
             ast.boolean_last_condition_tokens = boolean_chain.last_condition_tokens;
             ast.boolean_last_condition_kind = boolean_chain.last_condition_kind;
             ast.boolean_last_condition = boolean_chain.last_condition;
+            ast.boolean_condition_items = boolean_chain.condition_items;
         }
         return ast;
     }
@@ -3546,6 +3549,7 @@ const GeneratedSqlBooleanChainMetadata = struct {
     last_condition_tokens: GeneratedSqlTokenRange,
     last_condition_kind: ?GeneratedSqlExpressionKind,
     last_condition: *GeneratedSqlExpressionAst,
+    condition_items: GeneratedSqlListAst,
 };
 
 fn generatedBooleanChainMetadata(
@@ -3554,32 +3558,71 @@ fn generatedBooleanChainMetadata(
     range: GeneratedSqlTokenRange,
     kind: GeneratedSqlExpressionKind,
 ) !?GeneratedSqlBooleanChainMetadata {
+    if (range.start >= range.end or range.end > tokens.len) return null;
+
+    var condition_items = try buildGeneratedBooleanConditionListAst(alloc, tokens, range, kind);
+    errdefer condition_items.deinit(alloc);
+    if (condition_items.count < 2) return null;
+
+    const first_tokens = condition_items.first_tokens orelse return null;
+    const last_tokens = condition_items.last_tokens orelse return null;
+    const first_condition = try buildGeneratedExpressionNodeAlloc(alloc, tokens, first_tokens);
+    errdefer {
+        first_condition.deinit(alloc);
+        alloc.destroy(first_condition);
+    }
+    const last_condition = try buildGeneratedExpressionNodeAlloc(alloc, tokens, last_tokens);
+    return .{
+        .condition_count = condition_items.count,
+        .first_condition_tokens = first_tokens,
+        .first_condition_kind = generatedExpressionKindForRange(tokens, first_tokens),
+        .first_condition = first_condition,
+        .last_condition_tokens = last_tokens,
+        .last_condition_kind = generatedExpressionKindForRange(tokens, last_tokens),
+        .last_condition = last_condition,
+        .condition_items = condition_items,
+    };
+}
+
+fn buildGeneratedBooleanConditionListAst(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    range: GeneratedSqlTokenRange,
+    kind: GeneratedSqlExpressionKind,
+) !GeneratedSqlListAst {
     const keyword: token_mod.TokenKeyword = switch (kind) {
         .logical_or => .@"or",
         .logical_and => .@"and",
-        else => return null,
+        else => return .{},
     };
-    if (range.start >= range.end or range.end > tokens.len) return null;
+    var ast = GeneratedSqlListAst{};
+    if (range.start >= range.end or range.end > tokens.len) return ast;
 
+    var items: std.ArrayListUnmanaged(GeneratedSqlTokenRange) = .empty;
+    errdefer items.deinit(alloc);
     var depth: usize = 0;
     var case_depth: usize = 0;
-    var condition_count: usize = 1;
-    var first_condition_tokens: ?GeneratedSqlTokenRange = null;
-    var last_condition_start = range.start;
+    var item_start = range.start;
     var skip_next_between_and = false;
     var index = range.start;
     while (index < range.end) : (index += 1) {
         switch (tokens[index].kind) {
             .lparen, .lbracket => depth += 1,
             .rparen, .rbracket => {
-                if (depth == 0) return null;
+                if (depth == 0) {
+                    items.deinit(alloc);
+                    return .{};
+                }
                 depth -= 1;
             },
             else => if (depth == 0) {
                 if (tokens[index].matchesKeywordTag(.case)) {
                     case_depth += 1;
                 } else if (tokens[index].matchesKeywordTag(.end)) {
-                    if (case_depth == 0) return null;
+                    if (case_depth == 0) {
+                        items.deinit(alloc);
+                        return .{};
+                    }
                     case_depth -= 1;
                 } else if (case_depth == 0) {
                     if (tokens[index].matchesKeywordTag(.between) and kind == .logical_and) {
@@ -3588,37 +3631,49 @@ fn generatedBooleanChainMetadata(
                         if (kind == .logical_and and skip_next_between_and) {
                             skip_next_between_and = false;
                         } else {
-                            if (last_condition_start >= index) return null;
-                            if (first_condition_tokens == null) {
-                                first_condition_tokens = .{ .start = range.start, .end = index };
+                            if (item_start >= index) {
+                                items.deinit(alloc);
+                                return .{};
                             }
-                            condition_count += 1;
-                            last_condition_start = index + 1;
+                            try recordGeneratedListItem(alloc, &items, &ast, .{ .start = item_start, .end = index });
+                            item_start = index + 1;
                         }
                     }
                 }
             },
         }
     }
-    if (depth != 0 or case_depth != 0 or condition_count < 2 or last_condition_start >= range.end) return null;
-
-    const first_tokens = first_condition_tokens orelse return null;
-    const last_tokens = GeneratedSqlTokenRange{ .start = last_condition_start, .end = range.end };
-    const first_condition = try buildGeneratedExpressionNodeAlloc(alloc, tokens, first_tokens);
-    errdefer {
-        first_condition.deinit(alloc);
-        alloc.destroy(first_condition);
+    if (depth != 0 or case_depth != 0 or item_start >= range.end or ast.count == 0) {
+        items.deinit(alloc);
+        return .{};
     }
-    const last_condition = try buildGeneratedExpressionNodeAlloc(alloc, tokens, last_tokens);
-    return .{
-        .condition_count = condition_count,
-        .first_condition_tokens = first_tokens,
-        .first_condition_kind = generatedExpressionKindForRange(tokens, first_tokens),
-        .first_condition = first_condition,
-        .last_condition_tokens = last_tokens,
-        .last_condition_kind = generatedExpressionKindForRange(tokens, last_tokens),
-        .last_condition = last_condition,
-    };
+
+    try recordGeneratedListItem(alloc, &items, &ast, .{ .start = item_start, .end = range.end });
+    ast.items = try items.toOwnedSlice(alloc);
+    errdefer {
+        alloc.free(ast.items);
+        ast.items = &.{};
+    }
+    ast.expression_items = try alloc.alloc(GeneratedSqlTokenRange, ast.items.len);
+    errdefer {
+        alloc.free(ast.expression_items);
+        ast.expression_items = &.{};
+    }
+    for (ast.items, 0..) |item, item_index| {
+        ast.expression_items[item_index] = item;
+    }
+    ast.expressions = try alloc.alloc(GeneratedSqlExpressionAst, ast.items.len);
+    var expression_count: usize = 0;
+    errdefer {
+        for (ast.expressions[0..expression_count]) |*expression| expression.deinit(alloc);
+        alloc.free(ast.expressions);
+        ast.expressions = &.{};
+    }
+    for (ast.expression_items) |item| {
+        ast.expressions[expression_count] = try buildGeneratedExpressionAst(alloc, tokens, item);
+        expression_count += 1;
+    }
+    return ast;
 }
 
 fn findTopLevelExpressionOperator(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?GeneratedSqlExpressionOperator {
@@ -5323,6 +5378,13 @@ test "generated SQL parser facade builds null logical and join AST spans" {
             try std.testing.expectEqual(GeneratedSqlExpressionKind.is_null, read.where_expression.boolean_last_condition_kind.?);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.is_null, read.where_expression.boolean_last_condition.?.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 12 }, read.where_expression.boolean_last_condition.?.tokens.?);
+            try std.testing.expectEqual(@as(usize, 2), read.where_expression.boolean_condition_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 8 }, read.where_expression.boolean_condition_items.first_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 12 }, read.where_expression.boolean_condition_items.last_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 8 }, read.where_expression.boolean_condition_items.items[0]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 12 }, read.where_expression.boolean_condition_items.items[1]);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.boolean_condition_items.expressions[0].kind);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.is_null, read.where_expression.boolean_condition_items.expressions[1].kind);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -5342,6 +5404,15 @@ test "generated SQL parser facade builds null logical and join AST spans" {
             try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.boolean_last_condition_kind.?);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.boolean_last_condition.?.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 16 }, read.where_expression.boolean_last_condition.?.tokens.?);
+            try std.testing.expectEqual(@as(usize, 3), read.where_expression.boolean_condition_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 8 }, read.where_expression.boolean_condition_items.first_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 16 }, read.where_expression.boolean_condition_items.last_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 8 }, read.where_expression.boolean_condition_items.items[0]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 12 }, read.where_expression.boolean_condition_items.items[1]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 16 }, read.where_expression.boolean_condition_items.items[2]);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.boolean_condition_items.expressions[0].kind);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.is_null, read.where_expression.boolean_condition_items.expressions[1].kind);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.boolean_condition_items.expressions[2].kind);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -5363,6 +5434,9 @@ test "generated SQL parser facade builds null logical and join AST spans" {
             try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.boolean_first_condition_kind.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 12 }, read.where_expression.boolean_last_condition_tokens.?);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.is_null, read.where_expression.boolean_last_condition_kind.?);
+            try std.testing.expectEqual(@as(usize, 2), read.where_expression.boolean_condition_items.count);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.boolean_condition_items.expressions[0].kind);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.is_null, read.where_expression.boolean_condition_items.expressions[1].kind);
         },
         else => return error.TestUnexpectedResult,
     }

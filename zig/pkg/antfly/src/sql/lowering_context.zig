@@ -999,6 +999,7 @@ fn generatedExpressionAstHasMetadata(expression: generated_parser.GeneratedSqlEx
         expression.boolean_first_condition != null or
         expression.boolean_last_condition != null or
         expression.boolean_condition_count != 0 or
+        expression.boolean_condition_items.count != 0 or
         expression.argument_items.count != 0 or
         expression.argument_order_items.count != 0 or
         expression.within_group_order_items.count != 0 or
@@ -1069,10 +1070,19 @@ fn validateGeneratedBooleanChainExpressionAstStructure(expression: generated_par
     try validateGeneratedExpressionAstBinaryStructure(expression);
     if (expression.boolean_condition_count < 2 or
         expression.boolean_first_condition_tokens == null or
-        expression.boolean_last_condition_tokens == null)
+        expression.boolean_last_condition_tokens == null or
+        expression.boolean_condition_items.count != expression.boolean_condition_count)
     {
         return error.UnsupportedSqlShape;
     }
+    if (!std.meta.eql(
+        expression.boolean_first_condition_tokens.?,
+        expression.boolean_condition_items.first_tokens orelse return error.UnsupportedSqlShape,
+    )) return error.UnsupportedSqlShape;
+    if (!std.meta.eql(
+        expression.boolean_last_condition_tokens.?,
+        expression.boolean_condition_items.last_tokens orelse return error.UnsupportedSqlShape,
+    )) return error.UnsupportedSqlShape;
     try requireGeneratedExpressionAstChild(
         expression.boolean_first_condition_kind,
         expression.boolean_first_condition_tokens,
@@ -1387,6 +1397,7 @@ fn validateGeneratedExpressionAstRanges(
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.over_partition_items);
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.over_order_items);
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.array_items);
+    try validateGeneratedReadListAstRanges(tokens, read_ast, expression.boolean_condition_items);
     if (expression.kind == .subquery) {
         const inner = expression.inner_tokens orelse return error.UnsupportedSqlShape;
         const select_tokens = expression.subquery_select_tokens orelse return error.UnsupportedSqlShape;
@@ -2362,6 +2373,17 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         else => return error.UnsupportedSqlShape,
     };
     malformed_boolean_chain_read_ast.where_expression.boolean_condition_count = 1;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_boolean_chain_parsed_sql, malformed_boolean_chain_read_ast),
+    );
+
+    malformed_boolean_chain_read_ast = switch (malformed_boolean_chain_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_boolean_chain_read_ast.where_expression.boolean_condition_items.first_tokens =
+        malformed_boolean_chain_read_ast.where_expression.boolean_condition_items.last_tokens;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_boolean_chain_parsed_sql, malformed_boolean_chain_read_ast),
