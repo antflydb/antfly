@@ -572,7 +572,10 @@ pub const GeneratedSqlDdlAst = struct {
     index_table_tokens: ?GeneratedSqlTokenRange = null,
     index_method_tokens: ?GeneratedSqlTokenRange = null,
     index_elements_tokens: ?GeneratedSqlTokenRange = null,
+    index_include_tokens: ?GeneratedSqlTokenRange = null,
     index_options_tokens: ?GeneratedSqlTokenRange = null,
+    index_where_tokens: ?GeneratedSqlTokenRange = null,
+    unique: bool = false,
     if_not_exists: bool = false,
     if_exists: bool = false,
     cascade: bool = false,
@@ -771,6 +774,7 @@ pub const simple_ddl_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CREATE TABLE IF NOT EXISTS usage_records (id text PRIMARY KEY)", .kind = .ddl },
     .{ .sql = "CREATE INDEX usage_records_status_idx ON usage_records (status)", .kind = .extension_index },
     .{ .sql = "CREATE INDEX IF NOT EXISTS usage_records_status_idx ON usage_records (status)", .kind = .extension_index },
+    .{ .sql = "CREATE UNIQUE INDEX usage_records_status_active_idx ON usage_records (status) INCLUDE (tenant_id, amount) WHERE deleted_at IS NULL", .kind = .extension_index },
     .{ .sql = "CREATE EXTENSION vector", .kind = .extension_index },
     .{ .sql = "DROP TABLE usage_records", .kind = .ddl },
     .{ .sql = "DROP TABLE IF EXISTS usage_records", .kind = .ddl },
@@ -1114,6 +1118,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.schema)) return .{ .ddl = .create_schema };
         if (second.matchesKeywordTag(.table)) return .{ .ddl = .create_table };
         if (second.matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
+        if (second.matchesKeywordTag(.unique) and tokens.len > 2 and tokens[2].matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
         if (second.matchesKeywordTag(.graph) and tokens.len > 2) {
             if (tokens[2].matchesKeywordTag(.index)) return .{ .graph = .create_index };
             if (tokens[2].matchesKeywordTag(.metric)) return .{ .graph = .create_metric };
@@ -1365,6 +1370,10 @@ fn buildDdlAst(
             }
         },
         .create_index => {
+            if (tokens.len > 2 and tokens[1].matchesKeywordTag(.unique) and tokens[2].matchesKeywordTag(.index)) {
+                ast.unique = true;
+                index = 3;
+            }
             ast.if_not_exists = consumeGeneratedIfNotExists(tokens, &index, end);
             ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
             if (ast.object_name_tokens) |name_range| index = name_range.end;
@@ -1382,8 +1391,28 @@ fn buildDdlAst(
                         index = close_index + 1;
                     }
                 }
+                if (index < end and tokens[index].matchesKeywordTag(.include)) {
+                    const include_open = index + 1;
+                    if (include_open < end and tokens[include_open].kind == .lparen) {
+                        if (findMatchingParen(tokens, include_open, end)) |close_index| {
+                            ast.index_include_tokens = .{ .start = include_open + 1, .end = close_index };
+                            index = close_index + 1;
+                        }
+                    }
+                }
                 if (index < end and tokens[index].matchesKeywordTag(.with)) {
-                    ast.index_options_tokens = .{ .start = index, .end = end };
+                    const options_start = index;
+                    if (index + 1 < end and tokens[index + 1].kind == .lparen) {
+                        if (findMatchingParen(tokens, index + 1, end)) |close_index| {
+                            ast.index_options_tokens = .{ .start = options_start, .end = close_index + 1 };
+                            index = close_index + 1;
+                        }
+                    } else {
+                        ast.index_options_tokens = .{ .start = index, .end = end };
+                    }
+                }
+                if (index < end and tokens[index].matchesKeywordTag(.where)) {
+                    ast.index_where_tokens = .{ .start = index + 1, .end = end };
                 }
             }
         },
@@ -3750,6 +3779,26 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, ddl.index_method_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, ddl.index_elements_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 16 }, ddl.index_options_tokens.?);
+            try std.testing.expect(!ddl.unique);
+            try std.testing.expect(ddl.index_include_tokens == null);
+            try std.testing.expect(ddl.index_where_tokens == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const covering_partial_index_sql = "CREATE UNIQUE INDEX docs_status_active_idx ON docs (status) INCLUDE (tenant_id, amount) WHERE deleted_at IS NULL";
+    const covering_partial_index_result = try parseSqlAlloc(alloc, covering_partial_index_sql);
+    switch (covering_partial_index_result.ast.?) {
+        .extension_index => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.create_index, ddl.kind);
+            try std.testing.expect(ddl.unique);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, ddl.index_table_tokens.?);
+            try std.testing.expect(ddl.index_method_tokens == null);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, ddl.index_elements_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 14 }, ddl.index_include_tokens.?);
+            try std.testing.expect(ddl.index_options_tokens == null);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 16, .end = 19 }, ddl.index_where_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

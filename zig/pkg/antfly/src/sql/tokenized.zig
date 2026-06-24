@@ -923,11 +923,34 @@ test "sql adapter parsed sql owns typed statement variants" {
             try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 4, .end = 5 }, extension_index_ast.index_table_tokens.?);
             try std.testing.expect(extension_index_ast.index_method_tokens == null);
             try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 7 }, extension_index_ast.index_elements_tokens.?);
+            try std.testing.expect(extension_index_ast.index_include_tokens == null);
             try std.testing.expect(extension_index_ast.index_options_tokens == null);
+            try std.testing.expect(extension_index_ast.index_where_tokens == null);
+            try std.testing.expect(!extension_index_ast.unique);
         },
         else => return error.TestUnexpectedResult,
     }
     switch (extension_index.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var covering_partial_index = try ParsedSql.initAlloc(alloc, "CREATE UNIQUE INDEX usage_status_active_idx ON usage_records (status) INCLUDE (tenant_id, amount) WHERE deleted_at IS NULL");
+    defer covering_partial_index.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.extension_index, covering_partial_index.generatedStatementKind().?);
+    switch (covering_partial_index.generated_statement.?.ast.?) {
+        .extension_index => |extension_index_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_index, extension_index_ast.kind);
+            try std.testing.expect(extension_index_ast.unique);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 4 }, extension_index_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, extension_index_ast.index_table_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 8 }, extension_index_ast.index_elements_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 11, .end = 14 }, extension_index_ast.index_include_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 16, .end = 19 }, extension_index_ast.index_where_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (covering_partial_index.statement) {
         .ddl => {},
         else => return error.TestUnexpectedResult,
     }

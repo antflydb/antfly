@@ -54,7 +54,9 @@ simple DDL ASTs now carry structured object, option, and behavior fields for
 database, schema, and extension create/drop catalog plans and lower those
 catalog plans directly from generated AST ranges, plus generated AST-to-plan
 parity for seed `CREATE TABLE` and `CREATE INDEX` forms using the same parser
-options as the existing lowerer. Simple DML now has generated-parser corpus
+options as the existing lowerer. Generated `CREATE INDEX` ASTs also retain
+`UNIQUE`, method, element-list, covering-index `INCLUDE (...)`, options, and
+partial-index `WHERE ...` token ranges for later direct DDL cutover. Simple DML now has generated-parser corpus
 coverage, retained generated raw and AST nodes for covered write statements,
 structured generated DML ranges for target tables, sources, assignments,
 predicates, conflict clauses, returning clauses, values lists, default-values
@@ -253,7 +255,9 @@ Suggested migration order:
    table, index, and extension DDL now has generated-parser corpus coverage
    when it matches the seed grammar. Database, schema, and extension create/drop
    catalog DDL now has structured generated AST payloads and direct generated
-   AST-to-plan lowering. Unsupported DDL remains on the existing parser until
+   AST-to-plan lowering, and generated create-index metadata covers basic
+   PostgreSQL-style unique, covering, partial, method, element-list, and option
+   clauses. Unsupported DDL remains on the existing parser until
    each shape has raw AST parity.
 3. Simple DML: `INSERT ... VALUES`, primary-key `UPDATE`, primary-key
    `DELETE`, `RETURNING`, and `ON CONFLICT`. Initial generated-parser coverage
@@ -552,7 +556,8 @@ variants for:
 - extension/index statement, including a closed generated family for
   `CREATE INDEX`, `DROP INDEX`, `CREATE EXTENSION`, and `DROP EXTENSION` with
   DDL-compatible AST payloads for object names, index target tables, index
-  methods, index element lists, index options, extension options, and drop
+  methods, index element lists, covering-index include lists, partial-index
+  predicates, index options, extension options, unique-index flags, and drop
   behavior
 - graph statement, including a generated AST payload for command spans and
   graph-specific AST-to-plan wrappers for seed graph index and graph metric DDL
