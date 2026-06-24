@@ -2524,6 +2524,7 @@ fn validateGeneratedReadListAstRanges(
     if (list.order_using_operator_items.len != 0 and list.order_using_operator_items.len != list.count) return error.UnsupportedSqlShape;
     if (list.nulls_order_items.len != 0 and list.nulls_order_items.len != list.count) return error.UnsupportedSqlShape;
     if (list.nulls_orders.len != 0 and list.nulls_orders.len != list.count) return error.UnsupportedSqlShape;
+    if ((list.alias_items.len == 0) != (list.alias_name_items.len == 0)) return error.UnsupportedSqlShape;
     if ((list.direction_items.len == 0) != (list.directions.len == 0)) return error.UnsupportedSqlShape;
     if ((list.nulls_order_items.len == 0) != (list.nulls_orders.len == 0)) return error.UnsupportedSqlShape;
 
@@ -2549,6 +2550,7 @@ fn validateGeneratedReadListAstRanges(
                 if (alias_name.start < item.start or alias_name.end > item.end) return error.UnsupportedSqlShape;
             }
         }
+        try validateGeneratedReadListAliasMetadata(tokens, list, index);
         if (list.direction_items.len != 0) {
             if (list.direction_items[index]) |direction| {
                 try validateGeneratedReadTokenRange(tokens, read_ast, direction);
@@ -2574,6 +2576,29 @@ fn validateGeneratedReadListAstRanges(
             const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
             if (!std.meta.eql(expression_tokens, expression_item)) return error.UnsupportedSqlShape;
         }
+    }
+}
+
+fn validateGeneratedReadListAliasMetadata(
+    tokens: []const tokenized.Token,
+    list: generated_parser.GeneratedSqlListAst,
+    index: usize,
+) !void {
+    const alias_tokens = if (list.alias_items.len != 0) list.alias_items[index] else null;
+    const alias_name_tokens = if (list.alias_name_items.len != 0) list.alias_name_items[index] else null;
+    if (alias_tokens) |alias| {
+        const alias_name = alias_name_tokens orelse return error.UnsupportedSqlShape;
+        if (alias.start >= alias.end or alias_name.start >= alias_name.end) return error.UnsupportedSqlShape;
+        if (alias.end != list.items[index].end or alias_name.end != alias.end) return error.UnsupportedSqlShape;
+        if (alias.start == alias_name.start) {
+            if (alias.end != alias.start + 1) return error.UnsupportedSqlShape;
+            if (tokens[alias.start].kind != .identifier) return error.UnsupportedSqlShape;
+            return;
+        }
+        if (alias_name.start != alias.start + 1) return error.UnsupportedSqlShape;
+        if (!tokens[alias.start].matchesKeywordTag(.as)) return error.UnsupportedSqlShape;
+    } else if (alias_name_tokens != null) {
+        return error.UnsupportedSqlShape;
     }
 }
 
@@ -3441,6 +3466,59 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_projection_alias_parsed_sql, malformed_projection_alias_read_ast),
+    );
+
+    var malformed_projection_alias_name_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id AS order_id, status FROM usage_records WHERE kind = 'order'",
+    );
+    defer malformed_projection_alias_name_parsed_sql.deinit(alloc);
+    const malformed_projection_alias_name_generated_raw = malformed_projection_alias_name_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_projection_alias_name_read_ast = switch (malformed_projection_alias_name_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_projection_alias_name_read_ast.projection_items.alias_name_items[0] =
+        malformed_projection_alias_name_read_ast.projection_items.alias_items[0];
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_projection_alias_name_parsed_sql, malformed_projection_alias_name_read_ast),
+    );
+
+    var malformed_projection_missing_alias_name_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id AS order_id, status FROM usage_records WHERE kind = 'order'",
+    );
+    defer malformed_projection_missing_alias_name_parsed_sql.deinit(alloc);
+    const malformed_projection_missing_alias_name_generated_raw = malformed_projection_missing_alias_name_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_projection_missing_alias_name_read_ast = switch (malformed_projection_missing_alias_name_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_projection_missing_alias_name_read_ast.projection_items.alias_name_items[0] = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_projection_missing_alias_name_parsed_sql, malformed_projection_missing_alias_name_read_ast),
+    );
+
+    var malformed_projection_bare_alias_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id order_id, status FROM usage_records WHERE kind = 'order'",
+    );
+    defer malformed_projection_bare_alias_parsed_sql.deinit(alloc);
+    const malformed_projection_bare_alias_generated_raw = malformed_projection_bare_alias_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_projection_bare_alias_read_ast = switch (malformed_projection_bare_alias_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    const malformed_projection_bare_alias = malformed_projection_bare_alias_read_ast.projection_items.alias_items[0] orelse return error.UnsupportedSqlShape;
+    malformed_projection_bare_alias_read_ast.projection_items.alias_items[0] = .{
+        .start = malformed_projection_bare_alias.start - 1,
+        .end = malformed_projection_bare_alias.end,
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_projection_bare_alias_parsed_sql, malformed_projection_bare_alias_read_ast),
     );
 
     var malformed_function_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
