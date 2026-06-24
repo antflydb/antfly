@@ -162,6 +162,8 @@ pub const GeneratedSqlExpressionKind = enum {
     multiplicative,
     divisive,
     modulo,
+    contains,
+    overlaps,
     json_access,
     json_text_access,
     json_path_access,
@@ -485,6 +487,8 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT id FROM usage_records WHERE score <> ALL (1, 2)", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE score > SOME (1, 2)", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status = ANY(ARRAY['active','pending']::text[])", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE tags @> ARRAY['hot','new']", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE tags && ARRAY['hot','new']", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE deleted_at IS NULL", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE deleted_at IS NOT NULL", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE active IS TRUE", .kind = .read },
@@ -633,6 +637,8 @@ fn appendTokenIds(alloc: std.mem.Allocator, ids: *std.ArrayListUnmanaged(u16), t
         .minus => try appendSymbol(ids, alloc, "MINUS"),
         .slash => try appendSymbol(ids, alloc, "SLASH"),
         .percent => try appendSymbol(ids, alloc, "PERCENT"),
+        .at_contains => try appendSymbol(ids, alloc, "AT_CONTAINS"),
+        .range_overlap => try appendSymbol(ids, alloc, "RANGE_OVERLAP"),
         .lparen => try appendSymbol(ids, alloc, "LPAREN"),
         .rparen => try appendSymbol(ids, alloc, "RPAREN"),
         .lbracket => try appendSymbol(ids, alloc, "LBRACKET"),
@@ -1750,6 +1756,8 @@ fn findTopLevelExpressionOperator(tokens: []const token_mod.Token, range: Genera
                 }
                 return .{ .kind = .comparison, .index = index };
             },
+            .at_contains => if (depth == 0 and index > range.start and index + 1 < range.end) return .{ .kind = .contains, .index = index },
+            .range_overlap => if (depth == 0 and index > range.start and index + 1 < range.end) return .{ .kind = .overlaps, .index = index },
             else => if (depth == 0) {
                 if (tokens[index].matchesKeywordTag(.not) and index + 1 < range.end) {
                     if (tokens[index + 1].matchesKeywordTag(.like)) return .{ .kind = .not_like, .index = index + 1, .negation_index = index };
@@ -2366,6 +2374,42 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(@as(usize, 2), array_constructor.array_items.items.len);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 12 }, array_constructor.array_items.items[0]);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 14 }, array_constructor.array_items.items[1]);
+            try std.testing.expectEqual(@as(usize, 2), array_constructor.array_items.expressions.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const array_contains_read_sql = "SELECT id FROM usage_records WHERE tags @> ARRAY['hot','new']";
+    const array_contains_read_result = try parseSqlAlloc(alloc, array_contains_read_sql);
+    switch (array_contains_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.contains, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 13 }, read.where_expression.right_tokens.?);
+            const array_constructor = read.where_expression.right_expression orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.array_constructor, array_constructor.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 12 }, array_constructor.array_tokens.?);
+            try std.testing.expectEqual(@as(usize, 2), array_constructor.array_items.count);
+            try std.testing.expectEqual(@as(usize, 2), array_constructor.array_items.expressions.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const array_overlap_read_sql = "SELECT id FROM usage_records WHERE tags && ARRAY['hot','new']";
+    const array_overlap_read_result = try parseSqlAlloc(alloc, array_overlap_read_sql);
+    switch (array_overlap_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.overlaps, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 13 }, read.where_expression.right_tokens.?);
+            const array_constructor = read.where_expression.right_expression orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.array_constructor, array_constructor.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 12 }, array_constructor.array_tokens.?);
+            try std.testing.expectEqual(@as(usize, 2), array_constructor.array_items.count);
             try std.testing.expectEqual(@as(usize, 2), array_constructor.array_items.expressions.len);
         },
         else => return error.TestUnexpectedResult,
@@ -3128,7 +3172,7 @@ test "generated SQL parser reports bounded diagnostics for malformed corpus" {
 }
 
 test "generated SQL parser rejects unsupported token shapes" {
-    try std.testing.expectError(error.UnsupportedSqlShape, parseSqlAlloc(std.testing.allocator, "SELECT a @> b"));
+    try std.testing.expectError(error.UnsupportedSqlShape, parseSqlAlloc(std.testing.allocator, "SELECT a ? b"));
 }
 
 fn spanText(sql: []const u8, span: token_mod.SourceSpan) []const u8 {

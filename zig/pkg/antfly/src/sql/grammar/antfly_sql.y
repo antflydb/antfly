@@ -29,6 +29,7 @@
 %token IDENT STRING NUMBER PLACEHOLDER
 %token COMMA DOT STAR SEMICOLON LPAREN RPAREN LBRACKET RBRACKET
 %token EQ NEQ LT LTE GT GTE PLUS MINUS SLASH PERCENT COLON COLON_COLON
+%token AT_CONTAINS RANGE_OVERLAP
 %token ARROW_JSON ARROW_TEXT PATH_ARROW_JSON PATH_ARROW_TEXT
 %token ALL ALTER ANALYZE AND ANY ARRAY AS ASC BEGIN BETWEEN BY CASCADE COMMIT CONFLICT CONSTRAINT CONTINUE CURRENT
 %token CREATE DATABASE DEALLOCATE DEFAULT DELETE DESC DISCARD DISTINCT DO DROP EXECUTE
@@ -595,6 +596,8 @@ comparison_expression:
   | additive_expression LTE additive_expression
   | additive_expression GT additive_expression
   | additive_expression GTE additive_expression
+  | additive_expression AT_CONTAINS additive_expression
+  | additive_expression RANGE_OVERLAP additive_expression
   | additive_expression LIKE additive_expression
   | additive_expression ILIKE additive_expression
   | additive_expression IN LPAREN expression_list RPAREN
