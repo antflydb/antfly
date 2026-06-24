@@ -54,15 +54,19 @@ simple DDL ASTs now carry structured object, option, and behavior fields for
 database, schema, and extension create/drop catalog plans and lower those
 catalog plans directly from generated AST ranges, plus generated AST-to-plan
 parity for seed `CREATE TABLE` and `CREATE INDEX` forms using the same parser
-options as the existing lowerer. Simple DML now has generated-parser corpus coverage, retained
-generated raw and AST nodes for covered write statements, and an initial
-generated AST-to-plan wrapper that fails closed if the generated DML family does
-not match the existing write classifier before delegating to the current typed
-DML lowerer. Unsupported DML still falls back, and deeper DML cutover still
-requires replacing token-based command-body parsing with generated AST payloads
-for each write shape. Representative read queries now have generated-parser
-corpus coverage, retained generated raw and AST nodes for covered read
-statements, and an initial generated AST-to-plan wrapper that fails closed if
+options as the existing lowerer. Simple DML now has generated-parser corpus
+coverage, retained generated raw and AST nodes for covered write statements,
+structured generated DML ranges for target tables, sources, assignments,
+predicates, returning clauses, and truncate options, and a direct generated
+AST-to-plan path for `TRUNCATE` mutation-source plans. Other DML shapes still
+use an initial generated AST-to-plan wrapper that fails closed if the generated
+DML family does not match the existing write classifier before delegating to the
+current typed DML lowerer. Unsupported DML still falls back, and deeper DML
+cutover still requires replacing token-based command-body parsing with complete
+generated AST payloads for insert/update/delete/merge bodies. Representative
+read queries now have generated-parser corpus coverage, retained generated raw
+and AST nodes for covered read statements, and an initial generated AST-to-plan
+wrapper that fails closed if
 the generated read family is incompatible with the existing read classifier
 before delegating to the current typed read lowerer. Unsupported read shapes
 still fall back, and deeper read cutover still requires generated query-body
@@ -142,10 +146,13 @@ Suggested migration order:
    `DELETE`, `RETURNING`, and `ON CONFLICT`. Initial generated-parser coverage
    now retains raw and AST DML nodes for representative `INSERT ... VALUES`,
    `INSERT ... SELECT`, `UPDATE`, `DELETE`, `TRUNCATE`, and `MERGE` statements;
-   generated DML ASTs now have a validated wrapper into the current typed DML
-   lowerer for representative generated-covered write plans. Switching DML from
-   fallback to required generated parsing still requires generated command-body
-   ASTs and broader unsupported-shape diagnostics.
+   generated DML ASTs now carry structured body ranges, and `TRUNCATE` has a
+   direct generated AST-to-plan lowerer for the supported table-list,
+   identity, and drop-behavior surface. Other DML still has a validated wrapper
+   into the current typed DML lowerer for representative generated-covered write
+   plans. Switching insert/update/delete/merge from fallback to required
+   generated parsing still requires complete generated command-body ASTs and
+   broader unsupported-shape diagnostics.
 4. Read queries: projections, predicates, joins, CTEs, aggregates, windows,
    set operations, lateral, ordering, limits, and document-table sources.
    Initial generated-parser coverage now retains raw and AST read nodes for
@@ -252,8 +259,10 @@ variants for:
   names, catalog option fields, drop behavior, and generated AST-to-plan parity
   for database, schema, and extension create/drop catalog plans and seed
   `CREATE TABLE` / `CREATE INDEX` plans
-- DML statement, including a generated AST payload for command spans and an
-  initial AST-to-plan wrapper for generated-covered write statements
+- DML statement, including generated AST payloads for command spans, target
+  tables, source/body ranges, predicates, returning clauses, truncate options,
+  a direct generated AST-to-plan lowerer for `TRUNCATE`, and an initial
+  AST-to-plan wrapper for the other generated-covered write statements
 - read statement, including a generated AST payload for command spans and an
   initial AST-to-plan wrapper for generated-covered read statements
 - graph statement, including a generated AST payload for command spans and
@@ -295,9 +304,11 @@ Generated grammar work needs evidence at multiple levels:
   extension catalog plans plus seed `CREATE TABLE` / `CREATE INDEX` plans have
   generated AST-to-plan parity tests for their generated-covered forms; simple
   catalog DDL also has generated field-level checks for object names, option
-  flags, version strings, drop behavior, and fail-closed unsupported clauses. Simple
-  DML has initial generated AST-to-plan parity through a generated-family
-  validation wrapper over representative write plans. Read plans have initial
+  flags, version strings, drop behavior, and fail-closed unsupported clauses.
+  Simple DML has generated field-level checks for update and truncate body
+  ranges, direct generated AST-to-plan parity for truncate mutation-source
+  plans, and initial generated AST-to-plan parity through a generated-family
+  validation wrapper over other representative write plans. Read plans have initial
   generated AST-to-plan parity through a generated-family validation wrapper
   over representative query, aggregate, join, lateral, and non-recursive CTE
   plans. Seed graph DDL has generated AST-to-plan parity for graph index and

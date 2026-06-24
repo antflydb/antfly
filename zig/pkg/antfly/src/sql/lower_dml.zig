@@ -9760,11 +9760,19 @@ pub fn parseTruncateMutationSourceAlloc(
     schema: runtime_schema.TableSchema,
     row_claim: db_mod.types.RowClaimRequest,
 ) !plan_mod.LoweredMutationSource {
+    var syntax = try grammar.parseTruncateMutationSourceSqlAlloc(alloc, tokens, pos);
+    return try truncateMutationSourceFromSyntaxAlloc(alloc, &syntax, schema, row_claim);
+}
+
+pub fn truncateMutationSourceFromSyntaxAlloc(
+    alloc: std.mem.Allocator,
+    syntax: *grammar.TruncateMutationSourceSyntax,
+    schema: runtime_schema.TableSchema,
+    row_claim: db_mod.types.RowClaimRequest,
+) !plan_mod.LoweredMutationSource {
+    errdefer syntax.deinit(alloc);
     var owned_row_claim = row_claim;
     errdefer if (owned_row_claim.owner_id.len > 0) alloc.free(owned_row_claim.owner_id);
-
-    var syntax = try grammar.parseTruncateMutationSourceSqlAlloc(alloc, tokens, pos);
-    errdefer syntax.deinit(alloc);
 
     var source = db_mod.types.RelationalRowsQueryRequest{
         .select_all = true,
@@ -12377,7 +12385,115 @@ pub fn lowerWritePlanFromGeneratedDmlAstAlloc(
 ) !plan_mod.LoweredWritePlan {
     const write_kind = parsed_sql.writeStatementKind() orelse return error.UnsupportedSqlShape;
     if (!generatedDmlAstMatchesWriteKind(dml_ast.kind, write_kind)) return error.UnsupportedSqlShape;
+    if (dml_ast.kind == .truncate) {
+        if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+        const row_claim = options.row_claim orelse return error.UnsupportedRowsQuery;
+        if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
+        var syntax = try truncateSyntaxFromGeneratedDmlAstAlloc(alloc, parsed_sql.items(), dml_ast);
+        var lowered = try truncateMutationSourceFromSyntaxAlloc(alloc, &syntax, schema, row_claim);
+        lowered.sync_level = options.sync_level;
+        return .{ .truncate_source = lowered };
+    }
     return try lowerWritePlanParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, options);
+}
+
+fn truncateSyntaxFromGeneratedDmlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    ast: generated_parser.GeneratedSqlDmlAst,
+) !grammar.TruncateMutationSourceSyntax {
+    if (ast.kind != .truncate) return error.UnsupportedSqlShape;
+    const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    if (end < 2 or !tokens[0].matchesKeywordTag(.truncate)) return error.UnsupportedSqlShape;
+    var index: usize = 1;
+    if (index < end and tokens[index].matchesKeywordTag(.table)) index += 1;
+
+    const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, index, end);
+    const table_name = try generatedDmlTableReferenceIdentifierAlloc(alloc, tokens, target_range);
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+    index = target_range.end;
+
+    var additional_table_names = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (additional_table_names.items) |name| alloc.free(name);
+        additional_table_names.deinit(alloc);
+    }
+    if (ast.additional_target_tokens) |additional_range| {
+        if (additional_range.start != index or additional_range.end > end) return error.UnsupportedSqlShape;
+        while (index < additional_range.end) {
+            if (tokens[index].kind != .comma) return error.UnsupportedSqlShape;
+            index += 1;
+            const additional_name_range = try requireGeneratedDmlTokenRangeAt(.{ .start = index, .end = index + 1 }, index, additional_range.end);
+            try additional_table_names.append(alloc, try generatedDmlTableReferenceIdentifierAlloc(alloc, tokens, additional_name_range));
+            index = additional_name_range.end;
+        }
+    }
+
+    var restart_identity = false;
+    if (index < end and tokens[index].matchesKeywordTag(.restart)) {
+        if (index + 1 >= end or !tokens[index + 1].matchesKeywordTag(.identity) or !ast.restart_identity) return error.UnsupportedSqlShape;
+        restart_identity = true;
+        index += 2;
+    } else if (index < end and tokens[index].matchesKeywordTag(.@"continue")) {
+        if (index + 1 >= end or !tokens[index + 1].matchesKeywordTag(.identity) or ast.restart_identity) return error.UnsupportedSqlShape;
+        index += 2;
+    } else if (index < end and tokens[index].matchesKeywordTag(.identity)) {
+        return error.UnsupportedSqlShape;
+    } else if (ast.restart_identity) {
+        return error.UnsupportedSqlShape;
+    }
+
+    var cascade = false;
+    if (index < end and tokens[index].matchesKeywordTag(.cascade)) {
+        if (!ast.cascade) return error.UnsupportedSqlShape;
+        cascade = true;
+        index += 1;
+        if (index < end and tokens[index].matchesKeywordTag(.restrict)) return error.UnsupportedSqlShape;
+    } else if (index < end and tokens[index].matchesKeywordTag(.restrict)) {
+        if (ast.cascade) return error.UnsupportedSqlShape;
+        index += 1;
+    } else if (ast.cascade) {
+        return error.UnsupportedSqlShape;
+    }
+    if (index != end) return error.UnsupportedSqlShape;
+
+    const owned_additional_table_names = try additional_table_names.toOwnedSlice(alloc);
+    table_transferred = true;
+    return .{
+        .table_name = table_name,
+        .additional_table_names = owned_additional_table_names,
+        .restart_identity = restart_identity,
+        .cascade = cascade,
+    };
+}
+
+fn generatedDmlStatementEnd(tokens: []const Token, statement_span: @import("token.zig").SourceSpan) ?usize {
+    if (tokens.len == 0) return null;
+    var end = tokens.len;
+    while (end > 0 and tokens[end - 1].kind == .semicolon) end -= 1;
+    if (end == 0 or tokens[0].source_start != statement_span.start or tokens[end - 1].source_end != statement_span.end) return null;
+    return end;
+}
+
+fn requireGeneratedDmlTokenRangeAt(
+    maybe_range: ?generated_parser.GeneratedSqlTokenRange,
+    start: usize,
+    end: usize,
+) !generated_parser.GeneratedSqlTokenRange {
+    const range = maybe_range orelse return error.UnsupportedSqlShape;
+    if (range.start != start or range.end != start + 1 or range.end > end) return error.UnsupportedSqlShape;
+    return range;
+}
+
+fn generatedDmlTableReferenceIdentifierAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) ![]const u8 {
+    if (range.end != range.start + 1 or range.end > tokens.len) return error.UnsupportedSqlShape;
+    if (tokens[range.start].kind != .identifier) return error.UnsupportedSqlShape;
+    return try grammar.normalizeSqlObjectIdentifierAlloc(alloc, tokens[range.start].text);
 }
 
 fn generatedDmlAstMatchesWriteKind(
@@ -12498,6 +12614,27 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
         var generated = try lowerGeneratedDmlWritePlanForDmlTestAlloc(alloc, sql, schema, &.{}, options);
         defer generated.deinit(alloc);
         try std.testing.expectEqual(std.meta.activeTag(legacy), std.meta.activeTag(generated));
+    }
+
+    var generated_truncate = try lowerGeneratedDmlWritePlanForDmlTestAlloc(
+        alloc,
+        "TRUNCATE TABLE public.usage_records, usage_archive RESTART IDENTITY CASCADE",
+        schema,
+        &.{},
+        options,
+    );
+    defer generated_truncate.deinit(alloc);
+    switch (generated_truncate) {
+        .truncate_source => |truncate_source| {
+            try std.testing.expectEqualStrings("usage_records", truncate_source.table_name);
+            try std.testing.expectEqual(@as(usize, 1), truncate_source.additional_table_names.len);
+            try std.testing.expectEqualStrings("usage_archive", truncate_source.additional_table_names[0]);
+            try std.testing.expect(truncate_source.restart_identity);
+            try std.testing.expect(truncate_source.truncate_cascade);
+            try std.testing.expectEqual(options.sync_level, truncate_source.sync_level);
+            try std.testing.expect(truncate_source.mutation.req.source.row_claim != null);
+        },
+        else => return error.TestUnexpectedResult,
     }
 }
 

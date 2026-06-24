@@ -143,6 +143,16 @@ pub const GeneratedSqlDmlAst = struct {
     kind: GeneratedSqlDmlKind,
     statement_span: token_mod.SourceSpan,
     command_span: token_mod.SourceSpan,
+    target_table_tokens: ?GeneratedSqlTokenRange = null,
+    insert_columns_tokens: ?GeneratedSqlTokenRange = null,
+    values_tokens: ?GeneratedSqlTokenRange = null,
+    source_tokens: ?GeneratedSqlTokenRange = null,
+    assignments_tokens: ?GeneratedSqlTokenRange = null,
+    where_tokens: ?GeneratedSqlTokenRange = null,
+    returning_tokens: ?GeneratedSqlTokenRange = null,
+    additional_target_tokens: ?GeneratedSqlTokenRange = null,
+    restart_identity: bool = false,
+    cascade: bool = false,
 };
 
 pub const GeneratedSqlReadAst = struct {
@@ -484,11 +494,7 @@ fn buildGeneratedAst(tokens: []const token_mod.Token, statement: GeneratedSqlSta
         } },
         .prepared => |kind| .{ .prepared = buildPreparedAst(tokens, end, kind, statement_span, command_span) },
         .ddl => |kind| .{ .ddl = buildDdlAst(tokens, end, kind, statement_span, command_span) },
-        .dml => |kind| .{ .dml = .{
-            .kind = kind,
-            .statement_span = statement_span,
-            .command_span = command_span,
-        } },
+        .dml => |kind| .{ .dml = buildDmlAst(tokens, end, kind, statement_span, command_span) },
         .read => |kind| .{ .read = .{
             .kind = kind,
             .statement_span = statement_span,
@@ -622,6 +628,130 @@ fn buildDdlAst(
     return ast;
 }
 
+fn buildDmlAst(
+    tokens: []const token_mod.Token,
+    end: usize,
+    kind: GeneratedSqlDmlKind,
+    statement_span: token_mod.SourceSpan,
+    command_span: token_mod.SourceSpan,
+) GeneratedSqlDmlAst {
+    var ast = GeneratedSqlDmlAst{
+        .kind = kind,
+        .statement_span = statement_span,
+        .command_span = command_span,
+    };
+    switch (kind) {
+        .insert_values, .insert_select => buildInsertDmlAst(tokens, end, &ast),
+        .update => buildUpdateDmlAst(tokens, end, &ast),
+        .delete => buildDeleteDmlAst(tokens, end, &ast),
+        .truncate => buildTruncateDmlAst(tokens, end, &ast),
+        .merge => buildMergeDmlAst(tokens, end, &ast),
+    }
+    return ast;
+}
+
+fn buildInsertDmlAst(tokens: []const token_mod.Token, end: usize, ast: *GeneratedSqlDmlAst) void {
+    if (end < 4 or !tokens[1].matchesKeywordTag(.into)) return;
+    ast.target_table_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 2, end);
+    var index: usize = 3;
+    if (index < end and tokens[index].kind == .lparen) {
+        if (findMatchingParen(tokens, index, end)) |close| {
+            ast.insert_columns_tokens = .{ .start = index, .end = close + 1 };
+            index = close + 1;
+        }
+    }
+    if (findTopLevelKeyword(tokens, index, end, .values)) |values_index| {
+        const returning_index = findTopLevelKeyword(tokens, values_index + 1, end, .returning) orelse end;
+        ast.values_tokens = .{ .start = values_index + 1, .end = returning_index };
+        if (returning_index < end) ast.returning_tokens = .{ .start = returning_index + 1, .end = end };
+    } else if (findTopLevelKeyword(tokens, index, end, .select)) |select_index| {
+        const returning_index = findTopLevelKeyword(tokens, select_index + 1, end, .returning) orelse end;
+        ast.source_tokens = .{ .start = select_index, .end = returning_index };
+        if (returning_index < end) ast.returning_tokens = .{ .start = returning_index + 1, .end = end };
+    }
+}
+
+fn buildUpdateDmlAst(tokens: []const token_mod.Token, end: usize, ast: *GeneratedSqlDmlAst) void {
+    ast.target_table_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 1, end);
+    const set_index = findTopLevelKeyword(tokens, 2, end, .set) orelse return;
+    const from_index = findTopLevelKeyword(tokens, set_index + 1, end, .from);
+    const where_index = findTopLevelKeyword(tokens, set_index + 1, end, .where);
+    const returning_index = findTopLevelKeyword(tokens, set_index + 1, end, .returning);
+    const assignments_end = minOptionalIndex(from_index, minOptionalIndex(where_index, returning_index) orelse end) orelse end;
+    if (set_index + 1 < assignments_end) ast.assignments_tokens = .{ .start = set_index + 1, .end = assignments_end };
+    if (from_index) |idx| {
+        const source_end = minOptionalIndex(where_index, returning_index) orelse end;
+        if (idx + 1 < source_end) ast.source_tokens = .{ .start = idx + 1, .end = source_end };
+    }
+    if (where_index) |idx| {
+        const where_end = returning_index orelse end;
+        if (idx + 1 < where_end) ast.where_tokens = .{ .start = idx + 1, .end = where_end };
+    }
+    if (returning_index) |idx| {
+        if (idx + 1 < end) ast.returning_tokens = .{ .start = idx + 1, .end = end };
+    }
+}
+
+fn buildDeleteDmlAst(tokens: []const token_mod.Token, end: usize, ast: *GeneratedSqlDmlAst) void {
+    if (end < 3 or !tokens[1].matchesKeywordTag(.from)) return;
+    ast.target_table_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 2, end);
+    const using_index = findTopLevelKeyword(tokens, 3, end, .using);
+    const where_index = findTopLevelKeyword(tokens, 3, end, .where);
+    const returning_index = findTopLevelKeyword(tokens, 3, end, .returning);
+    if (using_index) |idx| {
+        const source_end = minOptionalIndex(where_index, returning_index) orelse end;
+        if (idx + 1 < source_end) ast.source_tokens = .{ .start = idx + 1, .end = source_end };
+    }
+    if (where_index) |idx| {
+        const where_end = returning_index orelse end;
+        if (idx + 1 < where_end) ast.where_tokens = .{ .start = idx + 1, .end = where_end };
+    }
+    if (returning_index) |idx| {
+        if (idx + 1 < end) ast.returning_tokens = .{ .start = idx + 1, .end = end };
+    }
+}
+
+fn buildTruncateDmlAst(tokens: []const token_mod.Token, end: usize, ast: *GeneratedSqlDmlAst) void {
+    var index: usize = 1;
+    if (index < end and tokens[index].matchesKeywordTag(.table)) index += 1;
+    ast.target_table_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
+    if (ast.target_table_tokens) |target| index = target.end;
+
+    const option_index = firstTopLevelTruncateOption(tokens, index, end) orelse end;
+    if (index < option_index and tokens[index].kind == .comma) {
+        ast.additional_target_tokens = .{ .start = index, .end = option_index };
+    }
+    ast.restart_identity = generatedTruncateHasRestartIdentity(tokens, option_index, end);
+    ast.cascade = findTopLevelKeyword(tokens, option_index, end, .cascade) != null;
+}
+
+fn buildMergeDmlAst(tokens: []const token_mod.Token, end: usize, ast: *GeneratedSqlDmlAst) void {
+    if (end < 4 or !tokens[1].matchesKeywordTag(.into)) return;
+    ast.target_table_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 2, end);
+    if (findTopLevelKeyword(tokens, 3, end, .using)) |using_index| {
+        const on_index = findTopLevelKeyword(tokens, using_index + 1, end, .on) orelse end;
+        if (using_index + 1 < on_index) ast.source_tokens = .{ .start = using_index + 1, .end = on_index };
+        if (on_index + 1 < end) ast.where_tokens = .{ .start = on_index + 1, .end = end };
+    }
+}
+
+fn firstTopLevelTruncateOption(tokens: []const token_mod.Token, start: usize, end: usize) ?usize {
+    var best: ?usize = null;
+    const candidates = [_]token_mod.TokenKeyword{ .restart, .@"continue", .identity, .cascade, .restrict };
+    for (candidates) |keyword| {
+        if (findTopLevelKeyword(tokens, start, end, keyword)) |idx| {
+            if (best == null or idx < best.?) best = idx;
+        }
+    }
+    return best;
+}
+
+fn generatedTruncateHasRestartIdentity(tokens: []const token_mod.Token, start: usize, end: usize) bool {
+    return start + 1 < end and
+        tokens[start].matchesKeywordTag(.restart) and
+        tokens[start + 1].matchesKeywordTag(.identity);
+}
+
 fn consumeGeneratedIfNotExists(tokens: []const token_mod.Token, index: *usize, end: usize) bool {
     if (index.* + 2 >= end) return false;
     if (!tokens[index.*].matchesKeywordTag(.@"if") or
@@ -658,12 +788,51 @@ fn findKeyword(tokens: []const token_mod.Token, start: usize, end: usize, keywor
     return null;
 }
 
+fn findTopLevelKeyword(tokens: []const token_mod.Token, start: usize, end: usize, keyword: token_mod.TokenKeyword) ?usize {
+    var depth: usize = 0;
+    var index = start;
+    while (index < end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth == 0) return null;
+                depth -= 1;
+            },
+            else => if (depth == 0 and tokens[index].matchesKeywordTag(keyword)) return index,
+        }
+    }
+    return null;
+}
+
 fn findKeywordText(tokens: []const token_mod.Token, start: usize, end: usize, keyword: []const u8) ?usize {
     var index = start;
     while (index < end) : (index += 1) {
         if (tokens[index].matchesKeyword(keyword)) return index;
     }
     return null;
+}
+
+fn findMatchingParen(tokens: []const token_mod.Token, open_index: usize, end: usize) ?usize {
+    if (open_index >= end or tokens[open_index].kind != .lparen) return null;
+    var depth: usize = 1;
+    var index = open_index + 1;
+    while (index < end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                depth -= 1;
+                if (depth == 0) return index;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn minOptionalIndex(a: ?usize, b: ?usize) ?usize {
+    if (a == null) return b;
+    if (b == null) return a;
+    return @min(a.?, b.?);
 }
 
 fn statementTokenEnd(tokens: []const token_mod.Token) usize {
@@ -798,6 +967,22 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlDmlKind.update, dml.kind);
             try std.testing.expectEqualStrings("UPDATE usage_records SET status = 'done' WHERE id = 'u1'", spanText(dml_sql, dml.statement_span));
             try std.testing.expectEqualStrings("UPDATE", spanText(dml_sql, dml.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, dml.target_table_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 6 }, dml.assignments_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 10 }, dml.where_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const truncate_sql = "TRUNCATE TABLE public.usage_records, usage_archive RESTART IDENTITY CASCADE";
+    const truncate_result = try parseSqlAlloc(alloc, truncate_sql);
+    switch (truncate_result.ast.?) {
+        .dml => |dml| {
+            try std.testing.expectEqual(GeneratedSqlDmlKind.truncate, dml.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, dml.target_table_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 5 }, dml.additional_target_tokens.?);
+            try std.testing.expect(dml.restart_identity);
+            try std.testing.expect(dml.cascade);
         },
         else => return error.TestUnexpectedResult,
     }

@@ -32,9 +32,9 @@
 %token ARROW_JSON ARROW_TEXT PATH_ARROW_JSON PATH_ARROW_TEXT
 %token ALL ALTER ANALYZE AND AS ASC BEGIN BY CASCADE COMMIT CONFLICT CONTINUE
 %token CREATE DATABASE DEALLOCATE DEFAULT DELETE DESC DISCARD DROP EXECUTE
-%token EXPLAIN EXISTS EXTENSION FALSE FROM FULL GRAPH GROUP HAVING IF INDEX INSERT INTO
+%token EXPLAIN EXISTS EXTENSION FALSE FROM FULL GRAPH GROUP HAVING IDENTITY IF INDEX INSERT INTO
 %token JOIN KEY LATERAL LIMIT MATCHED MERGE METRIC NOT NULL ON OR ORDER PREPARE PRIMARY PUBLIC
-%token QUERY RESET RESTRICT RETURNING ROLLBACK SCHEMA SELECT SET SHOW TABLE TO TRUNCATE
+%token QUERY RESET RESTART RESTRICT RETURNING ROLLBACK SCHEMA SELECT SET SHOW TABLE TO TRUNCATE
 %token THEN TRUE UPDATE USING VALUES WHEN WHERE WITH
 
 statement:
@@ -160,8 +160,23 @@ delete_statement:
   ;
 
 truncate_statement:
-    TRUNCATE TABLE qualified_name drop_behavior_opt
-  | TRUNCATE qualified_name drop_behavior_opt
+    TRUNCATE table_keyword_opt truncate_table_list truncate_identity_opt drop_behavior_opt
+  ;
+
+table_keyword_opt:
+    /* empty */
+  | TABLE
+  ;
+
+truncate_table_list:
+    qualified_name
+  | truncate_table_list COMMA qualified_name
+  ;
+
+truncate_identity_opt:
+    /* empty */
+  | RESTART IDENTITY
+  | CONTINUE IDENTITY
   ;
 
 merge_statement:
