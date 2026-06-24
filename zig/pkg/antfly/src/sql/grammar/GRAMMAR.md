@@ -462,6 +462,10 @@ Unsupported DDL remains on the existing parser until
    Plain `DISTINCT` and `DISTINCT ON (...)` reads now carry generated distinct
    ranges, `DISTINCT ON` expression-list AST items for top-level and CTE body
    reads, and preserve the production aggregate/query-family split.
+   Generated expression validation now rejects mixed-shape `token_range` leaf
+   expressions that carry stray operator, child, list, subquery, function,
+   window, cast, case, boolean-chain, temporal, extract, or predicate
+   metadata.
    Set-operation reads now classify as their own generated read family and
    dispatch to the native set-operation lowerer after validating the generated
    left-query, operator, `UNION ALL`, right-query projection/source, and
@@ -505,8 +509,8 @@ Unsupported DDL remains on the existing parser until
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current
    validated owned expression item arrays, expression-kind structural checks
-   and expression operator/kind token consistency checks for remaining
-   specialized operators, full multi-join
+   for remaining non-leaf expression shapes, expression operator/kind token
+   consistency checks for remaining specialized operators, full multi-join
    planning/lowering and richer join-tree semantics beyond the current
    validated left-associative generated join nodes, expression AST
    planning/lowering beyond the current recursive

@@ -1425,6 +1425,37 @@ fn validateGeneratedExpressionAstOptionalChild(
     }
 }
 
+fn validateGeneratedTokenRangeExpressionAstStructure(expression: generated_parser.GeneratedSqlExpressionAst) !void {
+    if (expression.tokens == null) return error.UnsupportedSqlShape;
+    var payload = expression;
+    payload.tokens = null;
+    if (generatedExpressionAstHasMetadata(payload) or
+        payload.inner_expression_kind != null or
+        payload.subquery_read_kind != null or
+        payload.subquery_where_expression_kind != null or
+        payload.filter_expression_kind != null or
+        payload.over_frame_start_expression_kind != null or
+        payload.over_frame_end_expression_kind != null or
+        payload.cast_expression_kind != null or
+        payload.case_branch_count != 0 or
+        payload.case_first_condition_kind != null or
+        payload.case_first_result_kind != null or
+        payload.case_else_expression_kind != null or
+        payload.boolean_condition_count != 0 or
+        payload.boolean_first_condition_kind != null or
+        payload.boolean_last_condition_kind != null or
+        payload.extract_source_expression_kind != null or
+        payload.left_expression_kind != null or
+        payload.between_modifier != null or
+        payload.between_lower_expression_kind != null or
+        payload.between_upper_expression_kind != null or
+        payload.right_expression_kind != null or
+        payload.escape_expression_kind != null)
+    {
+        return error.UnsupportedSqlShape;
+    }
+}
+
 fn validateGeneratedReadListAstContainedByRange(
     list: generated_parser.GeneratedSqlListAst,
     containing: generated_parser.GeneratedSqlTokenRange,
@@ -2187,9 +2218,7 @@ fn validateGeneratedCaseExpressionClauseMetadata(
 
 fn validateGeneratedExpressionAstStructure(expression: generated_parser.GeneratedSqlExpressionAst) !void {
     switch (expression.kind) {
-        .token_range => {
-            if (expression.tokens == null) return error.UnsupportedSqlShape;
-        },
+        .token_range => try validateGeneratedTokenRangeExpressionAstStructure(expression),
         .subquery => {
             if (expression.tokens == null or
                 expression.inner_tokens == null or
@@ -3569,6 +3598,23 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_projection_expression_span_parsed_sql, malformed_projection_expression_span_read_ast),
+    );
+
+    var malformed_token_range_payload_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id, status FROM usage_records WHERE kind = 'order'",
+    );
+    defer malformed_token_range_payload_parsed_sql.deinit(alloc);
+    const malformed_token_range_payload_generated_raw = malformed_token_range_payload_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_token_range_payload_read_ast = switch (malformed_token_range_payload_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_token_range_payload_read_ast.projection_items.expressions[0].operator_tokens =
+        malformed_token_range_payload_read_ast.projection_items.expressions[0].tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_token_range_payload_parsed_sql, malformed_token_range_payload_read_ast),
     );
 
     var malformed_projection_boundary_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
