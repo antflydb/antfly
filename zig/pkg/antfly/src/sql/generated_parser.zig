@@ -609,6 +609,8 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT id FROM usage_records WHERE CAST(amount + 1 AS text) = '2'", .kind = .read },
     .{ .sql = "SELECT id::text AS id_text FROM usage_records WHERE id::text = 'u1'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE metadata->'flags' = $1::jsonb", .kind = .read },
+    .{ .sql = "SELECT metadata #>> '{billing,plan}' AS plan FROM usage_records WHERE metadata #> '{flags}' = $1::jsonb", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE metadata #>> '{billing,plan}' = 'pro'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status = ANY($1::text[])", .kind = .read },
     .{ .sql = "SELECT CASE WHEN email IS NULL THEN 'missing' WHEN email = 'blocked@example.test' THEN 'blocked' ELSE lower(status) END AS email_bucket FROM usage_records WHERE id = 'u1'", .kind = .read },
     .{ .sql = "SELECT CASE WHEN email IS NULL THEN NULL ELSE email END AS maybe_email FROM usage_records WHERE id = 'u1'", .kind = .read },
@@ -4757,6 +4759,60 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqualStrings("EXPLAIN", spanText(explain_sql, unsupported.command_span));
             try std.testing.expect(unsupported.subject_tokens.?.start == 1);
             try std.testing.expect(unsupported.subject_tokens.?.end == 5);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "generated SQL parser exposes JSON path operator AST metadata" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const json_path_projection_read_sql = "SELECT metadata #>> '{billing,plan}' AS plan FROM usage_records WHERE metadata #> '{flags}' = $1::jsonb";
+    const json_path_projection_read_result = try parseSqlAlloc(alloc, json_path_projection_read_sql);
+    switch (json_path_projection_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 6 }, read.projection_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), read.projection_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 6 }, read.projection_items.items[0]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 4 }, read.projection_items.expression_items[0]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 6 }, read.projection_items.alias_items[0].?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.json_path_text_access, read.projection_items.expressions[0].kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.projection_items.expressions[0].left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, read.projection_items.expressions[0].operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read.projection_items.expressions[0].right_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.json_path_text_access, read.projection_first_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 12 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.json_path_access, read.where_expression.left_expression_kind.?);
+            const path_left = read.where_expression.left_expression orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.json_path_access, path_left.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, path_left.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, path_left.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 12 }, path_left.right_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 14 }, read.where_expression.right_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const json_path_text_predicate_read_sql = "SELECT id FROM usage_records WHERE metadata #>> '{billing,plan}' = 'pro'";
+    const json_path_text_predicate_read_result = try parseSqlAlloc(alloc, json_path_text_predicate_read_sql);
+    switch (json_path_text_predicate_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 8 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.json_path_text_access, read.where_expression.left_expression_kind.?);
+            const path_left = read.where_expression.left_expression orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.json_path_text_access, path_left.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, path_left.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, path_left.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, path_left.right_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.where_expression.right_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

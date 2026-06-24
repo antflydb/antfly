@@ -303,8 +303,9 @@ Suggested migration order:
    expression nodes.
    Parenthesized expression groups carry inner token ranges and owned inner
    expression nodes, and comparison operands can expose additive and
-   multiplicative child expression-kind summaries, including JSON/path postfix
-   operator summaries, function-call child summaries, direct function-call
+   multiplicative child expression-kind summaries, including JSON `->`/`->>`
+   and JSON path `#>`/`#>>` postfix operator summaries in projections and
+   predicates, function-call child summaries, direct function-call
    name and argument-list metadata, PostgreSQL `CAST(expr AS type)` value and
    target-type ranges, generated coverage for public-tokenizer-normalized
    `expr::type` inputs, and searched `CASE WHEN ... THEN ... ELSE ... END`
