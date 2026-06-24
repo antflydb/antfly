@@ -215,7 +215,11 @@ pub const GeneratedSqlExpressionAst = struct {
     inner_expression: ?*GeneratedSqlExpressionAst = null,
     function_name_tokens: ?GeneratedSqlTokenRange = null,
     argument_tokens: ?GeneratedSqlTokenRange = null,
+    argument_distinct_tokens: ?GeneratedSqlTokenRange = null,
+    argument_value_tokens: ?GeneratedSqlTokenRange = null,
     argument_items: GeneratedSqlListAst = .{},
+    argument_order_tokens: ?GeneratedSqlTokenRange = null,
+    argument_order_items: GeneratedSqlListAst = .{},
     within_group_tokens: ?GeneratedSqlTokenRange = null,
     within_group_order_tokens: ?GeneratedSqlTokenRange = null,
     within_group_order_items: GeneratedSqlListAst = .{},
@@ -253,6 +257,7 @@ pub const GeneratedSqlExpressionAst = struct {
             alloc.destroy(filter);
         }
         self.argument_items.deinit(alloc);
+        self.argument_order_items.deinit(alloc);
         self.within_group_order_items.deinit(alloc);
         self.array_items.deinit(alloc);
         self.* = .{};
@@ -595,6 +600,8 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT id FROM usage_records WHERE lower(status) = 'open'", .kind = .read },
     .{ .sql = "SELECT concat_ws(',', status), id FROM usage_records ORDER BY status, id", .kind = .read },
     .{ .sql = "SELECT customer, COUNT(*) FILTER (WHERE status = 'open') AS open_count FROM usage_records GROUP BY customer", .kind = .read },
+    .{ .sql = "SELECT customer, COUNT(DISTINCT status) AS status_count FROM usage_records GROUP BY customer", .kind = .read },
+    .{ .sql = "SELECT customer, ARRAY_AGG(DISTINCT status ORDER BY amount DESC) AS statuses FROM usage_records GROUP BY customer", .kind = .read },
     .{ .sql = "SELECT customer, percentile_cont(0.5) WITHIN GROUP (ORDER BY amount DESC NULLS LAST) AS median_amount FROM usage_records GROUP BY customer", .kind = .read },
     .{ .sql = "SELECT id, row_number() OVER (PARTITION BY tenant, account ORDER BY id) AS rn FROM usage_records ORDER BY id, tenant", .kind = .read },
     .{ .sql = "SELECT DISTINCT status FROM usage_records ORDER BY status", .kind = .read },
@@ -1906,8 +1913,14 @@ fn buildGeneratedExpressionAst(alloc: std.mem.Allocator, tokens: []const token_m
         ast.kind = .function_call;
         ast.function_name_tokens = function_call.name_tokens;
         ast.argument_tokens = function_call.argument_tokens;
-        if (function_call.argument_tokens) |argument_tokens| {
-            ast.argument_items = try buildTopLevelListAst(alloc, tokens, argument_tokens, .{});
+        ast.argument_distinct_tokens = function_call.argument_distinct_tokens;
+        ast.argument_value_tokens = function_call.argument_value_tokens;
+        if (function_call.argument_value_tokens) |argument_value_tokens| {
+            ast.argument_items = try buildTopLevelListAst(alloc, tokens, argument_value_tokens, .{});
+        }
+        ast.argument_order_tokens = function_call.argument_order_tokens;
+        if (function_call.argument_order_tokens) |argument_order_tokens| {
+            ast.argument_order_items = try buildTopLevelListAst(alloc, tokens, argument_order_tokens, .{ .order_modifiers = true });
         }
         ast.within_group_tokens = function_call.within_group_tokens;
         ast.within_group_order_tokens = function_call.within_group_order_tokens;
@@ -1988,10 +2001,20 @@ fn generatedSubqueryExpressionInnerRange(tokens: []const token_mod.Token, range:
 const GeneratedFunctionCallExpression = struct {
     name_tokens: GeneratedSqlTokenRange,
     argument_tokens: ?GeneratedSqlTokenRange = null,
+    argument_distinct_tokens: ?GeneratedSqlTokenRange = null,
+    argument_value_tokens: ?GeneratedSqlTokenRange = null,
+    argument_order_tokens: ?GeneratedSqlTokenRange = null,
     within_group_tokens: ?GeneratedSqlTokenRange = null,
     within_group_order_tokens: ?GeneratedSqlTokenRange = null,
     filter_tokens: ?GeneratedSqlTokenRange = null,
     filter_predicate_tokens: ?GeneratedSqlTokenRange = null,
+};
+
+const GeneratedFunctionArgumentMetadata = struct {
+    argument_tokens: ?GeneratedSqlTokenRange = null,
+    distinct_tokens: ?GeneratedSqlTokenRange = null,
+    value_tokens: ?GeneratedSqlTokenRange = null,
+    order_tokens: ?GeneratedSqlTokenRange = null,
 };
 
 fn generatedFunctionCallExpression(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?GeneratedFunctionCallExpression {
@@ -2025,6 +2048,7 @@ fn generatedFunctionCallExpression(tokens: []const token_mod.Token, range: Gener
     if (open_index <= range.start) return null;
     if (isGeneratedFunctionCallBlockedName(tokens[open_index - 1])) return null;
     if (!isGeneratedQualifiedNameRange(tokens, .{ .start = range.start, .end = open_index })) return null;
+    const argument_metadata = generatedFunctionArgumentMetadata(tokens, open_index, close_index) orelse return null;
     var cursor = close_index + 1;
     var within_group_tokens: ?GeneratedSqlTokenRange = null;
     var within_group_order_tokens: ?GeneratedSqlTokenRange = null;
@@ -2055,12 +2079,38 @@ fn generatedFunctionCallExpression(tokens: []const token_mod.Token, range: Gener
     }
     return .{
         .name_tokens = .{ .start = range.start, .end = open_index },
-        .argument_tokens = if (open_index + 1 < close_index) .{ .start = open_index + 1, .end = close_index } else null,
+        .argument_tokens = argument_metadata.argument_tokens,
+        .argument_distinct_tokens = argument_metadata.distinct_tokens,
+        .argument_value_tokens = argument_metadata.value_tokens,
+        .argument_order_tokens = argument_metadata.order_tokens,
         .within_group_tokens = within_group_tokens,
         .within_group_order_tokens = within_group_order_tokens,
         .filter_tokens = filter_tokens,
         .filter_predicate_tokens = filter_predicate_tokens,
     };
+}
+
+fn generatedFunctionArgumentMetadata(tokens: []const token_mod.Token, open_index: usize, close_index: usize) ?GeneratedFunctionArgumentMetadata {
+    if (open_index + 1 >= close_index) return .{};
+    var metadata = GeneratedFunctionArgumentMetadata{
+        .argument_tokens = .{ .start = open_index + 1, .end = close_index },
+        .value_tokens = .{ .start = open_index + 1, .end = close_index },
+    };
+    var value_start = open_index + 1;
+    if (tokens[value_start].matchesKeywordTag(.distinct)) {
+        metadata.distinct_tokens = .{ .start = value_start, .end = value_start + 1 };
+        value_start += 1;
+        if (value_start >= close_index) return null;
+    }
+    const order_index = findTopLevelKeywordSequence(tokens, value_start, close_index, .order, .by);
+    const value_end = order_index orelse close_index;
+    if (value_start >= value_end) return null;
+    metadata.value_tokens = .{ .start = value_start, .end = value_end };
+    if (order_index) |idx| {
+        if (idx + 2 >= close_index) return null;
+        metadata.order_tokens = .{ .start = idx + 2, .end = close_index };
+    }
+    return metadata;
 }
 
 fn isGeneratedFunctionCallBlockedName(token: token_mod.Token) bool {
@@ -3343,6 +3393,33 @@ test "generated SQL parser facade builds control AST spans" {
     try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, function_expression.argument_items.expressions[1].kind);
     try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, function_expression.argument_items.expressions[1].tokens.?);
 
+    var distinct_function_tokens = try lexer.tokenizeAlloc(alloc, "count(DISTINCT status)");
+    defer lexer.freeTokens(alloc, &distinct_function_tokens);
+    var distinct_function_expression = try buildGeneratedExpressionAst(alloc, distinct_function_tokens.items, .{ .start = 0, .end = distinct_function_tokens.items.len });
+    defer distinct_function_expression.deinit(alloc);
+    try std.testing.expectEqual(GeneratedSqlExpressionKind.function_call, distinct_function_expression.kind);
+    try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 4 }, distinct_function_expression.argument_tokens.?);
+    try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, distinct_function_expression.argument_distinct_tokens.?);
+    try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, distinct_function_expression.argument_value_tokens.?);
+    try std.testing.expectEqual(@as(usize, 1), distinct_function_expression.argument_items.count);
+    try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, distinct_function_expression.argument_items.items[0]);
+
+    var ordered_argument_function_tokens = try lexer.tokenizeAlloc(alloc, "array_agg(DISTINCT status ORDER BY amount DESC)");
+    defer lexer.freeTokens(alloc, &ordered_argument_function_tokens);
+    var ordered_argument_function_expression = try buildGeneratedExpressionAst(alloc, ordered_argument_function_tokens.items, .{ .start = 0, .end = ordered_argument_function_tokens.items.len });
+    defer ordered_argument_function_expression.deinit(alloc);
+    try std.testing.expectEqual(GeneratedSqlExpressionKind.function_call, ordered_argument_function_expression.kind);
+    try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 8 }, ordered_argument_function_expression.argument_tokens.?);
+    try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ordered_argument_function_expression.argument_distinct_tokens.?);
+    try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, ordered_argument_function_expression.argument_value_tokens.?);
+    try std.testing.expectEqual(@as(usize, 1), ordered_argument_function_expression.argument_items.count);
+    try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 8 }, ordered_argument_function_expression.argument_order_tokens.?);
+    try std.testing.expectEqual(@as(usize, 1), ordered_argument_function_expression.argument_order_items.count);
+    try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 8 }, ordered_argument_function_expression.argument_order_items.items[0]);
+    try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, ordered_argument_function_expression.argument_order_items.expression_items[0]);
+    try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, ordered_argument_function_expression.argument_order_items.direction_items[0].?);
+    try std.testing.expectEqual(GeneratedSqlOrderDirection.desc, ordered_argument_function_expression.argument_order_items.directions[0].?);
+
     var filter_function_tokens = try lexer.tokenizeAlloc(alloc, "count(*) FILTER (WHERE status = 'open')");
     defer lexer.freeTokens(alloc, &filter_function_tokens);
     var filter_function_expression = try buildGeneratedExpressionAst(alloc, filter_function_tokens.items, .{ .start = 0, .end = filter_function_tokens.items.len });
@@ -3474,6 +3551,47 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 17, .end = 18 }, read.source_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 20, .end = 21 }, read.group_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 20, .end = 21 }, read.group_items.items[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const distinct_aggregate_read_sql = "SELECT customer, COUNT(DISTINCT status) AS status_count FROM usage_records GROUP BY customer";
+    const distinct_aggregate_read_result = try parseSqlAlloc(alloc, distinct_aggregate_read_sql);
+    switch (distinct_aggregate_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.aggregate, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 10 }, read.projection_tokens.?);
+            try std.testing.expectEqual(@as(usize, 2), read.projection_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 10 }, read.projection_items.items[1]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 8 }, read.projection_items.expression_items[1]);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.function_call, read.projection_items.expressions[1].kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 7 }, read.projection_items.expressions[1].argument_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.projection_items.expressions[1].argument_distinct_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.projection_items.expressions[1].argument_value_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), read.projection_items.expressions[1].argument_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 14, .end = 15 }, read.group_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const ordered_argument_aggregate_read_sql = "SELECT customer, ARRAY_AGG(DISTINCT status ORDER BY amount DESC) AS statuses FROM usage_records GROUP BY customer";
+    const ordered_argument_aggregate_read_result = try parseSqlAlloc(alloc, ordered_argument_aggregate_read_sql);
+    switch (ordered_argument_aggregate_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.aggregate, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 14 }, read.projection_tokens.?);
+            try std.testing.expectEqual(@as(usize, 2), read.projection_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 14 }, read.projection_items.items[1]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 12 }, read.projection_items.expression_items[1]);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.function_call, read.projection_items.expressions[1].kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 11 }, read.projection_items.expressions[1].argument_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.projection_items.expressions[1].argument_distinct_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.projection_items.expressions[1].argument_value_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 11 }, read.projection_items.expressions[1].argument_order_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), read.projection_items.expressions[1].argument_order_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.projection_items.expressions[1].argument_order_items.expression_items[0]);
+            try std.testing.expectEqual(GeneratedSqlOrderDirection.desc, read.projection_items.expressions[1].argument_order_items.directions[0].?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 18, .end = 19 }, read.group_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

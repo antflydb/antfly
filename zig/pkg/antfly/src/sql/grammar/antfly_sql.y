@@ -592,7 +592,21 @@ execute_argument_list_opt:
 function_argument_list_opt:
     /* empty */
   | STAR
-  | expression_list
+  | function_argument_list
+  ;
+
+function_argument_list:
+    distinct_opt expression_list function_argument_order_opt
+  ;
+
+distinct_opt:
+    /* empty */
+  | DISTINCT
+  ;
+
+function_argument_order_opt:
+    /* empty */
+  | ORDER BY order_by_list
   ;
 
 array_element_list_opt:
