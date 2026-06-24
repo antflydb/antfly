@@ -204,11 +204,12 @@ read sources with named `=`/`=>` arguments, retained source/name/argument token
 ranges, owned named-argument item/name/operator/value ranges, list-based
 Antfly function kind metadata across joined sources, graph function subset
 metadata, and fail-closed range validation in the generated read lowering
-boundary. The generated parser now also treats seed graph DDL as a distinct
-graph statement family and `ParsedSql` retains those generated raw and AST
-nodes. Seed graph index and graph metric statements now have graph-specific
-generated AST-to-plan wrappers that lower to typed index plans instead of only
-routing through the generic DDL family. The generated
+boundary. The generated parser now also treats graph DDL as a distinct graph
+statement family and `ParsedSql` retains those generated raw and AST nodes.
+Seed and rich `CREATE GRAPH INDEX`, `CREATE GRAPH METRIC`, and
+`ALTER GRAPH INDEX ... ADD METRIC` statements now have graph-specific generated
+AST-to-plan wrappers that lower to typed index plans instead of only routing
+through the generic DDL family. The generated
 facade now returns closed statement-family nodes for the covered families and
 explicit unsupported statement nodes for seed `ANALYZE`, bulk I/O `COPY`,
 maintenance `VACUUM`/`REINDEX`, utility/control statements such as `CLUSTER`,
@@ -504,8 +505,9 @@ Unsupported DDL remains on the existing parser until
    `TRUNCATE`, and `MERGE`.
 6. Antfly extensions: graph traversal DSL, graph metric query surfaces,
    automatic embeddings, full-text ranking, algebraic indexes, enrichment
-   clauses, lake/source syntax, and Lite-specific capability checks. Seed
-   `CREATE GRAPH INDEX` and `CREATE GRAPH METRIC` statements now have generated
+   clauses, lake/source syntax, and Lite-specific capability checks. Seed and
+   rich `CREATE GRAPH INDEX`, `CREATE GRAPH METRIC`, and
+   `ALTER GRAPH INDEX ... ADD METRIC` statements now have generated
    graph-family corpus coverage, retained generated AST nodes, and generated
    AST-to-plan wrappers for typed graph index and graph metric index plans.
    Canonical `antfly.*` query table-function sources now have generated
@@ -626,7 +628,8 @@ variants for:
   behavior, plus generated-first AST-to-plan parity checks for covered
   create-index clauses
 - graph statement, including a generated AST payload for command spans and
-  graph-specific AST-to-plan wrappers for seed graph index and graph metric DDL;
+  graph-specific AST-to-plan wrappers for seed and rich graph index and graph
+  metric DDL;
   canonical `antfly.*` table-function reads are represented on generated read
   ASTs as source-level Antfly function item metadata, with graph function items
   retained as a subset rather than as standalone graph statements
@@ -658,8 +661,8 @@ Generated grammar work needs evidence at multiple levels:
 - Corpus tests for accepted PostgreSQL-compatible syntax. The initial checked
   corpus covers session commands, transaction commands, prepared statements,
   simple database/schema/table DDL, extension/index statements,
-  representative DML, and representative read queries. It also covers seed
-  graph statements as a distinct generated family. Runtime parsing also
+  representative DML, and representative read queries. It also covers seed and
+  rich graph statements as a distinct generated family. Runtime parsing also
   enforces generated parser success for the session, transaction, and prepared
   statement corpus.
 - Corpus tests for accepted Antfly-specific syntax. The generated corpus now
@@ -716,8 +719,9 @@ Generated grammar work needs evidence at multiple levels:
   consistency validation. Subquery expression tests cover generated
   `ORDER BY`, `LIMIT`, `OFFSET`, and `FETCH` tail payloads plus fail-closed
   malformed subquery tail validation.
-  Seed graph DDL has generated AST-to-plan parity for graph index and graph
-  metric index plans, and generated read AST tests cover canonical
+  Graph DDL has generated AST-to-plan parity for graph index and graph metric
+  index plans, including rich graph index declarations and
+  `ALTER GRAPH INDEX ... ADD METRIC`, and generated read AST tests cover canonical
   `antfly.*` table-function source ranges and named-argument item ranges,
   including joined graph sources, plus fail-closed malformed Antfly and
   graph-source validation.

@@ -3062,6 +3062,7 @@ pub fn graphDdlPlanFromGeneratedAstAlloc(
     return switch (ast.kind) {
         .create_index => .{ .create_index = try parseCreateGraphIndexPlanAlloc(alloc, tail, &pos) },
         .create_metric => .{ .create_index = try parseCreateGraphMetricPlanAlloc(alloc, tail, &pos) },
+        .alter_metric => .{ .create_index = try parseAlterGraphIndexAddMetricPlanAlloc(alloc, tail, &pos) },
     };
 }
 
@@ -13131,6 +13132,21 @@ test "sql adapter ddl plan lowers generated graph AST into typed index plans" {
             try std.testing.expect(std.mem.indexOf(u8, config, "\"algorithm\":\"pagerank\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, config, "\"damping\":0.85") != null);
             try std.testing.expect(std.mem.indexOf(u8, config, "\"max_iterations\":40") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const graph_alter_metric_sql = "ALTER GRAPH INDEX docs_edge_graph ADD METRIC pagerank_v1 USING pagerank WITH (damping = 0.85, max_iterations = 40);";
+    var generated_graph_alter_metric = try generatedGraphDdlPlanForTestAlloc(alloc, graph_alter_metric_sql);
+    defer generated_graph_alter_metric.deinit(alloc);
+    switch (generated_graph_alter_metric) {
+        .create_index => |generated| {
+            try std.testing.expectEqual(DdlIndexMethod.antfly_graph_metric, generated.method);
+            try std.testing.expectEqualStrings("pagerank_v1", generated.index_name);
+            try std.testing.expectEqualStrings("", generated.table_name);
+            const config = generated.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"graph_index\":\"docs_edge_graph\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"algorithm\":\"pagerank\"") != null);
         },
         else => return error.TestUnexpectedResult,
     }

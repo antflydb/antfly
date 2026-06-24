@@ -383,7 +383,7 @@ pub const DB = struct {
         pub const notify_resolver_replay_runtimes = lifecycle_impl.notifyResolverReplayRuntimes;
     };
     pub const HAReplicationCallbacks = struct {
-        pub const batch_replicated_apply_with_marker = batchReplicatedApplyWithMarker;
+        pub const batch_replicated_apply_with_marker = write_path_impl.batchReplicatedApplyWithMarker;
         pub const apply_ha_derived_effect_record = applyHADerivedEffectRecord;
     };
 
@@ -509,20 +509,12 @@ pub const DB = struct {
         return lifecycle_impl.trySnapshotLsmMaintenanceStats(self);
     }
 
-    fn snapshotLsmMaintenanceStatsLocked(self: *DB) lsm_backend_mod.Backend.MaintenanceStats {
-        return lifecycle_impl.snapshotLsmMaintenanceStatsLocked(self);
-    }
-
     pub fn snapshotLsmWriteStats(self: *DB) lsm_backend_mod.Backend.WriteStats {
         return lifecycle_impl.snapshotLsmWriteStats(self);
     }
 
     pub fn trySnapshotLsmWriteStats(self: *DB) ?lsm_backend_mod.Backend.WriteStats {
         return lifecycle_impl.trySnapshotLsmWriteStats(self);
-    }
-
-    fn snapshotLsmWriteStatsLocked(self: *DB) lsm_backend_mod.Backend.WriteStats {
-        return lifecycle_impl.snapshotLsmWriteStatsLocked(self);
     }
 
     pub fn snapshotTextMemoryAttributionStats(self: *DB) index_manager_mod.TextMemoryAttributionStats {
@@ -551,10 +543,6 @@ pub const DB = struct {
 
     pub fn trySnapshotLsmNativeStorageStats(self: *DB) ?lsm_backend_mod.NativeStorageStats {
         return lifecycle_impl.trySnapshotLsmNativeStorageStats(self);
-    }
-
-    fn snapshotLsmNativeStorageStatsLocked(self: *DB) lsm_backend_mod.NativeStorageStats {
-        return lifecycle_impl.snapshotLsmNativeStorageStatsLocked(self);
     }
 
     pub fn runLsmMaintenanceStep(self: *DB) !bool {
@@ -786,14 +774,6 @@ pub const DB = struct {
         return try write_path_impl.batchReplicatedApply(self, req);
     }
 
-    fn batchReplicatedApplyWithMarker(self: *DB, req: types.BatchRequest, applied_lsn_marker: ?u64) anyerror!void {
-        return try write_path_impl.batchReplicatedApplyWithMarker(self, req, applied_lsn_marker);
-    }
-
-    fn setSchemaReplicatedApplyWithMarker(self: *DB, table_schema: schema_mod.TableSchema, applied_lsn_marker: ?u64) anyerror!void {
-        return try ha_replication_impl.setSchemaReplicatedApplyWithMarker(self, table_schema, applied_lsn_marker);
-    }
-
     pub fn applyHAReplicationRecord(self: *DB, record: ha_replication_record_mod.RecordView) anyerror!void {
         return try ha_replication_impl.applyReplicationRecord(self, record);
     }
@@ -805,14 +785,6 @@ pub const DB = struct {
 
     pub fn haAppliedReplicationLsn(self: *DB) anyerror!u64 {
         return try ha_replication_impl.appliedReplicationLsn(self);
-    }
-
-    fn haReplicationRecordAlreadyApplied(self: *DB, record: ha_replication_record_mod.RecordView) !bool {
-        return try ha_replication_impl.replicationRecordAlreadyApplied(self, record);
-    }
-
-    fn markHAReplicationRecordApplied(self: *DB, lsn: u64) !void {
-        try ha_replication_impl.markReplicationRecordApplied(self, lsn);
     }
 
     pub fn applyHAReplicationRecordCallback(ctx: *anyopaque, record: ha_replication_record_mod.RecordView) anyerror!void {
@@ -1158,26 +1130,6 @@ pub const DB = struct {
         return try schema_runtime_impl.executeClaimedSchemaRewriteJob(self, alloc, job);
     }
 
-    fn validateRelationalSchemaConstraintsForJobLocked(
-        self: *DB,
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        lower_doc_key: []const u8,
-        upper_doc_key: []const u8,
-    ) !relational_store_mod.RowRewriteReport {
-        return try schema_runtime_impl.validateRelationalSchemaConstraintsForJobLocked(self, alloc, runtime_schema, lower_doc_key, upper_doc_key);
-    }
-
-    fn validateRelationalChecksInRangeLocked(
-        self: *DB,
-        alloc: Allocator,
-        checks: []const schema_mod.RelationalCheck,
-        lower_doc_key: []const u8,
-        upper_doc_key: []const u8,
-    ) !void {
-        try schema_runtime_impl.validateRelationalChecksInRangeLocked(self, alloc, checks, lower_doc_key, upper_doc_key);
-    }
-
     /// Returns the relational column catalog when the table is in relational
     /// storage mode (so document writes store a dedicated relational base row),
     /// or null for document-mode tables (which keep the JSON blob).
@@ -1446,27 +1398,6 @@ pub const DB = struct {
         try schema_runtime_impl.reloadAlgebraicSchemaConfigs(self, schema_json);
     }
 
-    fn stageAlgebraicSchemaConfigsPending(self: *DB, schema_json: []const u8) !void {
-        try schema_runtime_impl.stageAlgebraicSchemaConfigsPending(self, schema_json);
-    }
-
-    fn completePendingAlgebraicSchemaRebuilds(self: *DB) !void {
-        try schema_runtime_impl.completePendingAlgebraicSchemaRebuilds(self);
-    }
-
-    fn setSchemaWithLocalSchemaJson(self: *DB, table_schema: schema_mod.TableSchema, schema_json: []const u8) !void {
-        try schema_runtime_impl.setSchemaWithLocalSchemaJson(self, table_schema, schema_json);
-    }
-
-    fn setSchemaWithLocalLiteSqlTableRecordJson(
-        self: *DB,
-        table_schema: schema_mod.TableSchema,
-        schema_json: []const u8,
-        table_record_json: []const u8,
-    ) !void {
-        try schema_runtime_impl.setSchemaWithLocalLiteSqlTableRecordJson(self, table_schema, schema_json, table_record_json);
-    }
-
     pub fn setSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
         try schema_runtime_impl.setSchemaJson(self, alloc, schema_json);
     }
@@ -1519,15 +1450,6 @@ pub const DB = struct {
         claim: types.RowClaimRequest,
     ) !void {
         return try db_transactions_impl.claimRowsForTransaction(self, txn_id, row_keys, claim);
-    }
-
-    fn tryClaimRowForTransaction(
-        self: *DB,
-        txn_id: types.TxnId,
-        row_key: []const u8,
-        claim: types.RowClaimRequest,
-    ) !bool {
-        return try db_transactions_impl.tryClaimRowForTransaction(self, txn_id, row_key, claim);
     }
 
     pub fn commitTransaction(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64) !void {
@@ -1629,10 +1551,6 @@ pub const DB = struct {
         max_weight: f64,
     ) ![]paths_mod.Path {
         return try search_runtime_impl.findKShortestPaths(self, alloc, index_name, source, target, k, edge_types, direction, weight_mode, max_depth, min_weight, max_weight);
-    }
-
-    fn proveGraphTraversalProgram(self: *DB, index_name: []const u8, constrained_targets: bool) !void {
-        return try search_runtime_impl.proveGraphTraversalProgram(self, index_name, constrained_targets);
     }
 
     pub fn matchPattern(
@@ -2033,15 +1951,6 @@ pub const DB = struct {
             rebuild_chunk_size,
             rebuild_progress_interval,
         );
-    }
-
-    fn rebuildDenseIndexesFromStoredEmbeddingArtifactsWithProgress(
-        self: *DB,
-        alloc: Allocator,
-        progress_ctx: ?*anyopaque,
-        progress_hook: ?ReplayProgressHook,
-    ) !usize {
-        return try derived_async_impl.rebuildDenseIndexesFromStoredEmbeddingArtifactsWithProgress(self, alloc, progress_ctx, progress_hook);
     }
 
     pub fn rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(self: *DB, alloc: Allocator) !usize {
@@ -2516,26 +2425,6 @@ pub const DB = struct {
         return try relational_integrity_impl.claimAndRunForeignKeyIntegrityWorkUnitAt(self, claim_key, worker_id, group_id, phase, mode, constraint_name, lower_doc_key, upper_doc_key, lease_ms, now_ns);
     }
 
-    fn foreignKeyIntegrityModeName(mode: relational_store_mod.ForeignKeyIntegrityMode) []const u8 {
-        return relational_integrity_impl.foreignKeyIntegrityModeName(mode);
-    }
-
-    fn foreignKeyActionJobCanonicalAction(action: []const u8) ?[]const u8 {
-        return relational_integrity_impl.foreignKeyActionJobCanonicalAction(action);
-    }
-
-    fn foreignKeyActionJobActionSupported(action: []const u8) bool {
-        return relational_integrity_impl.foreignKeyActionJobActionSupported(action);
-    }
-
-    fn foreignKeyActionScheduleKeyAlloc(alloc: Allocator, schedule_id: []const u8) ![]u8 {
-        return try relational_integrity_impl.foreignKeyActionScheduleKeyAlloc(alloc, schedule_id);
-    }
-
-    fn foreignKeyActionJobKeyAlloc(alloc: Allocator, job_id: []const u8) ![]u8 {
-        return try relational_integrity_impl.foreignKeyActionJobKeyAlloc(alloc, job_id);
-    }
-
     pub fn cloneForeignKeyActionScheduleRecordFromJson(self: *DB, raw: []const u8) !ForeignKeyActionScheduleRecord {
         return try relational_integrity_impl.cloneForeignKeyActionScheduleRecordFromJson(self, raw);
     }
@@ -2544,89 +2433,12 @@ pub const DB = struct {
         return try relational_integrity_impl.cloneForeignKeyActionJobRecordFromJson(self, raw);
     }
 
-    fn cloneForeignKeyActionJobRecordOwned(self: *DB, record: ForeignKeyActionJobRecord) !ForeignKeyActionJobRecord {
-        return try relational_integrity_impl.cloneForeignKeyActionJobRecordOwned(self, record);
-    }
-
-    fn cloneForeignKeyActionScheduleRecordOwned(self: *DB, record: ForeignKeyActionScheduleRecord) !ForeignKeyActionScheduleRecord {
-        return try relational_integrity_impl.cloneForeignKeyActionScheduleRecordOwned(self, record);
-    }
-
-    fn validateForeignKeyActionLineage(cascade_depth: u32, cascade_max_depth: u32) !void {
-        try relational_integrity_impl.validateForeignKeyActionLineage(cascade_depth, cascade_max_depth);
-    }
-
-    fn validateForeignKeyActionJobIdentity(
-        job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        updated_parent_key: ?[]const u8,
-    ) !void {
-        try relational_integrity_impl.validateForeignKeyActionJobIdentity(job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
-    }
-
-    fn validateForeignKeyActionJobMatches(
-        existing: ForeignKeyActionJobRecord,
-        action: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        updated_parent_key: ?[]const u8,
-    ) !void {
-        try relational_integrity_impl.validateForeignKeyActionJobMatches(existing, action, constraint_name, parent_table, parent_key, updated_parent_key);
-    }
-
-    fn validateForeignKeyActionScheduleMatches(
-        existing: ForeignKeyActionScheduleRecord,
-        action_job_id: []const u8,
-        action: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        updated_parent_key: ?[]const u8,
-    ) !void {
-        try relational_integrity_impl.validateForeignKeyActionScheduleMatches(existing, action_job_id, action, constraint_name, parent_table, parent_key, updated_parent_key);
-    }
-
-    fn foreignKeyActionJobClaimsMatch(current: ForeignKeyActionJobRecord, claimed: ForeignKeyActionJobRecord) bool {
-        return relational_integrity_impl.foreignKeyActionJobClaimsMatch(current, claimed);
-    }
-
-    fn snapshotForeignKeyStats(self: *DB) types.ForeignKeyStats {
-        return lifecycle_impl.snapshotForeignKeyStats(self);
-    }
-
-    const DocIdentityCoverage = lifecycle_mod.DocIdentityCoverage;
-
-    fn diagnosticDocIdentityStats(self: *DB, byte_range: types.ByteRange) !types.DocIdentityStats {
-        return try lifecycle_impl.diagnosticDocIdentityStats(self, byte_range);
-    }
-
-    fn statsLocked(self: *DB, alloc: Allocator) !types.DBStats {
-        return try lifecycle_impl.statsLocked(self, alloc);
-    }
-
     pub fn diagnosticStats(self: *DB, alloc: Allocator) !types.DBStats {
         return try lifecycle_impl.diagnosticStats(self, alloc);
     }
 
-    fn statusOnlyStats(self: *DB, alloc: Allocator) !types.DBStats {
-        return try lifecycle_impl.statusOnlyStats(self, alloc);
-    }
-
     fn graphMetricRuntimeStats(self: *DB) types.GraphMetricRuntimeStats {
         return lifecycle_impl.graphMetricRuntimeStats(self);
-    }
-
-    fn scanPrimaryDocCount(self: *DB, byte_range: types.ByteRange) !u64 {
-        return try lifecycle_impl.scanPrimaryDocCount(self, byte_range);
-    }
-
-    fn scanPrimaryDocIdentityCoverage(self: *DB, byte_range: types.ByteRange) !DocIdentityCoverage {
-        return try lifecycle_impl.scanPrimaryDocIdentityCoverage(self, byte_range);
     }
 
     pub fn primaryDocCount(self: *DB, alloc: Allocator) !u64 {
@@ -2938,17 +2750,6 @@ pub const DB = struct {
         return try relational_rows_impl.windowRelationalRowsAcrossRanges(self, alloc, runtime_schema, req, ranges);
     }
 
-    fn appendRelationalRowsMaterializedCtesAlloc(
-        self: *DB,
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        ranges: []const types.RelationalRowsDocKeyRange,
-        ctes: []const types.RelationalRowsCte,
-        materialized_ctes: *std.ArrayListUnmanaged(relational_rows.MaterializedCte),
-    ) !void {
-        return try relational_rows_impl.appendRelationalRowsMaterializedCtesAlloc(self, alloc, runtime_schema, ranges, ctes, materialized_ctes);
-    }
-
     pub fn admitRelationalRowsSetOperationRows(
         plan: types.RelationalRowsSetOperationPlan,
         rows: []const []const u8,
@@ -2988,27 +2789,6 @@ pub const DB = struct {
         return try relational_rows.relationalRowsSetOperationRowsAlloc(alloc, operation, left, right);
     }
 
-    fn queryRelationalRowsWithMaterializedCtesAlloc(
-        self: *DB,
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        materialized_ctes: []relational_rows.MaterializedCte,
-        req: types.RelationalRowsQueryRequest,
-    ) !types.RelationalRowsQueryResult {
-        return try relational_rows_impl.queryRelationalRowsWithMaterializedCtesAlloc(self, alloc, runtime_schema, materialized_ctes, req);
-    }
-
-    fn queryRelationalRowsWithMaterializedCtesAndRangesAlloc(
-        self: *DB,
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        materialized_ctes: []relational_rows.MaterializedCte,
-        ranges: []const types.RelationalRowsDocKeyRange,
-        req: types.RelationalRowsQueryRequest,
-    ) !types.RelationalRowsQueryResult {
-        return try relational_rows_impl.queryRelationalRowsWithMaterializedCtesAndRangesAlloc(self, alloc, runtime_schema, materialized_ctes, ranges, req);
-    }
-
     pub fn queryRelationalRowsAcrossRanges(
         self: *DB,
         alloc: Allocator,
@@ -3017,54 +2797,6 @@ pub const DB = struct {
         ranges: []const types.RelationalRowsDocKeyRange,
     ) !types.RelationalRowsQueryResult {
         return try relational_rows_impl.queryRelationalRowsAcrossRanges(self, alloc, runtime_schema, req, ranges);
-    }
-
-    fn appendRelationalRowsQueryCandidatesForRequestAlloc(
-        self: *DB,
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        req: types.RelationalRowsQueryRequest,
-        generation: ?u64,
-        rows: *std.ArrayListUnmanaged(RelationalRowsQueryCandidate),
-    ) !void {
-        try relational_rows_impl.appendRelationalRowsQueryCandidatesForRequestAlloc(self, alloc, runtime_schema, req, generation, rows);
-    }
-
-    fn buildRelationalRowsQueryResultFromCandidatesAlloc(
-        self: *DB,
-        alloc: Allocator,
-        req: types.RelationalRowsQueryRequest,
-        rows: []RelationalRowsQueryCandidate,
-    ) !types.RelationalRowsQueryResult {
-        return try relational_rows_impl.buildRelationalRowsQueryResultFromCandidatesAlloc(self, alloc, req, rows);
-    }
-
-    fn collectRelationalRowsPreimagesFromCandidatesAlloc(
-        alloc: Allocator,
-        req: types.RelationalRowsQueryRequest,
-        rows: []RelationalRowsQueryCandidate,
-    ) ![]const types.RelationalRowsCollectedRow {
-        return try relational_rows_impl.collectRelationalRowsPreimagesFromCandidatesAlloc(alloc, req, rows);
-    }
-
-    fn appendRelationalRowsDistinctOnIndexesAlloc(
-        alloc: Allocator,
-        rows: []const RelationalRowsQueryCandidate,
-        distinct_on: []const []const u8,
-        distinct_on_expressions: []const types.RelationalRowsExpression,
-        out: *std.ArrayListUnmanaged(usize),
-    ) !void {
-        return try relational_rows_impl.appendRelationalRowsDistinctOnIndexesAlloc(alloc, rows, distinct_on, distinct_on_expressions, out);
-    }
-
-    fn queryRelationalRowsFromMaterializedCteAlloc(
-        self: *DB,
-        alloc: Allocator,
-        source_name: []const u8,
-        source_rows: []const []const u8,
-        req: types.RelationalRowsQueryRequest,
-    ) !types.RelationalRowsQueryResult {
-        return try relational_rows_impl.queryRelationalRowsFromMaterializedCteAlloc(self, alloc, source_name, source_rows, req);
     }
 
     pub fn queryRelationalRowsFromSourceRowsAlloc(
@@ -3103,74 +2835,6 @@ pub const DB = struct {
         req: types.RelationalRowsWindowRequest,
     ) !types.RelationalRowsWindowResult {
         return try relational_rows_impl.windowRelationalRowsFromUnorderedSourceRowsStaticAlloc(alloc, source_name, source_rows, req);
-    }
-
-    fn windowRelationalRowsFromSourceRowsAlloc(
-        alloc: Allocator,
-        req: types.RelationalRowsWindowRequest,
-        source_rows: []const []const u8,
-    ) !types.RelationalRowsWindowResult {
-        return try relational_rows_impl.windowRelationalRowsFromSourceRowsAlloc(alloc, req, source_rows);
-    }
-
-    fn projectRelationalRowsQueryCandidateAlloc(
-        self: *DB,
-        alloc: Allocator,
-        doc_key: []const u8,
-        row_json: []const u8,
-        req: types.RelationalRowsQueryRequest,
-    ) ![]u8 {
-        return try relational_rows_impl.projectRelationalRowsQueryCandidateAlloc(self, alloc, doc_key, row_json, req);
-    }
-
-    fn projectRelationalRowsQueryCandidateStaticAlloc(
-        alloc: Allocator,
-        doc_key: []const u8,
-        row_json: []const u8,
-        req: types.RelationalRowsQueryRequest,
-    ) ![]u8 {
-        return try relational_rows_impl.projectRelationalRowsQueryCandidateStaticAlloc(alloc, doc_key, row_json, req);
-    }
-
-    fn relationalRowsMutationSourceOperationsAlloc(
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        row_json: []const u8,
-        req: types.RelationalRowsMutationSourceRequest,
-    ) ![]types.TransformOp {
-        return try relational_rows_impl.relationalRowsMutationSourceOperationsAlloc(alloc, runtime_schema, row_json, req);
-    }
-
-    fn relationalRowsJoinedMutationSourceOperationsAlloc(
-        alloc: Allocator,
-        target_schema: schema_mod.TableSchema,
-        source_schema: schema_mod.TableSchema,
-        target_json: []const u8,
-        source_json: []const u8,
-        req: types.RelationalRowsJoinedMutationSourceRequest,
-    ) ![]types.TransformOp {
-        return try relational_rows_impl.relationalRowsJoinedMutationSourceOperationsAlloc(alloc, target_schema, source_schema, target_json, source_json, req);
-    }
-
-    fn relationalRowsFreeTransformOps(alloc: Allocator, operations: []const types.TransformOp) void {
-        relational_rows_impl.relationalRowsFreeTransformOps(alloc, operations);
-    }
-
-    fn relationalRowsMutationReturningJsonAlloc(
-        alloc: Allocator,
-        row_json: []const u8,
-        req: types.RelationalRowsMutationSourceRequest,
-    ) ![]u8 {
-        return try relational_rows_impl.relationalRowsMutationReturningJsonAlloc(alloc, row_json, req);
-    }
-
-    fn relationalRowsJoinedMutationReturningJsonAlloc(
-        alloc: Allocator,
-        row_json: []const u8,
-        source_row_json: []const u8,
-        req: types.RelationalRowsJoinedMutationSourceRequest,
-    ) ![]u8 {
-        return try relational_rows_impl.relationalRowsJoinedMutationReturningJsonAlloc(alloc, row_json, source_row_json, req);
     }
 
     pub fn applyRelationalRowsClaimToSelectedCandidatesAlloc(
@@ -3344,26 +3008,6 @@ pub const DB = struct {
         return try relational_rows_impl.resolveRelationalRowsQueryCandidateSetAlloc(self, alloc, runtime_schema, req, generation);
     }
 
-    fn resolveRelationalRowsOrPredicateGroupsCandidateSetAlloc(
-        self: *DB,
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        groups: []const types.RelationalRowsPredicateGroup,
-        generation: ?u64,
-    ) !?doc_set.ResolvedDocSet {
-        return try relational_rows_impl.resolveRelationalRowsOrPredicateGroupsCandidateSetAlloc(self, alloc, runtime_schema, groups, generation);
-    }
-
-    fn resolveRelationalRowsPredicateGroupCandidateSetAlloc(
-        self: *DB,
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        predicates: []const schema_mod.RelationalCheck,
-        generation: ?u64,
-    ) !?doc_set.ResolvedDocSet {
-        return try relational_rows_impl.resolveRelationalRowsPredicateGroupCandidateSetAlloc(self, alloc, runtime_schema, predicates, generation);
-    }
-
     fn appendRelationalRowsPlannedCandidateSetAlloc(
         alloc: Allocator,
         planned_sets: *std.ArrayListUnmanaged(RelationalRowsPlannedCandidateSet),
@@ -3381,39 +3025,9 @@ pub const DB = struct {
         return relational_rows.plannedCandidateSetLessThan({}, left, right);
     }
 
-    fn resolveRelationalRowsUniqueOwnerCandidateSetAlloc(
-        self: *DB,
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        req: types.RelationalRowsQueryRequest,
-        generation: ?u64,
-    ) !?doc_set.ResolvedDocSet {
-        return try relational_rows_impl.resolveRelationalRowsUniqueOwnerCandidateSetAlloc(self, alloc, runtime_schema, req, generation);
-    }
-
-    fn resolveRelationalRowsUniqueConstraintCandidateSetAlloc(
-        self: *DB,
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        constraint: schema_mod.UniqueConstraint,
-        equality_json: []const u8,
-        generation: ?u64,
-        implications: RelationalRowsPredicateImplications,
-    ) !?doc_set.ResolvedDocSet {
-        return try relational_rows_impl.resolveRelationalRowsUniqueConstraintCandidateSetAlloc(self, alloc, runtime_schema, constraint, equality_json, generation, implications);
-    }
-
     const relationalRowsUniqueConstraintColumnsAlloc = relational_rows.uniqueConstraintColumnsAlloc;
 
     const relationalRowsPredicatesImplyUniqueWhere = relational_rows.predicatesImplyUniqueWhere;
-
-    fn relationalRowsExpressionPredicatesImply(
-        alloc: Allocator,
-        implications: RelationalRowsPredicateImplications,
-        required: []const types.RelationalRowsExpressionCondition,
-    ) !bool {
-        return try relational_rows_impl.relationalRowsExpressionPredicatesImply(alloc, implications, required);
-    }
 
     pub fn relationalRowsExpressionConditionsImpliedByEqualityPredicatesAlloc(
         alloc: Allocator,
@@ -3430,338 +3044,13 @@ pub const DB = struct {
         return try relational_rows.equalityPredicateObjectJsonAlloc(alloc, predicates);
     }
 
-    fn resolveRelationalRowsPredicateDocSetAlloc(
-        self: *DB,
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        predicate: schema_mod.RelationalCheck,
-        generation: ?u64,
-    ) !?doc_set.ResolvedDocSet {
-        return try relational_rows_impl.resolveRelationalRowsPredicateDocSetAlloc(self, alloc, runtime_schema, predicate, generation);
-    }
-
-    fn resolveRelationalRowsPredicateDocSetWithPredicatesAlloc(
-        self: *DB,
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        predicate: schema_mod.RelationalCheck,
-        implications: RelationalRowsPredicateImplications,
-        generation: ?u64,
-    ) !?doc_set.ResolvedDocSet {
-        return try relational_rows_impl.resolveRelationalRowsPredicateDocSetWithPredicatesAlloc(self, alloc, runtime_schema, predicate, implications, generation);
-    }
-
-    fn resolveRelationalRowsArrayAnyDocSetAlloc(
-        self: *DB,
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        predicate: types.RelationalRowsArrayAnyPredicate,
-        generation: ?u64,
-    ) !?doc_set.ResolvedDocSet {
-        return try relational_rows_impl.resolveRelationalRowsArrayAnyDocSetAlloc(self, alloc, runtime_schema, predicate, generation);
-    }
-
-    fn resolveRelationalRowsArrayAnyDocSetWithPredicatesAlloc(
-        self: *DB,
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        predicate: types.RelationalRowsArrayAnyPredicate,
-        implications: RelationalRowsPredicateImplications,
-        generation: ?u64,
-    ) !?doc_set.ResolvedDocSet {
-        return try relational_rows_impl.resolveRelationalRowsArrayAnyDocSetWithPredicatesAlloc(self, alloc, runtime_schema, predicate, implications, generation);
-    }
-
-    fn resolveRelationalRowsArrayContainsDocSetWithPredicatesAlloc(
-        self: *DB,
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        predicate: types.RelationalRowsArrayContainsPredicate,
-        implications: RelationalRowsPredicateImplications,
-        generation: ?u64,
-    ) !?doc_set.ResolvedDocSet {
-        return try relational_rows_impl.resolveRelationalRowsArrayContainsDocSetWithPredicatesAlloc(self, alloc, runtime_schema, predicate, implications, generation);
-    }
-
-    fn resolveRelationalRowsArrayEqDocSetWithPredicatesAlloc(
-        self: *DB,
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        predicate: types.RelationalRowsArrayEqPredicate,
-        implications: RelationalRowsPredicateImplications,
-        generation: ?u64,
-        doc_key_range: ?types.RelationalRowsDocKeyRange,
-    ) !?doc_set.ResolvedDocSet {
-        return try relational_rows_impl.resolveRelationalRowsArrayEqDocSetWithPredicatesAlloc(self, alloc, runtime_schema, predicate, implications, generation, doc_key_range);
-    }
-
-    fn resolveRelationalRowsInDocSetWithPredicatesAlloc(
-        self: *DB,
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        predicate: types.RelationalRowsInPredicate,
-        implications: RelationalRowsPredicateImplications,
-        generation: ?u64,
-    ) !?doc_set.ResolvedDocSet {
-        return try relational_rows_impl.resolveRelationalRowsInDocSetWithPredicatesAlloc(self, alloc, runtime_schema, predicate, implications, generation);
-    }
-
-    fn resolveRelationalRowsJsonContainsDocSetAlloc(
-        self: *DB,
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        predicate: types.RelationalRowsJsonContainsPredicate,
-        generation: ?u64,
-    ) !?doc_set.ResolvedDocSet {
-        return try relational_rows_impl.resolveRelationalRowsJsonContainsDocSetAlloc(self, alloc, runtime_schema, predicate, generation);
-    }
-
-    fn resolveRelationalRowsJsonContainsDocSetWithPredicatesAlloc(
-        self: *DB,
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        predicate: types.RelationalRowsJsonContainsPredicate,
-        implications: RelationalRowsPredicateImplications,
-        generation: ?u64,
-    ) !?doc_set.ResolvedDocSet {
-        return try relational_rows_impl.resolveRelationalRowsJsonContainsDocSetWithPredicatesAlloc(self, alloc, runtime_schema, predicate, implications, generation);
-    }
-
-    fn resolveRelationalRowsJsonPathEqDocSetWithPredicatesAlloc(
-        self: *DB,
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        predicate: types.RelationalRowsJsonPathEqPredicate,
-        implications: RelationalRowsPredicateImplications,
-        generation: ?u64,
-        doc_key_range: ?types.RelationalRowsDocKeyRange,
-    ) !?doc_set.ResolvedDocSet {
-        return try relational_rows_impl.resolveRelationalRowsJsonPathEqDocSetWithPredicatesAlloc(self, alloc, runtime_schema, predicate, implications, generation, doc_key_range);
-    }
-
-    fn resolveRelationalRowsJsonPathExistsDocSetWithPredicatesAlloc(
-        self: *DB,
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        predicate: types.RelationalRowsJsonPathExistsPredicate,
-        implications: RelationalRowsPredicateImplications,
-        generation: ?u64,
-        doc_key_range: ?types.RelationalRowsDocKeyRange,
-    ) !?doc_set.ResolvedDocSet {
-        return try relational_rows_impl.resolveRelationalRowsJsonPathExistsDocSetWithPredicatesAlloc(self, alloc, runtime_schema, predicate, implications, generation, doc_key_range);
-    }
-
-    fn appendAllRelationalRowsQueryCandidatesAlloc(
-        self: *DB,
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        req: types.RelationalRowsQueryRequest,
-        rows: *std.ArrayListUnmanaged(RelationalRowsQueryCandidate),
-    ) !void {
-        try relational_rows_impl.appendAllRelationalRowsQueryCandidatesAlloc(self, alloc, runtime_schema, req, rows);
-    }
-
-    fn appendRelationalRowsQueryCandidateAlloc(
-        self: *DB,
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        req: types.RelationalRowsQueryRequest,
-        rows: *std.ArrayListUnmanaged(RelationalRowsQueryCandidate),
-        doc_key: []const u8,
-    ) !void {
-        try relational_rows_impl.appendRelationalRowsQueryCandidateAlloc(self, alloc, runtime_schema, req, rows, doc_key);
-    }
-
-    fn appendRelationalRowsQueryCandidateFromRawAlloc(
-        self: *DB,
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        req: types.RelationalRowsQueryRequest,
-        rows: *std.ArrayListUnmanaged(RelationalRowsQueryCandidate),
-        doc_key: []const u8,
-        raw_row: []const u8,
-    ) !void {
-        try relational_rows_impl.appendRelationalRowsQueryCandidateFromRawAlloc(self, alloc, runtime_schema, req, rows, doc_key, raw_row);
-    }
-
-    fn appendRelationalRowsQueryCandidateFromJsonAlloc(
-        self: *DB,
-        alloc: Allocator,
-        req: types.RelationalRowsQueryRequest,
-        rows: *std.ArrayListUnmanaged(RelationalRowsQueryCandidate),
-        doc_key: []const u8,
-        row_json: []const u8,
-        version: u64,
-    ) !void {
-        _ = self;
-        return try relational_rows_impl.appendRelationalRowsQueryCandidateFromJsonAlloc(alloc, req, rows, doc_key, row_json, version);
-    }
-
     const relationalRowsDocKeyInQueryRange = relational_rows.docKeyInQueryRange;
 
-    fn relationalRowsQueryJsonMatchesRequest(
-        alloc: Allocator,
-        row_json: []const u8,
-        req: types.RelationalRowsQueryRequest,
-    ) !bool {
-        return try relational_rows_impl.relationalRowsQueryJsonMatchesRequest(alloc, row_json, req);
-    }
-
     const relationalRowsQueryPredicatePasses = relational_rows.queryPredicatePasses;
-
-    fn relationalRowsQueryExpressionOrPredicateGroupsPass(
-        alloc: Allocator,
-        row: std.json.Value,
-        groups: []const types.RelationalRowsExpressionPredicateGroup,
-    ) !bool {
-        return try relational_rows_impl.relationalRowsQueryExpressionOrPredicateGroupsPass(alloc, row, groups);
-    }
-
-    fn relationalRowsQueryExpressionNotPredicateGroupsPass(
-        alloc: Allocator,
-        row: std.json.Value,
-        groups: []const types.RelationalRowsExpressionPredicateGroup,
-    ) !bool {
-        return try relational_rows_impl.relationalRowsQueryExpressionNotPredicateGroupsPass(alloc, row, groups);
-    }
-
-    fn relationalRowsExpressionOrPredicateGroupsPassWithSources(
-        alloc: Allocator,
-        row: std.json.Value,
-        proposed_row: ?std.json.Value,
-        source_row: ?std.json.Value,
-        groups: []const types.RelationalRowsExpressionPredicateGroup,
-    ) !bool {
-        return try relational_rows_impl.relationalRowsExpressionOrPredicateGroupsPassWithSources(alloc, row, proposed_row, source_row, groups);
-    }
-
-    fn relationalRowsExpressionNotPredicateGroupsPassWithSources(
-        alloc: Allocator,
-        row: std.json.Value,
-        proposed_row: ?std.json.Value,
-        source_row: ?std.json.Value,
-        groups: []const types.RelationalRowsExpressionPredicateGroup,
-    ) !bool {
-        return try relational_rows_impl.relationalRowsExpressionNotPredicateGroupsPassWithSources(alloc, row, proposed_row, source_row, groups);
-    }
-
-    fn relationalRowsAggregateFilterPasses(
-        alloc: Allocator,
-        row: std.json.Value,
-        predicates: []const schema_mod.RelationalCheck,
-        array_any: []const types.RelationalRowsArrayAnyPredicate,
-        array_contains: []const types.RelationalRowsArrayContainsPredicate,
-        array_eq: []const types.RelationalRowsArrayEqPredicate,
-        in_predicates: []const types.RelationalRowsInPredicate,
-        json_contains: []const types.RelationalRowsJsonContainsPredicate,
-        json_path_eq: []const types.RelationalRowsJsonPathEqPredicate,
-        json_path_exists: []const types.RelationalRowsJsonPathExistsPredicate,
-        text_patterns: []const types.RelationalRowsTextPatternPredicate,
-        expressions: []const types.RelationalRowsExpressionCondition,
-        expression_array_contains: []const types.RelationalRowsExpressionArrayContainsPredicate,
-        any_groups: []const types.RelationalRowsExpressionPredicateGroup,
-        not_groups: []const types.RelationalRowsExpressionPredicateGroup,
-    ) !bool {
-        return try relational_rows_impl.relationalRowsAggregateFilterPasses(alloc, row, predicates, array_any, array_contains, array_eq, in_predicates, json_contains, json_path_eq, json_path_exists, text_patterns, expressions, expression_array_contains, any_groups, not_groups);
-    }
-
-    fn relationalRowsExpressionValueJsonAlloc(
-        alloc: Allocator,
-        row: std.json.Value,
-        expression: types.RelationalRowsExpression,
-    ) anyerror![]u8 {
-        return try relational_rows_impl.relationalRowsExpressionValueJsonAlloc(alloc, row, expression);
-    }
-
-    fn relationalRowsExpressionValueJsonWithSourcesAlloc(
-        alloc: Allocator,
-        row: std.json.Value,
-        proposed_row: ?std.json.Value,
-        source_row: ?std.json.Value,
-        expression: types.RelationalRowsExpression,
-    ) anyerror![]u8 {
-        return try relational_rows_impl.relationalRowsExpressionValueJsonWithSourcesAlloc(alloc, row, proposed_row, source_row, expression);
-    }
-
-    fn relationalRowsJsonBuildObjectExpressionValueJsonAlloc(
-        alloc: Allocator,
-        row: std.json.Value,
-        proposed_row: ?std.json.Value,
-        source_row: ?std.json.Value,
-        expression: types.RelationalRowsExpression,
-    ) ![]u8 {
-        return try relational_rows_impl.relationalRowsJsonBuildObjectExpressionValueJsonAlloc(alloc, row, proposed_row, source_row, expression);
-    }
-
-    fn relationalRowsEvaluateCalendarIntervalArithmeticAlloc(
-        alloc: Allocator,
-        row: std.json.Value,
-        proposed_row: ?std.json.Value,
-        source_row: ?std.json.Value,
-        expression: types.RelationalRowsExpression,
-    ) anyerror![]u8 {
-        return try relational_rows_impl.relationalRowsEvaluateCalendarIntervalArithmeticAlloc(alloc, row, proposed_row, source_row, expression);
-    }
-
-    fn relationalRowsQueryExpressionArrayContainsPredicatePasses(
-        alloc: Allocator,
-        row: std.json.Value,
-        predicate: types.RelationalRowsExpressionArrayContainsPredicate,
-    ) !bool {
-        return try relational_rows_impl.relationalRowsQueryExpressionArrayContainsPredicatePasses(alloc, row, predicate);
-    }
-
-    fn relationalRowsQueryExpressionArrayContainsPredicatePassesWithSources(
-        alloc: Allocator,
-        row: std.json.Value,
-        proposed_row: ?std.json.Value,
-        source_row: ?std.json.Value,
-        predicate: types.RelationalRowsExpressionArrayContainsPredicate,
-    ) !bool {
-        return try relational_rows_impl.relationalRowsQueryExpressionArrayContainsPredicatePassesWithSources(alloc, row, proposed_row, source_row, predicate);
-    }
-
-    fn relationalRowsExpressionConditionMatches(
-        alloc: Allocator,
-        row: std.json.Value,
-        condition: types.RelationalRowsExpressionCondition,
-    ) anyerror!bool {
-        return try relational_rows_impl.relationalRowsExpressionConditionMatches(alloc, row, condition);
-    }
-
-    fn relationalRowsExpressionConditionMatchesWithSources(
-        alloc: Allocator,
-        row: std.json.Value,
-        proposed_row: ?std.json.Value,
-        source_row: ?std.json.Value,
-        condition: types.RelationalRowsExpressionCondition,
-    ) anyerror!bool {
-        return try relational_rows_impl.relationalRowsExpressionConditionMatchesWithSources(alloc, row, proposed_row, source_row, condition);
-    }
 
     const relationalRowsMd5HexTextAlloc = relational_rows.md5HexTextAlloc;
 
     const relationalRowsScalarJsonValueTextAlloc = relational_rows.scalarJsonValueTextAlloc;
-
-    fn relationalRowsQueryOrderKeysAlloc(
-        alloc: Allocator,
-        row: std.json.Value,
-        order_by: []const types.RelationalRowsQueryOrder,
-    ) ![]RelationalRowsQueryOrderKey {
-        return try relational_rows_impl.relationalRowsQueryOrderKeysAlloc(alloc, row, order_by);
-    }
-
-    fn relationalRowsQueryOrderKeyAlloc(alloc: Allocator, row: std.json.Value, order: types.RelationalRowsQueryOrder) !RelationalRowsQueryOrderKey {
-        return try relational_rows_impl.relationalRowsQueryOrderKeyAlloc(alloc, row, order);
-    }
-
-    fn sortRelationalRowsOutputRowsAlloc(
-        alloc: Allocator,
-        rows: [][]const u8,
-        order_by: []const types.RelationalRowsQueryOrder,
-    ) !void {
-        return try relational_rows_impl.sortRelationalRowsOutputRowsAlloc(alloc, rows, order_by);
-    }
 
     const relationalRowsPhysicalPrimaryKeyFromRowJsonAlloc = relational_rows.physicalPrimaryKeyFromRowJsonAlloc;
 
@@ -4245,29 +3534,6 @@ pub const DB = struct {
         return try search_runtime_impl.resolveRelationalFilterQueryDocSetAlloc(self, alloc, runtime_schema, query, generation);
     }
 
-    fn resolveRelationalFilterQueryDocSetWithImplicationsAlloc(
-        self: *DB,
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        query: search_mod.SearchQuery,
-        implications: RelationalRowsPredicateImplications,
-        generation: ?u64,
-    ) anyerror!?doc_set.ResolvedDocSet {
-        return try search_runtime_impl.resolveRelationalFilterQueryDocSetWithImplicationsAlloc(self, alloc, runtime_schema, query, implications, generation);
-    }
-
-    fn relationalFilterGenerationCanUseCurrentRows(self: *DB, generation: ?u64) bool {
-        return search_runtime_impl.relationalFilterGenerationCanUseCurrentRows(self, generation);
-    }
-
-    fn relationalAllRowsDocSetAlloc(
-        self: *DB,
-        alloc: Allocator,
-        generation: ?u64,
-    ) !doc_set.ResolvedDocSet {
-        return try search_runtime_impl.relationalAllRowsDocSetAlloc(self, alloc, generation);
-    }
-
     const relationalArrayColumnValueContains = relational_rows.arrayColumnValueContains;
 
     const relationalArrayColumnValueContainsAll = relational_rows.arrayColumnValueContainsAll;
@@ -4275,17 +3541,6 @@ pub const DB = struct {
     const relationalArrayColumnValueEquals = relational_rows.arrayColumnValueEquals;
 
     const RelationalFilterCombineMode = relational_rows.FilterCombineMode;
-
-    fn combineRelationalFilterSetAlloc(
-        self: *DB,
-        alloc: Allocator,
-        current: *?doc_set.ResolvedDocSet,
-        child: *const doc_set.ResolvedDocSet,
-        generation: ?u64,
-        mode: RelationalFilterCombineMode,
-    ) !void {
-        return try search_runtime_impl.combineRelationalFilterSetAlloc(self, alloc, current, child, generation, mode);
-    }
 
     fn relationalColumnIndexUsableForQuery(
         self: *DB,
@@ -4310,10 +3565,6 @@ pub const DB = struct {
         return try search_runtime_impl.resolvedDocFilterForRequestNativeConstraintsAlloc(self, alloc, req);
     }
 
-    fn canUsePublishedDenseSearch(self: *DB, req: types.SearchRequest) bool {
-        return search_runtime_impl.canUsePublishedDenseSearch(self, req);
-    }
-
     pub fn lookupLiveDocOrdinalForInternalRead(
         self: *DB,
         alloc: Allocator,
@@ -4331,15 +3582,6 @@ pub const DB = struct {
             return try alloc.dupe(u8, key);
         }
         return try internal_keys.documentKeyAlloc(alloc, key);
-    }
-
-    fn loadProjectedSearchDocumentMany(
-        self: *DB,
-        alloc: Allocator,
-        req: types.SearchRequest,
-        keys: []const []const u8,
-    ) ![]?[]u8 {
-        return try search_runtime_impl.loadProjectedSearchDocumentMany(self, alloc, req, keys);
     }
 };
 
@@ -5315,7 +4557,7 @@ test "db table schema apply stages algebraic pending before durable schema swap"
         // Simulate a crash after the algebraic catalog has been marked pending
         // for schema v2, but before the runtime schema is durably swapped from
         // v1 to v2.
-        try db.stageAlgebraicSchemaConfigsPending(schema_v2);
+        try DB.schema_runtime_impl.stageAlgebraicSchemaConfigsPending(&db, schema_v2);
         const staged = db.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(@as(u32, 2), staged.index.config().schema_version);
         try std.testing.expectEqualStrings("rebuild_required", staged.index.config().capability_lifecycle_status);
@@ -5397,7 +4639,7 @@ test "db staged algebraic pending waits for first durable schema" {
         });
         try std.testing.expect(try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, db.core.store, "old_field"));
 
-        try db.stageAlgebraicSchemaConfigsPending(schema_v2);
+        try DB.schema_runtime_impl.stageAlgebraicSchemaConfigsPending(&db, schema_v2);
         const staged = db.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(@as(u32, 2), staged.index.config().schema_version);
         try std.testing.expectEqualStrings("rebuild_required", staged.index.config().capability_lifecycle_status);
@@ -8082,7 +7324,7 @@ test "db dense index stores stable vector ids with ordinal filter mappings" {
     include = .all;
     defer filter.deinit(alloc);
 
-    try std.testing.expect(!db.canUsePublishedDenseSearch(.{
+    try std.testing.expect(!DB.search_runtime_impl.canUsePublishedDenseSearch(&db, .{
         .index_name = "dv_v1",
         .limit = 1,
         .include_stored = false,

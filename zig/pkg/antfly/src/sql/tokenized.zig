@@ -2080,7 +2080,9 @@ test "sql adapter parsed sql retains generated graph nodes as DDL until graph cu
         generated: generated_parser.GeneratedSqlGraphKind,
     }{
         .{ .sql = "CREATE GRAPH INDEX docs_edge_graph ON doc_edges", .generated = .create_index },
+        .{ .sql = "CREATE GRAPH INDEX docs_edge_graph_syntax ON doc_edges EDGE (source_doc -> target_doc) TYPE edge_type WEIGHT confidence WITH (edge_policy = 'all')", .generated = .create_index },
         .{ .sql = "CREATE GRAPH METRIC docs_pagerank ON doc_edges WITH (metric = 'pagerank')", .generated = .create_metric },
+        .{ .sql = "ALTER GRAPH INDEX docs_edge_graph ADD METRIC pagerank_v1 USING pagerank WITH (damping = 0.85, max_iterations = 40)", .generated = .alter_metric },
     };
 
     for (cases) |case| {

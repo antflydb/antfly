@@ -88,6 +88,7 @@ pub const GeneratedSqlReadKind = enum {
 pub const GeneratedSqlGraphKind = enum {
     create_index,
     create_metric,
+    alter_metric,
 };
 
 pub const GeneratedSqlGraphTableFunctionKind = enum {
@@ -1145,7 +1146,9 @@ pub const antfly_extension_read_corpus = [_]GeneratedSqlCorpusCase{
 
 pub const simple_graph_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CREATE GRAPH INDEX docs_edge_graph ON doc_edges", .kind = .graph },
+    .{ .sql = "CREATE GRAPH INDEX docs_edge_graph_syntax ON doc_edges EDGE (source_doc -> target_doc) TYPE edge_type WEIGHT confidence WITH (edge_policy = 'all')", .kind = .graph },
     .{ .sql = "CREATE GRAPH METRIC docs_pagerank ON doc_edges WITH (metric = 'pagerank')", .kind = .graph },
+    .{ .sql = "ALTER GRAPH INDEX docs_edge_graph ADD METRIC pagerank_v1 USING pagerank WITH (damping = 0.85, max_iterations = 40)", .kind = .graph },
 };
 
 pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
@@ -1369,6 +1372,9 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
             if (tokens[2].matchesKeywordTag(.metric)) return .{ .graph = .create_metric };
         }
         if (second.matchesKeywordTag(.extension)) return .{ .extension_index = .create_extension };
+    }
+    if (first.matchesKeywordTag(.alter) and tokens.len > 2 and tokens[1].matchesKeywordTag(.graph) and tokens[2].matchesKeywordTag(.index)) {
+        return .{ .graph = .alter_metric };
     }
     if (first.matchesKeywordTag(.alter) and tokens.len > 1 and tokens[1].matchesKeywordTag(.table)) {
         return .{ .ddl = .alter_table };
@@ -4737,6 +4743,7 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .read = .cte }, (try parseSqlAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .create_index }, (try parseSqlAlloc(alloc, "CREATE GRAPH INDEX docs_edge_graph ON doc_edges")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .create_metric }, (try parseSqlAlloc(alloc, "CREATE GRAPH METRIC docs_pagerank ON doc_edges")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .alter_metric }, (try parseSqlAlloc(alloc, "ALTER GRAPH INDEX docs_edge_graph ADD METRIC pagerank_v1 USING pagerank")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .analyze }, (try parseSqlAlloc(alloc, "ANALYZE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .call }, (try parseSqlAlloc(alloc, "CALL refresh_usage_records()")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .checkpoint }, (try parseSqlAlloc(alloc, "CHECKPOINT")).statement);
@@ -7497,6 +7504,17 @@ test "generated SQL parser facade builds extended read AST spans" {
             try std.testing.expectEqual(GeneratedSqlGraphKind.create_metric, graph.kind);
             try std.testing.expectEqualStrings("CREATE GRAPH METRIC docs_pagerank ON doc_edges WITH (metric = 'pagerank')", spanText(graph_sql, graph.statement_span));
             try std.testing.expectEqualStrings("CREATE", spanText(graph_sql, graph.command_span));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const alter_graph_sql = "ALTER GRAPH INDEX docs_edge_graph ADD METRIC pagerank_v1 USING pagerank WITH (damping = 0.85, max_iterations = 40)";
+    const alter_graph_result = try parseSqlAlloc(alloc, alter_graph_sql);
+    switch (alter_graph_result.ast.?) {
+        .graph => |graph| {
+            try std.testing.expectEqual(GeneratedSqlGraphKind.alter_metric, graph.kind);
+            try std.testing.expectEqualStrings(alter_graph_sql, spanText(alter_graph_sql, graph.statement_span));
+            try std.testing.expectEqualStrings("ALTER", spanText(alter_graph_sql, graph.command_span));
         },
         else => return error.TestUnexpectedResult,
     }
