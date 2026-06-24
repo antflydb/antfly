@@ -3023,15 +3023,13 @@ pub fn simpleDdlPlanFromGeneratedAstAlloc(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlDdlAst,
 ) !LoweredDdlPlan {
-    const tail = generatedStatementTail(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
-    var pos: usize = 0;
     return switch (ast.kind) {
-        .create_database => .{ .database_catalog = .{ .create = try parseCreateDatabasePlanTailAlloc(alloc, tail, &pos) } },
-        .create_schema => .{ .schema_namespace_catalog = .{ .create = try parseCreateSchemaNamespacePlanTailAlloc(alloc, tail, &pos) } },
-        .create_extension => .{ .extension_catalog = .{ .create = try parseCreateExtensionPlanTailAlloc(alloc, tail, &pos, catalog_resources.default_namespace_name) } },
-        .drop_database => .{ .database_catalog = .{ .drop = try parseDropDatabasePlanTailAlloc(alloc, tail, &pos) } },
-        .drop_schema => .{ .schema_namespace_catalog = .{ .drop = try parseDropSchemaNamespacePlanTailAlloc(alloc, tail, &pos) } },
-        .drop_extension => .{ .extension_catalog = .{ .drop = try parseDropExtensionPlanTailAlloc(alloc, tail, &pos) } },
+        .create_database => .{ .database_catalog = .{ .create = try createDatabasePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
+        .create_schema => .{ .schema_namespace_catalog = .{ .create = try createSchemaNamespacePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
+        .create_extension => .{ .extension_catalog = .{ .create = try createExtensionPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, catalog_resources.default_namespace_name) } },
+        .drop_database => .{ .database_catalog = .{ .drop = try dropDatabasePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
+        .drop_schema => .{ .schema_namespace_catalog = .{ .drop = try dropSchemaNamespacePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
+        .drop_extension => .{ .extension_catalog = .{ .drop = try dropExtensionPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
         else => error.UnsupportedSqlShape,
     };
 }
