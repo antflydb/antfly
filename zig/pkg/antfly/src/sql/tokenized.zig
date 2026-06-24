@@ -1184,10 +1184,15 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                     try std.testing.expect(read_ast.cte_name_tokens != null);
                     try std.testing.expect(read_ast.cte_body_tokens != null);
                     try std.testing.expect(read_ast.cte_count > 0);
+                    try std.testing.expectEqual(read_ast.cte_count, read_ast.cte_items.len);
+                    try std.testing.expectEqual(read_ast.cte_name_tokens.?, read_ast.cte_items[0].name_tokens);
+                    try std.testing.expectEqual(read_ast.cte_body_tokens.?, read_ast.cte_items[0].body_tokens.?);
                     if (std.mem.indexOf(u8, case.sql, " second_rows ")) |_| {
                         try std.testing.expectEqual(@as(usize, 2), read_ast.cte_count);
                         try std.testing.expect(read_ast.cte_last_name_tokens != null);
                         try std.testing.expect(read_ast.cte_last_body_tokens != null);
+                        try std.testing.expectEqual(read_ast.cte_last_name_tokens.?, read_ast.cte_items[1].name_tokens);
+                        try std.testing.expectEqual(read_ast.cte_last_body_tokens.?, read_ast.cte_items[1].body_tokens.?);
                     }
                     if (std.mem.indexOf(u8, case.sql, "WITH RECURSIVE")) |_| {
                         try std.testing.expect(read_ast.cte_recursive);

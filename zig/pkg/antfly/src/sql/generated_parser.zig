@@ -195,6 +195,11 @@ pub const GeneratedSqlJoinKind = enum {
     full,
 };
 
+pub const GeneratedSqlCteAst = struct {
+    name_tokens: GeneratedSqlTokenRange,
+    body_tokens: ?GeneratedSqlTokenRange = null,
+};
+
 pub const GeneratedSqlSessionAst = struct {
     kind: GeneratedSqlSessionKind,
     statement_span: token_mod.SourceSpan,
@@ -260,6 +265,7 @@ pub const GeneratedSqlReadAst = struct {
     cte_body_tokens: ?GeneratedSqlTokenRange = null,
     cte_last_name_tokens: ?GeneratedSqlTokenRange = null,
     cte_last_body_tokens: ?GeneratedSqlTokenRange = null,
+    cte_items: []GeneratedSqlCteAst = &.{},
     cte_count: usize = 0,
     cte_recursive: bool = false,
     distinct_tokens: ?GeneratedSqlTokenRange = null,
@@ -298,6 +304,7 @@ pub const GeneratedSqlReadAst = struct {
     set_operation_tokens: ?GeneratedSqlTokenRange = null,
 
     pub fn deinit(self: *GeneratedSqlReadAst, alloc: std.mem.Allocator) void {
+        if (self.cte_items.len > 0) alloc.free(self.cte_items);
         self.projection_items.deinit(alloc);
         self.projection_first_expression.deinit(alloc);
         self.projection_last_expression.deinit(alloc);
@@ -921,7 +928,7 @@ fn buildReadAst(
     const select_index = findTopLevelKeyword(tokens, 0, end, .select) orelse return ast;
     if (select_index > 0 and tokens[0].matchesKeywordTag(.with)) {
         ast.cte_tokens = .{ .start = 1, .end = select_index };
-        buildReadCteAst(tokens, select_index, &ast);
+        try buildReadCteAst(alloc, tokens, select_index, &ast);
     }
 
     const body_end = firstTopLevelSetOperation(tokens, select_index + 1, end) orelse end;
@@ -1082,7 +1089,7 @@ fn generatedReadProjectionStart(
     return distinct_index + 1;
 }
 
-fn buildReadCteAst(tokens: []const token_mod.Token, final_select_index: usize, ast: *GeneratedSqlReadAst) void {
+fn buildReadCteAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, final_select_index: usize, ast: *GeneratedSqlReadAst) !void {
     if (final_select_index < 5 or !tokens[0].matchesKeywordTag(.with)) return;
     var index: usize = 1;
     if (index < final_select_index and tokens[index].matchesKeywordTag(.recursive)) {
@@ -1092,6 +1099,9 @@ fn buildReadCteAst(tokens: []const token_mod.Token, final_select_index: usize, a
     if (index >= final_select_index) return;
     ast.cte_list_tokens = .{ .start = index, .end = final_select_index };
 
+    var items: std.ArrayListUnmanaged(GeneratedSqlCteAst) = .empty;
+    var items_owned = false;
+    defer if (!items_owned) items.deinit(alloc);
     var count: usize = 0;
     while (index < final_select_index) {
         if (tokens[index].kind != .identifier) return;
@@ -1106,6 +1116,10 @@ fn buildReadCteAst(tokens: []const token_mod.Token, final_select_index: usize, a
         else
             null;
 
+        try items.append(alloc, .{
+            .name_tokens = name_tokens,
+            .body_tokens = body_tokens,
+        });
         count += 1;
         if (count == 1) {
             ast.cte_name_tokens = name_tokens;
@@ -1119,6 +1133,8 @@ fn buildReadCteAst(tokens: []const token_mod.Token, final_select_index: usize, a
         if (tokens[index].kind != .comma) return;
         index += 1;
     }
+    ast.cte_items = try items.toOwnedSlice(alloc);
+    items_owned = true;
     ast.cte_count = count;
 }
 
@@ -2673,6 +2689,9 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.cte_last_name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 8 }, read.cte_last_body_tokens.?);
             try std.testing.expectEqual(@as(usize, 1), read.cte_count);
+            try std.testing.expectEqual(@as(usize, 1), read.cte_items.len);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.cte_items[0].name_tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 8 }, read.cte_items[0].body_tokens.?);
             try std.testing.expect(!read.cte_recursive);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.projection_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read.source_tokens.?);
@@ -2692,6 +2711,11 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.cte_last_name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 17 }, read.cte_last_body_tokens.?);
             try std.testing.expectEqual(@as(usize, 2), read.cte_count);
+            try std.testing.expectEqual(@as(usize, 2), read.cte_items.len);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.cte_items[0].name_tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 8 }, read.cte_items[0].body_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.cte_items[1].name_tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 17 }, read.cte_items[1].body_tokens.?);
             try std.testing.expect(!read.cte_recursive);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 19, .end = 20 }, read.projection_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 21, .end = 22 }, read.source_tokens.?);
@@ -2711,6 +2735,9 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, read.cte_last_name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 9 }, read.cte_last_body_tokens.?);
             try std.testing.expectEqual(@as(usize, 1), read.cte_count);
+            try std.testing.expectEqual(@as(usize, 1), read.cte_items.len);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, read.cte_items[0].name_tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 9 }, read.cte_items[0].body_tokens.?);
             try std.testing.expect(read.cte_recursive);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 12 }, read.projection_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 14 }, read.source_tokens.?);

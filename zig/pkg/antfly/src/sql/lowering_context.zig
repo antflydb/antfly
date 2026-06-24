@@ -290,6 +290,10 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: gen
     for (ranges) |range| {
         if (range) |value| try validateGeneratedReadTokenRange(tokens, read_ast, value);
     }
+    for (read_ast.cte_items) |cte| {
+        try validateGeneratedReadTokenRange(tokens, read_ast, cte.name_tokens);
+        if (cte.body_tokens) |body_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_tokens);
+    }
 
     switch (read_ast.kind) {
         .query => {

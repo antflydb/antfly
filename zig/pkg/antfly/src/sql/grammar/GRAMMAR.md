@@ -129,10 +129,11 @@ generated set-operation reads now classify as a distinct read family and
 validate the left query and set-operation tail before calling the set-operation
 lowerer directly;
 single- and multi-CTE reads now expose generated CTE-list, first-CTE, and
-last-CTE name/body ranges, recursive CTE reads carry an explicit generated
-recursive flag, and simple non-recursive CTE reads dispatch directly when those
-ranges validate; generated pagination grammar now covers `LIMIT`, `OFFSET`,
-and `FETCH FIRST`/`FETCH NEXT` query tails with count expression metadata.
+last-CTE name/body ranges plus owned per-CTE name/body item arrays, recursive
+CTE reads carry an explicit generated recursive flag, and simple non-recursive
+CTE reads dispatch directly when those ranges validate; generated pagination
+grammar now covers `LIMIT`, `OFFSET`, and `FETCH FIRST`/`FETCH NEXT` query
+tails with count expression metadata.
 Unsupported read shapes
 still fall back, and deeper read cutover still requires full generated
 query-body AST payloads for expression-level projections and predicates,
@@ -287,9 +288,10 @@ Suggested migration order:
    Set-operation reads now classify as their own generated read family and
    dispatch to the native set-operation lowerer after validating the generated
    left-query and set-operation-tail ranges. Single- and multi-CTE reads now
-   carry generated CTE-list, first-CTE, and last-CTE name/body ranges; recursive
-   CTE reads carry an explicit recursive flag; and simple non-recursive CTE
-   reads dispatch to the typed read lowerer after validating those ranges.
+   carry generated CTE-list, first-CTE, last-CTE, and owned per-CTE name/body
+   ranges; recursive CTE reads carry an explicit recursive flag; and simple
+   non-recursive CTE reads dispatch to the typed read lowerer after validating
+   those ranges.
    Generated pagination coverage now accepts and ranges `LIMIT`, `OFFSET`, and
    `FETCH FIRST`/`FETCH NEXT` tails with generated expression metadata for
    `LIMIT`, `OFFSET`, and explicit fetch counts.
@@ -300,8 +302,7 @@ Suggested migration order:
    query-body ASTs beyond the current first-join operator/type metadata, full pagination AST/lowering coverage, full expression AST
    nodes beyond list-level and simple-comparison/operator metadata, broader function
    coverage, broader boolean expression-tree coverage, quantified subquery and
-   array predicate coverage, per-CTE generated body arrays, recursive CTE
-   planning, direct generated read-plan lowering, and
+   array predicate coverage, recursive CTE planning, direct generated read-plan lowering, and
    unsupported-shape diagnostics.
 5. Advanced DML: `INSERT ... SELECT`, `UPDATE ... FROM`, `DELETE ... USING`,
    `TRUNCATE`, and `MERGE`.
