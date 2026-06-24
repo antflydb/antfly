@@ -259,11 +259,15 @@ pub const GeneratedSqlReadAst = struct {
     where_expression: GeneratedSqlExpressionAst = .{},
     group_tokens: ?GeneratedSqlTokenRange = null,
     group_items: GeneratedSqlListAst = .{},
+    group_first_expression: GeneratedSqlExpressionAst = .{},
+    group_last_expression: GeneratedSqlExpressionAst = .{},
     having_tokens: ?GeneratedSqlTokenRange = null,
     having_expression: GeneratedSqlExpressionAst = .{},
     window_tokens: ?GeneratedSqlTokenRange = null,
     order_tokens: ?GeneratedSqlTokenRange = null,
     order_items: GeneratedSqlListAst = .{},
+    order_first_expression: GeneratedSqlExpressionAst = .{},
+    order_last_expression: GeneratedSqlExpressionAst = .{},
     limit_tokens: ?GeneratedSqlTokenRange = null,
     offset_tokens: ?GeneratedSqlTokenRange = null,
     fetch_tokens: ?GeneratedSqlTokenRange = null,
@@ -911,6 +915,12 @@ fn buildReadAst(
             const group_tokens = GeneratedSqlTokenRange{ .start = group_start, .end = group_end };
             ast.group_tokens = group_tokens;
             ast.group_items = buildTopLevelListAst(tokens, group_tokens);
+            if (ast.group_items.first_tokens) |first_tokens| {
+                ast.group_first_expression = buildGeneratedExpressionAst(tokens, first_tokens);
+            }
+            if (ast.group_items.last_tokens) |last_tokens| {
+                ast.group_last_expression = buildGeneratedExpressionAst(tokens, last_tokens);
+            }
         }
     }
     if (having_index) |idx| {
@@ -932,6 +942,12 @@ fn buildReadAst(
             const order_tokens = GeneratedSqlTokenRange{ .start = order_start, .end = order_end };
             ast.order_tokens = order_tokens;
             ast.order_items = buildTopLevelListAst(tokens, order_tokens);
+            if (ast.order_items.first_tokens) |first_tokens| {
+                ast.order_first_expression = buildGeneratedExpressionAst(tokens, first_tokens);
+            }
+            if (ast.order_items.last_tokens) |last_tokens| {
+                ast.order_last_expression = buildGeneratedExpressionAst(tokens, last_tokens);
+            }
         }
     }
     if (limit_index) |idx| {
@@ -2264,6 +2280,10 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 14 }, read.order_items.first_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 15, .end = 16 }, read.order_items.last_tokens.?);
             try std.testing.expectEqual(@as(usize, 2), read.order_items.count);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.order_first_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 14 }, read.order_first_expression.tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.order_last_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 15, .end = 16 }, read.order_last_expression.tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -2279,6 +2299,10 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.group_items.first_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.group_items.last_tokens.?);
             try std.testing.expectEqual(@as(usize, 1), read.group_items.count);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.group_first_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.group_first_expression.tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.group_last_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.group_last_expression.tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 11 }, read.having_tokens.?);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.having_expression.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.having_expression.left_tokens.?);
