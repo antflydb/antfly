@@ -143,8 +143,9 @@ plain `DISTINCT` and `DISTINCT ON (...)` reads now carry generated distinct
 ranges, `DISTINCT ON` expression-list AST items, and match the production
 aggregate/query-family split;
 generated set-operation reads now classify as a distinct read family and
-validate the left query and set-operation tail before calling the set-operation
-lowerer directly;
+validate the left query plus generated set-operation operator, `UNION ALL`,
+right-query projection/source, and right-predicate payloads before calling the
+set-operation lowerer directly;
 single- and multi-CTE reads now expose generated CTE-list, first-CTE, and
 last-CTE name/body ranges plus owned per-CTE name/body item arrays, optional
 column-alias lists, and `MATERIALIZED` / `NOT MATERIALIZED` hint metadata;
@@ -374,16 +375,18 @@ Suggested migration order:
    reads, and preserve the production aggregate/query-family split.
    Set-operation reads now classify as their own generated read family and
    dispatch to the native set-operation lowerer after validating the generated
-   left-query and set-operation-tail ranges. Single- and multi-CTE reads now
+   left-query, operator, `UNION ALL`, right-query projection/source, and
+   right-predicate payload ranges. Single- and multi-CTE reads now
    carry generated CTE-list, first-CTE, last-CTE, owned per-CTE name/body
    ranges, optional column-alias lists, and `MATERIALIZED` / `NOT MATERIALIZED`
    hint metadata; generated CTE reads reject malformed CTE-list counts,
    first/last compatibility fields, column-alias list payloads,
    materialization hint payloads, and parenthesized body spans; each generated
    CTE item now carries body read-kind and first-query clause-span metadata,
-   including set-operation tails, plus owned body projection/group/order list
-   payloads, body predicate expression payloads, generated body join-tree
-   metadata with first-join compatibility fields, and body pagination
+   including set-operation tails with generated operator and right-query
+   payloads, plus owned body projection/group/order list payloads, body
+   predicate expression payloads, generated body join-tree metadata with
+   first-join compatibility fields, and body pagination
    expression payloads for `LIMIT`, `OFFSET`, and `FETCH`; generated CTE
    lowering validates those body payloads. Recursive CTE reads carry an
    explicit recursive flag; and simple non-recursive CTE reads dispatch to the
