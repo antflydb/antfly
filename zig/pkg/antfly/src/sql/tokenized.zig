@@ -810,6 +810,41 @@ test "sql adapter parsed sql owns typed statement variants" {
         else => return error.TestUnexpectedResult,
     }
 
+    const unsupported_diagnostics = [_]struct {
+        sql: []const u8,
+        kind: generated_parser.GeneratedSqlUnsupportedKind,
+        reason: generated_parser.GeneratedSqlUnsupportedReason,
+    }{
+        .{
+            .sql = "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)",
+            .kind = .copy,
+            .reason = .copy_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "VACUUM (FULL, VERBOSE, ANALYZE) public.usage_records",
+            .kind = .vacuum,
+            .reason = .vacuum_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "REINDEX INDEX CONCURRENTLY public.usage_status_idx",
+            .kind = .reindex,
+            .reason = .reindex_not_planned_by_generated_parser,
+        },
+    };
+    for (unsupported_diagnostics) |case| {
+        var parsed = try ParsedSql.initAlloc(alloc, case.sql);
+        defer parsed.deinit(alloc);
+        try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.unsupported, parsed.generatedStatementKind().?);
+        switch (parsed.generated_statement.?.ast.?) {
+            .unsupported => |unsupported| {
+                try std.testing.expectEqual(case.kind, unsupported.kind);
+                try std.testing.expectEqual(case.reason, unsupported.reason);
+                try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = parsed.items().len }, unsupported.subject_tokens.?);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
     var session = try ParsedSql.initAlloc(alloc, "SET search_path TO public");
     defer session.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.session, session.generatedStatementKind().?);

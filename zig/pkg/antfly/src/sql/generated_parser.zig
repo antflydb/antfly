@@ -91,12 +91,18 @@ pub const GeneratedSqlGraphKind = enum {
 
 pub const GeneratedSqlUnsupportedKind = enum {
     analyze,
+    copy,
     explain,
+    reindex,
+    vacuum,
 };
 
 pub const GeneratedSqlUnsupportedReason = enum {
     analyze_not_planned_by_generated_parser,
+    copy_not_planned_by_generated_parser,
     explain_not_planned_by_generated_parser,
+    reindex_not_planned_by_generated_parser,
+    vacuum_not_planned_by_generated_parser,
 };
 
 pub const GeneratedSqlStatement = union(GeneratedSqlStatementKind) {
@@ -877,11 +883,14 @@ pub const simple_graph_corpus = [_]GeneratedSqlCorpusCase{
 
 pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "ANALYZE", .kind = .unsupported },
+    .{ .sql = "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)", .kind = .unsupported },
     .{ .sql = "EXPLAIN", .kind = .unsupported },
     .{ .sql = "EXPLAIN SELECT id FROM usage_records", .kind = .unsupported },
     .{ .sql = "EXPLAIN ANALYZE INSERT INTO usage_records (id) VALUES ('u1')", .kind = .unsupported },
     .{ .sql = "EXPLAIN (FORMAT JSON, VERBOSE, COSTS OFF, ANALYZE ON, BUFFERS, TIMING OFF, SUMMARY OFF, SETTINGS ON, WAL) SELECT id FROM usage_records", .kind = .unsupported },
     .{ .sql = "EXPLAIN (FORMAT YAML) SELECT 1", .kind = .unsupported },
+    .{ .sql = "VACUUM (FULL, VERBOSE, ANALYZE) public.usage_records", .kind = .unsupported },
+    .{ .sql = "REINDEX INDEX CONCURRENTLY public.usage_status_idx", .kind = .unsupported },
 };
 
 pub fn parseSqlAlloc(alloc: std.mem.Allocator, sql: []const u8) !GeneratedSqlParseResult {
@@ -1099,7 +1108,10 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         return .{ .read = classifyReadKind(tokens) };
     }
     if (first.matchesKeywordTag(.analyze)) return .{ .unsupported = .analyze };
+    if (first.matchesKeywordTag(.copy)) return .{ .unsupported = .copy };
     if (first.matchesKeywordTag(.explain)) return .{ .unsupported = .explain };
+    if (first.matchesKeywordTag(.reindex)) return .{ .unsupported = .reindex };
+    if (first.matchesKeywordTag(.vacuum)) return .{ .unsupported = .vacuum };
     return .other;
 }
 
@@ -1136,7 +1148,10 @@ fn buildUnsupportedAst(
         .kind = kind,
         .reason = switch (kind) {
             .analyze => .analyze_not_planned_by_generated_parser,
+            .copy => .copy_not_planned_by_generated_parser,
             .explain => .explain_not_planned_by_generated_parser,
+            .reindex => .reindex_not_planned_by_generated_parser,
+            .vacuum => .vacuum_not_planned_by_generated_parser,
         },
         .statement_span = statement_span,
         .command_span = command_span,
@@ -1145,6 +1160,8 @@ fn buildUnsupportedAst(
         if (generatedExplainSubjectStart(tokens, end)) |subject_start| {
             ast.subject_tokens = .{ .start = subject_start, .end = end };
         }
+    } else if (end > 1) {
+        ast.subject_tokens = .{ .start = 1, .end = end };
     }
     return ast;
 }
@@ -3541,7 +3558,10 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .create_index }, (try parseSqlAlloc(alloc, "CREATE GRAPH INDEX docs_edge_graph ON doc_edges")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .create_metric }, (try parseSqlAlloc(alloc, "CREATE GRAPH METRIC docs_pagerank ON doc_edges")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .analyze }, (try parseSqlAlloc(alloc, "ANALYZE")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .copy }, (try parseSqlAlloc(alloc, "COPY usage_records FROM STDIN")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .explain }, (try parseSqlAlloc(alloc, "EXPLAIN SELECT id FROM usage_records")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .vacuum }, (try parseSqlAlloc(alloc, "VACUUM FULL usage_records")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .reindex }, (try parseSqlAlloc(alloc, "REINDEX INDEX usage_records_status_idx")).statement);
 }
 
 test "generated SQL parser facade builds control AST spans" {
@@ -5898,6 +5918,42 @@ test "generated SQL parser facade builds extended read AST spans" {
             try std.testing.expectEqualStrings("ANALYZE", spanText(analyze_sql, unsupported.statement_span));
             try std.testing.expectEqualStrings("ANALYZE", spanText(analyze_sql, unsupported.command_span));
             try std.testing.expect(unsupported.subject_tokens == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const copy_sql = "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)";
+    const copy_result = try parseSqlAlloc(alloc, copy_sql);
+    switch (copy_result.ast.?) {
+        .unsupported => |unsupported| {
+            try std.testing.expectEqual(GeneratedSqlUnsupportedKind.copy, unsupported.kind);
+            try std.testing.expectEqual(GeneratedSqlUnsupportedReason.copy_not_planned_by_generated_parser, unsupported.reason);
+            try std.testing.expectEqualStrings("COPY", spanText(copy_sql, unsupported.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 14 }, unsupported.subject_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const vacuum_sql = "VACUUM (FULL, VERBOSE, ANALYZE) public.usage_records";
+    const vacuum_result = try parseSqlAlloc(alloc, vacuum_sql);
+    switch (vacuum_result.ast.?) {
+        .unsupported => |unsupported| {
+            try std.testing.expectEqual(GeneratedSqlUnsupportedKind.vacuum, unsupported.kind);
+            try std.testing.expectEqual(GeneratedSqlUnsupportedReason.vacuum_not_planned_by_generated_parser, unsupported.reason);
+            try std.testing.expectEqualStrings("VACUUM", spanText(vacuum_sql, unsupported.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 9 }, unsupported.subject_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const reindex_sql = "REINDEX INDEX CONCURRENTLY public.usage_status_idx";
+    const reindex_result = try parseSqlAlloc(alloc, reindex_sql);
+    switch (reindex_result.ast.?) {
+        .unsupported => |unsupported| {
+            try std.testing.expectEqual(GeneratedSqlUnsupportedKind.reindex, unsupported.kind);
+            try std.testing.expectEqual(GeneratedSqlUnsupportedReason.reindex_not_planned_by_generated_parser, unsupported.reason);
+            try std.testing.expectEqualStrings("REINDEX", spanText(reindex_sql, unsupported.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 4 }, unsupported.subject_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
