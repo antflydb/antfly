@@ -2045,6 +2045,15 @@ fn validateGeneratedExistsSubqueryExpressionAstStructure(
         return error.UnsupportedSqlShape;
     }
     try requireGeneratedExpressionAstChild(.subquery, expression.right_tokens, expression.right_expression);
+
+    var payload = expression;
+    payload.tokens = null;
+    payload.operator_tokens = null;
+    payload.right_tokens = null;
+    payload.right_expression_kind = null;
+    payload.right_expression = null;
+    if (require_negation) payload.negation_tokens = null;
+    try validateGeneratedExpressionAstHasNoUnexpectedPayload(payload);
 }
 
 fn validateGeneratedPrefixExpressionAstStructure(expression: generated_parser.GeneratedSqlExpressionAst) !void {
@@ -2055,6 +2064,33 @@ fn validateGeneratedPrefixExpressionAstStructure(expression: generated_parser.Ge
         return error.UnsupportedSqlShape;
     }
     try requireGeneratedExpressionAstChild(expression.right_expression_kind, expression.right_tokens, expression.right_expression);
+
+    var payload = expression;
+    payload.tokens = null;
+    payload.operator_tokens = null;
+    payload.right_tokens = null;
+    payload.right_expression_kind = null;
+    payload.right_expression = null;
+    try validateGeneratedExpressionAstHasNoUnexpectedPayload(payload);
+}
+
+fn validateGeneratedIsExpressionAstStructure(expression: generated_parser.GeneratedSqlExpressionAst) !void {
+    if (expression.tokens == null or expression.left_tokens == null or expression.operator_tokens == null) {
+        return error.UnsupportedSqlShape;
+    }
+    try requireGeneratedExpressionAstChild(expression.left_expression_kind, expression.left_tokens, expression.left_expression);
+    try validateGeneratedExpressionAstOptionalChild(expression.right_expression_kind, expression.right_tokens, expression.right_expression);
+
+    var payload = expression;
+    payload.tokens = null;
+    payload.left_tokens = null;
+    payload.left_expression_kind = null;
+    payload.left_expression = null;
+    payload.operator_tokens = null;
+    payload.right_tokens = null;
+    payload.right_expression_kind = null;
+    payload.right_expression = null;
+    try validateGeneratedExpressionAstHasNoUnexpectedPayload(payload);
 }
 
 fn validateGeneratedFunctionOverMetadata(expression: generated_parser.GeneratedSqlExpressionAst) !void {
@@ -2418,13 +2454,7 @@ fn validateGeneratedExpressionAstStructure(expression: generated_parser.Generate
         .is_not_true,
         .is_not_false,
         .is_not_unknown,
-        => {
-            if (expression.tokens == null or expression.left_tokens == null or expression.operator_tokens == null) {
-                return error.UnsupportedSqlShape;
-            }
-            try requireGeneratedExpressionAstChild(expression.left_expression_kind, expression.left_tokens, expression.left_expression);
-            try validateGeneratedExpressionAstOptionalChild(expression.right_expression_kind, expression.right_tokens, expression.right_expression);
-        },
+        => try validateGeneratedIsExpressionAstStructure(expression),
         .not_like,
         .not_ilike,
         .not_in_list,
@@ -4209,6 +4239,16 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_is_true_expression_parsed_sql, malformed_is_true_expression_read_ast),
     );
+    malformed_is_true_expression_read_ast = switch (malformed_is_true_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_is_true_expression_read_ast.where_expression.function_name_tokens =
+        malformed_is_true_expression_read_ast.where_expression.left_tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_is_true_expression_parsed_sql, malformed_is_true_expression_read_ast),
+    );
 
     var malformed_is_not_false_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -4356,6 +4396,16 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_unary_expression_parsed_sql, malformed_unary_expression_read_ast),
     );
+    malformed_unary_expression_read_ast = switch (malformed_unary_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_unary_expression_read_ast.projection_items.expressions[0].function_name_tokens =
+        malformed_unary_expression_read_ast.projection_items.expressions[0].right_tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_unary_expression_parsed_sql, malformed_unary_expression_read_ast),
+    );
 
     var malformed_between_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -4384,6 +4434,16 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         else => return error.UnsupportedSqlShape,
     };
     malformed_exists_subquery_read_ast.where_expression.right_expression_kind = .token_range;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_exists_subquery_parsed_sql, malformed_exists_subquery_read_ast),
+    );
+    malformed_exists_subquery_read_ast = switch (malformed_exists_subquery_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_exists_subquery_read_ast.where_expression.filter_tokens =
+        malformed_exists_subquery_read_ast.where_expression.right_tokens;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_exists_subquery_parsed_sql, malformed_exists_subquery_read_ast),
