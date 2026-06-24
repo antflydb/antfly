@@ -30130,7 +30130,7 @@ pub const DB = struct {
         resolved_doc_filter: ?*doc_set.ResolvedDocFilter = null,
         resolved_doc_filter_alloc: ?Allocator = null,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             if (self.index) |index| {
                 index.freeDocIds(self.filter_doc_ids);
                 index.freeDocIds(self.exclude_doc_ids);
