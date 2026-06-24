@@ -194,7 +194,8 @@ facade now returns closed statement-family nodes for the covered families and
 explicit unsupported statement nodes for seed `ANALYZE`, bulk I/O `COPY`,
 maintenance `VACUUM`/`REINDEX`, utility/control statements such as `CLUSTER`,
 `COMMENT`, `GRANT`/`REVOKE`, `LISTEN`/`NOTIFY`, and `LOCK`, plus simple
-`EXPLAIN` forms with stable reason metadata; full production AST construction
+cursor and transaction-control statements such as `CLOSE`, `FETCH`, `MOVE`,
+`SAVEPOINT`, and `RELEASE`, plus simple `EXPLAIN` forms with stable reason metadata; full production AST construction
 remains the next migration boundary for larger DDL, query, DML, and Antfly
 extension families.
 
@@ -566,7 +567,8 @@ variants for:
   graph-specific AST-to-plan wrappers for seed graph index and graph metric DDL
 - unsupported statement, including generated AST payloads for seed `ANALYZE`,
   `COPY`, `VACUUM`, `REINDEX`, `CLUSTER`, `COMMENT`, `GRANT`, `REVOKE`,
-  `LISTEN`, `NOTIFY`, and `LOCK`, plus bare, simple, optioned, and
+  `LISTEN`, `NOTIFY`, `LOCK`, `CLOSE`, `FETCH`, `MOVE`, `SAVEPOINT`, and
+  `RELEASE`, plus bare, simple, optioned, and
   `EXPLAIN ANALYZE` forms with command spans, subject ranges where present,
   and stable unsupported reason metadata
 
@@ -598,7 +600,8 @@ Generated grammar work needs evidence at multiple levels:
 - Corpus tests for intentionally unsupported PostgreSQL syntax with stable
   diagnostics. Seed `ANALYZE`, bulk I/O `COPY`, maintenance `VACUUM`/`REINDEX`,
   utility/control statements such as `CLUSTER`, `COMMENT`, `GRANT`/`REVOKE`,
-  `LISTEN`/`NOTIFY`, and `LOCK`, and bare, simple, optioned, and
+  `LISTEN`/`NOTIFY`, `LOCK`, cursor commands `CLOSE`/`FETCH`/`MOVE`, and
+  transaction-control commands `SAVEPOINT`/`RELEASE`, and bare, simple, optioned, and
   `EXPLAIN ANALYZE` forms now produce generated unsupported AST nodes with
   stable reason metadata and subject ranges where available.
 - AST shape tests for source spans, identifier normalization, literals,

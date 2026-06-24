@@ -99,31 +99,41 @@ pub const GeneratedSqlExtensionIndexKind = enum {
 
 pub const GeneratedSqlUnsupportedKind = enum {
     analyze,
+    close,
     cluster,
     comment,
     copy,
     explain,
+    fetch,
     grant,
     listen,
     lock,
+    move,
     notify,
     reindex,
+    release,
     revoke,
+    savepoint,
     vacuum,
 };
 
 pub const GeneratedSqlUnsupportedReason = enum {
     analyze_not_planned_by_generated_parser,
+    close_not_planned_by_generated_parser,
     cluster_not_planned_by_generated_parser,
     comment_not_planned_by_generated_parser,
     copy_not_planned_by_generated_parser,
     explain_not_planned_by_generated_parser,
+    fetch_not_planned_by_generated_parser,
     grant_not_planned_by_generated_parser,
     listen_not_planned_by_generated_parser,
     lock_not_planned_by_generated_parser,
+    move_not_planned_by_generated_parser,
     notify_not_planned_by_generated_parser,
     reindex_not_planned_by_generated_parser,
+    release_not_planned_by_generated_parser,
     revoke_not_planned_by_generated_parser,
+    savepoint_not_planned_by_generated_parser,
     vacuum_not_planned_by_generated_parser,
 };
 
@@ -917,6 +927,7 @@ pub const simple_graph_corpus = [_]GeneratedSqlCorpusCase{
 
 pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "ANALYZE", .kind = .unsupported },
+    .{ .sql = "CLOSE usage_cursor", .kind = .unsupported },
     .{ .sql = "CLUSTER usage_records USING usage_status_idx", .kind = .unsupported },
     .{ .sql = "COMMENT ON TABLE usage_records IS 'billing rows'", .kind = .unsupported },
     .{ .sql = "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)", .kind = .unsupported },
@@ -925,13 +936,17 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "EXPLAIN ANALYZE INSERT INTO usage_records (id) VALUES ('u1')", .kind = .unsupported },
     .{ .sql = "EXPLAIN (FORMAT JSON, VERBOSE, COSTS OFF, ANALYZE ON, BUFFERS, TIMING OFF, SUMMARY OFF, SETTINGS ON, WAL) SELECT id FROM usage_records", .kind = .unsupported },
     .{ .sql = "EXPLAIN (FORMAT YAML) SELECT 1", .kind = .unsupported },
+    .{ .sql = "FETCH FROM usage_cursor", .kind = .unsupported },
     .{ .sql = "GRANT SELECT ON TABLE usage_records TO readonly", .kind = .unsupported },
     .{ .sql = "LISTEN usage_events", .kind = .unsupported },
     .{ .sql = "LOCK TABLE usage_records IN SHARE MODE", .kind = .unsupported },
+    .{ .sql = "MOVE FROM usage_cursor", .kind = .unsupported },
     .{ .sql = "NOTIFY usage_events, 'changed'", .kind = .unsupported },
     .{ .sql = "VACUUM (FULL, VERBOSE, ANALYZE) public.usage_records", .kind = .unsupported },
     .{ .sql = "REINDEX INDEX CONCURRENTLY public.usage_status_idx", .kind = .unsupported },
+    .{ .sql = "RELEASE SAVEPOINT usage_batch", .kind = .unsupported },
     .{ .sql = "REVOKE SELECT ON TABLE usage_records FROM readonly", .kind = .unsupported },
+    .{ .sql = "SAVEPOINT usage_batch", .kind = .unsupported },
 };
 
 pub fn parseSqlAlloc(alloc: std.mem.Allocator, sql: []const u8) !GeneratedSqlParseResult {
@@ -1150,16 +1165,21 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         return .{ .read = classifyReadKind(tokens) };
     }
     if (first.matchesKeywordTag(.analyze)) return .{ .unsupported = .analyze };
+    if (first.matchesKeywordTag(.close)) return .{ .unsupported = .close };
     if (first.matchesKeywordTag(.cluster)) return .{ .unsupported = .cluster };
     if (first.matchesKeywordTag(.comment)) return .{ .unsupported = .comment };
     if (first.matchesKeywordTag(.copy)) return .{ .unsupported = .copy };
     if (first.matchesKeywordTag(.explain)) return .{ .unsupported = .explain };
+    if (first.matchesKeywordTag(.fetch)) return .{ .unsupported = .fetch };
     if (first.matchesKeywordTag(.grant)) return .{ .unsupported = .grant };
     if (first.matchesKeywordTag(.listen)) return .{ .unsupported = .listen };
     if (first.matchesKeywordTag(.lock)) return .{ .unsupported = .lock };
+    if (first.matchesKeywordTag(.move)) return .{ .unsupported = .move };
     if (first.matchesKeywordTag(.notify)) return .{ .unsupported = .notify };
     if (first.matchesKeywordTag(.reindex)) return .{ .unsupported = .reindex };
+    if (first.matchesKeywordTag(.release)) return .{ .unsupported = .release };
     if (first.matchesKeywordTag(.revoke)) return .{ .unsupported = .revoke };
+    if (first.matchesKeywordTag(.savepoint)) return .{ .unsupported = .savepoint };
     if (first.matchesKeywordTag(.vacuum)) return .{ .unsupported = .vacuum };
     return .other;
 }
@@ -1197,16 +1217,21 @@ fn buildUnsupportedAst(
         .kind = kind,
         .reason = switch (kind) {
             .analyze => .analyze_not_planned_by_generated_parser,
+            .close => .close_not_planned_by_generated_parser,
             .cluster => .cluster_not_planned_by_generated_parser,
             .comment => .comment_not_planned_by_generated_parser,
             .copy => .copy_not_planned_by_generated_parser,
             .explain => .explain_not_planned_by_generated_parser,
+            .fetch => .fetch_not_planned_by_generated_parser,
             .grant => .grant_not_planned_by_generated_parser,
             .listen => .listen_not_planned_by_generated_parser,
             .lock => .lock_not_planned_by_generated_parser,
+            .move => .move_not_planned_by_generated_parser,
             .notify => .notify_not_planned_by_generated_parser,
             .reindex => .reindex_not_planned_by_generated_parser,
+            .release => .release_not_planned_by_generated_parser,
             .revoke => .revoke_not_planned_by_generated_parser,
+            .savepoint => .savepoint_not_planned_by_generated_parser,
             .vacuum => .vacuum_not_planned_by_generated_parser,
         },
         .statement_span = statement_span,
@@ -3684,17 +3709,22 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .create_index }, (try parseSqlAlloc(alloc, "CREATE GRAPH INDEX docs_edge_graph ON doc_edges")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .create_metric }, (try parseSqlAlloc(alloc, "CREATE GRAPH METRIC docs_pagerank ON doc_edges")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .analyze }, (try parseSqlAlloc(alloc, "ANALYZE")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .close }, (try parseSqlAlloc(alloc, "CLOSE usage_cursor")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .cluster }, (try parseSqlAlloc(alloc, "CLUSTER usage_records USING usage_status_idx")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .comment }, (try parseSqlAlloc(alloc, "COMMENT ON TABLE usage_records IS 'billing rows'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .copy }, (try parseSqlAlloc(alloc, "COPY usage_records FROM STDIN")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .explain }, (try parseSqlAlloc(alloc, "EXPLAIN SELECT id FROM usage_records")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .fetch }, (try parseSqlAlloc(alloc, "FETCH FROM usage_cursor")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .grant }, (try parseSqlAlloc(alloc, "GRANT SELECT ON TABLE usage_records TO readonly")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .listen }, (try parseSqlAlloc(alloc, "LISTEN usage_events")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .lock }, (try parseSqlAlloc(alloc, "LOCK TABLE usage_records IN SHARE MODE")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .move }, (try parseSqlAlloc(alloc, "MOVE FROM usage_cursor")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .notify }, (try parseSqlAlloc(alloc, "NOTIFY usage_events, 'changed'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .vacuum }, (try parseSqlAlloc(alloc, "VACUUM FULL usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .reindex }, (try parseSqlAlloc(alloc, "REINDEX INDEX usage_records_status_idx")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .release }, (try parseSqlAlloc(alloc, "RELEASE SAVEPOINT usage_batch")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .revoke }, (try parseSqlAlloc(alloc, "REVOKE SELECT ON TABLE usage_records FROM readonly")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .savepoint }, (try parseSqlAlloc(alloc, "SAVEPOINT usage_batch")).statement);
 }
 
 test "generated SQL parser facade builds control AST spans" {

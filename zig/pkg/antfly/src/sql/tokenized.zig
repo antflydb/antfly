@@ -817,6 +817,11 @@ test "sql adapter parsed sql owns typed statement variants" {
         reason: generated_parser.GeneratedSqlUnsupportedReason,
     }{
         .{
+            .sql = "CLOSE usage_cursor",
+            .kind = .close,
+            .reason = .close_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "CLUSTER usage_records USING usage_status_idx",
             .kind = .cluster,
             .reason = .cluster_not_planned_by_generated_parser,
@@ -830,6 +835,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)",
             .kind = .copy,
             .reason = .copy_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "FETCH FROM usage_cursor",
+            .kind = .fetch,
+            .reason = .fetch_not_planned_by_generated_parser,
         },
         .{
             .sql = "GRANT SELECT ON TABLE usage_records TO readonly",
@@ -847,6 +857,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .lock_not_planned_by_generated_parser,
         },
         .{
+            .sql = "MOVE FROM usage_cursor",
+            .kind = .move,
+            .reason = .move_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "NOTIFY usage_events, 'changed'",
             .kind = .notify,
             .reason = .notify_not_planned_by_generated_parser,
@@ -862,9 +877,19 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .reindex_not_planned_by_generated_parser,
         },
         .{
+            .sql = "RELEASE SAVEPOINT usage_batch",
+            .kind = .release,
+            .reason = .release_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "REVOKE SELECT ON TABLE usage_records FROM readonly",
             .kind = .revoke,
             .reason = .revoke_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "SAVEPOINT usage_batch",
+            .kind = .savepoint,
+            .reason = .savepoint_not_planned_by_generated_parser,
         },
     };
     for (unsupported_diagnostics) |case| {
