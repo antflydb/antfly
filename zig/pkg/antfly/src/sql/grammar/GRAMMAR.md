@@ -140,7 +140,8 @@ definition, partition-list, order-list, and frame-tail ranges, seed
 `ROWS`/`RANGE` frame tails are accepted, and window reads dispatch directly
 after validating projection/source/window ranges;
 plain `DISTINCT` and `DISTINCT ON (...)` reads now carry generated distinct
-ranges and match the production aggregate/query-family split;
+ranges, `DISTINCT ON` expression-list AST items, and match the production
+aggregate/query-family split;
 generated set-operation reads now classify as a distinct read family and
 validate the left query and set-operation tail before calling the set-operation
 lowerer directly;
@@ -368,7 +369,8 @@ Suggested migration order:
    body named windows carry the same generated metadata, and generated window
    reads dispatch to the typed window lowerer after range validation.
    Plain `DISTINCT` and `DISTINCT ON (...)` reads now carry generated distinct
-   ranges and preserve the production aggregate/query-family split.
+   ranges, `DISTINCT ON` expression-list AST items for top-level and CTE body
+   reads, and preserve the production aggregate/query-family split.
    Set-operation reads now classify as their own generated read family and
    dispatch to the native set-operation lowerer after validating the generated
    left-query and set-operation-tail ranges. Single- and multi-CTE reads now

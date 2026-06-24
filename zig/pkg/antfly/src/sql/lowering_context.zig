@@ -292,6 +292,7 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: gen
     for (ranges) |range| {
         if (range) |value| try validateGeneratedReadTokenRange(tokens, read_ast, value);
     }
+    try validateGeneratedDistinctOnListAstRanges(tokens, read_ast, read_ast.distinct_tokens, read_ast.distinct_on_items);
     try validateGeneratedReadListAstRanges(tokens, read_ast, read_ast.projection_items);
     try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, read_ast.projection_first_expression);
     try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, read_ast.projection_last_expression);
@@ -328,6 +329,7 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: gen
         if (cte.body_fetch_count_tokens) |body_fetch_count_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_fetch_count_tokens);
         if (cte.body_set_operation_tokens) |body_set_operation_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_set_operation_tokens);
         try validateGeneratedReadListAstRanges(tokens, read_ast, cte.column_names);
+        try validateGeneratedDistinctOnListAstRanges(tokens, read_ast, cte.body_distinct_tokens, cte.body_distinct_on_items);
         try validateGeneratedReadListAstRanges(tokens, read_ast, cte.body_projection_items);
         try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, cte.body_projection_first_expression);
         try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, cte.body_projection_last_expression);
@@ -482,7 +484,10 @@ fn validateGeneratedCteBodyMetadata(cte: generated_parser.GeneratedSqlCteAst) !v
         if (distinct_tokens.start != select_tokens.end or projection_tokens.start != distinct_tokens.end) {
             return error.UnsupportedSqlShape;
         }
+        try validateGeneratedDistinctOnListMetadata(cte.body_distinct_tokens, cte.body_distinct_on_items);
     } else if (projection_tokens.start != select_tokens.end) {
+        return error.UnsupportedSqlShape;
+    } else if (cte.body_distinct_on_items.count != 0) {
         return error.UnsupportedSqlShape;
     }
     if (cte.body_source_tokens) |source_tokens| {
@@ -1209,6 +1214,52 @@ fn validateGeneratedWindowAstListRanges(
     }
 }
 
+fn validateGeneratedDistinctOnListAstRanges(
+    tokens: []const tokenized.Token,
+    read_ast: generated_parser.GeneratedSqlReadAst,
+    distinct_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    distinct_on_items: generated_parser.GeneratedSqlListAst,
+) !void {
+    if (distinct_tokens == null) {
+        if (distinct_on_items.count != 0) return error.UnsupportedSqlShape;
+        try validateGeneratedReadListAstRanges(tokens, read_ast, distinct_on_items);
+        return;
+    }
+    const distinct = distinct_tokens.?;
+    try validateGeneratedDistinctOnListMetadata(distinct_tokens, distinct_on_items);
+    try validateGeneratedReadListAstRanges(tokens, read_ast, distinct_on_items);
+    if (distinct_on_items.count == 0) return;
+
+    if (distinct.start + 4 > distinct.end or distinct.end > tokens.len) return error.UnsupportedSqlShape;
+    if (!tokens[distinct.start].matchesKeywordTag(.distinct) or
+        !tokens[distinct.start + 1].matchesKeywordTag(.on) or
+        tokens[distinct.start + 2].kind != .lparen or
+        tokens[distinct.end - 1].kind != .rparen)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    const inner = generated_parser.GeneratedSqlTokenRange{ .start = distinct.start + 3, .end = distinct.end - 1 };
+    for (distinct_on_items.items) |item| {
+        if (item.start < inner.start or item.end > inner.end) return error.UnsupportedSqlShape;
+    }
+}
+
+fn validateGeneratedDistinctOnListMetadata(
+    distinct_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    distinct_on_items: generated_parser.GeneratedSqlListAst,
+) !void {
+    const distinct = distinct_tokens orelse {
+        if (distinct_on_items.count != 0) return error.UnsupportedSqlShape;
+        return;
+    };
+    const has_distinct_on_shape = distinct.end > distinct.start + 1;
+    if (!has_distinct_on_shape) {
+        if (distinct_on_items.count != 0) return error.UnsupportedSqlShape;
+        return;
+    }
+    if (distinct_on_items.count == 0) return error.UnsupportedSqlShape;
+}
+
 fn validateGeneratedReadListAstRanges(
     tokens: []const tokenized.Token,
     read_ast: generated_parser.GeneratedSqlReadAst,
@@ -1923,6 +1974,22 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_comparison_child_parsed_sql, malformed_comparison_child_read_ast),
     );
 
+    var malformed_distinct_on_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT DISTINCT ON (organization_id) organization_id, id FROM usage_records ORDER BY organization_id ASC, created_at DESC",
+    );
+    defer malformed_distinct_on_parsed_sql.deinit(alloc);
+    const malformed_distinct_on_generated_raw = malformed_distinct_on_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_distinct_on_read_ast = switch (malformed_distinct_on_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_distinct_on_read_ast.distinct_on_items.count = 0;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_distinct_on_parsed_sql, malformed_distinct_on_read_ast),
+    );
+
     var malformed_case_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
         "SELECT CASE WHEN status IS NULL THEN 'missing' ELSE status END AS status_key FROM usage_records WHERE kind = 'order'",
@@ -2107,6 +2174,22 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_cte_body_projection_list_parsed_sql, malformed_cte_body_projection_list_read_ast),
+    );
+
+    var malformed_cte_body_distinct_on_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH source_rows AS (SELECT DISTINCT ON (organization_id) organization_id FROM usage_records ORDER BY organization_id) SELECT organization_id FROM source_rows",
+    );
+    defer malformed_cte_body_distinct_on_parsed_sql.deinit(alloc);
+    const malformed_cte_body_distinct_on_generated_raw = malformed_cte_body_distinct_on_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_cte_body_distinct_on_read_ast = switch (malformed_cte_body_distinct_on_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_cte_body_distinct_on_read_ast.cte_items[0].body_distinct_on_items.count = 0;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_cte_body_distinct_on_parsed_sql, malformed_cte_body_distinct_on_read_ast),
     );
 
     var malformed_cte_body_window_parsed_sql = try tokenized.ParsedSql.initAlloc(

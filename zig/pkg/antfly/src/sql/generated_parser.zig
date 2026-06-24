@@ -388,6 +388,7 @@ pub const GeneratedSqlCteAst = struct {
     body_kind: ?GeneratedSqlReadKind = null,
     body_select_tokens: ?GeneratedSqlTokenRange = null,
     body_distinct_tokens: ?GeneratedSqlTokenRange = null,
+    body_distinct_on_items: GeneratedSqlListAst = .{},
     body_projection_tokens: ?GeneratedSqlTokenRange = null,
     body_source_tokens: ?GeneratedSqlTokenRange = null,
     body_where_tokens: ?GeneratedSqlTokenRange = null,
@@ -420,6 +421,7 @@ pub const GeneratedSqlCteAst = struct {
 
     pub fn deinit(self: *GeneratedSqlCteAst, alloc: std.mem.Allocator) void {
         self.column_names.deinit(alloc);
+        self.body_distinct_on_items.deinit(alloc);
         self.body_projection_items.deinit(alloc);
         self.body_projection_first_expression.deinit(alloc);
         self.body_projection_last_expression.deinit(alloc);
@@ -514,6 +516,7 @@ pub const GeneratedSqlReadAst = struct {
     cte_count: usize = 0,
     cte_recursive: bool = false,
     distinct_tokens: ?GeneratedSqlTokenRange = null,
+    distinct_on_items: GeneratedSqlListAst = .{},
     projection_tokens: ?GeneratedSqlTokenRange = null,
     projection_items: GeneratedSqlListAst = .{},
     projection_first_expression: GeneratedSqlExpressionAst = .{},
@@ -559,6 +562,7 @@ pub const GeneratedSqlReadAst = struct {
         if (self.cte_items.len > 0) alloc.free(self.cte_items);
         for (self.join_items) |*join| join.deinit(alloc);
         if (self.join_items.len > 0) alloc.free(self.join_items);
+        self.distinct_on_items.deinit(alloc);
         self.projection_items.deinit(alloc);
         self.projection_first_expression.deinit(alloc);
         self.projection_last_expression.deinit(alloc);
@@ -1258,6 +1262,9 @@ fn buildReadAst(
     if (body_end < end) ast.set_operation_tokens = .{ .start = body_end, .end = end };
 
     const projection_start = generatedReadProjectionStart(tokens, select_index, body_end, &ast);
+    if (generatedDistinctOnExpressionTokens(tokens, ast.distinct_tokens)) |distinct_on_tokens| {
+        ast.distinct_on_items = try buildTopLevelListAst(alloc, tokens, distinct_on_tokens, .{});
+    }
     const from_index = findTopLevelKeyword(tokens, projection_start, body_end, .from);
     const where_index = findTopLevelKeyword(tokens, projection_start, body_end, .where);
     const group_index = findTopLevelKeywordSequence(tokens, projection_start, body_end, .group, .by);
@@ -1421,6 +1428,20 @@ fn generatedReadProjectionStart(
     return distinct_index + 1;
 }
 
+fn generatedDistinctOnExpressionTokens(tokens: []const token_mod.Token, distinct_tokens: ?GeneratedSqlTokenRange) ?GeneratedSqlTokenRange {
+    const range = distinct_tokens orelse return null;
+    if (range.start + 4 > range.end or range.end > tokens.len) return null;
+    if (!tokens[range.start].matchesKeywordTag(.distinct) or
+        !tokens[range.start + 1].matchesKeywordTag(.on) or
+        tokens[range.start + 2].kind != .lparen or
+        tokens[range.end - 1].kind != .rparen)
+    {
+        return null;
+    }
+    if (range.start + 3 >= range.end - 1) return null;
+    return .{ .start = range.start + 3, .end = range.end - 1 };
+}
+
 fn buildReadCteAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, final_select_index: usize, ast: *GeneratedSqlReadAst) !void {
     if (final_select_index < 5 or !tokens[0].matchesKeywordTag(.with)) return;
     var index: usize = 1;
@@ -1514,6 +1535,9 @@ fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.
     if (body_end < body_tokens.end) cte.body_set_operation_tokens = .{ .start = body_end, .end = body_tokens.end };
 
     const projection_start = generatedReadProjectionStartInRange(tokens, select_index, body_end, &cte.body_distinct_tokens);
+    if (generatedDistinctOnExpressionTokens(tokens, cte.body_distinct_tokens)) |distinct_on_tokens| {
+        cte.body_distinct_on_items = try buildTopLevelListAst(alloc, tokens, distinct_on_tokens, .{});
+    }
     const from_index = findTopLevelKeyword(tokens, projection_start, body_end, .from);
     const where_index = findTopLevelKeyword(tokens, projection_start, body_end, .where);
     const group_index = findTopLevelKeywordSequence(tokens, projection_start, body_end, .group, .by);
@@ -4913,6 +4937,12 @@ test "generated SQL parser facade builds read AST spans" {
         .read => |read| {
             try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 6 }, read.distinct_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), read.distinct_on_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, read.distinct_on_items.first_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, read.distinct_on_items.last_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, read.distinct_on_items.items[0]);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.distinct_on_items.expressions[0].kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, read.distinct_on_items.expressions[0].tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 9 }, read.projection_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.source_tokens.?);
         },
@@ -5119,6 +5149,26 @@ test "generated SQL parser facade builds read AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 20, .end = 23 }, read.cte_items[0].body_window_items[0].definition_tokens);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 22, .end = 23 }, read.cte_items[0].body_window_items[0].order_tokens.?);
             try std.testing.expectEqual(@as(usize, 1), read.cte_items[0].body_window_items[0].order_items.count);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const cte_distinct_on_body_read_sql = "WITH source_rows AS (SELECT DISTINCT ON (organization_id) organization_id FROM usage_records ORDER BY organization_id) SELECT organization_id FROM source_rows";
+    const cte_distinct_on_body_read_result = try parseSqlAlloc(alloc, cte_distinct_on_body_read_sql);
+    switch (cte_distinct_on_body_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.cte, read.kind);
+            try std.testing.expectEqual(@as(usize, 1), read.cte_items.len);
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.cte_items[0].body_kind.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 16 }, read.cte_items[0].body_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 10 }, read.cte_items[0].body_distinct_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), read.cte_items[0].body_distinct_on_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.cte_items[0].body_distinct_on_items.items[0]);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.cte_items[0].body_distinct_on_items.expressions[0].kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.cte_items[0].body_distinct_on_items.expressions[0].tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.cte_items[0].body_projection_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read.cte_items[0].body_source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 15, .end = 16 }, read.cte_items[0].body_order_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
