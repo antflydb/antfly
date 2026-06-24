@@ -78,6 +78,7 @@ pub const GeneratedSqlReadKind = enum {
     aggregate,
     join,
     lateral,
+    window,
     set_operation,
     cte,
 };
@@ -268,6 +269,7 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT status FROM usage_records GROUP BY status HAVING status = 'open'", .kind = .read },
     .{ .sql = "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id", .kind = .read },
     .{ .sql = "SELECT id FROM LATERAL (SELECT id FROM usage_records) AS source_rows", .kind = .read },
+    .{ .sql = "SELECT id, row_number() OVER (ORDER BY id) AS rn FROM usage_records", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records UNION SELECT id FROM usage_archive", .kind = .read },
     .{ .sql = "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows", .kind = .read },
 };
@@ -490,6 +492,9 @@ fn classifyReadKind(tokens: []const token_mod.Token) GeneratedSqlReadKind {
     if (firstTopLevelSetOperation(tokens, 1, statementTokenEnd(tokens)) != null) return .set_operation;
     for (tokens) |token| {
         if (token.matchesKeywordTag(.lateral)) return .lateral;
+    }
+    for (tokens) |token| {
+        if (token.matchesKeywordTag(.over)) return .window;
     }
     for (tokens) |token| {
         if (token.matchesKeywordTag(.join)) return .join;
@@ -1237,6 +1242,17 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read.source_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 7 }, read.offset_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 12 }, read.fetch_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const window_read_sql = "SELECT id, row_number() OVER (ORDER BY id) AS rn FROM usage_records";
+    const window_read_result = try parseSqlAlloc(alloc, window_read_sql);
+    switch (window_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.window, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 14 }, read.projection_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 15, .end = 16 }, read.source_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

@@ -91,6 +91,8 @@ and an initial generated AST-to-plan wrapper that validates those ranges and
 fails closed if the generated read family is incompatible with the existing
 read classifier. Simple query, aggregate, join, and lateral reads now validate
 generated clause ranges before calling their typed read-plan lowerers directly;
+basic `OVER (ORDER BY ...)` window reads now classify as a generated window
+family and dispatch directly after validating projection/source ranges;
 generated set-operation reads now classify as a distinct read family and
 validate the left query and set-operation tail before calling the set-operation
 lowerer directly;
@@ -213,6 +215,8 @@ Suggested migration order:
    a direct generated AST-to-query-plan lowering boundary after clause-range
    validation, and aggregate, join, and lateral reads now have direct generated
    AST-to-read-family dispatch boundaries after clause-range validation.
+   Basic `OVER (ORDER BY ...)` window reads now classify as generated window
+   reads and dispatch to the typed window lowerer after range validation.
    Set-operation reads now classify as their own generated read family and
    dispatch to the native set-operation lowerer after validating the generated
    left-query and set-operation-tail ranges. Simple non-recursive CTE reads now

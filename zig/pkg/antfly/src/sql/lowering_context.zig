@@ -215,6 +215,15 @@ pub fn lowerReadPlanFromGeneratedReadAstAlloc(
                 context.params,
             ) };
         },
+        .window => blk: {
+            try validateGeneratedWindowReadAst(parsed_sql.items(), read_ast);
+            break :blk .{ .window = try context.callbacks.lower_window(
+                context.alloc,
+                parsed_sql,
+                context.schema,
+                context.params,
+            ) };
+        },
         .set_operation => blk: {
             try validateGeneratedSetOperationReadAst(read_ast);
             break :blk .{ .set_operation = try context.callbacks.lower_set_operation_optional_source_schema(
@@ -246,6 +255,7 @@ fn generatedReadAstMatchesReadKind(
         .aggregate => read_kind == .aggregate,
         .join => read_kind == .join,
         .lateral => read_kind == .lateral,
+        .window => read_kind == .window,
         .set_operation => read_kind == .set_operation,
         .cte => switch (read_kind) {
             .query, .aggregate, .join, .lateral, .window => true,
@@ -290,6 +300,10 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: gen
         .lateral => {
             if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return error.UnsupportedSqlShape;
             try validateGeneratedReadRangeContainsKeyword(tokens, read_ast.source_tokens.?, .lateral);
+        },
+        .window => {
+            if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return error.UnsupportedSqlShape;
+            try validateGeneratedReadRangeContainsKeyword(tokens, read_ast.projection_tokens.?, .over);
         },
         .cte => {
             if (read_ast.cte_tokens == null or read_ast.projection_tokens == null) return error.UnsupportedSqlShape;
@@ -337,6 +351,16 @@ fn validateGeneratedJoinedReadAst(
     }
     if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return error.UnsupportedSqlShape;
     try validateGeneratedReadRangeContainsKeyword(tokens, read_ast.source_tokens.?, keyword);
+}
+
+fn validateGeneratedWindowReadAst(tokens: []const tokenized.Token, read_ast: generated_parser.GeneratedSqlReadAst) !void {
+    if (read_ast.cte_tokens != null or read_ast.group_tokens != null or read_ast.having_tokens != null or
+        read_ast.set_operation_tokens != null)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return error.UnsupportedSqlShape;
+    try validateGeneratedReadRangeContainsKeyword(tokens, read_ast.projection_tokens.?, .over);
 }
 
 fn validateGeneratedSetOperationReadAst(read_ast: generated_parser.GeneratedSqlReadAst) !void {
