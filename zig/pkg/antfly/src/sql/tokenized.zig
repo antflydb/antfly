@@ -349,6 +349,7 @@ fn parseStatement(
             .transaction => return .{ .transaction = .{ .raw = raw_statement } },
             .prepared => return .{ .prepared = .{ .raw = raw_statement } },
             .ddl => return .{ .ddl = .{ .raw = raw_statement } },
+            .extension_index => return .{ .ddl = .{ .raw = raw_statement } },
             .dml => if (tokenized_sql.write_statement_kind) |kind| return .{ .write = .{ .kind = kind, .raw = raw_statement } },
             .read => if (tokenized_sql.read_statement_kind) |kind| return .{ .read = .{ .kind = kind, .raw = raw_statement } },
             .graph => return .{ .ddl = .{ .raw = raw_statement } },
@@ -908,6 +909,33 @@ test "sql adapter parsed sql owns typed statement variants" {
     defer ddl.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, ddl.generatedStatementKind().?);
     switch (ddl.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var extension_index = try ParsedSql.initAlloc(alloc, "CREATE INDEX usage_status_idx ON usage_records (status)");
+    defer extension_index.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.extension_index, extension_index.generatedStatementKind().?);
+    switch (extension_index.generated_statement.?.ast.?) {
+        .extension_index => |extension_index_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_index, extension_index_ast.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, extension_index_ast.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (extension_index.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var extension = try ParsedSql.initAlloc(alloc, "CREATE EXTENSION vector");
+    defer extension.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.extension_index, extension.generatedStatementKind().?);
+    switch (extension.generated_statement.?.ast.?) {
+        .extension_index => |extension_index_ast| try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_extension, extension_index_ast.kind),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (extension.statement) {
         .ddl => {},
         else => return error.TestUnexpectedResult,
     }

@@ -12694,10 +12694,7 @@ fn generatedSimpleDdlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8)
     var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
     defer parsed.deinit(alloc);
     const generated_raw = parsed.generated_statement orelse return error.UnsupportedSqlShape;
-    const ddl_ast = switch (generated_raw.ast orelse return error.UnsupportedSqlShape) {
-        .ddl => |ast| ast,
-        else => return error.UnsupportedSqlShape,
-    };
+    const ddl_ast = try generatedDdlCompatibleAst(generated_raw.ast orelse return error.UnsupportedSqlShape);
     return try simpleDdlPlanFromGeneratedAstAlloc(alloc, parsed.items(), ddl_ast);
 }
 
@@ -12705,10 +12702,7 @@ fn generatedDdlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !Lowe
     var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
     defer parsed.deinit(alloc);
     const generated_raw = parsed.generated_statement orelse return error.UnsupportedSqlShape;
-    const ddl_ast = switch (generated_raw.ast orelse return error.UnsupportedSqlShape) {
-        .ddl => |ast| ast,
-        else => return error.UnsupportedSqlShape,
-    };
+    const ddl_ast = try generatedDdlCompatibleAst(generated_raw.ast orelse return error.UnsupportedSqlShape);
     var state = parser_context.ParserState{
         .alloc = alloc,
         .tokens = parsed.items(),
@@ -12723,6 +12717,14 @@ fn generatedDdlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !Lowe
         .create_index_options = parser_context.ParserState.ContextAccessors.createIndexOptions(&state),
         .row_security_policy_options = parser_context.ParserState.ContextAccessors.rowSecurityPolicyOptions(&state),
     });
+}
+
+fn generatedDdlCompatibleAst(ast: generated_parser.GeneratedSqlAst) !generated_parser.GeneratedSqlDdlAst {
+    return switch (ast) {
+        .ddl => |ddl| ddl,
+        .extension_index => |ddl| ddl,
+        else => error.UnsupportedSqlShape,
+    };
 }
 
 fn generatedGraphDdlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !LoweredDdlPlan {

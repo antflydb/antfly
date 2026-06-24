@@ -25,6 +25,7 @@ pub const GeneratedSqlStatementKind = enum {
     ddl,
     dml,
     read,
+    extension_index,
     graph,
     unsupported,
     other,
@@ -89,6 +90,13 @@ pub const GeneratedSqlGraphKind = enum {
     create_metric,
 };
 
+pub const GeneratedSqlExtensionIndexKind = enum {
+    create_index,
+    drop_index,
+    create_extension,
+    drop_extension,
+};
+
 pub const GeneratedSqlUnsupportedKind = enum {
     analyze,
     cluster,
@@ -126,6 +134,7 @@ pub const GeneratedSqlStatement = union(GeneratedSqlStatementKind) {
     ddl: GeneratedSqlDdlKind,
     dml: GeneratedSqlDmlKind,
     read: GeneratedSqlReadKind,
+    extension_index: GeneratedSqlExtensionIndexKind,
     graph: GeneratedSqlGraphKind,
     unsupported: GeneratedSqlUnsupportedKind,
     other: void,
@@ -689,6 +698,7 @@ pub const GeneratedSqlAst = union(enum) {
     ddl: GeneratedSqlDdlAst,
     dml: GeneratedSqlDmlAst,
     read: GeneratedSqlReadAst,
+    extension_index: GeneratedSqlDdlAst,
     graph: GeneratedSqlGraphAst,
     unsupported: GeneratedSqlUnsupportedAst,
 
@@ -755,12 +765,13 @@ pub const simple_ddl_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CREATE SCHEMA IF NOT EXISTS analytics", .kind = .ddl },
     .{ .sql = "CREATE TABLE usage_records (id text PRIMARY KEY, status text DEFAULT 'open')", .kind = .ddl },
     .{ .sql = "CREATE TABLE IF NOT EXISTS usage_records (id text PRIMARY KEY)", .kind = .ddl },
-    .{ .sql = "CREATE INDEX usage_records_status_idx ON usage_records (status)", .kind = .ddl },
-    .{ .sql = "CREATE INDEX IF NOT EXISTS usage_records_status_idx ON usage_records (status)", .kind = .ddl },
-    .{ .sql = "CREATE EXTENSION vector", .kind = .ddl },
+    .{ .sql = "CREATE INDEX usage_records_status_idx ON usage_records (status)", .kind = .extension_index },
+    .{ .sql = "CREATE INDEX IF NOT EXISTS usage_records_status_idx ON usage_records (status)", .kind = .extension_index },
+    .{ .sql = "CREATE EXTENSION vector", .kind = .extension_index },
     .{ .sql = "DROP TABLE usage_records", .kind = .ddl },
     .{ .sql = "DROP TABLE IF EXISTS usage_records", .kind = .ddl },
-    .{ .sql = "DROP INDEX usage_records_status_idx", .kind = .ddl },
+    .{ .sql = "DROP INDEX usage_records_status_idx", .kind = .extension_index },
+    .{ .sql = "DROP EXTENSION vector", .kind = .extension_index },
     .{ .sql = "DROP SCHEMA analytics CASCADE", .kind = .ddl },
     .{ .sql = "DROP DATABASE tenant_ops", .kind = .ddl },
 };
@@ -942,7 +953,7 @@ pub fn parseGeneratedGateTokensAlloc(alloc: std.mem.Allocator, tokens: []const t
     const kind = classifyTokens(tokens);
     if (kind == .other) return null;
     return parseTokensAlloc(alloc, tokens) catch |err| switch (err) {
-        error.UnsupportedSqlShape, error.UnexpectedToken => if (kind == .ddl or kind == .dml or kind == .read or kind == .unsupported) null else err,
+        error.UnsupportedSqlShape, error.UnexpectedToken => if (kind == .ddl or kind == .dml or kind == .read or kind == .extension_index or kind == .unsupported) null else err,
         else => err,
     };
 }
@@ -1098,12 +1109,12 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.database)) return .{ .ddl = .create_database };
         if (second.matchesKeywordTag(.schema)) return .{ .ddl = .create_schema };
         if (second.matchesKeywordTag(.table)) return .{ .ddl = .create_table };
-        if (second.matchesKeywordTag(.index)) return .{ .ddl = .create_index };
+        if (second.matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
         if (second.matchesKeywordTag(.graph) and tokens.len > 2) {
             if (tokens[2].matchesKeywordTag(.index)) return .{ .graph = .create_index };
             if (tokens[2].matchesKeywordTag(.metric)) return .{ .graph = .create_metric };
         }
-        if (second.matchesKeywordTag(.extension)) return .{ .ddl = .create_extension };
+        if (second.matchesKeywordTag(.extension)) return .{ .extension_index = .create_extension };
     }
     if (first.matchesKeywordTag(.alter) and tokens.len > 1 and tokens[1].matchesKeywordTag(.table)) {
         return .{ .ddl = .alter_table };
@@ -1111,10 +1122,10 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.drop) and tokens.len > 1) {
         const second = tokens[1];
         if (second.matchesKeywordTag(.table)) return .{ .ddl = .drop_table };
-        if (second.matchesKeywordTag(.index)) return .{ .ddl = .drop_index };
+        if (second.matchesKeywordTag(.index)) return .{ .extension_index = .drop_index };
         if (second.matchesKeywordTag(.schema)) return .{ .ddl = .drop_schema };
         if (second.matchesKeywordTag(.database)) return .{ .ddl = .drop_database };
-        if (second.matchesKeywordTag(.extension)) return .{ .ddl = .drop_extension };
+        if (second.matchesKeywordTag(.extension)) return .{ .extension_index = .drop_extension };
     }
     if (first.matchesKeywordTag(.insert)) {
         for (tokens) |token| {
@@ -1230,6 +1241,7 @@ fn buildGeneratedAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, 
         .ddl => |kind| .{ .ddl = buildDdlAst(tokens, end, kind, statement_span, command_span) },
         .dml => |kind| .{ .dml = buildDmlAst(tokens, end, kind, statement_span, command_span) },
         .read => |kind| .{ .read = try buildReadAst(alloc, tokens, end, kind, statement_span, command_span) },
+        .extension_index => |kind| .{ .extension_index = buildDdlAst(tokens, end, ddlKindFromExtensionIndexKind(kind), statement_span, command_span) },
         .graph => |kind| .{ .graph = .{
             .kind = kind,
             .statement_span = statement_span,
@@ -1237,6 +1249,15 @@ fn buildGeneratedAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, 
         } },
         .unsupported => |kind| .{ .unsupported = buildUnsupportedAst(tokens, end, kind, statement_span, command_span) },
         else => null,
+    };
+}
+
+fn ddlKindFromExtensionIndexKind(kind: GeneratedSqlExtensionIndexKind) GeneratedSqlDdlKind {
+    return switch (kind) {
+        .create_index => .create_index,
+        .drop_index => .drop_index,
+        .create_extension => .create_extension,
+        .drop_extension => .drop_extension,
     };
 }
 
@@ -1339,10 +1360,19 @@ fn buildDdlAst(
                 ast.version_tokens = .{ .start = index + 1, .end = index + 2 };
             }
         },
+        .create_index => {
+            ast.if_not_exists = consumeGeneratedIfNotExists(tokens, &index, end);
+            ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
+        },
         .drop_database => {
             ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
             ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
             if (findKeywordText(tokens, index + 1, end, "force") != null) ast.force = true;
+        },
+        .drop_index => {
+            ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
+            ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
+            ast.cascade = findKeyword(tokens, index + 1, end, .cascade) != null;
         },
         .drop_schema => {
             ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
@@ -3586,6 +3616,10 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .prepared = .execute }, (try parseSqlAlloc(alloc, "EXECUTE read_stmt()")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_table }, (try parseSqlAlloc(alloc, "CREATE TABLE usage_records (id text)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_schema }, (try parseSqlAlloc(alloc, "DROP SCHEMA analytics CASCADE")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .create_index }, (try parseSqlAlloc(alloc, "CREATE INDEX usage_status_idx ON usage_records (status)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .drop_index }, (try parseSqlAlloc(alloc, "DROP INDEX usage_status_idx")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .create_extension }, (try parseSqlAlloc(alloc, "CREATE EXTENSION vector")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .drop_extension }, (try parseSqlAlloc(alloc, "DROP EXTENSION vector")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .insert_values }, (try parseSqlAlloc(alloc, "INSERT INTO usage_records (id) VALUES ('u1')")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .insert_values }, (try parseSqlAlloc(alloc, "INSERT INTO usage_records DEFAULT VALUES")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .update }, (try parseSqlAlloc(alloc, "UPDATE usage_records SET status = 'done' WHERE id = 'u1'")).statement);
@@ -3669,12 +3703,23 @@ test "generated SQL parser facade builds control AST spans" {
     const extension_sql = "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public VERSION '1.3'";
     const extension_result = try parseSqlAlloc(alloc, extension_sql);
     switch (extension_result.ast.?) {
-        .ddl => |ddl| {
+        .extension_index => |ddl| {
             try std.testing.expectEqual(GeneratedSqlDdlKind.create_extension, ddl.kind);
             try std.testing.expect(ddl.if_not_exists);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, ddl.object_name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, ddl.schema_name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, ddl.version_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const drop_index_sql = "DROP INDEX IF EXISTS usage_status_idx";
+    const drop_index_result = try parseSqlAlloc(alloc, drop_index_sql);
+    switch (drop_index_result.ast.?) {
+        .extension_index => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.drop_index, ddl.kind);
+            try std.testing.expect(ddl.if_exists);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl.object_name_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

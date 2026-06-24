@@ -536,8 +536,7 @@ variants for:
   for typed `PREPARE`, `EXECUTE`, and `DEALLOCATE`
 - DDL statement, including generated AST payloads for command spans, object
   names, catalog option fields, drop behavior, and generated AST-to-plan parity
-  for database, schema, and extension create/drop catalog plans and seed
-  `CREATE TABLE` / `CREATE INDEX` plans
+  for database and schema catalog plans plus seed `CREATE TABLE` plans
 - DML statement, including generated AST payloads for command spans, target
   tables, source/body ranges, predicates, conflict clauses, returning clauses,
   values lists, default-values inserts, truncate options, generated-first
@@ -550,6 +549,9 @@ variants for:
 - read statement, including a generated AST payload for command spans and an
   generated-first AST-to-plan dispatch for generated-covered read statements,
   backed by validated wrappers into the current typed read lowerers
+- extension/index statement, including a closed generated family for
+  `CREATE INDEX`, `DROP INDEX`, `CREATE EXTENSION`, and `DROP EXTENSION` with
+  DDL-compatible AST payloads for object names, options, and drop behavior
 - graph statement, including a generated AST payload for command spans and
   graph-specific AST-to-plan wrappers for seed graph index and graph metric DDL
 - unsupported statement, including generated AST payloads for seed `ANALYZE`,
@@ -560,7 +562,6 @@ variants for:
 
 Later statement-family cutovers should add closed variants for:
 
-- extension/index statement
 - broader unsupported PostgreSQL-compatible statements with diagnostic reasons,
   beyond the first generated utility/control diagnostic set
 
@@ -578,10 +579,11 @@ Generated grammar work needs evidence at multiple levels:
 
 - Corpus tests for accepted PostgreSQL-compatible syntax. The initial checked
   corpus covers session commands, transaction commands, prepared statements,
-  simple database/schema/table/index/extension DDL, representative DML, and
-  representative read queries. It also covers seed graph statements as a
-  distinct generated family. Runtime parsing also enforces generated parser
-  success for the session, transaction, and prepared statement corpus.
+  simple database/schema/table DDL, extension/index statements,
+  representative DML, and representative read queries. It also covers seed
+  graph statements as a distinct generated family. Runtime parsing also
+  enforces generated parser success for the session, transaction, and prepared
+  statement corpus.
 - Corpus tests for accepted Antfly-specific syntax.
 - Corpus tests for intentionally unsupported PostgreSQL syntax with stable
   diagnostics. Seed `ANALYZE`, bulk I/O `COPY`, maintenance `VACUUM`/`REINDEX`,
@@ -595,11 +597,12 @@ Generated grammar work needs evidence at multiple levels:
   graph statement payloads, including top-level generated read-list metadata.
 - Plan parity tests showing generated ASTs lower to the same typed plans as the
   current parser for migrated statement families. Session catalog commands,
-  transaction boundaries, prepared statements, and simple DDL database/schema/
-  extension catalog plans plus seed `CREATE TABLE` / `CREATE INDEX` plans have
-  generated AST-to-plan parity tests for their generated-covered forms; simple
-  catalog DDL also has generated field-level checks for object names, option
-  flags, version strings, drop behavior, and fail-closed unsupported clauses.
+  transaction boundaries, prepared statements, simple DDL database/schema
+  catalog plans plus seed `CREATE TABLE` plans, and extension/index
+  `CREATE INDEX` plus extension catalog plans have generated AST-to-plan parity
+  tests for their generated-covered forms; simple catalog DDL also has generated
+  field-level checks for object names, option flags, version strings, drop
+  behavior, and fail-closed unsupported clauses.
   Simple DML has generated field-level checks for update and truncate body
   ranges, direct generated AST-to-plan parity for truncate mutation-source
   plans, direct resolver-free generated AST-to-plan coverage for supported
