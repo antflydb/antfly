@@ -340,6 +340,7 @@ fn parseStatement(
             .ddl => return .{ .ddl = .{ .raw = raw_statement } },
             .dml => if (tokenized_sql.write_statement_kind) |kind| return .{ .write = .{ .kind = kind, .raw = raw_statement } },
             .read => if (tokenized_sql.read_statement_kind) |kind| return .{ .read = .{ .kind = kind, .raw = raw_statement } },
+            .graph => return .{ .ddl = .{ .raw = raw_statement } },
             .other => {},
         }
     }
@@ -847,4 +848,30 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
     defer unsupported_read.deinit(alloc);
     try std.testing.expect(unsupported_read.generated_statement == null);
     try std.testing.expectEqual(classifier.SqlReadStatementKind.query, unsupported_read.readStatementKind().?);
+}
+
+test "sql adapter parsed sql retains generated graph nodes as DDL until graph cutover" {
+    const alloc = std.testing.allocator;
+
+    const cases = [_]struct {
+        sql: []const u8,
+        generated: generated_parser.GeneratedSqlGraphKind,
+    }{
+        .{ .sql = "CREATE GRAPH INDEX docs_edge_graph ON doc_edges", .generated = .create_index },
+        .{ .sql = "CREATE GRAPH METRIC docs_pagerank ON doc_edges WITH (metric = 'pagerank')", .generated = .create_metric },
+    };
+
+    for (cases) |case| {
+        var parsed = try ParsedSql.initAlloc(alloc, case.sql);
+        defer parsed.deinit(alloc);
+        try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.graph, parsed.generatedStatementKind().?);
+        switch (parsed.generated_statement.?.statement) {
+            .graph => |kind| try std.testing.expectEqual(case.generated, kind),
+            else => return error.TestUnexpectedResult,
+        }
+        switch (parsed.statement) {
+            .ddl => {},
+            else => return error.TestUnexpectedResult,
+        }
+    }
 }

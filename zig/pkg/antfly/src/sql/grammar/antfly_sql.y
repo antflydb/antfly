@@ -341,7 +341,12 @@ option_list:
   ;
 
 option:
-    IDENT EQ expression
+    option_name EQ expression
+  ;
+
+option_name:
+    IDENT
+  | METRIC
   ;
 
 drop_behavior_opt:

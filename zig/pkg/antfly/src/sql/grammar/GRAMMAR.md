@@ -46,9 +46,13 @@ covered write statements, but unsupported DML still falls back until plan parity
 is proven. Representative read queries now have generated-parser corpus
 coverage and retained generated raw nodes for covered read statements, while
 unsupported read shapes still fall back until read-plan parity is proven. The
-generated facade now returns closed statement-family nodes for the covered
-families; full production AST construction remains the next migration boundary
-for larger DDL, query, and DML families.
+generated parser now also treats seed graph DDL as a distinct graph statement
+family and `ParsedSql` retains those generated nodes, but graph execution still
+routes through the existing DDL variant until graph-specific raw AST and
+lowering parity exist. The generated facade now returns closed statement-family
+nodes for the covered families; full production AST construction remains the
+next migration boundary for larger DDL, query, DML, and Antfly extension
+families.
 
 ## Compatibility Policy
 
@@ -126,7 +130,11 @@ Suggested migration order:
    `TRUNCATE`, and `MERGE`.
 6. Antfly extensions: graph traversal DSL, graph metric query surfaces,
    automatic embeddings, full-text ranking, algebraic indexes, enrichment
-   clauses, lake/source syntax, and Lite-specific capability checks.
+   clauses, lake/source syntax, and Lite-specific capability checks. Seed
+   `CREATE GRAPH INDEX` and `CREATE GRAPH METRIC` statements now have generated
+   graph-family corpus coverage and retained generated nodes; execution remains
+   on the existing DDL path until graph-specific raw AST and lowering parity are
+   complete.
 
 ## Generator Performance
 
@@ -229,7 +237,8 @@ Generated grammar work needs evidence at multiple levels:
 - Corpus tests for accepted PostgreSQL-compatible syntax. The initial checked
   corpus covers session commands, transaction commands, prepared statements,
   simple database/schema/table/index/extension DDL, representative DML, and
-  representative read queries. Runtime parsing also enforces generated parser
+  representative read queries. It also covers seed graph statements as a
+  distinct generated family. Runtime parsing also enforces generated parser
   success for the session, transaction, and prepared statement corpus.
 - Corpus tests for accepted Antfly-specific syntax.
 - Corpus tests for intentionally unsupported PostgreSQL syntax with stable

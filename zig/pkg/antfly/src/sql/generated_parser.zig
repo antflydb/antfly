@@ -25,6 +25,7 @@ pub const GeneratedSqlStatementKind = enum {
     ddl,
     dml,
     read,
+    graph,
     other,
 };
 
@@ -80,6 +81,11 @@ pub const GeneratedSqlReadKind = enum {
     cte,
 };
 
+pub const GeneratedSqlGraphKind = enum {
+    create_index,
+    create_metric,
+};
+
 pub const GeneratedSqlStatement = union(GeneratedSqlStatementKind) {
     session: GeneratedSqlSessionKind,
     transaction: GeneratedSqlTransactionKind,
@@ -87,6 +93,7 @@ pub const GeneratedSqlStatement = union(GeneratedSqlStatementKind) {
     ddl: GeneratedSqlDdlKind,
     dml: GeneratedSqlDmlKind,
     read: GeneratedSqlReadKind,
+    graph: GeneratedSqlGraphKind,
     other: void,
 };
 
@@ -162,6 +169,11 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id", .kind = .read },
     .{ .sql = "SELECT id FROM LATERAL (SELECT id FROM usage_records) AS source_rows", .kind = .read },
     .{ .sql = "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows", .kind = .read },
+};
+
+pub const simple_graph_corpus = [_]GeneratedSqlCorpusCase{
+    .{ .sql = "CREATE GRAPH INDEX docs_edge_graph ON doc_edges", .kind = .graph },
+    .{ .sql = "CREATE GRAPH METRIC docs_pagerank ON doc_edges WITH (metric = 'pagerank')", .kind = .graph },
 };
 
 pub fn parseSqlAlloc(alloc: std.mem.Allocator, sql: []const u8) !GeneratedSqlParseResult {
@@ -335,11 +347,11 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.schema)) return .{ .ddl = .create_schema };
         if (second.matchesKeywordTag(.table)) return .{ .ddl = .create_table };
         if (second.matchesKeywordTag(.index)) return .{ .ddl = .create_index };
-        if (second.matchesKeywordTag(.extension)) return .{ .ddl = .create_extension };
         if (second.matchesKeywordTag(.graph) and tokens.len > 2) {
-            if (tokens[2].matchesKeywordTag(.index)) return .{ .ddl = .create_graph_index };
-            if (tokens[2].matchesKeywordTag(.metric)) return .{ .ddl = .create_graph_metric };
+            if (tokens[2].matchesKeywordTag(.index)) return .{ .graph = .create_index };
+            if (tokens[2].matchesKeywordTag(.metric)) return .{ .graph = .create_metric };
         }
+        if (second.matchesKeywordTag(.extension)) return .{ .ddl = .create_extension };
     }
     if (first.matchesKeywordTag(.alter) and tokens.len > 1 and tokens[1].matchesKeywordTag(.table)) {
         return .{ .ddl = .alter_table };
@@ -390,7 +402,7 @@ test "generated SQL parser accepts session and control statements" {
 }
 
 test "generated SQL parser facade classifies gated corpus" {
-    const corpus = first_family_corpus ++ simple_ddl_corpus ++ simple_dml_corpus ++ simple_read_corpus;
+    const corpus = first_family_corpus ++ simple_ddl_corpus ++ simple_dml_corpus ++ simple_read_corpus ++ simple_graph_corpus;
     for (corpus) |case| {
         const generated_result = try parseSqlAlloc(std.testing.allocator, case.sql);
         try std.testing.expectEqual(case.kind, generated_result.kind);
@@ -407,6 +419,8 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .update }, (try parseSqlAlloc(std.testing.allocator, "UPDATE usage_records SET status = 'done' WHERE id = 'u1'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .read = .query }, (try parseSqlAlloc(std.testing.allocator, "SELECT id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .read = .cte }, (try parseSqlAlloc(std.testing.allocator, "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .create_index }, (try parseSqlAlloc(std.testing.allocator, "CREATE GRAPH INDEX docs_edge_graph ON doc_edges")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .create_metric }, (try parseSqlAlloc(std.testing.allocator, "CREATE GRAPH METRIC docs_pagerank ON doc_edges")).statement);
 }
 
 test "generated SQL parser reports source-aware diagnostics" {
