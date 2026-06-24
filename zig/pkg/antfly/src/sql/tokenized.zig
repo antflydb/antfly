@@ -866,6 +866,7 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
         .{ .sql = "SELECT id FROM usage_records WHERE metadata #>> '{billing,plan}' = 'pro'", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE status = ANY($1::text[])", .generated = .query, .read = .query },
         .{ .sql = "SELECT date_bin(INTERVAL '1 hour', amount, 0) AS amount_bucket FROM usage_records WHERE date_bin(INTERVAL '1 day', amount, 0) = $1", .generated = .query, .read = .query },
+        .{ .sql = "SELECT date_bin(INTERVAL '1 hour', TIMESTAMPTZ '2025-01-01T01:30:00+01:30', TIMESTAMP '2025-01-01T00:00:00') AS planned_bucket FROM usage_records WHERE id = $1", .generated = .query, .read = .query },
         .{ .sql = "SELECT EXTRACT(dow FROM amount) AS amount_dow FROM usage_records WHERE EXTRACT(hour FROM amount) = $1", .generated = .query, .read = .query },
         .{ .sql = "SELECT CASE WHEN email IS NULL THEN 'missing' WHEN email = 'blocked@example.test' THEN 'blocked' ELSE lower(status) END AS email_bucket FROM usage_records WHERE id = 'u1'", .generated = .query, .read = .query },
         .{ .sql = "SELECT CASE WHEN email IS NULL THEN NULL ELSE email END AS maybe_email FROM usage_records WHERE id = 'u1'", .generated = .query, .read = .query },
@@ -1065,6 +1066,20 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 18, .end = 19 }, predicate_call.argument_items.expressions[0].interval_value_tokens.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 24, .end = 25 }, read_ast.where_expression.operator_tokens.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 25, .end = 26 }, read_ast.where_expression.right_tokens.?);
+                } else if (std.mem.eql(u8, case.sql, "SELECT date_bin(INTERVAL '1 hour', TIMESTAMPTZ '2025-01-01T01:30:00+01:30', TIMESTAMP '2025-01-01T00:00:00') AS planned_bucket FROM usage_records WHERE id = $1")) {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.function_call, read_ast.projection_first_expression.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 11 }, read_ast.projection_first_expression.argument_tokens.?);
+                    try std.testing.expectEqual(@as(usize, 3), read_ast.projection_first_expression.argument_items.count);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.interval_literal, read_ast.projection_first_expression.argument_items.expressions[0].kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.timestamp_literal, read_ast.projection_first_expression.argument_items.expressions[1].kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read_ast.projection_first_expression.argument_items.expressions[1].timestamp_type_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read_ast.projection_first_expression.argument_items.expressions[1].timestamp_value_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.timestamp_literal, read_ast.projection_first_expression.argument_items.expressions[2].kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read_ast.projection_first_expression.argument_items.expressions[2].timestamp_type_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read_ast.projection_first_expression.argument_items.expressions[2].timestamp_value_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.comparison, read_ast.where_expression.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 18, .end = 19 }, read_ast.where_expression.operator_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 19, .end = 20 }, read_ast.where_expression.right_tokens.?);
                 } else if (std.mem.eql(u8, case.sql, "SELECT EXTRACT(dow FROM amount) AS amount_dow FROM usage_records WHERE EXTRACT(hour FROM amount) = $1")) {
                     try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.extract_expression, read_ast.projection_first_expression.kind);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read_ast.projection_first_expression.extract_field_tokens.?);

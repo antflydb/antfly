@@ -309,7 +309,8 @@ Suggested migration order:
    name and argument-list metadata, PostgreSQL `CAST(expr AS type)` value and
    target-type ranges, generated coverage for public-tokenizer-normalized
    `expr::type` inputs, generated `INTERVAL '...'` literal value ranges for
-   lowerer-backed date/time functions such as `date_bin`, generated
+   lowerer-backed date/time functions such as `date_bin`, generated `TIMESTAMP
+   '...'` / `TIMESTAMPTZ '...'` literal type/value ranges, generated
    `EXTRACT(field FROM expression)` field/source ranges, and searched `CASE
    WHEN ... THEN ... ELSE ... END` branch metadata.
    Generated read ASTs now have a validated wrapper
