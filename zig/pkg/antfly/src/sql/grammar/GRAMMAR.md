@@ -92,7 +92,8 @@ top-level projection, grouping, ordering, and function argument lists, explicit
 projection expression/alias token splits for explicit `AS` aliases and
 PostgreSQL-style bare aliases, generated ordering direction and `NULLS`
 ordering token splits, and first-join generated metadata for
-join operator/type, left input, right input, and join predicate ranges, plus simple top-level
+join operator/type, left input, right input, `ON` predicate ranges, and
+`USING` column-list ranges, plus simple top-level
 comparison expression metadata for covered `WHERE`, `HAVING`, and join
 predicates. Normal function-call argument
 lists are accepted in generated expression grammar, including top-level
@@ -257,7 +258,7 @@ Suggested migration order:
    PostgreSQL-style bare aliases, generated ordering direction and `NULLS`
    ordering token splits, and owned join item arrays
    with first-join compatibility metadata for join operator/type, left input,
-   right input, and join predicate ranges, plus simple top-level comparison
+   right input, `ON` predicate ranges, and `USING` column-list ranges, plus simple top-level comparison
    expression metadata for covered `WHERE`, `HAVING`, and join predicates; and
    normal function-call argument lists are accepted by the generated expression
    grammar for covered read projections, and positive `LIKE`, `ILIKE`,

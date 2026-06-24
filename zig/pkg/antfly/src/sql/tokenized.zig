@@ -1344,14 +1344,18 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                         try std.testing.expectEqual(generated_parser.GeneratedSqlJoinKind.inner, read_ast.join_items[0].kind);
                         try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read_ast.join_items[0].left_tokens);
                         try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read_ast.join_items[0].right_tokens);
-                        try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 10 }, read_ast.join_items[0].predicate_tokens);
+                        try std.testing.expectEqual(generated_parser.GeneratedSqlJoinConditionKind.on, read_ast.join_items[0].condition_kind);
+                        try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 10 }, read_ast.join_items[0].condition_tokens);
+                        try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 10 }, read_ast.join_items[0].predicate_tokens.?);
                         try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.comparison, read_ast.join_items[0].predicate_expression.kind);
                         try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 16 }, read_ast.join_items[1].tokens);
                         try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read_ast.join_items[1].operator_tokens);
                         try std.testing.expectEqual(generated_parser.GeneratedSqlJoinKind.inner, read_ast.join_items[1].kind);
                         try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 10 }, read_ast.join_items[1].left_tokens);
                         try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 11, .end = 12 }, read_ast.join_items[1].right_tokens);
-                        try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 13, .end = 16 }, read_ast.join_items[1].predicate_tokens);
+                        try std.testing.expectEqual(generated_parser.GeneratedSqlJoinConditionKind.on, read_ast.join_items[1].condition_kind);
+                        try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 12, .end = 16 }, read_ast.join_items[1].condition_tokens);
+                        try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 13, .end = 16 }, read_ast.join_items[1].predicate_tokens.?);
                         try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.comparison, read_ast.join_items[1].predicate_expression.kind);
                     } else if (std.mem.indexOf(u8, case.sql, "LEFT OUTER")) |_| {
                         try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 12 }, read_ast.join_tokens.?);

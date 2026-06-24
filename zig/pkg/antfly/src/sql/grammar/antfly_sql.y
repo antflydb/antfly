@@ -359,8 +359,13 @@ table_reference_list:
 table_reference:
     qualified_name
   | qualified_name AS IDENT
-  | table_reference join_operator table_reference ON expression
+  | table_reference join_operator table_reference join_condition
   | LATERAL LPAREN read_statement RPAREN AS IDENT
+  ;
+
+join_condition:
+    ON expression
+  | USING LPAREN identifier_list RPAREN
   ;
 
 join_operator:
