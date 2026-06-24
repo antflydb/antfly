@@ -175,17 +175,48 @@ pub fn lowerReadPlanFromGeneratedReadAstAlloc(
     const read_kind = parsed_sql.readStatementKind() orelse return error.UnsupportedSqlShape;
     if (!generatedReadAstMatchesReadKind(read_ast.kind, read_kind)) return error.UnsupportedSqlShape;
     try validateGeneratedReadAstRanges(parsed_sql.items(), read_ast);
-    if (read_ast.kind == .query) {
-        try validateGeneratedSimpleQueryReadAst(parsed_sql.items(), read_ast);
-        return .{ .query = try context.callbacks.lower_query_plan(
-            context.alloc,
-            parsed_sql,
-            context.schema,
-            context.params,
-            context.function_bindings,
-        ) };
-    }
-    return try context.lowerParsed(parsed_sql);
+    return switch (read_ast.kind) {
+        .query => blk: {
+            try validateGeneratedSimpleQueryReadAst(parsed_sql.items(), read_ast);
+            break :blk .{ .query = try context.callbacks.lower_query_plan(
+                context.alloc,
+                parsed_sql,
+                context.schema,
+                context.params,
+                context.function_bindings,
+            ) };
+        },
+        .aggregate => blk: {
+            try validateGeneratedAggregateReadAst(read_ast);
+            break :blk .{ .aggregate = try context.callbacks.lower_aggregate_plan(
+                context.alloc,
+                parsed_sql,
+                context.schema,
+                context.params,
+            ) };
+        },
+        .join => blk: {
+            try validateGeneratedJoinedReadAst(parsed_sql.items(), read_ast, .join);
+            break :blk .{ .join = try context.callbacks.lower_join_with_schemas(
+                context.alloc,
+                parsed_sql,
+                context.schema,
+                context.source_schema orelse context.schema,
+                context.params,
+            ) };
+        },
+        .lateral => blk: {
+            try validateGeneratedJoinedReadAst(parsed_sql.items(), read_ast, .lateral);
+            break :blk .{ .lateral = try context.callbacks.lower_lateral_with_schemas(
+                context.alloc,
+                parsed_sql,
+                context.schema,
+                context.source_schema orelse context.schema,
+                context.params,
+            ) };
+        },
+        .cte => try context.lowerParsed(parsed_sql),
+    };
 }
 
 fn generatedReadAstMatchesReadKind(
@@ -263,6 +294,28 @@ fn validateGeneratedSimpleQueryReadAst(tokens: []const tokenized.Token, read_ast
     if (read_ast.limit_tokens) |range| try validateGeneratedReadRangePrecededByKeyword(tokens, range, .limit);
     if (read_ast.offset_tokens) |range| try validateGeneratedReadRangePrecededByKeyword(tokens, range, .offset);
     if (read_ast.fetch_tokens) |range| try validateGeneratedReadRangePrecededByKeyword(tokens, range, .fetch);
+}
+
+fn validateGeneratedAggregateReadAst(read_ast: generated_parser.GeneratedSqlReadAst) !void {
+    if (read_ast.cte_tokens != null or read_ast.window_tokens != null or read_ast.set_operation_tokens != null) {
+        return error.UnsupportedSqlShape;
+    }
+    if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return error.UnsupportedSqlShape;
+    if (read_ast.group_tokens == null and read_ast.having_tokens == null) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedJoinedReadAst(
+    tokens: []const tokenized.Token,
+    read_ast: generated_parser.GeneratedSqlReadAst,
+    keyword: token_mod.TokenKeyword,
+) !void {
+    if (read_ast.cte_tokens != null or read_ast.group_tokens != null or read_ast.having_tokens != null or
+        read_ast.window_tokens != null or read_ast.set_operation_tokens != null)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return error.UnsupportedSqlShape;
+    try validateGeneratedReadRangeContainsKeyword(tokens, read_ast.source_tokens.?, keyword);
 }
 
 fn validateGeneratedReadTokenRange(

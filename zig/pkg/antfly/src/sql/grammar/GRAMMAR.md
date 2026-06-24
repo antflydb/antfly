@@ -89,9 +89,10 @@ covered `SELECT` projections, sources, predicates, grouping, having filters,
 window clauses, ordering, pagination, set-operation tails, and CTE prefixes,
 and an initial generated AST-to-plan wrapper that validates those ranges and
 fails closed if the generated read family is incompatible with the existing
-read classifier. Simple query reads now validate generated clause ranges before
-calling the query-plan lowerer directly; other covered read families still
-delegate to the current typed read lowerer. Unsupported read shapes
+read classifier. Simple query, aggregate, join, and lateral reads now validate
+generated clause ranges before calling their typed read-plan lowerers directly;
+covered CTE reads still delegate to the current typed read lowerer until CTE
+body payloads are generated. Unsupported read shapes
 still fall back, and deeper read cutover still requires full generated
 query-body AST payloads for expression-level projections and predicates,
 structured joins, complete CTE bodies, aggregates, windows, ordering,
@@ -205,7 +206,9 @@ Suggested migration order:
    into the current typed read lowerer for representative covered read plans
    that rejects malformed generated range payloads. Simple query reads now have
    a direct generated AST-to-query-plan lowering boundary after clause-range
-   validation. Switching reads from fallback to required generated parsing still requires
+   validation, and aggregate, join, and lateral reads now have direct generated
+   AST-to-read-family dispatch boundaries after clause-range validation.
+   Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, expression-level and
    join-level generated query-body ASTs, direct generated read-plan lowering,
    and unsupported-shape diagnostics.
