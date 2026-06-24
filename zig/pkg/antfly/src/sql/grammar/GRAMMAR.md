@@ -130,6 +130,10 @@ source, `WHERE`, and set-operation ranges plus owned projection-list and
 `WHERE` predicate expression payloads, plus generated set-operation payloads
 for subquery set-operation tails, and subquery-owned `ORDER BY`, `LIMIT`,
 `OFFSET`, and `FETCH` tail payloads for later direct subquery planning.
+Generated validation rejects unrelated payload fields on generated subquery,
+function-call, and `CASE` expression nodes, so those richer expression kinds now
+have the same kind-specific payload isolation as binary, prefix, grouped, cast,
+extract, array, temporal, and token-range expression nodes.
 `IS NULL` and `IS NOT NULL` predicates are accepted and
 classified as explicit null-test expression kinds, `IS TRUE`/`IS FALSE`/
 `IS UNKNOWN` boolean-test predicates are accepted with their `IS NOT` variants,
@@ -517,8 +521,7 @@ Unsupported DDL remains on the existing parser until
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current
-   validated owned expression item arrays, expression-kind structural checks
-   for remaining function, case, and subquery expression shapes, expression operator/kind token
+   validated owned expression item arrays, expression operator/kind token
    consistency checks for remaining specialized operators beyond the current
    validated binary/operator families, full multi-join
    planning/lowering and richer join-tree semantics beyond the current

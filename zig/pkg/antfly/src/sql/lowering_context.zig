@@ -1086,7 +1086,12 @@ fn generatedExpressionAstHasMetadata(expression: generated_parser.GeneratedSqlEx
         expression.argument_tokens != null or
         expression.argument_distinct_tokens != null or
         expression.argument_value_tokens != null or
+        expression.subquery_select_tokens != null or
+        expression.subquery_projection_tokens != null or
         expression.subquery_projection_items.count != 0 or
+        expression.subquery_source_tokens != null or
+        expression.subquery_where_tokens != null or
+        expression.subquery_set_operation_tokens != null or
         expression.subquery_tail != null or
         expression.argument_order_tokens != null or
         expression.within_group_tokens != null or
@@ -1546,6 +1551,140 @@ fn validateGeneratedArrayExpressionAstStructure(expression: generated_parser.Gen
     payload.tokens = null;
     payload.array_tokens = null;
     payload.array_items = .{};
+    try validateGeneratedExpressionAstHasNoUnexpectedPayload(payload);
+}
+
+fn validateGeneratedSubqueryExpressionAstStructure(expression: generated_parser.GeneratedSqlExpressionAst) !void {
+    if (expression.tokens == null or
+        expression.inner_tokens == null or
+        expression.subquery_read_kind == null or
+        expression.subquery_select_tokens == null or
+        expression.subquery_projection_tokens == null or
+        expression.subquery_projection_items.count == 0)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    if (expression.subquery_where_tokens != null and expression.subquery_where_expression == null) {
+        return error.UnsupportedSqlShape;
+    }
+    try validateGeneratedExpressionAstOptionalChild(
+        expression.subquery_where_expression_kind,
+        expression.subquery_where_tokens,
+        expression.subquery_where_expression,
+    );
+
+    var payload = expression;
+    payload.tokens = null;
+    payload.inner_tokens = null;
+    payload.subquery_read_kind = null;
+    payload.subquery_select_tokens = null;
+    payload.subquery_projection_tokens = null;
+    payload.subquery_projection_items = .{};
+    payload.subquery_source_tokens = null;
+    payload.subquery_where_tokens = null;
+    payload.subquery_where_expression_kind = null;
+    payload.subquery_where_expression = null;
+    payload.subquery_set_operation_tokens = null;
+    payload.subquery_set_operation = null;
+    payload.subquery_tail = null;
+    try validateGeneratedExpressionAstHasNoUnexpectedPayload(payload);
+}
+
+fn validateGeneratedCaseExpressionAstStructure(expression: generated_parser.GeneratedSqlExpressionAst) !void {
+    if (expression.tokens == null or
+        expression.case_branch_count == 0 or
+        expression.case_first_when_tokens == null or
+        expression.case_first_condition_tokens == null or
+        expression.case_first_result_tokens == null)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    if (expression.case_branch_count > 1 and expression.case_last_when_tokens == null) return error.UnsupportedSqlShape;
+    try requireGeneratedExpressionAstChild(expression.case_first_condition_kind, expression.case_first_condition_tokens, expression.case_first_condition);
+    try requireGeneratedExpressionAstChild(expression.case_first_result_kind, expression.case_first_result_tokens, expression.case_first_result);
+    if (expression.case_condition_items.count != expression.case_branch_count or
+        expression.case_result_items.count != expression.case_branch_count)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    if (!std.meta.eql(
+        expression.case_first_condition_tokens.?,
+        expression.case_condition_items.first_tokens orelse return error.UnsupportedSqlShape,
+    )) return error.UnsupportedSqlShape;
+    if (!std.meta.eql(
+        expression.case_first_result_tokens.?,
+        expression.case_result_items.first_tokens orelse return error.UnsupportedSqlShape,
+    )) return error.UnsupportedSqlShape;
+    if (expression.case_else_tokens != null and expression.case_else_expression_tokens == null) return error.UnsupportedSqlShape;
+    if (expression.case_else_expression_tokens != null and expression.case_else_tokens == null) return error.UnsupportedSqlShape;
+    try validateGeneratedExpressionAstOptionalChild(expression.case_else_expression_kind, expression.case_else_expression_tokens, expression.case_else_expression);
+
+    var payload = expression;
+    payload.tokens = null;
+    payload.case_branch_count = 0;
+    payload.case_first_when_tokens = null;
+    payload.case_last_when_tokens = null;
+    payload.case_first_condition_tokens = null;
+    payload.case_first_condition_kind = null;
+    payload.case_first_condition = null;
+    payload.case_first_result_tokens = null;
+    payload.case_first_result_kind = null;
+    payload.case_first_result = null;
+    payload.case_condition_items = .{};
+    payload.case_result_items = .{};
+    payload.case_else_tokens = null;
+    payload.case_else_expression_tokens = null;
+    payload.case_else_expression_kind = null;
+    payload.case_else_expression = null;
+    try validateGeneratedExpressionAstHasNoUnexpectedPayload(payload);
+}
+
+fn validateGeneratedFunctionCallExpressionAstStructure(expression: generated_parser.GeneratedSqlExpressionAst) !void {
+    if (expression.tokens == null or expression.function_name_tokens == null) return error.UnsupportedSqlShape;
+    if (expression.argument_distinct_tokens != null and expression.argument_value_tokens == null) return error.UnsupportedSqlShape;
+    if (expression.argument_value_tokens != null and expression.argument_tokens == null) return error.UnsupportedSqlShape;
+    if (expression.argument_order_tokens != null and expression.argument_order_items.count == 0) return error.UnsupportedSqlShape;
+    if (expression.within_group_tokens != null and
+        (expression.within_group_order_tokens == null or expression.within_group_order_items.count == 0))
+    {
+        return error.UnsupportedSqlShape;
+    }
+    if (expression.within_group_order_tokens != null and expression.within_group_tokens == null) return error.UnsupportedSqlShape;
+    if (expression.filter_tokens != null and expression.filter_predicate_tokens == null) return error.UnsupportedSqlShape;
+    if (expression.filter_predicate_tokens != null and expression.filter_tokens == null) return error.UnsupportedSqlShape;
+    try validateGeneratedExpressionAstOptionalChild(expression.filter_expression_kind, expression.filter_predicate_tokens, expression.filter_expression);
+    try validateGeneratedFunctionOverMetadata(expression);
+
+    var payload = expression;
+    payload.tokens = null;
+    payload.function_name_tokens = null;
+    payload.argument_tokens = null;
+    payload.argument_distinct_tokens = null;
+    payload.argument_value_tokens = null;
+    payload.argument_items = .{};
+    payload.argument_order_tokens = null;
+    payload.argument_order_items = .{};
+    payload.within_group_tokens = null;
+    payload.within_group_order_tokens = null;
+    payload.within_group_order_items = .{};
+    payload.filter_tokens = null;
+    payload.filter_predicate_tokens = null;
+    payload.filter_expression_kind = null;
+    payload.filter_expression = null;
+    payload.over_tokens = null;
+    payload.over_name_tokens = null;
+    payload.over_definition_tokens = null;
+    payload.over_partition_tokens = null;
+    payload.over_partition_items = .{};
+    payload.over_order_tokens = null;
+    payload.over_order_items = .{};
+    payload.over_frame_tokens = null;
+    payload.over_frame_start_expression_tokens = null;
+    payload.over_frame_start_expression_kind = null;
+    payload.over_frame_start_expression = null;
+    payload.over_frame_end_expression_tokens = null;
+    payload.over_frame_end_expression_kind = null;
+    payload.over_frame_end_expression = null;
     try validateGeneratedExpressionAstHasNoUnexpectedPayload(payload);
 }
 
@@ -2397,77 +2536,16 @@ fn validateGeneratedCaseExpressionClauseMetadata(
 fn validateGeneratedExpressionAstStructure(expression: generated_parser.GeneratedSqlExpressionAst) !void {
     switch (expression.kind) {
         .token_range => try validateGeneratedTokenRangeExpressionAstStructure(expression),
-        .subquery => {
-            if (expression.tokens == null or
-                expression.inner_tokens == null or
-                expression.subquery_read_kind == null or
-                expression.subquery_select_tokens == null or
-                expression.subquery_projection_tokens == null or
-                expression.subquery_projection_items.count == 0)
-            {
-                return error.UnsupportedSqlShape;
-            }
-            if (expression.subquery_where_tokens != null and expression.subquery_where_expression == null) {
-                return error.UnsupportedSqlShape;
-            }
-            try validateGeneratedExpressionAstOptionalChild(
-                expression.subquery_where_expression_kind,
-                expression.subquery_where_tokens,
-                expression.subquery_where_expression,
-            );
-        },
+        .subquery => try validateGeneratedSubqueryExpressionAstStructure(expression),
         .grouped => try validateGeneratedGroupedExpressionAstStructure(expression),
         .cast => try validateGeneratedCastExpressionAstStructure(expression),
-        .case_expression => {
-            if (expression.tokens == null or
-                expression.case_branch_count == 0 or
-                expression.case_first_when_tokens == null or
-                expression.case_first_condition_tokens == null or
-                expression.case_first_result_tokens == null)
-            {
-                return error.UnsupportedSqlShape;
-            }
-            if (expression.case_branch_count > 1 and expression.case_last_when_tokens == null) return error.UnsupportedSqlShape;
-            try requireGeneratedExpressionAstChild(expression.case_first_condition_kind, expression.case_first_condition_tokens, expression.case_first_condition);
-            try requireGeneratedExpressionAstChild(expression.case_first_result_kind, expression.case_first_result_tokens, expression.case_first_result);
-            if (expression.case_condition_items.count != expression.case_branch_count or
-                expression.case_result_items.count != expression.case_branch_count)
-            {
-                return error.UnsupportedSqlShape;
-            }
-            if (!std.meta.eql(
-                expression.case_first_condition_tokens.?,
-                expression.case_condition_items.first_tokens orelse return error.UnsupportedSqlShape,
-            )) return error.UnsupportedSqlShape;
-            if (!std.meta.eql(
-                expression.case_first_result_tokens.?,
-                expression.case_result_items.first_tokens orelse return error.UnsupportedSqlShape,
-            )) return error.UnsupportedSqlShape;
-            if (expression.case_else_tokens != null and expression.case_else_expression_tokens == null) return error.UnsupportedSqlShape;
-            if (expression.case_else_expression_tokens != null and expression.case_else_tokens == null) return error.UnsupportedSqlShape;
-            try validateGeneratedExpressionAstOptionalChild(expression.case_else_expression_kind, expression.case_else_expression_tokens, expression.case_else_expression);
-        },
+        .case_expression => try validateGeneratedCaseExpressionAstStructure(expression),
         .interval_literal => try validateGeneratedIntervalExpressionAstStructure(expression),
         .timestamp_literal => try validateGeneratedTimestampExpressionAstStructure(expression),
         .current_date => try validateGeneratedCurrentDateExpressionAstStructure(expression),
         .current_timestamp => try validateGeneratedCurrentTimestampExpressionAstStructure(expression),
         .extract_expression => try validateGeneratedExtractExpressionAstStructure(expression),
-        .function_call => {
-            if (expression.tokens == null or expression.function_name_tokens == null) return error.UnsupportedSqlShape;
-            if (expression.argument_distinct_tokens != null and expression.argument_value_tokens == null) return error.UnsupportedSqlShape;
-            if (expression.argument_value_tokens != null and expression.argument_tokens == null) return error.UnsupportedSqlShape;
-            if (expression.argument_order_tokens != null and expression.argument_order_items.count == 0) return error.UnsupportedSqlShape;
-            if (expression.within_group_tokens != null and
-                (expression.within_group_order_tokens == null or expression.within_group_order_items.count == 0))
-            {
-                return error.UnsupportedSqlShape;
-            }
-            if (expression.within_group_order_tokens != null and expression.within_group_tokens == null) return error.UnsupportedSqlShape;
-            if (expression.filter_tokens != null and expression.filter_predicate_tokens == null) return error.UnsupportedSqlShape;
-            if (expression.filter_predicate_tokens != null and expression.filter_tokens == null) return error.UnsupportedSqlShape;
-            try validateGeneratedExpressionAstOptionalChild(expression.filter_expression_kind, expression.filter_predicate_tokens, expression.filter_expression);
-            try validateGeneratedFunctionOverMetadata(expression);
-        },
+        .function_call => try validateGeneratedFunctionCallExpressionAstStructure(expression),
         .array_constructor => try validateGeneratedArrayExpressionAstStructure(expression),
         .logical_not => try validateGeneratedPrefixExpressionAstStructure(expression),
         .exists_subquery => try validateGeneratedExistsSubqueryExpressionAstStructure(expression, false),
@@ -4113,6 +4191,16 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_function_expression_parsed_sql, malformed_function_expression_read_ast),
     );
+    malformed_function_expression_read_ast = switch (malformed_function_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_function_expression_read_ast.projection_items.expressions[0].operator_tokens =
+        malformed_function_expression_read_ast.projection_items.expressions[0].function_name_tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_function_expression_parsed_sql, malformed_function_expression_read_ast),
+    );
 
     var malformed_function_argument_list_parsed_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -4552,6 +4640,16 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_exists_subquery_projection_parsed_sql, malformed_exists_subquery_projection_read_ast),
     );
+    malformed_exists_subquery_projection_read_ast = switch (malformed_exists_subquery_projection_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_exists_subquery_projection_read_ast.where_expression.right_expression.?.function_name_tokens =
+        malformed_exists_subquery_projection_read_ast.where_expression.right_expression.?.subquery_select_tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_exists_subquery_projection_parsed_sql, malformed_exists_subquery_projection_read_ast),
+    );
 
     var malformed_subquery_set_operation_parsed_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
@@ -4664,6 +4762,16 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     };
     malformed_case_expression_read_ast.projection_items.expressions[0].case_else_expression_tokens =
         malformed_case_expression_read_ast.projection_items.expressions[0].case_else_tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_case_expression_parsed_sql, malformed_case_expression_read_ast),
+    );
+    malformed_case_expression_read_ast = switch (malformed_case_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_case_expression_read_ast.projection_items.expressions[0].operator_tokens =
+        malformed_case_expression_read_ast.projection_items.expressions[0].case_first_condition_tokens;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_case_expression_parsed_sql, malformed_case_expression_read_ast),
