@@ -445,6 +445,8 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.concat_ws, keywordFromIdentifier("CONCAT_WS").?);
     try std.testing.expectEqual(TokenKeyword.function, keywordFromIdentifier("FUNCTION").?);
     try std.testing.expectEqual(TokenKeyword.initcap, keywordFromIdentifier("INITCAP").?);
+    try std.testing.expectEqual(TokenKeyword.all, keywordFromIdentifier("ALL").?);
+    try std.testing.expectEqual(TokenKeyword.any, keywordFromIdentifier("ANY").?);
     try std.testing.expectEqual(TokenKeyword.ilike, keywordFromIdentifier("ILIKE").?);
     try std.testing.expectEqual(TokenKeyword.in, keywordFromIdentifier("IN").?);
     try std.testing.expectEqual(TokenKeyword.interval, keywordFromIdentifier("INTERVAL").?);
@@ -453,6 +455,7 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.like, keywordFromIdentifier("LIKE").?);
     try std.testing.expectEqual(TokenKeyword.lpad, keywordFromIdentifier("LPAD").?);
     try std.testing.expectEqual(TokenKeyword.ltrim, keywordFromIdentifier("LTRIM").?);
+    try std.testing.expectEqual(TokenKeyword.some, keywordFromIdentifier("SOME").?);
     try std.testing.expectEqual(TokenKeyword.matched, keywordFromIdentifier("MATCHED").?);
     try std.testing.expectEqual(TokenKeyword.md5, keywordFromIdentifier("MD5").?);
     try std.testing.expectEqual(TokenKeyword.not, keywordFromIdentifier("NOT").?);

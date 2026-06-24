@@ -95,7 +95,9 @@ lists are accepted in generated expression grammar, including top-level
 projection functions with comma-separated arguments, and positive `LIKE`,
 `ILIKE`, `IN (...)`, and `BETWEEN ... AND ...` predicates are accepted and
 classified in generated expression metadata along with their `NOT` negated
-forms,
+forms. `ANY`/`ALL`/`SOME` quantified comparison predicates over parenthesized
+expression lists are also accepted and classified with explicit quantifier
+token ranges,
 and an initial generated AST-to-plan wrapper that validates those ranges and
 fails closed if the generated read family is incompatible with the existing
 read classifier. Simple query, aggregate, join, and lateral reads now validate
@@ -235,6 +237,9 @@ Suggested migration order:
    grammar for covered read projections, and positive `LIKE`, `ILIKE`,
    `IN (...)`, and `BETWEEN ... AND ...` predicates are accepted and classified
    in generated expression metadata along with their `NOT` negated forms.
+   `ANY`/`ALL`/`SOME` quantified comparison predicates over parenthesized
+   expression lists are accepted and classified with explicit quantifier token
+   ranges.
    Generated read ASTs now have a validated wrapper
    into the current typed read lowerer for representative covered read plans
    that rejects malformed generated range payloads. Simple query reads now have
@@ -259,9 +264,10 @@ Suggested migration order:
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, expression-level and
    full join-tree generated query-body ASTs, full expression AST nodes beyond
-   list-level and simple-comparison/operator metadata, broader function and
-   quantified predicate expression coverage, per-CTE generated body arrays,
-   recursive CTE planning, direct generated read-plan lowering, and
+   list-level and simple-comparison/operator metadata, broader function
+   coverage, quantified subquery and array predicate coverage, per-CTE
+   generated body arrays, recursive CTE planning, direct generated read-plan
+   lowering, and
    unsupported-shape diagnostics.
 5. Advanced DML: `INSERT ... SELECT`, `UPDATE ... FROM`, `DELETE ... USING`,
    `TRUNCATE`, and `MERGE`.
