@@ -856,7 +856,22 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
             else => return error.TestUnexpectedResult,
         }
         switch (parsed.generated_statement.?.ast.?) {
-            .read => |read_ast| try std.testing.expectEqual(case.generated, read_ast.kind),
+            .read => |read_ast| {
+                try std.testing.expectEqual(case.generated, read_ast.kind);
+                if (std.mem.eql(u8, case.sql, "SELECT id, status FROM usage_records WHERE status = 'open' ORDER BY id LIMIT 10")) {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = 4 }, read_ast.projection_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read_ast.source_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 10 }, read_ast.where_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read_ast.order_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 14, .end = 15 }, read_ast.limit_tokens.?);
+                } else if (case.generated == .aggregate) {
+                    try std.testing.expect(read_ast.group_tokens != null);
+                    try std.testing.expect(read_ast.having_tokens != null);
+                } else if (case.generated == .cte) {
+                    try std.testing.expect(read_ast.cte_tokens != null);
+                    try std.testing.expect(read_ast.projection_tokens != null);
+                }
+            },
             else => return error.TestUnexpectedResult,
         }
         switch (parsed.statement) {

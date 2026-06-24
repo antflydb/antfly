@@ -84,13 +84,16 @@ payloads for broader `INSERT ... SELECT` source bodies, semijoin/exists joined
 mutation bodies, and full `MERGE` arm bodies.
 Representative
 read queries now have generated-parser corpus coverage, retained generated raw
-and AST nodes for covered read statements, and an initial generated AST-to-plan
-wrapper that fails closed if
+and AST nodes for covered read statements, top-level generated AST ranges for
+covered `SELECT` projections, sources, predicates, grouping, having filters,
+window clauses, ordering, pagination, set-operation tails, and CTE prefixes,
+and an initial generated AST-to-plan wrapper that fails closed if
 the generated read family is incompatible with the existing read classifier
 before delegating to the current typed read lowerer. Unsupported read shapes
-still fall back, and deeper read cutover still requires generated query-body
-AST payloads for projections, predicates, sources, joins, CTE bodies,
-aggregates, windows, ordering, and limits. The generated parser now also treats seed
+still fall back, and deeper read cutover still requires full generated
+query-body AST payloads for expression-level projections and predicates,
+structured joins, complete CTE bodies, aggregates, windows, ordering,
+pagination, and direct generated read-plan lowering. The generated parser now also treats seed
 graph DDL as a distinct graph statement family and `ParsedSql` retains those
 generated raw and AST nodes. Seed graph index and graph metric statements now
 have graph-specific generated AST-to-plan wrappers that lower to typed index
@@ -193,11 +196,15 @@ Suggested migration order:
    set operations, lateral, ordering, limits, and document-table sources.
    Initial generated-parser coverage now retains raw and AST read nodes for
    representative projection/filter/order/limit, grouped, join, lateral, and
-   non-recursive CTE query shapes; generated read ASTs now have a validated
-   wrapper into the current typed read lowerer for representative covered read
-   plans. Switching reads from fallback to required generated parsing still
-   requires broader PostgreSQL-compatible grammar coverage, generated query-body
-   ASTs, and unsupported-shape diagnostics.
+   non-recursive CTE query shapes; generated read ASTs now carry top-level
+   ranges for covered `SELECT` projection, source, `WHERE`, `GROUP BY`,
+   `HAVING`, `WINDOW`, `ORDER BY`, `LIMIT`, `OFFSET`, `FETCH`, set-operation,
+   and CTE-prefix bodies; and generated read ASTs now have a validated wrapper
+   into the current typed read lowerer for representative covered read plans.
+   Switching reads from fallback to required generated parsing still requires
+   broader PostgreSQL-compatible grammar coverage, expression-level and
+   join-level generated query-body ASTs, direct generated read-plan lowering,
+   and unsupported-shape diagnostics.
 5. Advanced DML: `INSERT ... SELECT`, `UPDATE ... FROM`, `DELETE ... USING`,
    `TRUNCATE`, and `MERGE`.
 6. Antfly extensions: graph traversal DSL, graph metric query surfaces,

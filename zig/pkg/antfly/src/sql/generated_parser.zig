@@ -161,6 +161,18 @@ pub const GeneratedSqlReadAst = struct {
     kind: GeneratedSqlReadKind,
     statement_span: token_mod.SourceSpan,
     command_span: token_mod.SourceSpan,
+    cte_tokens: ?GeneratedSqlTokenRange = null,
+    projection_tokens: ?GeneratedSqlTokenRange = null,
+    source_tokens: ?GeneratedSqlTokenRange = null,
+    where_tokens: ?GeneratedSqlTokenRange = null,
+    group_tokens: ?GeneratedSqlTokenRange = null,
+    having_tokens: ?GeneratedSqlTokenRange = null,
+    window_tokens: ?GeneratedSqlTokenRange = null,
+    order_tokens: ?GeneratedSqlTokenRange = null,
+    limit_tokens: ?GeneratedSqlTokenRange = null,
+    offset_tokens: ?GeneratedSqlTokenRange = null,
+    fetch_tokens: ?GeneratedSqlTokenRange = null,
+    set_operation_tokens: ?GeneratedSqlTokenRange = null,
 };
 
 pub const GeneratedSqlGraphAst = struct {
@@ -497,11 +509,7 @@ fn buildGeneratedAst(tokens: []const token_mod.Token, statement: GeneratedSqlSta
         .prepared => |kind| .{ .prepared = buildPreparedAst(tokens, end, kind, statement_span, command_span) },
         .ddl => |kind| .{ .ddl = buildDdlAst(tokens, end, kind, statement_span, command_span) },
         .dml => |kind| .{ .dml = buildDmlAst(tokens, end, kind, statement_span, command_span) },
-        .read => |kind| .{ .read = .{
-            .kind = kind,
-            .statement_span = statement_span,
-            .command_span = command_span,
-        } },
+        .read => |kind| .{ .read = buildReadAst(tokens, end, kind, statement_span, command_span) },
         .graph => |kind| .{ .graph = .{
             .kind = kind,
             .statement_span = statement_span,
@@ -652,6 +660,80 @@ fn buildDmlAst(
     return ast;
 }
 
+fn buildReadAst(
+    tokens: []const token_mod.Token,
+    end: usize,
+    kind: GeneratedSqlReadKind,
+    statement_span: token_mod.SourceSpan,
+    command_span: token_mod.SourceSpan,
+) GeneratedSqlReadAst {
+    var ast = GeneratedSqlReadAst{
+        .kind = kind,
+        .statement_span = statement_span,
+        .command_span = command_span,
+    };
+    const select_index = findTopLevelKeyword(tokens, 0, end, .select) orelse return ast;
+    if (select_index > 0 and tokens[0].matchesKeywordTag(.with)) {
+        ast.cte_tokens = .{ .start = 1, .end = select_index };
+    }
+
+    const body_end = firstTopLevelSetOperation(tokens, select_index + 1, end) orelse end;
+    if (body_end < end) ast.set_operation_tokens = .{ .start = body_end, .end = end };
+
+    const from_index = findTopLevelKeyword(tokens, select_index + 1, body_end, .from);
+    const where_index = findTopLevelKeyword(tokens, select_index + 1, body_end, .where);
+    const group_index = findTopLevelKeyword(tokens, select_index + 1, body_end, .group);
+    const having_index = findTopLevelKeyword(tokens, select_index + 1, body_end, .having);
+    const window_index = findTopLevelKeyword(tokens, select_index + 1, body_end, .window);
+    const order_index = findTopLevelKeyword(tokens, select_index + 1, body_end, .order);
+    const limit_index = findTopLevelKeyword(tokens, select_index + 1, body_end, .limit);
+    const offset_index = findTopLevelKeyword(tokens, select_index + 1, body_end, .offset);
+    const fetch_index = findTopLevelKeyword(tokens, select_index + 1, body_end, .fetch);
+
+    const projection_end = firstOptionalIndex(&[_]?usize{ from_index, where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
+    if (select_index + 1 < projection_end) ast.projection_tokens = .{ .start = select_index + 1, .end = projection_end };
+
+    if (from_index) |idx| {
+        const source_end = firstOptionalIndex(&[_]?usize{ where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
+        if (idx + 1 < source_end) ast.source_tokens = .{ .start = idx + 1, .end = source_end };
+    }
+    if (where_index) |idx| {
+        const where_end = firstOptionalIndex(&[_]?usize{ group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
+        if (idx + 1 < where_end) ast.where_tokens = .{ .start = idx + 1, .end = where_end };
+    }
+    if (group_index) |idx| {
+        const group_start = if (idx + 1 < body_end and tokens[idx + 1].matchesKeywordTag(.by)) idx + 2 else idx + 1;
+        const group_end = firstOptionalIndex(&[_]?usize{ having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
+        if (group_start < group_end) ast.group_tokens = .{ .start = group_start, .end = group_end };
+    }
+    if (having_index) |idx| {
+        const having_end = firstOptionalIndex(&[_]?usize{ window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
+        if (idx + 1 < having_end) ast.having_tokens = .{ .start = idx + 1, .end = having_end };
+    }
+    if (window_index) |idx| {
+        const window_end = firstOptionalIndex(&[_]?usize{ order_index, limit_index, offset_index, fetch_index }) orelse body_end;
+        if (idx + 1 < window_end) ast.window_tokens = .{ .start = idx + 1, .end = window_end };
+    }
+    if (order_index) |idx| {
+        const order_start = if (idx + 1 < body_end and tokens[idx + 1].matchesKeywordTag(.by)) idx + 2 else idx + 1;
+        const order_end = firstOptionalIndex(&[_]?usize{ limit_index, offset_index, fetch_index }) orelse body_end;
+        if (order_start < order_end) ast.order_tokens = .{ .start = order_start, .end = order_end };
+    }
+    if (limit_index) |idx| {
+        const limit_end = firstOptionalIndex(&[_]?usize{ offset_index, fetch_index }) orelse body_end;
+        if (idx + 1 < limit_end) ast.limit_tokens = .{ .start = idx + 1, .end = limit_end };
+    }
+    if (offset_index) |idx| {
+        const offset_end = firstOptionalIndex(&[_]?usize{fetch_index}) orelse body_end;
+        if (idx + 1 < offset_end) ast.offset_tokens = .{ .start = idx + 1, .end = offset_end };
+    }
+    if (fetch_index) |idx| {
+        if (idx + 1 < body_end) ast.fetch_tokens = .{ .start = idx + 1, .end = body_end };
+    }
+
+    return ast;
+}
+
 fn buildInsertDmlAst(tokens: []const token_mod.Token, end: usize, ast: *GeneratedSqlDmlAst) void {
     if (end < 4 or !tokens[1].matchesKeywordTag(.into)) return;
     ast.target_table_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 2, end);
@@ -777,6 +859,17 @@ fn generatedTruncateHasRestartIdentity(tokens: []const token_mod.Token, start: u
         tokens[start + 1].matchesKeywordTag(.identity);
 }
 
+fn firstTopLevelSetOperation(tokens: []const token_mod.Token, start: usize, end: usize) ?usize {
+    var best: ?usize = null;
+    const candidates = [_]token_mod.TokenKeyword{ .@"union", .intersect, .except };
+    for (candidates) |keyword| {
+        if (findTopLevelKeyword(tokens, start, end, keyword)) |idx| {
+            if (best == null or idx < best.?) best = idx;
+        }
+    }
+    return best;
+}
+
 fn consumeGeneratedIfNotExists(tokens: []const token_mod.Token, index: *usize, end: usize) bool {
     if (index.* + 2 >= end) return false;
     if (!tokens[index.*].matchesKeywordTag(.@"if") or
@@ -874,6 +967,16 @@ fn minOptionalIndex(a: ?usize, b: ?usize) ?usize {
     if (a == null) return b;
     if (b == null) return a;
     return @min(a.?, b.?);
+}
+
+fn firstOptionalIndex(indices: []const ?usize) ?usize {
+    var best: ?usize = null;
+    for (indices) |index| {
+        if (index) |idx| {
+            if (best == null or idx < best.?) best = idx;
+        }
+    }
+    return best;
 }
 
 fn statementTokenEnd(tokens: []const token_mod.Token) usize {
@@ -1077,13 +1180,45 @@ test "generated SQL parser facade builds control AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
-    const read_sql = "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id";
+    const read_sql = "SELECT id, status FROM usage_records WHERE status = 'open' ORDER BY id LIMIT 10";
     const read_result = try parseSqlAlloc(alloc, read_sql);
     switch (read_result.ast.?) {
         .read => |read| {
-            try std.testing.expectEqual(GeneratedSqlReadKind.join, read.kind);
-            try std.testing.expectEqualStrings("SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id", spanText(read_sql, read.statement_span));
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqualStrings("SELECT id, status FROM usage_records WHERE status = 'open' ORDER BY id LIMIT 10", spanText(read_sql, read.statement_span));
             try std.testing.expectEqualStrings("SELECT", spanText(read_sql, read.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 4 }, read.projection_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 10 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read.order_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 14, .end = 15 }, read.limit_tokens.?);
+            try std.testing.expect(read.group_tokens == null);
+            try std.testing.expect(read.having_tokens == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const aggregate_read_sql = "SELECT status FROM usage_records GROUP BY status HAVING count > 1";
+    const aggregate_read_result = try parseSqlAlloc(alloc, aggregate_read_sql);
+    switch (aggregate_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.aggregate, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.projection_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.group_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 11 }, read.having_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const cte_read_sql = "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows";
+    const cte_read_result = try parseSqlAlloc(alloc, cte_read_sql);
+    switch (cte_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.cte, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 9 }, read.cte_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.projection_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read.source_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
