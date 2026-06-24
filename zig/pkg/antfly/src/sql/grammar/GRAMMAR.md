@@ -267,6 +267,8 @@ Suggested migration order:
    classified with generated operator ranges and array-constructor metadata for
    key-list variants. POSIX-style regex predicate operators `~`, `~*`, `!~`,
    and `!~*` are accepted and classified with generated operator ranges.
+   String concatenation with `||` is accepted and classified with generated
+   operator ranges in projections and predicates.
    `IS NULL` and `IS NOT NULL` predicates are accepted and classified
    as explicit null-test expression kinds, `IS TRUE`/`IS FALSE`/`IS UNKNOWN`
    boolean-test predicates are accepted with their `IS NOT` variants, and
@@ -315,8 +317,8 @@ Suggested migration order:
    lowering/cutover beyond the current generated AST metadata, broader expression AST
    nodes beyond the current recursive predicate/operator metadata, broader function
    coverage, broader boolean expression-tree coverage, quantified subquery
-   predicate coverage, remaining specialized expression operators such as
-   string concatenation, recursive CTE planning, direct generated read-plan lowering, and
+   predicate coverage, remaining specialized expression operators, recursive
+   CTE planning, direct generated read-plan lowering, and
    unsupported-shape diagnostics.
 5. Advanced DML: `INSERT ... SELECT`, `UPDATE ... FROM`, `DELETE ... USING`,
    `TRUNCATE`, and `MERGE`.

@@ -28,7 +28,7 @@
 
 %token IDENT STRING NUMBER PLACEHOLDER
 %token COMMA DOT STAR SEMICOLON LPAREN RPAREN LBRACKET RBRACKET
-%token EQ NEQ LT LTE GT GTE PLUS MINUS SLASH PERCENT COLON COLON_COLON
+%token EQ NEQ LT LTE GT GTE PLUS MINUS SLASH PERCENT PIPE_CONCAT COLON COLON_COLON
 %token AT_CONTAINS RANGE_OVERLAP QUESTION QUESTION_ANY QUESTION_ALL
 %token ARROW_JSON ARROW_TEXT PATH_ARROW_JSON PATH_ARROW_TEXT
 %token REGEX_MATCH REGEX_IMATCH REGEX_NOT_MATCH REGEX_NOT_IMATCH
@@ -590,41 +590,41 @@ not_expression:
   ;
 
 comparison_expression:
-    additive_expression
-  | additive_expression EQ additive_expression
-  | additive_expression NEQ additive_expression
-  | additive_expression LT additive_expression
-  | additive_expression LTE additive_expression
-  | additive_expression GT additive_expression
-  | additive_expression GTE additive_expression
-  | additive_expression AT_CONTAINS additive_expression
-  | additive_expression RANGE_OVERLAP additive_expression
-  | additive_expression QUESTION additive_expression
-  | additive_expression QUESTION_ANY additive_expression
-  | additive_expression QUESTION_ALL additive_expression
-  | additive_expression REGEX_MATCH additive_expression
-  | additive_expression REGEX_IMATCH additive_expression
-  | additive_expression REGEX_NOT_MATCH additive_expression
-  | additive_expression REGEX_NOT_IMATCH additive_expression
-  | additive_expression LIKE additive_expression
-  | additive_expression ILIKE additive_expression
-  | additive_expression IN LPAREN expression_list RPAREN
-  | additive_expression BETWEEN additive_expression AND additive_expression
-  | additive_expression NOT LIKE additive_expression
-  | additive_expression NOT ILIKE additive_expression
-  | additive_expression NOT IN LPAREN expression_list RPAREN
-  | additive_expression NOT BETWEEN additive_expression AND additive_expression
-  | additive_expression comparison_operator quantified_operator LPAREN expression_list RPAREN
-  | additive_expression IS NULL
-  | additive_expression IS NOT NULL
-  | additive_expression IS TRUE
-  | additive_expression IS FALSE
-  | additive_expression IS UNKNOWN
-  | additive_expression IS NOT TRUE
-  | additive_expression IS NOT FALSE
-  | additive_expression IS NOT UNKNOWN
-  | additive_expression IS DISTINCT FROM additive_expression
-  | additive_expression IS NOT DISTINCT FROM additive_expression
+    concat_expression
+  | concat_expression EQ concat_expression
+  | concat_expression NEQ concat_expression
+  | concat_expression LT concat_expression
+  | concat_expression LTE concat_expression
+  | concat_expression GT concat_expression
+  | concat_expression GTE concat_expression
+  | concat_expression AT_CONTAINS concat_expression
+  | concat_expression RANGE_OVERLAP concat_expression
+  | concat_expression QUESTION concat_expression
+  | concat_expression QUESTION_ANY concat_expression
+  | concat_expression QUESTION_ALL concat_expression
+  | concat_expression REGEX_MATCH concat_expression
+  | concat_expression REGEX_IMATCH concat_expression
+  | concat_expression REGEX_NOT_MATCH concat_expression
+  | concat_expression REGEX_NOT_IMATCH concat_expression
+  | concat_expression LIKE concat_expression
+  | concat_expression ILIKE concat_expression
+  | concat_expression IN LPAREN expression_list RPAREN
+  | concat_expression BETWEEN concat_expression AND concat_expression
+  | concat_expression NOT LIKE concat_expression
+  | concat_expression NOT ILIKE concat_expression
+  | concat_expression NOT IN LPAREN expression_list RPAREN
+  | concat_expression NOT BETWEEN concat_expression AND concat_expression
+  | concat_expression comparison_operator quantified_operator LPAREN expression_list RPAREN
+  | concat_expression IS NULL
+  | concat_expression IS NOT NULL
+  | concat_expression IS TRUE
+  | concat_expression IS FALSE
+  | concat_expression IS UNKNOWN
+  | concat_expression IS NOT TRUE
+  | concat_expression IS NOT FALSE
+  | concat_expression IS NOT UNKNOWN
+  | concat_expression IS DISTINCT FROM concat_expression
+  | concat_expression IS NOT DISTINCT FROM concat_expression
   ;
 
 comparison_operator:
@@ -640,6 +640,11 @@ quantified_operator:
     ANY
   | ALL
   | SOME
+  ;
+
+concat_expression:
+    additive_expression
+  | concat_expression PIPE_CONCAT additive_expression
   ;
 
 additive_expression:

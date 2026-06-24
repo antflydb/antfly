@@ -877,6 +877,8 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
         .{ .sql = "SELECT id FROM usage_records WHERE status ~* 'op.*'", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE status !~ 'closed.*'", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE status !~* 'closed.*'", .generated = .query, .read = .query },
+        .{ .sql = "SELECT first_name || ' ' || last_name FROM usage_records", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records WHERE status || ':' || id = 'open:u1'", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE deleted_at IS NULL", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE deleted_at IS NOT NULL", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE active IS TRUE", .generated = .query, .read = .query },
@@ -1083,6 +1085,20 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read_ast.where_expression.left_tokens.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read_ast.where_expression.operator_tokens.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read_ast.where_expression.right_tokens.?);
+                } else if (std.mem.eql(u8, case.sql, "SELECT first_name || ' ' || last_name FROM usage_records")) {
+                    try std.testing.expectEqual(@as(usize, 1), read_ast.projection_items.count);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.string_concat, read_ast.projection_items.expressions[0].kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read_ast.projection_items.expressions[0].left_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, read_ast.projection_items.expressions[0].operator_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 6 }, read_ast.projection_items.expressions[0].right_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.string_concat, read_ast.projection_items.expressions[0].right_expression_kind.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.string_concat, read_ast.projection_first_expression.kind);
+                } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records WHERE status || ':' || id = 'open:u1'")) {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.comparison, read_ast.where_expression.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 10 }, read_ast.where_expression.left_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.string_concat, read_ast.where_expression.left_expression_kind.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read_ast.where_expression.operator_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 11, .end = 12 }, read_ast.where_expression.right_tokens.?);
                 } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records WHERE deleted_at IS NULL")) {
                     try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.is_null, read_ast.where_expression.kind);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read_ast.where_expression.left_tokens.?);

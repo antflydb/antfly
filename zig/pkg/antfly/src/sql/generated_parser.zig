@@ -171,6 +171,7 @@ pub const GeneratedSqlExpressionKind = enum {
     regex_imatch,
     regex_not_match,
     regex_not_imatch,
+    string_concat,
     json_access,
     json_text_access,
     json_path_access,
@@ -503,6 +504,8 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT id FROM usage_records WHERE status ~* 'op.*'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status !~ 'closed.*'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status !~* 'closed.*'", .kind = .read },
+    .{ .sql = "SELECT first_name || ' ' || last_name FROM usage_records", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE status || ':' || id = 'open:u1'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE deleted_at IS NULL", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE deleted_at IS NOT NULL", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE active IS TRUE", .kind = .read },
@@ -651,6 +654,7 @@ fn appendTokenIds(alloc: std.mem.Allocator, ids: *std.ArrayListUnmanaged(u16), t
         .minus => try appendSymbol(ids, alloc, "MINUS"),
         .slash => try appendSymbol(ids, alloc, "SLASH"),
         .percent => try appendSymbol(ids, alloc, "PERCENT"),
+        .pipe_concat => try appendSymbol(ids, alloc, "PIPE_CONCAT"),
         .at_contains => try appendSymbol(ids, alloc, "AT_CONTAINS"),
         .range_overlap => try appendSymbol(ids, alloc, "RANGE_OVERLAP"),
         .question => try appendSymbol(ids, alloc, "QUESTION"),
@@ -669,7 +673,6 @@ fn appendTokenIds(alloc: std.mem.Allocator, ids: *std.ArrayListUnmanaged(u16), t
         .path_arrow_json => try appendSymbol(ids, alloc, "PATH_ARROW_JSON"),
         .path_arrow_text => try appendSymbol(ids, alloc, "PATH_ARROW_TEXT"),
         .semicolon => try appendSymbol(ids, alloc, "SEMICOLON"),
-        else => return error.UnsupportedSqlShape,
     }
 }
 
@@ -1833,6 +1836,19 @@ fn findTopLevelExpressionOperator(tokens: []const token_mod.Token, range: Genera
                 if (depth == 0) return null;
                 depth -= 1;
             },
+            .pipe_concat => if (depth == 0 and index > range.start and index + 1 < range.end) return .{ .kind = .string_concat, .index = index },
+            else => {},
+        }
+    }
+    depth = 0;
+    index = range.start;
+    while (index < range.end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth == 0) return null;
+                depth -= 1;
+            },
             .plus => if (depth == 0 and index > range.start) return .{ .kind = .additive, .index = index },
             .minus => if (depth == 0 and index > range.start) return .{ .kind = .subtractive, .index = index },
             else => {},
@@ -2511,6 +2527,38 @@ test "generated SQL parser facade builds control AST spans" {
             },
             else => return error.TestUnexpectedResult,
         }
+    }
+
+    const concat_projection_read_sql = "SELECT first_name || ' ' || last_name FROM usage_records";
+    const concat_projection_read_result = try parseSqlAlloc(alloc, concat_projection_read_sql);
+    switch (concat_projection_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 6 }, read.projection_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), read.projection_items.count);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.string_concat, read.projection_items.expressions[0].kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.projection_items.expressions[0].left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, read.projection_items.expressions[0].operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 6 }, read.projection_items.expressions[0].right_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.string_concat, read.projection_items.expressions[0].right_expression_kind.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.string_concat, read.projection_first_expression.kind);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const concat_predicate_read_sql = "SELECT id FROM usage_records WHERE status || ':' || id = 'open:u1'";
+    const concat_predicate_read_result = try parseSqlAlloc(alloc, concat_predicate_read_sql);
+    switch (concat_predicate_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 10 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.string_concat, read.where_expression.left_expression_kind.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.string_concat, read.where_expression.left_expression.?.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 12 }, read.where_expression.right_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
     }
 
     const is_null_read_sql = "SELECT id FROM usage_records WHERE deleted_at IS NULL";
@@ -3270,7 +3318,7 @@ test "generated SQL parser reports bounded diagnostics for malformed corpus" {
 }
 
 test "generated SQL parser rejects unsupported token shapes" {
-    try std.testing.expectError(error.UnsupportedSqlShape, parseSqlAlloc(std.testing.allocator, "SELECT a || b"));
+    try std.testing.expectError(error.UnsupportedSqlShape, parseSqlAlloc(std.testing.allocator, "SELECT a ! b"));
 }
 
 fn spanText(sql: []const u8, span: token_mod.SourceSpan) []const u8 {
