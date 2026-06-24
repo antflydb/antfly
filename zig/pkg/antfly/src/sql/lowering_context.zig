@@ -361,6 +361,7 @@ fn validateGeneratedWindowReadAst(tokens: []const tokenized.Token, read_ast: gen
     }
     if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return error.UnsupportedSqlShape;
     try validateGeneratedReadRangeContainsKeyword(tokens, read_ast.projection_tokens.?, .over);
+    if (read_ast.window_tokens) |range| try validateGeneratedReadRangePrecededByKeyword(tokens, range, .window);
 }
 
 fn validateGeneratedSetOperationReadAst(read_ast: generated_parser.GeneratedSqlReadAst) !void {

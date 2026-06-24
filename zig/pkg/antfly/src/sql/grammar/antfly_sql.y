@@ -35,7 +35,7 @@
 %token EXPLAIN EXISTS EXTENSION FALSE FETCH FIRST FROM FULL GRAPH GROUP HAVING IDENTITY IF INDEX INSERT INTO
 %token JOIN KEY LATERAL LIMIT MATCHED MERGE METRIC NOT NULL ON OR ORDER OVER PREPARE PRIMARY PUBLIC
 %token NEXT NOTHING OFFSET ONLY QUERY RESET RESTART RESTRICT RETURNING ROLLBACK ROW ROWS SCHEMA SELECT SET SHOW TABLE TO TRUNCATE
-%token THEN TRUE UNION UPDATE USING VALUES WHEN WHERE WITH
+%token THEN TRUE UNION UPDATE USING VALUES WHEN WHERE WINDOW WITH
 %token EXCEPT INTERSECT
 
 statement:
@@ -207,7 +207,7 @@ all_opt:
   ;
 
 select_statement:
-    SELECT select_list from_clause_opt where_clause_opt group_by_clause_opt having_clause_opt order_by_clause_opt pagination_clause_list_opt
+    SELECT select_list from_clause_opt where_clause_opt group_by_clause_opt having_clause_opt window_clause_opt order_by_clause_opt pagination_clause_list_opt
   ;
 
 graph_statement:
@@ -287,10 +287,25 @@ select_item:
 
 window_function_expression:
     qualified_name LPAREN argument_list_opt RPAREN OVER LPAREN window_definition RPAREN
+  | qualified_name LPAREN argument_list_opt RPAREN OVER IDENT
   ;
 
 window_definition:
     order_by_clause_opt
+  ;
+
+window_clause_opt:
+    /* empty */
+  | WINDOW named_window_list
+  ;
+
+named_window_list:
+    named_window
+  | named_window_list COMMA named_window
+  ;
+
+named_window:
+    IDENT AS LPAREN window_definition RPAREN
   ;
 
 from_clause_opt:
