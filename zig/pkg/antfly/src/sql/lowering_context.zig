@@ -1133,7 +1133,14 @@ fn validateGeneratedExpressionAstStructure(expression: generated_parser.Generate
             if (expression.tokens == null) return error.UnsupportedSqlShape;
         },
         .subquery => {
-            if (expression.tokens == null or expression.inner_tokens == null) return error.UnsupportedSqlShape;
+            if (expression.tokens == null or
+                expression.inner_tokens == null or
+                expression.subquery_read_kind == null or
+                expression.subquery_select_tokens == null or
+                expression.subquery_projection_tokens == null)
+            {
+                return error.UnsupportedSqlShape;
+            }
         },
         .grouped => {
             if (expression.tokens == null or expression.inner_tokens == null) return error.UnsupportedSqlShape;
@@ -1289,6 +1296,11 @@ fn validateGeneratedExpressionAstRanges(
     const ranges = [_]?generated_parser.GeneratedSqlTokenRange{
         expression.tokens,
         expression.inner_tokens,
+        expression.subquery_select_tokens,
+        expression.subquery_projection_tokens,
+        expression.subquery_source_tokens,
+        expression.subquery_where_tokens,
+        expression.subquery_set_operation_tokens,
         expression.function_name_tokens,
         expression.argument_tokens,
         expression.argument_distinct_tokens,
@@ -1345,6 +1357,22 @@ fn validateGeneratedExpressionAstRanges(
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.over_partition_items);
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.over_order_items);
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.array_items);
+    if (expression.kind == .subquery) {
+        const inner = expression.inner_tokens orelse return error.UnsupportedSqlShape;
+        const select_tokens = expression.subquery_select_tokens orelse return error.UnsupportedSqlShape;
+        const projection_tokens = expression.subquery_projection_tokens orelse return error.UnsupportedSqlShape;
+        if (select_tokens.start < inner.start or select_tokens.end > inner.end) return error.UnsupportedSqlShape;
+        if (projection_tokens.start < select_tokens.end or projection_tokens.end > inner.end) return error.UnsupportedSqlShape;
+        if (expression.subquery_source_tokens) |source_tokens| {
+            if (source_tokens.start < projection_tokens.end or source_tokens.end > inner.end) return error.UnsupportedSqlShape;
+        }
+        if (expression.subquery_where_tokens) |where_tokens| {
+            if (where_tokens.start <= projection_tokens.end or where_tokens.end > inner.end) return error.UnsupportedSqlShape;
+        }
+        if (expression.subquery_set_operation_tokens) |set_operation_tokens| {
+            if (set_operation_tokens.start <= projection_tokens.end or set_operation_tokens.end > inner.end) return error.UnsupportedSqlShape;
+        }
+    }
     if (expression.over_definition_tokens) |definition| {
         if (expression.over_partition_tokens) |partition| {
             if (partition.start < definition.start or partition.end > definition.end) return error.UnsupportedSqlShape;
@@ -2323,6 +2351,22 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_exists_subquery_parsed_sql, malformed_exists_subquery_read_ast),
+    );
+
+    var malformed_exists_subquery_projection_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE EXISTS (SELECT 1 FROM thresholds WHERE active IS TRUE)",
+    );
+    defer malformed_exists_subquery_projection_parsed_sql.deinit(alloc);
+    const malformed_exists_subquery_projection_generated_raw = malformed_exists_subquery_projection_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_exists_subquery_projection_read_ast = switch (malformed_exists_subquery_projection_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_exists_subquery_projection_read_ast.where_expression.right_expression.?.subquery_projection_tokens = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_exists_subquery_projection_parsed_sql, malformed_exists_subquery_projection_read_ast),
     );
 
     var malformed_in_subquery_parsed_sql = try tokenized.ParsedSql.initAlloc(
