@@ -188,16 +188,6 @@ def _first_sql_json(stdout: str) -> dict[str, Any]:
 
 def _select_rows(sql_cli, sql: str) -> list[dict[str, Any]] | None:
     result = sql_cli("sql", "-c", sql, check=False)
-    if os.environ.get("ANTFLY_DEBUG_SQL_E2E"):
-        print(
-            "SQL DEBUG",
-            {
-                "sql": sql,
-                "returncode": result.returncode,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-            },
-        )
     if result.returncode != 0:
         return None
     response = _first_sql_json(result.stdout)
@@ -439,6 +429,56 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     )
     assert lookup_unnested_rows == [{"_id": "doc:a", "tag": "urgent"}]
 
+    indexed_unnested_rows = wait_until(
+        lambda: _select_rows(
+            sql_cli,
+            (
+                f"SELECT d._id, tag FROM {table} AS d, UNNEST(d.tags) AS tag "
+                "WHERE full_text_search('body:search') AND tag = 'archive' LIMIT 10;"
+            ),
+        ),
+        timeout_s=15.0,
+        interval_s=0.5,
+    )
+    assert indexed_unnested_rows == [{"_id": "doc:d", "tag": "archive"}]
+
+    ordered_indexed_unnested_rows = wait_until(
+        lambda: _select_rows(
+            sql_cli,
+            (
+                f"SELECT d._id, tag FROM {table} AS d, UNNEST(d.tags) AS tag "
+                "WHERE full_text_search('body:search') ORDER BY tag ASC LIMIT 4;"
+            ),
+        ),
+        timeout_s=15.0,
+        interval_s=0.5,
+    )
+    assert ordered_indexed_unnested_rows == [
+        {"_id": "doc:d", "tag": "archive"},
+        {"_id": "doc:a", "tag": "search"},
+        {"_id": "doc:c", "tag": "search"},
+        {"_id": "doc:d", "tag": "search"},
+    ]
+
+    ordered_unnested_rows = wait_until(
+        lambda: _select_rows(
+            sql_cli,
+            (
+                f"SELECT d._id, tag FROM {table} AS d, UNNEST(d.tags) AS tag "
+                "ORDER BY tag ASC LIMIT 5;"
+            ),
+        ),
+        timeout_s=15.0,
+        interval_s=0.5,
+    )
+    assert ordered_unnested_rows == [
+        {"_id": "doc:b", "tag": "archive"},
+        {"_id": "doc:d", "tag": "archive"},
+        {"_id": "doc:a", "tag": "search"},
+        {"_id": "doc:c", "tag": "search"},
+        {"_id": "doc:d", "tag": "search"},
+    ]
+
     join_response = stateful_api.s.post(
         f"{stateful_api.url}/sql",
         json={
@@ -505,6 +545,22 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     assert native_search_predicate_response.status_code == 400
     assert (
         native_search_predicate_response.text
+        == "document_sql_native_search_requires_table_function"
+    )
+
+    native_full_text_predicate_response = stateful_api.s.post(
+        f"{stateful_api.url}/sql",
+        json={
+            "sql": (
+                f"SELECT _id FROM {table} "
+                "WHERE antfly.full_text_search('body:search') LIMIT 10;"
+            )
+        },
+        timeout=10,
+    )
+    assert native_full_text_predicate_response.status_code == 400
+    assert (
+        native_full_text_predicate_response.text
         == "document_sql_native_search_requires_table_function"
     )
 
@@ -753,6 +809,28 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
         {"category": "archive", "row_count": 2}
     ]
 
+    summed = _first_sql_json(
+        sql_cli(
+            "sql",
+            "-c",
+            f"SELECT sum(amount) AS total_amount FROM {table};",
+        ).stdout
+    )
+    assert summed["kind"] == "read"
+    assert summed["statement_kind"] == "aggregate"
+    assert summed["result"]["rows"] == [{"total_amount": 72}]
+
+    filtered_summed = _first_sql_json(
+        sql_cli(
+            "sql",
+            "-c",
+            f"SELECT sum(amount) AS total_amount FROM {table} WHERE full_text_search('body:search') AND status = 'active';",
+        ).stdout
+    )
+    assert filtered_summed["kind"] == "read"
+    assert filtered_summed["statement_kind"] == "aggregate"
+    assert filtered_summed["result"]["rows"] == [{"total_amount": 22}]
+
     virtual_field_by_id = stateful_api.post(
         "/sql",
         {"sql": f"SELECT _id, category FROM {table} WHERE _id = 'doc:a';"},
@@ -771,6 +849,23 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     assert virtual_star_by_id["statement_kind"] == "query"
     assert virtual_star_by_id["result"]["rows"][0]["category"] == "release"
     assert virtual_star_by_id["result"]["rows"][0]["_doc"]["category"] == "release"
+
+    doc_root_path_rows = wait_until(
+        lambda: _select_rows(
+            sql_cli,
+            (
+                f"SELECT _id, _doc->>'category' AS category, "
+                f"_doc#>>'{{metadata,billing,plan}}' AS billing_plan FROM {table} "
+                "WHERE _doc->>'category' = 'release' ORDER BY _id ASC LIMIT 10;"
+            ),
+        ),
+        timeout_s=15.0,
+        interval_s=0.5,
+    )
+    assert doc_root_path_rows == [
+        {"_id": "doc:a", "category": "release", "billing_plan": "annual"},
+        {"_id": "doc:c", "category": "release", "billing_plan": "annual"},
+    ]
 
     virtual_root_table = _sql_table_name("sql_cli_docs_virtual_root")
     _create_document_sql_virtual_root_table(stateful_api, virtual_root_table)

@@ -50,6 +50,8 @@ const snowball_languages = [_][]const u8{
 };
 
 const snowball_generated_root = "pkg/antfly/src/search/snowball/generated";
+const sql_grammar_source = "pkg/antfly/src/sql/grammar/antfly_sql.y";
+const sql_grammar_generated_root = "pkg/antfly/src/sql/grammar/generated/root.zig";
 
 const snowball_compiler_sources = [_][]const u8{
     "compiler/analyser.c",
@@ -603,6 +605,79 @@ fn addFileCompareTool(b: *std.Build) *std.Build.Step.Compile {
             .target = b.graph.host,
         }),
     });
+}
+
+fn addLocalYaccCodegen(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Step.Compile {
+    const yacc_mod = b.createModule(.{
+        .root_source_file = b.path("lib/yacc/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const exe = b.addExecutable(.{
+        .name = "yacc-zig",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/yacc/src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    exe.root_module.addImport("yacc", yacc_mod);
+    return exe;
+}
+
+fn addYaccTestStep(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Step {
+    const yacc_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/yacc/src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_yacc_tests = b.addRunArtifact(yacc_tests);
+    const yacc_test_step = b.step("yacc-test", "Run standalone lib/yacc parser generator tests");
+    yacc_test_step.dependOn(&run_yacc_tests.step);
+    return yacc_test_step;
+}
+
+fn addSqlGrammarRegenStep(b: *std.Build, yacc_codegen: *std.Build.Step.Compile) *std.Build.Step {
+    const regen_step = b.step("regen-sql-grammar", "Regenerate checked-in Antfly SQL grammar metadata");
+    const run = b.addRunArtifact(yacc_codegen);
+    run.addFileArg(b.path(sql_grammar_source));
+    run.addArg(sql_grammar_generated_root);
+    run.addArg(sql_grammar_source);
+    regen_step.dependOn(&run.step);
+    return regen_step;
+}
+
+fn addSqlGrammarGeneratedCheckStep(b: *std.Build, yacc_codegen: *std.Build.Step.Compile) *std.Build.Step {
+    const check_step = b.step("sql-grammar-generated-check", "Check checked-in Antfly SQL grammar metadata is current");
+    const run = b.addRunArtifact(yacc_codegen);
+    run.addFileArg(b.path(sql_grammar_source));
+    const generated = run.addOutputFileArg("sql_grammar_root.zig");
+    run.addArg(sql_grammar_source);
+
+    const fmt = b.addSystemCommand(&.{
+        b.graph.zig_exe,
+        "fmt",
+    });
+    fmt.addFileArg(generated);
+
+    const compare_tool = addFileCompareTool(b);
+    const compare = b.addRunArtifact(compare_tool);
+    compare.step.dependOn(&fmt.step);
+    compare.addFileArg(generated);
+    compare.addFileArg(b.path(sql_grammar_generated_root));
+    check_step.dependOn(&compare.step);
+    return check_step;
 }
 
 fn addDirCompareTool(b: *std.Build) *std.Build.Step.Compile {
@@ -1249,12 +1324,16 @@ pub fn build(b: *std.Build) void {
     const snowball_regen_step = addSnowballRegenStep(b);
     const snowball_check_step = addSnowballCheckStep(b);
     const openapi_codegen = addLocalOpenApiCodegen(b, target, optimize, httpx_mod);
+    const yacc_codegen = addLocalYaccCodegen(b, target, optimize);
+    _ = addYaccTestStep(b, target, optimize);
     const openapi_generate_step = addOpenApiRegenStep(b, openapi_codegen);
     const openapi_generated_check_step = addOpenApiGeneratedCheckStep(b, openapi_codegen);
+    const sql_grammar_regen_step = addSqlGrammarRegenStep(b, yacc_codegen);
     const snowball_sources_available = pathExists(b, "deps/snowball/zig/env.zig") and pathExists(b, "deps/snowball/compiler/analyser.c");
 
     const generate_step = b.step("generate", "Regenerate checked-in Zig generated artifacts");
     generate_step.dependOn(openapi_generate_step);
+    generate_step.dependOn(sql_grammar_regen_step);
     if (snowball_sources_available) {
         generate_step.dependOn(snowball_regen_step);
     }
@@ -3473,8 +3552,8 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db reopen replays pending derived embeddings",
             "storage.db.db.test.db replay respects per-index applied watermarks",
             "storage.db.db.test.db replay applies dense embeddings from artifact payloads",
-            "storage.db.db.test.db split cutover",
-            "storage.db.db.test.db merge-style cutover",
+            "storage.db.split_restore_test.test.db split cutover",
+            "storage.db.split_restore_test.test.db merge-style cutover",
         },
     });
     const run_lib_db_enrichment_tests = b.addRunArtifact(lib_db_enrichment_tests);
@@ -3516,8 +3595,8 @@ pub fn build(b: *std.Build) void {
     const lib_db_enrichment_cutover_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
-            "storage.db.db.test.db split cutover",
-            "storage.db.db.test.db merge-style cutover",
+            "storage.db.split_restore_test.test.db split cutover",
+            "storage.db.split_restore_test.test.db merge-style cutover",
         },
     });
     const run_lib_db_enrichment_cutover_tests = b.addRunArtifact(lib_db_enrichment_cutover_tests);
@@ -3527,8 +3606,8 @@ pub fn build(b: *std.Build) void {
     const lib_db_enrichment_split_cutover_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
-            "storage.db.db.test.db split cutover fences enrichment to the owning range",
-            "storage.db.db.test.db split cutover preserves enrichment resume and fencing across reopen",
+            "storage.db.split_restore_test.test.db split cutover fences enrichment to the owning range",
+            "storage.db.split_restore_test.test.db split cutover preserves enrichment resume and fencing across reopen",
         },
     });
     const run_lib_db_enrichment_split_cutover_tests = b.addRunArtifact(lib_db_enrichment_split_cutover_tests);
@@ -3538,8 +3617,8 @@ pub fn build(b: *std.Build) void {
     const lib_db_enrichment_merge_cutover_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
-            "storage.db.db.test.db merge-style cutover fences enrichment to the merged receiver range",
-            "storage.db.db.test.db merge-style cutover preserves enrichment resume and fencing across reopen",
+            "storage.db.split_restore_test.test.db merge-style cutover fences enrichment to the merged receiver range",
+            "storage.db.split_restore_test.test.db merge-style cutover preserves enrichment resume and fencing across reopen",
         },
     });
     const run_lib_db_enrichment_merge_cutover_tests = b.addRunArtifact(lib_db_enrichment_merge_cutover_tests);
@@ -3548,7 +3627,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_db_enrichment_split_cutover_reopen_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"storage.db.db.test.db split cutover preserves enrichment resume and fencing across reopen"},
+        .filters = &.{"storage.db.split_restore_test.test.db split cutover preserves enrichment resume and fencing across reopen"},
     });
     const run_lib_db_enrichment_split_cutover_reopen_tests = b.addRunArtifact(lib_db_enrichment_split_cutover_reopen_tests);
     const lib_db_enrichment_split_cutover_reopen_step = b.step("lib-db-enrichment-split-cutover-reopen-test", "Run root-module DB split cutover reopen test");
@@ -3556,7 +3635,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_db_enrichment_merge_cutover_reopen_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"storage.db.db.test.db merge-style cutover preserves enrichment resume and fencing across reopen"},
+        .filters = &.{"storage.db.split_restore_test.test.db merge-style cutover preserves enrichment resume and fencing across reopen"},
     });
     const run_lib_db_enrichment_merge_cutover_reopen_tests = b.addRunArtifact(lib_db_enrichment_merge_cutover_reopen_tests);
     const lib_db_enrichment_merge_cutover_reopen_step = b.step("lib-db-enrichment-merge-cutover-reopen-test", "Run root-module DB merge cutover reopen test");
@@ -5119,6 +5198,7 @@ pub fn build(b: *std.Build) void {
 
     const generated_check_step = b.step("generated-check", "Check checked-in Zig generated artifacts are current");
     generated_check_step.dependOn(openapi_check_step);
+    generated_check_step.dependOn(addSqlGrammarGeneratedCheckStep(b, yacc_codegen));
     if (snowball_sources_available) {
         generated_check_step.dependOn(snowball_check_step);
     }
@@ -5814,28 +5894,28 @@ pub fn build(b: *std.Build) void {
     usermgr_storage_db_test_mod.addImport("antfly_platform", platform_mod);
     db_test_mod.addImport("usermgr_storage", usermgr_storage_db_test_mod);
 
-    const db_split_sim_default_filters = [_][]const u8{
-        "db split sim default workload stays green",
-        "db split sim reopen-heavy workload stays green",
+    const db_sim_default_filters = [_][]const u8{
+        "storage.db.db_sim_test.test.",
     };
-    const db_split_sim_tests = b.addTest(.{
+    const db_sim_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = selectTestFilters(b, &db_split_sim_default_filters),
+        .filters = selectTestFilters(b, &db_sim_default_filters),
     });
-    const run_db_split_sim_tests = b.addRunArtifact(db_split_sim_tests);
-    const db_split_sim_step = b.step("db-split-sim-test", "Run only the DB split simulation workload tests");
-    db_split_sim_step.dependOn(&run_db_split_sim_tests.step);
+    const run_db_sim_tests = b.addRunArtifact(db_sim_tests);
+    const db_sim_step = b.step("db-sim-test", "Run DB simulation and replay tests");
+    db_sim_step.dependOn(&run_db_sim_tests.step);
+    sim_test_step.dependOn(&run_db_sim_tests.step);
 
-    const db_split_vopr_tests = b.addTest(.{
+    const db_split_restore_lifecycle_default_filters = [_][]const u8{
+        "storage.db.split_restore_test.test.",
+    };
+    const db_split_restore_lifecycle_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{
-            "db split modeled replay fixtures stay green",
-            "db split modeled sim workloads stay green",
-        },
+        .filters = selectTestFilters(b, &db_split_restore_lifecycle_default_filters),
     });
-    const run_db_split_vopr_tests = b.addRunArtifact(db_split_vopr_tests);
-    const db_split_vopr_step = b.step("db-split-vopr-test", "Run only the DB split modeled-storage replay fixture tests");
-    db_split_vopr_step.dependOn(&run_db_split_vopr_tests.step);
+    const run_db_split_restore_lifecycle_tests = b.addRunArtifact(db_split_restore_lifecycle_tests);
+    const db_split_restore_lifecycle_step = b.step("db-split-restore-lifecycle-test", "Run DB split/restore lifecycle regression tests");
+    db_split_restore_lifecycle_step.dependOn(&run_db_split_restore_lifecycle_tests.step);
 
     const storage_workload_sim_step = b.step("storage-sim-test", "Run legacy deterministic storage workload simulations that still use real storage I/O");
     storage_workload_sim_step.dependOn(&run_wal_sim_tests.step);
@@ -5848,7 +5928,6 @@ pub fn build(b: *std.Build) void {
     storage_vopr_step.dependOn(&run_wal_vopr_tests.step);
     storage_vopr_step.dependOn(&run_persistent_vopr_tests.step);
     storage_vopr_step.dependOn(&run_index_manager_vopr_tests.step);
-    storage_vopr_step.dependOn(&run_db_split_vopr_tests.step);
     sim_test_step.dependOn(storage_vopr_step);
 
     const db_unit_tests = b.addTest(.{
@@ -6037,14 +6116,6 @@ pub fn build(b: *std.Build) void {
     const run_db_dense_parent_paging_tests = b.addRunArtifact(db_dense_parent_paging_tests);
     const db_dense_parent_paging_step = b.step("db-dense-parent-paging-test", "Run the dense parent paging enrichment DB test");
     db_dense_parent_paging_step.dependOn(&run_db_dense_parent_paging_tests.step);
-
-    const db_split_replay_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = &.{"db split replay fixtures stay green"},
-    });
-    const run_db_split_replay_tests = b.addRunArtifact(db_split_replay_tests);
-    const db_split_replay_step = b.step("db-split-replay-fixtures", "Run only the DB split replay fixture tests");
-    db_split_replay_step.dependOn(&run_db_split_replay_tests.step);
 
     const sparse_test_mod = makeLmdbModule(b, "pkg/antfly/src/sparse_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     sparse_test_mod.addImport("bloom", bloom_mod);

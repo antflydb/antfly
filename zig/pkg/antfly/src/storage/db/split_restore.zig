@@ -931,6 +931,83 @@ pub fn Impl(comptime DB: type) type {
             return try keys.toOwnedSlice(alloc);
         }
 
+        fn relationalBaseRows(self: *DB) bool {
+            const schema = self.core.schema orelse return false;
+            return schema.storage_mode == .relational;
+        }
+
+        fn relationalColumnIndexPolicy(self: *DB) relational_store_mod.ColumnIndexPolicy {
+            const schema = self.core.schema orelse return relational_store_mod.ColumnIndexPolicy.all();
+            if (schema.storage_mode != .relational) return relational_store_mod.ColumnIndexPolicy.all();
+            return relational_store_mod.ColumnIndexPolicy.fromColumns(schema.relational_columns);
+        }
+
+        fn rebuildRelationalColumnIndexesInStoreRange(
+            self: *DB,
+            store: *docstore_mod.DocStore,
+            start: []const u8,
+            end: []const u8,
+        ) !void {
+            if (!Self.relationalBaseRows(self)) return;
+            try relational_store_mod.rebuildAllColumnIndexesFromRowsInRangeWithColumnIndexPolicy(
+                self.alloc,
+                store,
+                start,
+                end,
+                Self.relationalColumnIndexPolicy(self),
+            );
+        }
+
+        fn resetManagedIndexAppliedSequences(self: *DB) !void {
+            const managed_indexes = try self.core.managedIndexes(self.alloc);
+            defer {
+                for (managed_indexes) |index_ref| self.alloc.free(@constCast(index_ref.name));
+                self.alloc.free(managed_indexes);
+            }
+
+            for (managed_indexes) |index_ref| {
+                try self.core.saveAppliedSequence(index_ref.name, 0);
+            }
+        }
+
+        fn rebaseManagedIndexAppliedSequencesIfNeeded(self: *DB) !void {
+            const managed_indexes = try self.core.managedIndexes(self.alloc);
+            defer {
+                for (managed_indexes) |index_ref| self.alloc.free(@constCast(index_ref.name));
+                self.alloc.free(managed_indexes);
+            }
+
+            var max_applied: u64 = 0;
+            for (managed_indexes) |index_ref| {
+                const applied = try self.core.loadAppliedSequence(self.alloc, index_ref.name);
+                max_applied = @max(max_applied, applied);
+            }
+            if (max_applied == 0) return;
+
+            // Applied watermarks are independent of the retained replay log.
+            // Preserve the watermark and advance the floor so future replay
+            // sequence allocation cannot reuse already-applied sequence numbers.
+            try ensureReplayFloor(self.core.store, max_applied + 1);
+        }
+
+        fn refreshManagedIndexWorkersLocked(self: *DB) !void {
+            if (!self.start_index_workers) return;
+
+            const managed_indexes = try self.core.managedIndexes(self.alloc);
+            defer {
+                for (managed_indexes) |index_ref| self.alloc.free(@constCast(index_ref.name));
+                self.alloc.free(managed_indexes);
+            }
+
+            for (managed_indexes) |index_ref| {
+                self.executor.removeWorker(index_ref.name);
+            }
+            for (managed_indexes) |index_ref| {
+                const applied = try self.core.loadAppliedSequence(self.alloc, index_ref.name);
+                try self.executor.addWorker(index_ref.name, index_ref, applied);
+            }
+        }
+
         fn registerSplitDestinationIndexesDirect(
             alloc: Allocator,
             dest_store: *docstore_mod.DocStore,
@@ -969,7 +1046,7 @@ pub fn Impl(comptime DB: type) type {
                 self.index_backends,
             );
             defer dest_indexes.deinit();
-            dest_indexes.setRelationalBaseRows(self.splitRestoreRelationalBaseRows());
+            dest_indexes.setRelationalBaseRows(Self.relationalBaseRows(self));
             dest_indexes.setRelaxedSplitDurability(true);
             const dest_applied_sequence_checkpoint_path = try apply_state.checkpointPathAlloc(self.alloc, dest_dir);
             defer self.alloc.free(dest_applied_sequence_checkpoint_path);
@@ -982,7 +1059,7 @@ pub fn Impl(comptime DB: type) type {
             try ensureReplayFloor(dest_store, replay_floor);
 
             const split_doc_frontier = if (page_split_built)
-                try Self.collectSplitFrontierDocKeys(self.alloc, dest_store, byte_range.start, byte_range.end, self.splitRestoreRelationalBaseRows())
+                try Self.collectSplitFrontierDocKeys(self.alloc, dest_store, byte_range.start, byte_range.end, Self.relationalBaseRows(self))
             else
                 &.{};
             defer {
@@ -1031,7 +1108,7 @@ pub fn Impl(comptime DB: type) type {
                         split_handoffs.dense,
                         split_handoffs.text,
                         split_handoffs.sparse,
-                        self.splitRestoreRelationalColumnIndexPolicyForStore(),
+                        Self.relationalColumnIndexPolicy(self),
                     );
                 }
             } else {
@@ -1046,7 +1123,7 @@ pub fn Impl(comptime DB: type) type {
                     split_handoffs.dense,
                     split_handoffs.text,
                     split_handoffs.sparse,
-                    self.splitRestoreRelationalColumnIndexPolicyForStore(),
+                    Self.relationalColumnIndexPolicy(self),
                 );
             }
             try applySplitGraphArtifactsInRange(
@@ -1056,7 +1133,7 @@ pub fn Impl(comptime DB: type) type {
                 dest_store,
                 &dest_indexes,
             );
-            try self.splitRestoreRebuildRelationalColumnIndexesInStoreRange(dest_store, byte_range.start, byte_range.end);
+            try Self.rebuildRelationalColumnIndexesInStoreRange(self, dest_store, byte_range.start, byte_range.end);
 
             try dest_indexes.syncAll(true);
             try dest_store.sync(true);
@@ -1184,7 +1261,7 @@ pub fn Impl(comptime DB: type) type {
                 self.index_backends,
             );
             errdefer shadow_manager.deinit();
-            shadow_manager.setRelationalBaseRows(self.splitRestoreRelationalBaseRows());
+            shadow_manager.setRelationalBaseRows(Self.relationalBaseRows(self));
 
             const shadow_start = try self.alloc.dupe(u8, split_key);
             errdefer self.alloc.free(shadow_start);
@@ -1273,10 +1350,10 @@ pub fn Impl(comptime DB: type) type {
             const split_lower = try documentRangeLowerAlloc(self.alloc, split_state.split_key);
             defer self.alloc.free(split_lower);
             try Self.finalizePrimarySplitPreservingIdentity(self, split_lower);
-            try self.splitRestoreRebuildRelationalColumnIndexesInStoreRange(self.core.store, new_range.start, new_range.end);
+            try Self.rebuildRelationalColumnIndexesInStoreRange(self, self.core.store, new_range.start, new_range.end);
             try self.core.store.ensureReplayNextSequenceAtLeast(replay_floor);
             try self.core.pruneSplitRangeFromPrimaryIndexes(split_state.split_key, split_state.original_range_end);
-            try self.splitRestoreRebaseManagedIndexAppliedSequencesIfNeeded();
+            try Self.rebaseManagedIndexAppliedSequencesIfNeeded(self);
 
             if (split_state.phase == .prepare) {
                 try self.core.completeSplitTransition(split_state.new_shard_id, split_state.split_key);
@@ -1285,9 +1362,9 @@ pub fn Impl(comptime DB: type) type {
             }
 
             try self.core.finalizeSplitState();
-            try self.splitRestoreRefreshManagedIndexWorkersLocked();
+            try Self.refreshManagedIndexWorkersLocked(self);
             try Self.closeShadowIndexManager(self);
-            try self.splitRestoreRefreshManagedIndexWorkersLocked();
+            try Self.refreshManagedIndexWorkersLocked(self);
         }
 
         pub fn snapshot(self: *DB, id: []const u8) !u64 {
@@ -1527,14 +1604,14 @@ pub fn Impl(comptime DB: type) type {
 
             if (std.mem.eql(u8, phase, "runtime_repair") or std.mem.eql(u8, phase, "reset_watermarks")) {
                 std.log.info("restore runtime repair reset managed index watermarks path={s}", .{self.core.path});
-                try self.splitRestoreResetManagedIndexAppliedSequences();
-                try self.splitRestoreRefreshManagedIndexWorkersLocked();
+                try Self.resetManagedIndexAppliedSequences(self);
+                try Self.refreshManagedIndexWorkersLocked(self);
                 try Self.updateRestoreRuntimeRepairPhase(self, alloc, "rebuild_graph", false);
                 return true;
             }
             if (std.mem.eql(u8, phase, "rebuild_graph")) {
                 std.log.info("restore runtime repair rebuild graph state path={s}", .{self.core.path});
-                _ = try self.splitRestoreRebuildGraphDerivedState();
+                _ = try Self.rebuildGraphDerivedState(self);
                 try Self.updateRestoreRuntimeRepairPhase(self, alloc, "rebuild_artifacts", false);
                 return true;
             }
@@ -1579,7 +1656,12 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn rebuildGraphDerivedState(self: *DB) !usize {
-            return try self.splitRestoreRebuildGraphDerivedState();
+            self.splitRestoreLockApply();
+            defer self.core.unlockApply();
+            return try self.core.index_manager.rebuildGraphSplitDestination(
+                self.getRange().start,
+                self.getRange().end,
+            );
         }
     };
 }

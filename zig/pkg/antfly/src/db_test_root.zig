@@ -17,6 +17,8 @@ pub const lsm_backend = @import("storage/lsm_backend.zig");
 
 test {
     _ = @import("storage/db/db.zig");
+    _ = @import("storage/db/db_sim_test.zig");
     _ = @import("storage/db/promotion_runtime.zig");
     _ = @import("storage/db/resolution_runtime.zig");
+    _ = @import("storage/db/split_restore_test.zig");
 }

@@ -44,6 +44,8 @@ pub const RelationalBinding = struct {
 pub const DocumentSqlVirtualFieldSource = enum {
     declared_schema,
     index_definition,
+    /// Shape/type metadata only. This can expose a SQL-visible JSON path root,
+    /// but it must not satisfy index readiness or choose a storage producer.
     typed_path_metadata,
 };
 

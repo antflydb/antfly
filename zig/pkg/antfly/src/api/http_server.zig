@@ -4656,7 +4656,7 @@ pub const ApiHttpServer = struct {
         session_id: ?u64 = null,
         database: ?[]const u8 = null,
         namespace: ?[]const u8 = null,
-        read_only: bool = false,
+        read_only: ?bool = null,
     };
 
     const PublicSqlResponse = struct {
@@ -4689,7 +4689,7 @@ pub const ApiHttpServer = struct {
             search_path[0] = try self.alloc.dupe(u8, namespace);
             session.search_path = search_path;
         }
-        session.request_read_only = request.read_only;
+        session.request_read_only = request.read_only orelse false;
         return session;
     }
 
@@ -5966,16 +5966,15 @@ pub const ApiHttpServer = struct {
         if (responses_value != .array or responses_value.array.items.len == 0) return error.InvalidQueryRequest;
         const first_response = responses_value.array.items[0];
         if (first_response != .object) return error.InvalidQueryRequest;
-        const hits_value = first_response.object.get("hits") orelse return error.InvalidQueryRequest;
+        const hits_value = first_response.object.get("hits") orelse return try sqlQueryFunctionRowsFromGraphEnvelopeAlloc(alloc, first_response, projection_columns);
         if (hits_value != .object) return error.InvalidQueryRequest;
         const total_value = hits_value.object.get("total") orelse return error.InvalidQueryRequest;
-        const total = switch (total_value) {
-            .integer => |value| if (value >= 0 and value <= std.math.maxInt(u32)) @as(u32, @intCast(value)) else return error.InvalidQueryRequest,
-            .number_string => |text| std.fmt.parseUnsigned(u32, text, 10) catch return error.InvalidQueryRequest,
-            else => return error.InvalidQueryRequest,
-        };
+        const total = try sqlQueryFunctionU32FromJsonValue(total_value);
         const hit_items = hits_value.object.get("hits") orelse return error.InvalidQueryRequest;
         if (hit_items != .array) return error.InvalidQueryRequest;
+        if (hit_items.array.items.len == 0) {
+            if (try sqlQueryFunctionMaybeRowsFromGraphEnvelopeAlloc(alloc, first_response, projection_columns)) |rows| return rows;
+        }
 
         const rows = try alloc.alloc([]const u8, hit_items.array.items.len);
         errdefer alloc.free(rows);
@@ -5992,6 +5991,214 @@ pub const ApiHttpServer = struct {
             .rows = rows,
             .total = total,
         };
+    }
+
+    fn sqlQueryFunctionRowsFromGraphEnvelopeAlloc(
+        alloc: std.mem.Allocator,
+        first_response: std.json.Value,
+        projection_columns: []const []const u8,
+    ) !db_mod.types.RelationalRowsQueryResult {
+        return (try sqlQueryFunctionMaybeRowsFromGraphEnvelopeAlloc(alloc, first_response, projection_columns)) orelse error.InvalidQueryRequest;
+    }
+
+    fn sqlQueryFunctionMaybeRowsFromGraphEnvelopeAlloc(
+        alloc: std.mem.Allocator,
+        first_response: std.json.Value,
+        projection_columns: []const []const u8,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        if (try sqlQueryFunctionMaybeRowsFromGraphMetricResultsAlloc(alloc, first_response, projection_columns)) |rows| return rows;
+        if (try sqlQueryFunctionMaybeRowsFromGraphResultsAlloc(alloc, first_response, projection_columns)) |rows| return rows;
+        return null;
+    }
+
+    fn sqlQueryFunctionMaybeRowsFromGraphMetricResultsAlloc(
+        alloc: std.mem.Allocator,
+        first_response: std.json.Value,
+        projection_columns: []const []const u8,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const graph_metric_results = first_response.object.get("graph_metric_results") orelse return null;
+        if (graph_metric_results != .object) return error.InvalidQueryRequest;
+
+        var row_count: usize = 0;
+        var count_it = graph_metric_results.object.iterator();
+        while (count_it.next()) |entry| {
+            if (entry.value_ptr.* != .object) return error.InvalidQueryRequest;
+            const scores = entry.value_ptr.*.object.get("scores") orelse return error.InvalidQueryRequest;
+            if (scores != .array) return error.InvalidQueryRequest;
+            row_count += scores.array.items.len;
+        }
+
+        const rows = try alloc.alloc([]const u8, row_count);
+        errdefer alloc.free(rows);
+        var initialized: usize = 0;
+        errdefer {
+            for (rows[0..initialized]) |row| alloc.free(@constCast(row));
+        }
+
+        var it = graph_metric_results.object.iterator();
+        while (it.next()) |entry| {
+            const result = entry.value_ptr.*;
+            const index_name = result.object.get("index_name") orelse return error.InvalidQueryRequest;
+            if (index_name != .string) return error.InvalidQueryRequest;
+            const metric = result.object.get("metric") orelse return error.InvalidQueryRequest;
+            if (metric != .string) return error.InvalidQueryRequest;
+            const scores = result.object.get("scores") orelse return error.InvalidQueryRequest;
+            if (scores != .array) return error.InvalidQueryRequest;
+            for (scores.array.items) |score| {
+                if (score != .object) return error.InvalidQueryRequest;
+                rows[initialized] = try sqlQueryFunctionGraphMetricRowAlloc(alloc, entry.key_ptr.*, index_name.string, metric.string, score, projection_columns);
+                initialized += 1;
+            }
+        }
+
+        return .{
+            .rows = rows,
+            .total = @intCast(row_count),
+        };
+    }
+
+    fn sqlQueryFunctionMaybeRowsFromGraphResultsAlloc(
+        alloc: std.mem.Allocator,
+        first_response: std.json.Value,
+        projection_columns: []const []const u8,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const graph_results = first_response.object.get("graph_results") orelse return null;
+        if (graph_results != .object) return error.InvalidQueryRequest;
+
+        var row_count: usize = 0;
+        var total: u32 = 0;
+        var count_it = graph_results.object.iterator();
+        while (count_it.next()) |entry| {
+            if (entry.value_ptr.* != .object) return error.InvalidQueryRequest;
+            const nodes = entry.value_ptr.*.object.get("nodes") orelse continue;
+            if (nodes != .array) return error.InvalidQueryRequest;
+            row_count += nodes.array.items.len;
+            if (entry.value_ptr.*.object.get("total")) |total_value| {
+                total += try sqlQueryFunctionU32FromJsonValue(total_value);
+            } else {
+                total += @intCast(nodes.array.items.len);
+            }
+        }
+
+        const rows = try alloc.alloc([]const u8, row_count);
+        errdefer alloc.free(rows);
+        var initialized: usize = 0;
+        errdefer {
+            for (rows[0..initialized]) |row| alloc.free(@constCast(row));
+        }
+
+        var it = graph_results.object.iterator();
+        while (it.next()) |entry| {
+            const result = entry.value_ptr.*;
+            const result_type = result.object.get("type") orelse return error.InvalidQueryRequest;
+            if (result_type != .string) return error.InvalidQueryRequest;
+            const nodes = result.object.get("nodes") orelse continue;
+            if (nodes != .array) return error.InvalidQueryRequest;
+            for (nodes.array.items) |node| {
+                if (node != .object) return error.InvalidQueryRequest;
+                rows[initialized] = try sqlQueryFunctionGraphNodeRowAlloc(alloc, entry.key_ptr.*, result_type.string, node, projection_columns);
+                initialized += 1;
+            }
+        }
+
+        return .{
+            .rows = rows,
+            .total = total,
+        };
+    }
+
+    fn sqlQueryFunctionU32FromJsonValue(value: std.json.Value) !u32 {
+        return switch (value) {
+            .integer => |int| if (int >= 0 and int <= std.math.maxInt(u32)) @as(u32, @intCast(int)) else return error.InvalidQueryRequest,
+            .number_string => |text| std.fmt.parseUnsigned(u32, text, 10) catch return error.InvalidQueryRequest,
+            else => return error.InvalidQueryRequest,
+        };
+    }
+
+    fn sqlQueryFunctionGraphMetricRowAlloc(
+        alloc: std.mem.Allocator,
+        name: []const u8,
+        index_name: []const u8,
+        metric: []const u8,
+        score: std.json.Value,
+        projection_columns: []const []const u8,
+    ) ![]const u8 {
+        const node = score.object.get("node") orelse return error.InvalidQueryRequest;
+        if (node != .string) return error.InvalidQueryRequest;
+        const score_value = score.object.get("score") orelse return error.InvalidQueryRequest;
+
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        try writer.writeByte('{');
+        try writer.writeAll("\"_id\":");
+        try std.json.Stringify.value(node, .{}, writer);
+        try writer.writeAll(",\"_score\":");
+        try std.json.Stringify.value(score_value, .{}, writer);
+        try writer.writeAll(",\"_source\":null,\"_graph_metric\":");
+        try std.json.Stringify.value(name, .{}, writer);
+        try writer.writeAll(",\"_index\":");
+        try std.json.Stringify.value(index_name, .{}, writer);
+        try writer.writeAll(",\"_metric\":");
+        try std.json.Stringify.value(metric, .{}, writer);
+        try writer.writeByte('}');
+        return try sqlQueryFunctionMaybeProjectOwnedRowAlloc(alloc, try out.toOwnedSlice(), projection_columns);
+    }
+
+    fn sqlQueryFunctionGraphNodeRowAlloc(
+        alloc: std.mem.Allocator,
+        name: []const u8,
+        result_type: []const u8,
+        node: std.json.Value,
+        projection_columns: []const []const u8,
+    ) ![]const u8 {
+        const key = node.object.get("key") orelse return error.InvalidQueryRequest;
+        if (key != .string) return error.InvalidQueryRequest;
+
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        try writer.writeByte('{');
+        try writer.writeAll("\"_id\":");
+        try std.json.Stringify.value(key, .{}, writer);
+        try writer.writeAll(",\"_score\":null,\"_source\":");
+        if (node.object.get("document")) |document| {
+            try std.json.Stringify.value(document, .{}, writer);
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll(",\"_graph\":");
+        try std.json.Stringify.value(name, .{}, writer);
+        try writer.writeAll(",\"_graph_type\":");
+        try std.json.Stringify.value(result_type, .{}, writer);
+        try writer.writeAll(",\"_depth\":");
+        if (node.object.get("depth")) |depth| {
+            try std.json.Stringify.value(depth, .{}, writer);
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll(",\"_distance\":");
+        if (node.object.get("distance")) |distance| {
+            try std.json.Stringify.value(distance, .{}, writer);
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll(",\"_node\":");
+        try std.json.Stringify.value(node, .{}, writer);
+        try writer.writeByte('}');
+        return try sqlQueryFunctionMaybeProjectOwnedRowAlloc(alloc, try out.toOwnedSlice(), projection_columns);
+    }
+
+    fn sqlQueryFunctionMaybeProjectOwnedRowAlloc(
+        alloc: std.mem.Allocator,
+        row_json: []const u8,
+        projection_columns: []const []const u8,
+    ) ![]const u8 {
+        if (projection_columns.len == 0) return row_json;
+        defer alloc.free(@constCast(row_json));
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{ .allocate = .alloc_always }) catch return error.InvalidQueryRequest;
+        defer parsed.deinit();
+        return try sqlQueryFunctionHitRowAlloc(alloc, parsed.value, projection_columns);
     }
 
     fn sqlQueryFunctionHitRowAlloc(
@@ -25218,7 +25425,7 @@ test "api http server exposes psql-style SQL session endpoint" {
         .method = .POST,
         .uri = "/db/v1/sql",
         .content_type = "application/json",
-        .body = "{\"sql\":\"PREPARE usage_plan(text) AS SELECT id FROM usage_records WHERE status = $1;\"}",
+        .body = "{\"read_only\":null,\"sql\":\"PREPARE usage_plan(text) AS SELECT id FROM usage_records WHERE status = $1;\"}",
     });
     defer prepare_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), prepare_resp.status);
@@ -25844,7 +26051,7 @@ test "api http server executes Antfly SQL query functions through native query p
                     try std.testing.expectEqual(@as(u32, 2), graph_query.params.max_depth);
                     try std.testing.expectEqual(@as(u32, 8), graph_query.params.max_results);
                     return .{ .json = try allocator.dupe(u8,
-                        \\{"responses":[{"hits":{"total":1,"hits":[{"_id":"doc:g","_score":0.75,"_source":{"title":"graph","status":"active"}}]}}]}
+                        \\{"responses":[{"graph_results":{"citation_walk":{"type":"traverse","nodes":[{"key":"doc:g","depth":1,"distance":1.5,"document":{"title":"graph","status":"active"}}],"total":1,"took":1}}}]}
                     ) };
                 },
                 6 => {
@@ -25857,7 +26064,7 @@ test "api http server executes Antfly SQL query functions through native query p
                     try std.testing.expectEqual(@as(u32, 2), req.graph_metric_queries[0].query.top_k);
                     try std.testing.expectEqual(db_mod.types.GraphMetricFreshness.fresh, req.graph_metric_queries[0].query.freshness);
                     return .{ .json = try allocator.dupe(u8,
-                        \\{"responses":[{"hits":{"total":1,"hits":[{"_id":"doc:m","_score":0.66,"_source":{"title":"metric","status":"active"}}]}}]}
+                        \\{"responses":[{"graph_metric_results":{"pagerank":{"index_name":"docs_edge_graph","metric":"pagerank","scores":[{"node":"doc:m","score":0.66}]}}}]}
                     ) };
                 },
                 7 => {
@@ -26101,8 +26308,12 @@ test "api http server executes Antfly SQL query functions through native query p
     try std.testing.expectEqual(@as(i64, 1), graph_result.get("total").?.integer);
     const graph_row = graph_result.get("rows").?.array.items[0].object;
     try std.testing.expectEqualStrings("doc:g", graph_row.get("_id").?.string);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.75), graph_row.get("_score").?.float, 0.0001);
+    try std.testing.expect(graph_row.get("_score").? == .null);
     try std.testing.expectEqualStrings("graph", graph_row.get("_source").?.object.get("title").?.string);
+    try std.testing.expectEqualStrings("citation_walk", graph_row.get("_graph").?.string);
+    try std.testing.expectEqualStrings("traverse", graph_row.get("_graph_type").?.string);
+    try std.testing.expectEqual(@as(i64, 1), graph_row.get("_depth").?.integer);
+    try std.testing.expectEqual(@as(f64, 1.5), graph_row.get("_distance").?.float);
 
     var graph_metric_resp = try server.handle(.{
         .method = .POST,
@@ -26123,7 +26334,10 @@ test "api http server executes Antfly SQL query functions through native query p
     const graph_metric_row = graph_metric_result.get("rows").?.array.items[0].object;
     try std.testing.expectEqualStrings("doc:m", graph_metric_row.get("_id").?.string);
     try std.testing.expectApproxEqAbs(@as(f64, 0.66), graph_metric_row.get("_score").?.float, 0.0001);
-    try std.testing.expectEqualStrings("metric", graph_metric_row.get("_source").?.object.get("title").?.string);
+    try std.testing.expect(graph_metric_row.get("_source").? == .null);
+    try std.testing.expectEqualStrings("pagerank", graph_metric_row.get("_graph_metric").?.string);
+    try std.testing.expectEqualStrings("docs_edge_graph", graph_metric_row.get("_index").?.string);
+    try std.testing.expectEqualStrings("pagerank", graph_metric_row.get("_metric").?.string);
 
     var rerank_resp = try server.handle(.{
         .method = .POST,
@@ -26666,6 +26880,68 @@ test "api http server executes document SQL reads through typed document plan in
     const unnest_row = unnest_result.get("rows").?.array.items[0].object;
     try std.testing.expectEqualStrings("doc:a", unnest_row.get("_id").?.string);
     try std.testing.expectEqualStrings("urgent", unnest_row.get("tag").?.string);
+
+    var indexed_unnest_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE full_text_search('title:alpha') AND tag = 'vip' LIMIT 10;\"}",
+    });
+    defer indexed_unnest_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), indexed_unnest_resp.status);
+    try std.testing.expectEqualStrings("application/json", indexed_unnest_resp.content_type.?);
+
+    var indexed_unnest_parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexed_unnest_resp.body, .{ .allocate = .alloc_always });
+    defer indexed_unnest_parsed.deinit();
+    try std.testing.expectEqualStrings("read", indexed_unnest_parsed.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", indexed_unnest_parsed.value.object.get("statement_kind").?.string);
+    const indexed_unnest_result = indexed_unnest_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), indexed_unnest_result.get("total").?.integer);
+    const indexed_unnest_row = indexed_unnest_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", indexed_unnest_row.get("_id").?.string);
+    try std.testing.expectEqualStrings("vip", indexed_unnest_row.get("tag").?.string);
+
+    var ordered_indexed_unnest_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE full_text_search('title:alpha') ORDER BY tag ASC LIMIT 2;\"}",
+    });
+    defer ordered_indexed_unnest_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), ordered_indexed_unnest_resp.status);
+    try std.testing.expectEqualStrings("application/json", ordered_indexed_unnest_resp.content_type.?);
+
+    var ordered_indexed_unnest_parsed = try std.json.parseFromSlice(std.json.Value, alloc, ordered_indexed_unnest_resp.body, .{ .allocate = .alloc_always });
+    defer ordered_indexed_unnest_parsed.deinit();
+    const ordered_indexed_unnest_rows = ordered_indexed_unnest_parsed.value.object.get("result").?.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), ordered_indexed_unnest_rows.len);
+    try std.testing.expectEqualStrings("doc:a", ordered_indexed_unnest_rows[0].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("urgent", ordered_indexed_unnest_rows[0].object.get("tag").?.string);
+    try std.testing.expectEqualStrings("doc:a", ordered_indexed_unnest_rows[1].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("vip", ordered_indexed_unnest_rows[1].object.get("tag").?.string);
+
+    var ordered_unnest_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag ORDER BY tag ASC LIMIT 3;\"}",
+    });
+    defer ordered_unnest_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), ordered_unnest_resp.status);
+    try std.testing.expectEqualStrings("application/json", ordered_unnest_resp.content_type.?);
+
+    var ordered_unnest_parsed = try std.json.parseFromSlice(std.json.Value, alloc, ordered_unnest_resp.body, .{ .allocate = .alloc_always });
+    defer ordered_unnest_parsed.deinit();
+    try std.testing.expectEqualStrings("read", ordered_unnest_parsed.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", ordered_unnest_parsed.value.object.get("statement_kind").?.string);
+    const ordered_unnest_rows = ordered_unnest_parsed.value.object.get("result").?.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), ordered_unnest_rows.len);
+    try std.testing.expectEqualStrings("doc:b", ordered_unnest_rows[0].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("stale", ordered_unnest_rows[0].object.get("tag").?.string);
+    try std.testing.expectEqualStrings("doc:a", ordered_unnest_rows[1].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("urgent", ordered_unnest_rows[1].object.get("tag").?.string);
+    try std.testing.expectEqualStrings("doc:a", ordered_unnest_rows[2].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("vip", ordered_unnest_rows[2].object.get("tag").?.string);
 
     var ordered_resp = try server.handle(.{
         .method = .POST,

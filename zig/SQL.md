@@ -59,6 +59,23 @@ tree, but it should not read table metadata, role grants, extension state, or
 range ownership. That keeps parse behavior deterministic and lets unsupported
 statements be classified before any storage or metadata side effect is possible.
 
+### PostgreSQL Compatibility And Grammar Ownership
+
+Antfly SQL aims for PostgreSQL-compatible behavior at the user and API surface,
+while owning its grammar, AST, lowering, and execution semantics. PostgreSQL and
+CockroachDB grammar behavior should be used as compatibility references, not as
+vendored runtime parser code. This keeps the language boundary aligned with
+Antfly-native catalogs, document/relational storage, derived indexes, graph
+metrics, Lite files, and typed service contracts.
+
+The current hand-written parser remains the production path until a generated
+grammar can prove parity statement family by statement family. The desired
+long-term shape is Cockroach-style: a generated Antfly SQL parser over an
+Antfly-owned grammar, a SQL-aware scanner, Antfly AST nodes, typed lowering,
+and explicit unsupported-shape diagnostics. The migration plan and generator
+performance requirements live in
+[`pkg/antfly/src/sql/grammar/GRAMMAR.md`](pkg/antfly/src/sql/grammar/GRAMMAR.md).
+
 ## Design Summary
 
 The long-term production shape is a phase-separated SQL frontend over typed
@@ -854,6 +871,16 @@ derived-index execution on the document-query path without teaching the
 relational row planner to emulate search, graph, vector, hybrid, or reranking
 behavior.
 
+Current implementation note: SQL table-function reads normalize the native
+query response envelope rather than requiring every derived query to return
+ordinary search hits. Full-text, vector, semantic, hybrid, and reranked queries
+return hit rows from `hits.hits`. Graph metric reads can flatten
+`graph_metric_results` score entries into rows with `_id`, `_score`,
+`_graph_metric`, `_index`, and `_metric`. Graph traversal/path reads can flatten
+`graph_results` nodes into rows with `_id`, `_source`, `_graph`, `_graph_type`,
+`_depth`, `_distance`, and `_node`. Projection uses the same missing-as-`NULL`
+rule as hit rows.
+
 That means the planner has two distinct jobs. For explicit retrieval intent,
 such as semantic search, graph traversal, hybrid fusion, metric reranking, or
 full-text search with native analyzer semantics, SQL should bind an `antfly.*`
@@ -874,9 +901,12 @@ such as `WHERE full_text_search('title:alpha')` describe filters that the
 document planner may implement through a full-text/default index, future scalar
 path index, algebraic sidecar, lookup, or bounded residual scan. They should
 not grow into separate spellings for `semantic_search`, `hybrid_search`, graph
-traversal, graph metrics, or reranking. Those remain `antfly.*` table functions
-so SQL, REST, SDK, MCP, A2A, CLI, and serverless execution all share the same
-native query request path.
+traversal, graph metrics, reranking, or native full-text retrieval. Those remain
+`antfly.*` table functions so SQL, REST, SDK, MCP, A2A, CLI, and serverless
+execution all share the same native query request path. The compatibility
+predicate is intentionally the unqualified `full_text_search(...)`; qualified
+`antfly.full_text_search(...)` belongs in `FROM antfly.full_text_search(...)`
+and is rejected as a scalar document predicate.
 
 Current source binding records semantic, vector, hybrid, graph, and graph
 metric index families separately, even when the first SQL surface routes them
@@ -952,8 +982,12 @@ matching documents. When no algebraic materialization or native candidate
 producer can answer exactly, catalog-backed lowering can choose an explicit
 bounded-scan aggregate producer from `DocumentSqlCapabilities.bounded_scan`;
 execution fails closed if the scan reaches its cap, so counts are not returned
-from partial samples. Algebraic partial/result execution still fails closed
-until its producer-specific executor is implemented.
+from partial samples. The same bounded-producer rule now applies to ungrouped
+numeric `SUM(path)` over numeric declared fields or typed paths: `_id` lookup,
+capped native candidates, and policy-bounded scans can compute the exact sum,
+missing/JSON-null inputs are ignored, and an empty non-null input set returns
+`NULL`. Grouped numeric summaries and algebraic partial/result execution still
+fail closed until their producer-specific executors are implemented.
 
 Read execution now also has a policy-gated bounded residual scan path for simple
 scalar document predicates. If a predicate cannot use a ready document query,
@@ -982,6 +1016,14 @@ bounded local sort over an `_id` lookup, a capped native candidate producer, or
 a policy-capped scan; it does not claim that arbitrary document tables have a
 global sorted access path.
 
+Current implementation note: `_doc` is also a SQL JSON-path root for projection
+and compatible predicates. For example, `_doc->>'status'` lowers to the same
+logical path as `/status`, and `_doc#>>'{metadata,plan}'` lowers to
+`/metadata/plan`. `_doc` itself is not a producer and does not prove readiness;
+declared fields and typed paths can only make the resulting path typeable.
+Producer readiness must still come from catalog index metadata, another native
+producer capability, or an explicit bounded-scan policy.
+
 Residual filters are allowed only after an explicit bounded producer. Current
 document read lowering can attach scalar residual filters after an `_id IN (...)`
 or `_id = ...` lookup, after a bounded full-text candidate query, or after a
@@ -1005,10 +1047,12 @@ Current implementation note: document SQL projection can still expose array
 fields as JSON values, but scalar predicates over array paths fail closed with
 `DocumentSqlArrayRequiresUnnest`. `UNNEST(d.array_field) AS item` is the first
 explicit array-expansion shape: it expands a single declared array field over an
-`_id` lookup or policy-bounded scan producer, can apply an equality predicate on
-the unnest alias, and projects the expanded item as a SQL row value. Broader
-array operators, nested unnests, ordered unnests, and indexed array-element
-producers remain future work.
+`_id` lookup, a bounded native document-query candidate producer, or a
+policy-bounded scan producer; can apply an equality predicate on the unnest
+alias; projects the expanded item as a SQL row value; and supports bounded
+`ORDER BY` over either the unnest alias or a document field before applying
+`LIMIT`. Broader array operators, nested unnests, and true indexed
+array-element producers remain future work.
 
 ### Execution Contract
 

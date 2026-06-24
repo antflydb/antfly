@@ -16,6 +16,7 @@ const std = @import("std");
 
 const ast = @import("ast.zig");
 const classifier = @import("classifier.zig");
+const generated_parser = @import("generated_parser.zig");
 const lexer = @import("lexer.zig");
 const token_mod = @import("token.zig");
 
@@ -187,6 +188,7 @@ pub const ParsedSql = struct {
     pub fn initAlloc(alloc: std.mem.Allocator, source_sql: []const u8) !ParsedSql {
         var tokenized_sql = try TokenizedSql.initAlloc(alloc, source_sql);
         errdefer tokenized_sql.deinit(alloc);
+        try observeGeneratedParserGateAlloc(alloc, tokenized_sql.items());
         const raw_statement = try parseRawStatement(tokenized_sql.items(), tokenized_sql.statement_family);
         return .{
             .tokenized_sql = tokenized_sql,
@@ -198,6 +200,7 @@ pub const ParsedSql = struct {
     pub fn initFromTokenSliceAlloc(alloc: std.mem.Allocator, source_sql: []const u8, source_tokens: []const Token) !ParsedSql {
         var tokenized_sql = try TokenizedSql.initFromTokenSliceAlloc(alloc, source_sql, source_tokens);
         errdefer tokenized_sql.deinit(alloc);
+        try observeGeneratedParserGateAlloc(alloc, tokenized_sql.items());
         const raw_statement = try parseRawStatement(tokenized_sql.items(), tokenized_sql.statement_family);
         return .{
             .tokenized_sql = tokenized_sql,
@@ -261,6 +264,13 @@ pub const ParsedSql = struct {
     }
 };
 
+fn observeGeneratedParserGateAlloc(alloc: std.mem.Allocator, tokens: []const Token) !void {
+    _ = generated_parser.parseGeneratedGateTokensAlloc(alloc, tokens) catch |err| switch (err) {
+        error.UnsupportedSqlShape, error.UnexpectedToken => null,
+        else => return err,
+    };
+}
+
 fn parseStatement(raw_statement: RawSqlStatement, tokenized_sql: *const TokenizedSql) ParsedStatement {
     if (tokenized_sql.read_statement_kind) |kind| {
         return .{ .read = .{ .kind = kind, .raw = raw_statement } };
@@ -280,8 +290,15 @@ fn parseStatement(raw_statement: RawSqlStatement, tokenized_sql: *const Tokenize
 fn classifyDdlLikeStatement(raw_statement: RawSqlStatement, tokens: []const Token) ParsedStatement {
     if (tokens.len == 0 or tokens[0].kind != .identifier) return .{ .unknown = raw_statement };
     if (tokens[0].isKeyword(.explain)) return .{ .explain = parseExplainStatement(raw_statement, tokens) catch .{ .raw = raw_statement } };
-    if (tokens[0].isKeyword(.begin)) return .{ .transaction = .{ .raw = raw_statement } };
-    if (tokens[0].isKeyword(.set)) return .{ .session = .{ .raw = raw_statement } };
+    if (tokens[0].isKeyword(.begin) or tokens[0].isKeyword(.commit) or tokens[0].isKeyword(.rollback)) {
+        return .{ .transaction = .{ .raw = raw_statement } };
+    }
+    if (tokens[0].isKeyword(.set) or tokens[0].isKeyword(.reset) or tokens[0].isKeyword(.show) or tokens[0].isKeyword(.discard)) {
+        return .{ .session = .{ .raw = raw_statement } };
+    }
+    if (tokens[0].isKeyword(.prepare) or tokens[0].isKeyword(.execute) or tokens[0].isKeyword(.deallocate)) {
+        return .{ .session = .{ .raw = raw_statement } };
+    }
     return .{ .ddl = .{ .raw = raw_statement } };
 }
 
@@ -507,6 +524,18 @@ test "sql adapter parsed sql exposes raw statement source spans" {
     var nested_semicolon = try ParsedSql.initAlloc(alloc, "SELECT ';' AS separator");
     defer nested_semicolon.deinit(alloc);
     try std.testing.expectEqualStrings("SELECT ';' AS separator", nested_semicolon.statementSql());
+}
+
+test "sql adapter parsed sql does not require generated grammar parity" {
+    const alloc = std.testing.allocator;
+
+    var ddl = try ParsedSql.initAlloc(alloc, "ALTER TABLE audit_log ALTER COLUMN amount TYPE numeric USING amount + 1;");
+    defer ddl.deinit(alloc);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .ddl), std.meta.activeTag(ddl.statement));
+
+    var select = try ParsedSql.initAlloc(alloc, "SELECT id FROM docs WHERE status = 'active' LIMIT 5");
+    defer select.deinit(alloc);
+    try std.testing.expectEqual(classifier.SqlReadStatementKind.query, select.readStatementKind().?);
 }
 
 test "sql adapter parsed sql builds non-contiguous child statements from parent tokens" {
