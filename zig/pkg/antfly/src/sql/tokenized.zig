@@ -867,6 +867,8 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
         .{ .sql = "SELECT id FROM usage_records WHERE name ILIKE ALL(ARRAY['ada%', 'grace%'])", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE id IN ('u1', 'u2')", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE score BETWEEN 1 AND 10", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records WHERE priority BETWEEN SYMMETRIC 20 AND 10", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records WHERE array_length(tags, 1) BETWEEN SYMMETRIC 3 AND 1", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE status NOT LIKE 'closed%'", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE status NOT ILIKE 'closed%'", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE status NOT LIKE 'cl!_%' ESCAPE '!'", .generated = .query, .read = .query },
@@ -874,6 +876,8 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
         .{ .sql = "SELECT id FROM usage_records WHERE lower(name) NOT ILIKE ALL(ARRAY['bot%', 'sys%'])", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE id NOT IN ('u1', 'u2')", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE score NOT BETWEEN 1 AND 10", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records WHERE priority NOT BETWEEN ASYMMETRIC 10 AND 20", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records WHERE priority NOT BETWEEN SYMMETRIC 20 AND 10", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE score = ANY (1, 2)", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE score <> ALL (1, 2)", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE score > SOME (1, 2)", .generated = .query, .read = .query },
@@ -1062,6 +1066,21 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read_ast.where_expression.left_tokens.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read_ast.where_expression.operator_tokens.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 10 }, read_ast.where_expression.right_tokens.?);
+                } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records WHERE priority BETWEEN SYMMETRIC 20 AND 10")) {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.between, read_ast.where_expression.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read_ast.where_expression.left_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read_ast.where_expression.operator_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read_ast.where_expression.between_modifier_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlBetweenModifier.symmetric, read_ast.where_expression.between_modifier.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 8, .end = 11 }, read_ast.where_expression.right_tokens.?);
+                } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records WHERE array_length(tags, 1) BETWEEN SYMMETRIC 3 AND 1")) {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.between, read_ast.where_expression.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 11 }, read_ast.where_expression.left_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.function_call, read_ast.where_expression.left_expression_kind.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 11, .end = 12 }, read_ast.where_expression.operator_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read_ast.where_expression.between_modifier_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlBetweenModifier.symmetric, read_ast.where_expression.between_modifier.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 13, .end = 16 }, read_ast.where_expression.right_tokens.?);
                 } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records WHERE status NOT LIKE 'closed%'")) {
                     try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.not_like, read_ast.where_expression.kind);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read_ast.where_expression.negation_tokens.?);
@@ -1103,6 +1122,20 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read_ast.where_expression.negation_tokens.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read_ast.where_expression.operator_tokens.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 8, .end = 11 }, read_ast.where_expression.right_tokens.?);
+                } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records WHERE priority NOT BETWEEN ASYMMETRIC 10 AND 20")) {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.not_between, read_ast.where_expression.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read_ast.where_expression.negation_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read_ast.where_expression.operator_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read_ast.where_expression.between_modifier_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlBetweenModifier.asymmetric, read_ast.where_expression.between_modifier.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 9, .end = 12 }, read_ast.where_expression.right_tokens.?);
+                } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records WHERE priority NOT BETWEEN SYMMETRIC 20 AND 10")) {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.not_between, read_ast.where_expression.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read_ast.where_expression.negation_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read_ast.where_expression.operator_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read_ast.where_expression.between_modifier_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlBetweenModifier.symmetric, read_ast.where_expression.between_modifier.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 9, .end = 12 }, read_ast.where_expression.right_tokens.?);
                 } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records WHERE score = ANY (1, 2)")) {
                     try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.quantified_comparison, read_ast.where_expression.kind);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read_ast.where_expression.left_tokens.?);

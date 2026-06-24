@@ -296,9 +296,10 @@ Suggested migration order:
    multi-token operator ranges. Top-level
    `AND` and `OR` predicates are classified as logical-expression metadata with
    left and right token ranges and owned child expression nodes, while
-   `BETWEEN ... AND ...` remains classified as a range predicate. Prefix `NOT`
-   predicates are accepted and classified with owned right-side expression
-   nodes.
+   `BETWEEN ... AND ...` remains classified as a range predicate with explicit
+   generated metadata for PostgreSQL `SYMMETRIC` and `ASYMMETRIC` modifiers.
+   Prefix `NOT` predicates are accepted and classified with owned right-side
+   expression nodes.
    Parenthesized expression groups carry inner token ranges and owned inner
    expression nodes, and comparison operands can expose additive and
    multiplicative child expression-kind summaries, including JSON/path postfix

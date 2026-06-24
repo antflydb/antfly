@@ -207,6 +207,11 @@ pub const GeneratedSqlExpressionKind = enum {
     array_constructor,
 };
 
+pub const GeneratedSqlBetweenModifier = enum {
+    asymmetric,
+    symmetric,
+};
+
 pub const GeneratedSqlExpressionAst = struct {
     kind: GeneratedSqlExpressionKind = .token_range,
     tokens: ?GeneratedSqlTokenRange = null,
@@ -234,6 +239,8 @@ pub const GeneratedSqlExpressionAst = struct {
     left_expression: ?*GeneratedSqlExpressionAst = null,
     negation_tokens: ?GeneratedSqlTokenRange = null,
     operator_tokens: ?GeneratedSqlTokenRange = null,
+    between_modifier_tokens: ?GeneratedSqlTokenRange = null,
+    between_modifier: ?GeneratedSqlBetweenModifier = null,
     quantifier_tokens: ?GeneratedSqlTokenRange = null,
     right_tokens: ?GeneratedSqlTokenRange = null,
     right_expression_kind: ?GeneratedSqlExpressionKind = null,
@@ -572,6 +579,8 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT id FROM usage_records WHERE name ILIKE ALL(ARRAY['ada%', 'grace%'])", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE id IN ('u1', 'u2')", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE score BETWEEN 1 AND 10", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE priority BETWEEN SYMMETRIC 20 AND 10", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE array_length(tags, 1) BETWEEN SYMMETRIC 3 AND 1", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status NOT LIKE 'closed%'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status NOT ILIKE 'closed%'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status NOT LIKE 'cl!_%' ESCAPE '!'", .kind = .read },
@@ -579,6 +588,8 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT id FROM usage_records WHERE lower(name) NOT ILIKE ALL(ARRAY['bot%', 'sys%'])", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE id NOT IN ('u1', 'u2')", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE score NOT BETWEEN 1 AND 10", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE priority NOT BETWEEN ASYMMETRIC 10 AND 20", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE priority NOT BETWEEN SYMMETRIC 20 AND 10", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE score = ANY (1, 2)", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE score <> ALL (1, 2)", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE score > SOME (1, 2)", .kind = .read },
@@ -1981,10 +1992,19 @@ fn buildGeneratedExpressionAst(alloc: std.mem.Allocator, tokens: []const token_m
         break :blk quantifier_index + 1;
     } else operator_end;
     if (right_start >= range.end) return ast;
+    var operand_start = right_start;
+    if (isGeneratedBetweenExpressionKind(operator.kind)) {
+        if (generatedBetweenModifier(tokens[right_start])) |modifier| {
+            if (right_start + 1 >= range.end) return ast;
+            ast.between_modifier_tokens = .{ .start = right_start, .end = right_start + 1 };
+            ast.between_modifier = modifier;
+            operand_start = right_start + 1;
+        }
+    }
     var right_end = range.end;
     if (isGeneratedLikeExpressionKind(operator.kind)) {
-        if (findTopLevelKeyword(tokens, right_start, range.end, .escape)) |escape_index| {
-            if (right_start >= escape_index or escape_index + 1 >= range.end) return ast;
+        if (findTopLevelKeyword(tokens, operand_start, range.end, .escape)) |escape_index| {
+            if (operand_start >= escape_index or escape_index + 1 >= range.end) return ast;
             right_end = escape_index;
             ast.escape_tokens = .{ .start = escape_index, .end = range.end };
             const escape_expression_tokens = GeneratedSqlTokenRange{ .start = escape_index + 1, .end = range.end };
@@ -1992,7 +2012,7 @@ fn buildGeneratedExpressionAst(alloc: std.mem.Allocator, tokens: []const token_m
             ast.escape_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, escape_expression_tokens);
         }
     }
-    ast.right_tokens = .{ .start = right_start, .end = right_end };
+    ast.right_tokens = .{ .start = operand_start, .end = right_end };
     ast.right_expression_kind = generatedExpressionKindForRange(tokens, ast.right_tokens.?);
     ast.right_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, ast.right_tokens.?);
     return ast;
@@ -2402,6 +2422,16 @@ fn isGeneratedQuantifiedOperator(token: token_mod.Token) bool {
 
 fn isGeneratedLikeExpressionKind(kind: GeneratedSqlExpressionKind) bool {
     return kind == .like or kind == .ilike or kind == .not_like or kind == .not_ilike;
+}
+
+fn isGeneratedBetweenExpressionKind(kind: GeneratedSqlExpressionKind) bool {
+    return kind == .between or kind == .not_between;
+}
+
+fn generatedBetweenModifier(token: token_mod.Token) ?GeneratedSqlBetweenModifier {
+    if (token.matchesKeywordTag(.asymmetric)) return .asymmetric;
+    if (token.matchesKeywordTag(.symmetric)) return .symmetric;
+    return null;
 }
 
 fn findKeyword(tokens: []const token_mod.Token, start: usize, end: usize, keyword: token_mod.TokenKeyword) ?usize {
@@ -2911,6 +2941,39 @@ test "generated SQL parser facade builds control AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const symmetric_between_read_sql = "SELECT id FROM usage_records WHERE priority BETWEEN SYMMETRIC 20 AND 10";
+    const symmetric_between_read_result = try parseSqlAlloc(alloc, symmetric_between_read_sql);
+    switch (symmetric_between_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 11 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.between, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.where_expression.between_modifier_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlBetweenModifier.symmetric, read.where_expression.between_modifier.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 11 }, read.where_expression.right_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const function_symmetric_between_read_sql = "SELECT id FROM usage_records WHERE array_length(tags, 1) BETWEEN SYMMETRIC 3 AND 1";
+    const function_symmetric_between_read_result = try parseSqlAlloc(alloc, function_symmetric_between_read_sql);
+    switch (function_symmetric_between_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 16 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.between, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 11 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.function_call, read.where_expression.left_expression_kind.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 12 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read.where_expression.between_modifier_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlBetweenModifier.symmetric, read.where_expression.between_modifier.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 16 }, read.where_expression.right_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const not_like_read_sql = "SELECT id FROM usage_records WHERE status NOT LIKE 'closed%'";
     const not_like_read_result = try parseSqlAlloc(alloc, not_like_read_sql);
     switch (not_like_read_result.ast.?) {
@@ -3024,6 +3087,40 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.where_expression.negation_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.where_expression.operator_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 11 }, read.where_expression.right_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const not_asymmetric_between_read_sql = "SELECT id FROM usage_records WHERE priority NOT BETWEEN ASYMMETRIC 10 AND 20";
+    const not_asymmetric_between_read_result = try parseSqlAlloc(alloc, not_asymmetric_between_read_sql);
+    switch (not_asymmetric_between_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 12 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.not_between, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.where_expression.negation_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.where_expression.between_modifier_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlBetweenModifier.asymmetric, read.where_expression.between_modifier.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 12 }, read.where_expression.right_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const not_symmetric_between_read_sql = "SELECT id FROM usage_records WHERE priority NOT BETWEEN SYMMETRIC 20 AND 10";
+    const not_symmetric_between_read_result = try parseSqlAlloc(alloc, not_symmetric_between_read_sql);
+    switch (not_symmetric_between_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 12 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.not_between, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.where_expression.negation_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.where_expression.between_modifier_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlBetweenModifier.symmetric, read.where_expression.between_modifier.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 12 }, read.where_expression.right_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

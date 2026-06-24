@@ -32,12 +32,12 @@
 %token AT_CONTAINS RANGE_OVERLAP QUESTION QUESTION_ANY QUESTION_ALL
 %token ARROW_JSON ARROW_TEXT PATH_ARROW_JSON PATH_ARROW_TEXT
 %token REGEX_MATCH REGEX_IMATCH REGEX_NOT_MATCH REGEX_NOT_IMATCH
-%token ALL ALTER ANALYZE AND ANY ARRAY AS ASC BEGIN BETWEEN BY CASCADE COMMIT CONFLICT CONSTRAINT CONTINUE CURRENT
+%token ALL ALTER ANALYZE AND ANY ARRAY AS ASC ASYMMETRIC BEGIN BETWEEN BY CASCADE COMMIT CONFLICT CONSTRAINT CONTINUE CURRENT
 %token CREATE DATABASE DEALLOCATE DEFAULT DELETE DESC DISCARD DISTINCT DO DROP EXECUTE
 %token ESCAPE EXPLAIN EXISTS EXTENSION FALSE FETCH FILTER FIRST FOLLOWING FROM FULL GRAPH GROUP HAVING IDENTITY IF ILIKE IN INDEX INNER INSERT INTO IS
 %token JOIN KEY LAST LATERAL LEFT LIKE LIMIT MATCHED MATERIALIZED MERGE METRIC NOT NULL NULLS ON OR ORDER OUTER OVER PARTITION PRECEDING PREPARE PRIMARY PUBLIC
 %token NEXT NOTHING OFFSET ONLY QUERY RANGE RECURSIVE RESET RESTART RESTRICT RETURNING RIGHT ROLLBACK ROW ROWS SCHEMA SELECT SET SHOW SOME TABLE TO TRUNCATE
-%token THEN TRUE UNION UNKNOWN UPDATE USING VALUES WHEN WHERE WINDOW WITH WITHIN
+%token SYMMETRIC THEN TRUE UNION UNKNOWN UPDATE USING VALUES WHEN WHERE WINDOW WITH WITHIN
 %token EXCEPT INTERSECT UNBOUNDED
 
 statement:
@@ -660,13 +660,13 @@ comparison_expression:
   | concat_expression LIKE quantified_operator quantified_rhs
   | concat_expression ILIKE quantified_operator quantified_rhs
   | concat_expression IN LPAREN expression_list RPAREN
-  | concat_expression BETWEEN concat_expression AND concat_expression
+  | concat_expression BETWEEN between_modifier_opt concat_expression AND concat_expression
   | concat_expression NOT LIKE concat_expression like_escape_opt
   | concat_expression NOT ILIKE concat_expression like_escape_opt
   | concat_expression NOT LIKE quantified_operator quantified_rhs
   | concat_expression NOT ILIKE quantified_operator quantified_rhs
   | concat_expression NOT IN LPAREN expression_list RPAREN
-  | concat_expression NOT BETWEEN concat_expression AND concat_expression
+  | concat_expression NOT BETWEEN between_modifier_opt concat_expression AND concat_expression
   | concat_expression comparison_operator quantified_operator quantified_rhs
   | concat_expression IS NULL
   | concat_expression IS NOT NULL
@@ -683,6 +683,12 @@ comparison_expression:
 like_escape_opt:
     /* empty */
   | ESCAPE concat_expression
+  ;
+
+between_modifier_opt:
+    /* empty */
+  | ASYMMETRIC
+  | SYMMETRIC
   ;
 
 comparison_operator:
