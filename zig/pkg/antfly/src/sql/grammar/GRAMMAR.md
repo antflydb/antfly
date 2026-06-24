@@ -70,14 +70,17 @@ insert-source lowering. Single-table point `UPDATE` and `DELETE` statements with
 directly from generated AST ranges into relational row batches. Table-wide and
 single-table source `UPDATE` and `DELETE` statements without joined
 `FROM`/`USING` sources now validate generated AST ranges before direct
-mutation-source lowering, and `TRUNCATE` lowers directly from generated AST
-ranges into mutation-source plans. Other DML shapes still use an initial generated
+mutation-source lowering. Explicit `UPDATE ... FROM` and `DELETE ... USING`
+joined mutation-source statements now validate generated target, source,
+predicate, and returning ranges before direct joined mutation-source lowering,
+and `TRUNCATE` lowers directly from generated AST ranges into mutation-source
+plans. Other DML shapes still use an initial generated
 AST-to-plan wrapper that fails closed if the generated DML family does not
 match the existing write classifier before delegating to the current typed DML
 lowerer. Unsupported DML still falls back, and deeper DML cutover still
 requires replacing token-based command-body parsing with complete generated AST
-payloads for broader `INSERT ... SELECT` source bodies, joined `UPDATE`,
-joined `DELETE`, and `MERGE` bodies.
+payloads for broader `INSERT ... SELECT` source bodies, semijoin/exists joined
+mutation bodies, and `MERGE` bodies.
 Representative
 read queries now have generated-parser corpus coverage, retained generated raw
 and AST nodes for covered read statements, and an initial generated AST-to-plan
@@ -174,15 +177,16 @@ Suggested migration order:
    generated AST-to-plan lowerers for generated primary/unique selector ranges
    with field, all-field, and expression returning lists; table-wide and
    single-table source `UPDATE`/`DELETE` without joined sources have generated
-   range-validated direct mutation-source lowerers; and `TRUNCATE` has a direct
-   generated AST-to-plan lowerer for the supported table-list, identity, and
-   drop-behavior surface.
+   range-validated direct mutation-source lowerers; explicit `UPDATE ... FROM`
+   and `DELETE ... USING` have generated range-validated direct joined
+   mutation-source lowerers; and `TRUNCATE` has a direct generated AST-to-plan
+   lowerer for the supported table-list, identity, and drop-behavior surface.
    Other DML still has a validated wrapper into the current typed DML lowerer
    for representative generated-covered write plans. Switching the full DML
    family from fallback to required generated parsing still requires generated
    command-body ASTs for broader insert-select source bodies,
-   joined update/delete bodies, and merge arms, plus broader unsupported-shape
-   diagnostics.
+   semijoin/exists joined mutation bodies, and merge arms, plus broader
+   unsupported-shape diagnostics.
 4. Read queries: projections, predicates, joins, CTEs, aggregates, windows,
    set operations, lateral, ordering, limits, and document-table sources.
    Initial generated-parser coverage now retains raw and AST read nodes for
@@ -350,8 +354,10 @@ Generated grammar work needs evidence at multiple levels:
   AST-to-plan coverage for single-table point update/delete batches with
   returning lists, direct generated AST-to-plan coverage for table-wide and
   single-table source update/delete mutation-source requests without joined
-  sources, and initial generated AST-to-plan parity through a generated-family
-  validation wrapper over other representative write plans. Read plans have initial
+  sources, direct generated AST-to-plan coverage for explicit update-from and
+  delete-using joined mutation-source requests, and initial generated
+  AST-to-plan parity through a generated-family validation wrapper over other
+  representative write plans. Read plans have initial
   generated AST-to-plan parity through a generated-family validation wrapper
   over representative query, aggregate, join, lateral, and non-recursive CTE
   plans. Seed graph DDL has generated AST-to-plan parity for graph index and

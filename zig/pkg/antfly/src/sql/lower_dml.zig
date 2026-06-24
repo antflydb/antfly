@@ -12423,6 +12423,12 @@ pub fn lowerWritePlanFromGeneratedDmlAstAlloc(
                 error.UnsupportedSqlShape => {},
                 else => return err,
             },
+            .update_joined_source => if (updateJoinedSourceFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast, schema, params, options)) |update_joined_source| {
+                return .{ .update_joined_source = update_joined_source };
+            } else |err| switch (err) {
+                error.UnsupportedSqlShape => {},
+                else => return err,
+            },
             else => {},
         }
     }
@@ -12444,6 +12450,12 @@ pub fn lowerWritePlanFromGeneratedDmlAstAlloc(
             },
             .delete_source => if (deleteSourceFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast, schema, params, options, write_kind)) |delete_source| {
                 return .{ .delete_source = delete_source };
+            } else |err| switch (err) {
+                error.UnsupportedSqlShape => {},
+                else => return err,
+            },
+            .delete_joined_source => if (deleteJoinedSourceFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast, schema, params, options)) |delete_joined_source| {
+                return .{ .delete_joined_source = delete_joined_source };
             } else |err| switch (err) {
                 error.UnsupportedSqlShape => {},
                 else => return err,
@@ -12830,6 +12842,141 @@ fn validateGeneratedDmlTailRanges(
     } else if (returning_keyword) |returning_start| {
         if (tail_start != returning_start) return error.UnsupportedSqlShape;
     } else if (tail_start != end) return error.UnsupportedSqlShape;
+}
+
+fn updateJoinedSourceFromGeneratedDmlAstAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    ast: generated_parser.GeneratedSqlDmlAst,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+) !plan_mod.LoweredJoinedMutationSource {
+    if (ast.kind != .update) return error.UnsupportedSqlShape;
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    const source_schema = options.joined_source_schema orelse schema;
+    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    const row_claim = options.row_claim orelse return error.UnsupportedRowsQuery;
+    if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
+    const tokens = parsed_sql.items();
+    const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    try validateGeneratedUpdateJoinedRanges(tokens, ast, end);
+
+    const parser_context = @import("parser_context.zig");
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens,
+        .schema = schema,
+        .joined_source_schema = source_schema,
+        .params = params,
+        .mutation_claim = row_claim,
+    };
+    var lowered = try parseJoinedMutationSourceAlloc(
+        alloc,
+        tokens,
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.updateJoinedMutationSourceParserHooks(&parser_state),
+    ) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedRowsQuery,
+        else => return err,
+    };
+    errdefer lowered.deinit(alloc);
+    if (!generatedDmlParserConsumedStatement(tokens, end, parser_state.pos)) return error.UnsupportedSqlShape;
+    lowered.sync_level = options.sync_level;
+    return lowered;
+}
+
+fn deleteJoinedSourceFromGeneratedDmlAstAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    ast: generated_parser.GeneratedSqlDmlAst,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+) !plan_mod.LoweredJoinedMutationSource {
+    if (ast.kind != .delete) return error.UnsupportedSqlShape;
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    const source_schema = options.joined_source_schema orelse schema;
+    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    const row_claim = options.row_claim orelse return error.UnsupportedRowsQuery;
+    if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
+    const tokens = parsed_sql.items();
+    const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    try validateGeneratedDeleteJoinedRanges(tokens, ast, end);
+
+    const parser_context = @import("parser_context.zig");
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens,
+        .schema = schema,
+        .joined_source_schema = source_schema,
+        .params = params,
+        .mutation_claim = row_claim,
+    };
+    var lowered = try parseJoinedMutationSourceAlloc(
+        alloc,
+        tokens,
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.deleteJoinedMutationSourceParserHooks(&parser_state),
+    ) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedRowsQuery,
+        else => return err,
+    };
+    errdefer lowered.deinit(alloc);
+    if (!generatedDmlParserConsumedStatement(tokens, end, parser_state.pos)) return error.UnsupportedSqlShape;
+    lowered.sync_level = options.sync_level;
+    return lowered;
+}
+
+fn validateGeneratedUpdateJoinedRanges(
+    tokens: []const Token,
+    ast: generated_parser.GeneratedSqlDmlAst,
+    end: usize,
+) !void {
+    if (end < 8 or !tokens[0].matchesKeywordTag(.update)) return error.UnsupportedSqlShape;
+    _ = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, 1, end);
+    const assignments_range = ast.assignments_tokens orelse return error.UnsupportedSqlShape;
+    if (assignments_range.start == 0 or assignments_range.start >= assignments_range.end or assignments_range.end > end) return error.UnsupportedSqlShape;
+    if (!tokens[assignments_range.start - 1].matchesKeywordTag(.set)) return error.UnsupportedSqlShape;
+    const source_range = ast.source_tokens orelse return error.UnsupportedSqlShape;
+    if (source_range.start == 0 or source_range.start >= source_range.end or source_range.end > end) return error.UnsupportedSqlShape;
+    if (!tokens[source_range.start - 1].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
+    if (source_range.start - 1 != assignments_range.end) return error.UnsupportedSqlShape;
+    try validateGeneratedJoinedTailRanges(tokens, end, source_range.end, ast.where_tokens, ast.returning_tokens);
+}
+
+fn validateGeneratedDeleteJoinedRanges(
+    tokens: []const Token,
+    ast: generated_parser.GeneratedSqlDmlAst,
+    end: usize,
+) !void {
+    if (end < 7 or !tokens[0].matchesKeywordTag(.delete) or !tokens[1].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
+    const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, 2, end);
+    const source_range = ast.source_tokens orelse return error.UnsupportedSqlShape;
+    if (source_range.start == 0 or source_range.start >= source_range.end or source_range.end > end) return error.UnsupportedSqlShape;
+    if (!tokens[source_range.start - 1].matchesKeywordTag(.using)) return error.UnsupportedSqlShape;
+    if (source_range.start - 1 != target_range.end) return error.UnsupportedSqlShape;
+    try validateGeneratedJoinedTailRanges(tokens, end, source_range.end, ast.where_tokens, ast.returning_tokens);
+}
+
+fn validateGeneratedJoinedTailRanges(
+    tokens: []const Token,
+    end: usize,
+    source_end: usize,
+    where_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    returning_tokens: ?generated_parser.GeneratedSqlTokenRange,
+) !void {
+    const where_range = where_tokens orelse return error.UnsupportedSqlShape;
+    if (where_range.start == 0 or where_range.start >= where_range.end or where_range.end > end) return error.UnsupportedSqlShape;
+    if (!tokens[where_range.start - 1].matchesKeywordTag(.where)) return error.UnsupportedSqlShape;
+    if (where_range.start - 1 != source_end) return error.UnsupportedSqlShape;
+    if (returning_tokens) |returning_range| {
+        if (returning_range.start == 0 or returning_range.start > returning_range.end or returning_range.end > end) return error.UnsupportedSqlShape;
+        if (!tokens[returning_range.start - 1].matchesKeywordTag(.returning)) return error.UnsupportedSqlShape;
+        if (where_range.end != returning_range.start - 1 or returning_range.end != end) return error.UnsupportedSqlShape;
+    } else if (where_range.end != end) return error.UnsupportedSqlShape;
 }
 
 fn updatePointFromGeneratedDmlAstAlloc(
@@ -13652,6 +13799,59 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
     try std.testing.expectEqualStrings("organization_id", generated_source_delete.mutation.req.source.predicates[0].field);
     try std.testing.expect(generated_source_delete.mutation.req.source.row_claim.?.skip_locked);
     try std.testing.expectEqual(@as(usize, 1), generated_source_delete.mutation.req.returning.len);
+
+    var parsed_generated_joined_update = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET status = source.status FROM usage_records AS source WHERE usage_records.id = source.id FOR UPDATE RETURNING id",
+    );
+    defer parsed_generated_joined_update.deinit(alloc);
+    const generated_joined_update_ast = switch ((parsed_generated_joined_update.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_joined_update = try updateJoinedSourceFromGeneratedDmlAstAlloc(
+        alloc,
+        &parsed_generated_joined_update,
+        generated_joined_update_ast,
+        schema,
+        &.{},
+        options,
+    );
+    defer generated_joined_update.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", generated_joined_update.target_table_name);
+    try std.testing.expectEqualStrings("usage_records", generated_joined_update.source_table_name);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, generated_joined_update.sync_level);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, generated_joined_update.mutation.req.kind);
+    try std.testing.expectEqual(@as(usize, 1), generated_joined_update.mutation.req.join.on.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_joined_update.mutation.req.source_assignments.len);
+    try std.testing.expect(generated_joined_update.mutation.req.join.left.row_claim != null);
+    try std.testing.expectEqual(@as(usize, 1), generated_joined_update.mutation.req.returning.len);
+
+    var parsed_generated_joined_delete = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DELETE FROM usage_records USING usage_records AS source WHERE usage_records.id = source.id FOR UPDATE RETURNING id",
+    );
+    defer parsed_generated_joined_delete.deinit(alloc);
+    const generated_joined_delete_ast = switch ((parsed_generated_joined_delete.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_joined_delete = try deleteJoinedSourceFromGeneratedDmlAstAlloc(
+        alloc,
+        &parsed_generated_joined_delete,
+        generated_joined_delete_ast,
+        schema,
+        &.{},
+        options,
+    );
+    defer generated_joined_delete.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", generated_joined_delete.target_table_name);
+    try std.testing.expectEqualStrings("usage_records", generated_joined_delete.source_table_name);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, generated_joined_delete.sync_level);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, generated_joined_delete.mutation.req.kind);
+    try std.testing.expectEqual(@as(usize, 1), generated_joined_delete.mutation.req.join.on.len);
+    try std.testing.expect(generated_joined_delete.mutation.req.join.left.row_claim != null);
+    try std.testing.expectEqual(@as(usize, 1), generated_joined_delete.mutation.req.returning.len);
 
     const default_schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword","default":"u_default"},"status":{"type":"keyword","default":"active"},"quantity":{"type":"numeric","default":1}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
