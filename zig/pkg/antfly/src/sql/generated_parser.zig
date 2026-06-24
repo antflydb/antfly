@@ -239,6 +239,14 @@ pub const GeneratedSqlExpressionAst = struct {
     filter_predicate_tokens: ?GeneratedSqlTokenRange = null,
     filter_expression_kind: ?GeneratedSqlExpressionKind = null,
     filter_expression: ?*GeneratedSqlExpressionAst = null,
+    over_tokens: ?GeneratedSqlTokenRange = null,
+    over_name_tokens: ?GeneratedSqlTokenRange = null,
+    over_definition_tokens: ?GeneratedSqlTokenRange = null,
+    over_partition_tokens: ?GeneratedSqlTokenRange = null,
+    over_partition_items: GeneratedSqlListAst = .{},
+    over_order_tokens: ?GeneratedSqlTokenRange = null,
+    over_order_items: GeneratedSqlListAst = .{},
+    over_frame_tokens: ?GeneratedSqlTokenRange = null,
     array_tokens: ?GeneratedSqlTokenRange = null,
     array_items: GeneratedSqlListAst = .{},
     cast_expression_tokens: ?GeneratedSqlTokenRange = null,
@@ -319,6 +327,8 @@ pub const GeneratedSqlExpressionAst = struct {
         self.argument_items.deinit(alloc);
         self.argument_order_items.deinit(alloc);
         self.within_group_order_items.deinit(alloc);
+        self.over_partition_items.deinit(alloc);
+        self.over_order_items.deinit(alloc);
         self.array_items.deinit(alloc);
         self.* = .{};
     }
@@ -2600,6 +2610,18 @@ fn buildGeneratedExpressionAst(alloc: std.mem.Allocator, tokens: []const token_m
             ast.filter_expression_kind = generatedExpressionKindForRange(tokens, predicate_tokens);
             ast.filter_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, predicate_tokens);
         }
+        ast.over_tokens = function_call.over_tokens;
+        ast.over_name_tokens = function_call.over_name_tokens;
+        ast.over_definition_tokens = function_call.over_definition_tokens;
+        ast.over_partition_tokens = function_call.over_partition_tokens;
+        if (function_call.over_partition_tokens) |partition_tokens| {
+            ast.over_partition_items = try buildTopLevelListAst(alloc, tokens, partition_tokens, .{});
+        }
+        ast.over_order_tokens = function_call.over_order_tokens;
+        if (function_call.over_order_tokens) |order_tokens| {
+            ast.over_order_items = try buildTopLevelListAst(alloc, tokens, order_tokens, .{ .order_modifiers = true });
+        }
+        ast.over_frame_tokens = function_call.over_frame_tokens;
         return ast;
     }
     if (generatedArrayConstructorExpression(tokens, range)) |array_constructor| {
@@ -2760,6 +2782,12 @@ const GeneratedFunctionCallExpression = struct {
     within_group_order_tokens: ?GeneratedSqlTokenRange = null,
     filter_tokens: ?GeneratedSqlTokenRange = null,
     filter_predicate_tokens: ?GeneratedSqlTokenRange = null,
+    over_tokens: ?GeneratedSqlTokenRange = null,
+    over_name_tokens: ?GeneratedSqlTokenRange = null,
+    over_definition_tokens: ?GeneratedSqlTokenRange = null,
+    over_partition_tokens: ?GeneratedSqlTokenRange = null,
+    over_order_tokens: ?GeneratedSqlTokenRange = null,
+    over_frame_tokens: ?GeneratedSqlTokenRange = null,
 };
 
 const GeneratedFunctionArgumentMetadata = struct {
@@ -2771,7 +2799,6 @@ const GeneratedFunctionArgumentMetadata = struct {
 
 fn generatedFunctionCallExpression(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?GeneratedFunctionCallExpression {
     if (range.start + 2 > range.end or range.end > tokens.len) return null;
-    if (tokens[range.end - 1].kind != .rparen) return null;
 
     var depth: usize = 0;
     var lparen_index: ?usize = null;
@@ -2819,16 +2846,57 @@ fn generatedFunctionCallExpression(tokens: []const token_mod.Token, range: Gener
     }
     var filter_tokens: ?GeneratedSqlTokenRange = null;
     var filter_predicate_tokens: ?GeneratedSqlTokenRange = null;
-    if (cursor != range.end) {
+    if (cursor < range.end and tokens[cursor].matchesKeywordTag(.filter)) {
         if (cursor + 4 > range.end) return null;
         if (!tokens[cursor].matchesKeywordTag(.filter)) return null;
         if (tokens[cursor + 1].kind != .lparen) return null;
         if (!tokens[cursor + 2].matchesKeywordTag(.where)) return null;
-        if (tokens[range.end - 1].kind != .rparen) return null;
-        filter_tokens = .{ .start = cursor, .end = range.end };
-        filter_predicate_tokens = .{ .start = cursor + 3, .end = range.end - 1 };
+        const filter_close = findMatchingParen(tokens, cursor + 1, range.end) orelse return null;
+        filter_tokens = .{ .start = cursor, .end = filter_close + 1 };
+        filter_predicate_tokens = .{ .start = cursor + 3, .end = filter_close };
         if (filter_predicate_tokens.?.start >= filter_predicate_tokens.?.end) return null;
+        cursor = filter_close + 1;
     }
+    var over_tokens: ?GeneratedSqlTokenRange = null;
+    var over_name_tokens: ?GeneratedSqlTokenRange = null;
+    var over_definition_tokens: ?GeneratedSqlTokenRange = null;
+    var over_partition_tokens: ?GeneratedSqlTokenRange = null;
+    var over_order_tokens: ?GeneratedSqlTokenRange = null;
+    var over_frame_tokens: ?GeneratedSqlTokenRange = null;
+    if (cursor < range.end and tokens[cursor].matchesKeywordTag(.over)) {
+        if (cursor + 1 >= range.end) return null;
+        if (tokens[cursor + 1].kind == .identifier) {
+            if (cursor + 2 != range.end) return null;
+            over_tokens = .{ .start = cursor, .end = range.end };
+            over_name_tokens = .{ .start = cursor + 1, .end = range.end };
+        } else if (tokens[cursor + 1].kind == .lparen) {
+            const over_close = findMatchingParen(tokens, cursor + 1, range.end) orelse return null;
+            if (over_close + 1 != range.end) return null;
+            over_tokens = .{ .start = cursor, .end = range.end };
+            over_definition_tokens = .{ .start = cursor + 2, .end = over_close };
+            const definition = over_definition_tokens.?;
+            const partition_index = findTopLevelKeywordSequence(tokens, definition.start, definition.end, .partition, .by);
+            const order_index = findTopLevelKeywordSequence(tokens, definition.start, definition.end, .order, .by);
+            const rows_index = findTopLevelKeyword(tokens, definition.start, definition.end, .rows);
+            const range_index = findTopLevelKeyword(tokens, definition.start, definition.end, .range);
+            const frame_index = minOptionalIndex(rows_index, range_index);
+            if (partition_index) |idx| {
+                const partition_start = idx + 2;
+                const partition_end = firstOptionalIndex(&[_]?usize{ order_index, frame_index }) orelse definition.end;
+                if (partition_start < partition_end) over_partition_tokens = .{ .start = partition_start, .end = partition_end };
+            }
+            if (order_index) |idx| {
+                const order_start = idx + 2;
+                const order_end = frame_index orelse definition.end;
+                if (order_start < order_end) over_order_tokens = .{ .start = order_start, .end = order_end };
+            }
+            if (frame_index) |idx| over_frame_tokens = .{ .start = idx, .end = definition.end };
+        } else {
+            return null;
+        }
+        cursor = range.end;
+    }
+    if (cursor != range.end) return null;
     return .{
         .name_tokens = .{ .start = range.start, .end = open_index },
         .argument_tokens = argument_metadata.argument_tokens,
@@ -2839,6 +2907,12 @@ fn generatedFunctionCallExpression(tokens: []const token_mod.Token, range: Gener
         .within_group_order_tokens = within_group_order_tokens,
         .filter_tokens = filter_tokens,
         .filter_predicate_tokens = filter_predicate_tokens,
+        .over_tokens = over_tokens,
+        .over_name_tokens = over_name_tokens,
+        .over_definition_tokens = over_definition_tokens,
+        .over_partition_tokens = over_partition_tokens,
+        .over_order_tokens = over_order_tokens,
+        .over_frame_tokens = over_frame_tokens,
     };
 }
 
@@ -5211,6 +5285,18 @@ test "generated SQL parser facade builds read AST spans" {
             try std.testing.expectEqual(GeneratedSqlReadKind.window, read.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 14 }, read.projection_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 15, .end = 16 }, read.source_tokens.?);
+            try std.testing.expectEqual(@as(usize, 2), read.projection_items.count);
+            const window_expression = read.projection_items.expressions[1];
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.function_call, window_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 12 }, window_expression.over_tokens.?);
+            try std.testing.expect(window_expression.over_name_tokens == null);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 11 }, window_expression.over_definition_tokens.?);
+            try std.testing.expect(window_expression.over_partition_tokens == null);
+            try std.testing.expectEqual(@as(usize, 0), window_expression.over_partition_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, window_expression.over_order_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), window_expression.over_order_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, window_expression.over_order_items.items[0]);
+            try std.testing.expect(window_expression.over_frame_tokens == null);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -5233,6 +5319,17 @@ test "generated SQL parser facade builds read AST spans" {
             try std.testing.expectEqual(@as(usize, 1), read.window_items[0].order_items.count);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 18, .end = 19 }, read.window_items[0].order_items.items[0]);
             try std.testing.expect(read.window_items[0].frame_tokens == null);
+            try std.testing.expectEqual(@as(usize, 2), read.projection_items.count);
+            const window_expression = read.projection_items.expressions[1];
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.function_call, window_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 8 }, window_expression.over_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, window_expression.over_name_tokens.?);
+            try std.testing.expect(window_expression.over_definition_tokens == null);
+            try std.testing.expect(window_expression.over_partition_tokens == null);
+            try std.testing.expectEqual(@as(usize, 0), window_expression.over_partition_items.count);
+            try std.testing.expect(window_expression.over_order_tokens == null);
+            try std.testing.expectEqual(@as(usize, 0), window_expression.over_order_items.count);
+            try std.testing.expect(window_expression.over_frame_tokens == null);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -5244,6 +5341,19 @@ test "generated SQL parser facade builds read AST spans" {
             try std.testing.expectEqual(GeneratedSqlReadKind.window, read.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 17 }, read.projection_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 18, .end = 19 }, read.source_tokens.?);
+            try std.testing.expectEqual(@as(usize, 2), read.projection_items.count);
+            const window_expression = read.projection_items.expressions[1];
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.function_call, window_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 15 }, window_expression.over_tokens.?);
+            try std.testing.expect(window_expression.over_name_tokens == null);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 14 }, window_expression.over_definition_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, window_expression.over_partition_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), window_expression.over_partition_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, window_expression.over_partition_items.items[0]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 14 }, window_expression.over_order_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), window_expression.over_order_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 14 }, window_expression.over_order_items.items[0]);
+            try std.testing.expect(window_expression.over_frame_tokens == null);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -5272,6 +5382,18 @@ test "generated SQL parser facade builds read AST spans" {
             try std.testing.expectEqual(GeneratedSqlReadKind.window, read.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 21 }, read.projection_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 22, .end = 23 }, read.source_tokens.?);
+            try std.testing.expectEqual(@as(usize, 2), read.projection_items.count);
+            const window_expression = read.projection_items.expressions[1];
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.function_call, window_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 19 }, window_expression.over_tokens.?);
+            try std.testing.expect(window_expression.over_name_tokens == null);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 18 }, window_expression.over_definition_tokens.?);
+            try std.testing.expect(window_expression.over_partition_tokens == null);
+            try std.testing.expectEqual(@as(usize, 0), window_expression.over_partition_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, window_expression.over_order_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), window_expression.over_order_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, window_expression.over_order_items.items[0]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 18 }, window_expression.over_frame_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

@@ -927,6 +927,12 @@ fn generatedExpressionAstHasMetadata(expression: generated_parser.GeneratedSqlEx
         expression.within_group_order_tokens != null or
         expression.filter_tokens != null or
         expression.filter_predicate_tokens != null or
+        expression.over_tokens != null or
+        expression.over_name_tokens != null or
+        expression.over_definition_tokens != null or
+        expression.over_partition_tokens != null or
+        expression.over_order_tokens != null or
+        expression.over_frame_tokens != null or
         expression.array_tokens != null or
         expression.cast_expression_tokens != null or
         expression.cast_type_tokens != null or
@@ -964,6 +970,8 @@ fn generatedExpressionAstHasMetadata(expression: generated_parser.GeneratedSqlEx
         expression.argument_items.count != 0 or
         expression.argument_order_items.count != 0 or
         expression.within_group_order_items.count != 0 or
+        expression.over_partition_items.count != 0 or
+        expression.over_order_items.count != 0 or
         expression.array_items.count != 0;
 }
 
@@ -1023,6 +1031,45 @@ fn validateGeneratedExpressionAstBinaryStructure(expression: generated_parser.Ge
     }
     try requireGeneratedExpressionAstChild(expression.left_expression_kind, expression.left_tokens, expression.left_expression);
     try requireGeneratedExpressionAstChild(expression.right_expression_kind, expression.right_tokens, expression.right_expression);
+}
+
+fn validateGeneratedFunctionOverMetadata(expression: generated_parser.GeneratedSqlExpressionAst) !void {
+    if (expression.over_tokens == null) {
+        if (expression.over_name_tokens != null or expression.over_definition_tokens != null or
+            expression.over_partition_tokens != null or expression.over_partition_items.count != 0 or
+            expression.over_order_tokens != null or expression.over_order_items.count != 0 or
+            expression.over_frame_tokens != null)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        return;
+    }
+    if (expression.over_name_tokens != null and expression.over_definition_tokens != null) return error.UnsupportedSqlShape;
+    if (expression.over_name_tokens == null and expression.over_definition_tokens == null) return error.UnsupportedSqlShape;
+    const over_tokens = expression.over_tokens.?;
+    if (expression.over_name_tokens) |name_tokens| {
+        if (name_tokens.start <= over_tokens.start or name_tokens.end != over_tokens.end) return error.UnsupportedSqlShape;
+        if (expression.over_partition_tokens != null or expression.over_partition_items.count != 0 or
+            expression.over_order_tokens != null or expression.over_order_items.count != 0 or
+            expression.over_frame_tokens != null)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        return;
+    }
+    if (expression.over_definition_tokens) |definition_tokens| {
+        if (definition_tokens.start <= over_tokens.start or definition_tokens.end >= over_tokens.end) return error.UnsupportedSqlShape;
+    }
+    if (expression.over_partition_tokens) |_| {
+        if (expression.over_partition_items.count == 0) return error.UnsupportedSqlShape;
+    } else if (expression.over_partition_items.count != 0) {
+        return error.UnsupportedSqlShape;
+    }
+    if (expression.over_order_tokens) |_| {
+        if (expression.over_order_items.count == 0) return error.UnsupportedSqlShape;
+    } else if (expression.over_order_items.count != 0) {
+        return error.UnsupportedSqlShape;
+    }
 }
 
 fn validateGeneratedExpressionAstStructure(expression: generated_parser.GeneratedSqlExpressionAst) !void {
@@ -1091,6 +1138,7 @@ fn validateGeneratedExpressionAstStructure(expression: generated_parser.Generate
             if (expression.filter_tokens != null and expression.filter_predicate_tokens == null) return error.UnsupportedSqlShape;
             if (expression.filter_predicate_tokens != null and expression.filter_tokens == null) return error.UnsupportedSqlShape;
             try validateGeneratedExpressionAstOptionalChild(expression.filter_expression_kind, expression.filter_predicate_tokens, expression.filter_expression);
+            try validateGeneratedFunctionOverMetadata(expression);
         },
         .array_constructor => {
             if (expression.tokens == null) return error.UnsupportedSqlShape;
@@ -1190,6 +1238,12 @@ fn validateGeneratedExpressionAstRanges(
         expression.within_group_order_tokens,
         expression.filter_tokens,
         expression.filter_predicate_tokens,
+        expression.over_tokens,
+        expression.over_name_tokens,
+        expression.over_definition_tokens,
+        expression.over_partition_tokens,
+        expression.over_order_tokens,
+        expression.over_frame_tokens,
         expression.array_tokens,
         expression.cast_expression_tokens,
         expression.cast_type_tokens,
@@ -1228,7 +1282,23 @@ fn validateGeneratedExpressionAstRanges(
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.argument_items);
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.argument_order_items);
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.within_group_order_items);
+    try validateGeneratedReadListAstRanges(tokens, read_ast, expression.over_partition_items);
+    try validateGeneratedReadListAstRanges(tokens, read_ast, expression.over_order_items);
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.array_items);
+    if (expression.over_definition_tokens) |definition| {
+        if (expression.over_partition_tokens) |partition| {
+            if (partition.start < definition.start or partition.end > definition.end) return error.UnsupportedSqlShape;
+        }
+        if (expression.over_order_tokens) |order| {
+            if (order.start < definition.start or order.end > definition.end) return error.UnsupportedSqlShape;
+        }
+        if (expression.over_frame_tokens) |frame| {
+            if (frame.start < definition.start or frame.end > definition.end) return error.UnsupportedSqlShape;
+            if (!tokens[frame.start].matchesKeywordTag(.rows) and !tokens[frame.start].matchesKeywordTag(.range)) {
+                return error.UnsupportedSqlShape;
+            }
+        }
+    }
 }
 
 fn validateGeneratedWindowAstListRanges(
@@ -2273,6 +2343,22 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_window_parsed_sql, malformed_window_read_ast),
+    );
+
+    var malformed_inline_window_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id, row_number() OVER (PARTITION BY tenant ORDER BY id) AS rn FROM usage_records",
+    );
+    defer malformed_inline_window_parsed_sql.deinit(alloc);
+    const malformed_inline_window_generated_raw = malformed_inline_window_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_inline_window_read_ast = switch (malformed_inline_window_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_inline_window_read_ast.projection_items.expressions[1].over_order_items.count = 0;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_inline_window_parsed_sql, malformed_inline_window_read_ast),
     );
 
     var cte_parsed_sql = try tokenized.ParsedSql.initAlloc(

@@ -134,8 +134,10 @@ typed join lowerer before producing a join plan, and generated join reads now
 fail closed on malformed left-associative tree metadata, first-join
 compatibility metadata, and `ON`/`USING` condition payloads;
 basic `OVER (PARTITION BY ... ORDER BY ...)` window reads now classify as a
-generated window family, minimal named `WINDOW ... AS (PARTITION BY ... ORDER
-BY ...)` clauses are accepted and carry owned named-window AST items with name,
+generated window family, inline function-call `OVER` clauses carry generated
+name/definition, partition-list, order-list, and frame-tail expression
+metadata, minimal named `WINDOW ... AS (PARTITION BY ... ORDER BY ...)`
+clauses are accepted and carry owned named-window AST items with name,
 definition, partition-list, order-list, and frame-tail ranges, seed
 `ROWS`/`RANGE` frame tails are accepted, and window reads dispatch directly
 after validating projection/source/window ranges;
@@ -173,7 +175,7 @@ query-body AST payloads for expression-level projections and predicates,
 complete multi-join planning and richer join-tree semantics beyond the current
 validated left-associative generated join nodes, complete expression AST nodes,
 complete per-CTE body AST arrays, recursive CTE planning, aggregates, richer
-inline window-expression planning, ordering, remaining pagination cutover, and
+inline window-expression semantic planning, ordering, remaining pagination cutover, and
 direct generated read-plan lowering. The generated parser now also treats seed
 graph DDL as a distinct graph statement family and `ParsedSql` retains those
 generated raw and AST nodes. Seed graph index and graph metric statements now
@@ -365,11 +367,13 @@ Suggested migration order:
    payloads before invoking typed join lowering.
    Basic `OVER (PARTITION BY ... ORDER BY ...)` and named
    `WINDOW ... AS (PARTITION BY ... ORDER BY ...)` reads now classify as
-   generated window reads, named windows carry generated AST items with name,
-   definition, partition-list, order-list, and frame-tail ranges, seed
-   `ROWS`/`RANGE` frame tails are accepted in inline and named windows, CTE
-   body named windows carry the same generated metadata, and generated window
-   reads dispatch to the typed window lowerer after range validation.
+   generated window reads, inline function-call `OVER` clauses carry generated
+   name/definition, partition-list, order-list, and frame-tail expression
+   metadata, named windows carry generated AST items with name, definition,
+   partition-list, order-list, and frame-tail ranges, seed `ROWS`/`RANGE` frame
+   tails are accepted in inline and named windows, CTE body named windows carry
+   the same generated metadata, and generated window reads dispatch to the typed
+   window lowerer after range validation.
    Plain `DISTINCT` and `DISTINCT ON (...)` reads now carry generated distinct
    ranges, `DISTINCT ON` expression-list AST items for top-level and CTE body
    reads, and preserve the production aggregate/query-family split.
@@ -412,7 +416,8 @@ Suggested migration order:
    predicate/operator metadata and structural checks, broader function
    coverage, broader boolean expression-tree coverage, quantified subquery
    planning/lowering, remaining specialized expression operators, richer
-   inline window-expression planning beyond named-window clause metadata,
+   inline window-expression semantic planning beyond current generated `OVER`
+   clause metadata,
    recursive full CTE body planning beyond the current body
    clause/list/expression/join/window and pagination metadata, direct
    generated read-plan lowering, and
