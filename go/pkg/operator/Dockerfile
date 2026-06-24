@@ -2,15 +2,22 @@
 FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
 
 WORKDIR /workspace/go/pkg/operator
-# Copy the Go Modules manifests
+# Copy the Go module manifests, including local modules referenced by replace
+# directives in go/pkg/operator/go.mod.
 COPY go/pkg/operator/go.mod go.mod
 COPY go/pkg/operator/go.sum go.sum
+COPY go/pkg/libaf/go.mod ../libaf/go.mod
+COPY go/pkg/libaf/go.sum ../libaf/go.sum
+COPY go/pkg/sdk/go.mod ../sdk/go.mod
+COPY go/pkg/sdk/go.sum ../sdk/go.sum
 # cache deps before building and copying source so that we don't need to re-download as much
 # and so that source changes don't invalidate our downloaded layer
 RUN go mod download
 
 # Copy only source needed for `go build` so docs/examples/work-log changes do
 # not invalidate the build layer.
+COPY go/pkg/libaf ../libaf
+COPY go/pkg/sdk ../sdk
 COPY go/pkg/operator/api ./api
 COPY go/pkg/operator/bootstrap ./bootstrap
 COPY go/pkg/operator/cmd ./cmd
