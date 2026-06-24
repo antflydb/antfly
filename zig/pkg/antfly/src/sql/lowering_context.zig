@@ -969,6 +969,8 @@ fn generatedExpressionAstHasMetadata(expression: generated_parser.GeneratedSqlEx
         expression.case_first_result_tokens != null or
         expression.case_else_tokens != null or
         expression.case_else_expression_tokens != null or
+        expression.boolean_first_condition_tokens != null or
+        expression.boolean_last_condition_tokens != null or
         expression.interval_value_tokens != null or
         expression.timestamp_type_tokens != null or
         expression.timestamp_value_tokens != null or
@@ -994,6 +996,9 @@ fn generatedExpressionAstHasMetadata(expression: generated_parser.GeneratedSqlEx
         expression.case_first_condition != null or
         expression.case_first_result != null or
         expression.case_else_expression != null or
+        expression.boolean_first_condition != null or
+        expression.boolean_last_condition != null or
+        expression.boolean_condition_count != 0 or
         expression.argument_items.count != 0 or
         expression.argument_order_items.count != 0 or
         expression.within_group_order_items.count != 0 or
@@ -1058,6 +1063,26 @@ fn validateGeneratedExpressionAstBinaryStructure(expression: generated_parser.Ge
     }
     try requireGeneratedExpressionAstChild(expression.left_expression_kind, expression.left_tokens, expression.left_expression);
     try requireGeneratedExpressionAstChild(expression.right_expression_kind, expression.right_tokens, expression.right_expression);
+}
+
+fn validateGeneratedBooleanChainExpressionAstStructure(expression: generated_parser.GeneratedSqlExpressionAst) !void {
+    try validateGeneratedExpressionAstBinaryStructure(expression);
+    if (expression.boolean_condition_count < 2 or
+        expression.boolean_first_condition_tokens == null or
+        expression.boolean_last_condition_tokens == null)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    try requireGeneratedExpressionAstChild(
+        expression.boolean_first_condition_kind,
+        expression.boolean_first_condition_tokens,
+        expression.boolean_first_condition,
+    );
+    try requireGeneratedExpressionAstChild(
+        expression.boolean_last_condition_kind,
+        expression.boolean_last_condition_tokens,
+        expression.boolean_last_condition,
+    );
 }
 
 fn validateGeneratedExistsSubqueryExpressionAstStructure(
@@ -1262,8 +1287,6 @@ fn validateGeneratedExpressionAstStructure(expression: generated_parser.Generate
         .in_list,
         .is_distinct_from,
         .is_not_distinct_from,
-        .logical_or,
-        .logical_and,
         .additive,
         .subtractive,
         .multiplicative,
@@ -1284,6 +1307,9 @@ fn validateGeneratedExpressionAstStructure(expression: generated_parser.Generate
         .json_path_access,
         .json_path_text_access,
         => try validateGeneratedExpressionAstBinaryStructure(expression),
+        .logical_or,
+        .logical_and,
+        => try validateGeneratedBooleanChainExpressionAstStructure(expression),
     }
 }
 
@@ -1325,6 +1351,8 @@ fn validateGeneratedExpressionAstRanges(
         expression.case_first_result_tokens,
         expression.case_else_tokens,
         expression.case_else_expression_tokens,
+        expression.boolean_first_condition_tokens,
+        expression.boolean_last_condition_tokens,
         expression.interval_value_tokens,
         expression.timestamp_type_tokens,
         expression.timestamp_value_tokens,
@@ -1351,6 +1379,8 @@ fn validateGeneratedExpressionAstRanges(
     if (expression.case_first_condition) |case_first_condition| try validateGeneratedExpressionAstRanges(tokens, read_ast, case_first_condition.*);
     if (expression.case_first_result) |case_first_result| try validateGeneratedExpressionAstRanges(tokens, read_ast, case_first_result.*);
     if (expression.case_else_expression) |case_else_expression| try validateGeneratedExpressionAstRanges(tokens, read_ast, case_else_expression.*);
+    if (expression.boolean_first_condition) |boolean_first_condition| try validateGeneratedExpressionAstRanges(tokens, read_ast, boolean_first_condition.*);
+    if (expression.boolean_last_condition) |boolean_last_condition| try validateGeneratedExpressionAstRanges(tokens, read_ast, boolean_last_condition.*);
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.argument_items);
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.argument_order_items);
     try validateGeneratedReadListAstRanges(tokens, read_ast, expression.within_group_order_items);
@@ -2319,6 +2349,22 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_comparison_child_parsed_sql, malformed_comparison_child_read_ast),
+    );
+
+    var malformed_boolean_chain_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE kind = 'order' AND tenant = 'acme' AND id = '1'",
+    );
+    defer malformed_boolean_chain_parsed_sql.deinit(alloc);
+    const malformed_boolean_chain_generated_raw = malformed_boolean_chain_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_boolean_chain_read_ast = switch (malformed_boolean_chain_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_boolean_chain_read_ast.where_expression.boolean_condition_count = 1;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_boolean_chain_parsed_sql, malformed_boolean_chain_read_ast),
     );
 
     var malformed_unary_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
