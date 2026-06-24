@@ -582,6 +582,10 @@ comparison_expression:
   | additive_expression ILIKE additive_expression
   | additive_expression IN LPAREN expression_list RPAREN
   | additive_expression BETWEEN additive_expression AND additive_expression
+  | additive_expression NOT LIKE additive_expression
+  | additive_expression NOT ILIKE additive_expression
+  | additive_expression NOT IN LPAREN expression_list RPAREN
+  | additive_expression NOT BETWEEN additive_expression AND additive_expression
   ;
 
 additive_expression:
