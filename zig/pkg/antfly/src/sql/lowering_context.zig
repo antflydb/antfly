@@ -2524,6 +2524,8 @@ fn validateGeneratedReadListAstRanges(
     if (list.order_using_operator_items.len != 0 and list.order_using_operator_items.len != list.count) return error.UnsupportedSqlShape;
     if (list.nulls_order_items.len != 0 and list.nulls_order_items.len != list.count) return error.UnsupportedSqlShape;
     if (list.nulls_orders.len != 0 and list.nulls_orders.len != list.count) return error.UnsupportedSqlShape;
+    if ((list.direction_items.len == 0) != (list.directions.len == 0)) return error.UnsupportedSqlShape;
+    if ((list.nulls_order_items.len == 0) != (list.nulls_orders.len == 0)) return error.UnsupportedSqlShape;
 
     const first = list.first_tokens orelse return error.UnsupportedSqlShape;
     const last = list.last_tokens orelse return error.UnsupportedSqlShape;
@@ -2565,12 +2567,61 @@ fn validateGeneratedReadListAstRanges(
                 if (nulls_order.start < item.start or nulls_order.end > item.end) return error.UnsupportedSqlShape;
             }
         }
+        try validateGeneratedReadListOrderMetadata(tokens, list, index);
         if (list.expressions.len != 0) {
             const expression = list.expressions[index];
             try validateGeneratedExpressionAstRanges(tokens, read_ast, expression);
             const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
             if (!std.meta.eql(expression_tokens, expression_item)) return error.UnsupportedSqlShape;
         }
+    }
+}
+
+fn validateGeneratedReadListOrderMetadata(
+    tokens: []const tokenized.Token,
+    list: generated_parser.GeneratedSqlListAst,
+    index: usize,
+) !void {
+    const direction_tokens = if (list.direction_items.len != 0) list.direction_items[index] else null;
+    const direction = if (list.directions.len != 0) list.directions[index] else null;
+    const using_operator_tokens = if (list.order_using_operator_items.len != 0) list.order_using_operator_items[index] else null;
+    if (direction_tokens) |range| {
+        if (direction) |value| {
+            if (using_operator_tokens != null) return error.UnsupportedSqlShape;
+            if (range.end != range.start + 1) return error.UnsupportedSqlShape;
+            const expected: token_mod.TokenKeyword = switch (value) {
+                .asc => .asc,
+                .desc => .desc,
+            };
+            if (!tokens[range.start].matchesKeywordTag(expected)) return error.UnsupportedSqlShape;
+        } else if (using_operator_tokens) |operator_range| {
+            if (range.end != range.start + 2) return error.UnsupportedSqlShape;
+            if (!tokens[range.start].matchesKeywordTag(.using)) return error.UnsupportedSqlShape;
+            if (operator_range.start != range.start + 1 or operator_range.end != range.end) return error.UnsupportedSqlShape;
+            switch (tokens[operator_range.start].kind) {
+                .eq, .neq, .lt, .lte, .gt, .gte => {},
+                else => return error.UnsupportedSqlShape,
+            }
+        } else {
+            return error.UnsupportedSqlShape;
+        }
+    } else if (direction != null or using_operator_tokens != null) {
+        return error.UnsupportedSqlShape;
+    }
+
+    const nulls_order_tokens = if (list.nulls_order_items.len != 0) list.nulls_order_items[index] else null;
+    const nulls_order = if (list.nulls_orders.len != 0) list.nulls_orders[index] else null;
+    if (nulls_order_tokens) |range| {
+        const value = nulls_order orelse return error.UnsupportedSqlShape;
+        if (range.end != range.start + 2) return error.UnsupportedSqlShape;
+        if (!tokens[range.start].matchesKeywordTag(.nulls)) return error.UnsupportedSqlShape;
+        const expected: token_mod.TokenKeyword = switch (value) {
+            .first => .first,
+            .last => .last,
+        };
+        if (!tokens[range.start + 1].matchesKeywordTag(expected)) return error.UnsupportedSqlShape;
+    } else if (nulls_order != null) {
+        return error.UnsupportedSqlShape;
     }
 }
 
@@ -3216,6 +3267,54 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_order_list_containment_parsed_sql, malformed_order_list_containment_read_ast),
+    );
+
+    var malformed_order_direction_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records ORDER BY status DESC NULLS LAST",
+    );
+    defer malformed_order_direction_parsed_sql.deinit(alloc);
+    const malformed_order_direction_generated_raw = malformed_order_direction_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_order_direction_read_ast = switch (malformed_order_direction_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_order_direction_read_ast.order_items.directions[0] = .asc;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_order_direction_parsed_sql, malformed_order_direction_read_ast),
+    );
+
+    var malformed_nulls_order_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records ORDER BY status DESC NULLS LAST",
+    );
+    defer malformed_nulls_order_parsed_sql.deinit(alloc);
+    const malformed_nulls_order_generated_raw = malformed_nulls_order_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_nulls_order_read_ast = switch (malformed_nulls_order_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_nulls_order_read_ast.order_items.nulls_orders[0] = .first;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_nulls_order_parsed_sql, malformed_nulls_order_read_ast),
+    );
+
+    var malformed_order_using_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records ORDER BY status USING <",
+    );
+    defer malformed_order_using_parsed_sql.deinit(alloc);
+    const malformed_order_using_generated_raw = malformed_order_using_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_order_using_read_ast = switch (malformed_order_using_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_order_using_read_ast.order_items.order_using_operator_items[0] = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_order_using_parsed_sql, malformed_order_using_read_ast),
     );
 
     var malformed_graph_source_parsed_sql = try tokenized.ParsedSql.initAlloc(
