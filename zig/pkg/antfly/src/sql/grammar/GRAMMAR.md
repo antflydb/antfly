@@ -262,7 +262,10 @@ Suggested migration order:
    `= ANY(ARRAY[...]::text[])` carry generated array-constructor metadata after
    public tokenization normalizes cast suffixes. Array/range containment and
    overlap predicates using `@>` and `&&` are accepted and classified with
-   generated operator ranges and right-side array-constructor metadata. `IS NULL` and `IS NOT NULL` predicates are accepted and classified
+   generated operator ranges and right-side array-constructor metadata.
+   PostgreSQL JSON key predicates using `?`, `?|`, and `?&` are accepted and
+   classified with generated operator ranges and array-constructor metadata for
+   key-list variants. `IS NULL` and `IS NOT NULL` predicates are accepted and classified
    as explicit null-test expression kinds, `IS TRUE`/`IS FALSE`/`IS UNKNOWN`
    boolean-test predicates are accepted with their `IS NOT` variants, and
    `IS DISTINCT FROM` / `IS NOT DISTINCT FROM` predicates are accepted with
@@ -310,7 +313,7 @@ Suggested migration order:
    lowering/cutover beyond the current generated AST metadata, broader expression AST
    nodes beyond the current recursive predicate/operator metadata, broader function
    coverage, broader boolean expression-tree coverage, quantified subquery
-   predicate coverage, JSON key predicate operators, recursive CTE planning, direct generated read-plan lowering, and
+   predicate coverage, broader specialized predicate operators, recursive CTE planning, direct generated read-plan lowering, and
    unsupported-shape diagnostics.
 5. Advanced DML: `INSERT ... SELECT`, `UPDATE ... FROM`, `DELETE ... USING`,
    `TRUNCATE`, and `MERGE`.
