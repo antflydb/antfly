@@ -313,6 +313,15 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     table_detail = stateful_api.get_table(table)
     assert table_detail["schema"]["storage_mode"] == "document"
 
+    stateful_api.create_index(
+        table,
+        "amount_alg",
+        {
+            "type": "algebraic",
+            "derive_from_schema": True,
+        },
+    )
+
     written = stateful_api.batch_write(
         table,
         inserts={
@@ -820,6 +829,39 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     assert summed["statement_kind"] == "aggregate"
     assert summed["result"]["rows"] == [{"total_amount": 72}]
 
+    min_amount = _first_sql_json(
+        sql_cli(
+            "sql",
+            "-c",
+            f"SELECT min(amount) AS min_amount FROM {table};",
+        ).stdout
+    )
+    assert min_amount["kind"] == "read"
+    assert min_amount["statement_kind"] == "aggregate"
+    assert min_amount["result"]["rows"] == [{"min_amount": 10}]
+
+    avg_amount = _first_sql_json(
+        sql_cli(
+            "sql",
+            "-c",
+            f"SELECT avg(amount) AS avg_amount FROM {table};",
+        ).stdout
+    )
+    assert avg_amount["kind"] == "read"
+    assert avg_amount["statement_kind"] == "aggregate"
+    assert avg_amount["result"]["rows"] == [{"avg_amount": 18}]
+
+    max_amount = _first_sql_json(
+        sql_cli(
+            "sql",
+            "-c",
+            f"SELECT max(amount) AS max_amount FROM {table} WHERE full_text_search('body:search');",
+        ).stdout
+    )
+    assert max_amount["kind"] == "read"
+    assert max_amount["statement_kind"] == "aggregate"
+    assert max_amount["result"]["rows"] == [{"max_amount": 30}]
+
     filtered_summed = _first_sql_json(
         sql_cli(
             "sql",
@@ -830,6 +872,74 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     assert filtered_summed["kind"] == "read"
     assert filtered_summed["statement_kind"] == "aggregate"
     assert filtered_summed["result"]["rows"] == [{"total_amount": 22}]
+
+    grouped_summed = _first_sql_json(
+        sql_cli(
+            "sql",
+            "-c",
+            f"SELECT sum(amount) AS total_amount FROM {table} WHERE full_text_search('body:search') GROUP BY status LIMIT 10;",
+        ).stdout
+    )
+    assert grouped_summed["kind"] == "read"
+    assert grouped_summed["statement_kind"] == "aggregate"
+    grouped_sum_rows = sorted(
+        grouped_summed["result"]["rows"], key=lambda row: row["status"]
+    )
+    assert grouped_sum_rows == [
+        {"status": "active", "total_amount": 22},
+        {"status": "archived", "total_amount": 30},
+    ]
+
+    materialized_grouped_avg = _first_sql_json(
+        sql_cli(
+            "sql",
+            "-c",
+            f"SELECT avg(amount) AS avg_amount FROM {table} GROUP BY status LIMIT 10;",
+        ).stdout
+    )
+    assert materialized_grouped_avg["kind"] == "read"
+    assert materialized_grouped_avg["statement_kind"] == "aggregate"
+    materialized_grouped_avg_rows = sorted(
+        materialized_grouped_avg["result"]["rows"], key=lambda row: row["status"]
+    )
+    assert materialized_grouped_avg_rows == [
+        {"status": "active", "avg_amount": 11},
+        {"status": "archived", "avg_amount": 25},
+    ]
+
+    grouped_maxed = _first_sql_json(
+        sql_cli(
+            "sql",
+            "-c",
+            f"SELECT max(amount) AS max_amount FROM {table} WHERE full_text_search('body:search') GROUP BY status LIMIT 10;",
+        ).stdout
+    )
+    assert grouped_maxed["kind"] == "read"
+    assert grouped_maxed["statement_kind"] == "aggregate"
+    grouped_max_rows = sorted(
+        grouped_maxed["result"]["rows"], key=lambda row: row["status"]
+    )
+    assert grouped_max_rows == [
+        {"status": "active", "max_amount": 12},
+        {"status": "archived", "max_amount": 30},
+    ]
+
+    grouped_averaged = _first_sql_json(
+        sql_cli(
+            "sql",
+            "-c",
+            f"SELECT avg(amount) AS avg_amount FROM {table} WHERE full_text_search('body:search') GROUP BY status LIMIT 10;",
+        ).stdout
+    )
+    assert grouped_averaged["kind"] == "read"
+    assert grouped_averaged["statement_kind"] == "aggregate"
+    grouped_avg_rows = sorted(
+        grouped_averaged["result"]["rows"], key=lambda row: row["status"]
+    )
+    assert grouped_avg_rows == [
+        {"status": "active", "avg_amount": 11},
+        {"status": "archived", "avg_amount": 30},
+    ]
 
     virtual_field_by_id = stateful_api.post(
         "/sql",

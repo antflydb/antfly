@@ -16,7 +16,10 @@ const std = @import("std");
 
 const ha_replication = @import("ha_replication.zig");
 const docstore_mod = @import("../docstore.zig");
+const internal_keys = @import("../internal_keys.zig");
+const mapper = @import("document_mapper.zig");
 const metadata_table_manager = @import("../../metadata/table_manager.zig");
+const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const relational_store_mod = @import("relational_store.zig");
 const schema_api_mod = @import("../../schema/mod.zig");
 const schema_mod = @import("../schema.zig");
@@ -95,12 +98,12 @@ pub fn Impl(comptime DB: type) type {
             self.core.lockApply();
             defer self.core.unlockApply();
 
-            try self.schemaRuntimeValidateTableSchemaCompatibilityLocked(alloc, runtime_schema);
+            try Self.validateTableSchemaCompatibilityLocked(self, alloc, runtime_schema);
             if (options.reload_algebraic_schema_configs) {
                 try Self.stageAlgebraicSchemaConfigsPending(self, schema_json);
             }
-            try self.schemaRuntimeMigrateRelationalRowsForSchemaTransitionLocked(alloc, runtime_schema);
-            try self.schemaRuntimeMigrateRelationalConstraintsForSchemaTransitionLocked(alloc, runtime_schema);
+            try Self.migrateRelationalRowsForSchemaTransitionLocked(self, alloc, runtime_schema);
+            try Self.migrateRelationalConstraintsForSchemaTransitionLocked(self, alloc, runtime_schema);
             if (options.persist_local_schema_json) {
                 try Self.setSchemaWithLocalSchemaJson(self, runtime_schema, schema_json);
             } else {
@@ -192,10 +195,10 @@ pub fn Impl(comptime DB: type) type {
             self.core.lockApply();
             defer self.core.unlockApply();
 
-            try self.schemaRuntimeValidateTableSchemaCompatibilityLocked(alloc, runtime_schema);
+            try Self.validateTableSchemaCompatibilityLocked(self, alloc, runtime_schema);
             try Self.stageAlgebraicSchemaConfigsPending(self, table.schema_json);
-            try self.schemaRuntimeMigrateRelationalRowsForSchemaTransitionLocked(alloc, runtime_schema);
-            try self.schemaRuntimeMigrateRelationalConstraintsForSchemaTransitionLocked(alloc, runtime_schema);
+            try Self.migrateRelationalRowsForSchemaTransitionLocked(self, alloc, runtime_schema);
+            try Self.migrateRelationalConstraintsForSchemaTransitionLocked(self, alloc, runtime_schema);
             try Self.setSchemaWithLocalLiteSqlTableRecordJson(self, runtime_schema, table.schema_json, table_record_json);
             try Self.completePendingAlgebraicSchemaRebuilds(self);
         }
@@ -206,6 +209,337 @@ pub fn Impl(comptime DB: type) type {
             var parsed = try std.json.parseFromSlice(metadata_table_manager.TableRecord, alloc, raw, .{ .allocate = .alloc_always });
             defer parsed.deinit();
             return try metadata_table_manager.cloneTable(alloc, parsed.value);
+        }
+
+        pub fn validateTableSchemaCompatibilityLocked(self: *DB, alloc: Allocator, next_schema: schema_mod.TableSchema) !void {
+            if (self.core.schema) |current_schema| {
+                return validateRuntimeTableSchemaTransition(current_schema, next_schema);
+            }
+
+            const durable_schema = try schema_mod.loadSchema(self.core.store, alloc);
+            defer if (durable_schema) |loaded| schema_mod.freeSchema(alloc, loaded);
+            if (durable_schema) |current_schema| {
+                return validateRuntimeTableSchemaTransition(current_schema, next_schema);
+            }
+
+            try Self.validateFirstTableSchemaApplyAgainstExistingRows(self, alloc, next_schema);
+        }
+
+        pub fn migrateRelationalRowsForSchemaTransitionLocked(self: *DB, alloc: Allocator, next_schema: schema_mod.TableSchema) !void {
+            if (self.core.schema) |current_schema| {
+                return try Self.migrateRelationalRowsFromCurrentLocked(self, alloc, current_schema, next_schema);
+            }
+
+            const durable_schema = try schema_mod.loadSchema(self.core.store, alloc);
+            defer if (durable_schema) |loaded| schema_mod.freeSchema(alloc, loaded);
+            if (durable_schema) |current_schema| {
+                return try Self.migrateRelationalRowsFromCurrentLocked(self, alloc, current_schema, next_schema);
+            }
+        }
+
+        pub fn migrateRelationalConstraintsForSchemaTransitionLocked(self: *DB, alloc: Allocator, next_schema: schema_mod.TableSchema) !void {
+            if (self.core.schema) |current_schema| {
+                return try Self.migrateRelationalConstraintsFromCurrentLocked(self, alloc, current_schema, next_schema);
+            }
+
+            const durable_schema = try schema_mod.loadSchema(self.core.store, alloc);
+            defer if (durable_schema) |loaded| schema_mod.freeSchema(alloc, loaded);
+            if (durable_schema) |current_schema| {
+                return try Self.migrateRelationalConstraintsFromCurrentLocked(self, alloc, current_schema, next_schema);
+            }
+        }
+
+        fn migrateRelationalRowsFromCurrentLocked(
+            self: *DB,
+            alloc: Allocator,
+            current_schema: schema_mod.TableSchema,
+            next_schema: schema_mod.TableSchema,
+        ) !void {
+            if (current_schema.storage_mode != .relational or next_schema.storage_mode != .relational) return;
+
+            var sets = std.ArrayListUnmanaged(relational_store_mod.RowRewriteSet).empty;
+            defer sets.deinit(alloc);
+            var owned_rows = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (owned_rows.items) |row| alloc.free(row);
+                owned_rows.deinit(alloc);
+            }
+            var decoded_rows = std.ArrayListUnmanaged(relational_row_codec.Row).empty;
+            defer {
+                for (decoded_rows.items) |*row| row.deinit(alloc);
+                decoded_rows.deinit(alloc);
+            }
+
+            var generated_columns = std.ArrayListUnmanaged(schema_mod.RelationalColumn).empty;
+            defer generated_columns.deinit(alloc);
+
+            for (next_schema.relational_columns) |column| {
+                if (relationalColumnPathExists(current_schema.relational_columns, column.path)) continue;
+                if (try relationalColumnHasUniqueDroppedRenameSource(current_schema.relational_columns, next_schema.relational_columns, column)) continue;
+                if (column.generated != null) {
+                    try generated_columns.append(alloc, column);
+                    continue;
+                }
+                const default_value = column.default_value orelse continue;
+                if (default_value.kind != .literal) return error.InvalidSchemaUpdateRequest;
+                if (column.nullable and jsonLiteralIsNull(default_value.value_json)) continue;
+                const row_value = try relationalDefaultColumnRowValueAlloc(alloc, column, default_value.value_json);
+                errdefer alloc.free(row_value);
+                try owned_rows.append(alloc, row_value);
+                var decoded = try relational_row_codec.deserialize(alloc, row_value);
+                errdefer decoded.deinit(alloc);
+                if (decoded.cells.len != 1) return error.InvalidSchemaUpdateRequest;
+                try decoded_rows.append(alloc, decoded);
+                const stable_decoded = &decoded_rows.items[decoded_rows.items.len - 1];
+                try sets.append(alloc, .{
+                    .cell = stable_decoded.cells[0],
+                    .only_if_missing = true,
+                });
+            }
+
+            const column_index_policy = relational_store_mod.ColumnIndexPolicy.fromColumns(next_schema.relational_columns);
+            if (sets.items.len != 0) {
+                _ = try relational_store_mod.rewriteRowsInRangeWithColumnIndexPolicy(
+                    alloc,
+                    self.core.store,
+                    .{ .sets = sets.items },
+                    self.getRange().start,
+                    self.getRange().end,
+                    column_index_policy,
+                );
+            }
+            if (generated_columns.items.len != 0) {
+                try Self.backfillRelationalGeneratedColumnsLocked(self, alloc, generated_columns.items, column_index_policy);
+            }
+        }
+
+        fn backfillRelationalGeneratedColumnsLocked(
+            self: *DB,
+            alloc: Allocator,
+            generated_columns: []const schema_mod.RelationalColumn,
+            column_index_policy: relational_store_mod.ColumnIndexPolicy,
+        ) !void {
+            const rows = try relational_store_mod.scanRowsAlloc(alloc, self.core.store, self.getRange().start, self.getRange().end);
+            defer relational_store_mod.freeRows(alloc, rows);
+
+            var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+            defer writes.deinit(alloc);
+            var deletes = std.ArrayListUnmanaged([]const u8).empty;
+            defer deletes.deinit(alloc);
+            var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (owned_keys.items) |key| alloc.free(key);
+                owned_keys.deinit(alloc);
+            }
+            var owned_values = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (owned_values.items) |value| alloc.free(value);
+                owned_values.deinit(alloc);
+            }
+
+            for (rows) |row| {
+                const row_json = mapper.materializeRelationalRowValueAlloc(alloc, row.row_value) catch return error.InvalidRowsRequest;
+                defer alloc.free(row_json);
+                var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
+                defer parsed.deinit();
+                if (parsed.value != .object) return error.InvalidRowsRequest;
+
+                var row_sets = std.ArrayListUnmanaged(relational_store_mod.RowRewriteSet).empty;
+                defer row_sets.deinit(alloc);
+                var row_owned_values = std.ArrayListUnmanaged([]u8).empty;
+                defer {
+                    for (row_owned_values.items) |value| alloc.free(value);
+                    row_owned_values.deinit(alloc);
+                }
+                var row_decoded = std.ArrayListUnmanaged(relational_row_codec.Row).empty;
+                defer {
+                    for (row_decoded.items) |*decoded| decoded.deinit(alloc);
+                    row_decoded.deinit(alloc);
+                }
+
+                for (generated_columns) |column| {
+                    const generated = column.generated orelse continue;
+                    const value_json = self.schemaRuntimeRelationalRowsGeneratedColumnValueJsonAlloc(alloc, parsed.value, generated) catch return error.InvalidRowsRequest;
+                    defer alloc.free(value_json);
+                    const generated_row = try relationalDefaultColumnRowValueAlloc(alloc, column, value_json);
+                    errdefer alloc.free(generated_row);
+                    try row_owned_values.append(alloc, generated_row);
+                    var decoded = try relational_row_codec.deserialize(alloc, generated_row);
+                    errdefer decoded.deinit(alloc);
+                    if (decoded.cells.len != 1) return error.InvalidSchemaUpdateRequest;
+                    try row_decoded.append(alloc, decoded);
+                    const stable_decoded = &row_decoded.items[row_decoded.items.len - 1];
+                    try row_sets.append(alloc, .{
+                        .cell = stable_decoded.cells[0],
+                        .only_if_missing = true,
+                    });
+                }
+
+                const rewritten = try relational_store_mod.rewriteRowValueWithPlanAlloc(alloc, row.row_value, .{ .sets = row_sets.items });
+                if (rewritten) |new_row| {
+                    var new_row_owned = true;
+                    errdefer if (new_row_owned) alloc.free(new_row);
+                    try relational_store_mod.appendUpsertWithColumnIndexPolicy(alloc, self.core.store, &writes, &deletes, &owned_keys, &owned_values, row.doc_key, new_row, column_index_policy);
+                    try owned_values.append(alloc, new_row);
+                    new_row_owned = false;
+                }
+            }
+
+            if (writes.items.len > 0 or deletes.items.len > 0) try self.core.store.putBatch(writes.items, deletes.items);
+        }
+
+        fn migrateRelationalConstraintsFromCurrentLocked(
+            self: *DB,
+            alloc: Allocator,
+            current_schema: schema_mod.TableSchema,
+            next_schema: schema_mod.TableSchema,
+        ) !void {
+            if (current_schema.storage_mode != .relational or next_schema.storage_mode != .relational) return;
+
+            var unique_to_build = std.ArrayListUnmanaged(schema_mod.UniqueConstraint).empty;
+            defer unique_to_build.deinit(alloc);
+            var unique_to_delete = std.ArrayListUnmanaged(schema_mod.UniqueConstraint).empty;
+            defer unique_to_delete.deinit(alloc);
+            var foreign_keys_to_build = std.ArrayListUnmanaged(schema_mod.ForeignKey).empty;
+            defer foreign_keys_to_build.deinit(alloc);
+            var foreign_keys_to_delete = std.ArrayListUnmanaged(schema_mod.ForeignKey).empty;
+            defer foreign_keys_to_delete.deinit(alloc);
+            var checks_to_validate = std.ArrayListUnmanaged(schema_mod.RelationalCheck).empty;
+            defer checks_to_validate.deinit(alloc);
+
+            for (next_schema.unique_constraints) |constraint| {
+                if (findUniqueConstraintByName(current_schema.unique_constraints, constraint.name) == null) {
+                    try unique_to_build.append(alloc, constraint);
+                }
+            }
+            for (current_schema.unique_constraints) |constraint| {
+                if (findUniqueConstraintByName(next_schema.unique_constraints, constraint.name) == null) {
+                    try unique_to_delete.append(alloc, constraint);
+                }
+            }
+            for (next_schema.foreign_keys) |foreign_key| {
+                if (findForeignKeyByName(current_schema.foreign_keys, foreign_key.name)) |current_foreign_key| {
+                    if (current_foreign_key.validation_state != .enforced and foreign_key.validation_state == .enforced) {
+                        try foreign_keys_to_build.append(alloc, foreign_key);
+                    }
+                } else if (foreign_key.validation_state == .enforced) {
+                    try foreign_keys_to_build.append(alloc, foreign_key);
+                }
+            }
+            for (current_schema.foreign_keys) |foreign_key| {
+                if (findForeignKeyByName(next_schema.foreign_keys, foreign_key.name) == null) {
+                    try foreign_keys_to_delete.append(alloc, foreign_key);
+                }
+            }
+            for (next_schema.checks) |check| {
+                if (findRelationalCheckByName(current_schema.checks, check.name)) |current_check| {
+                    if (current_check.validation_state != .enforced and check.validation_state == .enforced) {
+                        try checks_to_validate.append(alloc, check);
+                    }
+                } else if (check.validation_state == .enforced) {
+                    try checks_to_validate.append(alloc, check);
+                }
+            }
+
+            if (unique_to_build.items.len > 0) {
+                try relational_store_mod.rebuildUniqueConstraintRowsInRange(
+                    alloc,
+                    self.core.store,
+                    next_schema.relational_columns,
+                    next_schema.periods,
+                    unique_to_build.items,
+                    self.getRange().start,
+                    self.getRange().end,
+                );
+            }
+            if (foreign_keys_to_build.items.len > 0) {
+                const validate_report = try relational_store_mod.reconcileForeignKeyRefsInRangeWithPrimaryKey(
+                    alloc,
+                    self.core.store,
+                    next_schema.default_type,
+                    next_schema.relational_columns,
+                    next_schema.periods,
+                    foreign_keys_to_build.items,
+                    next_schema.primary_key,
+                    next_schema.unique_constraints,
+                    self.getRange().start,
+                    self.getRange().end,
+                    .validate,
+                );
+                try self.schemaRuntimeRecordForeignKeyIntegrityProgressLocked(alloc, .validate, null, self.getRange().start, self.getRange().end, validate_report);
+                if (validate_report.missing_parent_rows != 0) return error.ForeignKeyViolation;
+
+                const repair_report = try relational_store_mod.reconcileForeignKeyRefsInRangeWithPrimaryKey(
+                    alloc,
+                    self.core.store,
+                    next_schema.default_type,
+                    next_schema.relational_columns,
+                    next_schema.periods,
+                    foreign_keys_to_build.items,
+                    next_schema.primary_key,
+                    next_schema.unique_constraints,
+                    self.getRange().start,
+                    self.getRange().end,
+                    .repair,
+                );
+                try self.schemaRuntimeRecordForeignKeyIntegrityProgressLocked(alloc, .repair, null, self.getRange().start, self.getRange().end, repair_report);
+                if (repair_report.missing_parent_rows != 0) return error.ForeignKeyViolation;
+            }
+            if (checks_to_validate.items.len > 0) {
+                try self.schemaRuntimeValidateRelationalChecksInRangeLocked(
+                    alloc,
+                    checks_to_validate.items,
+                    self.getRange().start,
+                    self.getRange().end,
+                );
+            }
+            if (foreign_keys_to_delete.items.len > 0) {
+                try relational_store_mod.deleteForeignKeyRefRows(alloc, self.core.store, foreign_keys_to_delete.items);
+            }
+            if (unique_to_delete.items.len > 0) {
+                try relational_store_mod.deleteUniqueConstraintRows(alloc, self.core.store, unique_to_delete.items);
+            }
+        }
+
+        fn schemaRewriteRowValueAlloc(
+            self: *DB,
+            alloc: Allocator,
+            row_value: []const u8,
+            target_column: schema_mod.RelationalColumn,
+            expression: schema_mod.RelationalRowsExpression,
+        ) !?[]u8 {
+            const row_json = mapper.materializeRelationalRowValueAlloc(alloc, row_value) catch return error.InvalidRowsRequest;
+            defer alloc.free(row_json);
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.InvalidRowsRequest;
+
+            const value_json = self.schemaRuntimeRelationalRowsExpressionValueJsonAlloc(alloc, parsed.value, expression) catch return error.InvalidRowsRequest;
+            defer alloc.free(value_json);
+            var parsed_value = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidRowsRequest;
+            defer parsed_value.deinit();
+
+            if (parsed_value.value == .null) {
+                if (!target_column.nullable) return error.InvalidRowsRequest;
+                return try relational_store_mod.rewriteRowValueWithPlanAlloc(alloc, row_value, .{ .drops = &.{target_column.path} });
+            }
+
+            const target_row = try relationalDefaultColumnRowValueAlloc(alloc, target_column, value_json);
+            defer alloc.free(target_row);
+            var decoded = try relational_row_codec.deserialize(alloc, target_row);
+            defer decoded.deinit(alloc);
+            if (decoded.cells.len != 1) return error.InvalidRowsRequest;
+            return try relational_store_mod.rewriteRowValueWithPlanAlloc(alloc, row_value, .{ .sets = &.{.{ .cell = decoded.cells[0] }} });
+        }
+
+        fn validateFirstTableSchemaApplyAgainstExistingRows(self: *DB, alloc: Allocator, next_schema: schema_mod.TableSchema) !void {
+            const existing_mode = try detectExistingPhysicalStorageMode(alloc, self.core.store);
+            switch (existing_mode) {
+                .empty => return,
+                .document => if (next_schema.storage_mode != .document) return error.InvalidSchemaUpdateRequest,
+                .relational => if (next_schema.storage_mode != .relational) return error.InvalidSchemaUpdateRequest,
+                .mixed => return error.InvalidSchemaUpdateRequest,
+            }
         }
 
         pub fn drainSchemaRewriteJobsForIdle(
@@ -357,7 +691,7 @@ pub fn Impl(comptime DB: type) type {
                 }
 
                 for (rows) |row| {
-                    const rewritten = try self.schemaRuntimeSchemaRewriteRowValueAlloc(alloc, row.row_value, target_column, expression);
+                    const rewritten = try Self.schemaRewriteRowValueAlloc(self, alloc, row.row_value, target_column, expression);
                     if (rewritten) |new_row| {
                         var new_row_owned = true;
                         errdefer if (new_row_owned) alloc.free(new_row);
@@ -490,6 +824,246 @@ fn schemaRewriteJobClaimableForDrain(job: metadata_table_manager.SchemaRewriteJo
         job.lease_expires_at_ms <= now_ms;
 }
 
+fn validateRuntimeTableSchemaTransition(current_schema: schema_mod.TableSchema, next_schema: schema_mod.TableSchema) !void {
+    if (current_schema.storage_mode != next_schema.storage_mode) return error.InvalidSchemaUpdateRequest;
+    if (next_schema.storage_mode != .relational) return;
+    try validateRelationalColumnCatalogTransition(current_schema.relational_columns, next_schema.relational_columns);
+    if (!schema_mod.primaryKeyCatalogsEqual(current_schema.primary_key, next_schema.primary_key)) {
+        return error.InvalidSchemaUpdateRequest;
+    }
+    if (!schema_mod.relationalPeriodCatalogsEqual(current_schema.periods, next_schema.periods)) {
+        return error.InvalidSchemaUpdateRequest;
+    }
+    try validateConstraintCatalogTransition(current_schema, next_schema);
+}
+
+fn validateRelationalColumnCatalogTransition(current_columns: []const schema_mod.RelationalColumn, next_columns: []const schema_mod.RelationalColumn) !void {
+    for (next_columns) |column| {
+        if (findRelationalColumnByPath(current_columns, column.path)) |current_column| {
+            if (!schema_mod.relationalColumnCatalogsEqual(&.{current_column.*}, &.{column})) {
+                return error.InvalidSchemaUpdateRequest;
+            }
+            continue;
+        }
+        if (try relationalColumnHasUniqueDroppedRenameSource(current_columns, next_columns, column)) continue;
+        try validateNewRelationalColumnTransition(current_columns, next_columns, column);
+    }
+}
+
+fn findRelationalColumnByPath(columns: []const schema_mod.RelationalColumn, path: []const u8) ?*const schema_mod.RelationalColumn {
+    for (columns) |*column| {
+        if (std.mem.eql(u8, column.path, path)) return column;
+    }
+    return null;
+}
+
+fn relationalColumnPathExists(columns: []const schema_mod.RelationalColumn, path: []const u8) bool {
+    return findRelationalColumnByPath(columns, path) != null;
+}
+
+fn relationalColumnHasUniqueDroppedRenameSource(
+    current_columns: []const schema_mod.RelationalColumn,
+    next_columns: []const schema_mod.RelationalColumn,
+    target_column: schema_mod.RelationalColumn,
+) !bool {
+    var source_index: ?usize = null;
+    for (current_columns, 0..) |current_column, index| {
+        if (relationalColumnPathExists(next_columns, current_column.path)) continue;
+        if (!schema_mod.relationalColumnDefinitionsEqual(current_column, target_column)) continue;
+        if (source_index != null) return error.InvalidSchemaUpdateRequest;
+        source_index = index;
+    }
+    const matched_source_index = source_index orelse return false;
+
+    var use_count: usize = 0;
+    for (next_columns) |next_column| {
+        if (relationalColumnPathExists(current_columns, next_column.path)) continue;
+        if (schema_mod.relationalColumnDefinitionsEqual(current_columns[matched_source_index], next_column)) {
+            use_count += 1;
+        }
+    }
+    if (use_count != 1) return error.InvalidSchemaUpdateRequest;
+    return true;
+}
+
+fn validateNewRelationalColumnTransition(
+    current_columns: []const schema_mod.RelationalColumn,
+    next_columns: []const schema_mod.RelationalColumn,
+    column: schema_mod.RelationalColumn,
+) !void {
+    if (column.generated) |generated| {
+        try validateAppendedGeneratedColumnTransition(current_columns, next_columns, generated);
+        return;
+    }
+    if (column.default_value) |default_value| {
+        if (default_value.kind != .literal) return error.InvalidSchemaUpdateRequest;
+        return;
+    }
+    if (!column.nullable) return error.InvalidSchemaUpdateRequest;
+}
+
+fn relationalColumnMatchesGeneratedSource(column: schema_mod.RelationalColumn, field: []const u8, normalized: []const u8) bool {
+    return std.mem.eql(u8, field, column.name) or
+        std.mem.eql(u8, field, column.path) or
+        std.mem.eql(u8, normalized, column.name) or
+        std.mem.eql(u8, normalized, column.path);
+}
+
+fn validateGeneratedColumnBackfillSource(
+    current_columns: []const schema_mod.RelationalColumn,
+    next_columns: []const schema_mod.RelationalColumn,
+    field: []const u8,
+) !void {
+    const normalized = if (std.mem.startsWith(u8, field, "/")) field[1..] else field;
+    for (current_columns) |column| {
+        if (relationalColumnMatchesGeneratedSource(column, field, normalized)) {
+            return;
+        }
+    }
+    for (next_columns) |column| {
+        if (relationalColumnPathExists(current_columns, column.path)) continue;
+        if (!relationalColumnMatchesGeneratedSource(column, field, normalized)) continue;
+        if (column.generated != null) return error.InvalidSchemaUpdateRequest;
+        const default_value = column.default_value orelse return error.InvalidSchemaUpdateRequest;
+        if (default_value.kind != .literal) return error.InvalidSchemaUpdateRequest;
+        if (jsonLiteralIsNull(default_value.value_json)) return error.InvalidSchemaUpdateRequest;
+        return;
+    }
+    return error.InvalidSchemaUpdateRequest;
+}
+
+fn validateAppendedGeneratedColumnTransition(
+    current_columns: []const schema_mod.RelationalColumn,
+    next_columns: []const schema_mod.RelationalColumn,
+    generated: schema_mod.RelationalGeneratedValue,
+) !void {
+    switch (generated.op) {
+        .lower, .upper, .md5 => {
+            const field = generated.field orelse return error.InvalidSchemaUpdateRequest;
+            try validateGeneratedColumnBackfillSource(current_columns, next_columns, field);
+        },
+        .concat, .concat_ws => {
+            if (generated.fields.len == 0) return error.InvalidSchemaUpdateRequest;
+            for (generated.fields) |field| {
+                try validateGeneratedColumnBackfillSource(current_columns, next_columns, field);
+            }
+        },
+        .expression => {
+            const expression = generated.expression orelse return error.InvalidSchemaUpdateRequest;
+            try validateGeneratedColumnExpressionBackfillSources(current_columns, next_columns, expression);
+        },
+    }
+}
+
+fn validateGeneratedColumnExpressionBackfillSources(
+    current_columns: []const schema_mod.RelationalColumn,
+    next_columns: []const schema_mod.RelationalColumn,
+    expression: schema_mod.RelationalRowsExpression,
+) error{InvalidSchemaUpdateRequest}!void {
+    if (expression.kind == .field) {
+        try validateGeneratedColumnBackfillSource(current_columns, next_columns, expression.field);
+    }
+    for (expression.operands) |operand| try validateGeneratedColumnExpressionBackfillSources(current_columns, next_columns, operand);
+    for (expression.case_branches) |branch| {
+        try validateGeneratedColumnExpressionConditionBackfillSources(current_columns, next_columns, branch.when);
+        try validateGeneratedColumnExpressionBackfillSources(current_columns, next_columns, branch.then);
+    }
+    for (expression.case_else) |case_else| try validateGeneratedColumnExpressionBackfillSources(current_columns, next_columns, case_else);
+}
+
+fn validateGeneratedColumnExpressionConditionBackfillSources(
+    current_columns: []const schema_mod.RelationalColumn,
+    next_columns: []const schema_mod.RelationalColumn,
+    condition: schema_mod.RelationalRowsExpressionCondition,
+) error{InvalidSchemaUpdateRequest}!void {
+    try validateGeneratedColumnExpressionBackfillSources(current_columns, next_columns, condition.lhs);
+    for (condition.rhs) |rhs| try validateGeneratedColumnExpressionBackfillSources(current_columns, next_columns, rhs);
+}
+
+fn validateConstraintCatalogTransition(current_schema: schema_mod.TableSchema, next_schema: schema_mod.TableSchema) !void {
+    for (current_schema.unique_constraints) |constraint| {
+        if (findUniqueConstraintByName(next_schema.unique_constraints, constraint.name)) |next_constraint| {
+            if (!uniqueConstraintsEqual(constraint, next_constraint)) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+    for (next_schema.unique_constraints) |constraint| {
+        if (findUniqueConstraintByName(current_schema.unique_constraints, constraint.name)) |current_constraint| {
+            if (!uniqueConstraintsEqual(current_constraint, constraint)) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+    for (current_schema.foreign_keys) |foreign_key| {
+        if (findForeignKeyByName(next_schema.foreign_keys, foreign_key.name)) |next_foreign_key| {
+            if (!foreignKeysSameDefinition(foreign_key, next_foreign_key)) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+    for (next_schema.foreign_keys) |foreign_key| {
+        if (findForeignKeyByName(current_schema.foreign_keys, foreign_key.name)) |current_foreign_key| {
+            if (!foreignKeysSameDefinition(current_foreign_key, foreign_key)) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+    for (current_schema.checks) |check| {
+        if (findRelationalCheckByName(next_schema.checks, check.name)) |next_check| {
+            if (!schema_mod.relationalChecksEqual(check, next_check)) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+    for (next_schema.checks) |check| {
+        if (findRelationalCheckByName(current_schema.checks, check.name)) |current_check| {
+            if (!schema_mod.relationalChecksEqual(current_check, check)) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+}
+
+fn relationalDefaultColumnRowValueAlloc(
+    alloc: Allocator,
+    column: schema_mod.RelationalColumn,
+    value_json: []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('{');
+    try writer.print("{f}:", .{std.json.fmt(column.path, .{})});
+    try writer.writeAll(value_json);
+    try writer.writeByte('}');
+    const json = try out.toOwnedSlice();
+    defer alloc.free(json);
+    const columns = [_]schema_mod.RelationalColumn{column};
+    return try mapper.buildRelationalRowValueAlloc(alloc, json, columns[0..]);
+}
+
+fn jsonLiteralIsNull(value_json: []const u8) bool {
+    return std.mem.eql(u8, std.mem.trim(u8, value_json, " \t\r\n"), "null");
+}
+
+const ExistingPhysicalStorageMode = enum {
+    empty,
+    document,
+    relational,
+    mixed,
+};
+
+fn detectExistingPhysicalStorageMode(alloc: Allocator, store: anytype) !ExistingPhysicalStorageMode {
+    const lower = [_]u8{internal_keys.user_namespace};
+    const upper = [_]u8{internal_keys.user_namespace + 1};
+    const rows = try store.scanRange(alloc, lower[0..], upper[0..]);
+    defer docstore_mod.DocStore.freeResults(alloc, rows);
+
+    var saw_document = false;
+    var saw_relational = false;
+    for (rows) |entry| {
+        if (internal_keys.isPrimaryDocumentKey(entry.key)) {
+            saw_document = true;
+        } else if (internal_keys.isRelationalRowKey(entry.key)) {
+            saw_relational = true;
+        }
+        if (saw_document and saw_relational) return .mixed;
+    }
+
+    if (saw_document) return .document;
+    if (saw_relational) return .relational;
+    return .empty;
+}
+
 fn relationalRowsFindColumn(columns: []const schema_mod.RelationalColumn, name: []const u8) ?schema_mod.RelationalColumn {
     for (columns) |column| {
         if (std.mem.eql(u8, column.path, name) or std.mem.eql(u8, column.name, name)) return column;
@@ -501,4 +1075,131 @@ fn optionalStringsEqual(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
     return std.mem.eql(u8, a.?, b.?);
+}
+
+fn findUniqueConstraintByName(unique_constraints: []const schema_mod.UniqueConstraint, name: []const u8) ?schema_mod.UniqueConstraint {
+    for (unique_constraints) |constraint| {
+        if (std.mem.eql(u8, constraint.name, name)) return constraint;
+    }
+    return null;
+}
+
+fn findForeignKeyByName(foreign_keys: []const schema_mod.ForeignKey, name: []const u8) ?schema_mod.ForeignKey {
+    for (foreign_keys) |foreign_key| {
+        if (std.mem.eql(u8, foreign_key.name, name)) return foreign_key;
+    }
+    return null;
+}
+
+fn findRelationalCheckByName(checks: []const schema_mod.RelationalCheck, name: []const u8) ?schema_mod.RelationalCheck {
+    for (checks) |check| {
+        if (std.mem.eql(u8, check.name, name)) return check;
+    }
+    return null;
+}
+
+fn uniqueConstraintsEqual(a: schema_mod.UniqueConstraint, b: schema_mod.UniqueConstraint) bool {
+    return std.mem.eql(u8, a.name, b.name) and
+        stringSlicesEqual(a.columns, b.columns) and
+        uniqueExpressionSlicesEqual(a.expressions, b.expressions) and
+        optionalStringsEqual(a.without_overlaps_period, b.without_overlaps_period) and
+        uniquePredicateSlicesEqual(a.where, b.where) and
+        relationalRowsExpressionConditionSlicesEqual(a.where_expressions, b.where_expressions);
+}
+
+fn uniqueExpressionSlicesEqual(a: []const schema_mod.UniqueExpression, b: []const schema_mod.UniqueExpression) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (left.op != right.op) return false;
+        if (!std.mem.eql(u8, left.field, right.field)) return false;
+        if (left.expression == null or right.expression == null) {
+            if (left.expression != null or right.expression != null) return false;
+        } else if (!relationalRowsExpressionEqual(left.expression.?, right.expression.?)) return false;
+    }
+    return true;
+}
+
+fn uniquePredicateSlicesEqual(a: []const schema_mod.UniquePredicate, b: []const schema_mod.UniquePredicate) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (left.op != right.op) return false;
+        if (!std.mem.eql(u8, left.field, right.field)) return false;
+        if (!optionalStringsEqual(left.value_json, right.value_json)) return false;
+    }
+    return true;
+}
+
+fn relationalRowsExpressionConditionSlicesEqual(
+    a: []const schema_mod.RelationalRowsExpressionCondition,
+    b: []const schema_mod.RelationalRowsExpressionCondition,
+) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!relationalRowsExpressionConditionEqual(left, right)) return false;
+    }
+    return true;
+}
+
+fn foreignKeysSameDefinition(a: schema_mod.ForeignKey, b: schema_mod.ForeignKey) bool {
+    return std.mem.eql(u8, a.name, b.name) and
+        stringSlicesEqual(a.child_columns, b.child_columns) and
+        optionalStringsEqual(a.child_period, b.child_period) and
+        std.mem.eql(u8, a.parent_table, b.parent_table) and
+        stringSlicesEqual(a.parent_columns, b.parent_columns) and
+        optionalStringsEqual(a.parent_period, b.parent_period) and
+        a.on_delete == b.on_delete and
+        a.on_update == b.on_update and
+        a.timing == b.timing and
+        a.deferrable == b.deferrable and
+        a.match == b.match;
+}
+
+fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!std.mem.eql(u8, left, right)) return false;
+    }
+    return true;
+}
+
+fn relationalRowsExpressionConditionEqual(
+    lhs: schema_mod.RelationalRowsExpressionCondition,
+    rhs: schema_mod.RelationalRowsExpressionCondition,
+) bool {
+    if (lhs.op != rhs.op or lhs.rhs.len != rhs.rhs.len) return false;
+    if (!relationalRowsExpressionEqual(lhs.lhs, rhs.lhs)) return false;
+    for (lhs.rhs, rhs.rhs) |lhs_rhs, rhs_rhs| {
+        if (!relationalRowsExpressionEqual(lhs_rhs, rhs_rhs)) return false;
+    }
+    return true;
+}
+
+fn relationalRowsExpressionEqual(
+    lhs: schema_mod.RelationalRowsExpression,
+    rhs: schema_mod.RelationalRowsExpression,
+) bool {
+    if (lhs.kind != rhs.kind or
+        lhs.field_source != rhs.field_source or
+        lhs.json_as_text != rhs.json_as_text or
+        lhs.cast_type != rhs.cast_type or
+        !std.mem.eql(u8, lhs.field, rhs.field) or
+        !std.mem.eql(u8, lhs.value_json, rhs.value_json) or
+        !std.mem.eql(u8, lhs.json_path, rhs.json_path) or
+        lhs.operands.len != rhs.operands.len or
+        lhs.case_branches.len != rhs.case_branches.len or
+        lhs.case_else.len != rhs.case_else.len)
+    {
+        return false;
+    }
+    for (lhs.operands, rhs.operands) |lhs_operand, rhs_operand| {
+        if (!relationalRowsExpressionEqual(lhs_operand, rhs_operand)) return false;
+    }
+    for (lhs.case_branches, rhs.case_branches) |lhs_branch, rhs_branch| {
+        if (!relationalRowsExpressionConditionEqual(lhs_branch.when, rhs_branch.when)) return false;
+        if (!relationalRowsExpressionEqual(lhs_branch.then, rhs_branch.then)) return false;
+    }
+    for (lhs.case_else, rhs.case_else) |lhs_fallback, rhs_fallback| {
+        if (!relationalRowsExpressionEqual(lhs_fallback, rhs_fallback)) return false;
+    }
+    return true;
 }

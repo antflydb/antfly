@@ -32,7 +32,9 @@ const usermgr = @import("../usermgr/mod.zig");
 
 pub const default_array_agg_max_items: u32 = db_mod.types.default_relational_rows_array_agg_max_items;
 pub const DocumentAlgebraicAggregatePlan = sql_adapter.DocumentAlgebraicAggregatePlan;
+pub const DocumentAggregateInput = sql_adapter.DocumentAggregateInput;
 pub const DocumentAggregateGroupBy = sql_adapter.DocumentAggregateGroupBy;
+pub const DocumentAggregateOp = sql_adapter.DocumentAggregateOp;
 pub const BoundedDocumentScan = sql_adapter.BoundedDocumentScan;
 pub const DocumentIndexQuery = sql_adapter.DocumentIndexQuery;
 pub const DocumentOrderBy = sql_adapter.DocumentOrderBy;

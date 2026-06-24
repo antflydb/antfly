@@ -67,6 +67,36 @@ pub const QueryResponse = struct {
     }
 };
 
+pub const AlgebraicAggregateRequest = struct {
+    index_name: []const u8,
+    materialization_name: []const u8,
+    aggregate_op: sql_adapter_runtime.DocumentAggregateOp,
+    group_by: ?sql_adapter_runtime.DocumentAggregateGroupBy = null,
+    limit: ?u32 = null,
+};
+
+pub const AlgebraicAggregateRow = struct {
+    group_json: ?[]u8 = null,
+    value_json: []u8,
+
+    pub fn deinit(self: *AlgebraicAggregateRow, alloc: std.mem.Allocator) void {
+        if (self.group_json) |value| alloc.free(value);
+        alloc.free(self.value_json);
+        self.* = undefined;
+    }
+};
+
+pub const AlgebraicAggregateResponse = struct {
+    rows: []AlgebraicAggregateRow,
+    total_groups: u32,
+
+    pub fn deinit(self: *AlgebraicAggregateResponse, alloc: std.mem.Allocator) void {
+        for (self.rows) |*row| row.deinit(alloc);
+        alloc.free(self.rows);
+        self.* = undefined;
+    }
+};
+
 pub const RowsQueryResult = struct {
     rows: [][]const u8,
     total: u32,
@@ -133,6 +163,13 @@ pub const Source = struct {
             req: QueryRequest,
             consistency: raft_mod.ReadConsistency,
         ) anyerror!?QueryResponse = null,
+        algebraic_aggregate: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: AlgebraicAggregateRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?AlgebraicAggregateResponse = null,
     };
 
     pub fn lookup(self: Source, alloc: std.mem.Allocator, table_name: []const u8, key: []const u8, opts: LookupOptions, consistency: raft_mod.ReadConsistency) !?LookupResponse {
@@ -155,6 +192,11 @@ pub const Source = struct {
     pub fn queryCatalog(self: Source, alloc: std.mem.Allocator, req: QueryRequest, consistency: raft_mod.ReadConsistency) !?QueryResponse {
         const callback = self.vtable.query_catalog orelse return error.UnsupportedOperation;
         return try callback(self.ptr, alloc, req, consistency);
+    }
+
+    pub fn algebraicAggregate(self: Source, alloc: std.mem.Allocator, table_name: []const u8, req: AlgebraicAggregateRequest, consistency: raft_mod.ReadConsistency) !?AlgebraicAggregateResponse {
+        const callback = self.vtable.algebraic_aggregate orelse return error.DocumentSqlIndexUnavailable;
+        return try callback(self.ptr, alloc, table_name, req, consistency);
     }
 };
 
@@ -287,6 +329,11 @@ fn documentSqlAdmitBoundedScanPayload(
     if (payload.len > max_bytes) return error.DocumentSqlRequiresBoundedScan;
 }
 
+fn documentSqlBoundedScanProbeLimit(max_rows: u32) u32 {
+    if (max_rows == std.math.maxInt(u32)) return max_rows;
+    return max_rows + 1;
+}
+
 pub fn executeAggregatePlanAlloc(
     alloc: std.mem.Allocator,
     source: Source,
@@ -296,21 +343,41 @@ pub fn executeAggregatePlanAlloc(
     const native_table_name = source.native_table_name;
     const public_table_name = source.public_table_name;
 
-    if (lowered.group_by) |group_by| {
-        if (lowered.aggregate.op != .count) return error.UnsupportedSqlShape;
-        return try executeLoweredDocumentSqlGroupedCountAggregatePlanAlloc(
+    if (lowered.index_name != null or lowered.materialization_name != null) {
+        return try executeLoweredDocumentSqlAlgebraicAggregatePlanAlloc(
             alloc,
             source,
             native_table_name,
-            public_table_name,
             lowered,
-            group_by,
             consistency,
         );
     }
 
-    if (lowered.aggregate.op == .sum) {
-        return try executeLoweredDocumentSqlSumAggregatePlanAlloc(
+    if (lowered.group_by) |group_by| {
+        return switch (lowered.aggregate.op) {
+            .count => try executeLoweredDocumentSqlGroupedCountAggregatePlanAlloc(
+                alloc,
+                source,
+                native_table_name,
+                public_table_name,
+                lowered,
+                group_by,
+                consistency,
+            ),
+            .sum, .avg, .min, .max => try executeLoweredDocumentSqlGroupedNumericAggregatePlanAlloc(
+                alloc,
+                source,
+                native_table_name,
+                public_table_name,
+                lowered,
+                group_by,
+                consistency,
+            ),
+        };
+    }
+
+    if (lowered.aggregate.op != .count) {
+        return try executeLoweredDocumentSqlNumericAggregatePlanAlloc(
             alloc,
             source,
             native_table_name,
@@ -357,30 +424,31 @@ pub fn executeAggregatePlanAlloc(
             var scan = (try documentSqlScanAlloc(alloc, source, native_table_name, public_table_name, "", "", .{
                 .include_documents = false,
                 .include_all_fields = false,
-                .limit = scan_plan.max_rows,
+                .limit = documentSqlBoundedScanProbeLimit(scan_plan.max_rows),
             }, consistency)) orelse return null;
             defer scan.deinit(alloc);
             try documentSqlAdmitBoundedScanPayload(scan_plan, scan.ndjson);
 
             var total: u32 = 0;
-            var scanned: u32 = 0;
+            var scanned_docs: u32 = 0;
             var lines = std.mem.splitScalar(u8, scan.ndjson, '\n');
             while (lines.next()) |line| {
                 if (line.len == 0) continue;
-                scanned += 1;
+                var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+                defer parsed.deinit();
+                if (parsed.value != .object) return error.InvalidRowsRequest;
+                const key_value = parsed.value.object.get("key") orelse return error.InvalidRowsRequest;
+                if (key_value != .string) return error.InvalidRowsRequest;
+
+                var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key_value.string, .{}, consistency)) orelse continue;
+                defer lookup.deinit(alloc);
+                scanned_docs += 1;
+                if (scanned_docs > scan_plan.max_rows) return error.DocumentSqlRequiresBoundedScan;
                 if (scan_plan.residual_filter_json) |filter| {
-                    var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
-                    defer parsed.deinit();
-                    if (parsed.value != .object) return error.InvalidRowsRequest;
-                    const key_value = parsed.value.object.get("key") orelse return error.InvalidRowsRequest;
-                    if (key_value != .string) return error.InvalidRowsRequest;
-                    var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key_value.string, .{}, consistency)) orelse continue;
-                    defer lookup.deinit(alloc);
                     if (!try residualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
                 }
                 total += 1;
             }
-            if (scanned >= scan_plan.max_rows) return error.DocumentSqlRequiresBoundedScan;
             break :blk total;
         },
     } else return error.UnsupportedSqlShape;
@@ -388,12 +456,51 @@ pub fn executeAggregatePlanAlloc(
     return try documentSqlCountAggregateResultAlloc(alloc, lowered.aggregate.output, count);
 }
 
-const DocumentSqlNumericSum = struct {
-    total: f64 = 0,
+fn executeLoweredDocumentSqlAlgebraicAggregatePlanAlloc(
+    alloc: std.mem.Allocator,
+    source: Source,
+    native_table_name: []const u8,
+    lowered: sql_adapter_runtime.DocumentAlgebraicAggregatePlan,
+    consistency: raft_mod.ReadConsistency,
+) !?RowsAggregateResult {
+    const index_name = lowered.index_name orelse return error.DocumentSqlIndexUnavailable;
+    const materialization_name = lowered.materialization_name orelse return error.DocumentSqlIndexUnavailable;
+    if (lowered.candidate_producer != null or lowered.filter_query_json != null) return error.DocumentSqlIndexUnavailable;
+
+    var response = (try source.algebraicAggregate(alloc, native_table_name, .{
+        .index_name = index_name,
+        .materialization_name = materialization_name,
+        .aggregate_op = lowered.aggregate.op,
+        .group_by = lowered.group_by,
+        .limit = lowered.limit,
+    }, consistency)) orelse return null;
+    defer response.deinit(alloc);
+
+    if (lowered.group_by) |group_by| {
+        return try documentSqlMaterializedGroupedAggregateResultAlloc(
+            alloc,
+            group_by.output,
+            lowered.aggregate.output,
+            response.rows,
+            response.total_groups,
+            lowered.limit,
+        );
+    }
+
+    const value_json = if (response.rows.len > 0) response.rows[0].value_json else switch (lowered.aggregate.op) {
+        .count => "0",
+        .sum, .avg, .min, .max => "null",
+    };
+    return try documentSqlMaterializedScalarAggregateResultAlloc(alloc, lowered.aggregate.output, value_json);
+}
+
+const DocumentSqlNumericAggregate = struct {
+    value: f64 = 0,
+    count: u32 = 0,
     seen: bool = false,
 };
 
-fn executeLoweredDocumentSqlSumAggregatePlanAlloc(
+fn executeLoweredDocumentSqlNumericAggregatePlanAlloc(
     alloc: std.mem.Allocator,
     source: Source,
     native_table_name: []const u8,
@@ -403,7 +510,7 @@ fn executeLoweredDocumentSqlSumAggregatePlanAlloc(
 ) !?RowsAggregateResult {
     const input = lowered.aggregate.input orelse return error.UnsupportedSqlShape;
     if (input.field_type != .numeric) return error.UnsupportedSqlShape;
-    var sum = DocumentSqlNumericSum{};
+    var aggregate = DocumentSqlNumericAggregate{};
 
     if (lowered.candidate_producer) |producer| switch (producer) {
         .id_lookup => |lookup_plan| {
@@ -413,7 +520,7 @@ fn executeLoweredDocumentSqlSumAggregatePlanAlloc(
                 if (lookup_plan.residual_filter_json) |filter| {
                     if (!try residualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
                 }
-                try appendDocumentSqlNumericSumFromDocJsonAlloc(alloc, &sum, input.field, lookup.json);
+                try appendDocumentSqlNumericAggregateFromDocJsonAlloc(alloc, &aggregate, lowered.aggregate.op, input.field, lookup.json);
             }
         },
         .indexed_query => |query| {
@@ -432,34 +539,73 @@ fn executeLoweredDocumentSqlSumAggregatePlanAlloc(
                 if (query.residual_filter_json) |filter| {
                     if (!try residualFilterMatchesAlloc(alloc, row, filter)) continue;
                 }
-                try appendDocumentSqlNumericSumFromDocJsonAlloc(alloc, &sum, input.field, row);
+                try appendDocumentSqlNumericAggregateFromDocJsonAlloc(alloc, &aggregate, lowered.aggregate.op, input.field, row);
             }
         },
         .bounded_scan => |scan_plan| {
+            native_match_all: {
+                if (try documentSqlIndexQueryAlloc(
+                    alloc,
+                    source,
+                    native_table_name,
+                    public_table_name,
+                    .{ .filter_query_json = "{\"match_all\":{}}", .max_candidate_rows = scan_plan.max_rows },
+                    scan_plan.max_rows,
+                    false,
+                    false,
+                    consistency,
+                )) |query_response| {
+                    var response = query_response;
+                    defer response.deinit(alloc);
+                    const total_hits = try documentSqlTotalHitsFromQueryResponse(alloc, response.json);
+                    if (total_hits > scan_plan.max_rows) break :native_match_all;
+                    var candidate_rows = std.ArrayListUnmanaged([]const u8).empty;
+                    defer {
+                        for (candidate_rows.items) |row| alloc.free(@constCast(row));
+                        candidate_rows.deinit(alloc);
+                    }
+                    try appendDocumentSqlFullRowsFromQueryResponseAlloc(alloc, source, native_table_name, public_table_name, response.json, consistency, &candidate_rows);
+                    for (candidate_rows.items) |row| {
+                        if (scan_plan.residual_filter_json) |filter| {
+                            if (!try residualFilterMatchesAlloc(alloc, row, filter)) continue;
+                        }
+                        try appendDocumentSqlNumericAggregateFromDocJsonAlloc(alloc, &aggregate, lowered.aggregate.op, input.field, row);
+                    }
+                    return try documentSqlNumericAggregateResultAlloc(alloc, lowered.aggregate.output, lowered.aggregate.op, aggregate);
+                }
+            }
+
             var scan = (try documentSqlScanAlloc(alloc, source, native_table_name, public_table_name, "", "", .{
-                .include_documents = true,
-                .include_all_fields = true,
-                .limit = scan_plan.max_rows,
+                .include_documents = false,
+                .include_all_fields = false,
+                .limit = documentSqlBoundedScanProbeLimit(scan_plan.max_rows),
             }, consistency)) orelse return null;
             defer scan.deinit(alloc);
             try documentSqlAdmitBoundedScanPayload(scan_plan, scan.ndjson);
-            var rows = std.ArrayListUnmanaged([]const u8).empty;
-            defer {
-                for (rows.items) |row| alloc.free(@constCast(row));
-                rows.deinit(alloc);
-            }
-            try appendDocumentSqlFullRowsFromScanAlloc(alloc, scan.ndjson, &rows);
-            for (rows.items) |row| {
+
+            var scanned_docs: u32 = 0;
+            var lines = std.mem.splitScalar(u8, scan.ndjson, '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+                defer parsed.deinit();
+                if (parsed.value != .object) return error.InvalidRowsRequest;
+                const key_value = parsed.value.object.get("key") orelse return error.InvalidRowsRequest;
+                if (key_value != .string) return error.InvalidRowsRequest;
+
+                var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key_value.string, .{}, consistency)) orelse continue;
+                defer lookup.deinit(alloc);
+                scanned_docs += 1;
+                if (scanned_docs > scan_plan.max_rows) return error.DocumentSqlRequiresBoundedScan;
                 if (scan_plan.residual_filter_json) |filter| {
-                    if (!try residualFilterMatchesAlloc(alloc, row, filter)) continue;
+                    if (!try residualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
                 }
-                try appendDocumentSqlNumericSumFromDocJsonAlloc(alloc, &sum, input.field, row);
+                try appendDocumentSqlNumericAggregateFromDocJsonAlloc(alloc, &aggregate, lowered.aggregate.op, input.field, lookup.json);
             }
-            if (rows.items.len >= scan_plan.max_rows) return error.DocumentSqlRequiresBoundedScan;
         },
     } else return error.DocumentSqlRequiresBoundedScan;
 
-    return try documentSqlNumericSumAggregateResultAlloc(alloc, lowered.aggregate.output, sum);
+    return try documentSqlNumericAggregateResultAlloc(alloc, lowered.aggregate.output, lowered.aggregate.op, aggregate);
 }
 
 fn executeLoweredDocumentSqlGroupedCountAggregatePlanAlloc(
@@ -512,29 +658,118 @@ fn executeLoweredDocumentSqlGroupedCountAggregatePlanAlloc(
         },
         .bounded_scan => |scan_plan| {
             var scan = (try documentSqlScanAlloc(alloc, source, native_table_name, public_table_name, "", "", .{
-                .include_documents = true,
-                .include_all_fields = true,
-                .limit = scan_plan.max_rows,
+                .include_documents = false,
+                .include_all_fields = false,
+                .limit = documentSqlBoundedScanProbeLimit(scan_plan.max_rows),
             }, consistency)) orelse return null;
             defer scan.deinit(alloc);
             try documentSqlAdmitBoundedScanPayload(scan_plan, scan.ndjson);
+
+            var scanned_docs: u32 = 0;
+            var lines = std.mem.splitScalar(u8, scan.ndjson, '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+                defer parsed.deinit();
+                if (parsed.value != .object) return error.InvalidRowsRequest;
+                const key_value = parsed.value.object.get("key") orelse return error.InvalidRowsRequest;
+                if (key_value != .string) return error.InvalidRowsRequest;
+
+                var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key_value.string, .{}, consistency)) orelse continue;
+                defer lookup.deinit(alloc);
+                scanned_docs += 1;
+                if (scanned_docs > scan_plan.max_rows) return error.DocumentSqlRequiresBoundedScan;
+                if (scan_plan.residual_filter_json) |filter| {
+                    if (!try residualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
+                }
+                try appendDocumentSqlCountGroupFromDocJsonAlloc(alloc, &groups, group_by, lookup.json);
+            }
+        },
+    }
+
+    return try documentSqlGroupedCountAggregateResultAlloc(alloc, group_by.output, lowered.aggregate.output, groups.items, lowered.limit);
+}
+
+fn executeLoweredDocumentSqlGroupedNumericAggregatePlanAlloc(
+    alloc: std.mem.Allocator,
+    source: Source,
+    native_table_name: []const u8,
+    public_table_name: []const u8,
+    lowered: sql_adapter_runtime.DocumentAlgebraicAggregatePlan,
+    group_by: sql_adapter_runtime.DocumentAggregateGroupBy,
+    consistency: raft_mod.ReadConsistency,
+) !?RowsAggregateResult {
+    const input = lowered.aggregate.input orelse return error.UnsupportedSqlShape;
+    if (input.field_type != .numeric) return error.UnsupportedSqlShape;
+    if (lowered.candidate_producer == null) return error.DocumentSqlRequiresBoundedScan;
+    var groups = std.ArrayListUnmanaged(DocumentSqlNumericAggregateGroup).empty;
+    defer {
+        for (groups.items) |*group| group.deinit(alloc);
+        groups.deinit(alloc);
+    }
+
+    switch (lowered.candidate_producer.?) {
+        .id_lookup => |lookup_plan| {
+            for (lookup_plan.ids) |id| {
+                var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, id, .{}, consistency)) orelse continue;
+                defer lookup.deinit(alloc);
+                if (lookup_plan.residual_filter_json) |filter| {
+                    if (!try residualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
+                }
+                try appendDocumentSqlNumericAggregateGroupFromDocJsonAlloc(alloc, &groups, group_by, input, lowered.aggregate.op, lookup.json);
+            }
+        },
+        .indexed_query => |query| {
+            const query_limit = query.max_candidate_rows orelse return error.DocumentSqlRequiresBoundedScan;
+            var query_response = (try documentSqlIndexQueryAlloc(alloc, source, native_table_name, public_table_name, query, query_limit, false, false, consistency)) orelse return null;
+            defer query_response.deinit(alloc);
+            const total_hits = try documentSqlTotalHitsFromQueryResponse(alloc, query_response.json);
+            if (total_hits > query_limit) return error.DocumentSqlRequiresBoundedScan;
             var rows = std.ArrayListUnmanaged([]const u8).empty;
             defer {
                 for (rows.items) |row| alloc.free(@constCast(row));
                 rows.deinit(alloc);
             }
-            try appendDocumentSqlFullRowsFromScanAlloc(alloc, scan.ndjson, &rows);
+            try appendDocumentSqlFullRowsFromQueryResponseAlloc(alloc, source, native_table_name, public_table_name, query_response.json, consistency, &rows);
             for (rows.items) |row| {
-                if (scan_plan.residual_filter_json) |filter| {
+                if (query.residual_filter_json) |filter| {
                     if (!try residualFilterMatchesAlloc(alloc, row, filter)) continue;
                 }
-                try appendDocumentSqlCountGroupFromDocJsonAlloc(alloc, &groups, group_by, row);
+                try appendDocumentSqlNumericAggregateGroupFromDocJsonAlloc(alloc, &groups, group_by, input, lowered.aggregate.op, row);
             }
-            if (rows.items.len >= scan_plan.max_rows) return error.DocumentSqlRequiresBoundedScan;
+        },
+        .bounded_scan => |scan_plan| {
+            var scan = (try documentSqlScanAlloc(alloc, source, native_table_name, public_table_name, "", "", .{
+                .include_documents = false,
+                .include_all_fields = false,
+                .limit = documentSqlBoundedScanProbeLimit(scan_plan.max_rows),
+            }, consistency)) orelse return null;
+            defer scan.deinit(alloc);
+            try documentSqlAdmitBoundedScanPayload(scan_plan, scan.ndjson);
+
+            var scanned_docs: u32 = 0;
+            var lines = std.mem.splitScalar(u8, scan.ndjson, '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+                defer parsed.deinit();
+                if (parsed.value != .object) return error.InvalidRowsRequest;
+                const key_value = parsed.value.object.get("key") orelse return error.InvalidRowsRequest;
+                if (key_value != .string) return error.InvalidRowsRequest;
+
+                var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key_value.string, .{}, consistency)) orelse continue;
+                defer lookup.deinit(alloc);
+                scanned_docs += 1;
+                if (scanned_docs > scan_plan.max_rows) return error.DocumentSqlRequiresBoundedScan;
+                if (scan_plan.residual_filter_json) |filter| {
+                    if (!try residualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
+                }
+                try appendDocumentSqlNumericAggregateGroupFromDocJsonAlloc(alloc, &groups, group_by, input, lowered.aggregate.op, lookup.json);
+            }
         },
     }
 
-    return try documentSqlGroupedCountAggregateResultAlloc(alloc, group_by.output, lowered.aggregate.output, groups.items, lowered.limit);
+    return try documentSqlGroupedNumericAggregateResultAlloc(alloc, group_by.output, lowered.aggregate.output, lowered.aggregate.op, groups.items, lowered.limit);
 }
 
 const DocumentSqlCountGroup = struct {
@@ -569,6 +804,48 @@ fn appendDocumentSqlCountGroupFromDocJsonAlloc(
     try groups.append(alloc, .{
         .key_json = key_json,
         .count = 1,
+    });
+}
+
+const DocumentSqlNumericAggregateGroup = struct {
+    key_json: []const u8,
+    aggregate: DocumentSqlNumericAggregate = .{},
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.key_json));
+        self.* = undefined;
+    }
+};
+
+fn appendDocumentSqlNumericAggregateGroupFromDocJsonAlloc(
+    alloc: std.mem.Allocator,
+    groups: *std.ArrayListUnmanaged(DocumentSqlNumericAggregateGroup),
+    group_by: sql_adapter_runtime.DocumentAggregateGroupBy,
+    input: sql_adapter_runtime.DocumentAggregateInput,
+    op: sql_adapter_runtime.DocumentAggregateOp,
+    doc_json: []const u8,
+) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, doc_json, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRowsRequest;
+    const group_value = documentSqlProjectedValue(parsed.value, group_by.field) orelse std.json.Value{ .null = {} };
+    const key_json = try std.json.Stringify.valueAlloc(alloc, group_value, .{});
+    errdefer alloc.free(key_json);
+    const value = documentSqlProjectedValue(parsed.value, input.field);
+
+    for (groups.items) |*group| {
+        if (std.mem.eql(u8, group.key_json, key_json)) {
+            alloc.free(key_json);
+            if (value) |item| try appendDocumentSqlNumericAggregateValue(&group.aggregate, op, item);
+            return;
+        }
+    }
+
+    var aggregate = DocumentSqlNumericAggregate{};
+    if (value) |item| try appendDocumentSqlNumericAggregateValue(&aggregate, op, item);
+    try groups.append(alloc, .{
+        .key_json = key_json,
+        .aggregate = aggregate,
     });
 }
 
@@ -1268,17 +1545,18 @@ fn documentSqlCountAggregateResultAlloc(
     };
 }
 
-fn documentSqlNumericSumAggregateResultAlloc(
+fn documentSqlNumericAggregateResultAlloc(
     alloc: std.mem.Allocator,
     output: []const u8,
-    sum: DocumentSqlNumericSum,
+    op: sql_adapter_runtime.DocumentAggregateOp,
+    aggregate: DocumentSqlNumericAggregate,
 ) !RowsAggregateResult {
     var row: std.Io.Writer.Allocating = .init(alloc);
     errdefer row.deinit();
     const writer = &row.writer;
     try writer.print("{{{f}:", .{std.json.fmt(output, .{})});
-    if (sum.seen) {
-        try writer.print("{d}", .{sum.total});
+    if (aggregate.seen) {
+        try writer.print("{d}", .{documentSqlNumericAggregateResultValue(aggregate, op)});
     } else {
         try writer.writeAll("null");
     }
@@ -1325,9 +1603,103 @@ fn documentSqlGroupedCountAggregateResultAlloc(
     };
 }
 
-fn appendDocumentSqlNumericSumFromDocJsonAlloc(
+fn documentSqlMaterializedScalarAggregateResultAlloc(
     alloc: std.mem.Allocator,
-    sum: *DocumentSqlNumericSum,
+    aggregate_output: []const u8,
+    value_json: []const u8,
+) !RowsAggregateResult {
+    var row: std.Io.Writer.Allocating = .init(alloc);
+    errdefer row.deinit();
+    try row.writer.print("{{{f}:{s}}}", .{
+        std.json.fmt(aggregate_output, .{}),
+        value_json,
+    });
+    const rows = try alloc.alloc([]const u8, 1);
+    errdefer alloc.free(rows);
+    rows[0] = try row.toOwnedSlice();
+    return .{
+        .rows = rows,
+        .total_groups = 1,
+    };
+}
+
+fn documentSqlMaterializedGroupedAggregateResultAlloc(
+    alloc: std.mem.Allocator,
+    group_output: []const u8,
+    aggregate_output: []const u8,
+    materialized_rows: []const AlgebraicAggregateRow,
+    total_groups: u32,
+    limit: ?u32,
+) !RowsAggregateResult {
+    const output_count = if (limit) |value| @min(materialized_rows.len, value) else materialized_rows.len;
+    const rows = try alloc.alloc([]const u8, output_count);
+    errdefer alloc.free(rows);
+    var initialized: usize = 0;
+    errdefer {
+        for (rows[0..initialized]) |row| alloc.free(@constCast(row));
+    }
+    for (materialized_rows[0..output_count], 0..) |materialized, i| {
+        const group_json = materialized.group_json orelse return error.InvalidRowsRequest;
+        var row: std.Io.Writer.Allocating = .init(alloc);
+        errdefer row.deinit();
+        try row.writer.print("{{{f}:{s},{f}:{s}}}", .{
+            std.json.fmt(group_output, .{}),
+            group_json,
+            std.json.fmt(aggregate_output, .{}),
+            materialized.value_json,
+        });
+        rows[i] = try row.toOwnedSlice();
+        initialized += 1;
+    }
+    return .{
+        .rows = rows,
+        .total_groups = total_groups,
+    };
+}
+
+fn documentSqlGroupedNumericAggregateResultAlloc(
+    alloc: std.mem.Allocator,
+    group_output: []const u8,
+    aggregate_output: []const u8,
+    op: sql_adapter_runtime.DocumentAggregateOp,
+    groups: []const DocumentSqlNumericAggregateGroup,
+    limit: ?u32,
+) !RowsAggregateResult {
+    const output_count = if (limit) |value| @min(groups.len, value) else groups.len;
+    const rows = try alloc.alloc([]const u8, output_count);
+    errdefer alloc.free(rows);
+    var initialized: usize = 0;
+    errdefer {
+        for (rows[0..initialized]) |row| alloc.free(@constCast(row));
+    }
+    for (groups[0..output_count], 0..) |group, i| {
+        var row: std.Io.Writer.Allocating = .init(alloc);
+        errdefer row.deinit();
+        const writer = &row.writer;
+        try writer.print("{{{f}:{s},{f}:", .{
+            std.json.fmt(group_output, .{}),
+            group.key_json,
+            std.json.fmt(aggregate_output, .{}),
+        });
+        if (group.aggregate.seen) {
+            try writer.print("{d}", .{documentSqlNumericAggregateResultValue(group.aggregate, op)});
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeByte('}');
+        rows[i] = try row.toOwnedSlice();
+        initialized += 1;
+    }
+    return .{
+        .rows = rows,
+        .total_groups = @intCast(groups.len),
+    };
+}
+
+fn appendDocumentSqlNumericAggregateFromDocJsonAlloc(
+    alloc: std.mem.Allocator,
+    aggregate: *DocumentSqlNumericAggregate,
+    op: sql_adapter_runtime.DocumentAggregateOp,
     field: []const u8,
     doc_json: []const u8,
 ) !void {
@@ -1335,10 +1707,40 @@ fn appendDocumentSqlNumericSumFromDocJsonAlloc(
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidRowsRequest;
     const value = documentSqlProjectedValue(parsed.value, field) orelse return;
+    try appendDocumentSqlNumericAggregateValue(aggregate, op, value);
+}
+
+fn appendDocumentSqlNumericAggregateValue(
+    aggregate: *DocumentSqlNumericAggregate,
+    op: sql_adapter_runtime.DocumentAggregateOp,
+    value: std.json.Value,
+) !void {
     if (value == .null) return;
     const number = try documentSqlNumericValueAsF64(value);
-    sum.total += number;
-    sum.seen = true;
+    aggregate.count += 1;
+    if (!aggregate.seen) {
+        aggregate.value = number;
+        aggregate.seen = true;
+        return;
+    }
+    aggregate.value = switch (op) {
+        .sum => aggregate.value + number,
+        .avg => aggregate.value + number,
+        .min => @min(aggregate.value, number),
+        .max => @max(aggregate.value, number),
+        .count => return error.UnsupportedSqlShape,
+    };
+}
+
+fn documentSqlNumericAggregateResultValue(
+    aggregate: DocumentSqlNumericAggregate,
+    op: sql_adapter_runtime.DocumentAggregateOp,
+) f64 {
+    return switch (op) {
+        .avg => aggregate.value / @as(f64, @floatFromInt(aggregate.count)),
+        .sum, .min, .max => aggregate.value,
+        .count => unreachable,
+    };
 }
 
 fn documentSqlNumericValueAsF64(value: std.json.Value) !f64 {
@@ -2264,6 +2666,406 @@ test "document sql native filter rewrite canonicalizes row filter conjunctions" 
         "{\"bool\":{\"should\":[{\"term\":{\"tier\":\"gold\"}},{\"terms\":{\"status\":[\"trial\",\"active\"]}}],\"minimum_should_match\":1}}",
         native_disjunction,
     );
+}
+
+test "document SQL bounded aggregate scan admits only lookup-backed document keys" {
+    const alloc = std.testing.allocator;
+
+    const MockSource = struct {
+        overflow: bool = false,
+
+        fn source(self: *@This()) Source {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+                .native_table_name = "docs",
+                .public_table_name = "docs",
+            };
+        }
+
+        fn lookup(
+            ptr: *anyopaque,
+            lookup_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            opts: LookupOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            _ = ptr;
+            _ = table_name;
+            _ = opts;
+            _ = consistency;
+            const json = if (std.mem.eql(u8, key, "doc:a"))
+                "{\"status\":\"active\",\"amount\":10}"
+            else if (std.mem.eql(u8, key, "doc:b"))
+                "{\"status\":\"archived\",\"amount\":20}"
+            else
+                return null;
+            return .{ .json = try lookup_alloc.dupe(u8, json), .version = 1 };
+        }
+
+        fn scan(
+            ptr: *anyopaque,
+            scan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: ScanOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = table_name;
+            _ = from_key;
+            _ = to_key;
+            _ = opts;
+            _ = consistency;
+            const ndjson = if (self.overflow)
+                "{\"key\":\"doc:a\"}\n{\"key\":\"doc:b\"}\n"
+            else
+                "{\"key\":\"__internal:index\"}\n{\"key\":\"doc:a\"}\n{\"key\":\"doc:b\"}\n";
+            return .{ .ndjson = try scan_alloc.dupe(u8, ndjson) };
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            query_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: QueryRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) !?QueryResponse {
+            _ = ptr;
+            _ = query_alloc;
+            _ = table_name;
+            _ = req;
+            _ = consistency;
+            return null;
+        }
+    };
+
+    const plan = sql_adapter_runtime.DocumentAlgebraicAggregatePlan{
+        .table_name = "docs",
+        .candidate_producer = .{ .bounded_scan = .{ .max_rows = 2 } },
+        .aggregate = .{
+            .op = .sum,
+            .output = "total_amount",
+            .input = .{ .field = "/amount", .source_field = "amount", .field_type = .numeric },
+        },
+    };
+
+    var source = MockSource{};
+    var result = (try executeAggregatePlanAlloc(alloc, source.source(), plan, .stale)).?;
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), result.total_groups);
+    try std.testing.expectEqualStrings("{\"total_amount\":30}", result.rows[0]);
+
+    const min_plan = sql_adapter_runtime.DocumentAlgebraicAggregatePlan{
+        .table_name = "docs",
+        .candidate_producer = .{ .bounded_scan = .{ .max_rows = 2 } },
+        .aggregate = .{
+            .op = .min,
+            .output = "min_amount",
+            .input = .{ .field = "/amount", .source_field = "amount", .field_type = .numeric },
+        },
+    };
+
+    var min_result = (try executeAggregatePlanAlloc(alloc, source.source(), min_plan, .stale)).?;
+    defer min_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), min_result.total_groups);
+    try std.testing.expectEqualStrings("{\"min_amount\":10}", min_result.rows[0]);
+
+    const avg_plan = sql_adapter_runtime.DocumentAlgebraicAggregatePlan{
+        .table_name = "docs",
+        .candidate_producer = .{ .bounded_scan = .{ .max_rows = 2 } },
+        .aggregate = .{
+            .op = .avg,
+            .output = "avg_amount",
+            .input = .{ .field = "/amount", .source_field = "amount", .field_type = .numeric },
+        },
+    };
+
+    var avg_result = (try executeAggregatePlanAlloc(alloc, source.source(), avg_plan, .stale)).?;
+    defer avg_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), avg_result.total_groups);
+    try std.testing.expectEqualStrings("{\"avg_amount\":15}", avg_result.rows[0]);
+
+    const max_plan = sql_adapter_runtime.DocumentAlgebraicAggregatePlan{
+        .table_name = "docs",
+        .candidate_producer = .{ .bounded_scan = .{ .max_rows = 2 } },
+        .aggregate = .{
+            .op = .max,
+            .output = "max_amount",
+            .input = .{ .field = "/amount", .source_field = "amount", .field_type = .numeric },
+        },
+    };
+
+    var max_result = (try executeAggregatePlanAlloc(alloc, source.source(), max_plan, .stale)).?;
+    defer max_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), max_result.total_groups);
+    try std.testing.expectEqualStrings("{\"max_amount\":20}", max_result.rows[0]);
+
+    const grouped_plan = sql_adapter_runtime.DocumentAlgebraicAggregatePlan{
+        .table_name = "docs",
+        .candidate_producer = .{ .bounded_scan = .{ .max_rows = 2 } },
+        .aggregate = .{
+            .op = .count,
+            .output = "row_count",
+        },
+        .group_by = .{
+            .field = "/status",
+            .source_field = "status",
+            .field_type = .keyword,
+            .output = "status",
+        },
+    };
+
+    var grouped = (try executeAggregatePlanAlloc(alloc, source.source(), grouped_plan, .stale)).?;
+    defer grouped.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), grouped.total_groups);
+    try std.testing.expectEqualStrings("{\"status\":\"active\",\"row_count\":1}", grouped.rows[0]);
+    try std.testing.expectEqualStrings("{\"status\":\"archived\",\"row_count\":1}", grouped.rows[1]);
+
+    const grouped_sum_plan = sql_adapter_runtime.DocumentAlgebraicAggregatePlan{
+        .table_name = "docs",
+        .candidate_producer = .{ .bounded_scan = .{ .max_rows = 2 } },
+        .aggregate = .{
+            .op = .sum,
+            .output = "total_amount",
+            .input = .{ .field = "/amount", .source_field = "amount", .field_type = .numeric },
+        },
+        .group_by = .{
+            .field = "/status",
+            .source_field = "status",
+            .field_type = .keyword,
+            .output = "status",
+        },
+    };
+
+    var grouped_sum = (try executeAggregatePlanAlloc(alloc, source.source(), grouped_sum_plan, .stale)).?;
+    defer grouped_sum.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), grouped_sum.total_groups);
+    try std.testing.expectEqualStrings("{\"status\":\"active\",\"total_amount\":10}", grouped_sum.rows[0]);
+    try std.testing.expectEqualStrings("{\"status\":\"archived\",\"total_amount\":20}", grouped_sum.rows[1]);
+
+    const grouped_max_plan = sql_adapter_runtime.DocumentAlgebraicAggregatePlan{
+        .table_name = "docs",
+        .candidate_producer = .{ .bounded_scan = .{ .max_rows = 2 } },
+        .aggregate = .{
+            .op = .max,
+            .output = "max_amount",
+            .input = .{ .field = "/amount", .source_field = "amount", .field_type = .numeric },
+        },
+        .group_by = .{
+            .field = "/status",
+            .source_field = "status",
+            .field_type = .keyword,
+            .output = "status",
+        },
+    };
+
+    var grouped_max = (try executeAggregatePlanAlloc(alloc, source.source(), grouped_max_plan, .stale)).?;
+    defer grouped_max.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), grouped_max.total_groups);
+    try std.testing.expectEqualStrings("{\"status\":\"active\",\"max_amount\":10}", grouped_max.rows[0]);
+    try std.testing.expectEqualStrings("{\"status\":\"archived\",\"max_amount\":20}", grouped_max.rows[1]);
+
+    const grouped_avg_plan = sql_adapter_runtime.DocumentAlgebraicAggregatePlan{
+        .table_name = "docs",
+        .candidate_producer = .{ .bounded_scan = .{ .max_rows = 2 } },
+        .aggregate = .{
+            .op = .avg,
+            .output = "avg_amount",
+            .input = .{ .field = "/amount", .source_field = "amount", .field_type = .numeric },
+        },
+        .group_by = .{
+            .field = "/status",
+            .source_field = "status",
+            .field_type = .keyword,
+            .output = "status",
+        },
+    };
+
+    var grouped_avg = (try executeAggregatePlanAlloc(alloc, source.source(), grouped_avg_plan, .stale)).?;
+    defer grouped_avg.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), grouped_avg.total_groups);
+    try std.testing.expectEqualStrings("{\"status\":\"active\",\"avg_amount\":10}", grouped_avg.rows[0]);
+    try std.testing.expectEqualStrings("{\"status\":\"archived\",\"avg_amount\":20}", grouped_avg.rows[1]);
+
+    var overflow_source = MockSource{ .overflow = true };
+    const overflow_plan = sql_adapter_runtime.DocumentAlgebraicAggregatePlan{
+        .table_name = "docs",
+        .candidate_producer = .{ .bounded_scan = .{ .max_rows = 1 } },
+        .aggregate = .{
+            .op = .sum,
+            .output = "total_amount",
+            .input = .{ .field = "/amount", .source_field = "amount", .field_type = .numeric },
+        },
+    };
+    try std.testing.expectError(
+        error.DocumentSqlRequiresBoundedScan,
+        executeAggregatePlanAlloc(alloc, overflow_source.source(), overflow_plan, .stale),
+    );
+
+    const overflow_grouped_plan = sql_adapter_runtime.DocumentAlgebraicAggregatePlan{
+        .table_name = "docs",
+        .candidate_producer = .{ .bounded_scan = .{ .max_rows = 1 } },
+        .aggregate = .{
+            .op = .count,
+            .output = "row_count",
+        },
+        .group_by = .{
+            .field = "/status",
+            .source_field = "status",
+            .field_type = .keyword,
+            .output = "status",
+        },
+    };
+    try std.testing.expectError(
+        error.DocumentSqlRequiresBoundedScan,
+        executeAggregatePlanAlloc(alloc, overflow_source.source(), overflow_grouped_plan, .stale),
+    );
+
+    const overflow_grouped_sum_plan = sql_adapter_runtime.DocumentAlgebraicAggregatePlan{
+        .table_name = "docs",
+        .candidate_producer = .{ .bounded_scan = .{ .max_rows = 1 } },
+        .aggregate = .{
+            .op = .sum,
+            .output = "total_amount",
+            .input = .{ .field = "/amount", .source_field = "amount", .field_type = .numeric },
+        },
+        .group_by = .{
+            .field = "/status",
+            .source_field = "status",
+            .field_type = .keyword,
+            .output = "status",
+        },
+    };
+    try std.testing.expectError(
+        error.DocumentSqlRequiresBoundedScan,
+        executeAggregatePlanAlloc(alloc, overflow_source.source(), overflow_grouped_sum_plan, .stale),
+    );
+
+    const overflow_max_plan = sql_adapter_runtime.DocumentAlgebraicAggregatePlan{
+        .table_name = "docs",
+        .candidate_producer = .{ .bounded_scan = .{ .max_rows = 1 } },
+        .aggregate = .{
+            .op = .max,
+            .output = "max_amount",
+            .input = .{ .field = "/amount", .source_field = "amount", .field_type = .numeric },
+        },
+    };
+    try std.testing.expectError(
+        error.DocumentSqlRequiresBoundedScan,
+        executeAggregatePlanAlloc(alloc, overflow_source.source(), overflow_max_plan, .stale),
+    );
+}
+
+test "document SQL executes algebraic materialized aggregate rows" {
+    const alloc = std.testing.allocator;
+
+    const MockSource = struct {
+        fn source(self: *@This()) Source {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .algebraic_aggregate = algebraicAggregate,
+                },
+                .native_table_name = "docs",
+                .public_table_name = "docs",
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            return null;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?ScanResponse {
+            return null;
+        }
+
+        fn query(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: QueryRequest,
+            _: raft_mod.ReadConsistency,
+        ) !?QueryResponse {
+            return null;
+        }
+
+        fn algebraicAggregate(
+            _: *anyopaque,
+            aggregate_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: AlgebraicAggregateRequest,
+            _: raft_mod.ReadConsistency,
+        ) !?AlgebraicAggregateResponse {
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("alg", req.index_name);
+            try std.testing.expectEqualStrings("sum_by_status", req.materialization_name);
+            try std.testing.expectEqual(sql_adapter_runtime.DocumentAggregateOp.sum, req.aggregate_op);
+            try std.testing.expect(req.group_by != null);
+            const rows = try aggregate_alloc.alloc(AlgebraicAggregateRow, 2);
+            rows[0] = .{
+                .group_json = try aggregate_alloc.dupe(u8, "\"active\""),
+                .value_json = try aggregate_alloc.dupe(u8, "22"),
+            };
+            rows[1] = .{
+                .group_json = try aggregate_alloc.dupe(u8, "\"archived\""),
+                .value_json = try aggregate_alloc.dupe(u8, "30"),
+            };
+            return .{
+                .rows = rows,
+                .total_groups = 2,
+            };
+        }
+    };
+
+    const plan = sql_adapter_runtime.DocumentAlgebraicAggregatePlan{
+        .table_name = "docs",
+        .index_name = "alg",
+        .materialization_name = "sum_by_status",
+        .aggregate = .{
+            .op = .sum,
+            .output = "total_amount",
+            .input = .{ .field = "/amount", .source_field = "amount", .field_type = .numeric },
+        },
+        .group_by = .{
+            .field = "/status",
+            .source_field = "status",
+            .field_type = .keyword,
+            .output = "status",
+        },
+        .limit = 1,
+    };
+
+    var source = MockSource{};
+    var result = (try executeAggregatePlanAlloc(alloc, source.source(), plan, .stale)).?;
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), result.total_groups);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqualStrings("{\"status\":\"active\",\"total_amount\":22}", result.rows[0]);
 }
 
 test "document SQL residual filter supports bool must not" {

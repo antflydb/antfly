@@ -34,6 +34,9 @@ const split_restore = @import("split_restore.zig");
 const db_internal = @import("internal.zig");
 const ha_replication = @import("ha_replication.zig");
 const schema_runtime = @import("schema_runtime.zig");
+const relational_integrity = @import("relational_integrity.zig");
+const relational_rows = @import("relational_rows.zig");
+const search_runtime = @import("search_runtime.zig");
 const internal_keys = @import("../internal_keys.zig");
 const doc_identity = @import("doc_identity.zig");
 const doc_set = @import("doc_set.zig");
@@ -120,8 +123,6 @@ const temporal_bound_neg_infinity_tag: u8 = 0xf0;
 const temporal_bound_pos_infinity_tag: u8 = 0xf1;
 const metadata_table_manager = @import("../../metadata/table_manager.zig");
 const relational_store_mod = @import("relational_store.zig");
-const planning_adapter_mod = @import("planning_adapter.zig");
-const planning_bindings_mod = @import("planning_bindings.zig");
 const planning_stats_mod = @import("planning_stats.zig");
 const db_query_graph = @import("query/graph_exec.zig");
 const db_query_projection = @import("query/projection.zig");
@@ -1998,6 +1999,9 @@ pub const DB = struct {
 
     const split_restore_impl = split_restore.Impl(@This());
     const schema_runtime_impl = schema_runtime.Impl(@This());
+    const relational_integrity_impl = relational_integrity.Impl(@This());
+    const relational_rows_impl = relational_rows.Impl(@This());
+    const search_runtime_impl = search_runtime.Impl(@This());
 
     const engine_vtable = db_core.Engine.VTable{
         .batch = engineBatch,
@@ -5082,7 +5086,7 @@ pub const DB = struct {
         if (!runtime_schema.system_versioned) return error.UnsupportedQueryRequest;
         if (req.source_cte.len != 0) return error.InvalidQueryRequest;
         if (req.row_claim != null or req.doc_key_range != null) return error.UnsupportedQueryRequest;
-        try validateRelationalRowsBaseQueryRequestAgainstSchema(runtime_schema, req);
+        try relational_rows.validateBaseQueryRequestAgainstSchema(runtime_schema, req);
 
         const history = try self.scanSystemVersionedHistoryAlloc(alloc);
         defer docstore_mod.DocStore.freeResults(alloc, history);
@@ -5688,14 +5692,14 @@ pub const DB = struct {
     ) !relational_store_mod.RowRewriteReport {
         if (runtime_schema.storage_mode != .relational) return error.InvalidSchemaUpdateRequest;
 
-        const unique_report = try self.reconcileUniqueConstraintRowsInRangeLocked(
+        const unique_report = try self.relationalIntegrityReconcileUniqueConstraintRowsInRangeLocked(
             lower_doc_key,
             upper_doc_key,
             .validate,
         );
         if (!unique_report.valid()) return error.UniqueConstraintViolation;
 
-        const foreign_key_report = try self.reconcileForeignKeyRefsInRangeLocked(
+        const foreign_key_report = try self.relationalIntegrityReconcileForeignKeyRefsInRangeLocked(
             null,
             lower_doc_key,
             upper_doc_key,
@@ -5721,545 +5725,6 @@ pub const DB = struct {
             .scanned_rows = @intCast(rows.len),
             .unchanged_rows = @intCast(rows.len),
         };
-    }
-
-    fn schemaRewriteRowValueAlloc(
-        self: *DB,
-        alloc: Allocator,
-        row_value: []const u8,
-        target_column: schema_mod.RelationalColumn,
-        expression: schema_mod.RelationalRowsExpression,
-    ) !?[]u8 {
-        _ = self;
-        const row_json = mapper.materializeRelationalRowValueAlloc(alloc, row_value) catch return error.InvalidRowsRequest;
-        defer alloc.free(row_json);
-        var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
-        defer parsed.deinit();
-        if (parsed.value != .object) return error.InvalidRowsRequest;
-
-        const value_json = relationalRowsExpressionValueJsonAlloc(alloc, parsed.value, expression) catch return error.InvalidRowsRequest;
-        defer alloc.free(value_json);
-        var parsed_value = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidRowsRequest;
-        defer parsed_value.deinit();
-
-        if (parsed_value.value == .null) {
-            if (!target_column.nullable) return error.InvalidRowsRequest;
-            return try relational_store_mod.rewriteRowValueWithPlanAlloc(alloc, row_value, .{ .drops = &.{target_column.path} });
-        }
-
-        const target_row = try relationalDefaultColumnRowValueAlloc(alloc, target_column, value_json);
-        defer alloc.free(target_row);
-        var decoded = try relational_row_codec.deserialize(alloc, target_row);
-        defer decoded.deinit(alloc);
-        if (decoded.cells.len != 1) return error.InvalidRowsRequest;
-        return try relational_store_mod.rewriteRowValueWithPlanAlloc(alloc, row_value, .{ .sets = &.{.{ .cell = decoded.cells[0] }} });
-    }
-
-    fn validateTableSchemaCompatibilityLocked(self: *DB, alloc: Allocator, next_schema: schema_mod.TableSchema) !void {
-        if (self.core.schema) |current_schema| {
-            return validateRuntimeTableSchemaTransition(current_schema, next_schema);
-        }
-
-        const durable_schema = try schema_mod.loadSchema(self.core.store, alloc);
-        defer if (durable_schema) |loaded| schema_mod.freeSchema(alloc, loaded);
-        if (durable_schema) |current_schema| {
-            return validateRuntimeTableSchemaTransition(current_schema, next_schema);
-        }
-
-        try self.validateFirstTableSchemaApplyAgainstExistingRows(alloc, next_schema);
-    }
-
-    fn validateRuntimeTableSchemaTransition(current_schema: schema_mod.TableSchema, next_schema: schema_mod.TableSchema) !void {
-        if (current_schema.storage_mode != next_schema.storage_mode) return error.InvalidSchemaUpdateRequest;
-        if (next_schema.storage_mode != .relational) return;
-        try validateRelationalColumnCatalogTransition(current_schema.relational_columns, next_schema.relational_columns);
-        if (!schema_mod.primaryKeyCatalogsEqual(current_schema.primary_key, next_schema.primary_key)) {
-            return error.InvalidSchemaUpdateRequest;
-        }
-        if (!schema_mod.relationalPeriodCatalogsEqual(current_schema.periods, next_schema.periods)) {
-            return error.InvalidSchemaUpdateRequest;
-        }
-        try validateConstraintCatalogTransition(current_schema, next_schema);
-    }
-
-    fn validateRelationalColumnCatalogTransition(current_columns: []const schema_mod.RelationalColumn, next_columns: []const schema_mod.RelationalColumn) !void {
-        for (next_columns) |column| {
-            if (findRelationalColumnByPath(current_columns, column.path)) |current_column| {
-                if (!relationalColumnCatalogEqual(current_column.*, column)) {
-                    return error.InvalidSchemaUpdateRequest;
-                }
-                continue;
-            }
-            if (try relationalColumnHasUniqueDroppedRenameSource(current_columns, next_columns, column)) continue;
-            try validateNewRelationalColumnTransition(current_columns, next_columns, column);
-        }
-    }
-
-    fn relationalColumnCatalogEqual(a: schema_mod.RelationalColumn, b: schema_mod.RelationalColumn) bool {
-        return schema_mod.relationalColumnCatalogsEqual(&.{a}, &.{b});
-    }
-
-    fn findRelationalColumnByPath(columns: []const schema_mod.RelationalColumn, path: []const u8) ?*const schema_mod.RelationalColumn {
-        for (columns) |*column| {
-            if (std.mem.eql(u8, column.path, path)) return column;
-        }
-        return null;
-    }
-
-    fn relationalColumnPathExists(columns: []const schema_mod.RelationalColumn, path: []const u8) bool {
-        return findRelationalColumnByPath(columns, path) != null;
-    }
-
-    fn relationalColumnHasUniqueDroppedRenameSource(
-        current_columns: []const schema_mod.RelationalColumn,
-        next_columns: []const schema_mod.RelationalColumn,
-        target_column: schema_mod.RelationalColumn,
-    ) !bool {
-        var source_index: ?usize = null;
-        for (current_columns, 0..) |current_column, index| {
-            if (relationalColumnPathExists(next_columns, current_column.path)) continue;
-            if (!schema_mod.relationalColumnDefinitionsEqual(current_column, target_column)) continue;
-            if (source_index != null) return error.InvalidSchemaUpdateRequest;
-            source_index = index;
-        }
-        const matched_source_index = source_index orelse return false;
-
-        var use_count: usize = 0;
-        for (next_columns) |next_column| {
-            if (relationalColumnPathExists(current_columns, next_column.path)) continue;
-            if (schema_mod.relationalColumnDefinitionsEqual(current_columns[matched_source_index], next_column)) {
-                use_count += 1;
-            }
-        }
-        if (use_count != 1) return error.InvalidSchemaUpdateRequest;
-        return true;
-    }
-
-    fn validateNewRelationalColumnTransition(
-        current_columns: []const schema_mod.RelationalColumn,
-        next_columns: []const schema_mod.RelationalColumn,
-        column: schema_mod.RelationalColumn,
-    ) !void {
-        if (column.generated) |generated| {
-            try validateAppendedGeneratedColumnTransition(current_columns, next_columns, generated);
-            return;
-        }
-        if (column.default_value) |default_value| {
-            if (default_value.kind != .literal) return error.InvalidSchemaUpdateRequest;
-            return;
-        }
-        if (!column.nullable) return error.InvalidSchemaUpdateRequest;
-    }
-
-    fn relationalColumnMatchesGeneratedSource(column: schema_mod.RelationalColumn, field: []const u8, normalized: []const u8) bool {
-        return std.mem.eql(u8, field, column.name) or
-            std.mem.eql(u8, field, column.path) or
-            std.mem.eql(u8, normalized, column.name) or
-            std.mem.eql(u8, normalized, column.path);
-    }
-
-    fn validateGeneratedColumnBackfillSource(
-        current_columns: []const schema_mod.RelationalColumn,
-        next_columns: []const schema_mod.RelationalColumn,
-        field: []const u8,
-    ) !void {
-        const normalized = if (std.mem.startsWith(u8, field, "/")) field[1..] else field;
-        for (current_columns) |column| {
-            if (relationalColumnMatchesGeneratedSource(column, field, normalized)) {
-                return;
-            }
-        }
-        for (next_columns) |column| {
-            if (relationalColumnPathExists(current_columns, column.path)) continue;
-            if (!relationalColumnMatchesGeneratedSource(column, field, normalized)) {
-                continue;
-            }
-            if (column.generated != null) return error.InvalidSchemaUpdateRequest;
-            const default_value = column.default_value orelse return error.InvalidSchemaUpdateRequest;
-            if (default_value.kind != .literal) return error.InvalidSchemaUpdateRequest;
-            if (jsonLiteralIsNull(default_value.value_json)) return error.InvalidSchemaUpdateRequest;
-            return;
-        }
-        return error.InvalidSchemaUpdateRequest;
-    }
-
-    fn validateAppendedGeneratedColumnTransition(
-        current_columns: []const schema_mod.RelationalColumn,
-        next_columns: []const schema_mod.RelationalColumn,
-        generated: schema_mod.RelationalGeneratedValue,
-    ) !void {
-        switch (generated.op) {
-            .lower, .upper, .md5 => {
-                const field = generated.field orelse return error.InvalidSchemaUpdateRequest;
-                try validateGeneratedColumnBackfillSource(current_columns, next_columns, field);
-            },
-            .concat, .concat_ws => {
-                if (generated.fields.len == 0) return error.InvalidSchemaUpdateRequest;
-                for (generated.fields) |field| {
-                    try validateGeneratedColumnBackfillSource(current_columns, next_columns, field);
-                }
-            },
-            .expression => {
-                const expression = generated.expression orelse return error.InvalidSchemaUpdateRequest;
-                try validateGeneratedColumnExpressionBackfillSources(current_columns, next_columns, expression);
-            },
-        }
-    }
-
-    fn validateGeneratedColumnExpressionBackfillSources(
-        current_columns: []const schema_mod.RelationalColumn,
-        next_columns: []const schema_mod.RelationalColumn,
-        expression: schema_mod.RelationalRowsExpression,
-    ) error{InvalidSchemaUpdateRequest}!void {
-        if (expression.kind == .field) {
-            try validateGeneratedColumnBackfillSource(current_columns, next_columns, expression.field);
-        }
-        for (expression.operands) |operand| try validateGeneratedColumnExpressionBackfillSources(current_columns, next_columns, operand);
-        for (expression.case_branches) |branch| {
-            try validateGeneratedColumnExpressionConditionBackfillSources(current_columns, next_columns, branch.when);
-            try validateGeneratedColumnExpressionBackfillSources(current_columns, next_columns, branch.then);
-        }
-        for (expression.case_else) |case_else| try validateGeneratedColumnExpressionBackfillSources(current_columns, next_columns, case_else);
-    }
-
-    fn validateGeneratedColumnExpressionConditionBackfillSources(
-        current_columns: []const schema_mod.RelationalColumn,
-        next_columns: []const schema_mod.RelationalColumn,
-        condition: schema_mod.RelationalRowsExpressionCondition,
-    ) error{InvalidSchemaUpdateRequest}!void {
-        try validateGeneratedColumnExpressionBackfillSources(current_columns, next_columns, condition.lhs);
-        for (condition.rhs) |rhs| try validateGeneratedColumnExpressionBackfillSources(current_columns, next_columns, rhs);
-    }
-
-    fn validateConstraintCatalogTransition(current_schema: schema_mod.TableSchema, next_schema: schema_mod.TableSchema) !void {
-        for (current_schema.unique_constraints) |constraint| {
-            if (findUniqueConstraintByName(next_schema.unique_constraints, constraint.name)) |next_constraint| {
-                if (!uniqueConstraintsEqual(constraint, next_constraint)) return error.InvalidSchemaUpdateRequest;
-            }
-        }
-        for (next_schema.unique_constraints) |constraint| {
-            if (findUniqueConstraintByName(current_schema.unique_constraints, constraint.name)) |current_constraint| {
-                if (!uniqueConstraintsEqual(current_constraint, constraint)) return error.InvalidSchemaUpdateRequest;
-            }
-        }
-        for (current_schema.foreign_keys) |foreign_key| {
-            if (findForeignKeyByName(next_schema.foreign_keys, foreign_key.name)) |next_foreign_key| {
-                if (!foreignKeysSameDefinition(foreign_key, next_foreign_key)) return error.InvalidSchemaUpdateRequest;
-            }
-        }
-        for (next_schema.foreign_keys) |foreign_key| {
-            if (findForeignKeyByName(current_schema.foreign_keys, foreign_key.name)) |current_foreign_key| {
-                if (!foreignKeysSameDefinition(current_foreign_key, foreign_key)) return error.InvalidSchemaUpdateRequest;
-            }
-        }
-        for (current_schema.checks) |check| {
-            if (findRelationalCheckByName(next_schema.checks, check.name)) |next_check| {
-                if (!relationalChecksSameDefinition(check, next_check)) return error.InvalidSchemaUpdateRequest;
-            }
-        }
-        for (next_schema.checks) |check| {
-            if (findRelationalCheckByName(current_schema.checks, check.name)) |current_check| {
-                if (!relationalChecksSameDefinition(current_check, check)) return error.InvalidSchemaUpdateRequest;
-            }
-        }
-    }
-
-    fn migrateRelationalRowsForSchemaTransitionLocked(self: *DB, alloc: Allocator, next_schema: schema_mod.TableSchema) !void {
-        if (self.core.schema) |current_schema| {
-            return try self.migrateRelationalRowsFromCurrentLocked(alloc, current_schema, next_schema);
-        }
-
-        const durable_schema = try schema_mod.loadSchema(self.core.store, alloc);
-        defer if (durable_schema) |loaded| schema_mod.freeSchema(alloc, loaded);
-        if (durable_schema) |current_schema| {
-            return try self.migrateRelationalRowsFromCurrentLocked(alloc, current_schema, next_schema);
-        }
-    }
-
-    fn migrateRelationalRowsFromCurrentLocked(
-        self: *DB,
-        alloc: Allocator,
-        current_schema: schema_mod.TableSchema,
-        next_schema: schema_mod.TableSchema,
-    ) !void {
-        if (current_schema.storage_mode != .relational or next_schema.storage_mode != .relational) return;
-
-        var sets = std.ArrayListUnmanaged(relational_store_mod.RowRewriteSet).empty;
-        defer sets.deinit(alloc);
-        var owned_rows = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (owned_rows.items) |row| alloc.free(row);
-            owned_rows.deinit(alloc);
-        }
-        var decoded_rows = std.ArrayListUnmanaged(relational_row_codec.Row).empty;
-        defer {
-            for (decoded_rows.items) |*row| row.deinit(alloc);
-            decoded_rows.deinit(alloc);
-        }
-
-        var generated_columns = std.ArrayListUnmanaged(schema_mod.RelationalColumn).empty;
-        defer generated_columns.deinit(alloc);
-
-        for (next_schema.relational_columns) |column| {
-            if (relationalColumnPathExists(current_schema.relational_columns, column.path)) continue;
-            if (try relationalColumnHasUniqueDroppedRenameSource(current_schema.relational_columns, next_schema.relational_columns, column)) continue;
-            if (column.generated != null) {
-                try generated_columns.append(alloc, column);
-                continue;
-            }
-            const default_value = column.default_value orelse continue;
-            if (default_value.kind != .literal) return error.InvalidSchemaUpdateRequest;
-            if (column.nullable and jsonLiteralIsNull(default_value.value_json)) continue;
-            const row_value = try relationalDefaultColumnRowValueAlloc(alloc, column, default_value.value_json);
-            errdefer alloc.free(row_value);
-            try owned_rows.append(alloc, row_value);
-            var decoded = try relational_row_codec.deserialize(alloc, row_value);
-            errdefer decoded.deinit(alloc);
-            if (decoded.cells.len != 1) return error.InvalidSchemaUpdateRequest;
-            try decoded_rows.append(alloc, decoded);
-            const stable_decoded = &decoded_rows.items[decoded_rows.items.len - 1];
-            try sets.append(alloc, .{
-                .cell = stable_decoded.cells[0],
-                .only_if_missing = true,
-            });
-        }
-
-        const column_index_policy = relational_store_mod.ColumnIndexPolicy.fromColumns(next_schema.relational_columns);
-        if (sets.items.len != 0) {
-            _ = try relational_store_mod.rewriteRowsInRangeWithColumnIndexPolicy(
-                alloc,
-                self.core.store,
-                .{ .sets = sets.items },
-                self.getRange().start,
-                self.getRange().end,
-                column_index_policy,
-            );
-        }
-        if (generated_columns.items.len != 0) {
-            try self.backfillRelationalGeneratedColumnsLocked(alloc, generated_columns.items, column_index_policy);
-        }
-    }
-
-    fn jsonLiteralIsNull(value_json: []const u8) bool {
-        return std.mem.eql(u8, std.mem.trim(u8, value_json, " \t\r\n"), "null");
-    }
-
-    fn relationalDefaultColumnRowValueAlloc(
-        alloc: Allocator,
-        column: schema_mod.RelationalColumn,
-        value_json: []const u8,
-    ) ![]u8 {
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        errdefer out.deinit();
-        const writer = &out.writer;
-        try writer.writeByte('{');
-        try writer.print("{f}:", .{std.json.fmt(column.path, .{})});
-        try writer.writeAll(value_json);
-        try writer.writeByte('}');
-        const json = try out.toOwnedSlice();
-        defer alloc.free(json);
-        const columns = [_]schema_mod.RelationalColumn{column};
-        return try mapper.buildRelationalRowValueAlloc(alloc, json, columns[0..]);
-    }
-
-    fn backfillRelationalGeneratedColumnsLocked(
-        self: *DB,
-        alloc: Allocator,
-        generated_columns: []const schema_mod.RelationalColumn,
-        column_index_policy: relational_store_mod.ColumnIndexPolicy,
-    ) !void {
-        const rows = try relational_store_mod.scanRowsAlloc(alloc, self.core.store, self.getRange().start, self.getRange().end);
-        defer relational_store_mod.freeRows(alloc, rows);
-
-        var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
-        defer writes.deinit(alloc);
-        var deletes = std.ArrayListUnmanaged([]const u8).empty;
-        defer deletes.deinit(alloc);
-        var owned_keys = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (owned_keys.items) |key| alloc.free(key);
-            owned_keys.deinit(alloc);
-        }
-        var owned_values = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (owned_values.items) |value| alloc.free(value);
-            owned_values.deinit(alloc);
-        }
-
-        for (rows) |row| {
-            const row_json = mapper.materializeRelationalRowValueAlloc(alloc, row.row_value) catch return error.InvalidRowsRequest;
-            defer alloc.free(row_json);
-            var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
-            defer parsed.deinit();
-            if (parsed.value != .object) return error.InvalidRowsRequest;
-
-            var row_sets = std.ArrayListUnmanaged(relational_store_mod.RowRewriteSet).empty;
-            defer row_sets.deinit(alloc);
-            var row_owned_values = std.ArrayListUnmanaged([]u8).empty;
-            defer {
-                for (row_owned_values.items) |value| alloc.free(value);
-                row_owned_values.deinit(alloc);
-            }
-            var row_decoded = std.ArrayListUnmanaged(relational_row_codec.Row).empty;
-            defer {
-                for (row_decoded.items) |*decoded| decoded.deinit(alloc);
-                row_decoded.deinit(alloc);
-            }
-
-            for (generated_columns) |column| {
-                const generated = column.generated orelse continue;
-                const value_json = relationalRowsGeneratedColumnValueJsonAlloc(alloc, parsed.value, generated) catch return error.InvalidRowsRequest;
-                defer alloc.free(value_json);
-                const generated_row = try relationalDefaultColumnRowValueAlloc(alloc, column, value_json);
-                errdefer alloc.free(generated_row);
-                try row_owned_values.append(alloc, generated_row);
-                var decoded = try relational_row_codec.deserialize(alloc, generated_row);
-                errdefer decoded.deinit(alloc);
-                if (decoded.cells.len != 1) return error.InvalidSchemaUpdateRequest;
-                try row_decoded.append(alloc, decoded);
-                const stable_decoded = &row_decoded.items[row_decoded.items.len - 1];
-                try row_sets.append(alloc, .{
-                    .cell = stable_decoded.cells[0],
-                    .only_if_missing = true,
-                });
-            }
-
-            const rewritten = try relational_store_mod.rewriteRowValueWithPlanAlloc(alloc, row.row_value, .{ .sets = row_sets.items });
-            if (rewritten) |new_row| {
-                var new_row_owned = true;
-                errdefer if (new_row_owned) alloc.free(new_row);
-                try relational_store_mod.appendUpsertWithColumnIndexPolicy(alloc, self.core.store, &writes, &deletes, &owned_keys, &owned_values, row.doc_key, new_row, column_index_policy);
-                try owned_values.append(alloc, new_row);
-                new_row_owned = false;
-            }
-        }
-
-        if (writes.items.len > 0 or deletes.items.len > 0) try self.core.store.putBatch(writes.items, deletes.items);
-    }
-
-    fn migrateRelationalConstraintsForSchemaTransitionLocked(self: *DB, alloc: Allocator, next_schema: schema_mod.TableSchema) !void {
-        if (self.core.schema) |current_schema| {
-            return try self.migrateRelationalConstraintsFromCurrentLocked(alloc, current_schema, next_schema);
-        }
-
-        const durable_schema = try schema_mod.loadSchema(self.core.store, alloc);
-        defer if (durable_schema) |loaded| schema_mod.freeSchema(alloc, loaded);
-        if (durable_schema) |current_schema| {
-            return try self.migrateRelationalConstraintsFromCurrentLocked(alloc, current_schema, next_schema);
-        }
-    }
-
-    fn migrateRelationalConstraintsFromCurrentLocked(
-        self: *DB,
-        alloc: Allocator,
-        current_schema: schema_mod.TableSchema,
-        next_schema: schema_mod.TableSchema,
-    ) !void {
-        if (current_schema.storage_mode != .relational or next_schema.storage_mode != .relational) return;
-
-        var unique_to_build = std.ArrayListUnmanaged(schema_mod.UniqueConstraint).empty;
-        defer unique_to_build.deinit(alloc);
-        var unique_to_delete = std.ArrayListUnmanaged(schema_mod.UniqueConstraint).empty;
-        defer unique_to_delete.deinit(alloc);
-        var foreign_keys_to_build = std.ArrayListUnmanaged(schema_mod.ForeignKey).empty;
-        defer foreign_keys_to_build.deinit(alloc);
-        var foreign_keys_to_delete = std.ArrayListUnmanaged(schema_mod.ForeignKey).empty;
-        defer foreign_keys_to_delete.deinit(alloc);
-        var checks_to_validate = std.ArrayListUnmanaged(schema_mod.RelationalCheck).empty;
-        defer checks_to_validate.deinit(alloc);
-
-        for (next_schema.unique_constraints) |constraint| {
-            if (findUniqueConstraintByName(current_schema.unique_constraints, constraint.name) == null) {
-                try unique_to_build.append(alloc, constraint);
-            }
-        }
-        for (current_schema.unique_constraints) |constraint| {
-            if (findUniqueConstraintByName(next_schema.unique_constraints, constraint.name) == null) {
-                try unique_to_delete.append(alloc, constraint);
-            }
-        }
-        for (next_schema.foreign_keys) |foreign_key| {
-            if (findForeignKeyByName(current_schema.foreign_keys, foreign_key.name)) |current_foreign_key| {
-                if (current_foreign_key.validation_state != .enforced and foreign_key.validation_state == .enforced) {
-                    try foreign_keys_to_build.append(alloc, foreign_key);
-                }
-            } else if (foreign_key.validation_state == .enforced) {
-                try foreign_keys_to_build.append(alloc, foreign_key);
-            }
-        }
-        for (current_schema.foreign_keys) |foreign_key| {
-            if (findForeignKeyByName(next_schema.foreign_keys, foreign_key.name) == null) {
-                try foreign_keys_to_delete.append(alloc, foreign_key);
-            }
-        }
-        for (next_schema.checks) |check| {
-            if (findRelationalCheckByName(current_schema.checks, check.name)) |current_check| {
-                if (current_check.validation_state != .enforced and check.validation_state == .enforced) {
-                    try checks_to_validate.append(alloc, check);
-                }
-            } else if (check.validation_state == .enforced) {
-                try checks_to_validate.append(alloc, check);
-            }
-        }
-
-        if (unique_to_build.items.len > 0) {
-            try relational_store_mod.rebuildUniqueConstraintRowsInRange(
-                alloc,
-                self.core.store,
-                next_schema.relational_columns,
-                next_schema.periods,
-                unique_to_build.items,
-                self.getRange().start,
-                self.getRange().end,
-            );
-        }
-        if (foreign_keys_to_build.items.len > 0) {
-            const validate_report = try relational_store_mod.reconcileForeignKeyRefsInRangeWithPrimaryKey(
-                alloc,
-                self.core.store,
-                next_schema.default_type,
-                next_schema.relational_columns,
-                next_schema.periods,
-                foreign_keys_to_build.items,
-                next_schema.primary_key,
-                next_schema.unique_constraints,
-                self.getRange().start,
-                self.getRange().end,
-                .validate,
-            );
-            try self.recordForeignKeyIntegrityProgressLocked(alloc, .validate, null, self.getRange().start, self.getRange().end, validate_report);
-            if (validate_report.missing_parent_rows != 0) return error.ForeignKeyViolation;
-
-            const repair_report = try relational_store_mod.reconcileForeignKeyRefsInRangeWithPrimaryKey(
-                alloc,
-                self.core.store,
-                next_schema.default_type,
-                next_schema.relational_columns,
-                next_schema.periods,
-                foreign_keys_to_build.items,
-                next_schema.primary_key,
-                next_schema.unique_constraints,
-                self.getRange().start,
-                self.getRange().end,
-                .repair,
-            );
-            try self.recordForeignKeyIntegrityProgressLocked(alloc, .repair, null, self.getRange().start, self.getRange().end, repair_report);
-            if (repair_report.missing_parent_rows != 0) return error.ForeignKeyViolation;
-        }
-        if (checks_to_validate.items.len > 0) {
-            try self.validateRelationalChecksInRangeLocked(
-                alloc,
-                checks_to_validate.items,
-                self.getRange().start,
-                self.getRange().end,
-            );
-        }
-        if (foreign_keys_to_delete.items.len > 0) {
-            try relational_store_mod.deleteForeignKeyRefRows(alloc, self.core.store, foreign_keys_to_delete.items);
-        }
-        if (unique_to_delete.items.len > 0) {
-            try relational_store_mod.deleteUniqueConstraintRows(alloc, self.core.store, unique_to_delete.items);
-        }
     }
 
     fn findUniqueConstraintByName(unique_constraints: []const schema_mod.UniqueConstraint, name: []const u8) ?schema_mod.UniqueConstraint {
@@ -6417,45 +5882,6 @@ pub const DB = struct {
         return true;
     }
 
-    const ExistingPhysicalStorageMode = enum {
-        empty,
-        document,
-        relational,
-        mixed,
-    };
-
-    fn validateFirstTableSchemaApplyAgainstExistingRows(self: *DB, alloc: Allocator, next_schema: schema_mod.TableSchema) !void {
-        const existing_mode = try self.detectExistingPhysicalStorageMode(alloc);
-        switch (existing_mode) {
-            .empty => return,
-            .document => if (next_schema.storage_mode != .document) return error.InvalidSchemaUpdateRequest,
-            .relational => if (next_schema.storage_mode != .relational) return error.InvalidSchemaUpdateRequest,
-            .mixed => return error.InvalidSchemaUpdateRequest,
-        }
-    }
-
-    fn detectExistingPhysicalStorageMode(self: *DB, alloc: Allocator) !ExistingPhysicalStorageMode {
-        const lower = [_]u8{internal_keys.user_namespace};
-        const upper = [_]u8{internal_keys.user_namespace + 1};
-        const rows = try self.core.store.scanRange(alloc, lower[0..], upper[0..]);
-        defer docstore_mod.DocStore.freeResults(alloc, rows);
-
-        var saw_document = false;
-        var saw_relational = false;
-        for (rows) |entry| {
-            if (internal_keys.isPrimaryDocumentKey(entry.key)) {
-                saw_document = true;
-            } else if (internal_keys.isRelationalRowKey(entry.key)) {
-                saw_relational = true;
-            }
-            if (saw_document and saw_relational) return .mixed;
-        }
-
-        if (saw_document) return .document;
-        if (saw_relational) return .relational;
-        return .empty;
-    }
-
     /// Returns the relational column catalog when the table is in relational
     /// storage mode (so document writes store a dedicated relational base row),
     /// or null for document-mode tables (which keep the JSON blob).
@@ -6495,7 +5921,7 @@ pub const DB = struct {
         lower_doc_key: []const u8,
         upper_doc_key: []const u8,
     ) !ForeignKeyIntegrityReport {
-        return try self.validateForeignKeyRefsInRangeForConstraint(null, lower_doc_key, upper_doc_key);
+        return try relational_integrity_impl.validateForeignKeyRefsInRange(self, lower_doc_key, upper_doc_key);
     }
 
     pub fn validateForeignKeyRefsInRangeForConstraint(
@@ -6504,9 +5930,7 @@ pub const DB = struct {
         lower_doc_key: []const u8,
         upper_doc_key: []const u8,
     ) !ForeignKeyIntegrityReport {
-        lockApply(self);
-        defer self.core.unlockApply();
-        return try self.reconcileForeignKeyRefsInRangeLocked(constraint_name, lower_doc_key, upper_doc_key, .validate);
+        return try relational_integrity_impl.validateForeignKeyRefsInRangeForConstraint(self, constraint_name, lower_doc_key, upper_doc_key);
     }
 
     pub fn repairForeignKeyRefsInRange(
@@ -6514,7 +5938,7 @@ pub const DB = struct {
         lower_doc_key: []const u8,
         upper_doc_key: []const u8,
     ) !ForeignKeyIntegrityReport {
-        return try self.repairForeignKeyRefsInRangeForConstraint(null, lower_doc_key, upper_doc_key);
+        return try relational_integrity_impl.repairForeignKeyRefsInRange(self, lower_doc_key, upper_doc_key);
     }
 
     pub fn repairForeignKeyRefsInRangeForConstraint(
@@ -6523,10 +5947,7 @@ pub const DB = struct {
         lower_doc_key: []const u8,
         upper_doc_key: []const u8,
     ) !ForeignKeyIntegrityReport {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        lockApply(self);
-        defer self.core.unlockApply();
-        return try self.reconcileForeignKeyRefsInRangeLocked(constraint_name, lower_doc_key, upper_doc_key, .repair);
+        return try relational_integrity_impl.repairForeignKeyRefsInRangeForConstraint(self, constraint_name, lower_doc_key, upper_doc_key);
     }
 
     pub fn dryRunRepairForeignKeyRefsInRange(
@@ -6534,7 +5955,7 @@ pub const DB = struct {
         lower_doc_key: []const u8,
         upper_doc_key: []const u8,
     ) !ForeignKeyIntegrityReport {
-        return try self.dryRunRepairForeignKeyRefsInRangeForConstraint(null, lower_doc_key, upper_doc_key);
+        return try relational_integrity_impl.dryRunRepairForeignKeyRefsInRange(self, lower_doc_key, upper_doc_key);
     }
 
     pub fn dryRunRepairForeignKeyRefsInRangeForConstraint(
@@ -6543,9 +5964,7 @@ pub const DB = struct {
         lower_doc_key: []const u8,
         upper_doc_key: []const u8,
     ) !ForeignKeyIntegrityReport {
-        lockApply(self);
-        defer self.core.unlockApply();
-        return try self.reconcileForeignKeyRefsInRangeLocked(constraint_name, lower_doc_key, upper_doc_key, .dry_run);
+        return try relational_integrity_impl.dryRunRepairForeignKeyRefsInRangeForConstraint(self, constraint_name, lower_doc_key, upper_doc_key);
     }
 
     pub fn validateUniqueConstraintRowsInRange(
@@ -6553,9 +5972,7 @@ pub const DB = struct {
         lower_doc_key: []const u8,
         upper_doc_key: []const u8,
     ) !UniqueConstraintIntegrityReport {
-        lockApply(self);
-        defer self.core.unlockApply();
-        return try self.reconcileUniqueConstraintRowsInRangeLocked(lower_doc_key, upper_doc_key, .validate);
+        return try relational_integrity_impl.validateUniqueConstraintRowsInRange(self, lower_doc_key, upper_doc_key);
     }
 
     pub fn dryRunRepairUniqueConstraintRowsInRange(
@@ -6563,9 +5980,7 @@ pub const DB = struct {
         lower_doc_key: []const u8,
         upper_doc_key: []const u8,
     ) !UniqueConstraintIntegrityReport {
-        lockApply(self);
-        defer self.core.unlockApply();
-        return try self.reconcileUniqueConstraintRowsInRangeLocked(lower_doc_key, upper_doc_key, .dry_run);
+        return try relational_integrity_impl.dryRunRepairUniqueConstraintRowsInRange(self, lower_doc_key, upper_doc_key);
     }
 
     pub fn repairUniqueConstraintRowsInRange(
@@ -6573,10 +5988,7 @@ pub const DB = struct {
         lower_doc_key: []const u8,
         upper_doc_key: []const u8,
     ) !UniqueConstraintIntegrityReport {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        lockApply(self);
-        defer self.core.unlockApply();
-        return try self.reconcileUniqueConstraintRowsInRangeLocked(lower_doc_key, upper_doc_key, .repair);
+        return try relational_integrity_impl.repairUniqueConstraintRowsInRange(self, lower_doc_key, upper_doc_key);
     }
 
     pub fn validateForeignKeyRefOwnerForParent(
@@ -6585,9 +5997,7 @@ pub const DB = struct {
         parent_table: []const u8,
         parent_key: []const u8,
     ) !ForeignKeyIntegrityReport {
-        lockApply(self);
-        defer self.core.unlockApply();
-        return try self.reconcileForeignKeyRefOwnerForParentLocked(constraint_name, parent_table, parent_key, .validate);
+        return try relational_integrity_impl.validateForeignKeyRefOwnerForParent(self, constraint_name, parent_table, parent_key);
     }
 
     pub fn dryRunRepairForeignKeyRefOwnerForParent(
@@ -6596,9 +6006,7 @@ pub const DB = struct {
         parent_table: []const u8,
         parent_key: []const u8,
     ) !ForeignKeyIntegrityReport {
-        lockApply(self);
-        defer self.core.unlockApply();
-        return try self.reconcileForeignKeyRefOwnerForParentLocked(constraint_name, parent_table, parent_key, .dry_run);
+        return try relational_integrity_impl.dryRunRepairForeignKeyRefOwnerForParent(self, constraint_name, parent_table, parent_key);
     }
 
     pub fn repairForeignKeyRefOwnerForParent(
@@ -6607,10 +6015,7 @@ pub const DB = struct {
         parent_table: []const u8,
         parent_key: []const u8,
     ) !ForeignKeyIntegrityReport {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        lockApply(self);
-        defer self.core.unlockApply();
-        return try self.reconcileForeignKeyRefOwnerForParentLocked(constraint_name, parent_table, parent_key, .repair);
+        return try relational_integrity_impl.repairForeignKeyRefOwnerForParent(self, constraint_name, parent_table, parent_key);
     }
 
     pub fn validateForeignKeyRefOwnerRange(
@@ -6620,9 +6025,7 @@ pub const DB = struct {
         start_parent_key: []const u8,
         end_parent_key: []const u8,
     ) !ForeignKeyIntegrityReport {
-        lockApply(self);
-        defer self.core.unlockApply();
-        return try self.reconcileForeignKeyRefOwnerRangeLocked(constraint_name, parent_table, start_parent_key, end_parent_key, .validate);
+        return try relational_integrity_impl.validateForeignKeyRefOwnerRange(self, constraint_name, parent_table, start_parent_key, end_parent_key);
     }
 
     pub fn dryRunRepairForeignKeyRefOwnerRange(
@@ -6632,9 +6035,7 @@ pub const DB = struct {
         start_parent_key: []const u8,
         end_parent_key: []const u8,
     ) !ForeignKeyIntegrityReport {
-        lockApply(self);
-        defer self.core.unlockApply();
-        return try self.reconcileForeignKeyRefOwnerRangeLocked(constraint_name, parent_table, start_parent_key, end_parent_key, .dry_run);
+        return try relational_integrity_impl.dryRunRepairForeignKeyRefOwnerRange(self, constraint_name, parent_table, start_parent_key, end_parent_key);
     }
 
     pub fn repairForeignKeyRefOwnerRange(
@@ -6644,36 +6045,15 @@ pub const DB = struct {
         start_parent_key: []const u8,
         end_parent_key: []const u8,
     ) !ForeignKeyIntegrityReport {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        lockApply(self);
-        defer self.core.unlockApply();
-        return try self.reconcileForeignKeyRefOwnerRangeLocked(constraint_name, parent_table, start_parent_key, end_parent_key, .repair);
+        return try relational_integrity_impl.repairForeignKeyRefOwnerRange(self, constraint_name, parent_table, start_parent_key, end_parent_key);
     }
 
     pub fn explainForeignKeyDelete(self: *DB, doc_key: []const u8) !ForeignKeyDeletePlan {
-        return try self.explainForeignKeyDeleteForConstraint(null, doc_key);
+        return try relational_integrity_impl.explainForeignKeyDelete(self, doc_key);
     }
 
     pub fn explainForeignKeyDeleteForConstraint(self: *DB, constraint_name: ?[]const u8, doc_key: []const u8) !ForeignKeyDeletePlan {
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const runtime_schema = self.core.schema orelse return .{};
-        if (runtime_schema.storage_mode != .relational or runtime_schema.foreign_keys.len == 0) return .{};
-        const foreign_keys = try foreignKeysForIntegrityConstraint(self.alloc, runtime_schema.foreign_keys, constraint_name);
-        defer if (constraint_name == null and foreign_keys.len > 0) self.alloc.free(foreign_keys);
-        if (foreign_keys.len == 0) return .{};
-        return try relational_store_mod.explainForeignKeyDeleteWithPrimaryKey(
-            self.alloc,
-            self.core.store,
-            runtime_schema.default_type,
-            runtime_schema.relational_columns,
-            runtime_schema.periods,
-            foreign_keys,
-            runtime_schema.primary_key,
-            runtime_schema.unique_constraints,
-            doc_key,
-        );
+        return try relational_integrity_impl.explainForeignKeyDeleteForConstraint(self, constraint_name, doc_key);
     }
 
     pub fn listForeignKeyViolationsInRange(
@@ -6681,7 +6061,7 @@ pub const DB = struct {
         lower_doc_key: []const u8,
         upper_doc_key: []const u8,
     ) ![]ForeignKeyIntegrityViolation {
-        return try self.listForeignKeyViolationsInRangeForConstraint(null, lower_doc_key, upper_doc_key);
+        return try relational_integrity_impl.listForeignKeyViolationsInRange(self, lower_doc_key, upper_doc_key);
     }
 
     pub fn listForeignKeyViolationsInRangeForConstraint(
@@ -6690,31 +6070,11 @@ pub const DB = struct {
         lower_doc_key: []const u8,
         upper_doc_key: []const u8,
     ) ![]ForeignKeyIntegrityViolation {
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const runtime_schema = self.core.schema orelse return try self.alloc.alloc(ForeignKeyIntegrityViolation, 0);
-        if (runtime_schema.storage_mode != .relational or runtime_schema.foreign_keys.len == 0) {
-            return try self.alloc.alloc(ForeignKeyIntegrityViolation, 0);
-        }
-        const foreign_keys = try foreignKeysForIntegrityConstraint(self.alloc, runtime_schema.foreign_keys, constraint_name);
-        defer if (constraint_name == null and foreign_keys.len > 0) self.alloc.free(foreign_keys);
-        return try relational_store_mod.listForeignKeyViolationsInRangeWithPrimaryKey(
-            self.alloc,
-            self.core.store,
-            runtime_schema.default_type,
-            runtime_schema.relational_columns,
-            runtime_schema.periods,
-            foreign_keys,
-            runtime_schema.primary_key,
-            runtime_schema.unique_constraints,
-            lower_doc_key,
-            upper_doc_key,
-        );
+        return try relational_integrity_impl.listForeignKeyViolationsInRangeForConstraint(self, constraint_name, lower_doc_key, upper_doc_key);
     }
 
     pub fn freeForeignKeyIntegrityViolations(self: *DB, violations: []ForeignKeyIntegrityViolation) void {
-        relational_store_mod.freeForeignKeyIntegrityViolations(self.alloc, violations);
+        relational_integrity_impl.freeForeignKeyIntegrityViolations(self, violations);
     }
 
     pub fn listForeignKeyRefChildrenForParent(
@@ -6725,13 +6085,7 @@ pub const DB = struct {
         parent_key: []const u8,
         limit: usize,
     ) ![]types.ForeignKeyRefChild {
-        var page = try self.listForeignKeyRefChildrenPageForParent(alloc, constraint_name, parent_table, parent_key, null, null, limit);
-        errdefer self.freeForeignKeyRefChildrenPage(alloc, &page);
-        if (!page.complete) return error.ForeignKeyActionLimitExceeded;
-        const children = page.children;
-        page.children = &.{};
-        self.freeForeignKeyRefChildrenPage(alloc, &page);
-        return children;
+        return try relational_integrity_impl.listForeignKeyRefChildrenForParent(self, alloc, constraint_name, parent_table, parent_key, limit);
     }
 
     pub fn listForeignKeyRefChildrenPageForParent(
@@ -6744,180 +6098,47 @@ pub const DB = struct {
         start_after_child_key: ?[]const u8,
         limit: usize,
     ) !types.ForeignKeyRefChildrenPage {
-        if ((start_after_child_table == null) != (start_after_child_key == null)) return error.ForeignKeyViolation;
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const runtime_schema = self.core.schema orelse return error.ForeignKeyViolation;
-        if (runtime_schema.storage_mode != .relational) return error.ForeignKeyViolation;
-        const foreign_key = findRuntimeForeignKeyByName(runtime_schema.foreign_keys, constraint_name) orelse return error.ForeignKeyViolation;
-        if (!foreignKeyIsEnforcedImmediate(foreign_key)) return error.ForeignKeyViolation;
-        if (!std.mem.eql(u8, foreign_key.parent_table, parent_table)) return error.ForeignKeyViolation;
-
-        const prefix = try internal_keys.relationalForeignKeyRefParentPrefixAlloc(alloc, constraint_name, parent_table, parent_key);
-        defer alloc.free(prefix);
-        const upper = try internal_keys.relationalForeignKeyRefParentPrefixUpperAlloc(alloc, constraint_name, parent_table, parent_key);
-        defer if (upper) |buf| alloc.free(buf);
-        const scanned = try self.core.store.scanRange(alloc, prefix, if (upper) |buf| buf else "");
-        defer docstore_mod.DocStore.freeResults(alloc, scanned);
-
-        var out = std.ArrayListUnmanaged(types.ForeignKeyRefChild).empty;
-        errdefer {
-            for (out.items) |child| {
-                alloc.free(@constCast(child.child_table));
-                alloc.free(@constCast(child.child_key));
-            }
-            out.deinit(alloc);
-        }
-        var complete = true;
-        for (scanned) |entry| {
-            var decoded = (try internal_keys.decodeRelationalForeignKeyRefKeyAlloc(alloc, entry.key)) orelse continue;
-            defer decoded.deinit(alloc);
-            if (!std.mem.eql(u8, decoded.child_table, runtime_schema.default_type)) continue;
-            if (start_after_child_table) |cursor_table| {
-                if (compareForeignKeyRefChildCursor(decoded.child_table, decoded.child_key, cursor_table, start_after_child_key.?) != .gt) continue;
-            }
-            if (limit > 0 and out.items.len == limit) {
-                complete = false;
-                break;
-            }
-            try out.append(alloc, .{
-                .child_table = try alloc.dupe(u8, decoded.child_table),
-                .child_key = try alloc.dupe(u8, decoded.child_key),
-            });
-        }
-        const children = try out.toOwnedSlice(alloc);
-        errdefer {
-            for (children) |child| {
-                alloc.free(@constCast(child.child_table));
-                alloc.free(@constCast(child.child_key));
-            }
-            if (children.len > 0) alloc.free(children);
-        }
-        var next_child_table: ?[]const u8 = null;
-        var next_child_key: ?[]const u8 = null;
-        errdefer {
-            if (next_child_table) |value| alloc.free(@constCast(value));
-            if (next_child_key) |value| alloc.free(@constCast(value));
-        }
-        if (!complete and children.len > 0) {
-            next_child_table = try alloc.dupe(u8, children[children.len - 1].child_table);
-            next_child_key = try alloc.dupe(u8, children[children.len - 1].child_key);
-        }
-        return .{
-            .children = children,
-            .complete = complete,
-            .next_child_table = next_child_table,
-            .next_child_key = next_child_key,
-        };
+        return try relational_integrity_impl.listForeignKeyRefChildrenPageForParent(self, alloc, constraint_name, parent_table, parent_key, start_after_child_table, start_after_child_key, limit);
     }
 
-    pub fn freeForeignKeyRefChildren(_: *DB, alloc: Allocator, children: []types.ForeignKeyRefChild) void {
-        for (children) |child| {
-            alloc.free(child.child_table);
-            alloc.free(child.child_key);
-        }
-        if (children.len > 0) alloc.free(children);
+    pub fn freeForeignKeyRefChildren(self: *DB, alloc: Allocator, children: []types.ForeignKeyRefChild) void {
+        relational_integrity_impl.freeForeignKeyRefChildren(self, alloc, children);
     }
 
     pub fn freeForeignKeyRefChildrenPage(self: *DB, alloc: Allocator, page: *types.ForeignKeyRefChildrenPage) void {
-        self.freeForeignKeyRefChildren(alloc, page.children);
-        if (page.next_child_table) |value| alloc.free(@constCast(value));
-        if (page.next_child_key) |value| alloc.free(@constCast(value));
-        page.* = undefined;
+        relational_integrity_impl.freeForeignKeyRefChildrenPage(self, alloc, page);
     }
 
-    fn compareForeignKeyRefChildCursor(
-        lhs_table: []const u8,
-        lhs_key: []const u8,
-        rhs_table: []const u8,
-        rhs_key: []const u8,
-    ) std.math.Order {
-        const table_order = std.mem.order(u8, lhs_table, rhs_table);
-        if (table_order != .eq) return table_order;
-        return std.mem.order(u8, lhs_key, rhs_key);
-    }
-
-    fn reconcileForeignKeyRefsInRangeLocked(
+    pub fn relationalIntegrityReconcileForeignKeyRefsInRangeLocked(
         self: *DB,
         constraint_name: ?[]const u8,
         lower_doc_key: []const u8,
         upper_doc_key: []const u8,
         mode: relational_store_mod.ForeignKeyIntegrityMode,
     ) !ForeignKeyIntegrityReport {
-        const runtime_schema = self.core.schema orelse return .{};
-        if (runtime_schema.storage_mode != .relational or runtime_schema.foreign_keys.len == 0) return .{};
-        const foreign_keys = try foreignKeysForIntegrityConstraint(self.alloc, runtime_schema.foreign_keys, constraint_name);
-        defer if (constraint_name == null and foreign_keys.len > 0) self.alloc.free(foreign_keys);
-        if (foreign_keys.len == 0) return .{};
-        const report = try relational_store_mod.reconcileForeignKeyRefsInRangeWithPrimaryKey(
-            self.alloc,
-            self.core.store,
-            runtime_schema.default_type,
-            runtime_schema.relational_columns,
-            runtime_schema.periods,
-            foreign_keys,
-            runtime_schema.primary_key,
-            runtime_schema.unique_constraints,
-            lower_doc_key,
-            upper_doc_key,
-            mode,
-        );
-        try self.recordForeignKeyIntegrityProgressLocked(self.alloc, mode, constraint_name, lower_doc_key, upper_doc_key, report);
-        return report;
+        return try relational_integrity_impl.reconcileForeignKeyRefsInRangeLocked(self, constraint_name, lower_doc_key, upper_doc_key, mode);
     }
 
-    fn reconcileUniqueConstraintRowsInRangeLocked(
+    pub fn relationalIntegrityReconcileUniqueConstraintRowsInRangeLocked(
         self: *DB,
         lower_doc_key: []const u8,
         upper_doc_key: []const u8,
         mode: relational_store_mod.ForeignKeyIntegrityMode,
     ) !UniqueConstraintIntegrityReport {
-        const runtime_schema = self.core.schema orelse return .{};
-        if (runtime_schema.storage_mode != .relational or (runtime_schema.primary_key == null and runtime_schema.unique_constraints.len == 0)) return .{};
-        const owner_constraints = try uniqueOwnerConstraintsAlloc(self.alloc, runtime_schema);
-        defer self.alloc.free(owner_constraints);
-        const report = try relational_store_mod.reconcileUniqueConstraintRowsInRange(
-            self.alloc,
-            self.core.store,
-            runtime_schema.relational_columns,
-            runtime_schema.periods,
-            owner_constraints,
-            lower_doc_key,
-            upper_doc_key,
-            mode,
-        );
-        try self.recordUniqueConstraintIntegrityProgressLocked(self.alloc, mode, lower_doc_key, upper_doc_key, report);
-        return report;
+        return try relational_integrity_impl.reconcileUniqueConstraintRowsInRangeLocked(self, lower_doc_key, upper_doc_key, mode);
     }
 
-    fn reconcileForeignKeyRefOwnerForParentLocked(
+    pub fn relationalIntegrityReconcileForeignKeyRefOwnerForParentLocked(
         self: *DB,
         constraint_name: []const u8,
         parent_table: []const u8,
         parent_key: []const u8,
         mode: relational_store_mod.ForeignKeyIntegrityMode,
     ) !ForeignKeyIntegrityReport {
-        const runtime_schema = self.core.schema orelse return error.ForeignKeyViolation;
-        if (runtime_schema.storage_mode != .relational) return error.ForeignKeyViolation;
-        const foreign_key = findRuntimeForeignKeyByName(runtime_schema.foreign_keys, constraint_name) orelse return error.ForeignKeyViolation;
-        if (!foreignKeyIsEnforcedImmediate(foreign_key)) return error.ForeignKeyViolation;
-        if (!std.mem.eql(u8, foreign_key.parent_table, parent_table)) return error.ForeignKeyViolation;
-        const report = try relational_store_mod.reconcileForeignKeyRefOwnerForParent(
-            self.alloc,
-            self.core.store,
-            runtime_schema.default_type,
-            &.{foreign_key},
-            constraint_name,
-            parent_table,
-            parent_key,
-            mode,
-        );
-        self.recordForeignKeyIntegrityReport(mode, report);
-        return report;
+        return try relational_integrity_impl.reconcileForeignKeyRefOwnerForParentLocked(self, constraint_name, parent_table, parent_key, mode);
     }
 
-    fn reconcileForeignKeyRefOwnerRangeLocked(
+    pub fn relationalIntegrityReconcileForeignKeyRefOwnerRangeLocked(
         self: *DB,
         constraint_name: []const u8,
         parent_table: []const u8,
@@ -6925,88 +6146,27 @@ pub const DB = struct {
         end_parent_key: []const u8,
         mode: relational_store_mod.ForeignKeyIntegrityMode,
     ) !ForeignKeyIntegrityReport {
-        const runtime_schema = self.core.schema orelse return error.ForeignKeyViolation;
-        if (runtime_schema.storage_mode != .relational) return error.ForeignKeyViolation;
-        const foreign_key = findRuntimeForeignKeyByName(runtime_schema.foreign_keys, constraint_name) orelse return error.ForeignKeyViolation;
-        if (!foreignKeyIsEnforcedImmediate(foreign_key)) return error.ForeignKeyViolation;
-        if (!std.mem.eql(u8, foreign_key.parent_table, parent_table)) return error.ForeignKeyViolation;
-        if (end_parent_key.len > 0 and std.mem.order(u8, start_parent_key, end_parent_key) != .lt) return error.ForeignKeyViolation;
-        const report = try relational_store_mod.reconcileForeignKeyRefOwnerRange(
-            self.alloc,
-            self.core.store,
-            runtime_schema.default_type,
-            &.{foreign_key},
-            constraint_name,
-            parent_table,
-            start_parent_key,
-            end_parent_key,
-            mode,
-        );
-        self.recordForeignKeyIntegrityReport(mode, report);
-        return report;
+        return try relational_integrity_impl.reconcileForeignKeyRefOwnerRangeLocked(self, constraint_name, parent_table, start_parent_key, end_parent_key, mode);
     }
 
-    fn reconcileForeignKeyRefOwnerRangeForConstraintLocked(
+    pub fn relationalIntegrityReconcileForeignKeyRefOwnerRangeForConstraintLocked(
         self: *DB,
         constraint_name: []const u8,
         start_parent_key: []const u8,
         end_parent_key: []const u8,
         mode: relational_store_mod.ForeignKeyIntegrityMode,
     ) !ForeignKeyIntegrityReport {
-        const runtime_schema = self.core.schema orelse return error.ForeignKeyViolation;
-        if (runtime_schema.storage_mode != .relational) return error.ForeignKeyViolation;
-        const foreign_key = findRuntimeForeignKeyByName(runtime_schema.foreign_keys, constraint_name) orelse return error.ForeignKeyViolation;
-        if (!foreignKeyIsEnforcedImmediate(foreign_key)) return error.ForeignKeyViolation;
-        if (end_parent_key.len > 0 and std.mem.order(u8, start_parent_key, end_parent_key) != .lt) return error.ForeignKeyViolation;
-        const report = try relational_store_mod.reconcileForeignKeyRefOwnerRange(
-            self.alloc,
-            self.core.store,
-            runtime_schema.default_type,
-            &.{foreign_key},
-            constraint_name,
-            foreign_key.parent_table,
-            start_parent_key,
-            end_parent_key,
-            mode,
-        );
-        try self.recordForeignKeyIntegrityProgressForPhaseLocked(self.alloc, "owner_range", mode, constraint_name, start_parent_key, end_parent_key, report);
-        return report;
+        return try relational_integrity_impl.reconcileForeignKeyRefOwnerRangeForConstraintLocked(self, constraint_name, start_parent_key, end_parent_key, mode);
     }
 
-    fn foreignKeysForIntegrityConstraint(
-        alloc: Allocator,
-        foreign_keys: []const schema_mod.ForeignKey,
-        constraint_name: ?[]const u8,
-    ) ![]const schema_mod.ForeignKey {
-        if (constraint_name == null) {
-            var active = std.ArrayListUnmanaged(schema_mod.ForeignKey).empty;
-            errdefer active.deinit(alloc);
-            for (foreign_keys) |foreign_key| {
-                if (!foreignKeyIsLocallyEnforced(foreign_key)) continue;
-                try active.append(alloc, foreign_key);
-            }
-            return try active.toOwnedSlice(alloc);
-        }
-        const name = constraint_name.?;
-        for (foreign_keys, 0..) |foreign_key, i| {
-            if (!std.mem.eql(u8, foreign_key.name, name)) continue;
-            if (!foreignKeyCanRunIntegrity(foreign_key)) return error.ForeignKeyNotFound;
-            return foreign_keys[i .. i + 1];
-        }
-        return error.ForeignKeyNotFound;
+    pub fn relationalIntegrityFindRuntimeForeignKeyByName(self: *DB, foreign_keys: []const schema_mod.ForeignKey, name: []const u8) ?schema_mod.ForeignKey {
+        _ = self;
+        return findRuntimeForeignKeyByName(foreign_keys, name);
     }
 
-    fn foreignKeyCanRunIntegrity(foreign_key: schema_mod.ForeignKey) bool {
-        return foreign_key.timing == .immediate or foreign_key.timing == .deferred;
-    }
-
-    fn foreignKeyIsEnforcedImmediate(foreign_key: schema_mod.ForeignKey) bool {
-        return foreign_key.validation_state == .enforced and foreign_key.timing == .immediate;
-    }
-
-    fn foreignKeyIsLocallyEnforced(foreign_key: schema_mod.ForeignKey) bool {
-        return foreign_key.validation_state == .enforced and
-            (foreign_key.timing == .immediate or foreign_key.timing == .deferred);
+    pub fn relationalIntegrityUniqueOwnerConstraintsAlloc(self: *DB, alloc: Allocator, runtime_schema: schema_mod.TableSchema) ![]schema_mod.UniqueConstraint {
+        _ = self;
+        return try uniqueOwnerConstraintsAlloc(alloc, runtime_schema);
     }
 
     /// Refresh schema-derived algebraic index configs for callers that have
@@ -7055,15 +6215,15 @@ pub const DB = struct {
     }
 
     pub fn schemaRuntimeValidateTableSchemaCompatibilityLocked(self: *DB, alloc: Allocator, next_schema: schema_mod.TableSchema) !void {
-        try self.validateTableSchemaCompatibilityLocked(alloc, next_schema);
+        try schema_runtime_impl.validateTableSchemaCompatibilityLocked(self, alloc, next_schema);
     }
 
     pub fn schemaRuntimeMigrateRelationalRowsForSchemaTransitionLocked(self: *DB, alloc: Allocator, next_schema: schema_mod.TableSchema) !void {
-        try self.migrateRelationalRowsForSchemaTransitionLocked(alloc, next_schema);
+        try schema_runtime_impl.migrateRelationalRowsForSchemaTransitionLocked(self, alloc, next_schema);
     }
 
     pub fn schemaRuntimeMigrateRelationalConstraintsForSchemaTransitionLocked(self: *DB, alloc: Allocator, next_schema: schema_mod.TableSchema) !void {
-        try self.migrateRelationalConstraintsForSchemaTransitionLocked(alloc, next_schema);
+        try schema_runtime_impl.migrateRelationalConstraintsForSchemaTransitionLocked(self, alloc, next_schema);
     }
 
     pub fn schemaRuntimeRelationalColumnsForStore(self: *DB) ?[]const schema_mod.RelationalColumn {
@@ -7091,17 +6251,49 @@ pub const DB = struct {
         expression: schema_mod.RelationalRowsExpression,
     ) !void {
         _ = self;
-        try validateRelationalRowsExpressionAgainstSchema(runtime_schema, expression);
+        try relational_rows.validateExpressionAgainstSchema(runtime_schema, expression);
     }
 
-    pub fn schemaRuntimeSchemaRewriteRowValueAlloc(
+    pub fn schemaRuntimeRelationalRowsExpressionValueJsonAlloc(
         self: *DB,
         alloc: Allocator,
-        row_value: []const u8,
-        target_column: schema_mod.RelationalColumn,
+        row: std.json.Value,
         expression: schema_mod.RelationalRowsExpression,
-    ) !?[]u8 {
-        return try self.schemaRewriteRowValueAlloc(alloc, row_value, target_column, expression);
+    ) ![]u8 {
+        _ = self;
+        return try relationalRowsExpressionValueJsonAlloc(alloc, row, expression);
+    }
+
+    pub fn schemaRuntimeRelationalRowsGeneratedColumnValueJsonAlloc(
+        self: *DB,
+        alloc: Allocator,
+        row: std.json.Value,
+        generated: schema_mod.RelationalGeneratedValue,
+    ) ![]u8 {
+        _ = self;
+        return try relationalRowsGeneratedColumnValueJsonAlloc(alloc, row, generated);
+    }
+
+    pub fn schemaRuntimeRecordForeignKeyIntegrityProgressLocked(
+        self: *DB,
+        alloc: Allocator,
+        mode: relational_store_mod.ForeignKeyIntegrityMode,
+        constraint_name: ?[]const u8,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+        report: relational_store_mod.ForeignKeyIntegrityReport,
+    ) !void {
+        try self.recordForeignKeyIntegrityProgressLocked(alloc, mode, constraint_name, lower_doc_key, upper_doc_key, report);
+    }
+
+    pub fn schemaRuntimeValidateRelationalChecksInRangeLocked(
+        self: *DB,
+        alloc: Allocator,
+        checks: []const schema_mod.RelationalCheck,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+    ) !void {
+        try self.validateRelationalChecksInRangeLocked(alloc, checks, lower_doc_key, upper_doc_key);
     }
 
     pub fn beginTransaction(self: *DB, timestamp_ns: u64) !transactions_mod.TxnId {
@@ -9098,7 +8290,7 @@ pub const DB = struct {
             }
         }
 
-        return try self.executeGraphQueriesWithSets(alloc, snapshot_req, graph_queries, named_sets);
+        return try search_runtime_impl.executeGraphQueriesWithSets(self, alloc, snapshot_req, graph_queries, named_sets);
     }
 
     pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
@@ -12476,417 +11668,99 @@ pub const DB = struct {
         self.foreign_key_stats.recordIntegrityReport(mode, report);
     }
 
-    pub const ForeignKeyIntegrityProgressRecord = struct {
-        version: u32 = 1,
-        phase: []const u8 = "child_range",
-        mode: []const u8,
-        constraint_name: ?[]const u8 = null,
-        lower_doc_key: []const u8,
-        upper_doc_key: []const u8,
-        completed: bool = true,
-        valid: bool,
-        updated_at_ns: u64,
+    pub fn relationalIntegrityRecordForeignKeyIntegrityReport(
+        self: *DB,
+        mode: relational_store_mod.ForeignKeyIntegrityMode,
         report: relational_store_mod.ForeignKeyIntegrityReport,
-    };
+    ) void {
+        self.recordForeignKeyIntegrityReport(mode, report);
+    }
+
+    pub const ForeignKeyIntegrityProgressRecord = relational_integrity_impl.ForeignKeyIntegrityProgressRecord;
+    pub const ForeignKeyIntegrityClaimRecord = relational_integrity_impl.ForeignKeyIntegrityClaimRecord;
+    pub const ForeignKeyIntegrityJobRecord = relational_integrity_impl.ForeignKeyIntegrityJobRecord;
+    pub const ForeignKeyActionJobRecord = relational_integrity_impl.ForeignKeyActionJobRecord;
+    pub const ForeignKeyActionScheduleRecord = relational_integrity_impl.ForeignKeyActionScheduleRecord;
+    pub const UniqueConstraintIntegrityProgressRecord = relational_integrity_impl.UniqueConstraintIntegrityProgressRecord;
 
     pub fn freeForeignKeyIntegrityProgressRecord(self: *DB, record: ForeignKeyIntegrityProgressRecord) void {
-        if (record.phase.len > 0) self.alloc.free(record.phase);
-        if (record.mode.len > 0) self.alloc.free(record.mode);
-        if (record.constraint_name) |value| self.alloc.free(value);
-        if (record.lower_doc_key.len > 0) self.alloc.free(record.lower_doc_key);
-        if (record.upper_doc_key.len > 0) self.alloc.free(record.upper_doc_key);
+        relational_integrity_impl.freeForeignKeyIntegrityProgressRecord(self, record);
     }
 
     pub fn freeForeignKeyIntegrityProgressRecords(self: *DB, records: []ForeignKeyIntegrityProgressRecord) void {
-        for (records) |record| self.freeForeignKeyIntegrityProgressRecord(record);
-        if (records.len > 0) self.alloc.free(records);
+        relational_integrity_impl.freeForeignKeyIntegrityProgressRecords(self, records);
     }
 
-    pub const ForeignKeyIntegrityClaimRecord = struct {
-        version: u32 = 1,
-        claim_key: []const u8,
-        worker_id: []const u8,
-        group_id: u64,
-        phase: []const u8 = "child_range",
-        planned_action: []const u8,
-        constraint_name: ?[]const u8 = null,
-        lower_doc_key: []const u8,
-        upper_doc_key: []const u8,
-        claimed_at_ns: u64,
-        lease_until_ns: u64,
-        attempts: u32 = 1,
-    };
-
     pub fn freeForeignKeyIntegrityClaimRecord(self: *DB, record: ForeignKeyIntegrityClaimRecord) void {
-        if (record.claim_key.len > 0) self.alloc.free(record.claim_key);
-        if (record.worker_id.len > 0) self.alloc.free(record.worker_id);
-        if (record.phase.len > 0) self.alloc.free(record.phase);
-        if (record.planned_action.len > 0) self.alloc.free(record.planned_action);
-        if (record.constraint_name) |value| self.alloc.free(value);
-        if (record.lower_doc_key.len > 0) self.alloc.free(record.lower_doc_key);
-        if (record.upper_doc_key.len > 0) self.alloc.free(record.upper_doc_key);
+        relational_integrity_impl.freeForeignKeyIntegrityClaimRecord(self, record);
     }
 
     pub fn freeForeignKeyIntegrityClaimRecords(self: *DB, records: []ForeignKeyIntegrityClaimRecord) void {
-        for (records) |record| self.freeForeignKeyIntegrityClaimRecord(record);
-        if (records.len > 0) self.alloc.free(records);
+        relational_integrity_impl.freeForeignKeyIntegrityClaimRecords(self, records);
     }
 
-    pub const ForeignKeyIntegrityJobRecord = struct {
-        version: u32 = 1,
-        job_id: []const u8,
-        table_name: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: ?[]const u8 = null,
-        lower_doc_key: []const u8,
-        upper_doc_key: []const u8,
-        lease_ms: u64,
-        max_work_units: usize,
-        status: []const u8,
-        created_at_ns: u64,
-        updated_at_ns: u64,
-        attempts: u32 = 0,
-        completed: bool = false,
-        valid: ?bool = null,
-        last_report: relational_store_mod.ForeignKeyIntegrityReport = .{},
-        aggregate_report: relational_store_mod.ForeignKeyIntegrityReport = .{},
-        violation_samples_json: []const u8 = "[]",
-        violation_sample_count: usize = 0,
-        violations_truncated: bool = false,
-        diagnostic_passes: u64 = 0,
-        violating_passes: u64 = 0,
-        first_violation_at_ns: ?u64 = null,
-        last_violation_at_ns: ?u64 = null,
-    };
-
     pub fn freeForeignKeyIntegrityJobRecord(self: *DB, record: ForeignKeyIntegrityJobRecord) void {
-        if (record.job_id.len > 0) self.alloc.free(record.job_id);
-        if (record.table_name.len > 0) self.alloc.free(record.table_name);
-        if (record.action.len > 0) self.alloc.free(record.action);
-        if (record.worker_id.len > 0) self.alloc.free(record.worker_id);
-        if (record.constraint_name) |value| self.alloc.free(value);
-        if (record.lower_doc_key.len > 0) self.alloc.free(record.lower_doc_key);
-        if (record.upper_doc_key.len > 0) self.alloc.free(record.upper_doc_key);
-        if (record.status.len > 0) self.alloc.free(record.status);
-        if (record.violation_samples_json.len > 0) self.alloc.free(record.violation_samples_json);
+        relational_integrity_impl.freeForeignKeyIntegrityJobRecord(self, record);
     }
 
     pub fn freeForeignKeyIntegrityJobRecords(self: *DB, records: []ForeignKeyIntegrityJobRecord) void {
-        for (records) |record| self.freeForeignKeyIntegrityJobRecord(record);
-        if (records.len > 0) self.alloc.free(records);
+        relational_integrity_impl.freeForeignKeyIntegrityJobRecords(self, records);
     }
 
-    pub const ForeignKeyActionJobRecord = struct {
-        version: u32 = 1,
-        job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        updated_parent_key: ?[]const u8 = null,
-        page_limit: usize,
-        status: []const u8,
-        created_at_ns: u64,
-        updated_at_ns: u64,
-        claimed_at_ns: u64,
-        lease_until_ns: u64,
-        attempts: u32 = 0,
-        completed: bool = false,
-        applied_children: u64 = 0,
-        failure_count: u64 = 0,
-        first_failed_at_ns: ?u64 = null,
-        last_failed_at_ns: ?u64 = null,
-        requeue_count: u64 = 0,
-        last_requeued_at_ns: ?u64 = null,
-        cascade_depth: u32,
-        cascade_max_depth: u32,
-        next_child_table: ?[]const u8 = null,
-        next_child_key: ?[]const u8 = null,
-        last_error: ?[]const u8 = null,
-    };
-
     pub fn freeForeignKeyActionJobRecord(self: *DB, record: ForeignKeyActionJobRecord) void {
-        if (record.job_id.len > 0) self.alloc.free(record.job_id);
-        if (record.action.len > 0) self.alloc.free(record.action);
-        if (record.worker_id.len > 0) self.alloc.free(record.worker_id);
-        if (record.constraint_name.len > 0) self.alloc.free(record.constraint_name);
-        if (record.parent_table.len > 0) self.alloc.free(record.parent_table);
-        if (record.parent_key.len > 0) self.alloc.free(record.parent_key);
-        if (record.updated_parent_key) |value| self.alloc.free(value);
-        if (record.status.len > 0) self.alloc.free(record.status);
-        if (record.next_child_table) |value| self.alloc.free(value);
-        if (record.next_child_key) |value| self.alloc.free(value);
-        if (record.last_error) |value| self.alloc.free(value);
+        relational_integrity_impl.freeForeignKeyActionJobRecord(self, record);
     }
 
     pub fn freeForeignKeyActionJobRecords(self: *DB, records: []ForeignKeyActionJobRecord) void {
-        for (records) |record| self.freeForeignKeyActionJobRecord(record);
-        if (records.len > 0) self.alloc.free(records);
+        relational_integrity_impl.freeForeignKeyActionJobRecords(self, records);
     }
 
-    pub const ForeignKeyActionScheduleRecord = struct {
-        version: u32 = 1,
-        schedule_id: []const u8,
-        action_job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        updated_parent_key: ?[]const u8 = null,
-        page_limit: usize,
-        status: []const u8,
-        created_at_ns: u64,
-        updated_at_ns: u64,
-        completed: bool = false,
-        scheduled_groups: u64 = 0,
-        cascade_depth: u32,
-        cascade_max_depth: u32,
-        requeue_count: u64 = 0,
-        last_requeued_at_ns: ?u64 = null,
-        last_error: ?[]const u8 = null,
-    };
-
     pub fn freeForeignKeyActionScheduleRecord(self: *DB, record: ForeignKeyActionScheduleRecord) void {
-        if (record.schedule_id.len > 0) self.alloc.free(record.schedule_id);
-        if (record.action_job_id.len > 0) self.alloc.free(record.action_job_id);
-        if (record.action.len > 0) self.alloc.free(record.action);
-        if (record.worker_id.len > 0) self.alloc.free(record.worker_id);
-        if (record.constraint_name.len > 0) self.alloc.free(record.constraint_name);
-        if (record.parent_table.len > 0) self.alloc.free(record.parent_table);
-        if (record.parent_key.len > 0) self.alloc.free(record.parent_key);
-        if (record.updated_parent_key) |value| self.alloc.free(value);
-        if (record.status.len > 0) self.alloc.free(record.status);
-        if (record.last_error) |value| self.alloc.free(value);
+        relational_integrity_impl.freeForeignKeyActionScheduleRecord(self, record);
     }
 
     pub fn freeForeignKeyActionScheduleRecords(self: *DB, records: []ForeignKeyActionScheduleRecord) void {
-        for (records) |record| self.freeForeignKeyActionScheduleRecord(record);
-        if (records.len > 0) self.alloc.free(records);
+        relational_integrity_impl.freeForeignKeyActionScheduleRecords(self, records);
     }
 
-    pub const UniqueConstraintIntegrityProgressRecord = struct {
-        version: u32 = 1,
-        mode: []const u8,
-        lower_doc_key: []const u8,
-        upper_doc_key: []const u8,
-        completed: bool = true,
-        valid: bool,
-        updated_at_ns: u64,
-        report: relational_store_mod.UniqueConstraintIntegrityReport,
-    };
-
     pub fn freeUniqueConstraintIntegrityProgressRecord(self: *DB, record: UniqueConstraintIntegrityProgressRecord) void {
-        if (record.mode.len > 0) self.alloc.free(record.mode);
-        if (record.lower_doc_key.len > 0) self.alloc.free(record.lower_doc_key);
-        if (record.upper_doc_key.len > 0) self.alloc.free(record.upper_doc_key);
+        relational_integrity_impl.freeUniqueConstraintIntegrityProgressRecord(self, record);
     }
 
     pub fn freeUniqueConstraintIntegrityProgressRecords(self: *DB, records: []UniqueConstraintIntegrityProgressRecord) void {
-        for (records) |record| self.freeUniqueConstraintIntegrityProgressRecord(record);
-        if (records.len > 0) self.alloc.free(records);
+        relational_integrity_impl.freeUniqueConstraintIntegrityProgressRecords(self, records);
     }
 
     pub fn listForeignKeyIntegrityProgressRecords(self: *DB) ![]ForeignKeyIntegrityProgressRecord {
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const upper = try metadataPrefixUpperAlloc(self.alloc, foreign_key_integrity_progress_key_prefix);
-        defer if (upper) |buf| self.alloc.free(buf);
-        const scanned = try self.core.store.scanRange(self.alloc, foreign_key_integrity_progress_key_prefix, if (upper) |buf| buf else "");
-        defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
-
-        var out = std.ArrayListUnmanaged(ForeignKeyIntegrityProgressRecord).empty;
-        errdefer {
-            for (out.items) |record| self.freeForeignKeyIntegrityProgressRecord(record);
-            out.deinit(self.alloc);
-        }
-        for (scanned) |entry| {
-            var parsed = try std.json.parseFromSlice(ForeignKeyIntegrityProgressRecord, self.alloc, entry.value, .{
-                .allocate = .alloc_always,
-                .ignore_unknown_fields = true,
-            });
-            defer parsed.deinit();
-
-            var cloned = ForeignKeyIntegrityProgressRecord{
-                .version = parsed.value.version,
-                .phase = &.{},
-                .mode = &.{},
-                .constraint_name = null,
-                .lower_doc_key = &.{},
-                .upper_doc_key = &.{},
-                .completed = parsed.value.completed,
-                .valid = parsed.value.valid,
-                .updated_at_ns = parsed.value.updated_at_ns,
-                .report = parsed.value.report,
-            };
-            errdefer self.freeForeignKeyIntegrityProgressRecord(cloned);
-            cloned.phase = try self.alloc.dupe(u8, parsed.value.phase);
-            cloned.mode = try self.alloc.dupe(u8, parsed.value.mode);
-            if (parsed.value.constraint_name) |value| cloned.constraint_name = try self.alloc.dupe(u8, value);
-            cloned.lower_doc_key = try self.alloc.dupe(u8, parsed.value.lower_doc_key);
-            cloned.upper_doc_key = try self.alloc.dupe(u8, parsed.value.upper_doc_key);
-            try out.append(self.alloc, cloned);
-        }
-        return try out.toOwnedSlice(self.alloc);
+        return try relational_integrity_impl.listForeignKeyIntegrityProgressRecords(self);
     }
 
     pub fn listForeignKeyIntegrityClaimRecords(self: *DB) ![]ForeignKeyIntegrityClaimRecord {
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const upper = try metadataPrefixUpperAlloc(self.alloc, foreign_key_integrity_claim_key_prefix);
-        defer if (upper) |buf| self.alloc.free(buf);
-        const scanned = try self.core.store.scanRange(self.alloc, foreign_key_integrity_claim_key_prefix, if (upper) |buf| buf else "");
-        defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
-
-        var out = std.ArrayListUnmanaged(ForeignKeyIntegrityClaimRecord).empty;
-        errdefer {
-            for (out.items) |record| self.freeForeignKeyIntegrityClaimRecord(record);
-            out.deinit(self.alloc);
-        }
-        for (scanned) |entry| {
-            const cloned = try self.cloneForeignKeyIntegrityClaimRecordFromJson(entry.value);
-            errdefer self.freeForeignKeyIntegrityClaimRecord(cloned);
-            try out.append(self.alloc, cloned);
-        }
-        return try out.toOwnedSlice(self.alloc);
+        return try relational_integrity_impl.listForeignKeyIntegrityClaimRecords(self);
     }
 
     pub fn listForeignKeyIntegrityJobRecords(self: *DB) ![]ForeignKeyIntegrityJobRecord {
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const upper = try metadataPrefixUpperAlloc(self.alloc, foreign_key_integrity_job_key_prefix);
-        defer if (upper) |buf| self.alloc.free(buf);
-        const scanned = try self.core.store.scanRange(self.alloc, foreign_key_integrity_job_key_prefix, if (upper) |buf| buf else "");
-        defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
-
-        var out = std.ArrayListUnmanaged(ForeignKeyIntegrityJobRecord).empty;
-        errdefer {
-            for (out.items) |record| self.freeForeignKeyIntegrityJobRecord(record);
-            out.deinit(self.alloc);
-        }
-        for (scanned) |entry| {
-            const cloned = try self.cloneForeignKeyIntegrityJobRecordFromJson(entry.value);
-            errdefer self.freeForeignKeyIntegrityJobRecord(cloned);
-            try out.append(self.alloc, cloned);
-        }
-        return try out.toOwnedSlice(self.alloc);
+        return try relational_integrity_impl.listForeignKeyIntegrityJobRecords(self);
     }
 
     pub fn loadForeignKeyActionJobRecord(self: *DB, job_id: []const u8) !?ForeignKeyActionJobRecord {
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const key = try foreignKeyActionJobKeyAlloc(self.alloc, job_id);
-        defer self.alloc.free(key);
-        const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
-            error.NotFound => return null,
-            else => return err,
-        };
-        defer self.alloc.free(raw);
-        return try self.cloneForeignKeyActionJobRecordFromJson(raw);
+        return try relational_integrity_impl.loadForeignKeyActionJobRecord(self, job_id);
     }
 
     pub fn listForeignKeyActionJobRecords(self: *DB) ![]ForeignKeyActionJobRecord {
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const upper = try metadataPrefixUpperAlloc(self.alloc, foreign_key_action_job_key_prefix);
-        defer if (upper) |buf| self.alloc.free(buf);
-        const scanned = try self.core.store.scanRange(self.alloc, foreign_key_action_job_key_prefix, if (upper) |buf| buf else "");
-        defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
-
-        var out = std.ArrayListUnmanaged(ForeignKeyActionJobRecord).empty;
-        errdefer {
-            for (out.items) |record| self.freeForeignKeyActionJobRecord(record);
-            out.deinit(self.alloc);
-        }
-        for (scanned) |entry| {
-            const cloned = try self.cloneForeignKeyActionJobRecordFromJson(entry.value);
-            errdefer self.freeForeignKeyActionJobRecord(cloned);
-            try out.append(self.alloc, cloned);
-        }
-        return try out.toOwnedSlice(self.alloc);
+        return try relational_integrity_impl.listForeignKeyActionJobRecords(self);
     }
 
     pub fn loadForeignKeyActionScheduleRecord(self: *DB, schedule_id: []const u8) !?ForeignKeyActionScheduleRecord {
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const key = try foreignKeyActionScheduleKeyAlloc(self.alloc, schedule_id);
-        defer self.alloc.free(key);
-        const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
-            error.NotFound => return null,
-            else => return err,
-        };
-        defer self.alloc.free(raw);
-        return try self.cloneForeignKeyActionScheduleRecordFromJson(raw);
+        return try relational_integrity_impl.loadForeignKeyActionScheduleRecord(self, schedule_id);
     }
 
     pub fn listForeignKeyActionScheduleRecords(self: *DB) ![]ForeignKeyActionScheduleRecord {
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const upper = try metadataPrefixUpperAlloc(self.alloc, foreign_key_action_schedule_key_prefix);
-        defer if (upper) |buf| self.alloc.free(buf);
-        const scanned = try self.core.store.scanRange(self.alloc, foreign_key_action_schedule_key_prefix, if (upper) |buf| buf else "");
-        defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
-
-        var out = std.ArrayListUnmanaged(ForeignKeyActionScheduleRecord).empty;
-        errdefer {
-            for (out.items) |record| self.freeForeignKeyActionScheduleRecord(record);
-            out.deinit(self.alloc);
-        }
-        for (scanned) |entry| {
-            const cloned = try self.cloneForeignKeyActionScheduleRecordFromJson(entry.value);
-            errdefer self.freeForeignKeyActionScheduleRecord(cloned);
-            try out.append(self.alloc, cloned);
-        }
-        return try out.toOwnedSlice(self.alloc);
+        return try relational_integrity_impl.listForeignKeyActionScheduleRecords(self);
     }
 
     pub fn listUniqueConstraintIntegrityProgressRecords(self: *DB) ![]UniqueConstraintIntegrityProgressRecord {
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const upper = try metadataPrefixUpperAlloc(self.alloc, unique_constraint_integrity_progress_key_prefix);
-        defer if (upper) |buf| self.alloc.free(buf);
-        const scanned = try self.core.store.scanRange(self.alloc, unique_constraint_integrity_progress_key_prefix, if (upper) |buf| buf else "");
-        defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
-
-        var out = std.ArrayListUnmanaged(UniqueConstraintIntegrityProgressRecord).empty;
-        errdefer {
-            for (out.items) |record| self.freeUniqueConstraintIntegrityProgressRecord(record);
-            out.deinit(self.alloc);
-        }
-        for (scanned) |entry| {
-            var parsed = try std.json.parseFromSlice(UniqueConstraintIntegrityProgressRecord, self.alloc, entry.value, .{
-                .allocate = .alloc_always,
-                .ignore_unknown_fields = true,
-            });
-            defer parsed.deinit();
-
-            var cloned = UniqueConstraintIntegrityProgressRecord{
-                .version = parsed.value.version,
-                .mode = &.{},
-                .lower_doc_key = &.{},
-                .upper_doc_key = &.{},
-                .completed = parsed.value.completed,
-                .valid = parsed.value.valid,
-                .updated_at_ns = parsed.value.updated_at_ns,
-                .report = parsed.value.report,
-            };
-            errdefer self.freeUniqueConstraintIntegrityProgressRecord(cloned);
-            cloned.mode = try self.alloc.dupe(u8, parsed.value.mode);
-            cloned.lower_doc_key = try self.alloc.dupe(u8, parsed.value.lower_doc_key);
-            cloned.upper_doc_key = try self.alloc.dupe(u8, parsed.value.upper_doc_key);
-            try out.append(self.alloc, cloned);
-        }
-        return try out.toOwnedSlice(self.alloc);
+        return try relational_integrity_impl.listUniqueConstraintIntegrityProgressRecords(self);
     }
 
     pub fn loadForeignKeyIntegrityProgressRecord(
@@ -12896,7 +11770,7 @@ pub const DB = struct {
         lower_doc_key: []const u8,
         upper_doc_key: []const u8,
     ) !?ForeignKeyIntegrityProgressRecord {
-        return try self.loadForeignKeyIntegrityProgressRecordForPhase("child_range", mode, constraint_name, lower_doc_key, upper_doc_key);
+        return try relational_integrity_impl.loadForeignKeyIntegrityProgressRecord(self, mode, constraint_name, lower_doc_key, upper_doc_key);
     }
 
     pub fn loadForeignKeyIntegrityProgressRecordForPhase(
@@ -12907,76 +11781,21 @@ pub const DB = struct {
         lower_doc_key: []const u8,
         upper_doc_key: []const u8,
     ) !?ForeignKeyIntegrityProgressRecord {
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const key = try foreignKeyIntegrityProgressKeyAlloc(self.alloc, phase, mode, constraint_name, lower_doc_key, upper_doc_key);
-        defer self.alloc.free(key);
-        const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
-            error.NotFound => return null,
-            else => return err,
-        };
-        defer self.alloc.free(raw);
-
-        var parsed = try std.json.parseFromSlice(ForeignKeyIntegrityProgressRecord, self.alloc, raw, .{
-            .allocate = .alloc_always,
-            .ignore_unknown_fields = true,
-        });
-        defer parsed.deinit();
-
-        var cloned = ForeignKeyIntegrityProgressRecord{
-            .version = parsed.value.version,
-            .phase = &.{},
-            .mode = &.{},
-            .constraint_name = null,
-            .lower_doc_key = &.{},
-            .upper_doc_key = &.{},
-            .completed = parsed.value.completed,
-            .valid = parsed.value.valid,
-            .updated_at_ns = parsed.value.updated_at_ns,
-            .report = parsed.value.report,
-        };
-        errdefer self.freeForeignKeyIntegrityProgressRecord(cloned);
-        cloned.phase = try self.alloc.dupe(u8, parsed.value.phase);
-        cloned.mode = try self.alloc.dupe(u8, parsed.value.mode);
-        if (parsed.value.constraint_name) |value| cloned.constraint_name = try self.alloc.dupe(u8, value);
-        cloned.lower_doc_key = try self.alloc.dupe(u8, parsed.value.lower_doc_key);
-        cloned.upper_doc_key = try self.alloc.dupe(u8, parsed.value.upper_doc_key);
-        return cloned;
+        return try relational_integrity_impl.loadForeignKeyIntegrityProgressRecordForPhase(self, phase, mode, constraint_name, lower_doc_key, upper_doc_key);
     }
 
     pub fn loadForeignKeyIntegrityClaimRecord(
         self: *DB,
         claim_key: []const u8,
     ) !?ForeignKeyIntegrityClaimRecord {
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const key = try foreignKeyIntegrityClaimKeyAlloc(self.alloc, claim_key);
-        defer self.alloc.free(key);
-        const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
-            error.NotFound => return null,
-            else => return err,
-        };
-        defer self.alloc.free(raw);
-        return try self.cloneForeignKeyIntegrityClaimRecordFromJson(raw);
+        return try relational_integrity_impl.loadForeignKeyIntegrityClaimRecord(self, claim_key);
     }
 
     pub fn loadForeignKeyIntegrityJobRecord(
         self: *DB,
         job_id: []const u8,
     ) !?ForeignKeyIntegrityJobRecord {
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const key = try foreignKeyIntegrityJobKeyAlloc(self.alloc, job_id);
-        defer self.alloc.free(key);
-        const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
-            error.NotFound => return null,
-            else => return err,
-        };
-        defer self.alloc.free(raw);
-        return try self.cloneForeignKeyIntegrityJobRecordFromJson(raw);
+        return try relational_integrity_impl.loadForeignKeyIntegrityJobRecord(self, job_id);
     }
 
     pub fn loadUniqueConstraintIntegrityProgressRecord(
@@ -12985,38 +11804,7 @@ pub const DB = struct {
         lower_doc_key: []const u8,
         upper_doc_key: []const u8,
     ) !?UniqueConstraintIntegrityProgressRecord {
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const key = try uniqueConstraintIntegrityProgressKeyAlloc(self.alloc, mode, lower_doc_key, upper_doc_key);
-        defer self.alloc.free(key);
-        const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
-            error.NotFound => return null,
-            else => return err,
-        };
-        defer self.alloc.free(raw);
-
-        var parsed = try std.json.parseFromSlice(UniqueConstraintIntegrityProgressRecord, self.alloc, raw, .{
-            .allocate = .alloc_always,
-            .ignore_unknown_fields = true,
-        });
-        defer parsed.deinit();
-
-        var cloned = UniqueConstraintIntegrityProgressRecord{
-            .version = parsed.value.version,
-            .mode = &.{},
-            .lower_doc_key = &.{},
-            .upper_doc_key = &.{},
-            .completed = parsed.value.completed,
-            .valid = parsed.value.valid,
-            .updated_at_ns = parsed.value.updated_at_ns,
-            .report = parsed.value.report,
-        };
-        errdefer self.freeUniqueConstraintIntegrityProgressRecord(cloned);
-        cloned.mode = try self.alloc.dupe(u8, parsed.value.mode);
-        cloned.lower_doc_key = try self.alloc.dupe(u8, parsed.value.lower_doc_key);
-        cloned.upper_doc_key = try self.alloc.dupe(u8, parsed.value.upper_doc_key);
-        return cloned;
+        return try relational_integrity_impl.loadUniqueConstraintIntegrityProgressRecord(self, mode, lower_doc_key, upper_doc_key);
     }
 
     fn recordForeignKeyIntegrityProgressLocked(
@@ -13028,7 +11816,7 @@ pub const DB = struct {
         upper_doc_key: []const u8,
         report: relational_store_mod.ForeignKeyIntegrityReport,
     ) !void {
-        return try self.recordForeignKeyIntegrityProgressForPhaseLocked(alloc, "child_range", mode, constraint_name, lower_doc_key, upper_doc_key, report);
+        return try relational_integrity_impl.recordForeignKeyIntegrityProgressLocked(self, alloc, mode, constraint_name, lower_doc_key, upper_doc_key, report);
     }
 
     fn recordForeignKeyIntegrityProgressForPhaseLocked(
@@ -13041,22 +11829,7 @@ pub const DB = struct {
         upper_doc_key: []const u8,
         report: relational_store_mod.ForeignKeyIntegrityReport,
     ) !void {
-        self.recordForeignKeyIntegrityReport(mode, report);
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return;
-        const key = try foreignKeyIntegrityProgressKeyAlloc(alloc, phase, mode, constraint_name, lower_doc_key, upper_doc_key);
-        defer alloc.free(key);
-        const payload = try std.json.Stringify.valueAlloc(alloc, ForeignKeyIntegrityProgressRecord{
-            .phase = phase,
-            .mode = foreignKeyIntegrityModeName(mode),
-            .constraint_name = constraint_name,
-            .lower_doc_key = lower_doc_key,
-            .upper_doc_key = upper_doc_key,
-            .valid = foreignKeyIntegrityProgressValid(mode, report),
-            .updated_at_ns = currentTimeNs(),
-            .report = report,
-        }, .{ .emit_null_optional_fields = false });
-        defer alloc.free(payload);
-        try self.core.store.put(key, payload);
+        return try relational_integrity_impl.recordForeignKeyIntegrityProgressForPhaseLocked(self, alloc, phase, mode, constraint_name, lower_doc_key, upper_doc_key, report);
     }
 
     fn recordUniqueConstraintIntegrityProgressLocked(
@@ -13067,19 +11840,7 @@ pub const DB = struct {
         upper_doc_key: []const u8,
         report: relational_store_mod.UniqueConstraintIntegrityReport,
     ) !void {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return;
-        const key = try uniqueConstraintIntegrityProgressKeyAlloc(alloc, mode, lower_doc_key, upper_doc_key);
-        defer alloc.free(key);
-        const payload = try std.json.Stringify.valueAlloc(alloc, UniqueConstraintIntegrityProgressRecord{
-            .mode = foreignKeyIntegrityModeName(mode),
-            .lower_doc_key = lower_doc_key,
-            .upper_doc_key = upper_doc_key,
-            .valid = uniqueConstraintIntegrityProgressValid(mode, report),
-            .updated_at_ns = currentTimeNs(),
-            .report = report,
-        }, .{});
-        defer alloc.free(payload);
-        try self.core.store.put(key, payload);
+        return try relational_integrity_impl.recordUniqueConstraintIntegrityProgressLocked(self, alloc, mode, lower_doc_key, upper_doc_key, report);
     }
 
     pub fn claimForeignKeyIntegrityWorkUnit(
@@ -13094,18 +11855,7 @@ pub const DB = struct {
         upper_doc_key: []const u8,
         lease_ms: u64,
     ) !ForeignKeyIntegrityClaimRecord {
-        return try self.claimForeignKeyIntegrityWorkUnitAt(
-            claim_key,
-            worker_id,
-            group_id,
-            phase,
-            planned_action,
-            constraint_name,
-            lower_doc_key,
-            upper_doc_key,
-            lease_ms,
-            currentTimeNs(),
-        );
+        return try relational_integrity_impl.claimForeignKeyIntegrityWorkUnit(self, claim_key, worker_id, group_id, phase, planned_action, constraint_name, lower_doc_key, upper_doc_key, lease_ms);
     }
 
     pub fn claimForeignKeyIntegrityWorkUnitAt(
@@ -13121,46 +11871,7 @@ pub const DB = struct {
         lease_ms: u64,
         now_ns: u64,
     ) !ForeignKeyIntegrityClaimRecord {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        if (claim_key.len == 0 or worker_id.len == 0 or phase.len == 0 or planned_action.len == 0) return error.InvalidForeignKeyIntegrityClaim;
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const key = try foreignKeyIntegrityClaimKeyAlloc(self.alloc, claim_key);
-        defer self.alloc.free(key);
-
-        var attempts: u32 = 1;
-        if (self.core.store.get(self.alloc, key)) |raw| {
-            defer self.alloc.free(raw);
-            const existing = try self.cloneForeignKeyIntegrityClaimRecordFromJson(raw);
-            defer self.freeForeignKeyIntegrityClaimRecord(existing);
-            const held_by_other = !std.mem.eql(u8, existing.worker_id, worker_id);
-            if (held_by_other and existing.lease_until_ns > now_ns) return error.ForeignKeyIntegrityClaimBusy;
-            attempts = existing.attempts +| 1;
-        } else |err| switch (err) {
-            error.NotFound => {},
-            else => return err,
-        }
-
-        const lease_ns = std.math.mul(u64, lease_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
-        const lease_until_ns = now_ns +| lease_ns;
-        const record = ForeignKeyIntegrityClaimRecord{
-            .claim_key = claim_key,
-            .worker_id = worker_id,
-            .group_id = group_id,
-            .phase = phase,
-            .planned_action = planned_action,
-            .constraint_name = constraint_name,
-            .lower_doc_key = lower_doc_key,
-            .upper_doc_key = upper_doc_key,
-            .claimed_at_ns = now_ns,
-            .lease_until_ns = lease_until_ns,
-            .attempts = attempts,
-        };
-        const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
-        defer self.alloc.free(payload);
-        try self.core.store.put(key, payload);
-        return try self.cloneForeignKeyIntegrityClaimRecordFromJson(payload);
+        return try relational_integrity_impl.claimForeignKeyIntegrityWorkUnitAt(self, claim_key, worker_id, group_id, phase, planned_action, constraint_name, lower_doc_key, upper_doc_key, lease_ms, now_ns);
     }
 
     pub fn upsertForeignKeyIntegrityJobRecord(
@@ -13176,19 +11887,7 @@ pub const DB = struct {
         max_work_units: usize,
         status: []const u8,
     ) !ForeignKeyIntegrityJobRecord {
-        return try self.upsertForeignKeyIntegrityJobRecordAt(
-            job_id,
-            table_name,
-            action,
-            worker_id,
-            constraint_name,
-            lower_doc_key,
-            upper_doc_key,
-            lease_ms,
-            max_work_units,
-            status,
-            currentTimeNs(),
-        );
+        return try relational_integrity_impl.upsertForeignKeyIntegrityJobRecord(self, job_id, table_name, action, worker_id, constraint_name, lower_doc_key, upper_doc_key, lease_ms, max_work_units, status);
     }
 
     pub fn upsertForeignKeyIntegrityJobRecordAt(
@@ -13205,78 +11904,7 @@ pub const DB = struct {
         status: []const u8,
         now_ns: u64,
     ) !ForeignKeyIntegrityJobRecord {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        if (job_id.len == 0 or table_name.len == 0 or action.len == 0 or worker_id.len == 0 or status.len == 0) return error.InvalidForeignKeyIntegrityJob;
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const key = try foreignKeyIntegrityJobKeyAlloc(self.alloc, job_id);
-        defer self.alloc.free(key);
-
-        var created_at_ns = now_ns;
-        var attempts: u32 = 1;
-        var violation_samples_json: []const u8 = "[]";
-        var preserved_violation_samples_json: ?[]u8 = null;
-        defer if (preserved_violation_samples_json) |value| self.alloc.free(value);
-        var violation_sample_count: usize = 0;
-        var violations_truncated = false;
-        var last_report: relational_store_mod.ForeignKeyIntegrityReport = .{};
-        var aggregate_report: relational_store_mod.ForeignKeyIntegrityReport = .{};
-        var diagnostic_passes: u64 = 0;
-        var violating_passes: u64 = 0;
-        var first_violation_at_ns: ?u64 = null;
-        var last_violation_at_ns: ?u64 = null;
-        if (self.core.store.get(self.alloc, key)) |raw| {
-            defer self.alloc.free(raw);
-            const existing = try self.cloneForeignKeyIntegrityJobRecordFromJson(raw);
-            defer self.freeForeignKeyIntegrityJobRecord(existing);
-            created_at_ns = existing.created_at_ns;
-            attempts = existing.attempts +| 1;
-            preserved_violation_samples_json = try self.alloc.dupe(u8, existing.violation_samples_json);
-            violation_samples_json = preserved_violation_samples_json.?;
-            violation_sample_count = existing.violation_sample_count;
-            violations_truncated = existing.violations_truncated;
-            last_report = existing.last_report;
-            aggregate_report = existing.aggregate_report;
-            diagnostic_passes = existing.diagnostic_passes;
-            violating_passes = existing.violating_passes;
-            first_violation_at_ns = existing.first_violation_at_ns;
-            last_violation_at_ns = existing.last_violation_at_ns;
-        } else |err| switch (err) {
-            error.NotFound => {},
-            else => return err,
-        }
-
-        const record = ForeignKeyIntegrityJobRecord{
-            .job_id = job_id,
-            .table_name = table_name,
-            .action = action,
-            .worker_id = worker_id,
-            .constraint_name = constraint_name,
-            .lower_doc_key = lower_doc_key,
-            .upper_doc_key = upper_doc_key,
-            .lease_ms = lease_ms,
-            .max_work_units = max_work_units,
-            .status = status,
-            .created_at_ns = created_at_ns,
-            .updated_at_ns = now_ns,
-            .attempts = attempts,
-            .completed = false,
-            .valid = null,
-            .last_report = last_report,
-            .aggregate_report = aggregate_report,
-            .violation_samples_json = violation_samples_json,
-            .violation_sample_count = violation_sample_count,
-            .violations_truncated = violations_truncated,
-            .diagnostic_passes = diagnostic_passes,
-            .violating_passes = violating_passes,
-            .first_violation_at_ns = first_violation_at_ns,
-            .last_violation_at_ns = last_violation_at_ns,
-        };
-        const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
-        defer self.alloc.free(payload);
-        try self.core.store.put(key, payload);
-        return try self.cloneForeignKeyIntegrityJobRecordFromJson(payload);
+        return try relational_integrity_impl.upsertForeignKeyIntegrityJobRecordAt(self, job_id, table_name, action, worker_id, constraint_name, lower_doc_key, upper_doc_key, lease_ms, max_work_units, status, now_ns);
     }
 
     pub fn completeForeignKeyIntegrityJobRecord(
@@ -13286,7 +11914,7 @@ pub const DB = struct {
         valid: bool,
         report: relational_store_mod.ForeignKeyIntegrityReport,
     ) !ForeignKeyIntegrityJobRecord {
-        return try self.completeForeignKeyIntegrityJobRecordAt(job_id, status, valid, report, currentTimeNs());
+        return try relational_integrity_impl.completeForeignKeyIntegrityJobRecord(self, job_id, status, valid, report);
     }
 
     pub fn completeForeignKeyIntegrityJobRecordWithDiagnostics(
@@ -13299,16 +11927,7 @@ pub const DB = struct {
         violation_sample_count: usize,
         violations_truncated: bool,
     ) !ForeignKeyIntegrityJobRecord {
-        return try self.completeForeignKeyIntegrityJobRecordWithDiagnosticsAt(
-            job_id,
-            status,
-            valid,
-            report,
-            violation_samples_json,
-            violation_sample_count,
-            violations_truncated,
-            currentTimeNs(),
-        );
+        return try relational_integrity_impl.completeForeignKeyIntegrityJobRecordWithDiagnostics(self, job_id, status, valid, report, violation_samples_json, violation_sample_count, violations_truncated);
     }
 
     pub fn completeForeignKeyIntegrityJobRecordAt(
@@ -13319,16 +11938,7 @@ pub const DB = struct {
         report: relational_store_mod.ForeignKeyIntegrityReport,
         now_ns: u64,
     ) !ForeignKeyIntegrityJobRecord {
-        return try self.completeForeignKeyIntegrityJobRecordWithDiagnosticsAt(
-            job_id,
-            status,
-            valid,
-            report,
-            null,
-            null,
-            null,
-            now_ns,
-        );
+        return try relational_integrity_impl.completeForeignKeyIntegrityJobRecordAt(self, job_id, status, valid, report, now_ns);
     }
 
     pub fn completeForeignKeyIntegrityJobRecordWithDiagnosticsAt(
@@ -13342,56 +11952,7 @@ pub const DB = struct {
         violations_truncated: ?bool,
         now_ns: u64,
     ) !ForeignKeyIntegrityJobRecord {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        if (job_id.len == 0 or status.len == 0) return error.InvalidForeignKeyIntegrityJob;
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const key = try foreignKeyIntegrityJobKeyAlloc(self.alloc, job_id);
-        defer self.alloc.free(key);
-        const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
-            error.NotFound => return error.ForeignKeyIntegrityJobNotFound,
-            else => return err,
-        };
-        defer self.alloc.free(raw);
-        const existing = try self.cloneForeignKeyIntegrityJobRecordFromJson(raw);
-        defer self.freeForeignKeyIntegrityJobRecord(existing);
-        const has_diagnostics = violation_samples_json != null or violation_sample_count != null or violations_truncated != null;
-        const pass_has_violations = !valid or
-            foreignKeyIntegrityReportHasViolations(report) or
-            (violation_sample_count orelse 0) > 0 or
-            (violations_truncated orelse false);
-
-        const record = ForeignKeyIntegrityJobRecord{
-            .job_id = existing.job_id,
-            .table_name = existing.table_name,
-            .action = existing.action,
-            .worker_id = existing.worker_id,
-            .constraint_name = existing.constraint_name,
-            .lower_doc_key = existing.lower_doc_key,
-            .upper_doc_key = existing.upper_doc_key,
-            .lease_ms = existing.lease_ms,
-            .max_work_units = existing.max_work_units,
-            .status = status,
-            .created_at_ns = existing.created_at_ns,
-            .updated_at_ns = now_ns,
-            .attempts = existing.attempts,
-            .completed = true,
-            .valid = valid,
-            .last_report = report,
-            .aggregate_report = foreignKeyIntegrityReportAdd(existing.aggregate_report, report),
-            .violation_samples_json = violation_samples_json orelse existing.violation_samples_json,
-            .violation_sample_count = violation_sample_count orelse existing.violation_sample_count,
-            .violations_truncated = violations_truncated orelse existing.violations_truncated,
-            .diagnostic_passes = existing.diagnostic_passes +| @as(u64, if (has_diagnostics) 1 else 0),
-            .violating_passes = existing.violating_passes +| @as(u64, if (pass_has_violations) 1 else 0),
-            .first_violation_at_ns = foreignKeyIntegrityFirstViolationAt(existing.first_violation_at_ns, pass_has_violations, now_ns),
-            .last_violation_at_ns = if (pass_has_violations) now_ns else existing.last_violation_at_ns,
-        };
-        const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
-        defer self.alloc.free(payload);
-        try self.core.store.put(key, payload);
-        return try self.cloneForeignKeyIntegrityJobRecordFromJson(payload);
+        return try relational_integrity_impl.completeForeignKeyIntegrityJobRecordWithDiagnosticsAt(self, job_id, status, valid, report, violation_samples_json, violation_sample_count, violations_truncated, now_ns);
     }
 
     pub fn updateForeignKeyIntegrityJobDiagnostics(
@@ -13401,13 +11962,7 @@ pub const DB = struct {
         violation_sample_count: usize,
         violations_truncated: bool,
     ) !ForeignKeyIntegrityJobRecord {
-        return try self.updateForeignKeyIntegrityJobDiagnosticsAt(
-            job_id,
-            violation_samples_json,
-            violation_sample_count,
-            violations_truncated,
-            currentTimeNs(),
-        );
+        return try relational_integrity_impl.updateForeignKeyIntegrityJobDiagnostics(self, job_id, violation_samples_json, violation_sample_count, violations_truncated);
     }
 
     pub fn updateForeignKeyIntegrityJobDiagnosticsWithReport(
@@ -13418,14 +11973,7 @@ pub const DB = struct {
         violation_sample_count: usize,
         violations_truncated: bool,
     ) !ForeignKeyIntegrityJobRecord {
-        return try self.updateForeignKeyIntegrityJobDiagnosticsWithReportAt(
-            job_id,
-            report,
-            violation_samples_json,
-            violation_sample_count,
-            violations_truncated,
-            currentTimeNs(),
-        );
+        return try relational_integrity_impl.updateForeignKeyIntegrityJobDiagnosticsWithReport(self, job_id, report, violation_samples_json, violation_sample_count, violations_truncated);
     }
 
     pub fn updateForeignKeyIntegrityJobDiagnosticsAt(
@@ -13436,14 +11984,7 @@ pub const DB = struct {
         violations_truncated: bool,
         now_ns: u64,
     ) !ForeignKeyIntegrityJobRecord {
-        return try self.updateForeignKeyIntegrityJobDiagnosticsMaybeReportAt(
-            job_id,
-            null,
-            violation_samples_json,
-            violation_sample_count,
-            violations_truncated,
-            now_ns,
-        );
+        return try relational_integrity_impl.updateForeignKeyIntegrityJobDiagnosticsAt(self, job_id, violation_samples_json, violation_sample_count, violations_truncated, now_ns);
     }
 
     pub fn updateForeignKeyIntegrityJobDiagnosticsWithReportAt(
@@ -13455,1680 +11996,167 @@ pub const DB = struct {
         violations_truncated: bool,
         now_ns: u64,
     ) !ForeignKeyIntegrityJobRecord {
-        return try self.updateForeignKeyIntegrityJobDiagnosticsMaybeReportAt(
-            job_id,
-            report,
-            violation_samples_json,
-            violation_sample_count,
-            violations_truncated,
-            now_ns,
-        );
+        return try relational_integrity_impl.updateForeignKeyIntegrityJobDiagnosticsWithReportAt(self, job_id, report, violation_samples_json, violation_sample_count, violations_truncated, now_ns);
     }
 
-    fn updateForeignKeyIntegrityJobDiagnosticsMaybeReportAt(
-        self: *DB,
-        job_id: []const u8,
-        report: ?relational_store_mod.ForeignKeyIntegrityReport,
-        violation_samples_json: []const u8,
-        violation_sample_count: usize,
-        violations_truncated: bool,
-        now_ns: u64,
-    ) !ForeignKeyIntegrityJobRecord {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        if (job_id.len == 0) return error.InvalidForeignKeyIntegrityJob;
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const key = try foreignKeyIntegrityJobKeyAlloc(self.alloc, job_id);
-        defer self.alloc.free(key);
-        const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
-            error.NotFound => return error.ForeignKeyIntegrityJobNotFound,
-            else => return err,
-        };
-        defer self.alloc.free(raw);
-        const existing = try self.cloneForeignKeyIntegrityJobRecordFromJson(raw);
-        defer self.freeForeignKeyIntegrityJobRecord(existing);
-        const pass_has_violations = foreignKeyIntegrityReportHasViolations(report orelse existing.last_report) or
-            violation_sample_count > 0 or
-            violations_truncated;
-
-        const record = ForeignKeyIntegrityJobRecord{
-            .job_id = existing.job_id,
-            .table_name = existing.table_name,
-            .action = existing.action,
-            .worker_id = existing.worker_id,
-            .constraint_name = existing.constraint_name,
-            .lower_doc_key = existing.lower_doc_key,
-            .upper_doc_key = existing.upper_doc_key,
-            .lease_ms = existing.lease_ms,
-            .max_work_units = existing.max_work_units,
-            .status = existing.status,
-            .created_at_ns = existing.created_at_ns,
-            .updated_at_ns = now_ns,
-            .attempts = existing.attempts,
-            .completed = existing.completed,
-            .valid = existing.valid,
-            .last_report = report orelse existing.last_report,
-            .aggregate_report = if (report) |value| foreignKeyIntegrityReportAdd(existing.aggregate_report, value) else existing.aggregate_report,
-            .violation_samples_json = violation_samples_json,
-            .violation_sample_count = violation_sample_count,
-            .violations_truncated = violations_truncated,
-            .diagnostic_passes = existing.diagnostic_passes +| 1,
-            .violating_passes = existing.violating_passes +| @as(u64, if (pass_has_violations) 1 else 0),
-            .first_violation_at_ns = foreignKeyIntegrityFirstViolationAt(existing.first_violation_at_ns, pass_has_violations, now_ns),
-            .last_violation_at_ns = if (pass_has_violations) now_ns else existing.last_violation_at_ns,
-        };
-        const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
-        defer self.alloc.free(payload);
-        try self.core.store.put(key, payload);
-        return try self.cloneForeignKeyIntegrityJobRecordFromJson(payload);
+    pub fn claimAndRunForeignKeyActionJobPage(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, lease_ms: u64) !ForeignKeyActionJobRecord {
+        return try relational_integrity_impl.claimAndRunForeignKeyActionJobPage(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit, lease_ms);
     }
 
-    pub fn claimAndRunForeignKeyActionJobPage(
-        self: *DB,
-        job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        page_limit: usize,
-        lease_ms: u64,
-    ) !ForeignKeyActionJobRecord {
-        return try self.claimAndRunForeignKeyActionJobPageAt(
-            job_id,
-            action,
-            worker_id,
-            constraint_name,
-            parent_table,
-            parent_key,
-            page_limit,
-            lease_ms,
-            currentTimeNs(),
-        );
+    pub fn scheduleForeignKeyActionJob(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize) !ForeignKeyActionJobRecord {
+        return try relational_integrity_impl.scheduleForeignKeyActionJob(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit);
     }
 
-    pub fn scheduleForeignKeyActionJob(
-        self: *DB,
-        job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        page_limit: usize,
-    ) !ForeignKeyActionJobRecord {
-        return try self.scheduleForeignKeyActionJobWithUpdatedParentKeyAt(
-            job_id,
-            action,
-            worker_id,
-            constraint_name,
-            parent_table,
-            parent_key,
-            null,
-            page_limit,
-            currentTimeNs(),
-        );
+    pub fn scheduleForeignKeyActionJobWithUpdatedParentKey(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize) !ForeignKeyActionJobRecord {
+        return try relational_integrity_impl.scheduleForeignKeyActionJobWithUpdatedParentKey(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit);
     }
 
-    pub fn scheduleForeignKeyActionJobWithUpdatedParentKey(
-        self: *DB,
-        job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        updated_parent_key: ?[]const u8,
-        page_limit: usize,
-    ) !ForeignKeyActionJobRecord {
-        return try self.scheduleForeignKeyActionJobWithUpdatedParentKeyAt(
-            job_id,
-            action,
-            worker_id,
-            constraint_name,
-            parent_table,
-            parent_key,
-            updated_parent_key,
-            page_limit,
-            currentTimeNs(),
-        );
+    pub fn scheduleForeignKeyActionJobAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, now_ns: u64) !ForeignKeyActionJobRecord {
+        return try relational_integrity_impl.scheduleForeignKeyActionJobAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit, now_ns);
     }
 
-    pub fn scheduleForeignKeyActionJobAt(
-        self: *DB,
-        job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        page_limit: usize,
-        now_ns: u64,
-    ) !ForeignKeyActionJobRecord {
-        return try self.scheduleForeignKeyActionJobWithUpdatedParentKeyAt(
-            job_id,
-            action,
-            worker_id,
-            constraint_name,
-            parent_table,
-            parent_key,
-            null,
-            page_limit,
-            now_ns,
-        );
+    pub fn scheduleForeignKeyActionJobWithUpdatedParentKeyAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, now_ns: u64) !ForeignKeyActionJobRecord {
+        return try relational_integrity_impl.scheduleForeignKeyActionJobWithUpdatedParentKeyAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, now_ns);
     }
 
-    pub fn scheduleForeignKeyActionJobWithUpdatedParentKeyAt(
-        self: *DB,
-        job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        updated_parent_key: ?[]const u8,
-        page_limit: usize,
-        now_ns: u64,
-    ) !ForeignKeyActionJobRecord {
-        return try self.scheduleForeignKeyActionJobWithUpdatedParentKeyAndCascadeLineageAt(
-            job_id,
-            action,
-            worker_id,
-            constraint_name,
-            parent_table,
-            parent_key,
-            updated_parent_key,
-            page_limit,
-            0,
-            foreign_key_action_default_cascade_max_depth,
-            now_ns,
-        );
+    pub fn scheduleForeignKeyActionJobWithUpdatedParentKeyAndCascadeLineageAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, cascade_depth: u32, cascade_max_depth: u32, now_ns: u64) !ForeignKeyActionJobRecord {
+        return try relational_integrity_impl.scheduleForeignKeyActionJobWithUpdatedParentKeyAndCascadeLineageAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, cascade_depth, cascade_max_depth, now_ns);
     }
 
-    pub fn scheduleForeignKeyActionJobWithUpdatedParentKeyAndCascadeLineageAt(
-        self: *DB,
-        job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        updated_parent_key: ?[]const u8,
-        page_limit: usize,
-        cascade_depth: u32,
-        cascade_max_depth: u32,
-        now_ns: u64,
-    ) !ForeignKeyActionJobRecord {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        if (page_limit == 0) return error.InvalidForeignKeyActionJob;
-        const canonical_action = foreignKeyActionJobCanonicalAction(action) orelse return error.InvalidForeignKeyActionJob;
-        try validateForeignKeyActionLineage(cascade_depth, cascade_max_depth);
-        try validateForeignKeyActionJobIdentity(job_id, canonical_action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const key = try foreignKeyActionJobKeyAlloc(self.alloc, job_id);
-        defer self.alloc.free(key);
-
-        if (self.core.store.get(self.alloc, key)) |raw| {
-            defer self.alloc.free(raw);
-            const existing = try self.cloneForeignKeyActionJobRecordFromJson(raw);
-            errdefer self.freeForeignKeyActionJobRecord(existing);
-            try validateForeignKeyActionJobMatches(existing, canonical_action, constraint_name, parent_table, parent_key, updated_parent_key);
-            return existing;
-        } else |err| switch (err) {
-            error.NotFound => {},
-            else => return err,
-        }
-
-        const record = ForeignKeyActionJobRecord{
-            .job_id = job_id,
-            .action = canonical_action,
-            .worker_id = worker_id,
-            .constraint_name = constraint_name,
-            .parent_table = parent_table,
-            .parent_key = parent_key,
-            .updated_parent_key = updated_parent_key,
-            .page_limit = page_limit,
-            .status = "pending",
-            .created_at_ns = now_ns,
-            .updated_at_ns = now_ns,
-            .claimed_at_ns = 0,
-            .lease_until_ns = 0,
-            .attempts = 0,
-            .completed = false,
-            .applied_children = 0,
-            .failure_count = 0,
-            .first_failed_at_ns = null,
-            .last_failed_at_ns = null,
-            .requeue_count = 0,
-            .last_requeued_at_ns = null,
-            .cascade_depth = cascade_depth,
-            .cascade_max_depth = cascade_max_depth,
-            .next_child_table = null,
-            .next_child_key = null,
-            .last_error = null,
-        };
-        const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
-        defer self.alloc.free(payload);
-        try self.core.store.put(key, payload);
-        return try self.cloneForeignKeyActionJobRecordFromJson(payload);
+    pub fn requeueForeignKeyActionJob(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize) !ForeignKeyActionJobRecord {
+        return try relational_integrity_impl.requeueForeignKeyActionJob(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit);
     }
 
-    pub fn requeueForeignKeyActionJob(
-        self: *DB,
-        job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        page_limit: usize,
-    ) !ForeignKeyActionJobRecord {
-        return try self.requeueForeignKeyActionJobWithUpdatedParentKeyAt(
-            job_id,
-            action,
-            worker_id,
-            constraint_name,
-            parent_table,
-            parent_key,
-            null,
-            page_limit,
-            currentTimeNs(),
-        );
+    pub fn requeueForeignKeyActionJobWithUpdatedParentKey(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize) !ForeignKeyActionJobRecord {
+        return try relational_integrity_impl.requeueForeignKeyActionJobWithUpdatedParentKey(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit);
     }
 
-    pub fn requeueForeignKeyActionJobWithUpdatedParentKey(
-        self: *DB,
-        job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        updated_parent_key: ?[]const u8,
-        page_limit: usize,
-    ) !ForeignKeyActionJobRecord {
-        return try self.requeueForeignKeyActionJobWithUpdatedParentKeyAt(
-            job_id,
-            action,
-            worker_id,
-            constraint_name,
-            parent_table,
-            parent_key,
-            updated_parent_key,
-            page_limit,
-            currentTimeNs(),
-        );
+    pub fn requeueForeignKeyActionJobAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, now_ns: u64) !ForeignKeyActionJobRecord {
+        return try relational_integrity_impl.requeueForeignKeyActionJobAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit, now_ns);
     }
 
-    pub fn requeueForeignKeyActionJobAt(
-        self: *DB,
-        job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        page_limit: usize,
-        now_ns: u64,
-    ) !ForeignKeyActionJobRecord {
-        return try self.requeueForeignKeyActionJobWithUpdatedParentKeyAt(
-            job_id,
-            action,
-            worker_id,
-            constraint_name,
-            parent_table,
-            parent_key,
-            null,
-            page_limit,
-            now_ns,
-        );
+    pub fn requeueForeignKeyActionJobWithUpdatedParentKeyAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, now_ns: u64) !ForeignKeyActionJobRecord {
+        return try relational_integrity_impl.requeueForeignKeyActionJobWithUpdatedParentKeyAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, now_ns);
     }
 
-    pub fn requeueForeignKeyActionJobWithUpdatedParentKeyAt(
-        self: *DB,
-        job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        updated_parent_key: ?[]const u8,
-        page_limit: usize,
-        now_ns: u64,
-    ) !ForeignKeyActionJobRecord {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        if (page_limit == 0) return error.InvalidForeignKeyActionJob;
-        const canonical_action = foreignKeyActionJobCanonicalAction(action) orelse return error.InvalidForeignKeyActionJob;
-        try validateForeignKeyActionJobIdentity(job_id, canonical_action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const key = try foreignKeyActionJobKeyAlloc(self.alloc, job_id);
-        defer self.alloc.free(key);
-        const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
-            error.NotFound => return error.ForeignKeyActionJobNotFound,
-            else => return err,
-        };
-        defer self.alloc.free(raw);
-
-        const existing = try self.cloneForeignKeyActionJobRecordFromJson(raw);
-        defer self.freeForeignKeyActionJobRecord(existing);
-        try validateForeignKeyActionJobMatches(existing, canonical_action, constraint_name, parent_table, parent_key, updated_parent_key);
-        if (existing.completed) return error.InvalidForeignKeyActionJob;
-        if (!std.mem.eql(u8, existing.status, "invalid") and existing.last_error == null) {
-            return error.InvalidForeignKeyActionJob;
-        }
-
-        const record = ForeignKeyActionJobRecord{
-            .job_id = existing.job_id,
-            .action = existing.action,
-            .worker_id = worker_id,
-            .constraint_name = existing.constraint_name,
-            .parent_table = existing.parent_table,
-            .parent_key = existing.parent_key,
-            .updated_parent_key = existing.updated_parent_key,
-            .page_limit = page_limit,
-            .status = "pending",
-            .created_at_ns = existing.created_at_ns,
-            .updated_at_ns = now_ns,
-            .claimed_at_ns = 0,
-            .lease_until_ns = 0,
-            .attempts = existing.attempts,
-            .completed = false,
-            .applied_children = existing.applied_children,
-            .failure_count = existing.failure_count,
-            .first_failed_at_ns = existing.first_failed_at_ns,
-            .last_failed_at_ns = existing.last_failed_at_ns,
-            .requeue_count = existing.requeue_count +| 1,
-            .last_requeued_at_ns = now_ns,
-            .cascade_depth = existing.cascade_depth,
-            .cascade_max_depth = existing.cascade_max_depth,
-            .next_child_table = existing.next_child_table,
-            .next_child_key = existing.next_child_key,
-            .last_error = null,
-        };
-        const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
-        defer self.alloc.free(payload);
-        try self.core.store.put(key, payload);
-        return try self.cloneForeignKeyActionJobRecordFromJson(payload);
+    pub fn scheduleForeignKeyActionSchedule(self: *DB, schedule_id: []const u8, action_job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize) !ForeignKeyActionScheduleRecord {
+        return try relational_integrity_impl.scheduleForeignKeyActionSchedule(self, schedule_id, action_job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit);
     }
 
-    pub fn scheduleForeignKeyActionSchedule(
-        self: *DB,
-        schedule_id: []const u8,
-        action_job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        page_limit: usize,
-    ) !ForeignKeyActionScheduleRecord {
-        return try self.scheduleForeignKeyActionScheduleWithUpdatedParentKeyAt(
-            schedule_id,
-            action_job_id,
-            action,
-            worker_id,
-            constraint_name,
-            parent_table,
-            parent_key,
-            null,
-            page_limit,
-            currentTimeNs(),
-        );
+    pub fn scheduleForeignKeyActionScheduleWithUpdatedParentKey(self: *DB, schedule_id: []const u8, action_job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize) !ForeignKeyActionScheduleRecord {
+        return try relational_integrity_impl.scheduleForeignKeyActionScheduleWithUpdatedParentKey(self, schedule_id, action_job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit);
     }
 
-    pub fn scheduleForeignKeyActionScheduleWithUpdatedParentKey(
-        self: *DB,
-        schedule_id: []const u8,
-        action_job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        updated_parent_key: ?[]const u8,
-        page_limit: usize,
-    ) !ForeignKeyActionScheduleRecord {
-        return try self.scheduleForeignKeyActionScheduleWithUpdatedParentKeyAt(
-            schedule_id,
-            action_job_id,
-            action,
-            worker_id,
-            constraint_name,
-            parent_table,
-            parent_key,
-            updated_parent_key,
-            page_limit,
-            currentTimeNs(),
-        );
+    pub fn scheduleForeignKeyActionScheduleAt(self: *DB, schedule_id: []const u8, action_job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, now_ns: u64) !ForeignKeyActionScheduleRecord {
+        return try relational_integrity_impl.scheduleForeignKeyActionScheduleAt(self, schedule_id, action_job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit, now_ns);
     }
 
-    pub fn scheduleForeignKeyActionScheduleAt(
-        self: *DB,
-        schedule_id: []const u8,
-        action_job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        page_limit: usize,
-        now_ns: u64,
-    ) !ForeignKeyActionScheduleRecord {
-        return try self.scheduleForeignKeyActionScheduleWithUpdatedParentKeyAt(
-            schedule_id,
-            action_job_id,
-            action,
-            worker_id,
-            constraint_name,
-            parent_table,
-            parent_key,
-            null,
-            page_limit,
-            now_ns,
-        );
+    pub fn scheduleForeignKeyActionScheduleWithUpdatedParentKeyAt(self: *DB, schedule_id: []const u8, action_job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, now_ns: u64) !ForeignKeyActionScheduleRecord {
+        return try relational_integrity_impl.scheduleForeignKeyActionScheduleWithUpdatedParentKeyAt(self, schedule_id, action_job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, now_ns);
     }
 
-    pub fn scheduleForeignKeyActionScheduleWithUpdatedParentKeyAt(
-        self: *DB,
-        schedule_id: []const u8,
-        action_job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        updated_parent_key: ?[]const u8,
-        page_limit: usize,
-        now_ns: u64,
-    ) !ForeignKeyActionScheduleRecord {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        if (schedule_id.len == 0 or action_job_id.len == 0 or page_limit == 0) return error.InvalidForeignKeyActionJob;
-        const canonical_action = foreignKeyActionJobCanonicalAction(action) orelse return error.InvalidForeignKeyActionJob;
-        try validateForeignKeyActionJobIdentity(action_job_id, canonical_action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const key = try foreignKeyActionScheduleKeyAlloc(self.alloc, schedule_id);
-        defer self.alloc.free(key);
-        if (self.core.store.get(self.alloc, key)) |raw| {
-            defer self.alloc.free(raw);
-            const existing = try self.cloneForeignKeyActionScheduleRecordFromJson(raw);
-            errdefer self.freeForeignKeyActionScheduleRecord(existing);
-            try validateForeignKeyActionScheduleMatches(existing, action_job_id, canonical_action, constraint_name, parent_table, parent_key, updated_parent_key);
-            return existing;
-        } else |err| switch (err) {
-            error.NotFound => {},
-            else => return err,
-        }
-
-        const record = ForeignKeyActionScheduleRecord{
-            .schedule_id = schedule_id,
-            .action_job_id = action_job_id,
-            .action = canonical_action,
-            .worker_id = worker_id,
-            .constraint_name = constraint_name,
-            .parent_table = parent_table,
-            .parent_key = parent_key,
-            .updated_parent_key = updated_parent_key,
-            .page_limit = page_limit,
-            .status = "pending",
-            .created_at_ns = now_ns,
-            .updated_at_ns = now_ns,
-            .completed = false,
-            .scheduled_groups = 0,
-            .cascade_depth = 0,
-            .cascade_max_depth = foreign_key_action_default_cascade_max_depth,
-            .requeue_count = 0,
-            .last_requeued_at_ns = null,
-            .last_error = null,
-        };
-        const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
-        defer self.alloc.free(payload);
-        try self.core.store.put(key, payload);
-        return try self.cloneForeignKeyActionScheduleRecordFromJson(payload);
+    pub fn requeueForeignKeyActionSchedule(self: *DB, schedule_id: []const u8, action_job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize) !ForeignKeyActionScheduleRecord {
+        return try relational_integrity_impl.requeueForeignKeyActionSchedule(self, schedule_id, action_job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit);
     }
 
-    pub fn requeueForeignKeyActionSchedule(
-        self: *DB,
-        schedule_id: []const u8,
-        action_job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        page_limit: usize,
-    ) !ForeignKeyActionScheduleRecord {
-        return try self.requeueForeignKeyActionScheduleWithUpdatedParentKeyAt(
-            schedule_id,
-            action_job_id,
-            action,
-            worker_id,
-            constraint_name,
-            parent_table,
-            parent_key,
-            null,
-            page_limit,
-            currentTimeNs(),
-        );
+    pub fn requeueForeignKeyActionScheduleAt(self: *DB, schedule_id: []const u8, action_job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, now_ns: u64) !ForeignKeyActionScheduleRecord {
+        return try relational_integrity_impl.requeueForeignKeyActionScheduleAt(self, schedule_id, action_job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit, now_ns);
     }
 
-    pub fn requeueForeignKeyActionScheduleAt(
-        self: *DB,
-        schedule_id: []const u8,
-        action_job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        page_limit: usize,
-        now_ns: u64,
-    ) !ForeignKeyActionScheduleRecord {
-        return try self.requeueForeignKeyActionScheduleWithUpdatedParentKeyAt(
-            schedule_id,
-            action_job_id,
-            action,
-            worker_id,
-            constraint_name,
-            parent_table,
-            parent_key,
-            null,
-            page_limit,
-            now_ns,
-        );
+    pub fn requeueForeignKeyActionScheduleWithUpdatedParentKeyAt(self: *DB, schedule_id: []const u8, action_job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, now_ns: u64) !ForeignKeyActionScheduleRecord {
+        return try relational_integrity_impl.requeueForeignKeyActionScheduleWithUpdatedParentKeyAt(self, schedule_id, action_job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, now_ns);
     }
 
-    pub fn requeueForeignKeyActionScheduleWithUpdatedParentKeyAt(
-        self: *DB,
-        schedule_id: []const u8,
-        action_job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        updated_parent_key: ?[]const u8,
-        page_limit: usize,
-        now_ns: u64,
-    ) !ForeignKeyActionScheduleRecord {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        if (schedule_id.len == 0 or action_job_id.len == 0 or page_limit == 0) return error.InvalidForeignKeyActionJob;
-        const canonical_action = foreignKeyActionJobCanonicalAction(action) orelse return error.InvalidForeignKeyActionJob;
-        try validateForeignKeyActionJobIdentity(action_job_id, canonical_action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const key = try foreignKeyActionScheduleKeyAlloc(self.alloc, schedule_id);
-        defer self.alloc.free(key);
-        const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
-            error.NotFound => return error.ForeignKeyActionScheduleNotFound,
-            else => return err,
-        };
-        defer self.alloc.free(raw);
-
-        const existing = try self.cloneForeignKeyActionScheduleRecordFromJson(raw);
-        defer self.freeForeignKeyActionScheduleRecord(existing);
-        try validateForeignKeyActionScheduleMatches(existing, action_job_id, canonical_action, constraint_name, parent_table, parent_key, updated_parent_key);
-        if (existing.completed) return error.InvalidForeignKeyActionJob;
-        if (!std.mem.eql(u8, existing.status, "invalid") and existing.last_error == null) {
-            return error.InvalidForeignKeyActionJob;
-        }
-
-        const record = ForeignKeyActionScheduleRecord{
-            .schedule_id = existing.schedule_id,
-            .action_job_id = existing.action_job_id,
-            .action = existing.action,
-            .worker_id = worker_id,
-            .constraint_name = existing.constraint_name,
-            .parent_table = existing.parent_table,
-            .parent_key = existing.parent_key,
-            .updated_parent_key = existing.updated_parent_key,
-            .page_limit = page_limit,
-            .status = "pending",
-            .created_at_ns = existing.created_at_ns,
-            .updated_at_ns = now_ns,
-            .completed = false,
-            .scheduled_groups = 0,
-            .cascade_depth = existing.cascade_depth,
-            .cascade_max_depth = existing.cascade_max_depth,
-            .requeue_count = existing.requeue_count +| 1,
-            .last_requeued_at_ns = now_ns,
-            .last_error = null,
-        };
-        const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
-        defer self.alloc.free(payload);
-        try self.core.store.put(key, payload);
-        return try self.cloneForeignKeyActionScheduleRecordFromJson(payload);
+    pub fn markForeignKeyActionScheduleSeeded(self: *DB, schedule_id: []const u8, scheduled_groups: u64) !ForeignKeyActionScheduleRecord {
+        return try relational_integrity_impl.markForeignKeyActionScheduleSeeded(self, schedule_id, scheduled_groups);
     }
 
-    pub fn markForeignKeyActionScheduleSeeded(
-        self: *DB,
-        schedule_id: []const u8,
-        scheduled_groups: u64,
-    ) !ForeignKeyActionScheduleRecord {
-        return try self.markForeignKeyActionScheduleSeededAt(schedule_id, scheduled_groups, currentTimeNs());
+    pub fn markForeignKeyActionScheduleSeededAt(self: *DB, schedule_id: []const u8, scheduled_groups: u64, now_ns: u64) !ForeignKeyActionScheduleRecord {
+        return try relational_integrity_impl.markForeignKeyActionScheduleSeededAt(self, schedule_id, scheduled_groups, now_ns);
     }
 
-    pub fn markForeignKeyActionScheduleSeededAt(
-        self: *DB,
-        schedule_id: []const u8,
-        scheduled_groups: u64,
-        now_ns: u64,
-    ) !ForeignKeyActionScheduleRecord {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        if (schedule_id.len == 0) return error.InvalidForeignKeyActionJob;
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const key = try foreignKeyActionScheduleKeyAlloc(self.alloc, schedule_id);
-        defer self.alloc.free(key);
-        const raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
-            error.NotFound => return error.ForeignKeyActionScheduleNotFound,
-            else => return err,
-        };
-        defer self.alloc.free(raw);
-        const existing = try self.cloneForeignKeyActionScheduleRecordFromJson(raw);
-        defer self.freeForeignKeyActionScheduleRecord(existing);
-        if (existing.completed) return try self.cloneForeignKeyActionScheduleRecordOwned(existing);
-        if (std.mem.eql(u8, existing.status, "invalid") or existing.last_error != null) {
-            return error.InvalidForeignKeyActionJob;
-        }
-
-        const record = ForeignKeyActionScheduleRecord{
-            .schedule_id = existing.schedule_id,
-            .action_job_id = existing.action_job_id,
-            .action = existing.action,
-            .worker_id = existing.worker_id,
-            .constraint_name = existing.constraint_name,
-            .parent_table = existing.parent_table,
-            .parent_key = existing.parent_key,
-            .updated_parent_key = existing.updated_parent_key,
-            .page_limit = existing.page_limit,
-            .status = if (scheduled_groups == 0) "invalid" else "seeded",
-            .created_at_ns = existing.created_at_ns,
-            .updated_at_ns = now_ns,
-            .completed = scheduled_groups != 0,
-            .scheduled_groups = scheduled_groups,
-            .cascade_depth = existing.cascade_depth,
-            .cascade_max_depth = existing.cascade_max_depth,
-            .requeue_count = existing.requeue_count,
-            .last_requeued_at_ns = existing.last_requeued_at_ns,
-            .last_error = if (scheduled_groups == 0) "NoForeignKeyActionOwnerGroups" else null,
-        };
-        const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
-        defer self.alloc.free(payload);
-        try self.core.store.put(key, payload);
-        return try self.cloneForeignKeyActionScheduleRecordFromJson(payload);
+    pub fn claimAndRunForeignKeyActionJobPageAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, lease_ms: u64, now_ns: u64) !ForeignKeyActionJobRecord {
+        return try relational_integrity_impl.claimAndRunForeignKeyActionJobPageAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit, lease_ms, now_ns);
     }
 
-    pub fn claimAndRunForeignKeyActionJobPageAt(
-        self: *DB,
-        job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        page_limit: usize,
-        lease_ms: u64,
-        now_ns: u64,
-    ) !ForeignKeyActionJobRecord {
-        return try self.claimAndRunForeignKeyActionJobPageWithUpdatedParentKeyAt(
-            job_id,
-            action,
-            worker_id,
-            constraint_name,
-            parent_table,
-            parent_key,
-            null,
-            page_limit,
-            lease_ms,
-            now_ns,
-        );
+    pub fn claimAndRunForeignKeyActionJobPageWithUpdatedParentKeyAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, lease_ms: u64, now_ns: u64) !ForeignKeyActionJobRecord {
+        return try relational_integrity_impl.claimAndRunForeignKeyActionJobPageWithUpdatedParentKeyAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, lease_ms, now_ns);
     }
 
-    pub fn claimAndRunForeignKeyActionJobPageWithUpdatedParentKeyAt(
-        self: *DB,
-        job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        updated_parent_key: ?[]const u8,
-        page_limit: usize,
-        lease_ms: u64,
-        now_ns: u64,
-    ) !ForeignKeyActionJobRecord {
-        return try self.claimAndRunForeignKeyActionJobPageWithUpdatedParentKeyAndCascadeLineageAt(
-            job_id,
-            action,
-            worker_id,
-            constraint_name,
-            parent_table,
-            parent_key,
-            updated_parent_key,
-            page_limit,
-            lease_ms,
-            0,
-            foreign_key_action_default_cascade_max_depth,
-            now_ns,
-        );
+    pub fn claimAndRunForeignKeyActionJobPageWithUpdatedParentKeyAndCascadeLineageAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, lease_ms: u64, cascade_depth: u32, cascade_max_depth: u32, now_ns: u64) !ForeignKeyActionJobRecord {
+        return try relational_integrity_impl.claimAndRunForeignKeyActionJobPageWithUpdatedParentKeyAndCascadeLineageAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, lease_ms, cascade_depth, cascade_max_depth, now_ns);
     }
 
-    pub fn claimAndRunForeignKeyActionJobPageWithUpdatedParentKeyAndCascadeLineageAt(
-        self: *DB,
-        job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        updated_parent_key: ?[]const u8,
-        page_limit: usize,
-        lease_ms: u64,
-        cascade_depth: u32,
-        cascade_max_depth: u32,
-        now_ns: u64,
-    ) !ForeignKeyActionJobRecord {
-        if (page_limit == 0 or lease_ms == 0) return error.InvalidForeignKeyActionJob;
-        const canonical_action = foreignKeyActionJobCanonicalAction(action) orelse return error.InvalidForeignKeyActionJob;
-        try validateForeignKeyActionLineage(cascade_depth, cascade_max_depth);
-        try validateForeignKeyActionJobIdentity(job_id, canonical_action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
-
-        const claimed = try self.claimForeignKeyActionJobRecordAt(
-            job_id,
-            canonical_action,
-            worker_id,
-            constraint_name,
-            parent_table,
-            parent_key,
-            updated_parent_key,
-            page_limit,
-            lease_ms,
-            cascade_depth,
-            cascade_max_depth,
-            now_ns,
-        );
-        defer self.freeForeignKeyActionJobRecord(claimed);
-        if (claimed.completed) return try self.cloneForeignKeyActionJobRecordOwned(claimed);
-
-        return self.runClaimedForeignKeyActionJobPageAt(claimed, canonical_action, constraint_name, parent_table, parent_key, page_limit, now_ns) catch |err| {
-            const failed = self.updateForeignKeyActionJobRecordAfterPageAt(
-                claimed,
-                0,
-                false,
-                claimed.next_child_table,
-                claimed.next_child_key,
-                @errorName(err),
-                now_ns +| 1,
-            ) catch null;
-            if (failed) |record| self.freeForeignKeyActionJobRecord(record);
-            return err;
-        };
+    pub fn claimForeignKeyActionJobPage(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, lease_ms: u64) !ForeignKeyActionJobRecord {
+        return try relational_integrity_impl.claimForeignKeyActionJobPage(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit, lease_ms);
     }
 
-    pub fn claimForeignKeyActionJobPage(
-        self: *DB,
-        job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        page_limit: usize,
-        lease_ms: u64,
-    ) !ForeignKeyActionJobRecord {
-        return try self.claimForeignKeyActionJobPageAt(
-            job_id,
-            action,
-            worker_id,
-            constraint_name,
-            parent_table,
-            parent_key,
-            page_limit,
-            lease_ms,
-            currentTimeNs(),
-        );
+    pub fn claimForeignKeyActionJobPageAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, lease_ms: u64, now_ns: u64) !ForeignKeyActionJobRecord {
+        return try relational_integrity_impl.claimForeignKeyActionJobPageAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit, lease_ms, now_ns);
     }
 
-    pub fn claimForeignKeyActionJobPageAt(
-        self: *DB,
-        job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        page_limit: usize,
-        lease_ms: u64,
-        now_ns: u64,
-    ) !ForeignKeyActionJobRecord {
-        return try self.claimForeignKeyActionJobPageWithUpdatedParentKeyAt(
-            job_id,
-            action,
-            worker_id,
-            constraint_name,
-            parent_table,
-            parent_key,
-            null,
-            page_limit,
-            lease_ms,
-            now_ns,
-        );
+    pub fn claimForeignKeyActionJobPageWithUpdatedParentKeyAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, lease_ms: u64, now_ns: u64) !ForeignKeyActionJobRecord {
+        return try relational_integrity_impl.claimForeignKeyActionJobPageWithUpdatedParentKeyAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, lease_ms, now_ns);
     }
 
-    pub fn claimForeignKeyActionJobPageWithUpdatedParentKeyAt(
-        self: *DB,
-        job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        updated_parent_key: ?[]const u8,
-        page_limit: usize,
-        lease_ms: u64,
-        now_ns: u64,
-    ) !ForeignKeyActionJobRecord {
-        return try self.claimForeignKeyActionJobRecordAt(
-            job_id,
-            action,
-            worker_id,
-            constraint_name,
-            parent_table,
-            parent_key,
-            updated_parent_key,
-            page_limit,
-            lease_ms,
-            0,
-            foreign_key_action_default_cascade_max_depth,
-            now_ns,
-        );
+    pub fn claimForeignKeyActionJobPageWithUpdatedParentKeyAndCascadeLineageAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, lease_ms: u64, cascade_depth: u32, cascade_max_depth: u32, now_ns: u64) !ForeignKeyActionJobRecord {
+        return try relational_integrity_impl.claimForeignKeyActionJobPageWithUpdatedParentKeyAndCascadeLineageAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, lease_ms, cascade_depth, cascade_max_depth, now_ns);
     }
 
-    pub fn claimForeignKeyActionJobPageWithUpdatedParentKeyAndCascadeLineageAt(
-        self: *DB,
-        job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        updated_parent_key: ?[]const u8,
-        page_limit: usize,
-        lease_ms: u64,
-        cascade_depth: u32,
-        cascade_max_depth: u32,
-        now_ns: u64,
-    ) !ForeignKeyActionJobRecord {
-        return try self.claimForeignKeyActionJobRecordAt(
-            job_id,
-            action,
-            worker_id,
-            constraint_name,
-            parent_table,
-            parent_key,
-            updated_parent_key,
-            page_limit,
-            lease_ms,
-            cascade_depth,
-            cascade_max_depth,
-            now_ns,
-        );
+    pub fn finishClaimedForeignKeyActionJobPage(self: *DB, claimed: ForeignKeyActionJobRecord, applied_count: usize, complete: bool, next_child_table: ?[]const u8, next_child_key: ?[]const u8, last_error: ?[]const u8) !ForeignKeyActionJobRecord {
+        return try relational_integrity_impl.finishClaimedForeignKeyActionJobPage(self, claimed, applied_count, complete, next_child_table, next_child_key, last_error);
     }
 
-    pub fn finishClaimedForeignKeyActionJobPage(
-        self: *DB,
-        claimed: ForeignKeyActionJobRecord,
-        applied_count: usize,
-        complete: bool,
-        next_child_table: ?[]const u8,
-        next_child_key: ?[]const u8,
-        last_error: ?[]const u8,
-    ) !ForeignKeyActionJobRecord {
-        return try self.finishClaimedForeignKeyActionJobPageAt(
-            claimed,
-            applied_count,
-            complete,
-            next_child_table,
-            next_child_key,
-            last_error,
-            currentTimeNs(),
-        );
+    pub fn finishClaimedForeignKeyActionJobPageAt(self: *DB, claimed: ForeignKeyActionJobRecord, applied_count: usize, complete: bool, next_child_table: ?[]const u8, next_child_key: ?[]const u8, last_error: ?[]const u8, now_ns: u64) !ForeignKeyActionJobRecord {
+        return try relational_integrity_impl.finishClaimedForeignKeyActionJobPageAt(self, claimed, applied_count, complete, next_child_table, next_child_key, last_error, now_ns);
     }
 
-    pub fn finishClaimedForeignKeyActionJobPageAt(
-        self: *DB,
-        claimed: ForeignKeyActionJobRecord,
-        applied_count: usize,
-        complete: bool,
-        next_child_table: ?[]const u8,
-        next_child_key: ?[]const u8,
-        last_error: ?[]const u8,
-        now_ns: u64,
-    ) !ForeignKeyActionJobRecord {
-        return try self.updateForeignKeyActionJobRecordAfterPageAt(
-            claimed,
-            applied_count,
-            complete,
-            next_child_table,
-            next_child_key,
-            last_error,
-            now_ns,
-        );
+    pub fn claimAndRunForeignKeyIntegrityWorkUnit(self: *DB, claim_key: []const u8, worker_id: []const u8, group_id: u64, phase: []const u8, mode: relational_store_mod.ForeignKeyIntegrityMode, constraint_name: ?[]const u8, lower_doc_key: []const u8, upper_doc_key: []const u8, lease_ms: u64) !ForeignKeyIntegrityReport {
+        return try relational_integrity_impl.claimAndRunForeignKeyIntegrityWorkUnit(self, claim_key, worker_id, group_id, phase, mode, constraint_name, lower_doc_key, upper_doc_key, lease_ms);
     }
 
-    fn runClaimedForeignKeyActionJobPageAt(
-        self: *DB,
-        claimed: ForeignKeyActionJobRecord,
-        action: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        page_limit: usize,
-        now_ns: u64,
-    ) !ForeignKeyActionJobRecord {
-        var page = try self.listForeignKeyRefChildrenPageForParent(
-            self.alloc,
-            constraint_name,
-            parent_table,
-            parent_key,
-            claimed.next_child_table,
-            claimed.next_child_key,
-            page_limit,
-        );
-        defer self.freeForeignKeyRefChildrenPage(self.alloc, &page);
-
-        if (page.children.len > 0) {
-            const txn_id = try self.beginTransaction(now_ns);
-            var txn_open = true;
-            errdefer if (txn_open) self.abortTransaction(txn_id, now_ns +| 1) catch {};
-
-            if (std.mem.eql(u8, action, "set_null")) {
-                const actions = try self.alloc.alloc(types.ForeignKeySetNullChildAction, page.children.len);
-                defer self.alloc.free(actions);
-                for (page.children, 0..) |child, i| {
-                    actions[i] = .{
-                        .constraint_name = constraint_name,
-                        .parent_table = parent_table,
-                        .parent_key = parent_key,
-                        .child_key = child.child_key,
-                    };
-                }
-                try self.writeTransaction(txn_id, .{ .foreign_key_set_null_children = actions });
-            } else if (std.mem.eql(u8, action, "update_set_null")) {
-                const actions = try self.alloc.alloc(types.ForeignKeySetNullChildAction, page.children.len);
-                defer self.alloc.free(actions);
-                for (page.children, 0..) |child, i| {
-                    actions[i] = .{
-                        .constraint_name = constraint_name,
-                        .parent_table = parent_table,
-                        .parent_key = parent_key,
-                        .child_key = child.child_key,
-                        .operation = .update,
-                    };
-                }
-                try self.writeTransaction(txn_id, .{ .foreign_key_set_null_children = actions });
-            } else if (std.mem.eql(u8, action, "cascade")) {
-                const actions = try self.alloc.alloc(types.ForeignKeyCascadeChildAction, page.children.len);
-                defer self.alloc.free(actions);
-                for (page.children, 0..) |child, i| {
-                    actions[i] = .{
-                        .constraint_name = constraint_name,
-                        .parent_table = parent_table,
-                        .parent_key = parent_key,
-                        .child_key = child.child_key,
-                    };
-                }
-                try self.writeTransaction(txn_id, .{ .foreign_key_cascade_children = actions });
-            } else if (std.mem.eql(u8, action, "update_cascade")) {
-                const updated_parent_key = claimed.updated_parent_key orelse return error.InvalidForeignKeyActionJob;
-                const actions = try self.alloc.alloc(types.ForeignKeyCascadeChildAction, page.children.len);
-                defer self.alloc.free(actions);
-                for (page.children, 0..) |child, i| {
-                    actions[i] = .{
-                        .constraint_name = constraint_name,
-                        .parent_table = parent_table,
-                        .parent_key = parent_key,
-                        .updated_parent_key = updated_parent_key,
-                        .child_key = child.child_key,
-                        .operation = .update,
-                    };
-                }
-                try self.writeTransaction(txn_id, .{ .foreign_key_cascade_children = actions });
-            } else {
-                return error.InvalidForeignKeyActionJob;
-            }
-            try self.commitTransaction(txn_id, now_ns +| 1);
-            txn_open = false;
-        }
-
-        return try self.updateForeignKeyActionJobRecordAfterPageAt(
-            claimed,
-            page.children.len,
-            page.complete,
-            page.next_child_table,
-            page.next_child_key,
-            null,
-            now_ns +| 1,
-        );
-    }
-
-    fn claimForeignKeyActionJobRecordAt(
-        self: *DB,
-        job_id: []const u8,
-        action: []const u8,
-        worker_id: []const u8,
-        constraint_name: []const u8,
-        parent_table: []const u8,
-        parent_key: []const u8,
-        updated_parent_key: ?[]const u8,
-        page_limit: usize,
-        lease_ms: u64,
-        cascade_depth: u32,
-        cascade_max_depth: u32,
-        now_ns: u64,
-    ) !ForeignKeyActionJobRecord {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        if (page_limit == 0 or lease_ms == 0) return error.InvalidForeignKeyActionJob;
-        const canonical_action = foreignKeyActionJobCanonicalAction(action) orelse return error.InvalidForeignKeyActionJob;
-        try validateForeignKeyActionLineage(cascade_depth, cascade_max_depth);
-        try validateForeignKeyActionJobIdentity(job_id, canonical_action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const key = try foreignKeyActionJobKeyAlloc(self.alloc, job_id);
-        defer self.alloc.free(key);
-
-        var created_at_ns = now_ns;
-        var attempts: u32 = 1;
-        var completed = false;
-        var applied_children: u64 = 0;
-        var failure_count: u64 = 0;
-        var first_failed_at_ns: ?u64 = null;
-        var last_failed_at_ns: ?u64 = null;
-        var requeue_count: u64 = 0;
-        var last_requeued_at_ns: ?u64 = null;
-        var record_cascade_depth: u32 = cascade_depth;
-        var record_cascade_max_depth: u32 = cascade_max_depth;
-        var next_child_table: ?[]const u8 = null;
-        var next_child_key: ?[]const u8 = null;
-        var existing_next_child_table: ?[]u8 = null;
-        var existing_next_child_key: ?[]u8 = null;
-        defer {
-            if (existing_next_child_table) |value| self.alloc.free(value);
-            if (existing_next_child_key) |value| self.alloc.free(value);
-        }
-        if (self.core.store.get(self.alloc, key)) |raw| {
-            defer self.alloc.free(raw);
-            const existing = try self.cloneForeignKeyActionJobRecordFromJson(raw);
-            defer self.freeForeignKeyActionJobRecord(existing);
-            try validateForeignKeyActionJobMatches(existing, canonical_action, constraint_name, parent_table, parent_key, updated_parent_key);
-            if (existing.completed) {
-                return try self.cloneForeignKeyActionJobRecordOwned(existing);
-            }
-            if (!existing.completed and (std.mem.eql(u8, existing.status, "invalid") or existing.last_error != null)) {
-                return error.InvalidForeignKeyActionJob;
-            }
-            if (!existing.completed and !std.mem.eql(u8, existing.worker_id, worker_id) and existing.lease_until_ns > now_ns) {
-                return error.ForeignKeyIntegrityClaimBusy;
-            }
-            created_at_ns = existing.created_at_ns;
-            attempts = existing.attempts +| 1;
-            completed = existing.completed;
-            applied_children = existing.applied_children;
-            failure_count = existing.failure_count;
-            first_failed_at_ns = existing.first_failed_at_ns;
-            last_failed_at_ns = existing.last_failed_at_ns;
-            requeue_count = existing.requeue_count;
-            last_requeued_at_ns = existing.last_requeued_at_ns;
-            record_cascade_depth = existing.cascade_depth;
-            record_cascade_max_depth = existing.cascade_max_depth;
-            if (existing.next_child_table) |value| {
-                existing_next_child_table = try self.alloc.dupe(u8, value);
-                next_child_table = existing_next_child_table.?;
-            }
-            if (existing.next_child_key) |value| {
-                existing_next_child_key = try self.alloc.dupe(u8, value);
-                next_child_key = existing_next_child_key.?;
-            }
-        } else |err| switch (err) {
-            error.NotFound => {},
-            else => return err,
-        }
-
-        const lease_ns = std.math.mul(u64, lease_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
-        const lease_until_ns = now_ns +| lease_ns;
-        const record = ForeignKeyActionJobRecord{
-            .job_id = job_id,
-            .action = canonical_action,
-            .worker_id = worker_id,
-            .constraint_name = constraint_name,
-            .parent_table = parent_table,
-            .parent_key = parent_key,
-            .updated_parent_key = updated_parent_key,
-            .page_limit = page_limit,
-            .status = if (completed) "complete" else "claimed",
-            .created_at_ns = created_at_ns,
-            .updated_at_ns = now_ns,
-            .claimed_at_ns = now_ns,
-            .lease_until_ns = lease_until_ns,
-            .attempts = attempts,
-            .completed = completed,
-            .applied_children = applied_children,
-            .failure_count = failure_count,
-            .first_failed_at_ns = first_failed_at_ns,
-            .last_failed_at_ns = last_failed_at_ns,
-            .requeue_count = requeue_count,
-            .last_requeued_at_ns = last_requeued_at_ns,
-            .cascade_depth = record_cascade_depth,
-            .cascade_max_depth = record_cascade_max_depth,
-            .next_child_table = next_child_table,
-            .next_child_key = next_child_key,
-            .last_error = null,
-        };
-        const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
-        defer self.alloc.free(payload);
-        try self.core.store.put(key, payload);
-        return try self.cloneForeignKeyActionJobRecordFromJson(payload);
-    }
-
-    fn updateForeignKeyActionJobRecordAfterPageAt(
-        self: *DB,
-        existing: ForeignKeyActionJobRecord,
-        applied_count: usize,
-        complete: bool,
-        next_child_table: ?[]const u8,
-        next_child_key: ?[]const u8,
-        last_error: ?[]const u8,
-        now_ns: u64,
-    ) !ForeignKeyActionJobRecord {
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        try validateForeignKeyActionJobPageFinish(applied_count, complete, next_child_table, next_child_key, last_error);
-        lockApply(self);
-        defer self.core.unlockApply();
-
-        const key = try foreignKeyActionJobKeyAlloc(self.alloc, existing.job_id);
-        defer self.alloc.free(key);
-        const current_raw = self.core.store.get(self.alloc, key) catch |err| switch (err) {
-            error.NotFound => return error.ForeignKeyActionJobNotFound,
-            else => return err,
-        };
-        defer self.alloc.free(current_raw);
-        const current = try self.cloneForeignKeyActionJobRecordFromJson(current_raw);
-        defer self.freeForeignKeyActionJobRecord(current);
-        try validateForeignKeyActionJobMatches(current, existing.action, existing.constraint_name, existing.parent_table, existing.parent_key, existing.updated_parent_key);
-        if (!foreignKeyActionJobClaimsMatch(current, existing)) return error.ForeignKeyIntegrityClaimBusy;
-        const failed = last_error != null;
-
-        const record = ForeignKeyActionJobRecord{
-            .job_id = current.job_id,
-            .action = current.action,
-            .worker_id = current.worker_id,
-            .constraint_name = current.constraint_name,
-            .parent_table = current.parent_table,
-            .parent_key = current.parent_key,
-            .updated_parent_key = current.updated_parent_key,
-            .page_limit = current.page_limit,
-            .status = if (last_error != null) "invalid" else if (complete) "complete" else "pending",
-            .created_at_ns = current.created_at_ns,
-            .updated_at_ns = now_ns,
-            .claimed_at_ns = current.claimed_at_ns,
-            .lease_until_ns = current.lease_until_ns,
-            .attempts = current.attempts,
-            .completed = complete and !failed,
-            .applied_children = current.applied_children +| @as(u64, @intCast(applied_count)),
-            .failure_count = current.failure_count +| @as(u64, if (failed) 1 else 0),
-            .first_failed_at_ns = if (failed and current.first_failed_at_ns == null) now_ns else current.first_failed_at_ns,
-            .last_failed_at_ns = if (failed) now_ns else current.last_failed_at_ns,
-            .requeue_count = current.requeue_count,
-            .last_requeued_at_ns = current.last_requeued_at_ns,
-            .cascade_depth = current.cascade_depth,
-            .cascade_max_depth = current.cascade_max_depth,
-            .next_child_table = if (complete) null else next_child_table,
-            .next_child_key = if (complete) null else next_child_key,
-            .last_error = last_error,
-        };
-        const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
-        defer self.alloc.free(payload);
-        try self.core.store.put(key, payload);
-        return try self.cloneForeignKeyActionJobRecordFromJson(payload);
-    }
-
-    fn validateForeignKeyActionJobPageFinish(
-        applied_count: usize,
-        complete: bool,
-        next_child_table: ?[]const u8,
-        next_child_key: ?[]const u8,
-        last_error: ?[]const u8,
-    ) !void {
-        if ((next_child_table == null) != (next_child_key == null)) return error.InvalidForeignKeyActionJob;
-        if (next_child_table) |table| if (table.len == 0) return error.InvalidForeignKeyActionJob;
-        if (next_child_key) |key| if (key.len == 0) return error.InvalidForeignKeyActionJob;
-        if (complete) {
-            if (last_error != null or next_child_table != null) return error.InvalidForeignKeyActionJob;
-            return;
-        }
-        if (last_error == null and next_child_table == null) return error.InvalidForeignKeyActionJob;
-        if (last_error != null and applied_count > 0 and next_child_table == null) return error.InvalidForeignKeyActionJob;
-    }
-
-    pub fn claimAndRunForeignKeyIntegrityWorkUnit(
-        self: *DB,
-        claim_key: []const u8,
-        worker_id: []const u8,
-        group_id: u64,
-        phase: []const u8,
-        mode: relational_store_mod.ForeignKeyIntegrityMode,
-        constraint_name: ?[]const u8,
-        lower_doc_key: []const u8,
-        upper_doc_key: []const u8,
-        lease_ms: u64,
-    ) !ForeignKeyIntegrityReport {
-        return try self.claimAndRunForeignKeyIntegrityWorkUnitAt(
-            claim_key,
-            worker_id,
-            group_id,
-            phase,
-            mode,
-            constraint_name,
-            lower_doc_key,
-            upper_doc_key,
-            lease_ms,
-            currentTimeNs(),
-        );
-    }
-
-    pub fn claimAndRunForeignKeyIntegrityWorkUnitAt(
-        self: *DB,
-        claim_key: []const u8,
-        worker_id: []const u8,
-        group_id: u64,
-        phase: []const u8,
-        mode: relational_store_mod.ForeignKeyIntegrityMode,
-        constraint_name: ?[]const u8,
-        lower_doc_key: []const u8,
-        upper_doc_key: []const u8,
-        lease_ms: u64,
-        now_ns: u64,
-    ) !ForeignKeyIntegrityReport {
-        const claim = try self.claimForeignKeyIntegrityWorkUnitAt(
-            claim_key,
-            worker_id,
-            group_id,
-            phase,
-            foreignKeyIntegrityModeName(mode),
-            constraint_name,
-            lower_doc_key,
-            upper_doc_key,
-            lease_ms,
-            now_ns,
-        );
-        defer self.freeForeignKeyIntegrityClaimRecord(claim);
-
-        if (std.mem.eql(u8, phase, "owner_range")) {
-            const scoped_constraint = constraint_name orelse return error.InvalidForeignKeyIntegrityRequest;
-            lockApply(self);
-            defer self.core.unlockApply();
-            return try self.reconcileForeignKeyRefOwnerRangeForConstraintLocked(scoped_constraint, lower_doc_key, upper_doc_key, mode);
-        }
-        if (!std.mem.eql(u8, phase, "child_range")) return error.InvalidForeignKeyIntegrityRequest;
-        return switch (mode) {
-            .validate => try self.validateForeignKeyRefsInRangeForConstraint(constraint_name, lower_doc_key, upper_doc_key),
-            .dry_run => try self.dryRunRepairForeignKeyRefsInRangeForConstraint(constraint_name, lower_doc_key, upper_doc_key),
-            .repair => try self.repairForeignKeyRefsInRangeForConstraint(constraint_name, lower_doc_key, upper_doc_key),
-        };
-    }
-
-    fn foreignKeyIntegrityProgressKeyAlloc(
-        alloc: Allocator,
-        phase: []const u8,
-        mode: relational_store_mod.ForeignKeyIntegrityMode,
-        constraint_name: ?[]const u8,
-        lower_doc_key: []const u8,
-        upper_doc_key: []const u8,
-    ) ![]u8 {
-        const constraint = constraint_name orelse "*";
-        return try std.fmt.allocPrint(alloc, "{s}:v2:{d}:{s}:{s}:{d}:{s}:{d}:{s}:{d}:{s}", .{
-            foreign_key_integrity_progress_key_prefix,
-            phase.len,
-            phase,
-            foreignKeyIntegrityModeName(mode),
-            constraint.len,
-            constraint,
-            lower_doc_key.len,
-            lower_doc_key,
-            upper_doc_key.len,
-            upper_doc_key,
-        });
-    }
-
-    fn foreignKeyIntegrityClaimKeyAlloc(
-        alloc: Allocator,
-        claim_key: []const u8,
-    ) ![]u8 {
-        return try std.fmt.allocPrint(alloc, "{s}:{d}:{s}", .{
-            foreign_key_integrity_claim_key_prefix,
-            claim_key.len,
-            claim_key,
-        });
-    }
-
-    fn foreignKeyIntegrityJobKeyAlloc(
-        alloc: Allocator,
-        job_id: []const u8,
-    ) ![]u8 {
-        return try std.fmt.allocPrint(alloc, "{s}:{d}:{s}", .{
-            foreign_key_integrity_job_key_prefix,
-            job_id.len,
-            job_id,
-        });
-    }
-
-    fn foreignKeyActionJobKeyAlloc(
-        alloc: Allocator,
-        job_id: []const u8,
-    ) ![]u8 {
-        return try std.fmt.allocPrint(alloc, "{s}:{d}:{s}", .{
-            foreign_key_action_job_key_prefix,
-            job_id.len,
-            job_id,
-        });
-    }
-
-    fn foreignKeyActionScheduleKeyAlloc(
-        alloc: Allocator,
-        schedule_id: []const u8,
-    ) ![]u8 {
-        return try std.fmt.allocPrint(alloc, "{s}:{d}:{s}", .{
-            foreign_key_action_schedule_key_prefix,
-            schedule_id.len,
-            schedule_id,
-        });
-    }
-
-    fn uniqueConstraintIntegrityProgressKeyAlloc(
-        alloc: Allocator,
-        mode: relational_store_mod.ForeignKeyIntegrityMode,
-        lower_doc_key: []const u8,
-        upper_doc_key: []const u8,
-    ) ![]u8 {
-        return try std.fmt.allocPrint(alloc, "{s}:{s}:{d}:{s}:{d}:{s}", .{
-            unique_constraint_integrity_progress_key_prefix,
-            foreignKeyIntegrityModeName(mode),
-            lower_doc_key.len,
-            lower_doc_key,
-            upper_doc_key.len,
-            upper_doc_key,
-        });
-    }
-
-    fn cloneForeignKeyIntegrityClaimRecordFromJson(self: *DB, raw: []const u8) !ForeignKeyIntegrityClaimRecord {
-        var parsed = try std.json.parseFromSlice(ForeignKeyIntegrityClaimRecord, self.alloc, raw, .{
-            .allocate = .alloc_always,
-            .ignore_unknown_fields = true,
-        });
-        defer parsed.deinit();
-
-        var cloned = ForeignKeyIntegrityClaimRecord{
-            .version = parsed.value.version,
-            .claim_key = &.{},
-            .worker_id = &.{},
-            .group_id = parsed.value.group_id,
-            .phase = &.{},
-            .planned_action = &.{},
-            .constraint_name = null,
-            .lower_doc_key = &.{},
-            .upper_doc_key = &.{},
-            .claimed_at_ns = parsed.value.claimed_at_ns,
-            .lease_until_ns = parsed.value.lease_until_ns,
-            .attempts = parsed.value.attempts,
-        };
-        errdefer self.freeForeignKeyIntegrityClaimRecord(cloned);
-        cloned.claim_key = try self.alloc.dupe(u8, parsed.value.claim_key);
-        cloned.worker_id = try self.alloc.dupe(u8, parsed.value.worker_id);
-        cloned.phase = try self.alloc.dupe(u8, parsed.value.phase);
-        cloned.planned_action = try self.alloc.dupe(u8, parsed.value.planned_action);
-        if (parsed.value.constraint_name) |value| cloned.constraint_name = try self.alloc.dupe(u8, value);
-        cloned.lower_doc_key = try self.alloc.dupe(u8, parsed.value.lower_doc_key);
-        cloned.upper_doc_key = try self.alloc.dupe(u8, parsed.value.upper_doc_key);
-        return cloned;
-    }
-
-    fn cloneForeignKeyIntegrityJobRecordFromJson(self: *DB, raw: []const u8) !ForeignKeyIntegrityJobRecord {
-        var parsed = try std.json.parseFromSlice(ForeignKeyIntegrityJobRecord, self.alloc, raw, .{
-            .allocate = .alloc_always,
-            .ignore_unknown_fields = true,
-        });
-        defer parsed.deinit();
-
-        var cloned = ForeignKeyIntegrityJobRecord{
-            .version = parsed.value.version,
-            .job_id = &.{},
-            .table_name = &.{},
-            .action = &.{},
-            .worker_id = &.{},
-            .constraint_name = null,
-            .lower_doc_key = &.{},
-            .upper_doc_key = &.{},
-            .lease_ms = parsed.value.lease_ms,
-            .max_work_units = parsed.value.max_work_units,
-            .status = &.{},
-            .created_at_ns = parsed.value.created_at_ns,
-            .updated_at_ns = parsed.value.updated_at_ns,
-            .attempts = parsed.value.attempts,
-            .completed = parsed.value.completed,
-            .valid = parsed.value.valid,
-            .last_report = parsed.value.last_report,
-            .aggregate_report = parsed.value.aggregate_report,
-            .violation_samples_json = &.{},
-            .violation_sample_count = parsed.value.violation_sample_count,
-            .violations_truncated = parsed.value.violations_truncated,
-            .diagnostic_passes = parsed.value.diagnostic_passes,
-            .violating_passes = parsed.value.violating_passes,
-            .first_violation_at_ns = parsed.value.first_violation_at_ns,
-            .last_violation_at_ns = parsed.value.last_violation_at_ns,
-        };
-        errdefer self.freeForeignKeyIntegrityJobRecord(cloned);
-        cloned.job_id = try self.alloc.dupe(u8, parsed.value.job_id);
-        cloned.table_name = try self.alloc.dupe(u8, parsed.value.table_name);
-        cloned.action = try self.alloc.dupe(u8, parsed.value.action);
-        cloned.worker_id = try self.alloc.dupe(u8, parsed.value.worker_id);
-        if (parsed.value.constraint_name) |value| cloned.constraint_name = try self.alloc.dupe(u8, value);
-        cloned.lower_doc_key = try self.alloc.dupe(u8, parsed.value.lower_doc_key);
-        cloned.upper_doc_key = try self.alloc.dupe(u8, parsed.value.upper_doc_key);
-        cloned.status = try self.alloc.dupe(u8, parsed.value.status);
-        cloned.violation_samples_json = try self.alloc.dupe(u8, parsed.value.violation_samples_json);
-        return cloned;
-    }
-
-    fn cloneForeignKeyActionJobRecordFromJson(self: *DB, raw: []const u8) !ForeignKeyActionJobRecord {
-        var parsed = try std.json.parseFromSlice(ForeignKeyActionJobRecord, self.alloc, raw, .{
-            .allocate = .alloc_always,
-            .ignore_unknown_fields = true,
-        });
-        defer parsed.deinit();
-        try validateForeignKeyActionLineage(parsed.value.cascade_depth, parsed.value.cascade_max_depth);
-
-        var cloned = ForeignKeyActionJobRecord{
-            .version = parsed.value.version,
-            .job_id = &.{},
-            .action = &.{},
-            .worker_id = &.{},
-            .constraint_name = &.{},
-            .parent_table = &.{},
-            .parent_key = &.{},
-            .updated_parent_key = null,
-            .page_limit = parsed.value.page_limit,
-            .status = &.{},
-            .created_at_ns = parsed.value.created_at_ns,
-            .updated_at_ns = parsed.value.updated_at_ns,
-            .claimed_at_ns = parsed.value.claimed_at_ns,
-            .lease_until_ns = parsed.value.lease_until_ns,
-            .attempts = parsed.value.attempts,
-            .completed = parsed.value.completed,
-            .applied_children = parsed.value.applied_children,
-            .failure_count = parsed.value.failure_count,
-            .first_failed_at_ns = parsed.value.first_failed_at_ns,
-            .last_failed_at_ns = parsed.value.last_failed_at_ns,
-            .requeue_count = parsed.value.requeue_count,
-            .last_requeued_at_ns = parsed.value.last_requeued_at_ns,
-            .cascade_depth = parsed.value.cascade_depth,
-            .cascade_max_depth = parsed.value.cascade_max_depth,
-            .next_child_table = null,
-            .next_child_key = null,
-            .last_error = null,
-        };
-        errdefer self.freeForeignKeyActionJobRecord(cloned);
-        cloned.job_id = try self.alloc.dupe(u8, parsed.value.job_id);
-        cloned.action = try self.alloc.dupe(u8, parsed.value.action);
-        cloned.worker_id = try self.alloc.dupe(u8, parsed.value.worker_id);
-        cloned.constraint_name = try self.alloc.dupe(u8, parsed.value.constraint_name);
-        cloned.parent_table = try self.alloc.dupe(u8, parsed.value.parent_table);
-        cloned.parent_key = try self.alloc.dupe(u8, parsed.value.parent_key);
-        if (parsed.value.updated_parent_key) |value| cloned.updated_parent_key = try self.alloc.dupe(u8, value);
-        cloned.status = try self.alloc.dupe(u8, parsed.value.status);
-        if (parsed.value.next_child_table) |value| cloned.next_child_table = try self.alloc.dupe(u8, value);
-        if (parsed.value.next_child_key) |value| cloned.next_child_key = try self.alloc.dupe(u8, value);
-        if (parsed.value.last_error) |value| cloned.last_error = try self.alloc.dupe(u8, value);
-        return cloned;
-    }
-
-    fn cloneForeignKeyActionJobRecordOwned(self: *DB, record: ForeignKeyActionJobRecord) !ForeignKeyActionJobRecord {
-        const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
-        defer self.alloc.free(payload);
-        return try self.cloneForeignKeyActionJobRecordFromJson(payload);
-    }
-
-    fn cloneForeignKeyActionScheduleRecordOwned(self: *DB, record: ForeignKeyActionScheduleRecord) !ForeignKeyActionScheduleRecord {
-        const payload = try std.json.Stringify.valueAlloc(self.alloc, record, .{ .emit_null_optional_fields = false });
-        defer self.alloc.free(payload);
-        return try self.cloneForeignKeyActionScheduleRecordFromJson(payload);
-    }
-
-    fn cloneForeignKeyActionScheduleRecordFromJson(self: *DB, raw: []const u8) !ForeignKeyActionScheduleRecord {
-        var parsed = try std.json.parseFromSlice(ForeignKeyActionScheduleRecord, self.alloc, raw, .{
-            .allocate = .alloc_always,
-            .ignore_unknown_fields = true,
-        });
-        defer parsed.deinit();
-        try validateForeignKeyActionLineage(parsed.value.cascade_depth, parsed.value.cascade_max_depth);
-
-        var cloned = ForeignKeyActionScheduleRecord{
-            .version = parsed.value.version,
-            .schedule_id = &.{},
-            .action_job_id = &.{},
-            .action = &.{},
-            .worker_id = &.{},
-            .constraint_name = &.{},
-            .parent_table = &.{},
-            .parent_key = &.{},
-            .updated_parent_key = null,
-            .page_limit = parsed.value.page_limit,
-            .status = &.{},
-            .created_at_ns = parsed.value.created_at_ns,
-            .updated_at_ns = parsed.value.updated_at_ns,
-            .completed = parsed.value.completed,
-            .scheduled_groups = parsed.value.scheduled_groups,
-            .cascade_depth = parsed.value.cascade_depth,
-            .cascade_max_depth = parsed.value.cascade_max_depth,
-            .requeue_count = parsed.value.requeue_count,
-            .last_requeued_at_ns = parsed.value.last_requeued_at_ns,
-            .last_error = null,
-        };
-        errdefer self.freeForeignKeyActionScheduleRecord(cloned);
-        cloned.schedule_id = try self.alloc.dupe(u8, parsed.value.schedule_id);
-        cloned.action_job_id = try self.alloc.dupe(u8, parsed.value.action_job_id);
-        cloned.action = try self.alloc.dupe(u8, parsed.value.action);
-        cloned.worker_id = try self.alloc.dupe(u8, parsed.value.worker_id);
-        cloned.constraint_name = try self.alloc.dupe(u8, parsed.value.constraint_name);
-        cloned.parent_table = try self.alloc.dupe(u8, parsed.value.parent_table);
-        cloned.parent_key = try self.alloc.dupe(u8, parsed.value.parent_key);
-        if (parsed.value.updated_parent_key) |value| cloned.updated_parent_key = try self.alloc.dupe(u8, value);
-        cloned.status = try self.alloc.dupe(u8, parsed.value.status);
-        if (parsed.value.last_error) |value| cloned.last_error = try self.alloc.dupe(u8, value);
-        return cloned;
-    }
-
-    fn metadataPrefixUpperAlloc(alloc: Allocator, prefix: []const u8) !?[]u8 {
-        var out = try alloc.dupe(u8, prefix);
-        errdefer alloc.free(out);
-        var i = out.len;
-        while (i > 0) {
-            i -= 1;
-            if (out[i] != 0xff) {
-                out[i] += 1;
-                return try alloc.realloc(out, i + 1);
-            }
-        }
-        alloc.free(out);
-        return null;
+    pub fn claimAndRunForeignKeyIntegrityWorkUnitAt(self: *DB, claim_key: []const u8, worker_id: []const u8, group_id: u64, phase: []const u8, mode: relational_store_mod.ForeignKeyIntegrityMode, constraint_name: ?[]const u8, lower_doc_key: []const u8, upper_doc_key: []const u8, lease_ms: u64, now_ns: u64) !ForeignKeyIntegrityReport {
+        return try relational_integrity_impl.claimAndRunForeignKeyIntegrityWorkUnitAt(self, claim_key, worker_id, group_id, phase, mode, constraint_name, lower_doc_key, upper_doc_key, lease_ms, now_ns);
     }
 
     fn foreignKeyIntegrityModeName(mode: relational_store_mod.ForeignKeyIntegrityMode) []const u8 {
-        return switch (mode) {
-            .validate => "validate",
-            .dry_run => "dry_run",
-            .repair => "repair",
-        };
+        return relational_integrity_impl.foreignKeyIntegrityModeName(mode);
     }
 
     fn foreignKeyActionJobCanonicalAction(action: []const u8) ?[]const u8 {
-        if (enumTokenEql(action, "set_null") or enumTokenEql(action, "delete_set_null") or enumTokenEql(action, "on_delete_set_null")) return "set_null";
-        if (enumTokenEql(action, "cascade") or enumTokenEql(action, "delete_cascade") or enumTokenEql(action, "on_delete_cascade")) return "cascade";
-        if (enumTokenEql(action, "update_set_null") or enumTokenEql(action, "on_update_set_null")) return "update_set_null";
-        if (enumTokenEql(action, "update_cascade") or enumTokenEql(action, "on_update_cascade")) return "update_cascade";
-        return null;
+        return relational_integrity_impl.foreignKeyActionJobCanonicalAction(action);
     }
 
     fn foreignKeyActionJobActionSupported(action: []const u8) bool {
-        return foreignKeyActionJobCanonicalAction(action) != null;
+        return relational_integrity_impl.foreignKeyActionJobActionSupported(action);
     }
 
-    fn foreignKeyActionJobIsUpdate(action: []const u8) bool {
-        const canonical_action = foreignKeyActionJobCanonicalAction(action) orelse return false;
-        return std.mem.eql(u8, canonical_action, "update_set_null") or std.mem.eql(u8, canonical_action, "update_cascade");
+    fn foreignKeyActionScheduleKeyAlloc(alloc: Allocator, schedule_id: []const u8) ![]u8 {
+        return try relational_integrity_impl.foreignKeyActionScheduleKeyAlloc(alloc, schedule_id);
     }
 
-    fn enumTokenEql(actual: []const u8, expected: []const u8) bool {
-        var actual_index: usize = 0;
-        var expected_index: usize = 0;
-        while (true) {
-            while (actual_index < actual.len and enumTokenSeparator(actual[actual_index])) actual_index += 1;
-            while (expected_index < expected.len and enumTokenSeparator(expected[expected_index])) expected_index += 1;
-            if (actual_index == actual.len or expected_index == expected.len) break;
-            if (std.ascii.toLower(actual[actual_index]) != std.ascii.toLower(expected[expected_index])) return false;
-            actual_index += 1;
-            expected_index += 1;
-        }
-        while (actual_index < actual.len and enumTokenSeparator(actual[actual_index])) actual_index += 1;
-        while (expected_index < expected.len and enumTokenSeparator(expected[expected_index])) expected_index += 1;
-        return actual_index == actual.len and expected_index == expected.len;
+    fn foreignKeyActionJobKeyAlloc(alloc: Allocator, job_id: []const u8) ![]u8 {
+        return try relational_integrity_impl.foreignKeyActionJobKeyAlloc(alloc, job_id);
     }
 
-    fn enumTokenSeparator(ch: u8) bool {
-        return ch == ' ' or ch == '_' or ch == '-';
+    pub fn cloneForeignKeyActionScheduleRecordFromJson(self: *DB, raw: []const u8) !ForeignKeyActionScheduleRecord {
+        return try relational_integrity_impl.cloneForeignKeyActionScheduleRecordFromJson(self, raw);
     }
 
-    fn foreignKeyActionUpdatedParentKeyMatches(existing: ?[]const u8, expected: ?[]const u8) bool {
-        if (existing) |existing_value| {
-            const expected_value = expected orelse return false;
-            return std.mem.eql(u8, existing_value, expected_value);
-        }
-        return expected == null;
+    pub fn cloneForeignKeyActionJobRecordFromJson(self: *DB, raw: []const u8) !ForeignKeyActionJobRecord {
+        return try relational_integrity_impl.cloneForeignKeyActionJobRecordFromJson(self, raw);
+    }
+
+    fn cloneForeignKeyActionJobRecordOwned(self: *DB, record: ForeignKeyActionJobRecord) !ForeignKeyActionJobRecord {
+        return try relational_integrity_impl.cloneForeignKeyActionJobRecordOwned(self, record);
+    }
+
+    fn cloneForeignKeyActionScheduleRecordOwned(self: *DB, record: ForeignKeyActionScheduleRecord) !ForeignKeyActionScheduleRecord {
+        return try relational_integrity_impl.cloneForeignKeyActionScheduleRecordOwned(self, record);
     }
 
     fn validateForeignKeyActionLineage(cascade_depth: u32, cascade_max_depth: u32) !void {
-        if (cascade_max_depth == 0 or cascade_depth > cascade_max_depth) {
-            return error.InvalidForeignKeyActionJob;
-        }
+        try relational_integrity_impl.validateForeignKeyActionLineage(cascade_depth, cascade_max_depth);
     }
 
     fn validateForeignKeyActionJobIdentity(
@@ -15140,15 +12168,7 @@ pub const DB = struct {
         parent_key: []const u8,
         updated_parent_key: ?[]const u8,
     ) !void {
-        if (job_id.len == 0 or action.len == 0 or worker_id.len == 0 or constraint_name.len == 0 or parent_table.len == 0 or parent_key.len == 0) {
-            return error.InvalidForeignKeyActionJob;
-        }
-        const canonical_action = foreignKeyActionJobCanonicalAction(action) orelse return error.InvalidForeignKeyActionJob;
-        if (std.mem.eql(u8, canonical_action, "update_cascade")) {
-            if (updated_parent_key == null or updated_parent_key.?.len == 0) return error.InvalidForeignKeyActionJob;
-        } else if (!foreignKeyActionJobIsUpdate(canonical_action) and updated_parent_key != null) {
-            return error.InvalidForeignKeyActionJob;
-        }
+        try relational_integrity_impl.validateForeignKeyActionJobIdentity(job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
     }
 
     fn validateForeignKeyActionJobMatches(
@@ -15159,24 +12179,7 @@ pub const DB = struct {
         parent_key: []const u8,
         updated_parent_key: ?[]const u8,
     ) !void {
-        const canonical_action = foreignKeyActionJobCanonicalAction(action) orelse return error.InvalidForeignKeyActionJob;
-        if (!std.mem.eql(u8, existing.action, canonical_action) or
-            !std.mem.eql(u8, existing.constraint_name, constraint_name) or
-            !std.mem.eql(u8, existing.parent_table, parent_table) or
-            !std.mem.eql(u8, existing.parent_key, parent_key) or
-            !foreignKeyActionUpdatedParentKeyMatches(existing.updated_parent_key, updated_parent_key))
-        {
-            return error.InvalidForeignKeyActionJob;
-        }
-    }
-
-    fn foreignKeyActionJobClaimsMatch(current: ForeignKeyActionJobRecord, claimed: ForeignKeyActionJobRecord) bool {
-        return !current.completed and
-            std.mem.eql(u8, current.status, "claimed") and
-            std.mem.eql(u8, current.worker_id, claimed.worker_id) and
-            current.claimed_at_ns == claimed.claimed_at_ns and
-            current.lease_until_ns == claimed.lease_until_ns and
-            current.attempts == claimed.attempts;
+        try relational_integrity_impl.validateForeignKeyActionJobMatches(existing, action, constraint_name, parent_table, parent_key, updated_parent_key);
     }
 
     fn validateForeignKeyActionScheduleMatches(
@@ -15188,63 +12191,11 @@ pub const DB = struct {
         parent_key: []const u8,
         updated_parent_key: ?[]const u8,
     ) !void {
-        const canonical_action = foreignKeyActionJobCanonicalAction(action) orelse return error.InvalidForeignKeyActionJob;
-        if (!std.mem.eql(u8, existing.action_job_id, action_job_id) or
-            !std.mem.eql(u8, existing.action, canonical_action) or
-            !std.mem.eql(u8, existing.constraint_name, constraint_name) or
-            !std.mem.eql(u8, existing.parent_table, parent_table) or
-            !std.mem.eql(u8, existing.parent_key, parent_key) or
-            !foreignKeyActionUpdatedParentKeyMatches(existing.updated_parent_key, updated_parent_key))
-        {
-            return error.InvalidForeignKeyActionJob;
-        }
+        try relational_integrity_impl.validateForeignKeyActionScheduleMatches(existing, action_job_id, action, constraint_name, parent_table, parent_key, updated_parent_key);
     }
 
-    fn foreignKeyIntegrityProgressValid(
-        mode: relational_store_mod.ForeignKeyIntegrityMode,
-        report: relational_store_mod.ForeignKeyIntegrityReport,
-    ) bool {
-        return switch (mode) {
-            .validate, .dry_run => report.valid(),
-            .repair => report.missing_parent_rows == 0,
-        };
-    }
-
-    fn foreignKeyIntegrityReportHasViolations(report: relational_store_mod.ForeignKeyIntegrityReport) bool {
-        return report.missing_parent_rows != 0 or
-            report.missing_ref_rows != 0 or
-            report.stale_ref_rows != 0;
-    }
-
-    fn foreignKeyIntegrityReportAdd(
-        left: relational_store_mod.ForeignKeyIntegrityReport,
-        right: relational_store_mod.ForeignKeyIntegrityReport,
-    ) relational_store_mod.ForeignKeyIntegrityReport {
-        return .{
-            .scanned_child_rows = left.scanned_child_rows +| right.scanned_child_rows,
-            .referenced_child_rows = left.referenced_child_rows +| right.referenced_child_rows,
-            .scanned_ref_rows = left.scanned_ref_rows +| right.scanned_ref_rows,
-            .missing_parent_rows = left.missing_parent_rows +| right.missing_parent_rows,
-            .missing_ref_rows = left.missing_ref_rows +| right.missing_ref_rows,
-            .stale_ref_rows = left.stale_ref_rows +| right.stale_ref_rows,
-            .repaired_ref_rows = left.repaired_ref_rows +| right.repaired_ref_rows,
-            .deleted_stale_ref_rows = left.deleted_stale_ref_rows +| right.deleted_stale_ref_rows,
-        };
-    }
-
-    fn foreignKeyIntegrityFirstViolationAt(existing: ?u64, pass_has_violations: bool, now_ns: u64) ?u64 {
-        if (existing) |timestamp| return timestamp;
-        return if (pass_has_violations) now_ns else null;
-    }
-
-    fn uniqueConstraintIntegrityProgressValid(
-        mode: relational_store_mod.ForeignKeyIntegrityMode,
-        report: relational_store_mod.UniqueConstraintIntegrityReport,
-    ) bool {
-        return switch (mode) {
-            .validate, .dry_run => report.valid(),
-            .repair => report.duplicate_unique_rows == 0,
-        };
+    fn foreignKeyActionJobClaimsMatch(current: ForeignKeyActionJobRecord, claimed: ForeignKeyActionJobRecord) bool {
+        return relational_integrity_impl.foreignKeyActionJobClaimsMatch(current, claimed);
     }
 
     fn snapshotForeignKeyStats(self: *DB) types.ForeignKeyStats {
@@ -16165,7 +13116,7 @@ pub const DB = struct {
     ) !types.RelationalRowsQueryResult {
         if (runtime_schema.storage_mode != .relational or runtime_schema.primary_key == null) return error.InvalidArgument;
         if (req.source_cte.len != 0) return error.InvalidQueryRequest;
-        try validateRelationalRowsBaseQueryRequestAgainstSchema(runtime_schema, req);
+        try relational_rows.validateBaseQueryRequestAgainstSchema(runtime_schema, req);
 
         lockApplyShared(self);
         var apply_shared_held = true;
@@ -16206,7 +13157,7 @@ pub const DB = struct {
         if (req.source_cte.len != 0) return error.InvalidQueryRequest;
         if (req.row_claim != null) return error.UnsupportedQueryRequest;
         if (ranges.len > 0 and req.doc_key_range != null) return error.InvalidQueryRequest;
-        try validateRelationalRowsBaseQueryRequestAgainstSchema(runtime_schema, req);
+        try relational_rows.validateBaseQueryRequestAgainstSchema(runtime_schema, req);
         try validateRelationalRowsDocKeyRanges(ranges);
 
         lockApplyShared(self);
@@ -16245,13 +13196,13 @@ pub const DB = struct {
         plan: types.RelationalRowsQueryPlan,
     ) !types.RelationalRowsQueryResult {
         if (runtime_schema.storage_mode != .relational or runtime_schema.primary_key == null) return error.InvalidArgument;
-        try validateRelationalRowsQueryPlanRequest(plan);
-        try validateRelationalRowsQueryPlanCteReferences(plan);
+        try relational_rows.validateQueryPlanRequest(plan);
+        try relational_rows.validateQueryPlanCteReferences(plan);
         const planned_ctes = try planRelationalRowsCteOutputsAlloc(alloc, runtime_schema, plan.ctes);
-        defer deinitRelationalRowsPlannedCtes(alloc, planned_ctes);
-        try validateRelationalRowsQueryAgainstPlannedCteOutput(planned_ctes, plan.query);
+        defer relational_rows.deinitPlannedCtes(alloc, planned_ctes);
+        try relational_rows.validateQueryAgainstPlannedCteOutput(planned_ctes, plan.query);
 
-        var materialized_ctes = std.ArrayListUnmanaged(RelationalRowsMaterializedCte).empty;
+        var materialized_ctes = std.ArrayListUnmanaged(relational_rows.MaterializedCte).empty;
         defer {
             for (materialized_ctes.items) |*cte| cte.deinit(alloc);
             materialized_ctes.deinit(alloc);
@@ -16267,24 +13218,7 @@ pub const DB = struct {
         runtime_schema: schema_mod.TableSchema,
         plan: types.RelationalRowsSetOperationPlan,
     ) !types.RelationalRowsQueryResult {
-        if (runtime_schema.storage_mode != .relational or runtime_schema.primary_key == null) return error.InvalidArgument;
-
-        var left = try self.queryRelationalRowsPlan(alloc, runtime_schema, plan.left);
-        defer left.deinit(alloc);
-        var right = try self.queryRelationalRowsPlan(alloc, runtime_schema, plan.right);
-        defer right.deinit(alloc);
-
-        const combined = try relationalRowsSetOperationRowsAlloc(alloc, plan.operation, left.rows, right.rows);
-        defer freeOwnedConstStringSlice(alloc, combined);
-        try admitRelationalRowsSetOperationRowsWithPolicy(plan, combined, .allow_spill);
-
-        const tail_query = types.RelationalRowsQueryRequest{
-            .order_by = plan.order_by,
-            .limit = plan.limit,
-            .offset = plan.offset,
-            .select_all = true,
-        };
-        return try self.queryRelationalRowsFromSourceRowsAlloc(alloc, "set_operation", combined, tail_query);
+        return try relational_rows_impl.queryRelationalRowsSetOperationPlan(self, alloc, runtime_schema, plan);
     }
 
     pub fn mutateRelationalRowsFromSource(
@@ -16316,9 +13250,9 @@ pub const DB = struct {
         if (source_schema.primary_key == null and req.source.source_cte.len == 0) return error.InvalidArgument;
         if (req.source.row_claim != null) return error.InvalidQueryRequest;
         if (req.source.doc_key_range != null and req.source.source_cte.len != 0) return error.InvalidQueryRequest;
-        if (relationalRowsQueryHasDistinctOn(req.source)) return error.UnsupportedQueryRequest;
+        if (relational_rows.queryHasDistinctOn(req.source)) return error.UnsupportedQueryRequest;
         if (req.assignments.len == 0) return error.InvalidQueryRequest;
-        try validateRelationalRowsBaseQueryRequestAgainstSchema(source_schema, req.source);
+        try relational_rows.validateBaseQueryRequestAgainstSchema(source_schema, req.source);
         for (req.assignments, 0..) |assignment, i| {
             if (assignment.field.len == 0) return error.InvalidQueryRequest;
             _ = relationalRowsFindColumn(target_schema.relational_columns, assignment.field) orelse return error.InvalidQueryRequest;
@@ -16944,11 +13878,11 @@ pub const DB = struct {
         if (source.row_claim != null) return error.InvalidQueryRequest;
         try validateRelationalRowsJoinedMutationCteReferences(req);
         if (target.doc_key_range != null or source.doc_key_range != null) return error.UnsupportedQueryRequest;
-        if (relationalRowsQueryHasDistinctOn(target) or relationalRowsQueryHasDistinctOn(source)) return error.UnsupportedQueryRequest;
+        if (relational_rows.queryHasDistinctOn(target) or relational_rows.queryHasDistinctOn(source)) return error.UnsupportedQueryRequest;
         try validateRelationalRowsJoinedMutationJoinFieldsForSide(target_schema, req, relationalRowsJoinedMutationTargetJoinSide(req));
         if (req.kind == .update and req.source_assignments.len == 0 and req.operations.len == 0 and req.patch_expressions.len == 0 and req.increment_expressions.len == 0 and req.json_set_expressions.len == 0) return error.InvalidQueryRequest;
         if (req.kind == .delete and (req.rewrite_identity or req.source_assignments.len != 0 or req.operations.len != 0 or req.patch_expressions.len != 0 or req.increment_expressions.len != 0 or req.json_set_expressions.len != 0)) return error.InvalidQueryRequest;
-        try validateRelationalRowsMutationUpdateTargetPaths(req.operations, req.patch_expressions, req.increment_expressions, req.json_set_expressions, req.source_assignments);
+        try relational_rows.validateMutationUpdateTargetPaths(req.operations, req.patch_expressions, req.increment_expressions, req.json_set_expressions, req.source_assignments);
         const touches_primary_key = relationalRowsJoinedMutationTouchesPrimaryKey(target_schema.primary_key.?, req);
         if (touches_primary_key != req.rewrite_identity) return error.InvalidQueryRequest;
         if (req.rewrite_identity and target_schema.primary_key.?.without_overlaps_period != null) return error.UnsupportedQueryRequest;
@@ -17002,10 +13936,10 @@ pub const DB = struct {
         }
 
         const planned_ctes = try planRelationalRowsCteOutputsAlloc(alloc, source_schema, req.ctes);
-        defer deinitRelationalRowsPlannedCtes(alloc, planned_ctes);
-        try validateRelationalRowsJoinAgainstPlannedCteOutput(planned_ctes, req.join);
+        defer relational_rows.deinitPlannedCtes(alloc, planned_ctes);
+        try relational_rows.validateJoinAgainstPlannedCteOutput(planned_ctes, req.join);
 
-        var materialized_ctes = std.ArrayListUnmanaged(RelationalRowsMaterializedCte).empty;
+        var materialized_ctes = std.ArrayListUnmanaged(relational_rows.MaterializedCte).empty;
         defer {
             for (materialized_ctes.items) |*cte| cte.deinit(alloc);
             materialized_ctes.deinit(alloc);
@@ -17031,11 +13965,11 @@ pub const DB = struct {
         if (source.row_claim != null) return error.InvalidQueryRequest;
         try validateRelationalRowsJoinedMutationCteReferences(req);
         if (target.doc_key_range != null or source.doc_key_range != null) return error.UnsupportedQueryRequest;
-        if (relationalRowsQueryHasDistinctOn(target) or relationalRowsQueryHasDistinctOn(source)) return error.UnsupportedQueryRequest;
+        if (relational_rows.queryHasDistinctOn(target) or relational_rows.queryHasDistinctOn(source)) return error.UnsupportedQueryRequest;
         try validateRelationalRowsJoinedMutationJoinFieldsForSide(source_schema, req, relationalRowsJoinedMutationSourceJoinSide(req));
         if (req.kind == .update and req.source_assignments.len == 0 and req.operations.len == 0 and req.patch_expressions.len == 0 and req.increment_expressions.len == 0 and req.json_set_expressions.len == 0) return error.InvalidQueryRequest;
         if (req.kind == .delete and (req.rewrite_identity or req.source_assignments.len != 0 or req.operations.len != 0 or req.patch_expressions.len != 0 or req.increment_expressions.len != 0 or req.json_set_expressions.len != 0)) return error.InvalidQueryRequest;
-        try validateRelationalRowsMutationUpdateTargetPaths(req.operations, req.patch_expressions, req.increment_expressions, req.json_set_expressions, req.source_assignments);
+        try relational_rows.validateMutationUpdateTargetPaths(req.operations, req.patch_expressions, req.increment_expressions, req.json_set_expressions, req.source_assignments);
 
         for (req.source_assignments) |assignment| {
             if (assignment.source_side == req.target_side) return error.InvalidQueryRequest;
@@ -17052,8 +13986,8 @@ pub const DB = struct {
             return;
         }
         if (source.source_cte.len == 0) return error.InvalidQueryRequest;
-        try validateRelationalRowsMaterializedCtes(req.ctes, &.{});
-        try validateRelationalRowsFinalCteReference(req.ctes, source.source_cte);
+        try relational_rows.validateMaterializedCtes(req.ctes, &.{});
+        try relational_rows.validateFinalCteReference(req.ctes, source.source_cte);
     }
 
     fn validateRelationalRowsJoinedMutationJoinFieldsForSide(
@@ -17080,7 +14014,7 @@ pub const DB = struct {
                 .left => predicate.left_field,
                 .right => predicate.right_field,
             };
-            try validateRelationalRowsCteOutputField(output_fields, field);
+            try relational_rows.validateOutputField(output_fields, field);
         }
     }
 
@@ -17893,12 +14827,12 @@ pub const DB = struct {
         if (claim.txn_id == null) return error.InvalidQueryRequest;
         if (!claim.mode.isExclusiveWriteClaim()) return error.InvalidQueryRequest;
         if (req.source.source_cte.len != 0) return error.UnsupportedQueryRequest;
-        if (relationalRowsQueryHasDistinctOn(req.source)) return error.UnsupportedQueryRequest;
-        try validateRelationalRowsBaseQueryRequestAgainstSchema(runtime_schema, req.source);
+        if (relational_rows.queryHasDistinctOn(req.source)) return error.UnsupportedQueryRequest;
+        try relational_rows.validateBaseQueryRequestAgainstSchema(runtime_schema, req.source);
         if (req.restart_identity) return error.UnsupportedQueryRequest;
         if (req.kind == .update and req.operations.len == 0 and req.patch_expressions.len == 0 and req.increment_expressions.len == 0 and req.json_set_expressions.len == 0) return error.InvalidQueryRequest;
         if (req.kind == .delete and (req.rewrite_identity or req.operations.len != 0 or req.patch_expressions.len != 0 or req.increment_expressions.len != 0 or req.json_set_expressions.len != 0)) return error.InvalidQueryRequest;
-        try validateRelationalRowsMutationUpdateTargetPaths(req.operations, req.patch_expressions, req.increment_expressions, req.json_set_expressions, &.{});
+        try relational_rows.validateMutationUpdateTargetPaths(req.operations, req.patch_expressions, req.increment_expressions, req.json_set_expressions, &.{});
         const touches_primary_key = relationalRowsMutationTouchesPrimaryKey(runtime_schema.primary_key.?, req);
         if (touches_primary_key != req.rewrite_identity) return error.InvalidQueryRequest;
         if (req.rewrite_identity and runtime_schema.primary_key.?.without_overlaps_period != null) return error.UnsupportedQueryRequest;
@@ -18004,22 +14938,22 @@ pub const DB = struct {
         if (source.row_claim != null) return error.InvalidQueryRequest;
         try validateRelationalRowsJoinedMutationCteReferences(req);
         if (target.doc_key_range != null or source.doc_key_range != null) return error.UnsupportedQueryRequest;
-        if (relationalRowsQueryHasDistinctOn(target) or relationalRowsQueryHasDistinctOn(source)) return error.UnsupportedQueryRequest;
+        if (relational_rows.queryHasDistinctOn(target) or relational_rows.queryHasDistinctOn(source)) return error.UnsupportedQueryRequest;
 
-        var planned_ctes: []RelationalRowsPlannedCte = &.{};
-        defer if (planned_ctes.len != 0) deinitRelationalRowsPlannedCtes(alloc, planned_ctes);
+        var planned_ctes: []relational_rows.PlannedCte = &.{};
+        defer if (planned_ctes.len != 0) relational_rows.deinitPlannedCtes(alloc, planned_ctes);
         const source_output_fields: ?[]const []const u8 = if (req.ctes.len != 0) blk: {
             planned_ctes = try planRelationalRowsCteOutputsAlloc(alloc, source_schema, req.ctes);
-            try validateRelationalRowsJoinAgainstPlannedCteOutput(planned_ctes, req.join);
-            break :blk relationalRowsPlannedSourceCteOutputFields(planned_ctes, source) orelse return error.InvalidQueryRequest;
+            try relational_rows.validateJoinAgainstPlannedCteOutput(planned_ctes, req.join);
+            break :blk relational_rows.plannedSourceCteOutputFields(planned_ctes, source) orelse return error.InvalidQueryRequest;
         } else null;
 
-        try validateRelationalRowsBaseQueryRequestAgainstSchema(target_schema, target);
+        try relational_rows.validateBaseQueryRequestAgainstSchema(target_schema, target);
         if (source_output_fields) |fields| {
-            try validateRelationalRowsQueryAgainstCteOutput(source, fields);
-            try validateRelationalRowsBaseQueryRequestAgainstOutputFields(fields, source);
+            try relational_rows.validateQueryAgainstCteOutput(source, fields);
+            try relational_rows.validateBaseQueryRequestAgainstOutputFields(fields, source);
         } else {
-            try validateRelationalRowsBaseQueryRequestAgainstSchema(source_schema, source);
+            try relational_rows.validateBaseQueryRequestAgainstSchema(source_schema, source);
         }
         try validateRelationalRowsJoinedMutationJoinFieldsForSide(target_schema, req, relationalRowsJoinedMutationTargetJoinSide(req));
         if (source_output_fields) |fields| {
@@ -18029,7 +14963,7 @@ pub const DB = struct {
         }
         if (req.kind == .update and req.source_assignments.len == 0 and req.operations.len == 0 and req.patch_expressions.len == 0 and req.increment_expressions.len == 0 and req.json_set_expressions.len == 0) return error.InvalidQueryRequest;
         if (req.kind == .delete and (req.rewrite_identity or req.source_assignments.len != 0 or req.operations.len != 0 or req.patch_expressions.len != 0 or req.increment_expressions.len != 0 or req.json_set_expressions.len != 0)) return error.InvalidQueryRequest;
-        try validateRelationalRowsMutationUpdateTargetPaths(req.operations, req.patch_expressions, req.increment_expressions, req.json_set_expressions, req.source_assignments);
+        try relational_rows.validateMutationUpdateTargetPaths(req.operations, req.patch_expressions, req.increment_expressions, req.json_set_expressions, req.source_assignments);
         const touches_primary_key = relationalRowsJoinedMutationTouchesPrimaryKey(target_schema.primary_key.?, req);
         if (touches_primary_key != req.rewrite_identity) return error.InvalidQueryRequest;
         if (req.rewrite_identity and target_schema.primary_key.?.without_overlaps_period != null) return error.UnsupportedQueryRequest;
@@ -18049,7 +14983,7 @@ pub const DB = struct {
             if (assignment.source_side == req.target_side) return error.InvalidQueryRequest;
             const target_column = relationalRowsFindColumn(target_schema.relational_columns, assignment.field) orelse return error.InvalidQueryRequest;
             if (source_output_fields) |fields| {
-                try validateRelationalRowsCteOutputField(fields, assignment.source_field);
+                try relational_rows.validateOutputField(fields, assignment.source_field);
             } else {
                 const source_column = relationalRowsFindColumn(source_schema.relational_columns, assignment.source_field) orelse return error.InvalidQueryRequest;
                 if (target_column.field_type != source_column.field_type) return error.InvalidQueryRequest;
@@ -18122,12 +15056,12 @@ pub const DB = struct {
             {
                 return error.InvalidQueryRequest;
             }
-            if (relationalRowsMutationReturningOutputCount(fields, expressions, field) > 1) return error.InvalidQueryRequest;
+            if (relational_rows.mutationReturningOutputCount(fields, expressions, field) > 1) return error.InvalidQueryRequest;
         }
         for (expressions) |projection| {
             if (projection.output.len == 0) return error.InvalidQueryRequest;
             if (returning_all and relationalRowsFindColumn(runtime_schema.relational_columns, projection.output) != null) return error.InvalidQueryRequest;
-            if (relationalRowsMutationReturningOutputCount(fields, expressions, projection.output) > 1) return error.InvalidQueryRequest;
+            if (relational_rows.mutationReturningOutputCount(fields, expressions, projection.output) > 1) return error.InvalidQueryRequest;
         }
     }
 
@@ -18254,7 +15188,7 @@ pub const DB = struct {
             },
             .update => {
                 if (conflict.operations.len == 0 and conflict.patch_expressions.len == 0 and conflict.increment_expressions.len == 0 and conflict.json_set_expressions.len == 0) return error.InvalidQueryRequest;
-                try validateRelationalRowsMutationUpdateTargetPaths(conflict.operations, conflict.patch_expressions, conflict.increment_expressions, conflict.json_set_expressions, &.{});
+                try relational_rows.validateMutationUpdateTargetPaths(conflict.operations, conflict.patch_expressions, conflict.increment_expressions, conflict.json_set_expressions, &.{});
                 for (conflict.patch_expressions) |assignment| try validateRelationalRowsConflictExpression(runtime_schema, assignment.expression);
                 for (conflict.increment_expressions) |assignment| try validateRelationalRowsConflictExpression(runtime_schema, assignment.expression);
                 for (conflict.json_set_expressions) |assignment| try validateRelationalRowsConflictExpression(runtime_schema, assignment.expression);
@@ -18323,7 +15257,7 @@ pub const DB = struct {
         constraint: schema_mod.UniqueConstraint,
     ) !void {
         if (!relationalRowsExpressionConditionSlicesEqual(predicates, constraint.where_expressions)) return error.InvalidQueryRequest;
-        for (predicates) |condition| try validateRelationalRowsExpressionConditionAgainstSchema(runtime_schema, condition);
+        for (predicates) |condition| try relational_rows.validateExpressionConditionAgainstSchema(runtime_schema, condition);
     }
 
     fn relationalRowsUniquePredicateOpMatchesCheck(actual: schema_mod.RelationalCheckOp, expected: schema_mod.UniquePredicateOp) bool {
@@ -18335,145 +15269,6 @@ pub const DB = struct {
         };
     }
 
-    fn validateRelationalRowsMutationUpdateTargetPaths(
-        operations: []const types.TransformOp,
-        patch_expressions: []const types.RelationalRowsExpressionAssignment,
-        increment_expressions: []const types.RelationalRowsExpressionAssignment,
-        json_set_expressions: []const types.RelationalRowsJsonSetExpressionAssignment,
-        source_assignments: []const types.RelationalRowsJoinedMutationFieldAssignment,
-    ) !void {
-        for (operations, 0..) |lhs, i| {
-            for (operations[i + 1 ..]) |rhs| {
-                if (relationalRowsMutationOperationPathsConflict(lhs, rhs)) return error.InvalidQueryRequest;
-            }
-            for (patch_expressions) |assignment| {
-                if (relationalRowsDottedPathsConflict(lhs.path, assignment.field)) return error.InvalidQueryRequest;
-            }
-            for (increment_expressions) |assignment| {
-                if (relationalRowsDottedPathsConflict(lhs.path, assignment.field)) return error.InvalidQueryRequest;
-            }
-            for (json_set_expressions) |assignment| {
-                if (relationalRowsDottedPathConflictsJsonSetPath(lhs.path, assignment.field, assignment.path)) return error.InvalidQueryRequest;
-            }
-            for (source_assignments) |assignment| {
-                if (relationalRowsDottedPathsConflict(lhs.path, assignment.field)) return error.InvalidQueryRequest;
-            }
-        }
-        for (patch_expressions, 0..) |lhs, i| {
-            for (patch_expressions[i + 1 ..]) |rhs| {
-                if (relationalRowsDottedPathsConflict(lhs.field, rhs.field)) return error.InvalidQueryRequest;
-            }
-            for (increment_expressions) |assignment| {
-                if (relationalRowsDottedPathsConflict(lhs.field, assignment.field)) return error.InvalidQueryRequest;
-            }
-            for (json_set_expressions) |assignment| {
-                if (relationalRowsDottedPathConflictsJsonSetPath(lhs.field, assignment.field, assignment.path)) return error.InvalidQueryRequest;
-            }
-            for (source_assignments) |assignment| {
-                if (relationalRowsDottedPathsConflict(lhs.field, assignment.field)) return error.InvalidQueryRequest;
-            }
-        }
-        for (increment_expressions, 0..) |lhs, i| {
-            for (increment_expressions[i + 1 ..]) |rhs| {
-                if (relationalRowsDottedPathsConflict(lhs.field, rhs.field)) return error.InvalidQueryRequest;
-            }
-            for (json_set_expressions) |assignment| {
-                if (relationalRowsDottedPathConflictsJsonSetPath(lhs.field, assignment.field, assignment.path)) return error.InvalidQueryRequest;
-            }
-            for (source_assignments) |assignment| {
-                if (relationalRowsDottedPathsConflict(lhs.field, assignment.field)) return error.InvalidQueryRequest;
-            }
-        }
-        for (json_set_expressions, 0..) |lhs, i| {
-            for (json_set_expressions[i + 1 ..]) |rhs| {
-                if (relationalRowsJsonSetPathsConflict(lhs.field, lhs.path, rhs.field, rhs.path)) return error.InvalidQueryRequest;
-            }
-            for (source_assignments) |assignment| {
-                if (relationalRowsDottedPathConflictsJsonSetPath(assignment.field, lhs.field, lhs.path)) return error.InvalidQueryRequest;
-            }
-        }
-        for (source_assignments, 0..) |lhs, i| {
-            for (source_assignments[i + 1 ..]) |rhs| {
-                if (relationalRowsDottedPathsConflict(lhs.field, rhs.field)) return error.InvalidQueryRequest;
-            }
-        }
-    }
-
-    fn relationalRowsMutationOperationPathsConflict(lhs: types.TransformOp, rhs: types.TransformOp) bool {
-        if (!relationalRowsDottedPathsConflict(lhs.path, rhs.path)) return false;
-        return !(relationalRowsTransformOpIsArrayUpdate(lhs.op) and relationalRowsTransformOpIsArrayUpdate(rhs.op) and std.mem.eql(u8, lhs.path, rhs.path));
-    }
-
-    fn relationalRowsTransformOpIsArrayUpdate(op: types.TransformOpType) bool {
-        return switch (op) {
-            .push, .pull, .add_to_set, .pop => true,
-            else => false,
-        };
-    }
-
-    fn relationalRowsDottedPathsConflict(lhs: []const u8, rhs: []const u8) bool {
-        if (std.mem.eql(u8, lhs, rhs)) return true;
-        return relationalRowsDottedPathIsAncestor(lhs, rhs) or relationalRowsDottedPathIsAncestor(rhs, lhs);
-    }
-
-    fn relationalRowsDottedPathIsAncestor(parent: []const u8, child: []const u8) bool {
-        return parent.len < child.len and
-            std.mem.startsWith(u8, child, parent) and
-            child[parent.len] == '.';
-    }
-
-    fn relationalRowsDottedPathConflictsJsonSetPath(path: []const u8, json_field: []const u8, json_path: []const []const u8) bool {
-        if (relationalRowsDottedPathsConflict(path, json_field)) return true;
-        if (path.len <= json_field.len + 1) return false;
-        if (!std.mem.startsWith(u8, path, json_field) or path[json_field.len] != '.') return false;
-        return relationalRowsJsonSegmentsConflictDottedPath(json_path, path[json_field.len + 1 ..]);
-    }
-
-    fn relationalRowsJsonSetPathsConflict(
-        lhs_field: []const u8,
-        lhs_path: []const []const u8,
-        rhs_field: []const u8,
-        rhs_path: []const []const u8,
-    ) bool {
-        if (!std.mem.eql(u8, lhs_field, rhs_field)) return relationalRowsDottedPathsConflict(lhs_field, rhs_field);
-        const shared = @min(lhs_path.len, rhs_path.len);
-        for (lhs_path[0..shared], rhs_path[0..shared]) |lhs, rhs| {
-            if (!std.mem.eql(u8, lhs, rhs)) return false;
-        }
-        return true;
-    }
-
-    fn relationalRowsJsonSegmentsConflictDottedPath(json_path: []const []const u8, dotted_path: []const u8) bool {
-        if (json_path.len == 0 or dotted_path.len == 0) return false;
-        var offset: usize = 0;
-        for (json_path, 0..) |segment, i| {
-            if (offset >= dotted_path.len) return true;
-            if (!std.mem.startsWith(u8, dotted_path[offset..], segment)) return false;
-            offset += segment.len;
-            const dotted_done = offset == dotted_path.len;
-            const json_done = i + 1 == json_path.len;
-            if (!dotted_done and dotted_path[offset] != '.') return false;
-            if (dotted_done or json_done) return true;
-            offset += 1;
-        }
-        return offset == dotted_path.len;
-    }
-
-    fn relationalRowsMutationReturningOutputCount(
-        fields: []const []const u8,
-        expressions: []const types.RelationalRowsExpressionProjection,
-        output: []const u8,
-    ) usize {
-        var count: usize = 0;
-        for (fields) |field| {
-            if (std.mem.eql(u8, field, output)) count += 1;
-        }
-        for (expressions) |projection| {
-            if (std.mem.eql(u8, projection.output, output)) count += 1;
-        }
-        return count;
-    }
-
     pub fn windowRelationalRowsPlan(
         self: *DB,
         alloc: Allocator,
@@ -18481,14 +15276,14 @@ pub const DB = struct {
         plan: types.RelationalRowsWindowPlan,
     ) !types.RelationalRowsWindowResult {
         if (runtime_schema.storage_mode != .relational or runtime_schema.primary_key == null) return error.InvalidArgument;
-        try validateRelationalRowsWindowRequestAlloc(alloc, plan.window);
-        try validateRelationalRowsWindowPlanCteReferences(plan);
+        try relational_rows.validateWindowRequestAlloc(alloc, plan.window);
+        try relational_rows.validateWindowPlanCteReferences(plan);
         const planned_ctes = try planRelationalRowsCteOutputsAlloc(alloc, runtime_schema, plan.ctes);
-        defer deinitRelationalRowsPlannedCtes(alloc, planned_ctes);
-        try validateRelationalRowsWindowAgainstPlannedCteOutput(planned_ctes, plan.window);
-        try validateRelationalRowsWindowOutputReferencesAgainstPlannedCtesAlloc(alloc, runtime_schema, planned_ctes, plan.window);
+        defer relational_rows.deinitPlannedCtes(alloc, planned_ctes);
+        try relational_rows.validateWindowAgainstPlannedCteOutput(planned_ctes, plan.window);
+        try relational_rows.validateWindowOutputReferencesAgainstPlannedCtesAlloc(alloc, runtime_schema, planned_ctes, plan.window);
 
-        var materialized_ctes = std.ArrayListUnmanaged(RelationalRowsMaterializedCte).empty;
+        var materialized_ctes = std.ArrayListUnmanaged(relational_rows.MaterializedCte).empty;
         defer {
             for (materialized_ctes.items) |*cte| cte.deinit(alloc);
             materialized_ctes.deinit(alloc);
@@ -18506,10 +15301,10 @@ pub const DB = struct {
         ranges: []const types.RelationalRowsDocKeyRange,
     ) !types.RelationalRowsWindowResult {
         if (req.source.source_cte.len != 0) return error.InvalidQueryRequest;
-        const source_order = try validateRelationalRowsWindowRequestAndSourceOrderAlloc(alloc, req);
+        const source_order = try relational_rows.validateWindowRequestAndSourceOrderAlloc(alloc, req);
         defer alloc.free(source_order);
-        try validateRelationalRowsWindowAgainstSchema(runtime_schema, req);
-        try validateRelationalRowsWindowOutputReferencesAlloc(alloc, runtime_schema, &.{}, req);
+        try relational_rows.validateWindowAgainstSchema(runtime_schema, req);
+        try relational_rows.validateWindowOutputReferencesAlloc(alloc, runtime_schema, &.{}, req);
 
         const source = relationalRowsWindowSourceQuery(req, source_order);
         var source_rows = try self.queryRelationalRowsAcrossRanges(alloc, runtime_schema, source, ranges);
@@ -18518,49 +15313,18 @@ pub const DB = struct {
         return try windowRelationalRowsFromSourceRowsAlloc(alloc, req, source_rows.rows);
     }
 
-    fn relationalRowsTableFunctionOutputFieldsAlloc(
-        alloc: Allocator,
-        table_function: types.RelationalRowsTableFunction,
-        req: types.RelationalRowsQueryRequest,
-    ) ![]const []const u8 {
-        _ = table_function;
-        var fields = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            for (fields.items) |field| alloc.free(@constCast(field));
-            fields.deinit(alloc);
-        }
-        const source_fields = types.relational_rows_graph_table_function_fields[0..];
-        if (req.select_all) {
-            for (source_fields) |field| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, field);
-        } else {
-            for (req.select) |field| {
-                if (!relationalRowsOutputFieldExists(source_fields, field)) return error.InvalidQueryRequest;
-                try appendRelationalRowsOutputFieldAlloc(alloc, &fields, field);
-            }
-        }
-        for (req.json_extract) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
-        for (req.array_length) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
-        for (req.coalesce) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
-        for (req.field_aliases) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
-        for (req.expressions) |projection| {
-            if (relationalRowsQueryProjectionOutputAlreadyRendered(req, projection.output)) continue;
-            try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
-        }
-        return try fields.toOwnedSlice(alloc);
-    }
-
     fn appendRelationalRowsMaterializedCtesAlloc(
         self: *DB,
         alloc: Allocator,
         runtime_schema: schema_mod.TableSchema,
         ranges: []const types.RelationalRowsDocKeyRange,
         ctes: []const types.RelationalRowsCte,
-        materialized_ctes: *std.ArrayListUnmanaged(RelationalRowsMaterializedCte),
+        materialized_ctes: *std.ArrayListUnmanaged(relational_rows.MaterializedCte),
     ) !void {
-        try validateRelationalRowsMaterializedCtes(ctes, materialized_ctes.items);
+        try relational_rows.validateMaterializedCtes(ctes, materialized_ctes.items);
         for (ctes) |cte| {
             if (cte.name.len == 0) return error.InvalidQueryRequest;
-            if (findRelationalRowsMaterializedCte(materialized_ctes.items, cte.name) != null) return error.InvalidQueryRequest;
+            if (relational_rows.findMaterializedCte(materialized_ctes.items, cte.name) != null) return error.InvalidQueryRequest;
             if (cte.query.row_claim != null or cte.query.doc_key_range != null) return error.UnsupportedQueryRequest;
 
             const result = if (cte.table_function) |table_function|
@@ -18575,11 +15339,11 @@ pub const DB = struct {
                 }
             }
             const materialized_bytes = types.relationalRowsCteMaterializedJsonBytes(result.rows) orelse return error.UnsupportedQueryRequest;
-            try admitRelationalRowsCteMaterialization(cte, result.rows.len, materialized_bytes);
+            try relational_rows.admitRelationalRowsCteMaterialization(cte, result.rows.len, materialized_bytes);
             const output_fields = if (cte.table_function) |table_function|
-                try relationalRowsTableFunctionOutputFieldsAlloc(alloc, table_function, cte.query)
+                try relational_rows.tableFunctionOutputFieldsAlloc(alloc, table_function, cte.query)
             else
-                try relationalRowsQueryOutputFieldsAlloc(alloc, runtime_schema, materialized_ctes.items, cte.query);
+                try relational_rows.queryOutputFieldsAlloc(alloc, runtime_schema, materialized_ctes.items, cte.query);
             var output_fields_transferred = false;
             errdefer if (!output_fields_transferred) freeOwnedConstStringSlice(alloc, output_fields);
             try materialized_ctes.append(alloc, .{
@@ -18589,27 +15353,6 @@ pub const DB = struct {
             });
             result_transferred = true;
             output_fields_transferred = true;
-        }
-    }
-
-    fn validateRelationalRowsMaterializedCtes(
-        ctes: []const types.RelationalRowsCte,
-        materialized_ctes: []RelationalRowsMaterializedCte,
-    ) !void {
-        for (ctes, 0..) |cte, idx| {
-            if (cte.name.len == 0) return error.InvalidQueryRequest;
-            if (findRelationalRowsMaterializedCte(materialized_ctes, cte.name) != null) return error.InvalidQueryRequest;
-            for (ctes[0..idx]) |prior| {
-                if (std.mem.eql(u8, prior.name, cte.name)) return error.InvalidQueryRequest;
-            }
-            if (cte.query.source_cte.len != 0 and
-                findRelationalRowsMaterializedCte(materialized_ctes, cte.query.source_cte) == null and
-                !relationalRowsCteNameExists(ctes[0..idx], cte.query.source_cte))
-            {
-                return error.InvalidQueryRequest;
-            }
-            if (cte.table_function != null and cte.query.source_cte.len != 0) return error.InvalidQueryRequest;
-            if (cte.query.row_claim != null or cte.query.doc_key_range != null) return error.UnsupportedQueryRequest;
         }
     }
 
@@ -18846,43 +15589,18 @@ pub const DB = struct {
         try writer.writeAll("}");
     }
 
-    fn validateRelationalRowsQueryPlanCteReferences(plan: types.RelationalRowsQueryPlan) !void {
-        try validateRelationalRowsMaterializedCtes(plan.ctes, &.{});
-        try validateRelationalRowsFinalCteReference(plan.ctes, plan.query.source_cte);
-    }
-
-    fn validateRelationalRowsQueryPlanRequest(plan: types.RelationalRowsQueryPlan) !void {
-        if (plan.query.row_claim != null or plan.query.doc_key_range != null) return error.UnsupportedQueryRequest;
-    }
-
     pub fn admitRelationalRowsSetOperationRows(
         plan: types.RelationalRowsSetOperationPlan,
         rows: []const []const u8,
     ) !void {
-        try admitRelationalRowsSetOperationRowsWithPolicy(plan, rows, .strict);
+        try relational_rows.admitRelationalRowsSetOperationRows(plan, rows);
     }
 
     pub fn admitRelationalRowsSetOperationRowsAllowSpill(
         plan: types.RelationalRowsSetOperationPlan,
         rows: []const []const u8,
     ) !void {
-        try admitRelationalRowsSetOperationRowsWithPolicy(plan, rows, .allow_spill);
-    }
-
-    fn admitRelationalRowsSetOperationRowsWithPolicy(
-        plan: types.RelationalRowsSetOperationPlan,
-        rows: []const []const u8,
-        policy: RelationalRowsCteMaterializationPolicy,
-    ) !void {
-        const materialized_bytes = types.relationalRowsCteMaterializedJsonBytes(rows) orelse return error.UnsupportedQueryRequest;
-        const admission = types.RelationalRowsCte{
-            .name = "set_operation",
-            .query = .{},
-            .max_rows = plan.max_rows,
-            .max_bytes = plan.max_bytes,
-            .spill_after_bytes = plan.spill_after_bytes,
-        };
-        try admitRelationalRowsCteMaterializationWithPolicy(admission, rows.len, materialized_bytes, policy);
+        try relational_rows.admitRelationalRowsSetOperationRowsAllowSpill(plan, rows);
     }
 
     pub fn admitRelationalRowsCteMaterialization(
@@ -18890,7 +15608,7 @@ pub const DB = struct {
         observed_rows: usize,
         observed_bytes: u64,
     ) !void {
-        try admitRelationalRowsCteMaterializationWithPolicy(cte, observed_rows, observed_bytes, .strict);
+        try relational_rows.admitRelationalRowsCteMaterialization(cte, observed_rows, observed_bytes);
     }
 
     pub fn admitRelationalRowsCteMaterializationAllowSpill(
@@ -18898,28 +15616,7 @@ pub const DB = struct {
         observed_rows: usize,
         observed_bytes: u64,
     ) !void {
-        try admitRelationalRowsCteMaterializationWithPolicy(cte, observed_rows, observed_bytes, .allow_spill);
-    }
-
-    const RelationalRowsCteMaterializationPolicy = enum {
-        strict,
-        allow_spill,
-    };
-
-    fn admitRelationalRowsCteMaterializationWithPolicy(
-        cte: types.RelationalRowsCte,
-        observed_rows: usize,
-        observed_bytes: u64,
-        policy: RelationalRowsCteMaterializationPolicy,
-    ) !void {
-        switch (types.relationalRowsCteMaterializationDecision(cte, observed_rows, observed_bytes)) {
-            .memory => {},
-            .spill => switch (policy) {
-                .strict => return error.RelationalRowsCteSpillRequired,
-                .allow_spill => {},
-            },
-            .reject => return error.RelationalRowsCteMaterializationRejected,
-        }
+        try relational_rows.admitRelationalRowsCteMaterializationAllowSpill(cte, observed_rows, observed_bytes);
     }
 
     pub fn relationalRowsSetOperationRowsAlloc(
@@ -18928,248 +15625,26 @@ pub const DB = struct {
         left: []const []const u8,
         right: []const []const u8,
     ) ![]const []const u8 {
-        return switch (operation) {
-            .union_all => try relationalRowsUnionAllRowsAlloc(alloc, left, right),
-            .union_distinct => try relationalRowsUnionDistinctRowsAlloc(alloc, left, right),
-            .intersect => try relationalRowsIntersectRowsAlloc(alloc, left, right),
-            .except => try relationalRowsExceptRowsAlloc(alloc, left, right),
-        };
-    }
-
-    fn relationalRowsUnionAllRowsAlloc(
-        alloc: Allocator,
-        left: []const []const u8,
-        right: []const []const u8,
-    ) ![]const []const u8 {
-        var rows = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer deinitRelationalRowsSetRowList(alloc, &rows);
-        try rows.ensureUnusedCapacity(alloc, left.len + right.len);
-        for (left) |row| rows.appendAssumeCapacity(try alloc.dupe(u8, row));
-        for (right) |row| rows.appendAssumeCapacity(try alloc.dupe(u8, row));
-        return try rows.toOwnedSlice(alloc);
-    }
-
-    fn relationalRowsUnionDistinctRowsAlloc(
-        alloc: Allocator,
-        left: []const []const u8,
-        right: []const []const u8,
-    ) ![]const []const u8 {
-        var seen = std.StringHashMapUnmanaged(void).empty;
-        defer freeRelationalRowsSetKeyMap(alloc, &seen);
-        var rows = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer deinitRelationalRowsSetRowList(alloc, &rows);
-        for (left) |row| try appendDistinctRelationalRowsSetRowAlloc(alloc, &seen, &rows, row);
-        for (right) |row| try appendDistinctRelationalRowsSetRowAlloc(alloc, &seen, &rows, row);
-        return try rows.toOwnedSlice(alloc);
-    }
-
-    fn relationalRowsIntersectRowsAlloc(
-        alloc: Allocator,
-        left: []const []const u8,
-        right: []const []const u8,
-    ) ![]const []const u8 {
-        var right_set = std.StringHashMapUnmanaged(void).empty;
-        defer freeRelationalRowsSetKeyMap(alloc, &right_set);
-        for (right) |row| _ = try putRelationalRowsSetKeyAlloc(alloc, &right_set, row);
-
-        var emitted = std.StringHashMapUnmanaged(void).empty;
-        defer freeRelationalRowsSetKeyMap(alloc, &emitted);
-        var rows = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer deinitRelationalRowsSetRowList(alloc, &rows);
-        for (left) |row| {
-            if (!right_set.contains(row)) continue;
-            try appendDistinctRelationalRowsSetRowAlloc(alloc, &emitted, &rows, row);
-        }
-        return try rows.toOwnedSlice(alloc);
-    }
-
-    fn relationalRowsExceptRowsAlloc(
-        alloc: Allocator,
-        left: []const []const u8,
-        right: []const []const u8,
-    ) ![]const []const u8 {
-        var right_set = std.StringHashMapUnmanaged(void).empty;
-        defer freeRelationalRowsSetKeyMap(alloc, &right_set);
-        for (right) |row| _ = try putRelationalRowsSetKeyAlloc(alloc, &right_set, row);
-
-        var emitted = std.StringHashMapUnmanaged(void).empty;
-        defer freeRelationalRowsSetKeyMap(alloc, &emitted);
-        var rows = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer deinitRelationalRowsSetRowList(alloc, &rows);
-        for (left) |row| {
-            if (right_set.contains(row)) continue;
-            try appendDistinctRelationalRowsSetRowAlloc(alloc, &emitted, &rows, row);
-        }
-        return try rows.toOwnedSlice(alloc);
-    }
-
-    fn appendDistinctRelationalRowsSetRowAlloc(
-        alloc: Allocator,
-        seen: *std.StringHashMapUnmanaged(void),
-        rows: *std.ArrayListUnmanaged([]const u8),
-        row: []const u8,
-    ) !void {
-        if (try putRelationalRowsSetKeyAlloc(alloc, seen, row)) {
-            const row_copy = try alloc.dupe(u8, row);
-            errdefer alloc.free(row_copy);
-            try rows.append(alloc, row_copy);
-        }
-    }
-
-    fn putRelationalRowsSetKeyAlloc(
-        alloc: Allocator,
-        set: *std.StringHashMapUnmanaged(void),
-        row: []const u8,
-    ) !bool {
-        if (set.contains(row)) return false;
-        const key = try alloc.dupe(u8, row);
-        errdefer alloc.free(key);
-        const gop = try set.getOrPut(alloc, key);
-        if (gop.found_existing) {
-            alloc.free(key);
-            return false;
-        }
-        return true;
-    }
-
-    fn deinitRelationalRowsSetRowList(
-        alloc: Allocator,
-        rows: *std.ArrayListUnmanaged([]const u8),
-    ) void {
-        for (rows.items) |row| alloc.free(@constCast(row));
-        rows.deinit(alloc);
-    }
-
-    fn freeRelationalRowsSetKeyMap(
-        alloc: Allocator,
-        set: *std.StringHashMapUnmanaged(void),
-    ) void {
-        var keys = set.keyIterator();
-        while (keys.next()) |key| alloc.free(@constCast(key.*));
-        set.deinit(alloc);
-    }
-
-    fn validateRelationalRowsAggregatePlanCteReferences(plan: types.RelationalRowsAggregatePlan) !void {
-        try validateRelationalRowsMaterializedCtes(plan.ctes, &.{});
-        try validateRelationalRowsFinalCteReference(plan.ctes, plan.aggregate.source.source_cte);
-    }
-
-    fn validateRelationalRowsAggregateRequest(req: types.RelationalRowsAggregateRequest) !void {
-        if (req.aggregations.len == 0 and req.group_by.len == 0 and req.group_expressions.len == 0) return error.InvalidArgument;
-        if (req.source.row_claim != null) return error.UnsupportedQueryRequest;
-        if (req.source.doc_key_range != null and req.source.source_cte.len != 0) return error.InvalidQueryRequest;
-        try validateRelationalRowsAggregateOutputNames(req);
-    }
-
-    fn validateRelationalRowsAggregateOutputNames(req: types.RelationalRowsAggregateRequest) !void {
-        for (req.group_by) |field| {
-            if (field.len == 0) return error.InvalidQueryRequest;
-            if (relationalRowsAggregateOutputNameCount(req, field) > 1) return error.InvalidQueryRequest;
-        }
-        for (req.group_expressions) |projection| {
-            if (projection.output.len == 0) return error.InvalidQueryRequest;
-            if (relationalRowsAggregateOutputNameCount(req, projection.output) > 1) return error.InvalidQueryRequest;
-        }
-        for (req.aggregations) |aggregation| {
-            if (aggregation.name.len == 0) return error.InvalidQueryRequest;
-            if (relationalRowsAggregateOutputNameCount(req, aggregation.name) > 1) return error.InvalidQueryRequest;
-        }
-    }
-
-    fn relationalRowsAggregateOutputNameCount(
-        req: types.RelationalRowsAggregateRequest,
-        name: []const u8,
-    ) usize {
-        var count: usize = 0;
-        for (req.group_by) |field| {
-            if (std.mem.eql(u8, field, name)) count += 1;
-        }
-        for (req.group_expressions) |projection| {
-            if (std.mem.eql(u8, projection.output, name)) count += 1;
-        }
-        for (req.aggregations) |aggregation| {
-            if (std.mem.eql(u8, aggregation.name, name)) count += 1;
-        }
-        return count;
-    }
-
-    fn validateRelationalRowsWindowPlanCteReferences(plan: types.RelationalRowsWindowPlan) !void {
-        try validateRelationalRowsMaterializedCtes(plan.ctes, &.{});
-        try validateRelationalRowsFinalCteReference(plan.ctes, plan.window.source.source_cte);
-    }
-
-    fn validateRelationalRowsWindowRequestAlloc(
-        alloc: Allocator,
-        req: types.RelationalRowsWindowRequest,
-    ) !void {
-        const source_order = try validateRelationalRowsWindowRequestAndSourceOrderAlloc(alloc, req);
-        alloc.free(source_order);
-    }
-
-    fn validateRelationalRowsJoinPlanCteReferences(plan: types.RelationalRowsJoinPlan) !void {
-        try validateRelationalRowsMaterializedCtes(plan.ctes, &.{});
-        try validateRelationalRowsFinalCteReference(plan.ctes, plan.join.left.source_cte);
-        try validateRelationalRowsFinalCteReference(plan.ctes, plan.join.right.source_cte);
-    }
-
-    fn validateRelationalRowsLateralPlanCteReferences(plan: types.RelationalRowsLateralPlan) !void {
-        try validateRelationalRowsMaterializedCtes(plan.ctes, &.{});
-        try validateRelationalRowsFinalCteReference(plan.ctes, plan.lateral.left.source_cte);
-        try validateRelationalRowsFinalCteReference(plan.ctes, plan.lateral.right.source_cte);
-    }
-
-    fn validateRelationalRowsFinalCteReference(
-        ctes: []const types.RelationalRowsCte,
-        name: []const u8,
-    ) !void {
-        if (name.len != 0 and !relationalRowsCteNameExists(ctes, name)) return error.InvalidQueryRequest;
-    }
-
-    fn relationalRowsCteNameExists(
-        ctes: []const types.RelationalRowsCte,
-        name: []const u8,
-    ) bool {
-        for (ctes) |cte| {
-            if (std.mem.eql(u8, cte.name, name)) return true;
-        }
-        return false;
-    }
-
-    const RelationalRowsPlannedCte = struct {
-        name: []const u8,
-        output_fields: []const []const u8,
-
-        fn deinit(self: *@This(), alloc: Allocator) void {
-            freeOwnedConstStringSlice(alloc, self.output_fields);
-            self.* = undefined;
-        }
-    };
-
-    fn deinitRelationalRowsPlannedCtes(
-        alloc: Allocator,
-        planned_ctes: []RelationalRowsPlannedCte,
-    ) void {
-        for (planned_ctes) |*cte| cte.deinit(alloc);
-        if (planned_ctes.len > 0) alloc.free(planned_ctes);
+        return try relational_rows.relationalRowsSetOperationRowsAlloc(alloc, operation, left, right);
     }
 
     fn planRelationalRowsCteOutputsAlloc(
         alloc: Allocator,
         runtime_schema: schema_mod.TableSchema,
         ctes: []const types.RelationalRowsCte,
-    ) ![]RelationalRowsPlannedCte {
-        var planned = std.ArrayListUnmanaged(RelationalRowsPlannedCte).empty;
+    ) ![]relational_rows.PlannedCte {
+        var planned = std.ArrayListUnmanaged(relational_rows.PlannedCte).empty;
         errdefer {
             for (planned.items) |*cte| cte.deinit(alloc);
             planned.deinit(alloc);
         }
         for (ctes) |cte| {
             if (cte.table_function != null and cte.query.source_cte.len != 0) return error.InvalidQueryRequest;
-            try validateRelationalRowsQueryAgainstPlannedCteOutput(planned.items, cte.query);
+            try relational_rows.validateQueryAgainstPlannedCteOutput(planned.items, cte.query);
             const output_fields = if (cte.table_function) |table_function|
-                try relationalRowsTableFunctionOutputFieldsAlloc(alloc, table_function, cte.query)
+                try relational_rows.tableFunctionOutputFieldsAlloc(alloc, table_function, cte.query)
             else
-                try relationalRowsPlannedQueryOutputFieldsAlloc(alloc, runtime_schema, planned.items, cte.query);
+                try relational_rows.plannedQueryOutputFieldsAlloc(alloc, runtime_schema, planned.items, cte.query);
             errdefer freeOwnedConstStringSlice(alloc, output_fields);
             try planned.append(alloc, .{
                 .name = cte.name,
@@ -19179,142 +15654,11 @@ pub const DB = struct {
         return try planned.toOwnedSlice(alloc);
     }
 
-    fn relationalRowsPlannedQueryOutputFieldsAlloc(
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        planned_ctes: []RelationalRowsPlannedCte,
-        req: types.RelationalRowsQueryRequest,
-    ) ![]const []const u8 {
-        var fields = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            for (fields.items) |field| alloc.free(@constCast(field));
-            fields.deinit(alloc);
-        }
-
-        if (req.select_all) {
-            if (req.source_cte.len != 0) {
-                const source = findRelationalRowsPlannedCte(planned_ctes, req.source_cte) orelse return error.InvalidQueryRequest;
-                for (source.output_fields) |field| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, field);
-            } else {
-                for (runtime_schema.relational_columns) |column| {
-                    try appendRelationalRowsOutputFieldAlloc(alloc, &fields, column.name);
-                    if (!std.mem.eql(u8, column.path, column.name)) try appendRelationalRowsOutputFieldAlloc(alloc, &fields, column.path);
-                }
-            }
-        } else {
-            for (req.select) |field| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, field);
-        }
-        for (req.json_extract) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
-        for (req.array_length) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
-        for (req.coalesce) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
-        for (req.field_aliases) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
-        for (req.expressions) |projection| {
-            if (relationalRowsQueryProjectionOutputAlreadyRendered(req, projection.output)) continue;
-            try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
-        }
-        return try fields.toOwnedSlice(alloc);
-    }
-
-    fn relationalRowsOutputFieldExists(fields: []const []const u8, name: []const u8) bool {
-        for (fields) |field| {
-            if (std.mem.eql(u8, field, name)) return true;
-        }
-        return false;
-    }
-
-    fn findRelationalRowsPlannedCte(
-        planned_ctes: []RelationalRowsPlannedCte,
-        name: []const u8,
-    ) ?*RelationalRowsPlannedCte {
-        for (planned_ctes) |*cte| {
-            if (std.mem.eql(u8, cte.name, name)) return cte;
-        }
-        return null;
-    }
-
-    fn relationalRowsPlannedSourceCteOutputFields(
-        planned_ctes: []RelationalRowsPlannedCte,
-        req: types.RelationalRowsQueryRequest,
-    ) ?[]const []const u8 {
-        if (req.source_cte.len == 0) return null;
-        const source = findRelationalRowsPlannedCte(planned_ctes, req.source_cte) orelse return &.{};
-        return source.output_fields;
-    }
-
-    fn validateRelationalRowsQueryAgainstPlannedCteOutput(
-        planned_ctes: []RelationalRowsPlannedCte,
-        req: types.RelationalRowsQueryRequest,
-    ) !void {
-        const source_output = relationalRowsPlannedSourceCteOutputFields(planned_ctes, req) orelse return;
-        try validateRelationalRowsQueryAgainstCteOutput(req, source_output);
-    }
-
-    fn validateRelationalRowsAggregateAgainstPlannedCteOutput(
-        planned_ctes: []RelationalRowsPlannedCte,
-        req: types.RelationalRowsAggregateRequest,
-    ) !void {
-        const source_output = relationalRowsPlannedSourceCteOutputFields(planned_ctes, req.source) orelse return;
-        try validateRelationalRowsAggregateAgainstOutputFields(source_output, req);
-    }
-
-    fn validateRelationalRowsWindowAgainstPlannedCteOutput(
-        planned_ctes: []RelationalRowsPlannedCte,
-        req: types.RelationalRowsWindowRequest,
-    ) !void {
-        const source_output = relationalRowsPlannedSourceCteOutputFields(planned_ctes, req.source) orelse return;
-        try validateRelationalRowsWindowAgainstOutputFields(source_output, req);
-    }
-
-    fn validateRelationalRowsJoinAgainstPlannedCteOutput(
-        planned_ctes: []RelationalRowsPlannedCte,
-        req: types.RelationalRowsJoinRequest,
-    ) !void {
-        const left_output = relationalRowsPlannedSourceCteOutputFields(planned_ctes, req.left);
-        const right_output = relationalRowsPlannedSourceCteOutputFields(planned_ctes, req.right);
-        try validateRelationalRowsJoinAgainstOutputFields(left_output, right_output, req);
-    }
-
-    fn validateRelationalRowsLateralAgainstPlannedCteOutput(
-        planned_ctes: []RelationalRowsPlannedCte,
-        req: types.RelationalRowsLateralRequest,
-    ) !void {
-        const left_output = relationalRowsPlannedSourceCteOutputFields(planned_ctes, req.left);
-        const right_output = relationalRowsPlannedSourceCteOutputFields(planned_ctes, req.right);
-        try validateRelationalRowsLateralAgainstOutputFields(left_output, right_output, req);
-    }
-
-    fn validateRelationalRowsWindowOutputReferencesAgainstPlannedCtesAlloc(
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        planned_ctes: []RelationalRowsPlannedCte,
-        req: types.RelationalRowsWindowRequest,
-    ) !void {
-        var output_fields = std.ArrayListUnmanaged([]const u8).empty;
-        defer {
-            for (output_fields.items) |field| alloc.free(@constCast(field));
-            output_fields.deinit(alloc);
-        }
-        if (req.select_all) {
-            if (relationalRowsPlannedSourceCteOutputFields(planned_ctes, req.source)) |source_fields| {
-                for (source_fields) |field| try appendRelationalRowsOutputFieldAlloc(alloc, &output_fields, field);
-            } else {
-                for (runtime_schema.relational_columns) |column| {
-                    try appendRelationalRowsOutputFieldAlloc(alloc, &output_fields, column.name);
-                    if (!std.mem.eql(u8, column.path, column.name)) try appendRelationalRowsOutputFieldAlloc(alloc, &output_fields, column.path);
-                }
-            }
-        } else {
-            for (req.select) |field| try appendRelationalRowsOutputFieldAlloc(alloc, &output_fields, field);
-        }
-        for (req.windows) |window| try appendRelationalRowsOutputFieldAlloc(alloc, &output_fields, window.output);
-        for (req.order_by) |order| try validateRelationalRowsQueryOrderAgainstCteOutput(output_fields.items, order);
-    }
-
     fn queryRelationalRowsWithMaterializedCtesAlloc(
         self: *DB,
         alloc: Allocator,
         runtime_schema: schema_mod.TableSchema,
-        materialized_ctes: []RelationalRowsMaterializedCte,
+        materialized_ctes: []relational_rows.MaterializedCte,
         req: types.RelationalRowsQueryRequest,
     ) !types.RelationalRowsQueryResult {
         return try self.queryRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes, &.{}, req);
@@ -19324,313 +15668,124 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         runtime_schema: schema_mod.TableSchema,
-        materialized_ctes: []RelationalRowsMaterializedCte,
+        materialized_ctes: []relational_rows.MaterializedCte,
         ranges: []const types.RelationalRowsDocKeyRange,
         req: types.RelationalRowsQueryRequest,
     ) !types.RelationalRowsQueryResult {
         if (req.source_cte.len != 0) {
-            const source = findRelationalRowsMaterializedCte(materialized_ctes, req.source_cte) orelse return error.InvalidQueryRequest;
-            try validateRelationalRowsBaseQueryRequestAgainstOutputFields(source.output_fields, req);
-            try validateRelationalRowsQueryAgainstCteOutput(req, source.output_fields);
+            const source = relational_rows.findMaterializedCte(materialized_ctes, req.source_cte) orelse return error.InvalidQueryRequest;
+            try relational_rows.validateBaseQueryRequestAgainstOutputFields(source.output_fields, req);
+            try relational_rows.validateQueryAgainstCteOutput(req, source.output_fields);
             return try self.queryRelationalRowsFromMaterializedCteAlloc(alloc, req.source_cte, source.result.rows, req);
         }
         if (ranges.len > 0) return try self.queryRelationalRowsAcrossRanges(alloc, runtime_schema, req, ranges);
         return try self.queryRelationalRows(alloc, runtime_schema, req);
     }
 
-    fn relationalRowsQueryOutputFieldsAlloc(
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        materialized_ctes: []RelationalRowsMaterializedCte,
-        req: types.RelationalRowsQueryRequest,
-    ) ![]const []const u8 {
-        var fields = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            for (fields.items) |field| alloc.free(@constCast(field));
-            fields.deinit(alloc);
-        }
-
-        if (req.select_all) {
-            if (req.source_cte.len != 0) {
-                const source = findRelationalRowsMaterializedCte(materialized_ctes, req.source_cte) orelse return error.InvalidQueryRequest;
-                for (source.output_fields) |field| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, field);
-            } else {
-                for (runtime_schema.relational_columns) |column| {
-                    try appendRelationalRowsOutputFieldAlloc(alloc, &fields, column.name);
-                    if (!std.mem.eql(u8, column.path, column.name)) try appendRelationalRowsOutputFieldAlloc(alloc, &fields, column.path);
-                }
-            }
-        } else {
-            for (req.select) |field| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, field);
-        }
-        for (req.json_extract) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
-        for (req.array_length) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
-        for (req.coalesce) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
-        for (req.field_aliases) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
-        for (req.expressions) |projection| {
-            if (relationalRowsQueryProjectionOutputAlreadyRendered(req, projection.output)) continue;
-            try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
-        }
-        return try fields.toOwnedSlice(alloc);
-    }
-
-    fn appendRelationalRowsOutputFieldAlloc(
-        alloc: Allocator,
-        fields: *std.ArrayListUnmanaged([]const u8),
-        field: []const u8,
-    ) !void {
-        if (field.len == 0) return error.InvalidQueryRequest;
-        if (relationalRowsCteOutputCoversField(fields.items, field)) return;
-        const owned = try alloc.dupe(u8, field);
-        errdefer alloc.free(owned);
-        try fields.append(alloc, owned);
-    }
-
-    fn validateRelationalRowsQueryAgainstCteOutput(
-        req: types.RelationalRowsQueryRequest,
-        output_fields: []const []const u8,
-    ) !void {
-        for (req.predicates) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
-        for (req.array_any) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
-        for (req.array_contains) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
-        for (req.array_eq) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
-        for (req.in_predicates) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
-        for (req.json_contains) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
-        for (req.json_path_eq) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
-        for (req.json_path_exists) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
-        for (req.text_patterns) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
-        for (req.or_predicates) |group| {
-            for (group.predicates) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
-        }
-        for (req.not_predicates) |group| {
-            for (group.predicates) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
-        }
-        for (req.access_or_predicates) |group| try validateRelationalRowsAccessPredicateGroupAgainstCteOutput(output_fields, group);
-        for (req.access_not_predicates) |group| try validateRelationalRowsAccessPredicateGroupAgainstCteOutput(output_fields, group);
-        for (req.expression_predicates) |condition| try validateRelationalRowsExpressionConditionAgainstCteOutput(output_fields, condition);
-        for (req.expression_or_predicates) |group| {
-            for (group.conditions) |condition| try validateRelationalRowsExpressionConditionAgainstCteOutput(output_fields, condition);
-        }
-        for (req.expression_not_predicates) |group| {
-            for (group.conditions) |condition| try validateRelationalRowsExpressionConditionAgainstCteOutput(output_fields, condition);
-        }
-        for (req.expression_array_contains) |predicate| try validateRelationalRowsExpressionAgainstCteOutput(output_fields, predicate.expression);
-        if (!req.select_all) {
-            for (req.select) |field| try validateRelationalRowsCteOutputField(output_fields, field);
-        }
-        for (req.distinct_on) |field| try validateRelationalRowsCteOutputField(output_fields, field);
-        for (req.distinct_on_expressions) |expression| try validateRelationalRowsExpressionAgainstCteOutput(output_fields, expression);
-        for (req.order_by) |order| {
-            if (order.field.len > 0) try validateRelationalRowsCteOutputField(output_fields, order.field);
-            if (order.expression) |expression| try validateRelationalRowsExpressionAgainstCteOutput(output_fields, expression);
-        }
-        for (req.json_extract) |projection| try validateRelationalRowsCteOutputField(output_fields, projection.field);
-        for (req.array_length) |projection| try validateRelationalRowsCteOutputField(output_fields, projection.field);
-        for (req.coalesce) |projection| {
-            for (projection.operands) |operand| {
-                if (operand.kind == .field) try validateRelationalRowsCteOutputField(output_fields, operand.field);
-            }
-        }
-        for (req.field_aliases) |projection| try validateRelationalRowsCteOutputField(output_fields, projection.field);
-        for (req.expressions) |projection| try validateRelationalRowsExpressionAgainstCteOutput(output_fields, projection.expression);
-    }
-
-    fn validateRelationalRowsAccessPredicateGroupAgainstCteOutput(
-        output_fields: []const []const u8,
-        group: types.RelationalRowsAccessPredicateGroup,
-    ) !void {
-        for (group.predicates) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
-        for (group.array_any) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
-        for (group.array_contains) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
-        for (group.array_eq) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
-        for (group.in_predicates) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
-        for (group.json_contains) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
-        for (group.json_path_eq) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
-        for (group.json_path_exists) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
-        for (group.text_patterns) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
-    }
-
-    fn validateRelationalRowsAggregateAgainstSchema(
+    fn relational_rows.validateAggregateAgainstSchema(
         runtime_schema: schema_mod.TableSchema,
         req: types.RelationalRowsAggregateRequest,
     ) !void {
-        for (req.group_by) |field| try validateRelationalRowsSchemaField(runtime_schema, field);
-        for (req.group_expressions) |projection| try validateRelationalRowsExpressionAgainstSchema(runtime_schema, projection.expression);
+        for (req.group_by) |field| try relational_rows.validateSchemaField(runtime_schema, field);
+        for (req.group_expressions) |projection| try relational_rows.validateExpressionAgainstSchema(runtime_schema, projection.expression);
         for (req.aggregations) |aggregation| {
-            if (aggregation.field) |field| try validateRelationalRowsSchemaField(runtime_schema, field);
-            if (aggregation.expression) |expression| try validateRelationalRowsExpressionAgainstSchema(runtime_schema, expression);
-            for (aggregation.array_order_by) |order| try validateRelationalRowsQueryOrderAgainstSchema(runtime_schema, order);
-            for (aggregation.filter_predicates) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-            for (aggregation.filter_array_any) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-            for (aggregation.filter_array_contains) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-            for (aggregation.filter_array_eq) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-            for (aggregation.filter_in_predicates) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-            for (aggregation.filter_json_contains) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-            for (aggregation.filter_json_path_eq) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-            for (aggregation.filter_json_path_exists) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-            for (aggregation.filter_text_patterns) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-            for (aggregation.filter_expressions) |condition| try validateRelationalRowsExpressionConditionAgainstSchema(runtime_schema, condition);
-            for (aggregation.filter_expression_array_contains) |predicate| try validateRelationalRowsExpressionAgainstSchema(runtime_schema, predicate.expression);
+            if (aggregation.field) |field| try relational_rows.validateSchemaField(runtime_schema, field);
+            if (aggregation.expression) |expression| try relational_rows.validateExpressionAgainstSchema(runtime_schema, expression);
+            for (aggregation.array_order_by) |order| try relational_rows.validateQueryOrderAgainstSchema(runtime_schema, order);
+            for (aggregation.filter_predicates) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+            for (aggregation.filter_array_any) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+            for (aggregation.filter_array_contains) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+            for (aggregation.filter_array_eq) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+            for (aggregation.filter_in_predicates) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+            for (aggregation.filter_json_contains) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+            for (aggregation.filter_json_path_eq) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+            for (aggregation.filter_json_path_exists) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+            for (aggregation.filter_text_patterns) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+            for (aggregation.filter_expressions) |condition| try relational_rows.validateExpressionConditionAgainstSchema(runtime_schema, condition);
+            for (aggregation.filter_expression_array_contains) |predicate| try relational_rows.validateExpressionAgainstSchema(runtime_schema, predicate.expression);
             for (aggregation.filter_any) |group| {
-                for (group.conditions) |condition| try validateRelationalRowsExpressionConditionAgainstSchema(runtime_schema, condition);
+                for (group.conditions) |condition| try relational_rows.validateExpressionConditionAgainstSchema(runtime_schema, condition);
             }
             for (aggregation.filter_not) |group| {
-                for (group.conditions) |condition| try validateRelationalRowsExpressionConditionAgainstSchema(runtime_schema, condition);
+                for (group.conditions) |condition| try relational_rows.validateExpressionConditionAgainstSchema(runtime_schema, condition);
             }
         }
     }
 
-    fn validateRelationalRowsWindowAgainstSchema(
+    fn relational_rows.validateWindowAgainstSchema(
         runtime_schema: schema_mod.TableSchema,
         req: types.RelationalRowsWindowRequest,
     ) !void {
         for (req.windows) |window| {
-            for (window.partition_by) |field| try validateRelationalRowsSchemaField(runtime_schema, field);
-            for (window.order_by) |order| try validateRelationalRowsQueryOrderAgainstSchema(runtime_schema, order);
-            if (window.value_expression) |expression| try validateRelationalRowsExpressionAgainstSchema(runtime_schema, expression);
-            for (window.filter_predicates) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-            for (window.filter_array_any) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-            for (window.filter_array_contains) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-            for (window.filter_array_eq) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-            for (window.filter_in_predicates) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-            for (window.filter_json_contains) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-            for (window.filter_json_path_eq) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-            for (window.filter_json_path_exists) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-            for (window.filter_text_patterns) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-            for (window.filter_expressions) |condition| try validateRelationalRowsExpressionConditionAgainstSchema(runtime_schema, condition);
-            for (window.filter_expression_array_contains) |predicate| try validateRelationalRowsExpressionAgainstSchema(runtime_schema, predicate.expression);
+            for (window.partition_by) |field| try relational_rows.validateSchemaField(runtime_schema, field);
+            for (window.order_by) |order| try relational_rows.validateQueryOrderAgainstSchema(runtime_schema, order);
+            if (window.value_expression) |expression| try relational_rows.validateExpressionAgainstSchema(runtime_schema, expression);
+            for (window.filter_predicates) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+            for (window.filter_array_any) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+            for (window.filter_array_contains) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+            for (window.filter_array_eq) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+            for (window.filter_in_predicates) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+            for (window.filter_json_contains) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+            for (window.filter_json_path_eq) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+            for (window.filter_json_path_exists) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+            for (window.filter_text_patterns) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+            for (window.filter_expressions) |condition| try relational_rows.validateExpressionConditionAgainstSchema(runtime_schema, condition);
+            for (window.filter_expression_array_contains) |predicate| try relational_rows.validateExpressionAgainstSchema(runtime_schema, predicate.expression);
             for (window.filter_any) |group| {
-                for (group.conditions) |condition| try validateRelationalRowsExpressionConditionAgainstSchema(runtime_schema, condition);
+                for (group.conditions) |condition| try relational_rows.validateExpressionConditionAgainstSchema(runtime_schema, condition);
             }
             for (window.filter_not) |group| {
-                for (group.conditions) |condition| try validateRelationalRowsExpressionConditionAgainstSchema(runtime_schema, condition);
+                for (group.conditions) |condition| try relational_rows.validateExpressionConditionAgainstSchema(runtime_schema, condition);
             }
         }
         if (!req.select_all) {
-            for (req.select) |field| try validateRelationalRowsSchemaField(runtime_schema, field);
+            for (req.select) |field| try relational_rows.validateSchemaField(runtime_schema, field);
         }
     }
 
-    fn validateRelationalRowsQueryOrderAgainstSchema(
+    fn relational_rows.validateQueryOrderAgainstSchema(
         runtime_schema: schema_mod.TableSchema,
         order: types.RelationalRowsQueryOrder,
     ) !void {
-        if (order.field.len > 0) try validateRelationalRowsSchemaField(runtime_schema, order.field);
-        if (order.expression) |expression| try validateRelationalRowsExpressionAgainstSchema(runtime_schema, expression);
+        if (order.field.len > 0) try relational_rows.validateSchemaField(runtime_schema, order.field);
+        if (order.expression) |expression| try relational_rows.validateExpressionAgainstSchema(runtime_schema, expression);
     }
 
-    fn validateRelationalRowsAggregateAgainstCteOutput(
-        materialized_ctes: []RelationalRowsMaterializedCte,
-        req: types.RelationalRowsAggregateRequest,
-    ) !void {
-        const source_output = relationalRowsSourceCteOutputFields(materialized_ctes, req.source) orelse return;
-        try validateRelationalRowsAggregateAgainstOutputFields(source_output, req);
-    }
-
-    fn validateRelationalRowsAggregateAgainstOutputFields(
-        source_output: []const []const u8,
-        req: types.RelationalRowsAggregateRequest,
-    ) !void {
-        for (req.group_by) |field| try validateRelationalRowsCteOutputField(source_output, field);
-        for (req.group_expressions) |projection| try validateRelationalRowsExpressionAgainstCteOutput(source_output, projection.expression);
-        for (req.aggregations) |aggregation| {
-            if (aggregation.field) |field| try validateRelationalRowsCteOutputField(source_output, field);
-            if (aggregation.expression) |expression| try validateRelationalRowsExpressionAgainstCteOutput(source_output, expression);
-            for (aggregation.array_order_by) |order| try validateRelationalRowsQueryOrderAgainstCteOutput(source_output, order);
-            for (aggregation.filter_predicates) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
-            for (aggregation.filter_array_any) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
-            for (aggregation.filter_array_contains) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
-            for (aggregation.filter_array_eq) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
-            for (aggregation.filter_in_predicates) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
-            for (aggregation.filter_json_contains) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
-            for (aggregation.filter_json_path_eq) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
-            for (aggregation.filter_json_path_exists) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
-            for (aggregation.filter_text_patterns) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
-            for (aggregation.filter_expressions) |condition| try validateRelationalRowsExpressionConditionAgainstCteOutput(source_output, condition);
-            for (aggregation.filter_expression_array_contains) |predicate| try validateRelationalRowsExpressionAgainstCteOutput(source_output, predicate.expression);
-            for (aggregation.filter_any) |group| {
-                for (group.conditions) |condition| try validateRelationalRowsExpressionConditionAgainstCteOutput(source_output, condition);
-            }
-            for (aggregation.filter_not) |group| {
-                for (group.conditions) |condition| try validateRelationalRowsExpressionConditionAgainstCteOutput(source_output, condition);
-            }
-        }
-    }
-
-    fn validateRelationalRowsWindowAgainstCteOutput(
-        materialized_ctes: []RelationalRowsMaterializedCte,
-        req: types.RelationalRowsWindowRequest,
-    ) !void {
-        const source_output = relationalRowsSourceCteOutputFields(materialized_ctes, req.source) orelse return;
-        try validateRelationalRowsWindowAgainstOutputFields(source_output, req);
-    }
-
-    fn validateRelationalRowsWindowAgainstOutputFields(
-        source_output: []const []const u8,
-        req: types.RelationalRowsWindowRequest,
-    ) !void {
-        for (req.windows) |window| {
-            for (window.partition_by) |field| try validateRelationalRowsCteOutputField(source_output, field);
-            for (window.order_by) |order| try validateRelationalRowsQueryOrderAgainstCteOutput(source_output, order);
-            if (window.value_expression) |expression| try validateRelationalRowsExpressionAgainstCteOutput(source_output, expression);
-            for (window.filter_predicates) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
-            for (window.filter_array_any) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
-            for (window.filter_array_contains) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
-            for (window.filter_array_eq) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
-            for (window.filter_in_predicates) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
-            for (window.filter_json_contains) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
-            for (window.filter_json_path_eq) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
-            for (window.filter_json_path_exists) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
-            for (window.filter_text_patterns) |predicate| try validateRelationalRowsCteOutputField(source_output, predicate.field);
-            for (window.filter_expressions) |condition| try validateRelationalRowsExpressionConditionAgainstCteOutput(source_output, condition);
-            for (window.filter_expression_array_contains) |predicate| try validateRelationalRowsExpressionAgainstCteOutput(source_output, predicate.expression);
-            for (window.filter_any) |group| {
-                for (group.conditions) |condition| try validateRelationalRowsExpressionConditionAgainstCteOutput(source_output, condition);
-            }
-            for (window.filter_not) |group| {
-                for (group.conditions) |condition| try validateRelationalRowsExpressionConditionAgainstCteOutput(source_output, condition);
-            }
-        }
-        if (!req.select_all) {
-            for (req.select) |field| try validateRelationalRowsCteOutputField(source_output, field);
-        }
-    }
-
-    fn validateRelationalRowsJoinAgainstSchema(
+    fn relational_rows.validateJoinAgainstSchema(
         runtime_schema: schema_mod.TableSchema,
         req: types.RelationalRowsJoinRequest,
     ) !void {
         const validate_left = req.left.source_cte.len == 0;
         const validate_right = req.right.source_cte.len == 0;
-        if (validate_left) try validateRelationalRowsQueryAgainstSchema(runtime_schema, relationalRowsJoinSideSource(req.left));
-        if (validate_right) try validateRelationalRowsQueryAgainstSchema(runtime_schema, relationalRowsJoinSideSource(req.right));
+        if (validate_left) try relational_rows.validateQueryAgainstSchema(runtime_schema, relationalRowsJoinSideSource(req.left));
+        if (validate_right) try relational_rows.validateQueryAgainstSchema(runtime_schema, relationalRowsJoinSideSource(req.right));
         for (req.on) |join_on| {
-            if (validate_left) try validateRelationalRowsSchemaField(runtime_schema, join_on.left_field);
-            if (validate_right) try validateRelationalRowsSchemaField(runtime_schema, join_on.right_field);
+            if (validate_left) try relational_rows.validateSchemaField(runtime_schema, join_on.left_field);
+            if (validate_right) try relational_rows.validateSchemaField(runtime_schema, join_on.right_field);
         }
         for (req.select) |projection| switch (projection.side) {
-            .left => if (validate_left) try validateRelationalRowsSchemaField(runtime_schema, projection.field),
-            .right => if (validate_right) try validateRelationalRowsSchemaField(runtime_schema, projection.field),
+            .left => if (validate_left) try relational_rows.validateSchemaField(runtime_schema, projection.field),
+            .right => if (validate_right) try relational_rows.validateSchemaField(runtime_schema, projection.field),
         };
         try validateRelationalRowsJoinMatchExpressionsAgainstSchema(runtime_schema, validate_left, validate_right, req.on_expression_predicates, req.on_expression_or_predicates, req.on_expression_not_predicates, req.on_expression_array_contains);
         try validateRelationalRowsJoinMatchExpressionsAgainstSchema(runtime_schema, validate_left, validate_right, req.match_expression_predicates, req.match_expression_or_predicates, req.match_expression_not_predicates, req.match_expression_array_contains);
     }
 
-    fn validateRelationalRowsLateralAgainstSchema(
+    fn relational_rows.validateLateralAgainstSchema(
         runtime_schema: schema_mod.TableSchema,
         req: types.RelationalRowsLateralRequest,
     ) !void {
         const validate_left = req.left.source_cte.len == 0;
         const validate_right = req.right.source_cte.len == 0;
-        if (validate_left) try validateRelationalRowsQueryAgainstSchema(runtime_schema, relationalRowsJoinSideSource(req.left));
-        if (validate_right) try validateRelationalRowsQueryAgainstSchema(runtime_schema, relationalRowsJoinSideSource(req.right));
+        if (validate_left) try relational_rows.validateQueryAgainstSchema(runtime_schema, relationalRowsJoinSideSource(req.left));
+        if (validate_right) try relational_rows.validateQueryAgainstSchema(runtime_schema, relationalRowsJoinSideSource(req.right));
         for (req.correlations) |correlation| {
-            if (validate_left) try validateRelationalRowsSchemaField(runtime_schema, correlation.left_field);
-            if (validate_right) try validateRelationalRowsSchemaField(runtime_schema, correlation.right_field);
+            if (validate_left) try relational_rows.validateSchemaField(runtime_schema, correlation.left_field);
+            if (validate_right) try relational_rows.validateSchemaField(runtime_schema, correlation.right_field);
         }
         for (req.select) |projection| switch (projection.side) {
-            .left => if (validate_left) try validateRelationalRowsSchemaField(runtime_schema, projection.field),
-            .right => if (validate_right) try validateRelationalRowsSchemaField(runtime_schema, projection.field),
+            .left => if (validate_left) try relational_rows.validateSchemaField(runtime_schema, projection.field),
+            .right => if (validate_right) try relational_rows.validateSchemaField(runtime_schema, projection.field),
         };
         try validateRelationalRowsJoinMatchExpressionsAgainstSchema(runtime_schema, validate_left, validate_right, req.match_expression_predicates, req.match_expression_or_predicates, req.match_expression_not_predicates, req.match_expression_array_contains);
     }
@@ -19672,8 +15827,8 @@ pub const DB = struct {
     ) anyerror!void {
         if (expression.kind == .field) {
             switch (expression.field_source) {
-                .row => if (validate_left) try validateRelationalRowsSchemaField(runtime_schema, expression.field),
-                .source => if (validate_right) try validateRelationalRowsSchemaField(runtime_schema, expression.field),
+                .row => if (validate_left) try relational_rows.validateSchemaField(runtime_schema, expression.field),
+                .source => if (validate_right) try relational_rows.validateSchemaField(runtime_schema, expression.field),
                 .existing, .proposed => return error.InvalidQueryRequest,
             }
         }
@@ -19685,479 +15840,124 @@ pub const DB = struct {
         for (expression.case_else) |fallback| try validateRelationalRowsJoinMatchExpressionAgainstSchema(runtime_schema, validate_left, validate_right, fallback);
     }
 
-    fn validateRelationalRowsJoinAgainstCteOutput(
-        materialized_ctes: []RelationalRowsMaterializedCte,
-        req: types.RelationalRowsJoinRequest,
-    ) !void {
-        const left_output = relationalRowsSourceCteOutputFields(materialized_ctes, req.left);
-        const right_output = relationalRowsSourceCteOutputFields(materialized_ctes, req.right);
-        try validateRelationalRowsJoinAgainstOutputFields(left_output, right_output, req);
-    }
-
-    fn validateRelationalRowsJoinAgainstOutputFields(
-        left_output: ?[]const []const u8,
-        right_output: ?[]const []const u8,
-        req: types.RelationalRowsJoinRequest,
-    ) !void {
-        if (left_output) |fields| try validateRelationalRowsQueryAgainstCteOutput(relationalRowsJoinSideSource(req.left), fields);
-        if (right_output) |fields| try validateRelationalRowsQueryAgainstCteOutput(relationalRowsJoinSideSource(req.right), fields);
-        for (req.on) |join_on| {
-            if (left_output) |fields| try validateRelationalRowsCteOutputField(fields, join_on.left_field);
-            if (right_output) |fields| try validateRelationalRowsCteOutputField(fields, join_on.right_field);
-        }
-        for (req.select) |projection| switch (projection.side) {
-            .left => if (left_output) |fields| try validateRelationalRowsCteOutputField(fields, projection.field),
-            .right => if (right_output) |fields| try validateRelationalRowsCteOutputField(fields, projection.field),
-        };
-        try validateRelationalRowsJoinMatchExpressionsAgainstOutputFields(left_output, right_output, req.on_expression_predicates, req.on_expression_or_predicates, req.on_expression_not_predicates, req.on_expression_array_contains);
-        try validateRelationalRowsJoinMatchExpressionsAgainstOutputFields(left_output, right_output, req.match_expression_predicates, req.match_expression_or_predicates, req.match_expression_not_predicates, req.match_expression_array_contains);
-    }
-
-    fn validateRelationalRowsLateralAgainstCteOutput(
-        materialized_ctes: []RelationalRowsMaterializedCte,
-        req: types.RelationalRowsLateralRequest,
-    ) !void {
-        const left_output = relationalRowsSourceCteOutputFields(materialized_ctes, req.left);
-        const right_output = relationalRowsSourceCteOutputFields(materialized_ctes, req.right);
-        try validateRelationalRowsLateralAgainstOutputFields(left_output, right_output, req);
-    }
-
-    fn validateRelationalRowsLateralAgainstOutputFields(
-        left_output: ?[]const []const u8,
-        right_output: ?[]const []const u8,
-        req: types.RelationalRowsLateralRequest,
-    ) !void {
-        if (left_output) |fields| try validateRelationalRowsQueryAgainstCteOutput(relationalRowsJoinSideSource(req.left), fields);
-        if (right_output) |fields| try validateRelationalRowsQueryAgainstCteOutput(relationalRowsJoinSideSource(req.right), fields);
-        for (req.correlations) |correlation| {
-            if (left_output) |fields| try validateRelationalRowsCteOutputField(fields, correlation.left_field);
-            if (right_output) |fields| try validateRelationalRowsCteOutputField(fields, correlation.right_field);
-        }
-        for (req.select) |projection| switch (projection.side) {
-            .left => if (left_output) |fields| try validateRelationalRowsCteOutputField(fields, projection.field),
-            .right => if (right_output) |fields| try validateRelationalRowsCteOutputField(fields, projection.field),
-        };
-        try validateRelationalRowsJoinMatchExpressionsAgainstOutputFields(left_output, right_output, req.match_expression_predicates, req.match_expression_or_predicates, req.match_expression_not_predicates, req.match_expression_array_contains);
-    }
-
-    fn validateRelationalRowsJoinMatchExpressionsAgainstOutputFields(
-        left_output: ?[]const []const u8,
-        right_output: ?[]const []const u8,
-        predicates: []const types.RelationalRowsExpressionCondition,
-        any_groups: []const types.RelationalRowsExpressionPredicateGroup,
-        not_groups: []const types.RelationalRowsExpressionPredicateGroup,
-        array_contains: []const types.RelationalRowsExpressionArrayContainsPredicate,
-    ) !void {
-        for (predicates) |condition| try validateRelationalRowsJoinMatchExpressionConditionAgainstOutputFields(left_output, right_output, condition);
-        for (any_groups) |group| {
-            for (group.conditions) |condition| try validateRelationalRowsJoinMatchExpressionConditionAgainstOutputFields(left_output, right_output, condition);
-        }
-        for (not_groups) |group| {
-            for (group.conditions) |condition| try validateRelationalRowsJoinMatchExpressionConditionAgainstOutputFields(left_output, right_output, condition);
-        }
-        for (array_contains) |predicate| try validateRelationalRowsJoinMatchExpressionAgainstOutputFields(left_output, right_output, predicate.expression);
-    }
-
-    fn validateRelationalRowsJoinMatchExpressionConditionAgainstOutputFields(
-        left_output: ?[]const []const u8,
-        right_output: ?[]const []const u8,
-        condition: types.RelationalRowsExpressionCondition,
-    ) anyerror!void {
-        try validateRelationalRowsJoinMatchExpressionAgainstOutputFields(left_output, right_output, condition.lhs);
-        for (condition.rhs) |expression| try validateRelationalRowsJoinMatchExpressionAgainstOutputFields(left_output, right_output, expression);
-    }
-
-    fn validateRelationalRowsJoinMatchExpressionAgainstOutputFields(
-        left_output: ?[]const []const u8,
-        right_output: ?[]const []const u8,
-        expression: types.RelationalRowsExpression,
-    ) anyerror!void {
-        if (expression.kind == .field) {
-            switch (expression.field_source) {
-                .source => if (right_output) |fields| try validateRelationalRowsCteOutputField(fields, expression.field),
-                .row => if (left_output) |fields| try validateRelationalRowsCteOutputField(fields, expression.field),
-                .existing, .proposed => return error.InvalidQueryRequest,
-            }
-        }
-        for (expression.operands) |operand| try validateRelationalRowsJoinMatchExpressionAgainstOutputFields(left_output, right_output, operand);
-        for (expression.case_branches) |branch| {
-            try validateRelationalRowsJoinMatchExpressionConditionAgainstOutputFields(left_output, right_output, branch.when);
-            try validateRelationalRowsJoinMatchExpressionAgainstOutputFields(left_output, right_output, branch.then);
-        }
-        for (expression.case_else) |fallback| try validateRelationalRowsJoinMatchExpressionAgainstOutputFields(left_output, right_output, fallback);
-    }
-
-    fn validateRelationalRowsAggregateOutputReferencesAlloc(
-        alloc: Allocator,
-        req: types.RelationalRowsAggregateRequest,
-    ) !void {
-        const output_fields = try relationalRowsAggregateOutputFieldsAlloc(alloc, req);
-        defer freeOwnedConstStringSlice(alloc, output_fields);
-        for (req.having_predicates) |predicate| try validateRelationalRowsCteOutputField(output_fields, predicate.field);
-        for (req.having_expressions) |condition| try validateRelationalRowsExpressionConditionAgainstCteOutput(output_fields, condition);
-        for (req.having_any) |group| {
-            for (group.conditions) |condition| try validateRelationalRowsExpressionConditionAgainstCteOutput(output_fields, condition);
-        }
-        for (req.having_not) |group| {
-            for (group.conditions) |condition| try validateRelationalRowsExpressionConditionAgainstCteOutput(output_fields, condition);
-        }
-        for (req.order_by) |order| try validateRelationalRowsQueryOrderAgainstCteOutput(output_fields, order);
-    }
-
-    fn relationalRowsAggregateOutputFieldsAlloc(
-        alloc: Allocator,
-        req: types.RelationalRowsAggregateRequest,
-    ) ![]const []const u8 {
-        var fields = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            for (fields.items) |field| alloc.free(@constCast(field));
-            fields.deinit(alloc);
-        }
-        for (req.group_by) |field| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, field);
-        for (req.group_expressions) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
-        for (req.aggregations) |aggregation| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, aggregation.name);
-        return try fields.toOwnedSlice(alloc);
-    }
-
-    fn validateRelationalRowsJoinOutputReferencesAlloc(
-        alloc: Allocator,
-        req: types.RelationalRowsJoinRequest,
-    ) !void {
-        const output_fields = try relationalRowsJoinOutputFieldsAlloc(alloc, req.select);
-        defer freeOwnedConstStringSlice(alloc, output_fields);
-        for (req.order_by) |order| try validateRelationalRowsQueryOrderAgainstCteOutput(output_fields, order);
-    }
-
-    fn validateRelationalRowsLateralOutputReferencesAlloc(
-        alloc: Allocator,
-        req: types.RelationalRowsLateralRequest,
-    ) !void {
-        const output_fields = try relationalRowsJoinOutputFieldsAlloc(alloc, req.select);
-        defer freeOwnedConstStringSlice(alloc, output_fields);
-        for (req.order_by) |order| try validateRelationalRowsQueryOrderAgainstCteOutput(output_fields, order);
-    }
-
-    fn relationalRowsJoinOutputFieldsAlloc(
-        alloc: Allocator,
-        select: []const types.RelationalRowsJoinProjection,
-    ) ![]const []const u8 {
-        var fields = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            for (fields.items) |field| alloc.free(@constCast(field));
-            fields.deinit(alloc);
-        }
-        if (select.len == 0) {
-            try appendRelationalRowsOutputFieldAlloc(alloc, &fields, "left");
-            try appendRelationalRowsOutputFieldAlloc(alloc, &fields, "right");
-        } else {
-            for (select) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
-        }
-        return try fields.toOwnedSlice(alloc);
-    }
-
-    fn validateRelationalRowsWindowOutputReferencesAlloc(
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        materialized_ctes: []RelationalRowsMaterializedCte,
-        req: types.RelationalRowsWindowRequest,
-    ) !void {
-        const output_fields = try relationalRowsWindowOutputFieldsAlloc(alloc, runtime_schema, materialized_ctes, req);
-        defer freeOwnedConstStringSlice(alloc, output_fields);
-        for (req.order_by) |order| try validateRelationalRowsQueryOrderAgainstCteOutput(output_fields, order);
-    }
-
-    fn relationalRowsWindowOutputFieldsAlloc(
-        alloc: Allocator,
-        runtime_schema: schema_mod.TableSchema,
-        materialized_ctes: []RelationalRowsMaterializedCte,
-        req: types.RelationalRowsWindowRequest,
-    ) ![]const []const u8 {
-        var fields = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            for (fields.items) |field| alloc.free(@constCast(field));
-            fields.deinit(alloc);
-        }
-        if (req.select_all) {
-            if (relationalRowsSourceCteOutputFields(materialized_ctes, req.source)) |source_fields| {
-                for (source_fields) |field| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, field);
-            } else {
-                for (runtime_schema.relational_columns) |column| {
-                    try appendRelationalRowsOutputFieldAlloc(alloc, &fields, column.name);
-                    if (!std.mem.eql(u8, column.path, column.name)) try appendRelationalRowsOutputFieldAlloc(alloc, &fields, column.path);
-                }
-            }
-        } else {
-            for (req.select) |field| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, field);
-        }
-        for (req.windows) |window| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, window.output);
-        return try fields.toOwnedSlice(alloc);
-    }
-
-    fn validateRelationalRowsQueryOrderAgainstCteOutput(
-        output_fields: []const []const u8,
-        order: types.RelationalRowsQueryOrder,
-    ) !void {
-        if (order.field.len > 0) try validateRelationalRowsCteOutputField(output_fields, order.field);
-        if (order.expression) |expression| try validateRelationalRowsExpressionAgainstCteOutput(output_fields, expression);
-    }
-
-    fn relationalRowsSourceCteOutputFields(
-        materialized_ctes: []RelationalRowsMaterializedCte,
-        req: types.RelationalRowsQueryRequest,
-    ) ?[]const []const u8 {
-        if (req.source_cte.len == 0) return null;
-        const source = findRelationalRowsMaterializedCte(materialized_ctes, req.source_cte) orelse return &.{};
-        return source.output_fields;
-    }
-
-    fn validateRelationalRowsExpressionConditionAgainstCteOutput(
-        output_fields: []const []const u8,
-        condition: types.RelationalRowsExpressionCondition,
-    ) anyerror!void {
-        try validateRelationalRowsExpressionAgainstCteOutput(output_fields, condition.lhs);
-        for (condition.rhs) |expression| try validateRelationalRowsExpressionAgainstCteOutput(output_fields, expression);
-    }
-
-    fn validateRelationalRowsExpressionAgainstCteOutput(
-        output_fields: []const []const u8,
-        expression: types.RelationalRowsExpression,
-    ) anyerror!void {
-        if (expression.kind == .field) {
-            if (expression.field_source != .row) return error.InvalidQueryRequest;
-            try validateRelationalRowsCteOutputField(output_fields, expression.field);
-        }
-        for (expression.operands) |operand| try validateRelationalRowsExpressionAgainstCteOutput(output_fields, operand);
-        for (expression.case_branches) |branch| {
-            try validateRelationalRowsExpressionConditionAgainstCteOutput(output_fields, branch.when);
-            try validateRelationalRowsExpressionAgainstCteOutput(output_fields, branch.then);
-        }
-        for (expression.case_else) |fallback| try validateRelationalRowsExpressionAgainstCteOutput(output_fields, fallback);
-    }
-
-    fn validateRelationalRowsCteOutputField(output_fields: []const []const u8, field: []const u8) !void {
-        if (field.len == 0 or !relationalRowsCteOutputCoversField(output_fields, field)) return error.InvalidQueryRequest;
-    }
-
-    fn relationalRowsCteOutputCoversField(output_fields: []const []const u8, field: []const u8) bool {
-        for (output_fields) |output| {
-            if (std.mem.eql(u8, output, field)) return true;
-            if (field.len > output.len and std.mem.startsWith(u8, field, output) and field[output.len] == '.') return true;
-        }
-        return false;
-    }
-
-    fn validateRelationalRowsBaseQueryRequest(req: types.RelationalRowsQueryRequest) !void {
-        if (relationalRowsQueryHasDistinctOn(req) and req.row_claim != null) return error.UnsupportedQueryRequest;
-        if (req.row_claim) |claim| {
-            if (claim.txn_id == null) return error.InvalidQueryRequest;
-            if (!claim.mode.usesDurableIntent()) return error.InvalidQueryRequest;
-        }
-        try validateRelationalRowsQueryProjectionOutputs(req);
-    }
-
-    fn validateRelationalRowsBaseQueryRequestAgainstSchema(
+    fn relational_rows.validateBaseQueryRequestAgainstSchema(
         runtime_schema: schema_mod.TableSchema,
         req: types.RelationalRowsQueryRequest,
     ) !void {
-        try validateRelationalRowsBaseQueryRequest(req);
-        try validateRelationalRowsQueryAgainstSchema(runtime_schema, req);
+        try relational_rows.validateBaseQueryRequest(req);
+        try relational_rows.validateQueryAgainstSchema(runtime_schema, req);
         if (!req.select_all) return;
         for (runtime_schema.relational_columns) |column| {
-            try validateRelationalRowsQueryProjectionOutputDoesNotCollide(req, column.name);
+            try relational_rows.validateQueryProjectionOutputDoesNotCollide(req, column.name);
             if (!std.mem.eql(u8, column.path, column.name)) {
-                try validateRelationalRowsQueryProjectionOutputDoesNotCollide(req, column.path);
+                try relational_rows.validateQueryProjectionOutputDoesNotCollide(req, column.path);
             }
         }
     }
 
-    fn validateRelationalRowsQueryAgainstSchema(
+    fn relational_rows.validateQueryAgainstSchema(
         runtime_schema: schema_mod.TableSchema,
         req: types.RelationalRowsQueryRequest,
     ) !void {
-        for (req.predicates) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-        for (req.array_any) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-        for (req.array_contains) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-        for (req.array_eq) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-        for (req.in_predicates) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-        for (req.json_contains) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-        for (req.json_path_eq) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-        for (req.json_path_exists) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-        for (req.text_patterns) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
+        for (req.predicates) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+        for (req.array_any) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+        for (req.array_contains) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+        for (req.array_eq) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+        for (req.in_predicates) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+        for (req.json_contains) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+        for (req.json_path_eq) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+        for (req.json_path_exists) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+        for (req.text_patterns) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
         for (req.or_predicates) |group| {
-            for (group.predicates) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
+            for (group.predicates) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
         }
         for (req.not_predicates) |group| {
-            for (group.predicates) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
+            for (group.predicates) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
         }
-        for (req.access_or_predicates) |group| try validateRelationalRowsAccessPredicateGroupAgainstSchema(runtime_schema, group);
-        for (req.access_not_predicates) |group| try validateRelationalRowsAccessPredicateGroupAgainstSchema(runtime_schema, group);
-        for (req.expression_predicates) |condition| try validateRelationalRowsExpressionConditionAgainstSchema(runtime_schema, condition);
+        for (req.access_or_predicates) |group| try relational_rows.validateAccessPredicateGroupAgainstSchema(runtime_schema, group);
+        for (req.access_not_predicates) |group| try relational_rows.validateAccessPredicateGroupAgainstSchema(runtime_schema, group);
+        for (req.expression_predicates) |condition| try relational_rows.validateExpressionConditionAgainstSchema(runtime_schema, condition);
         for (req.expression_or_predicates) |group| {
-            for (group.conditions) |condition| try validateRelationalRowsExpressionConditionAgainstSchema(runtime_schema, condition);
+            for (group.conditions) |condition| try relational_rows.validateExpressionConditionAgainstSchema(runtime_schema, condition);
         }
         for (req.expression_not_predicates) |group| {
-            for (group.conditions) |condition| try validateRelationalRowsExpressionConditionAgainstSchema(runtime_schema, condition);
+            for (group.conditions) |condition| try relational_rows.validateExpressionConditionAgainstSchema(runtime_schema, condition);
         }
-        for (req.expression_array_contains) |predicate| try validateRelationalRowsExpressionAgainstSchema(runtime_schema, predicate.expression);
+        for (req.expression_array_contains) |predicate| try relational_rows.validateExpressionAgainstSchema(runtime_schema, predicate.expression);
         if (!req.select_all) {
-            for (req.select) |field| try validateRelationalRowsSchemaField(runtime_schema, field);
+            for (req.select) |field| try relational_rows.validateSchemaField(runtime_schema, field);
         }
-        for (req.distinct_on) |field| try validateRelationalRowsSchemaField(runtime_schema, field);
-        for (req.distinct_on_expressions) |expression| try validateRelationalRowsExpressionAgainstSchema(runtime_schema, expression);
+        for (req.distinct_on) |field| try relational_rows.validateSchemaField(runtime_schema, field);
+        for (req.distinct_on_expressions) |expression| try relational_rows.validateExpressionAgainstSchema(runtime_schema, expression);
         for (req.order_by) |order| {
-            if (order.field.len > 0) try validateRelationalRowsSchemaField(runtime_schema, order.field);
-            if (order.expression) |expression| try validateRelationalRowsExpressionAgainstSchema(runtime_schema, expression);
+            if (order.field.len > 0) try relational_rows.validateSchemaField(runtime_schema, order.field);
+            if (order.expression) |expression| try relational_rows.validateExpressionAgainstSchema(runtime_schema, expression);
         }
-        for (req.json_extract) |projection| try validateRelationalRowsSchemaField(runtime_schema, projection.field);
-        for (req.array_length) |projection| try validateRelationalRowsSchemaField(runtime_schema, projection.field);
+        for (req.json_extract) |projection| try relational_rows.validateSchemaField(runtime_schema, projection.field);
+        for (req.array_length) |projection| try relational_rows.validateSchemaField(runtime_schema, projection.field);
         for (req.coalesce) |projection| {
             for (projection.operands) |operand| {
-                if (operand.kind == .field) try validateRelationalRowsSchemaField(runtime_schema, operand.field);
+                if (operand.kind == .field) try relational_rows.validateSchemaField(runtime_schema, operand.field);
             }
         }
-        for (req.field_aliases) |projection| try validateRelationalRowsSchemaField(runtime_schema, projection.field);
-        for (req.expressions) |projection| try validateRelationalRowsExpressionAgainstSchema(runtime_schema, projection.expression);
+        for (req.field_aliases) |projection| try relational_rows.validateSchemaField(runtime_schema, projection.field);
+        for (req.expressions) |projection| try relational_rows.validateExpressionAgainstSchema(runtime_schema, projection.expression);
     }
 
-    fn validateRelationalRowsAccessPredicateGroupAgainstSchema(
+    fn relational_rows.validateAccessPredicateGroupAgainstSchema(
         runtime_schema: schema_mod.TableSchema,
         group: types.RelationalRowsAccessPredicateGroup,
     ) !void {
-        for (group.predicates) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-        for (group.array_any) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-        for (group.array_contains) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-        for (group.array_eq) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-        for (group.in_predicates) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-        for (group.json_contains) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-        for (group.json_path_eq) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-        for (group.json_path_exists) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
-        for (group.text_patterns) |predicate| try validateRelationalRowsSchemaField(runtime_schema, predicate.field);
+        for (group.predicates) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+        for (group.array_any) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+        for (group.array_contains) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+        for (group.array_eq) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+        for (group.in_predicates) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+        for (group.json_contains) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+        for (group.json_path_eq) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+        for (group.json_path_exists) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
+        for (group.text_patterns) |predicate| try relational_rows.validateSchemaField(runtime_schema, predicate.field);
     }
 
-    fn validateRelationalRowsExpressionConditionAgainstSchema(
+    fn relational_rows.validateExpressionConditionAgainstSchema(
         runtime_schema: schema_mod.TableSchema,
         condition: types.RelationalRowsExpressionCondition,
     ) anyerror!void {
-        try validateRelationalRowsExpressionAgainstSchema(runtime_schema, condition.lhs);
-        for (condition.rhs) |expression| try validateRelationalRowsExpressionAgainstSchema(runtime_schema, expression);
+        try relational_rows.validateExpressionAgainstSchema(runtime_schema, condition.lhs);
+        for (condition.rhs) |expression| try relational_rows.validateExpressionAgainstSchema(runtime_schema, expression);
     }
 
-    fn validateRelationalRowsExpressionAgainstSchema(
+    fn relational_rows.validateExpressionAgainstSchema(
         runtime_schema: schema_mod.TableSchema,
         expression: types.RelationalRowsExpression,
     ) anyerror!void {
         if (expression.kind == .field) {
             if (expression.field_source != .row) return error.InvalidQueryRequest;
-            try validateRelationalRowsSchemaField(runtime_schema, expression.field);
+            try relational_rows.validateSchemaField(runtime_schema, expression.field);
         }
-        for (expression.operands) |operand| try validateRelationalRowsExpressionAgainstSchema(runtime_schema, operand);
+        for (expression.operands) |operand| try relational_rows.validateExpressionAgainstSchema(runtime_schema, operand);
         for (expression.case_branches) |branch| {
-            try validateRelationalRowsExpressionConditionAgainstSchema(runtime_schema, branch.when);
-            try validateRelationalRowsExpressionAgainstSchema(runtime_schema, branch.then);
+            try relational_rows.validateExpressionConditionAgainstSchema(runtime_schema, branch.when);
+            try relational_rows.validateExpressionAgainstSchema(runtime_schema, branch.then);
         }
-        for (expression.case_else) |fallback| try validateRelationalRowsExpressionAgainstSchema(runtime_schema, fallback);
+        for (expression.case_else) |fallback| try relational_rows.validateExpressionAgainstSchema(runtime_schema, fallback);
     }
 
-    fn validateRelationalRowsSchemaField(runtime_schema: schema_mod.TableSchema, field: []const u8) !void {
-        if (field.len == 0 or !relationalRowsSchemaCoversField(runtime_schema, field)) return error.InvalidQueryRequest;
+    fn relational_rows.validateSchemaField(runtime_schema: schema_mod.TableSchema, field: []const u8) !void {
+        if (field.len == 0 or !relational_rows.schemaCoversField(runtime_schema, field)) return error.InvalidQueryRequest;
     }
 
-    fn relationalRowsSchemaCoversField(runtime_schema: schema_mod.TableSchema, field: []const u8) bool {
+    fn relational_rows.schemaCoversField(runtime_schema: schema_mod.TableSchema, field: []const u8) bool {
         for (runtime_schema.relational_columns) |column| {
-            if (relationalRowsFieldCoversName(column.name, field)) return true;
-            if (!std.mem.eql(u8, column.path, column.name) and relationalRowsFieldCoversName(column.path, field)) return true;
+            if (relational_rows.fieldCoversName(column.name, field)) return true;
+            if (!std.mem.eql(u8, column.path, column.name) and relational_rows.fieldCoversName(column.path, field)) return true;
         }
         return false;
     }
 
-    fn relationalRowsFieldCoversName(source: []const u8, field: []const u8) bool {
+    fn relational_rows.fieldCoversName(source: []const u8, field: []const u8) bool {
         if (std.mem.eql(u8, source, field)) return true;
         return field.len > source.len and std.mem.startsWith(u8, field, source) and field[source.len] == '.';
-    }
-
-    fn validateRelationalRowsBaseQueryRequestAgainstOutputFields(
-        output_fields: []const []const u8,
-        req: types.RelationalRowsQueryRequest,
-    ) !void {
-        try validateRelationalRowsBaseQueryRequest(req);
-        if (!req.select_all) return;
-        for (output_fields) |field| try validateRelationalRowsQueryProjectionOutputDoesNotCollide(req, field);
-    }
-
-    fn validateRelationalRowsQueryProjectionOutputDoesNotCollide(
-        req: types.RelationalRowsQueryRequest,
-        field: []const u8,
-    ) !void {
-        if (field.len == 0) return error.InvalidQueryRequest;
-        for (req.json_extract) |projection| {
-            if (std.mem.eql(u8, projection.output, field)) return error.InvalidQueryRequest;
-        }
-        for (req.array_length) |projection| {
-            if (std.mem.eql(u8, projection.output, field)) return error.InvalidQueryRequest;
-        }
-        for (req.coalesce) |projection| {
-            if (std.mem.eql(u8, projection.output, field)) return error.InvalidQueryRequest;
-        }
-        for (req.field_aliases) |projection| {
-            if (std.mem.eql(u8, projection.output, field)) return error.InvalidQueryRequest;
-        }
-        for (req.expressions) |projection| {
-            if (std.mem.eql(u8, projection.output, field)) return error.InvalidQueryRequest;
-        }
-    }
-
-    fn validateRelationalRowsQueryProjectionOutputs(req: types.RelationalRowsQueryRequest) !void {
-        if (!req.select_all) {
-            for (req.select) |field| {
-                if (field.len == 0) return error.InvalidQueryRequest;
-                if (relationalRowsQueryProjectionOutputCount(req, field) > 1) return error.InvalidQueryRequest;
-            }
-        }
-        for (req.json_extract) |projection| {
-            if (projection.output.len == 0) return error.InvalidQueryRequest;
-            if (relationalRowsQueryProjectionOutputCount(req, projection.output) > 1) return error.InvalidQueryRequest;
-        }
-        for (req.array_length) |projection| {
-            if (projection.output.len == 0) return error.InvalidQueryRequest;
-            if (relationalRowsQueryProjectionOutputCount(req, projection.output) > 1) return error.InvalidQueryRequest;
-        }
-        for (req.coalesce) |projection| {
-            if (projection.output.len == 0) return error.InvalidQueryRequest;
-            if (relationalRowsQueryProjectionOutputCount(req, projection.output) > 1) return error.InvalidQueryRequest;
-        }
-        for (req.field_aliases) |projection| {
-            if (projection.output.len == 0) return error.InvalidQueryRequest;
-            if (relationalRowsQueryProjectionOutputCount(req, projection.output) > 1) return error.InvalidQueryRequest;
-        }
-        for (req.expressions) |projection| {
-            if (projection.output.len == 0) return error.InvalidQueryRequest;
-            if (relationalRowsQueryProjectionOutputCount(req, projection.output) > 1) return error.InvalidQueryRequest;
-        }
-    }
-
-    fn relationalRowsQueryProjectionOutputCount(req: types.RelationalRowsQueryRequest, output: []const u8) usize {
-        var count: usize = 0;
-        if (!req.select_all) {
-            for (req.select) |field| {
-                if (std.mem.eql(u8, field, output)) count += 1;
-            }
-        }
-        for (req.json_extract) |projection| {
-            if (std.mem.eql(u8, projection.output, output)) count += 1;
-        }
-        for (req.array_length) |projection| {
-            if (std.mem.eql(u8, projection.output, output)) count += 1;
-        }
-        for (req.coalesce) |projection| {
-            if (std.mem.eql(u8, projection.output, output)) count += 1;
-        }
-        for (req.field_aliases) |projection| {
-            if (std.mem.eql(u8, projection.output, output)) count += 1;
-        }
-        for (req.expressions) |projection| {
-            if (std.mem.eql(u8, projection.output, output)) count += 1;
-        }
-        return count;
     }
 
     pub fn queryRelationalRowsAcrossRanges(
@@ -20168,7 +15968,7 @@ pub const DB = struct {
         ranges: []const types.RelationalRowsDocKeyRange,
     ) !types.RelationalRowsQueryResult {
         if (runtime_schema.storage_mode != .relational or runtime_schema.primary_key == null) return error.InvalidArgument;
-        try validateRelationalRowsBaseQueryRequestAgainstSchema(runtime_schema, req);
+        try relational_rows.validateBaseQueryRequestAgainstSchema(runtime_schema, req);
         if (ranges.len == 0) return try self.queryRelationalRows(alloc, runtime_schema, req);
         if (req.doc_key_range != null) return error.InvalidQueryRequest;
         try validateRelationalRowsDocKeyRanges(ranges);
@@ -20237,11 +16037,11 @@ pub const DB = struct {
             std.sort.pdq(RelationalRowsQueryCandidate, rows, RelationalRowsQuerySortContext{ .order_by = req.order_by }, relationalRowsQueryCandidateLessThan);
         }
 
-        if (relationalRowsQueryHasDistinctOn(req) and req.row_claim != null) return error.UnsupportedQueryRequest;
+        if (relational_rows.queryHasDistinctOn(req) and req.row_claim != null) return error.UnsupportedQueryRequest;
 
         var candidate_indexes = std.ArrayListUnmanaged(usize).empty;
         defer candidate_indexes.deinit(alloc);
-        if (relationalRowsQueryHasDistinctOn(req)) {
+        if (relational_rows.queryHasDistinctOn(req)) {
             try appendRelationalRowsDistinctOnIndexesAlloc(alloc, rows, req.distinct_on, req.distinct_on_expressions, &candidate_indexes);
         } else {
             try candidate_indexes.ensureUnusedCapacity(alloc, rows.len);
@@ -20303,7 +16103,7 @@ pub const DB = struct {
 
         var candidate_indexes = std.ArrayListUnmanaged(usize).empty;
         defer candidate_indexes.deinit(alloc);
-        if (relationalRowsQueryHasDistinctOn(req)) {
+        if (relational_rows.queryHasDistinctOn(req)) {
             try appendRelationalRowsDistinctOnIndexesAlloc(alloc, rows, req.distinct_on, req.distinct_on_expressions, &candidate_indexes);
         } else {
             try candidate_indexes.ensureUnusedCapacity(alloc, rows.len);
@@ -20354,7 +16154,7 @@ pub const DB = struct {
 
         var candidate_indexes = std.ArrayListUnmanaged(usize).empty;
         defer candidate_indexes.deinit(alloc);
-        if (relationalRowsQueryHasDistinctOn(req)) {
+        if (relational_rows.queryHasDistinctOn(req)) {
             try appendRelationalRowsDistinctOnIndexesAlloc(alloc, rows, req.distinct_on, req.distinct_on_expressions, &candidate_indexes);
         } else {
             try candidate_indexes.ensureUnusedCapacity(alloc, rows.len);
@@ -20423,10 +16223,6 @@ pub const DB = struct {
         }
     }
 
-    fn relationalRowsQueryHasDistinctOn(req: types.RelationalRowsQueryRequest) bool {
-        return req.distinct_on.len > 0 or req.distinct_on_expressions.len > 0;
-    }
-
     fn relationalRowsDistinctOnKeyJsonAlloc(
         alloc: Allocator,
         row: std.json.Value,
@@ -20468,7 +16264,7 @@ pub const DB = struct {
     ) !types.RelationalRowsQueryResult {
         if (req.row_claim != null) return error.UnsupportedQueryRequest;
         if (req.doc_key_range != null) return error.InvalidQueryRequest;
-        try validateRelationalRowsBaseQueryRequest(req);
+        try relational_rows.validateBaseQueryRequest(req);
 
         var local_req = req;
         local_req.source_cte = "";
@@ -20508,7 +16304,7 @@ pub const DB = struct {
         if (req.source_cte.len != 0) return error.InvalidQueryRequest;
         if (req.row_claim != null) return error.UnsupportedQueryRequest;
         if (req.doc_key_range != null) return error.InvalidQueryRequest;
-        try validateRelationalRowsBaseQueryRequest(req);
+        try relational_rows.validateBaseQueryRequest(req);
 
         var rows = std.ArrayListUnmanaged(RelationalRowsQueryCandidate).empty;
         defer {
@@ -20529,7 +16325,7 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         runtime_schema: schema_mod.TableSchema,
-        materialized_ctes: []RelationalRowsMaterializedCte,
+        materialized_ctes: []relational_rows.MaterializedCte,
         req: types.RelationalRowsWindowRequest,
     ) !types.RelationalRowsWindowResult {
         return try self.windowRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes, &.{}, req);
@@ -20539,15 +16335,15 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         runtime_schema: schema_mod.TableSchema,
-        materialized_ctes: []RelationalRowsMaterializedCte,
+        materialized_ctes: []relational_rows.MaterializedCte,
         ranges: []const types.RelationalRowsDocKeyRange,
         req: types.RelationalRowsWindowRequest,
     ) !types.RelationalRowsWindowResult {
-        const source_order = try validateRelationalRowsWindowRequestAndSourceOrderAlloc(alloc, req);
+        const source_order = try relational_rows.validateWindowRequestAndSourceOrderAlloc(alloc, req);
         defer alloc.free(source_order);
-        try validateRelationalRowsWindowAgainstCteOutput(materialized_ctes, req);
-        if (req.source.source_cte.len == 0) try validateRelationalRowsWindowAgainstSchema(runtime_schema, req);
-        try validateRelationalRowsWindowOutputReferencesAlloc(alloc, runtime_schema, materialized_ctes, req);
+        try relational_rows.validateWindowAgainstCteOutput(materialized_ctes, req);
+        if (req.source.source_cte.len == 0) try relational_rows.validateWindowAgainstSchema(runtime_schema, req);
+        try relational_rows.validateWindowOutputReferencesAlloc(alloc, runtime_schema, materialized_ctes, req);
 
         const source = relationalRowsWindowSourceQuery(req, source_order);
         var source_rows = try self.queryRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes, ranges, source);
@@ -20563,7 +16359,7 @@ pub const DB = struct {
         source_rows: []const []const u8,
         req: types.RelationalRowsWindowRequest,
     ) !types.RelationalRowsWindowResult {
-        const source_order = try validateRelationalRowsWindowRequestAndSourceOrderAlloc(alloc, req);
+        const source_order = try relational_rows.validateWindowRequestAndSourceOrderAlloc(alloc, req);
         defer alloc.free(source_order);
 
         const source = relationalRowsWindowSourceQuery(req, source_order);
@@ -20579,7 +16375,7 @@ pub const DB = struct {
         source_rows: []const []const u8,
         req: types.RelationalRowsWindowRequest,
     ) !types.RelationalRowsWindowResult {
-        const source_order = try validateRelationalRowsWindowRequestAndSourceOrderAlloc(alloc, req);
+        const source_order = try relational_rows.validateWindowRequestAndSourceOrderAlloc(alloc, req);
         defer alloc.free(source_order);
 
         const source = relationalRowsWindowSourceQuery(req, source_order);
@@ -20587,155 +16383,6 @@ pub const DB = struct {
         defer ordered_source_rows.deinit(alloc);
 
         return try windowRelationalRowsFromSourceRowsAlloc(alloc, req, ordered_source_rows.rows);
-    }
-
-    fn validateRelationalRowsWindowRequestAndSourceOrderAlloc(
-        alloc: Allocator,
-        req: types.RelationalRowsWindowRequest,
-    ) ![]types.RelationalRowsQueryOrder {
-        if (req.windows.len == 0) return error.InvalidQueryRequest;
-        if (req.source.row_claim != null) return error.UnsupportedQueryRequest;
-        if (req.source.doc_key_range != null and req.source.source_cte.len != 0) return error.InvalidQueryRequest;
-        try validateRelationalRowsWindowOutputNames(req);
-        const first_window = req.windows[0];
-        for (req.windows) |window| {
-            if (window.output.len == 0) return error.InvalidQueryRequest;
-            try validateRelationalRowsWindowFrameSpec(window);
-            switch (window.function) {
-                .row_number, .rank, .dense_rank, .percent_rank, .cume_dist => {
-                    if (window.value_expression != null or window.offset != 1 or window.default_json.len > 0) return error.InvalidQueryRequest;
-                },
-                .ntile => {
-                    if (window.value_expression != null or window.offset == 0 or window.default_json.len > 0) return error.InvalidQueryRequest;
-                },
-                .lag, .lead => {
-                    if (window.value_expression == null or window.offset == 0) return error.InvalidQueryRequest;
-                },
-                .first_value => {
-                    if (window.value_expression == null or window.offset != 1 or window.default_json.len > 0) return error.InvalidQueryRequest;
-                },
-                .last_value => {
-                    if (window.value_expression == null or window.offset != 1 or window.default_json.len > 0) return error.InvalidQueryRequest;
-                },
-                .nth_value => {
-                    if (window.value_expression == null or window.offset == 0 or window.default_json.len > 0) return error.InvalidQueryRequest;
-                },
-                .count => {
-                    if (window.offset != 1 or window.default_json.len > 0) return error.InvalidQueryRequest;
-                },
-                .sum, .avg, .min, .max => {
-                    if (window.value_expression == null or window.offset != 1 or window.default_json.len > 0) return error.InvalidQueryRequest;
-                },
-                .bool_or, .bool_and => {
-                    if (window.value_expression == null or window.offset != 1 or window.default_json.len > 0) return error.InvalidQueryRequest;
-                },
-            }
-            if (window.order_by.len == 0 and relationalRowsWindowFunctionRequiresOrder(window.function)) return error.InvalidQueryRequest;
-            if (!relationalRowsWindowFunctionSupportsFilter(window.function) and relationalRowsWindowHasFilters(window)) return error.InvalidQueryRequest;
-        }
-
-        return try relationalRowsWindowSourceOrderAlloc(alloc, first_window);
-    }
-
-    fn validateRelationalRowsWindowFrameSpec(window: types.RelationalRowsWindowSpec) !void {
-        const frame = window.frame orelse return;
-        if (window.order_by.len == 0) return error.InvalidQueryRequest;
-        if (frame.start == .unbounded_following or frame.end == .unbounded_preceding) return error.InvalidQueryRequest;
-        try validateRelationalRowsWindowFrameBoundOffset(frame.start, frame.start_offset);
-        try validateRelationalRowsWindowFrameBoundOffset(frame.end, frame.end_offset);
-        if (relationalRowsWindowFrameBoundOrdinal(frame.start, frame.start_offset) > relationalRowsWindowFrameBoundOrdinal(frame.end, frame.end_offset)) return error.InvalidQueryRequest;
-        if (frame.unit != .range or !relationalRowsWindowFrameHasOffset(frame)) return;
-        const order = window.order_by[0];
-        if (order.null_test != null) return error.InvalidQueryRequest;
-        if (order.field.len == 0 and order.expression == null) return error.InvalidQueryRequest;
-    }
-
-    fn validateRelationalRowsWindowFrameBoundOffset(
-        bound: types.RelationalRowsWindowFrameBound,
-        offset: u32,
-    ) !void {
-        switch (bound) {
-            .offset_preceding, .offset_following => {
-                if (offset == 0) return error.InvalidQueryRequest;
-            },
-            else => if (offset != 0) return error.InvalidQueryRequest,
-        }
-    }
-
-    fn relationalRowsWindowFrameHasOffset(frame: types.RelationalRowsWindowFrame) bool {
-        return frame.start == .offset_preceding or
-            frame.start == .offset_following or
-            frame.end == .offset_preceding or
-            frame.end == .offset_following;
-    }
-
-    fn relationalRowsWindowFrameBoundOrdinal(bound: types.RelationalRowsWindowFrameBound, offset: u32) i64 {
-        return switch (bound) {
-            .unbounded_preceding => std.math.minInt(i64),
-            .offset_preceding => -@as(i64, @intCast(offset)),
-            .current_row => 0,
-            .offset_following => @as(i64, @intCast(offset)),
-            .unbounded_following => std.math.maxInt(i64),
-        };
-    }
-
-    fn relationalRowsWindowFunctionSupportsFilter(function: types.RelationalRowsWindowFunction) bool {
-        return switch (function) {
-            .count, .sum, .avg, .min, .max, .bool_or, .bool_and => true,
-            else => false,
-        };
-    }
-
-    fn relationalRowsWindowFunctionRequiresOrder(function: types.RelationalRowsWindowFunction) bool {
-        return switch (function) {
-            .count, .sum, .avg, .min, .max, .bool_or, .bool_and => false,
-            .row_number, .rank, .dense_rank, .percent_rank, .cume_dist, .ntile, .lag, .lead, .first_value, .last_value, .nth_value => true,
-        };
-    }
-
-    fn relationalRowsWindowHasFilters(window: types.RelationalRowsWindowSpec) bool {
-        return window.filter_predicates.len > 0 or
-            window.filter_array_any.len > 0 or
-            window.filter_array_contains.len > 0 or
-            window.filter_array_eq.len > 0 or
-            window.filter_in_predicates.len > 0 or
-            window.filter_json_contains.len > 0 or
-            window.filter_json_path_eq.len > 0 or
-            window.filter_json_path_exists.len > 0 or
-            window.filter_text_patterns.len > 0 or
-            window.filter_expressions.len > 0 or
-            window.filter_expression_array_contains.len > 0 or
-            window.filter_any.len > 0 or
-            window.filter_not.len > 0;
-    }
-
-    fn validateRelationalRowsWindowOutputNames(req: types.RelationalRowsWindowRequest) !void {
-        if (!req.select_all) {
-            for (req.select) |field| {
-                if (field.len == 0) return error.InvalidQueryRequest;
-                if (relationalRowsWindowExplicitOutputNameCount(req, field) > 1) return error.InvalidQueryRequest;
-            }
-        }
-        for (req.windows) |window| {
-            if (window.output.len == 0) return error.InvalidQueryRequest;
-            if (relationalRowsWindowExplicitOutputNameCount(req, window.output) > 1) return error.InvalidQueryRequest;
-        }
-    }
-
-    fn relationalRowsWindowExplicitOutputNameCount(
-        req: types.RelationalRowsWindowRequest,
-        name: []const u8,
-    ) usize {
-        var count: usize = 0;
-        if (!req.select_all) {
-            for (req.select) |field| {
-                if (std.mem.eql(u8, field, name)) count += 1;
-            }
-        }
-        for (req.windows) |window| {
-            if (std.mem.eql(u8, window.output, name)) count += 1;
-        }
-        return count;
     }
 
     fn relationalRowsWindowSourceQuery(
@@ -20807,16 +16454,6 @@ pub const DB = struct {
         }
 
         return .{ .rows = try rows.toOwnedSlice(alloc), .total_rows = total_rows };
-    }
-
-    fn relationalRowsWindowSourceOrderAlloc(
-        alloc: Allocator,
-        window: types.RelationalRowsWindowSpec,
-    ) ![]types.RelationalRowsQueryOrder {
-        const out = try alloc.alloc(types.RelationalRowsQueryOrder, window.partition_by.len + window.order_by.len);
-        for (window.partition_by, 0..) |field, i| out[i] = .{ .field = field, .direction = .asc };
-        for (window.order_by, 0..) |order, i| out[window.partition_by.len + i] = order;
-        return out;
     }
 
     fn relationalRowsWindowPartitionKeyJsonAlloc(
@@ -21422,7 +17059,7 @@ pub const DB = struct {
                 defer value.deinit();
                 if (value.value != .null) count += 1;
             }
-        } else if (!relationalRowsWindowHasFilters(window)) {
+        } else if (!relational_rows.windowHasFilters(window)) {
             count = @intCast(range.end - range.start + 1);
         } else {
             for (source_rows[range.start .. range.end + 1]) |row_json| {
@@ -21689,7 +17326,7 @@ pub const DB = struct {
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidQueryRequest;
-        try validateRelationalRowsMutationReturningRowOutputs(parsed.value, req.select, req.select_all, req.expressions);
+        try relational_rows.validateMutationReturningRowOutputs(parsed.value, req.select, req.select_all, req.expressions);
 
         var out: std.Io.Writer.Allocating = .init(alloc);
         errdefer out.deinit();
@@ -21744,7 +17381,7 @@ pub const DB = struct {
             }
         }
         for (req.expressions) |projection| {
-            if (relationalRowsQueryProjectionOutputAlreadyRendered(req, projection.output)) continue;
+            if (relational_rows.queryProjectionOutputAlreadyRendered(req, projection.output)) continue;
             if (!first) try writer.writeByte(',');
             first = false;
             try writer.print("{f}:", .{std.json.fmt(projection.output, .{})});
@@ -21754,25 +17391,6 @@ pub const DB = struct {
         }
         try writer.writeByte('}');
         return try out.toOwnedSlice();
-    }
-
-    fn relationalRowsQueryProjectionOutputAlreadyRendered(req: types.RelationalRowsQueryRequest, output: []const u8) bool {
-        for (req.select) |field| {
-            if (std.mem.eql(u8, field, output)) return true;
-        }
-        for (req.json_extract) |projection| {
-            if (std.mem.eql(u8, projection.output, output)) return true;
-        }
-        for (req.array_length) |projection| {
-            if (std.mem.eql(u8, projection.output, output)) return true;
-        }
-        for (req.coalesce) |projection| {
-            if (std.mem.eql(u8, projection.output, output)) return true;
-        }
-        for (req.field_aliases) |projection| {
-            if (std.mem.eql(u8, projection.output, output)) return true;
-        }
-        return false;
     }
 
     fn noSpecialRelationalRowsFieldValue(
@@ -22221,25 +17839,6 @@ pub const DB = struct {
         return try out.toOwnedSlice();
     }
 
-    fn validateRelationalRowsMutationReturningRowOutputs(
-        row: std.json.Value,
-        fields: []const []const u8,
-        returning_all: bool,
-        expressions: []const types.RelationalRowsExpressionProjection,
-    ) !void {
-        if (row != .object) return error.InvalidQueryRequest;
-        if (returning_all and fields.len != 0) return error.InvalidQueryRequest;
-        for (fields) |field| {
-            if (field.len == 0) return error.InvalidQueryRequest;
-            if (relationalRowsMutationReturningOutputCount(fields, expressions, field) > 1) return error.InvalidQueryRequest;
-        }
-        for (expressions) |projection| {
-            if (projection.output.len == 0) return error.InvalidQueryRequest;
-            if (returning_all and row.object.get(projection.output) != null) return error.InvalidQueryRequest;
-            if (relationalRowsMutationReturningOutputCount(fields, expressions, projection.output) > 1) return error.InvalidQueryRequest;
-        }
-    }
-
     fn relationalRowsJoinedMutationReturningJsonAlloc(
         alloc: Allocator,
         row_json: []const u8,
@@ -22435,13 +18034,13 @@ pub const DB = struct {
         plan: types.RelationalRowsAggregatePlan,
     ) !types.RelationalRowsAggregateResult {
         if (runtime_schema.storage_mode != .relational or runtime_schema.primary_key == null) return error.InvalidArgument;
-        try validateRelationalRowsAggregateRequest(plan.aggregate);
-        try validateRelationalRowsAggregateOutputReferencesAlloc(alloc, plan.aggregate);
-        try validateRelationalRowsAggregatePlanCteReferences(plan);
+        try relational_rows.validateAggregateRequest(plan.aggregate);
+        try relational_rows.validateAggregateOutputReferencesAlloc(alloc, plan.aggregate);
+        try relational_rows.validateAggregatePlanCteReferences(plan);
         const planned_ctes = try planRelationalRowsCteOutputsAlloc(alloc, runtime_schema, plan.ctes);
-        defer deinitRelationalRowsPlannedCtes(alloc, planned_ctes);
-        try validateRelationalRowsAggregateAgainstPlannedCteOutput(planned_ctes, plan.aggregate);
-        var materialized_ctes = std.ArrayListUnmanaged(RelationalRowsMaterializedCte).empty;
+        defer relational_rows.deinitPlannedCtes(alloc, planned_ctes);
+        try relational_rows.validateAggregateAgainstPlannedCteOutput(planned_ctes, plan.aggregate);
+        var materialized_ctes = std.ArrayListUnmanaged(relational_rows.MaterializedCte).empty;
         defer {
             for (materialized_ctes.items) |*cte| cte.deinit(alloc);
             materialized_ctes.deinit(alloc);
@@ -22457,10 +18056,10 @@ pub const DB = struct {
         req: types.RelationalRowsAggregateRequest,
         ranges: []const types.RelationalRowsDocKeyRange,
     ) !types.RelationalRowsAggregateResult {
-        try validateRelationalRowsAggregateRequest(req);
+        try relational_rows.validateAggregateRequest(req);
         if (req.source.source_cte.len != 0) return error.InvalidQueryRequest;
-        try validateRelationalRowsAggregateOutputReferencesAlloc(alloc, req);
-        try validateRelationalRowsAggregateAgainstSchema(runtime_schema, req);
+        try relational_rows.validateAggregateOutputReferencesAlloc(alloc, req);
+        try relational_rows.validateAggregateAgainstSchema(runtime_schema, req);
 
         const source = relationalRowsAggregateSourceQuery(req);
         var source_rows = try self.queryRelationalRowsAcrossRanges(alloc, runtime_schema, source, ranges);
@@ -22473,7 +18072,7 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         runtime_schema: schema_mod.TableSchema,
-        materialized_ctes: []RelationalRowsMaterializedCte,
+        materialized_ctes: []relational_rows.MaterializedCte,
         req: types.RelationalRowsAggregateRequest,
     ) !types.RelationalRowsAggregateResult {
         return try self.aggregateRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes, &.{}, req);
@@ -22483,14 +18082,14 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         runtime_schema: schema_mod.TableSchema,
-        materialized_ctes: []RelationalRowsMaterializedCte,
+        materialized_ctes: []relational_rows.MaterializedCte,
         ranges: []const types.RelationalRowsDocKeyRange,
         req: types.RelationalRowsAggregateRequest,
     ) !types.RelationalRowsAggregateResult {
-        try validateRelationalRowsAggregateRequest(req);
-        try validateRelationalRowsAggregateAgainstCteOutput(materialized_ctes, req);
-        if (req.source.source_cte.len == 0) try validateRelationalRowsAggregateAgainstSchema(runtime_schema, req);
-        try validateRelationalRowsAggregateOutputReferencesAlloc(alloc, req);
+        try relational_rows.validateAggregateRequest(req);
+        try relational_rows.validateAggregateAgainstCteOutput(materialized_ctes, req);
+        if (req.source.source_cte.len == 0) try relational_rows.validateAggregateAgainstSchema(runtime_schema, req);
+        try relational_rows.validateAggregateOutputReferencesAlloc(alloc, req);
 
         const source = relationalRowsAggregateSourceQuery(req);
 
@@ -23203,14 +18802,14 @@ pub const DB = struct {
     ) !types.RelationalRowsJoinResult {
         if (runtime_schema.storage_mode != .relational or runtime_schema.primary_key == null) return error.InvalidArgument;
         if ((plan.left_ranges.len == 0) != (plan.right_ranges.len == 0)) return error.InvalidQueryRequest;
-        try validateRelationalRowsJoinRequest(plan.join);
-        try validateRelationalRowsJoinOutputReferencesAlloc(alloc, plan.join);
-        try validateRelationalRowsJoinPlanCteReferences(plan);
+        try relational_rows.validateJoinRequest(plan.join);
+        try relational_rows.validateJoinOutputReferencesAlloc(alloc, plan.join);
+        try relational_rows.validateJoinPlanCteReferences(plan);
         const planned_ctes = try planRelationalRowsCteOutputsAlloc(alloc, runtime_schema, plan.ctes);
-        defer deinitRelationalRowsPlannedCtes(alloc, planned_ctes);
-        try validateRelationalRowsJoinAgainstPlannedCteOutput(planned_ctes, plan.join);
-        try validateRelationalRowsJoinAgainstSchema(runtime_schema, plan.join);
-        var materialized_ctes = std.ArrayListUnmanaged(RelationalRowsMaterializedCte).empty;
+        defer relational_rows.deinitPlannedCtes(alloc, planned_ctes);
+        try relational_rows.validateJoinAgainstPlannedCteOutput(planned_ctes, plan.join);
+        try relational_rows.validateJoinAgainstSchema(runtime_schema, plan.join);
+        var materialized_ctes = std.ArrayListUnmanaged(relational_rows.MaterializedCte).empty;
         defer {
             for (materialized_ctes.items) |*cte| cte.deinit(alloc);
             materialized_ctes.deinit(alloc);
@@ -23231,9 +18830,9 @@ pub const DB = struct {
     ) !types.RelationalRowsJoinResult {
         if (req.left.source_cte.len != 0 or req.right.source_cte.len != 0) return error.InvalidQueryRequest;
         if ((left_ranges.len == 0) != (right_ranges.len == 0)) return error.InvalidQueryRequest;
-        try validateRelationalRowsJoinRequest(req);
-        try validateRelationalRowsJoinOutputReferencesAlloc(alloc, req);
-        try validateRelationalRowsJoinAgainstSchema(runtime_schema, req);
+        try relational_rows.validateJoinRequest(req);
+        try relational_rows.validateJoinOutputReferencesAlloc(alloc, req);
+        try relational_rows.validateJoinAgainstSchema(runtime_schema, req);
 
         const left_source = relationalRowsJoinSideSource(req.left);
         const right_source = relationalRowsJoinSideSource(req.right);
@@ -23254,14 +18853,14 @@ pub const DB = struct {
     ) !types.RelationalRowsJoinResult {
         if (runtime_schema.storage_mode != .relational or runtime_schema.primary_key == null) return error.InvalidArgument;
         if ((plan.left_ranges.len == 0) != (plan.right_ranges.len == 0)) return error.InvalidQueryRequest;
-        try validateRelationalRowsLateralRequest(plan.lateral);
-        try validateRelationalRowsLateralOutputReferencesAlloc(alloc, plan.lateral);
-        try validateRelationalRowsLateralPlanCteReferences(plan);
+        try relational_rows.validateLateralRequest(plan.lateral);
+        try relational_rows.validateLateralOutputReferencesAlloc(alloc, plan.lateral);
+        try relational_rows.validateLateralPlanCteReferences(plan);
         const planned_ctes = try planRelationalRowsCteOutputsAlloc(alloc, runtime_schema, plan.ctes);
-        defer deinitRelationalRowsPlannedCtes(alloc, planned_ctes);
-        try validateRelationalRowsLateralAgainstPlannedCteOutput(planned_ctes, plan.lateral);
-        try validateRelationalRowsLateralAgainstSchema(runtime_schema, plan.lateral);
-        var materialized_ctes = std.ArrayListUnmanaged(RelationalRowsMaterializedCte).empty;
+        defer relational_rows.deinitPlannedCtes(alloc, planned_ctes);
+        try relational_rows.validateLateralAgainstPlannedCteOutput(planned_ctes, plan.lateral);
+        try relational_rows.validateLateralAgainstSchema(runtime_schema, plan.lateral);
+        var materialized_ctes = std.ArrayListUnmanaged(relational_rows.MaterializedCte).empty;
         defer {
             for (materialized_ctes.items) |*cte| cte.deinit(alloc);
             materialized_ctes.deinit(alloc);
@@ -23282,9 +18881,9 @@ pub const DB = struct {
     ) !types.RelationalRowsJoinResult {
         if (req.left.source_cte.len != 0 or req.right.source_cte.len != 0) return error.InvalidQueryRequest;
         if ((left_ranges.len == 0) != (right_ranges.len == 0)) return error.InvalidQueryRequest;
-        try validateRelationalRowsLateralRequest(req);
-        try validateRelationalRowsLateralOutputReferencesAlloc(alloc, req);
-        try validateRelationalRowsLateralAgainstSchema(runtime_schema, req);
+        try relational_rows.validateLateralRequest(req);
+        try relational_rows.validateLateralOutputReferencesAlloc(alloc, req);
+        try relational_rows.validateLateralAgainstSchema(runtime_schema, req);
 
         const left_source = relationalRowsLateralLeftSource(req.left);
         var left_rows = try self.queryRelationalRowsAcrossRanges(alloc, runtime_schema, left_source, left_ranges);
@@ -23297,7 +18896,7 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         runtime_schema: schema_mod.TableSchema,
-        materialized_ctes: []RelationalRowsMaterializedCte,
+        materialized_ctes: []relational_rows.MaterializedCte,
         req: types.RelationalRowsJoinRequest,
     ) !types.RelationalRowsJoinResult {
         return try self.joinRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes, &.{}, &.{}, req);
@@ -23307,16 +18906,16 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         runtime_schema: schema_mod.TableSchema,
-        materialized_ctes: []RelationalRowsMaterializedCte,
+        materialized_ctes: []relational_rows.MaterializedCte,
         left_ranges: []const types.RelationalRowsDocKeyRange,
         right_ranges: []const types.RelationalRowsDocKeyRange,
         req: types.RelationalRowsJoinRequest,
     ) !types.RelationalRowsJoinResult {
         if ((left_ranges.len == 0) != (right_ranges.len == 0)) return error.InvalidQueryRequest;
-        try validateRelationalRowsJoinRequest(req);
-        try validateRelationalRowsJoinAgainstCteOutput(materialized_ctes, req);
-        try validateRelationalRowsJoinAgainstSchema(runtime_schema, req);
-        try validateRelationalRowsJoinOutputReferencesAlloc(alloc, req);
+        try relational_rows.validateJoinRequest(req);
+        try relational_rows.validateJoinAgainstCteOutput(materialized_ctes, req);
+        try relational_rows.validateJoinAgainstSchema(runtime_schema, req);
+        try relational_rows.validateJoinOutputReferencesAlloc(alloc, req);
 
         const left_source = relationalRowsJoinSideSource(req.left);
         const right_source = relationalRowsJoinSideSource(req.right);
@@ -23327,60 +18926,6 @@ pub const DB = struct {
         defer right_rows.deinit(alloc);
 
         return try joinRelationalRowsFromSourceRowsAlloc(alloc, req, left_rows.rows, right_rows.rows);
-    }
-
-    fn validateRelationalRowsJoinRequest(req: types.RelationalRowsJoinRequest) !void {
-        if (req.on.len == 0) return error.InvalidArgument;
-        if (req.left.row_claim != null or req.right.row_claim != null) return error.UnsupportedQueryRequest;
-        if (req.left.doc_key_range != null and req.left.source_cte.len != 0) return error.InvalidQueryRequest;
-        if (req.right.doc_key_range != null and req.right.source_cte.len != 0) return error.InvalidQueryRequest;
-        try validateRelationalRowsJoinMatchExpressionSources(req);
-        try validateRelationalRowsJoinProjectionOutputs(req.select);
-    }
-
-    fn validateRelationalRowsJoinMatchExpressionSources(req: types.RelationalRowsJoinRequest) error{UnsupportedQueryRequest}!void {
-        for (req.on_expression_predicates) |condition| try validateRelationalRowsJoinMatchExpressionConditionSources(condition);
-        for (req.on_expression_or_predicates) |group| {
-            for (group.conditions) |condition| try validateRelationalRowsJoinMatchExpressionConditionSources(condition);
-        }
-        for (req.on_expression_not_predicates) |group| {
-            for (group.conditions) |condition| try validateRelationalRowsJoinMatchExpressionConditionSources(condition);
-        }
-        for (req.on_expression_array_contains) |predicate| try validateRelationalRowsJoinMatchExpressionSourcesOne(predicate.expression);
-        for (req.match_expression_predicates) |condition| try validateRelationalRowsJoinMatchExpressionConditionSources(condition);
-        for (req.match_expression_or_predicates) |group| {
-            for (group.conditions) |condition| try validateRelationalRowsJoinMatchExpressionConditionSources(condition);
-        }
-        for (req.match_expression_not_predicates) |group| {
-            for (group.conditions) |condition| try validateRelationalRowsJoinMatchExpressionConditionSources(condition);
-        }
-        for (req.match_expression_array_contains) |predicate| try validateRelationalRowsJoinMatchExpressionSourcesOne(predicate.expression);
-    }
-
-    fn validateRelationalRowsJoinMatchExpressionConditionSources(condition: types.RelationalRowsExpressionCondition) error{UnsupportedQueryRequest}!void {
-        try validateRelationalRowsJoinMatchExpressionSourcesOne(condition.lhs);
-        for (condition.rhs) |rhs| try validateRelationalRowsJoinMatchExpressionSourcesOne(rhs);
-    }
-
-    fn validateRelationalRowsJoinMatchExpressionSourcesOne(expression: types.RelationalRowsExpression) error{UnsupportedQueryRequest}!void {
-        if (expression.kind == .field and (expression.field_source == .existing or expression.field_source == .proposed)) {
-            return error.UnsupportedQueryRequest;
-        }
-        for (expression.operands) |operand| try validateRelationalRowsJoinMatchExpressionSourcesOne(operand);
-        for (expression.case_branches) |branch| {
-            try validateRelationalRowsJoinMatchExpressionConditionSources(branch.when);
-            try validateRelationalRowsJoinMatchExpressionSourcesOne(branch.then);
-        }
-        for (expression.case_else) |case_else| try validateRelationalRowsJoinMatchExpressionSourcesOne(case_else);
-    }
-
-    fn validateRelationalRowsJoinProjectionOutputs(select: []const types.RelationalRowsJoinProjection) !void {
-        for (select, 0..) |projection, i| {
-            if (projection.output.len == 0 or projection.field.len == 0) return error.InvalidQueryRequest;
-            for (select[i + 1 ..]) |other| {
-                if (std.mem.eql(u8, projection.output, other.output)) return error.InvalidQueryRequest;
-            }
-        }
     }
 
     fn relationalRowsJoinSideSource(source_req: types.RelationalRowsQueryRequest) types.RelationalRowsQueryRequest {
@@ -23791,7 +19336,7 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         runtime_schema: schema_mod.TableSchema,
-        materialized_ctes: []RelationalRowsMaterializedCte,
+        materialized_ctes: []relational_rows.MaterializedCte,
         req: types.RelationalRowsLateralRequest,
     ) !types.RelationalRowsJoinResult {
         return try self.lateralRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes, &.{}, &.{}, req);
@@ -23801,16 +19346,16 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         runtime_schema: schema_mod.TableSchema,
-        materialized_ctes: []RelationalRowsMaterializedCte,
+        materialized_ctes: []relational_rows.MaterializedCte,
         left_ranges: []const types.RelationalRowsDocKeyRange,
         right_ranges: []const types.RelationalRowsDocKeyRange,
         req: types.RelationalRowsLateralRequest,
     ) !types.RelationalRowsJoinResult {
         if ((left_ranges.len == 0) != (right_ranges.len == 0)) return error.InvalidQueryRequest;
-        try validateRelationalRowsLateralRequest(req);
-        try validateRelationalRowsLateralAgainstCteOutput(materialized_ctes, req);
-        try validateRelationalRowsLateralAgainstSchema(runtime_schema, req);
-        try validateRelationalRowsLateralOutputReferencesAlloc(alloc, req);
+        try relational_rows.validateLateralRequest(req);
+        try relational_rows.validateLateralAgainstCteOutput(materialized_ctes, req);
+        try relational_rows.validateLateralAgainstSchema(runtime_schema, req);
+        try relational_rows.validateLateralOutputReferencesAlloc(alloc, req);
 
         const left_source = relationalRowsLateralLeftSource(req.left);
         var left_rows = try self.queryRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes, left_ranges, left_source);
@@ -23828,7 +19373,7 @@ pub const DB = struct {
         right_rows: []const []const u8,
     ) !types.RelationalRowsJoinResult {
         if (req.left.doc_key_range != null or req.right.doc_key_range != null) return error.InvalidQueryRequest;
-        try validateRelationalRowsLateralRequest(req);
+        try relational_rows.validateLateralRequest(req);
         return try self.lateralRelationalRowsFromLeftRowsAlloc(alloc, runtime_schema, .{ .source_rows = right_rows }, req, left_rows);
     }
 
@@ -23839,40 +19384,19 @@ pub const DB = struct {
         right_rows: []const []const u8,
     ) !types.RelationalRowsJoinResult {
         if (req.left.doc_key_range != null or req.right.doc_key_range != null) return error.InvalidQueryRequest;
-        try validateRelationalRowsLateralRequest(req);
+        try relational_rows.validateLateralRequest(req);
         return try lateralRelationalRowsFromLeftRowsStaticAlloc(alloc, req, left_rows, right_rows);
     }
 
     const RelationalRowsLateralRightSource = union(enum) {
-        materialized_ctes: []RelationalRowsMaterializedCte,
+        materialized_ctes: []relational_rows.MaterializedCte,
         materialized_ctes_and_ranges: struct {
-            ctes: []RelationalRowsMaterializedCte,
+            ctes: []relational_rows.MaterializedCte,
             ranges: []const types.RelationalRowsDocKeyRange,
         },
         ranges: []const types.RelationalRowsDocKeyRange,
         source_rows: []const []const u8,
     };
-
-    fn validateRelationalRowsLateralRequest(req: types.RelationalRowsLateralRequest) !void {
-        if (req.correlations.len == 0) return error.InvalidArgument;
-        if (req.right.limit == null) return error.UnsupportedQueryRequest;
-        if (req.left.row_claim != null or req.right.row_claim != null) return error.UnsupportedQueryRequest;
-        if (req.left.doc_key_range != null and req.left.source_cte.len != 0) return error.InvalidQueryRequest;
-        if (req.right.doc_key_range != null and req.right.source_cte.len != 0) return error.InvalidQueryRequest;
-        try validateRelationalRowsLateralMatchExpressionSources(req);
-        try validateRelationalRowsJoinProjectionOutputs(req.select);
-    }
-
-    fn validateRelationalRowsLateralMatchExpressionSources(req: types.RelationalRowsLateralRequest) error{UnsupportedQueryRequest}!void {
-        for (req.match_expression_predicates) |condition| try validateRelationalRowsJoinMatchExpressionConditionSources(condition);
-        for (req.match_expression_or_predicates) |group| {
-            for (group.conditions) |condition| try validateRelationalRowsJoinMatchExpressionConditionSources(condition);
-        }
-        for (req.match_expression_not_predicates) |group| {
-            for (group.conditions) |condition| try validateRelationalRowsJoinMatchExpressionConditionSources(condition);
-        }
-        for (req.match_expression_array_contains) |predicate| try validateRelationalRowsJoinMatchExpressionSourcesOne(predicate.expression);
-    }
 
     fn relationalRowsLateralLeftSource(source_req: types.RelationalRowsQueryRequest) types.RelationalRowsQueryRequest {
         var source = source_req;
@@ -24438,25 +19962,6 @@ pub const DB = struct {
             self.* = undefined;
         }
     };
-
-    const RelationalRowsMaterializedCte = struct {
-        name: []const u8,
-        output_fields: []const []const u8 = &.{},
-        result: types.RelationalRowsQueryResult,
-
-        fn deinit(self: *@This(), alloc: Allocator) void {
-            freeOwnedConstStringSlice(alloc, self.output_fields);
-            self.result.deinit(alloc);
-            self.* = undefined;
-        }
-    };
-
-    fn findRelationalRowsMaterializedCte(ctes: []RelationalRowsMaterializedCte, name: []const u8) ?*RelationalRowsMaterializedCte {
-        for (ctes) |*cte| {
-            if (std.mem.eql(u8, cte.name, name)) return cte;
-        }
-        return null;
-    }
 
     pub const RelationalRowsQueryOrderKey = union(enum) {
         missing,
@@ -28281,7 +23786,7 @@ pub const DB = struct {
     }
 
     pub fn search(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
-        return try self.searchWithExecutionContext(alloc, req, .{});
+        return try search_runtime_impl.search(self, alloc, req);
     }
 
     pub fn searchWithExecutionContext(
@@ -28290,71 +23795,10 @@ pub const DB = struct {
         req: types.SearchRequest,
         exec_ctx: types.ExecutionContext,
     ) !types.SearchResult {
-        if (req.row_claim != null) {
-            return try self.searchWithRowClaim(alloc, req, exec_ctx);
-        }
-        const bench_profile = benchQueryProfileEnabled();
-        const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        var generation_ns: u64 = 0;
-        var lock_wait_ns: u64 = 0;
-        var locked_search_ns: u64 = 0;
-        if (self.canUsePublishedDenseSearch(req)) {
-            const generation_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-            const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
-            if (bench_profile) generation_ns = platform_time.monotonicNs() - generation_start_ns;
-            const search_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-            const result = try self.searchLockedWithExecutionContext(alloc, snapshot_req, exec_ctx);
-            if (bench_profile) {
-                locked_search_ns = platform_time.monotonicNs() - search_start_ns;
-                std.log.info(
-                    "antfly_bench_db_search_wrapper total_us={d} generation_us={d} lock_wait_us={d} locked_search_us={d} published_dense={}",
-                    .{ (platform_time.monotonicNs() - total_start_ns) / 1000, generation_ns / 1000, lock_wait_ns / 1000, locked_search_ns / 1000, true },
-                );
-            }
-            return result;
-        }
-        const lock_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        lockApplyShared(self);
-        if (bench_profile) lock_wait_ns = platform_time.monotonicNs() - lock_start_ns;
-        defer self.core.unlockApplyShared();
-        const generation_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        const snapshot_req = try self.searchRequestAtCurrentIdentityGeneration(req);
-        if (bench_profile) generation_ns = platform_time.monotonicNs() - generation_start_ns;
-        const search_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        const result = try self.searchLockedWithExecutionContext(alloc, snapshot_req, exec_ctx);
-        if (bench_profile) {
-            locked_search_ns = platform_time.monotonicNs() - search_start_ns;
-            std.log.info(
-                "antfly_bench_db_search_wrapper total_us={d} generation_us={d} lock_wait_us={d} locked_search_us={d} published_dense={}",
-                .{ (platform_time.monotonicNs() - total_start_ns) / 1000, generation_ns / 1000, lock_wait_ns / 1000, locked_search_ns / 1000, false },
-            );
-        }
-        return result;
+        return try search_runtime_impl.searchWithExecutionContext(self, alloc, req, exec_ctx);
     }
 
-    fn searchWithRowClaim(
-        self: *DB,
-        alloc: Allocator,
-        req: types.SearchRequest,
-        exec_ctx: types.ExecutionContext,
-    ) anyerror!types.SearchResult {
-        const claim = req.row_claim orelse return error.InvalidQueryRequest;
-        const txn_id = claim.txn_id orelse return error.InvalidQueryRequest;
-        if (!claim.mode.usesDurableIntent()) return error.InvalidQueryRequest;
-        if (req.count_only) return error.UnsupportedQueryRequest;
-        if (req.return_mode != .parent) return error.UnsupportedQueryRequest;
-        if (req.graph_queries.len > 0) return error.UnsupportedQueryRequest;
-        if (req.graph_metric_queries.len > 0) return error.UnsupportedQueryRequest;
-
-        var search_req = req;
-        search_req.row_claim = null;
-        var result = try self.searchWithExecutionContext(alloc, search_req, exec_ctx);
-        errdefer result.deinit();
-        try self.applyRowClaimToSearchResult(&result, txn_id, claim);
-        return result;
-    }
-
-    fn applyRowClaimToSearchResult(
+    pub fn searchRuntimeApplyRowClaimToSearchResult(
         self: *DB,
         result: *types.SearchResult,
         txn_id: types.TxnId,
@@ -28389,95 +23833,469 @@ pub const DB = struct {
         result.total_hits_relation = .exact;
     }
 
-    fn searchLocked(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
-        return try self.searchLockedWithExecutionContext(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), .{});
-    }
-
     pub fn searchRequestAtCurrentIdentityGeneration(self: *DB, req: types.SearchRequest) !types.SearchRequest {
-        var snapshot_req = req;
-        snapshot_req.identity_read_generation = try self.currentIdentityReadGenerationForRequest(snapshot_req.identity_read_generation);
-        try self.validateResolvedDocFilterWireContext(snapshot_req);
-        return snapshot_req;
+        return try search_runtime_impl.searchRequestAtCurrentIdentityGeneration(self, req);
     }
 
-    fn validateResolvedDocFilterWireContext(self: *DB, req: types.SearchRequest) !void {
-        const ctx = req.resolved_doc_filter_wire_context orelse return;
-        if (req.resolved_doc_filter == null) return error.InvalidQueryRequest;
-        if (!ctx.namespace.eql(self.core.identity_namespace)) return error.DocIdentityNamespaceMismatch;
-        if (req.identity_read_generation == null or req.identity_read_generation.? != ctx.identity_read_generation) {
-            self.doc_set_planning_stats.recordStaleIdentityGenerationRejection();
-            return error.UnsupportedQueryRequest;
-        }
+    pub fn searchRuntimeCanUsePublishedDenseSearch(self: *DB, req: types.SearchRequest) bool {
+        return self.canUsePublishedDenseSearch(req);
     }
 
-    fn searchLockedWithExecutionContext(
+    pub fn searchRuntimeApplyGraphMetricRerank(
+        self: *DB,
+        result: *types.SearchResult,
+        req: types.SearchRequest,
+    ) !void {
+        try self.applyGraphMetricRerank(result, req);
+    }
+
+    pub fn searchRuntimeSearchRequestWithTextAlgebraicDocFilterAlloc(self: *DB, req: types.SearchRequest) !AlgebraicDocFilterRequest {
+        const needs_algebraic_doc_filter = req.doc_filter_bindings.len > 0 or req.require_algebraic_filter_resolution;
+        return if (needs_algebraic_doc_filter)
+            try self.searchRequestWithAlgebraicDocFilterAlloc(req)
+        else
+            AlgebraicDocFilterRequest{ .req = req };
+    }
+
+    pub fn searchRuntimeSearchRequestWithAlgebraicDocFilterAlloc(self: *DB, req: types.SearchRequest) !AlgebraicDocFilterRequest {
+        return try self.searchRequestWithAlgebraicDocFilterAlloc(req);
+    }
+
+    pub fn searchRuntimeExecuteGraphMetricQueries(
+        self: *DB,
+        alloc: Allocator,
+        queries: []const types.NamedGraphMetricQuery,
+    ) ![]types.GraphMetricResult {
+        return try self.executeGraphMetricQueries(alloc, queries);
+    }
+
+    pub fn searchRuntimeApplyGraphExpandStrategy(
+        self: *DB,
+        alloc: Allocator,
+        result: *types.SearchResult,
+        strategy: ?graph_query_mod.ExpandStrategy,
+    ) !void {
+        try self.applyGraphExpandStrategy(alloc, result, strategy);
+    }
+
+    pub fn searchRuntimeCloneNamedSetAsResult(
+        self: *DB,
+        alloc: Allocator,
+        set: NamedResultSet,
+        include_stored: bool,
+    ) !types.SearchResult {
+        _ = self;
+        return try cloneNamedSetAsResult(alloc, set, include_stored);
+    }
+
+    pub fn searchRuntimeResolveSearchHitsToDocSet(
         self: *DB,
         alloc: Allocator,
         req: types.SearchRequest,
-        exec_ctx: types.ExecutionContext,
+        hits: []const types.SearchHit,
+    ) !doc_set.ResolvedDocSet {
+        if (try resolvedDocSetFromSearchHitOrdinalsAlloc(alloc, hits)) |resolved| {
+            self.recordResolvedDocSet(&resolved, false);
+            return resolved;
+        }
+        var doc_ids = try alloc.alloc([]const u8, hits.len);
+        defer alloc.free(doc_ids);
+        for (hits, 0..) |hit, i| doc_ids[i] = hit.id;
+        return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids, req.identity_read_generation);
+    }
+
+    pub fn searchRuntimeResolveGraphNodesToDocSet(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        nodes: []const graph_query_mod.GraphResultNode,
+    ) !doc_set.ResolvedDocSet {
+        var doc_ids = try alloc.alloc([]const u8, nodes.len);
+        defer alloc.free(doc_ids);
+        for (nodes, 0..) |node, i| doc_ids[i] = node.key;
+        return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids, req.identity_read_generation);
+    }
+
+    pub fn searchRuntimeMatchPattern(
+        self: *DB,
+        alloc: Allocator,
+        named: *const types.NamedGraphQuery,
+        start_key_refs: []const []const u8,
+    ) ![]graph_pattern_mod.PatternMatch {
+        return try self.matchPattern(
+            alloc,
+            named.query.index_name,
+            start_key_refs,
+            named.query.pattern,
+            named.query.params.max_results,
+            named.query.return_aliases,
+        );
+    }
+
+    pub fn searchRuntimeLoadPatternProjectedDocument(
+        self: *DB,
+        alloc: Allocator,
+        query: graph_query_mod.GraphQuery,
+        key: []const u8,
+    ) !?[]u8 {
+        return if (try self.loadStoredSearchDocumentProbe(alloc, key)) |stored|
+            try projectLookupStoredBytes(self, alloc, key, stored, .{
+                .fields = query.fields,
+                .include_all_fields = query.include_all_fields,
+            })
+        else
+            null;
+    }
+
+    pub fn searchRuntimeFindShortestPath(
+        self: *DB,
+        alloc: Allocator,
+        named: *const types.NamedGraphQuery,
+        source: []const u8,
+        target: []const u8,
+    ) !?types.GraphPath {
+        return try self.findShortestPath(
+            alloc,
+            named.query.index_name,
+            source,
+            target,
+            named.query.params.edge_types,
+            named.query.params.direction,
+            named.query.params.weight_mode,
+            named.query.params.max_depth,
+            named.query.params.min_weight,
+            named.query.params.max_weight,
+        );
+    }
+
+    pub fn searchRuntimeFindKShortestPaths(
+        self: *DB,
+        alloc: Allocator,
+        named: *const types.NamedGraphQuery,
+        source: []const u8,
+        target: []const u8,
+    ) ![]types.GraphPath {
+        return try self.findKShortestPaths(
+            alloc,
+            named.query.index_name,
+            source,
+            target,
+            named.query.k,
+            named.query.params.edge_types,
+            named.query.params.direction,
+            named.query.params.weight_mode,
+            named.query.params.max_depth,
+            named.query.params.min_weight,
+            named.query.params.max_weight,
+        );
+    }
+
+    pub fn searchRuntimeResolveDocSetDocIds(
+        self: *DB,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+    ) !?[]const []const u8 {
+        return try self.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, set, generation);
+    }
+
+    pub fn searchRuntimeResolveDocIdsToDocSet(
+        self: *DB,
+        alloc: Allocator,
+        doc_ids: []const []const u8,
+        generation: ?u64,
+    ) !doc_set.ResolvedDocSet {
+        return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids, generation);
+    }
+
+    pub fn searchRuntimeResolveRelationalFilterDocSet(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        query: search_mod.SearchQuery,
+        generation: ?u64,
+    ) !?doc_set.ResolvedDocSet {
+        if (runtime_schema.storage_mode != .relational or runtime_schema.relational_columns.len == 0) return null;
+        return try self.resolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, query, generation);
+    }
+
+    pub fn searchRuntimeLiveFilterDocSet(
+        self: *DB,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+    ) !doc_set.ResolvedDocSet {
+        if (try self.allDocsVisibleAtGeneration(generation)) {
+            return try doc_set.cloneAlloc(alloc, set);
+        }
+        return try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, set, generation);
+    }
+
+    pub fn searchRuntimeAllDocsVisible(self: *DB, generation: ?u64) !bool {
+        return try self.allDocsVisibleAtGeneration(generation);
+    }
+
+    pub fn searchRuntimeTextIndexIsChunkBacked(self: *DB, alloc: Allocator, index_name: ?[]const u8) !bool {
+        return try self.core.textIndexIsChunkBacked(alloc, index_name);
+    }
+
+    pub fn searchRuntimeProjectStoredBytesForSearch(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        doc_key: []const u8,
+        raw: []const u8,
+    ) ![]u8 {
+        return try projectStoredBytesForSearch(self, alloc, req, doc_key, raw);
+    }
+
+    pub fn searchRuntimeLoadProjectedSearchDocument(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        key: []const u8,
+    ) !?[]u8 {
+        return if (try self.loadStoredSearchDocumentProbe(alloc, key)) |stored|
+            try projectOwnedStoredBytesForSearch(self, alloc, req, key, stored)
+        else
+            null;
+    }
+
+    pub fn searchRuntimePostprocessTextSearchResult(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        raw: types.SearchResult,
+        chunk_backed: bool,
     ) !types.SearchResult {
-        const execution_req = directSingleVectorRequest(req) orelse req;
-        if (execution_req.full_text_queries.len > 0 or execution_req.dense_queries.len > 0 or execution_req.sparse_queries.len > 0 or execution_req.merge_config != null) {
-            var composed = try self.searchComposed(alloc, execution_req, exec_ctx);
-            errdefer composed.deinit();
-            try self.applyGraphMetricRerank(&composed, execution_req);
-            try externalizeSearchResultArtifactIds(alloc, &composed);
-            return composed;
+        return try db_query_result_shape.postprocessTextSearchResult(alloc, req, raw, chunk_backed, .{
+            .ctx = self,
+            .is_visible = isVisibleSearchHitCallback,
+            .filter_visible_many = filterVisibleSearchHitsManyCallback,
+            .resolve_parent_id = resolveChunkParentIdCallback,
+            .load_parent_stored = loadParentStoredForSearchCallback,
+            .load_stored = loadStoredSearchDocumentCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .load_many_parent_stored = loadParentStoredForSearchManyCallback,
+            .load_many_stored = loadStoredSearchDocumentManyCallback,
+        });
+    }
+
+    pub fn searchRuntimeDenseIndex(self: *DB, index_name: ?[]const u8) ?*index_manager_mod.IndexManager.DenseIndex {
+        return self.core.denseIndex(index_name);
+    }
+
+    pub fn searchRuntimeSparseIndex(self: *DB, index_name: ?[]const u8) ?*index_manager_mod.IndexManager.SparseIndex {
+        return self.core.sparseIndex(index_name);
+    }
+
+    pub fn searchRuntimeDenseDocKey(self: *DB, index_name: []const u8, vector_id: u64) !?[]u8 {
+        return try self.core.index_manager.lookupDenseDocKey(self.core.store, index_name, vector_id);
+    }
+
+    pub fn searchRuntimeDenseVectorId(self: *DB, index_name: []const u8, doc_key: []const u8) !?u64 {
+        return try self.core.index_manager.lookupDenseVectorId(self.core.store, index_name, doc_key);
+    }
+
+    pub fn searchRuntimeDenseVectorIdsForOrdinals(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        ordinals: []const u32,
+    ) ![]u64 {
+        return try self.core.index_manager.lookupDenseVectorIdsForOrdinalsAlloc(
+            alloc,
+            self.core.store,
+            index_name,
+            ordinals,
+        );
+    }
+
+    pub fn searchRuntimeAllDocsVisibleFast(self: *DB, generation: ?u64) !bool {
+        return try self.allDocsVisibleSummaryFast(generation);
+    }
+
+    pub fn searchRuntimeLookupLiveDocOrdinalNoLock(
+        self: *DB,
+        alloc: Allocator,
+        doc_id: []const u8,
+        generation: ?u64,
+    ) !?doc_set.DocOrdinal {
+        return try self.lookupLiveDocOrdinalNoLock(alloc, doc_id, generation);
+    }
+
+    pub fn searchRuntimeLookupLiveDocOrdinalsNoLock(
+        self: *DB,
+        alloc: Allocator,
+        doc_ids: []const []const u8,
+        generation: ?u64,
+    ) ![]?doc_set.DocOrdinal {
+        return try self.lookupLiveDocOrdinalsNoLock(alloc, doc_ids, generation);
+    }
+
+    pub fn searchRuntimeDenseOrdinalsForVectorIds(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        vector_ids: []const u64,
+        generation: ?u64,
+    ) ![]?doc_set.DocOrdinal {
+        const ordinals = try self.core.index_manager.lookupDenseOrdinalsForVectorIdsAlloc(
+            alloc,
+            self.core.store,
+            index_name,
+            vector_ids,
+        );
+        errdefer alloc.free(ordinals);
+        const all_visible = try self.allDocsVisibleSummaryFast(generation);
+        if (all_visible) return ordinals;
+
+        var txn = try self.core.store.beginProbeTxn();
+        defer txn.abort();
+        for (ordinals) |*maybe_ordinal| {
+            const ordinal = maybe_ordinal.* orelse continue;
+            const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse {
+                maybe_ordinal.* = null;
+                continue;
+            };
+            const visible = if (generation) |at| state.isVisibleAt(at) else state.isLive();
+            if (!visible) maybe_ordinal.* = null;
         }
+        return ordinals;
+    }
 
-        const has_primary = execution_req.full_text != null or execution_req.dense != null or execution_req.sparse != null or !db_query_search.isDefaultMatchAll(execution_req.query) or (execution_req.graph_queries.len == 0 and execution_req.graph_metric_queries.len == 0);
+    pub fn searchRuntimeSparseDocNumsForOrdinals(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        ordinals: []const u32,
+    ) ![]const u32 {
+        return try self.core.index_manager.lookupSparseDocNumsForOrdinalsAlloc(alloc, self.core.store, index_name, ordinals);
+    }
 
-        var base = if (!has_primary and (execution_req.graph_queries.len > 0 or execution_req.graph_metric_queries.len > 0))
-            try db_query_search.emptySearchResult(alloc)
-        else if (execution_req.full_text) |text|
-            try self.searchTextQuery(alloc, execution_req, text)
-        else if (execution_req.dense) |dense|
-            try self.searchDense(alloc, execution_req, dense)
-        else if (execution_req.sparse) |sparse|
-            try self.searchSparse(alloc, execution_req, sparse)
-        else switch (execution_req.query) {
-            .match_none,
-            .match_all,
-            .phrase,
-            .multi_phrase,
-            .term,
-            .fuzzy,
-            .numeric_range,
-            .date_range,
-            .doc_id,
-            .bool_field,
-            .geo_distance,
-            .geo_bbox,
-            .term_range,
-            .ip_range,
-            .geo_shape,
-            .match,
-            .match_phrase,
-            .prefix,
-            .wildcard,
-            .regexp,
-            => try self.searchText(alloc, execution_req),
-            .dense_knn => |dense| try self.searchDense(alloc, execution_req, dense),
-            .sparse_knn => |sparse| try self.searchSparse(alloc, execution_req, sparse),
-            .graph => |graph| try self.searchGraph(alloc, execution_req, graph, null),
-        };
-        errdefer base.deinit();
+    pub fn searchRuntimeLoadRequiredProjectedSearchDocument(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        key: []const u8,
+    ) ![]u8 {
+        return try projectOwnedStoredBytesForSearch(
+            self,
+            alloc,
+            req,
+            key,
+            (try self.loadStoredSearchDocumentProbe(alloc, key)) orelse return error.StoredDocMissing,
+        );
+    }
 
-        if (execution_req.graph_metric_queries.len > 0) {
-            base.graph_metric_results = try self.executeGraphMetricQueries(alloc, execution_req.graph_metric_queries);
-        }
+    pub fn searchRuntimeLoadProjectedSearchDocumentMany(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        keys: []const []const u8,
+    ) ![]?[]u8 {
+        return try self.loadProjectedSearchDocumentMany(alloc, req, keys);
+    }
 
-        try self.applyGraphMetricRerank(&base, execution_req);
+    pub fn searchRuntimePostprocessVectorSearchResult(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        raw: types.SearchResult,
+        chunk_backed: bool,
+    ) !types.SearchResult {
+        return try db_query_result_shape.postprocessVectorSearchResult(alloc, req, raw, chunk_backed, .{
+            .ctx = self,
+            .is_visible = if (chunk_backed) isVisibleSearchHitCallback else isVisibleNonChunkSearchHitCallback,
+            .filter_visible_many = filterVisibleSearchHitsManyCallback,
+            .resolve_parent_id = resolveChunkParentIdCallback,
+            .load_parent_stored = loadParentStoredForSearchCallback,
+            .load_stored = loadStoredSearchDocumentCallback,
+            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+            .load_many_parent_stored = loadParentStoredForSearchManyCallback,
+            .load_many_stored = loadStoredSearchDocumentManyCallback,
+        });
+    }
 
-        if (execution_req.graph_queries.len == 0) {
-            try externalizeSearchResultArtifactIds(alloc, &base);
-            return base;
-        }
+    pub fn searchRuntimeHbcSearch(
+        self: *DB,
+        entry: *index_manager_mod.IndexManager.DenseIndex,
+        req: vectorindex_mod.SearchRequest,
+    ) !vectorindex_mod.SearchResults {
+        return try self.core.index_manager.searchDenseEntryWithRequest(entry, req);
+    }
 
-        base.graph_results = try self.executeGraphQueries(alloc, execution_req, execution_req.graph_queries, base.hits, base.total_hits);
-        try self.applyGraphExpandStrategy(alloc, &base, execution_req.expand_strategy);
-        try externalizeSearchResultArtifactIds(alloc, &base);
-        return base;
+    pub fn searchRuntimeHbcSearchProfiled(
+        self: *DB,
+        entry: *index_manager_mod.IndexManager.DenseIndex,
+        req: vectorindex_mod.SearchRequest,
+    ) !vectorindex_mod.ProfiledSearchResults {
+        return try self.core.index_manager.searchDenseEntryProfiledWithRequest(entry, req);
+    }
+
+    pub fn searchRuntimeHasRelationalBaseRows(self: *DB) bool {
+        return self.relationalColumnsForStore() != null;
+    }
+
+    pub fn searchRuntimeScanStoreRange(
+        self: *DB,
+        alloc: Allocator,
+        lower: []const u8,
+        upper: []const u8,
+    ) ![]docstore_mod.OwnedKVPair {
+        return try self.core.scanStoreRange(alloc, lower, upper);
+    }
+
+    pub fn searchRuntimeIsExpiredDocumentKey(self: *DB, alloc: Allocator, key: []const u8) !bool {
+        return try isExpiredDocumentKey(self, alloc, key);
+    }
+
+    pub fn searchRuntimeLookupLiveDocOrdinal(
+        self: *DB,
+        alloc: Allocator,
+        doc_id: []const u8,
+        generation: ?u64,
+    ) !?doc_set.DocOrdinal {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return try self.lookupLiveDocOrdinalNoLock(alloc, doc_id, generation);
+    }
+
+    pub fn searchRuntimeLoadStoredSearchDocument(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
+        return try self.loadStoredSearchDocumentProbe(alloc, key);
+    }
+
+    pub fn searchRuntimeLoadStoredSearchDocumentMany(self: *DB, alloc: Allocator, keys: []const []const u8) ![]?[]u8 {
+        return try loadStoredSearchDocumentsMany(self, alloc, keys);
+    }
+
+    pub fn searchRuntimeExecuteSearchGraphQuery(
+        self: *DB,
+        alloc: Allocator,
+        graph_query: graph_query_mod.GraphQuery,
+        start_key_refs: []const []const u8,
+        target_keys: [][]u8,
+    ) !graph_query_mod.GraphQueryResult {
+        return try executeGraphQueryWithTargets(self, alloc, graph_query, start_key_refs, target_keys);
+    }
+
+    pub fn searchRuntimeAnnotateSearchHitOrdinalsNoLock(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        hits: []types.SearchHit,
+    ) !void {
+        try self.annotateSearchHitOrdinalsNoLock(alloc, req, hits);
+    }
+
+    pub fn searchRuntimeFilterExpiredSearchResult(
+        self: *DB,
+        alloc: Allocator,
+        raw: types.SearchResult,
+    ) !types.SearchResult {
+        return try filterExpiredSearchResult(self, alloc, raw);
     }
 
     fn executeGraphMetricQueries(
@@ -28672,204 +24490,12 @@ pub const DB = struct {
         };
     }
 
-    fn directSingleVectorRequest(req: types.SearchRequest) ?types.SearchRequest {
-        if (req.merge_config != null or req.reranker != null or req.pruner != null) return null;
-        if (req.full_text_queries.len != 0) return null;
-        if (req.full_text) |text| switch (text) {
-            .match_all => {},
-            else => return null,
-        };
-        if (!db_query_search.isDefaultMatchAll(req.query)) return null;
-        if (req.graph_queries.len != 0 or req.graph_metric_queries.len != 0 or req.expand_strategy != null) return null;
-        if (req.dense != null or req.sparse != null) return null;
-        if (req.dense_queries.len == 1 and req.sparse_queries.len == 0) {
-            var next = req;
-            next.index_name = req.dense_queries[0].index_name;
-            next.full_text = null;
-            next.dense = req.dense_queries[0].query;
-            next.dense_queries = &.{};
-            return next;
-        }
-        if (req.sparse_queries.len == 1 and req.dense_queries.len == 0) {
-            var next = req;
-            next.index_name = req.sparse_queries[0].index_name;
-            next.full_text = null;
-            next.sparse = req.sparse_queries[0].query;
-            next.sparse_queries = &.{};
-            return next;
-        }
-        return null;
-    }
-
-    fn searchComposed(
-        self: *DB,
-        alloc: Allocator,
-        req: types.SearchRequest,
-        exec_ctx: types.ExecutionContext,
-    ) !types.SearchResult {
-        _ = exec_ctx;
-        return try db_query_search.searchComposed(alloc, req, .{
-            .ctx = self,
-            .resolve_structured_doc_filter = resolveStructuredDocFilterForComposedCallback,
-            .resolve_structured_text_doc_filter = resolveStructuredTextDocFilterForComposedCallback,
-            .search_text_query = searchTextQueryCallback,
-            .search_text = searchTextComposedCallback,
-            .search_dense = searchDenseComposedCallback,
-            .search_sparse = searchSparseComposedCallback,
-            .clone_named_set = cloneNamedSetCallback,
-            .fuse_named_sets = fuseNamedSetsCallback,
-            .resolve_hits_to_doc_set = resolveSearchHitsToDocSetCallback,
-            .attach_graph_results = attachGraphResultsCallback,
-        });
-    }
-
-    fn resolveStructuredDocFilterForComposedCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        req: types.SearchRequest,
-    ) anyerror!?doc_set.ResolvedDocFilter {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try db_query_search.resolveStructuredDocFilterForComposedAlloc(alloc, req, .{
-            .ctx = self,
-            .text_index_entry = textIndexEntryCallback,
-            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
-            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
-            .resolve_relational_filter_doc_set = resolveRelationalFilterDocSetCallback,
-            .live_filter_doc_set = liveFilterDocSetCallback,
-            .project_ordinals_to_doc_ids = false,
-            .identity_read_generation = req.identity_read_generation,
-        });
-    }
-
-    fn resolveStructuredTextDocFilterForComposedCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        req: types.SearchRequest,
-    ) anyerror!?db_query_search.ResolvedTextDocNumFilter {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, req, .{
-            .ctx = self,
-            .text_index_entry = textIndexEntryCallback,
-            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
-            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
-            .resolve_relational_filter_doc_set = resolveRelationalFilterDocSetCallback,
-            .live_filter_doc_set = liveFilterDocSetCallback,
-            .all_docs_visible = allDocsVisibleCallback,
-            .project_ordinals_to_doc_ids = false,
-            .identity_read_generation = req.identity_read_generation,
-        });
-    }
-
-    fn searchText(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
-        return try db_query_search.searchText(alloc, req, .{
-            .ctx = self,
-            .func = searchTextQueryCallback,
-        });
-    }
-
-    fn searchTextQuery(self: *DB, alloc: Allocator, req: types.SearchRequest, text_query: types.TextQuery) !types.SearchResult {
-        const needs_algebraic_doc_filter = req.doc_filter_bindings.len > 0 or req.require_algebraic_filter_resolution;
-        var algebraic_filter = if (needs_algebraic_doc_filter)
-            try self.searchRequestWithAlgebraicDocFilterAlloc(req)
-        else
-            AlgebraicDocFilterRequest{ .req = req };
-        defer algebraic_filter.deinit();
-        try self.proveTextQueryAccessPaths(algebraic_filter.req.index_name, text_query);
-        const metric_name = self.textQueryMetricIndexName(algebraic_filter.req);
-        const start_ns = platform_time.monotonicNs();
-        defer db_query_metrics.observe(metric_name, .search, platform_time.monotonicNs() -| start_ns);
-        return try db_query_search.searchTextQuery(alloc, algebraic_filter.req, text_query, .{
-            .ctx = self,
-            .text_index_entry = textIndexEntryCallback,
-            .text_index_is_chunk_backed = textIndexIsChunkBackedCallback,
-            .search_match_all = searchMatchAllCallback,
-            .project_stored_search = projectStoredBytesForSearchCallback,
-            .load_projected_document = loadProjectedSearchDocumentCallback,
-            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
-            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
-            .resolve_relational_filter_doc_set = resolveRelationalFilterDocSetCallback,
-            .live_filter_doc_set = liveFilterDocSetCallback,
-            .postprocess = postprocessTextSearchResultCallback,
-        });
-    }
-
-    fn proveTextQueryAccessPaths(self: *DB, index_name: ?[]const u8, text_query: types.TextQuery) !void {
-        switch (text_query) {
-            .term => |term| try self.proveTextFieldAccessPath(index_name, term.field, null, .slice),
-            .match => |match| try self.proveTextFieldAccessPath(index_name, match.field, match.analyzer, .slice),
-            .multi_match_bool_prefix => |multi_match| {
-                for (multi_match.fields) |field| try self.proveMultiMatchBoolPrefixAccessPaths(index_name, field.field);
-            },
-            .prefix => |prefix| try self.proveTextFieldAccessPath(index_name, prefix.field, null, .automaton_select),
-            .wildcard => |wildcard| try self.proveTextFieldAccessPath(index_name, wildcard.field, null, .automaton_select),
-            .regexp => |regexp| try self.proveTextFieldAccessPath(index_name, regexp.field, null, .automaton_select),
-            .fuzzy => |fuzzy| try self.proveTextFieldAccessPath(index_name, fuzzy.field, null, .automaton_select),
-            .bool_query => |bool_query| {
-                for (bool_query.must) |child| try self.proveTextQueryAccessPaths(index_name, child);
-                for (bool_query.should) |child| try self.proveTextQueryAccessPaths(index_name, child);
-                for (bool_query.must_not) |child| try self.proveTextQueryAccessPaths(index_name, child);
-            },
-            else => {},
-        }
-    }
-
-    fn proveTextFieldAccessPath(self: *DB, index_name: ?[]const u8, field: []const u8, analyzer: ?[]const u8, fragment: algebraic_mod.ir.TensorFragment) !void {
-        _ = try self.core.index_manager.planFullTextLexicalAccessPathAlloc(self.alloc, index_name, field, analyzer, fragment) orelse return error.IndexNotFound;
-    }
-
-    fn proveOptionalTextFieldAccessPath(self: *DB, index_name: ?[]const u8, field: []const u8, fragment: algebraic_mod.ir.TensorFragment) !bool {
-        const plan = try self.core.index_manager.planFullTextLexicalAccessPathAlloc(self.alloc, index_name, field, null, fragment);
-        return plan != null;
-    }
-
-    fn proveMultiMatchBoolPrefixAccessPaths(self: *DB, index_name: ?[]const u8, field: []const u8) !void {
-        if (std.mem.endsWith(u8, field, "._index_prefix")) {
-            try self.proveTextFieldAccessPath(index_name, field, null, .slice);
-            return;
-        }
-
-        try self.proveTextFieldAccessPath(index_name, field, null, .slice);
-        try self.proveTextFieldAccessPath(index_name, field, null, .automaton_select);
-        if (isSearchAsYouTypeGeneratedFieldName(field)) return;
-
-        const two_gram = try std.fmt.allocPrint(self.alloc, "{s}._2gram", .{field});
-        defer self.alloc.free(two_gram);
-        const has_two_gram = try self.proveOptionalTextFieldAccessPath(index_name, two_gram, .slice);
-        if (has_two_gram) _ = try self.proveOptionalTextFieldAccessPath(index_name, two_gram, .automaton_select);
-
-        const three_gram = try std.fmt.allocPrint(self.alloc, "{s}._3gram", .{field});
-        defer self.alloc.free(three_gram);
-        const has_three_gram = try self.proveOptionalTextFieldAccessPath(index_name, three_gram, .slice);
-        if (has_three_gram) _ = try self.proveOptionalTextFieldAccessPath(index_name, three_gram, .automaton_select);
-
-        const index_prefix = try std.fmt.allocPrint(self.alloc, "{s}._index_prefix", .{field});
-        defer self.alloc.free(index_prefix);
-        _ = try self.proveOptionalTextFieldAccessPath(index_name, index_prefix, .slice);
-    }
-
-    fn isSearchAsYouTypeGeneratedFieldName(field: []const u8) bool {
-        return std.mem.endsWith(u8, field, "._2gram") or
-            std.mem.endsWith(u8, field, "._3gram") or
-            std.mem.endsWith(u8, field, "._index_prefix");
-    }
-
-    fn textQueryMetricIndexName(self: *DB, req: types.SearchRequest) ?[]const u8 {
-        if (req.index_name) |name| return name;
-        const entry = self.core.textIndexEntry(null) orelse return null;
-        return entry.config.name;
-    }
-
     pub fn collectSearchRequestTextStats(self: *DB, alloc: Allocator, req: types.SearchRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
-        lockApplyShared(self);
-        defer self.core.unlockApplyShared();
-        return try db_query_search.collectSearchRequestTextStats(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), .{
-            .ctx = self,
-            .text_index_entry = textIndexEntryCallback,
-        });
+        return try search_runtime_impl.collectSearchRequestTextStats(self, alloc, req);
     }
 
     pub fn preflightSearchRequest(self: *DB, alloc: Allocator, req: types.SearchRequest, max_work: u32) !db_query_search.RuntimePreflightSummary {
-        return try self.preflightSearchRequestWithExecutionContext(alloc, req, max_work, .{});
+        return try search_runtime_impl.preflightSearchRequest(self, alloc, req, max_work);
     }
 
     pub fn preflightSearchRequestWithExecutionContext(
@@ -28879,7 +24505,7 @@ pub const DB = struct {
         max_work: u32,
         exec_ctx: types.ExecutionContext,
     ) !db_query_search.RuntimePreflightSummary {
-        return try self.collectPlanningStatsWithExecutionContext(alloc, req, max_work, exec_ctx);
+        return try search_runtime_impl.preflightSearchRequestWithExecutionContext(self, alloc, req, max_work, exec_ctx);
     }
 
     pub fn collectPlanningStats(
@@ -28888,7 +24514,7 @@ pub const DB = struct {
         req: types.SearchRequest,
         max_work: u32,
     ) !planning_stats_mod.PlanningStatsSummary {
-        return try self.collectPlanningStatsWithExecutionContext(alloc, req, max_work, .{});
+        return try search_runtime_impl.collectPlanningStats(self, alloc, req, max_work);
     }
 
     pub fn collectPlanningStatsWithExecutionContext(
@@ -28898,60 +24524,15 @@ pub const DB = struct {
         max_work: u32,
         exec_ctx: types.ExecutionContext,
     ) !planning_stats_mod.PlanningStatsSummary {
-        lockApplyShared(self);
-        defer self.core.unlockApplyShared();
-        return try self.collectPlanningStatsLocked(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), max_work, exec_ctx);
-    }
-
-    fn collectPlanningStatsLocked(
-        self: *DB,
-        alloc: Allocator,
-        req: types.SearchRequest,
-        max_work: u32,
-        exec_ctx: types.ExecutionContext,
-    ) !planning_stats_mod.PlanningStatsSummary {
-        _ = exec_ctx;
-        try planning_bindings_mod.validateSearchRequestBindings(&self.core, self.alloc, req);
-        return try planning_adapter_mod.collectSearchRequestStatsAlloc(
-            alloc,
-            &self.core,
-            self,
-            planningStatsSearchRequestCallback,
-            req,
-            max_work,
-        );
+        return try search_runtime_impl.collectPlanningStatsWithExecutionContext(self, alloc, req, max_work, exec_ctx);
     }
 
     pub fn planningStatsProvider(self: *DB) planning_stats_mod.PlanningStatsProvider {
-        return planning_stats_mod.PlanningStatsProvider.init(self, planningStatsProviderCollectSearchRequestStats);
-    }
-
-    fn planningStatsProviderCollectSearchRequestStats(
-        ptr: *anyopaque,
-        alloc: Allocator,
-        req: types.SearchRequest,
-        max_work: u32,
-    ) !planning_stats_mod.PlanningStatsSummary {
-        const self: *DB = @ptrCast(@alignCast(ptr));
-        return try self.collectPlanningStats(alloc, req, max_work);
-    }
-
-    fn planningStatsSearchRequestCallback(
-        ptr: *anyopaque,
-        alloc: Allocator,
-        req: types.SearchRequest,
-    ) !types.SearchResult {
-        const self: *DB = @ptrCast(@alignCast(ptr));
-        return try self.searchLocked(alloc, req);
+        return search_runtime_impl.planningStatsProvider(self);
     }
 
     pub fn collectExplicitTextStats(self: *DB, alloc: Allocator, requests: []const db_query_search.ExplicitTextStatRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
-        lockApplyShared(self);
-        defer self.core.unlockApplyShared();
-        return try db_query_search.collectExplicitTextStats(alloc, requests, .{
-            .ctx = self,
-            .text_index_entry = textIndexEntryCallback,
-        });
+        return try search_runtime_impl.collectExplicitTextStats(self, alloc, requests);
     }
 
     pub fn collectExplicitBackgroundTextStats(
@@ -28959,12 +24540,7 @@ pub const DB = struct {
         alloc: Allocator,
         requests: []const db_query_search.ExplicitBackgroundTextStatRequest,
     ) ![]const aggregations_mod.DistributedBackgroundTextStats {
-        lockApplyShared(self);
-        defer self.core.unlockApplyShared();
-        return try db_query_search.collectExplicitBackgroundTextStats(alloc, requests, .{
-            .ctx = self,
-            .text_index_entry = textIndexEntryCallback,
-        });
+        return try search_runtime_impl.collectExplicitBackgroundTextStats(self, alloc, requests);
     }
 
     fn textIndexEntryCallback(
@@ -28973,146 +24549,6 @@ pub const DB = struct {
     ) anyerror!?*index_manager_mod.IndexManager.TextIndex {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         return self.core.textIndexEntry(index_name);
-    }
-
-    fn textIndexIsChunkBackedCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        index_name: ?[]const u8,
-    ) anyerror!bool {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.core.textIndexIsChunkBacked(alloc, index_name);
-    }
-
-    fn searchMatchAllCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        req: types.SearchRequest,
-    ) anyerror!types.SearchResult {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.searchMatchAll(alloc, req);
-    }
-
-    fn projectStoredBytesForSearchCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        req: types.SearchRequest,
-        doc_key: []const u8,
-        raw: []const u8,
-    ) anyerror![]u8 {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try projectStoredBytesForSearch(self, alloc, req, doc_key, raw);
-    }
-
-    fn postprocessTextSearchResultCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        req: types.SearchRequest,
-        raw: types.SearchResult,
-        chunk_backed: bool,
-    ) anyerror!types.SearchResult {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try db_query_result_shape.postprocessTextSearchResult(alloc, req, raw, chunk_backed, .{
-            .ctx = self,
-            .is_visible = isVisibleSearchHitCallback,
-            .filter_visible_many = filterVisibleSearchHitsManyCallback,
-            .resolve_parent_id = resolveChunkParentIdCallback,
-            .load_parent_stored = loadParentStoredForSearchCallback,
-            .load_stored = loadStoredSearchDocumentCallback,
-            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
-            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
-            .load_many_parent_stored = loadParentStoredForSearchManyCallback,
-            .load_many_stored = loadStoredSearchDocumentManyCallback,
-        });
-    }
-
-    fn searchTextQueryCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        req: types.SearchRequest,
-        text_query: types.TextQuery,
-    ) anyerror!types.SearchResult {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.searchTextQuery(alloc, req, text_query);
-    }
-
-    fn searchTextComposedCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        req: types.SearchRequest,
-    ) anyerror!types.SearchResult {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.searchText(alloc, req);
-    }
-
-    fn searchDenseComposedCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        req: types.SearchRequest,
-        dense: types.DenseKnnQuery,
-    ) anyerror!types.SearchResult {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.searchDense(alloc, req, dense);
-    }
-
-    fn searchSparseComposedCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        req: types.SearchRequest,
-        sparse: types.SparseKnnQuery,
-    ) anyerror!types.SearchResult {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.searchSparse(alloc, req, sparse);
-    }
-
-    fn cloneNamedSetCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        set: NamedResultSet,
-        include_stored: bool,
-    ) anyerror!types.SearchResult {
-        _ = ctx;
-        return try cloneNamedSetAsResult(alloc, set, include_stored);
-    }
-
-    fn fuseNamedSetsCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        req: types.SearchRequest,
-        named_sets: []const NamedResultSet,
-    ) anyerror!types.SearchResult {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.fuseNamedSets(alloc, req, named_sets);
-    }
-
-    fn attachGraphResultsCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        req: types.SearchRequest,
-        base: *types.SearchResult,
-        named_sets: []const NamedResultSet,
-    ) anyerror!void {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        base.graph_results = try self.executeGraphQueriesWithSets(alloc, req, req.graph_queries, named_sets);
-        try self.applyGraphExpandStrategy(alloc, base, req.expand_strategy);
-    }
-
-    fn hbcSearchCallback(
-        ctx: ?*anyopaque,
-        entry: *index_manager_mod.IndexManager.DenseIndex,
-        req: vectorindex_mod.SearchRequest,
-    ) anyerror!vectorindex_mod.SearchResults {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.core.index_manager.searchDenseEntryWithRequest(entry, req);
-    }
-
-    fn hbcSearchProfiledCallback(
-        ctx: ?*anyopaque,
-        entry: *index_manager_mod.IndexManager.DenseIndex,
-        req: vectorindex_mod.SearchRequest,
-    ) anyerror!vectorindex_mod.ProfiledSearchResults {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.core.index_manager.searchDenseEntryProfiledWithRequest(entry, req);
     }
 
     fn resolveDocSetDocIdsCallback(
@@ -29843,14 +25279,6 @@ pub const DB = struct {
         return try self.allDocsVisibleAtGeneration(generation);
     }
 
-    fn allDocsVisibleFastCallback(
-        ctx: ?*anyopaque,
-        generation: ?u64,
-    ) anyerror!bool {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.allDocsVisibleSummaryFast(generation);
-    }
-
     fn allDocsVisibleAtGeneration(self: *DB, generation: ?u64) !bool {
         const bench_profile = platform.env.getenv("ANTFLY_BENCH_QUERY_PROFILE") != null;
         const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
@@ -29896,230 +25324,8 @@ pub const DB = struct {
         return try doc_identity.allVisibleFromSummaryFast(self.core.store, generation);
     }
 
-    fn denseVectorIdsForOrdinalsCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        index_name: []const u8,
-        ordinals: []const u32,
-    ) anyerror![]u64 {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.core.index_manager.lookupDenseVectorIdsForOrdinalsAlloc(
-            alloc,
-            self.core.store,
-            index_name,
-            ordinals,
-        );
-    }
-
-    fn denseOrdinalsForVectorIdsCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        index_name: []const u8,
-        vector_ids: []const u64,
-        generation: ?u64,
-    ) anyerror![]?doc_set.DocOrdinal {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        const ordinals = try self.core.index_manager.lookupDenseOrdinalsForVectorIdsAlloc(
-            alloc,
-            self.core.store,
-            index_name,
-            vector_ids,
-        );
-        errdefer alloc.free(ordinals);
-        const all_visible = try self.allDocsVisibleSummaryFast(generation);
-        if (all_visible) return ordinals;
-
-        var txn = try self.core.store.beginProbeTxn();
-        defer txn.abort();
-        for (ordinals) |*maybe_ordinal| {
-            const ordinal = maybe_ordinal.* orelse continue;
-            const state = (try doc_identity.lookupStateTxn(&txn, ordinal)) orelse {
-                maybe_ordinal.* = null;
-                continue;
-            };
-            const visible = if (generation) |at| state.isVisibleAt(at) else state.isLive();
-            if (!visible) maybe_ordinal.* = null;
-        }
-        return ordinals;
-    }
-
-    fn searchDense(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !types.SearchResult {
-        if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
-        const metric_name = self.denseQueryMetricIndexName(req);
-        const start_ns = platform_time.monotonicNs();
-        defer db_query_metrics.observe(metric_name, .vector, platform_time.monotonicNs() -| start_ns);
-        const bench_profile = benchQueryProfileEnabled();
-        const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        var algebraic_ns: u64 = 0;
-        var prove_ns: u64 = 0;
-        var inner_ns: u64 = 0;
-        const algebraic_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        var algebraic_filter = try self.searchRequestWithAlgebraicDocFilterAlloc(req);
-        defer algebraic_filter.deinit();
-        if (bench_profile) algebraic_ns = platform_time.monotonicNs() - algebraic_start_ns;
-        const prove_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        try self.proveVectorSearchAccessPath(algebraic_filter.req.index_name, .dense_vector, hasNativeDocIdConstraints(algebraic_filter.req));
-        if (bench_profile) prove_ns = platform_time.monotonicNs() - prove_start_ns;
-        const inner_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        const result = try db_query_search.searchDense(alloc, algebraic_filter.req, dense, .{
-            .ctx = self,
-            .text_index_entry = textIndexEntryCallback,
-            .dense_index = denseIndexCallback,
-            .lookup_doc_key = denseDocKeyCallback,
-            .lookup_vector_id = denseVectorIdCallback,
-            .lookup_vector_ids_for_ordinals = denseVectorIdsForOrdinalsCallback,
-            .all_docs_visible_fast = allDocsVisibleFastCallback,
-            .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
-            .lookup_doc_ordinals = lookupLiveDocOrdinalsNoLockCallback,
-            .lookup_doc_ordinals_for_vector_ids = denseOrdinalsForVectorIdsCallback,
-            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
-            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
-            .resolve_relational_filter_doc_set = resolveRelationalFilterDocSetCallback,
-            .live_filter_doc_set = liveFilterDocSetCallback,
-            .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
-            .hbc_search = hbcSearchCallback,
-            .hbc_search_profiled = hbcSearchProfiledCallback,
-            .postprocess = postprocessVectorSearchResultCallback,
-        });
-        if (bench_profile) {
-            inner_ns = platform_time.monotonicNs() - inner_start_ns;
-            std.log.info(
-                "antfly_bench_db_dense_wrapper total_us={d} algebraic_us={d} prove_us={d} inner_us={d}",
-                .{ (platform_time.monotonicNs() - total_start_ns) / 1000, algebraic_ns / 1000, prove_ns / 1000, inner_ns / 1000 },
-            );
-        }
-        return result;
-    }
-
     pub fn searchDenseProfiled(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
-        if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
-        if (self.canUsePublishedDenseSearch(req)) {
-            return try self.searchDenseProfiledAtSnapshot(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), dense);
-        }
-        {
-            lockApplyShared(self);
-            defer self.core.unlockApplyShared();
-            return try self.searchDenseProfiledAtSnapshot(alloc, try self.searchRequestAtCurrentIdentityGeneration(req), dense);
-        }
-    }
-
-    fn searchDenseProfiledAtSnapshot(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
-        var algebraic_filter = try self.searchRequestWithAlgebraicDocFilterAlloc(req);
-        defer algebraic_filter.deinit();
-        try self.proveVectorSearchAccessPath(algebraic_filter.req.index_name, .dense_vector, hasNativeDocIdConstraints(algebraic_filter.req));
-        const profiled = db_query_search.searchDenseProfiled(alloc, algebraic_filter.req, dense, .{
-            .ctx = self,
-            .text_index_entry = textIndexEntryCallback,
-            .dense_index = denseIndexCallback,
-            .lookup_doc_key = denseDocKeyCallback,
-            .lookup_vector_id = denseVectorIdCallback,
-            .lookup_vector_ids_for_ordinals = denseVectorIdsForOrdinalsCallback,
-            .all_docs_visible_fast = allDocsVisibleFastCallback,
-            .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
-            .lookup_doc_ordinals = lookupLiveDocOrdinalsNoLockCallback,
-            .lookup_doc_ordinals_for_vector_ids = denseOrdinalsForVectorIdsCallback,
-            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
-            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
-            .resolve_relational_filter_doc_set = resolveRelationalFilterDocSetCallback,
-            .live_filter_doc_set = liveFilterDocSetCallback,
-            .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
-            .hbc_search = hbcSearchCallback,
-            .hbc_search_profiled = hbcSearchProfiledCallback,
-            .postprocess = postprocessVectorSearchResultCallback,
-        });
-        return profiled catch |err| {
-            if (err == error.IndexNotFound) {
-                const index_configs = self.listIndexes(alloc) catch |list_err| {
-                    std.log.err("dense profiled search missing index requested={s} list_err={s}", .{
-                        req.index_name orelse "<null>",
-                        @errorName(list_err),
-                    });
-                    return err;
-                };
-                defer types.freeIndexConfigs(alloc, index_configs);
-                std.log.err("dense profiled search missing index requested={s} configured_index_count={d}", .{
-                    req.index_name orelse "<null>",
-                    index_configs.len,
-                });
-                for (index_configs) |cfg| {
-                    std.log.err("dense profiled search visible index name={s} kind={s}", .{
-                        cfg.name,
-                        @tagName(cfg.kind),
-                    });
-                }
-            }
-            return err;
-        };
-    }
-
-    fn searchSparse(self: *DB, alloc: Allocator, req: types.SearchRequest, sparse: types.SparseKnnQuery) !types.SearchResult {
-        if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
-        const metric_name = self.sparseQueryMetricIndexName(req);
-        const start_ns = platform_time.monotonicNs();
-        defer db_query_metrics.observe(metric_name, .vector, platform_time.monotonicNs() -| start_ns);
-        const bench_profile = benchQueryProfileEnabled();
-        const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        var algebraic_ns: u64 = 0;
-        var prove_ns: u64 = 0;
-        var inner_ns: u64 = 0;
-        const algebraic_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        var algebraic_filter = try self.searchRequestWithAlgebraicDocFilterAlloc(req);
-        defer algebraic_filter.deinit();
-        if (bench_profile) algebraic_ns = platform_time.monotonicNs() - algebraic_start_ns;
-        const prove_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        try self.proveVectorSearchAccessPath(algebraic_filter.req.index_name, .sparse_vector, hasNativeDocIdConstraints(algebraic_filter.req));
-        if (bench_profile) prove_ns = platform_time.monotonicNs() - prove_start_ns;
-        const inner_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        const result = try db_query_search.searchSparse(alloc, algebraic_filter.req, sparse, .{
-            .ctx = self,
-            .text_index_entry = textIndexEntryCallback,
-            .sparse_index = sparseIndexCallback,
-            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
-            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
-            .resolve_relational_filter_doc_set = resolveRelationalFilterDocSetCallback,
-            .live_filter_doc_set = liveFilterDocSetCallback,
-            .lookup_doc_nums_for_ordinals = sparseDocNumsForOrdinalsCallback,
-            .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
-            .lookup_doc_ordinals = lookupLiveDocOrdinalsNoLockCallback,
-            .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
-            .load_projected_documents = loadProjectedSearchDocumentManyCallback,
-            .postprocess = postprocessVectorSearchResultCallback,
-        });
-        if (bench_profile) {
-            inner_ns = platform_time.monotonicNs() - inner_start_ns;
-            std.log.info(
-                "antfly_bench_db_sparse_wrapper total_us={d} algebraic_us={d} prove_us={d} inner_us={d}",
-                .{ (platform_time.monotonicNs() - total_start_ns) / 1000, algebraic_ns / 1000, prove_ns / 1000, inner_ns / 1000 },
-            );
-        }
-        return result;
-    }
-
-    fn proveVectorSearchAccessPath(self: *DB, index_name: ?[]const u8, layout: algebraic_mod.ir.PhysicalLayout, constrained: bool) !void {
-        const selected_path = switch (layout) {
-            .dense_vector => self.core.index_manager.denseVectorAccessPath(index_name),
-            .sparse_vector => self.core.index_manager.sparseVectorAccessPath(index_name),
-            else => null,
-        };
-        const access_path = selected_path orelse return error.IndexNotFound;
-        var planned = (try algebraic_mod.planner.planVectorSearchTensorProgramAlloc(self.alloc, access_path.owner, layout, constrained)) orelse return error.InvalidIndexConfig;
-        defer planned.deinit(self.alloc);
-        if (planned.access_paths.len != 1 or
-            planned.access_paths[0].layout != layout or
-            !std.mem.eql(u8, planned.access_paths[0].owner, access_path.owner) or
-            !std.mem.eql(algebraic_mod.ir.Dimension, planned.access_paths[0].output_dims, access_path.output_dims))
-        {
-            return error.InvalidIndexConfig;
-        }
-        if (!algebraic_mod.ir.vectorSearchProgramMatchesTarget(planned.asProgram(), access_path.owner, layout, constrained)) return error.InvalidIndexConfig;
-    }
-
-    fn hasNativeDocIdConstraints(req: types.SearchRequest) bool {
-        return req.filter_doc_ids_positive or
-            req.filter_doc_ids.len > 0 or
-            req.exclude_doc_ids.len > 0 or
-            req.resolved_doc_filter != null or
-            req.doc_filter_bindings.len > 0;
+        return try search_runtime_impl.searchDenseProfiled(self, alloc, req, dense);
     }
 
     const AlgebraicDocFilterRequest = struct {
@@ -30648,26 +25854,6 @@ pub const DB = struct {
         return try out.toOwnedSlice(alloc);
     }
 
-    fn denseQueryMetricIndexName(self: *DB, req: types.SearchRequest) ?[]const u8 {
-        if (req.index_name) |name| return name;
-        const entry = self.core.denseIndex(null) orelse return null;
-        return entry.config.name;
-    }
-
-    fn sparseQueryMetricIndexName(self: *DB, req: types.SearchRequest) ?[]const u8 {
-        if (req.index_name) |name| return name;
-        const entry = self.core.sparseIndex(null) orelse return null;
-        return entry.config.name;
-    }
-
-    fn denseIndexCallback(
-        ctx: ?*anyopaque,
-        index_name: ?[]const u8,
-    ) anyerror!?*index_manager_mod.IndexManager.DenseIndex {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return self.core.denseIndex(index_name);
-    }
-
     fn canUsePublishedDenseSearch(self: *DB, req: types.SearchRequest) bool {
         if (req.graph_queries.len != 0) return false;
         if (req.graph_metric_queries.len != 0) return false;
@@ -30681,42 +25867,6 @@ pub const DB = struct {
         if (!(req.dense != null or req.query == .dense_knn)) return false;
         const entry = self.core.denseIndex(req.index_name) orelse return false;
         return !entry.index.hasExternalVectorLoader();
-    }
-
-    fn denseDocKeyCallback(
-        ctx: ?*anyopaque,
-        index_name: []const u8,
-        vector_id: u64,
-    ) anyerror!?[]u8 {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.core.index_manager.lookupDenseDocKey(self.core.store, index_name, vector_id);
-    }
-
-    fn denseVectorIdCallback(
-        ctx: ?*anyopaque,
-        index_name: []const u8,
-        doc_key: []const u8,
-    ) anyerror!?u64 {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.core.index_manager.lookupDenseVectorId(self.core.store, index_name, doc_key);
-    }
-
-    fn sparseIndexCallback(
-        ctx: ?*anyopaque,
-        index_name: ?[]const u8,
-    ) anyerror!?*index_manager_mod.IndexManager.SparseIndex {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return self.core.sparseIndex(index_name);
-    }
-
-    fn sparseDocNumsForOrdinalsCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        index_name: []const u8,
-        ordinals: []const u32,
-    ) anyerror![]const u32 {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.core.index_manager.lookupSparseDocNumsForOrdinalsAlloc(alloc, self.core.store, index_name, ordinals);
     }
 
     fn loadRequiredProjectedSearchDocumentCallback(
@@ -30733,70 +25883,6 @@ pub const DB = struct {
             key,
             (try self.loadStoredSearchDocumentProbe(alloc, key)) orelse return error.StoredDocMissing,
         );
-    }
-
-    fn postprocessVectorSearchResultCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        req: types.SearchRequest,
-        raw: types.SearchResult,
-        chunk_backed: bool,
-    ) anyerror!types.SearchResult {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try db_query_result_shape.postprocessVectorSearchResult(alloc, req, raw, chunk_backed, .{
-            .ctx = self,
-            .is_visible = if (chunk_backed) isVisibleSearchHitCallback else isVisibleNonChunkSearchHitCallback,
-            .filter_visible_many = filterVisibleSearchHitsManyCallback,
-            .resolve_parent_id = resolveChunkParentIdCallback,
-            .load_parent_stored = loadParentStoredForSearchCallback,
-            .load_stored = loadStoredSearchDocumentCallback,
-            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
-            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
-            .load_many_parent_stored = loadParentStoredForSearchManyCallback,
-            .load_many_stored = loadStoredSearchDocumentManyCallback,
-        });
-    }
-
-    fn searchMatchAll(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
-        return try db_query_search.searchMatchAll(alloc, req, .{
-            .ctx = self,
-            .collect_candidates = collectSearchMatchAllCandidatesCallback,
-            .text_index_entry = textIndexEntryCallback,
-            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
-            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
-            .resolve_relational_filter_doc_set = resolveRelationalFilterDocSetCallback,
-            .live_filter_doc_set = liveFilterDocSetCallback,
-            .load_projected_document = loadRequiredProjectedSearchDocumentCallback,
-            .load_stored = loadStoredSearchDocumentCallback,
-            .load_many_stored = loadStoredSearchDocumentManyCallback,
-        });
-    }
-
-    fn collectSearchMatchAllCandidatesCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        req: types.SearchRequest,
-    ) anyerror!db_query_search.MatchAllCandidates {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try db_query_search.collectMatchAllCandidates(alloc, req, .{
-            .ctx = self,
-            .relational_base_rows = self.relationalColumnsForStore() != null,
-            .scan_store_range = scanStoreRangeCallback,
-            .is_expired_key = isExpiredDocumentKeyCallback,
-            .lookup_doc_ordinal = lookupLiveDocOrdinalCallback,
-        });
-    }
-
-    fn lookupLiveDocOrdinalCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        doc_id: []const u8,
-        generation: ?u64,
-    ) anyerror!?doc_set.DocOrdinal {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        lockApplyShared(self);
-        defer self.core.unlockApplyShared();
-        return try self.lookupLiveDocOrdinalNoLock(alloc, doc_id, generation);
     }
 
     fn lookupLiveDocOrdinalNoLockCallback(
@@ -30880,74 +25966,6 @@ pub const DB = struct {
         return try self.core.scanStoreRange(alloc, lower, upper);
     }
 
-    fn searchGraph(self: *DB, alloc: Allocator, req: types.SearchRequest, graph_query: graph_query_mod.GraphQuery, base_hits: ?[]const types.SearchHit) !types.SearchResult {
-        _ = req.index_name;
-        var raw = try db_query_graph.executeSearchGraph(alloc, req, graph_query, base_hits, .{
-            .ctx = self,
-            .execute_graph_query = executeSearchGraphQueryCallback,
-            .load_projected_document = loadProjectedSearchDocumentCallback,
-            .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
-        });
-        errdefer raw.deinit();
-        try self.annotateSearchHitOrdinalsNoLock(alloc, req, raw.hits);
-        return try filterExpiredSearchResult(self, alloc, raw);
-    }
-
-    fn executeGraphQueries(
-        self: *DB,
-        alloc: Allocator,
-        req: types.SearchRequest,
-        graph_queries: []const types.NamedGraphQuery,
-        base_hits: []const types.SearchHit,
-        base_total_hits: u32,
-    ) ![]types.GraphSearchResult {
-        return try db_query_graph.executeGraphQueries(alloc, req, graph_queries, base_hits, base_total_hits, .{
-            .ctx = self,
-            .func = executeSingleGraphQueryWithSetsCallback,
-            .resolve_hits_to_doc_set = resolveSearchHitsToDocSetCallback,
-            .resolve_nodes_to_doc_set = resolveGraphNodesToDocSetCallback,
-        });
-    }
-
-    fn executeGraphQueriesWithSets(
-        self: *DB,
-        alloc: Allocator,
-        req: types.SearchRequest,
-        graph_queries: []const types.NamedGraphQuery,
-        named_sets: []const NamedResultSet,
-    ) ![]types.GraphSearchResult {
-        return try db_query_graph.executeGraphQueriesWithSets(alloc, req, graph_queries, named_sets, .{
-            .ctx = self,
-            .func = executeSingleGraphQueryWithSetsCallback,
-            .resolve_hits_to_doc_set = resolveSearchHitsToDocSetCallback,
-            .resolve_nodes_to_doc_set = resolveGraphNodesToDocSetCallback,
-        });
-    }
-
-    fn executeSingleGraphQueryWithSets(
-        self: *DB,
-        alloc: Allocator,
-        req: types.SearchRequest,
-        named: *const types.NamedGraphQuery,
-        named_sets: []const NamedResultSet,
-    ) !types.GraphSearchResult {
-        var result = switch (named.query.query_type) {
-            .pattern => try self.executeSinglePatternQueryWithSets(alloc, req, named, named_sets),
-            else => try db_query_graph.executeSingleNonPatternQueryWithSets(alloc, req, named, named_sets, .{
-                .ctx = self,
-                .find_shortest_path = executeShortestPathCallback,
-                .find_k_shortest_paths = executeKShortestPathsCallback,
-                .execute_graph_query = executeGraphQueryCallback,
-                .load_projected_document = loadProjectedSearchDocumentCallback,
-                .resolve_doc_set_doc_ids = resolveDocSetDocIdsForGraphCallback,
-                .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
-            }),
-        };
-        errdefer result.deinit(alloc);
-        try self.annotateSearchHitOrdinalsNoLock(alloc, req, result.hits);
-        return result;
-    }
-
     fn annotateSearchHitOrdinalsNoLock(
         self: *DB,
         alloc: Allocator,
@@ -30958,168 +25976,6 @@ pub const DB = struct {
             if (hit.doc_ordinal != null) continue;
             hit.doc_ordinal = try self.lookupLiveDocOrdinalNoLock(alloc, hit.id, req.identity_read_generation);
         }
-    }
-
-    fn resolveSearchHitsToDocSetCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        req: types.SearchRequest,
-        hits: []const types.SearchHit,
-    ) anyerror!doc_set.ResolvedDocSet {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        if (try resolvedDocSetFromSearchHitOrdinalsAlloc(alloc, hits)) |resolved| {
-            self.recordResolvedDocSet(&resolved, false);
-            return resolved;
-        }
-        var doc_ids = try alloc.alloc([]const u8, hits.len);
-        defer alloc.free(doc_ids);
-        for (hits, 0..) |hit, i| doc_ids[i] = hit.id;
-        return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids, req.identity_read_generation);
-    }
-
-    fn resolveGraphNodesToDocSetCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        req: types.SearchRequest,
-        nodes: []const graph_query_mod.GraphResultNode,
-    ) anyerror!doc_set.ResolvedDocSet {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        var doc_ids = try alloc.alloc([]const u8, nodes.len);
-        defer alloc.free(doc_ids);
-        for (nodes, 0..) |node, i| doc_ids[i] = node.key;
-        return try self.resolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids, req.identity_read_generation);
-    }
-
-    fn resolveDocSetDocIdsForGraphCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        set: *const doc_set.ResolvedDocSet,
-        generation: ?u64,
-    ) anyerror!?[][]u8 {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        const ids = (try self.docIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, set, generation)) orelse return null;
-        defer alloc.free(@constCast(ids));
-        errdefer for (ids) |id| alloc.free(@constCast(id));
-
-        const out = try alloc.alloc([]u8, ids.len);
-        for (ids, 0..) |id, i| out[i] = @constCast(id);
-        return out;
-    }
-
-    fn executeSingleGraphQueryWithSetsCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        req: types.SearchRequest,
-        named: *const types.NamedGraphQuery,
-        named_sets: []const NamedResultSet,
-    ) anyerror!types.GraphSearchResult {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.executeSingleGraphQueryWithSets(alloc, req, named, named_sets);
-    }
-
-    fn executeSinglePatternQueryWithSets(
-        self: *DB,
-        alloc: Allocator,
-        req: types.SearchRequest,
-        named: *const types.NamedGraphQuery,
-        named_sets: []const NamedResultSet,
-    ) !types.GraphSearchResult {
-        return try db_query_graph.executeSinglePatternQueryWithSets(alloc, req, named, named_sets, .{
-            .ctx = self,
-            .match_pattern = executePatternMatchCallback,
-            .load_projected_document = loadPatternProjectedDocumentCallback,
-            .resolve_doc_set_doc_ids = resolveDocSetDocIdsForGraphCallback,
-            .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
-        });
-    }
-
-    fn executePatternMatchCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        named: *const types.NamedGraphQuery,
-        start_key_refs: []const []const u8,
-    ) anyerror![]graph_pattern_mod.PatternMatch {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.matchPattern(
-            alloc,
-            named.query.index_name,
-            start_key_refs,
-            named.query.pattern,
-            named.query.params.max_results,
-            named.query.return_aliases,
-        );
-    }
-
-    fn loadPatternProjectedDocumentCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        query: graph_query_mod.GraphQuery,
-        key: []const u8,
-    ) anyerror!?[]u8 {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return if (try self.loadStoredSearchDocumentProbe(alloc, key)) |stored|
-            try projectLookupStoredBytes(self, alloc, key, stored, .{
-                .fields = query.fields,
-                .include_all_fields = query.include_all_fields,
-            })
-        else
-            null;
-    }
-
-    fn executeShortestPathCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        named: *const types.NamedGraphQuery,
-        source: []const u8,
-        target: []const u8,
-    ) anyerror!?types.GraphPath {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.findShortestPath(
-            alloc,
-            named.query.index_name,
-            source,
-            target,
-            named.query.params.edge_types,
-            named.query.params.direction,
-            named.query.params.weight_mode,
-            named.query.params.max_depth,
-            named.query.params.min_weight,
-            named.query.params.max_weight,
-        );
-    }
-
-    fn executeKShortestPathsCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        named: *const types.NamedGraphQuery,
-        source: []const u8,
-        target: []const u8,
-    ) anyerror![]types.GraphPath {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.findKShortestPaths(
-            alloc,
-            named.query.index_name,
-            source,
-            target,
-            named.query.k,
-            named.query.params.edge_types,
-            named.query.params.direction,
-            named.query.params.weight_mode,
-            named.query.params.max_depth,
-            named.query.params.min_weight,
-            named.query.params.max_weight,
-        );
-    }
-
-    fn executeGraphQueryCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        named: *const types.NamedGraphQuery,
-        start_key_refs: []const []const u8,
-        target_keys: [][]u8,
-    ) anyerror!graph_query_mod.GraphQueryResult {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try executeGraphQueryWithTargets(self, alloc, named.query, start_key_refs, target_keys);
     }
 
     fn loadProjectedSearchDocumentCallback(
@@ -31195,53 +26051,6 @@ pub const DB = struct {
             );
         }
         return loaded;
-    }
-
-    fn executeSearchGraphQueryCallback(
-        ctx: ?*anyopaque,
-        alloc: Allocator,
-        graph_query: graph_query_mod.GraphQuery,
-        start_key_refs: []const []const u8,
-        target_keys: [][]u8,
-    ) anyerror!graph_query_mod.GraphQueryResult {
-        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try executeGraphQueryWithTargets(self, alloc, graph_query, start_key_refs, target_keys);
-    }
-
-    fn searchGraphWithSets(self: *DB, alloc: Allocator, req: types.SearchRequest, graph_query: graph_query_mod.GraphQuery, named_sets: []const NamedResultSet) !types.SearchResult {
-        _ = req.index_name;
-
-        if (graph_query.query_type == .pattern) {
-            const named_query: types.NamedGraphQuery = .{
-                .name = "__graph",
-                .query = graph_query,
-            };
-            const graph_results = try alloc.alloc(types.GraphSearchResult, 1);
-            errdefer alloc.free(graph_results);
-            graph_results[0] = try self.executeSinglePatternQueryWithSets(alloc, req, &named_query, named_sets);
-            return .{
-                .alloc = alloc,
-                .hits = &.{},
-                .total_hits = graph_results[0].total_hits,
-                .graph_results = graph_results,
-            };
-        }
-        const raw = try db_query_graph.executeSearchGraphWithSets(alloc, req, graph_query, named_sets, .{
-            .ctx = self,
-            .execute_graph_query = executeSearchGraphQueryCallback,
-            .load_projected_document = loadProjectedSearchDocumentCallback,
-            .resolve_doc_set_doc_ids = resolveDocSetDocIdsForGraphCallback,
-            .lookup_doc_ordinal = lookupLiveDocOrdinalNoLockCallback,
-        });
-        return try filterExpiredSearchResult(self, alloc, raw);
-    }
-
-    fn fuseNamedSets(self: *DB, alloc: Allocator, req: types.SearchRequest, named_sets: []const NamedResultSet) !types.SearchResult {
-        const raw = try db_query_graph.fuseNamedSets(alloc, req, named_sets, .{
-            .ctx = self,
-            .load_projected_document = loadProjectedSearchDocumentCallback,
-        });
-        return try filterExpiredSearchResult(self, alloc, raw);
     }
 
     fn applyGraphExpandStrategy(self: *DB, alloc: Allocator, result: *types.SearchResult, strategy: ?graph_query_mod.ExpandStrategy) !void {
@@ -42433,12 +37242,14 @@ fn waitForDenseSearchResult(alloc: Allocator, db: *DB, req: types.SearchRequest,
 
 fn waitForDenseSearchResultWithAttempts(alloc: Allocator, db: *DB, req: types.SearchRequest, min_hits: u32, max_attempts: usize) !types.SearchResult {
     const dense = req.dense orelse return error.InvalidArgument;
-    var last = try db.searchDense(alloc, req, dense);
+    var last_profiled = try db.searchDenseProfiled(alloc, req, dense);
+    var last = last_profiled.result;
     var attempts: usize = 0;
     while (last.total_hits < min_hits and attempts < max_attempts) : (attempts += 1) {
         last.deinit();
         sleepPollInterval();
-        last = try db.searchDense(alloc, req, dense);
+        last_profiled = try db.searchDenseProfiled(alloc, req, dense);
+        last = last_profiled.result;
     }
     if (last.total_hits < min_hits) {
         last.deinit();
@@ -43753,23 +38564,23 @@ test "db drains metadata schema rewrite jobs through claim and finish lifecycle"
             self.manager.deinit();
         }
 
-        fn listProjectedSchemaRewriteJobs(self: *@This(), allocator: std.mem.Allocator) ![]metadata_table_manager.SchemaRewriteJobRecord {
+        pub fn listProjectedSchemaRewriteJobs(self: *@This(), allocator: std.mem.Allocator) ![]metadata_table_manager.SchemaRewriteJobRecord {
             return try self.manager.listSchemaRewriteJobs(allocator);
         }
 
-        fn freeProjectedSchemaRewriteJobs(self: *@This(), allocator: std.mem.Allocator, records: []metadata_table_manager.SchemaRewriteJobRecord) void {
+        pub fn freeProjectedSchemaRewriteJobs(self: *@This(), allocator: std.mem.Allocator, records: []metadata_table_manager.SchemaRewriteJobRecord) void {
             self.manager.freeSchemaRewriteJobs(allocator, records);
         }
 
-        fn beginSchemaRewriteJob(self: *@This(), request: metadata_table_manager.SchemaRewriteJobBeginRequest) !void {
+        pub fn beginSchemaRewriteJob(self: *@This(), request: metadata_table_manager.SchemaRewriteJobBeginRequest) !void {
             try self.manager.beginSchemaRewriteJob(request);
         }
 
-        fn finishSchemaRewriteJob(self: *@This(), request: metadata_table_manager.SchemaRewriteJobFinishRequest) !void {
+        pub fn finishSchemaRewriteJob(self: *@This(), request: metadata_table_manager.SchemaRewriteJobFinishRequest) !void {
             try self.manager.finishSchemaRewriteJob(request);
         }
 
-        fn invalidateSchemaRewriteJob(self: *@This(), request: metadata_table_manager.SchemaRewriteJobInvalidateRequest) !void {
+        pub fn invalidateSchemaRewriteJob(self: *@This(), request: metadata_table_manager.SchemaRewriteJobInvalidateRequest) !void {
             try self.manager.invalidateSchemaRewriteJob(request);
         }
     };
@@ -43859,15 +38670,15 @@ test "db schema rewrite drain skips stale claim races and continues" {
             self.manager.deinit();
         }
 
-        fn listProjectedSchemaRewriteJobs(self: *@This(), allocator: std.mem.Allocator) ![]metadata_table_manager.SchemaRewriteJobRecord {
+        pub fn listProjectedSchemaRewriteJobs(self: *@This(), allocator: std.mem.Allocator) ![]metadata_table_manager.SchemaRewriteJobRecord {
             return try self.manager.listSchemaRewriteJobs(allocator);
         }
 
-        fn freeProjectedSchemaRewriteJobs(self: *@This(), allocator: std.mem.Allocator, records: []metadata_table_manager.SchemaRewriteJobRecord) void {
+        pub fn freeProjectedSchemaRewriteJobs(self: *@This(), allocator: std.mem.Allocator, records: []metadata_table_manager.SchemaRewriteJobRecord) void {
             self.manager.freeSchemaRewriteJobs(allocator, records);
         }
 
-        fn beginSchemaRewriteJob(self: *@This(), request: metadata_table_manager.SchemaRewriteJobBeginRequest) !void {
+        pub fn beginSchemaRewriteJob(self: *@This(), request: metadata_table_manager.SchemaRewriteJobBeginRequest) !void {
             if (request.job_id == self.raced_job_id) {
                 self.race_claims += 1;
                 return error.SchemaRewriteJobClaimBusy;
@@ -43875,11 +38686,11 @@ test "db schema rewrite drain skips stale claim races and continues" {
             try self.manager.beginSchemaRewriteJob(request);
         }
 
-        fn finishSchemaRewriteJob(self: *@This(), request: metadata_table_manager.SchemaRewriteJobFinishRequest) !void {
+        pub fn finishSchemaRewriteJob(self: *@This(), request: metadata_table_manager.SchemaRewriteJobFinishRequest) !void {
             try self.manager.finishSchemaRewriteJob(request);
         }
 
-        fn invalidateSchemaRewriteJob(self: *@This(), request: metadata_table_manager.SchemaRewriteJobInvalidateRequest) !void {
+        pub fn invalidateSchemaRewriteJob(self: *@This(), request: metadata_table_manager.SchemaRewriteJobInvalidateRequest) !void {
             try self.manager.invalidateSchemaRewriteJob(request);
         }
     };
@@ -86065,8 +80876,7 @@ test "db dense lsm cache profile benchmark" {
         }
 
         const postprocess_start = monotonicTimeNs();
-        var profiled_result = try DB.postprocessVectorSearchResultCallback(
-            @ptrCast(&db),
+        var profiled_result = try db.searchRuntimePostprocessVectorSearchResult(
             alloc,
             req,
             .{

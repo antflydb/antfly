@@ -111,6 +111,9 @@ pub const DocumentIndexQuery = struct {
 pub const DocumentAggregateOp = enum {
     count,
     sum,
+    avg,
+    min,
+    max,
 };
 
 pub const DocumentAggregateInput = struct {
@@ -650,7 +653,6 @@ fn lowerDocumentAlgebraicAggregatePlanWithBoundedScanPolicyInternalParsedSqlAllo
     else
         null;
     errdefer if (group_by) |*group| group.deinit(alloc);
-    if (aggregate.op != .count and group_by != null) return error.UnsupportedSqlShape;
 
     var candidate_producer: ?DocumentProducer = null;
     errdefer if (candidate_producer) |*producer| producer.deinit(alloc);
@@ -709,7 +711,7 @@ fn lowerDocumentAlgebraicAggregatePlanWithBoundedScanPolicyInternalParsedSqlAllo
     if (attach_unfiltered_scan and where_index == null) {
         try attachDocumentAggregateUnfilteredBoundedScanFallback(&plan, bounded_scan_policy);
     }
-    if (aggregate.op != .count) {
+    if (aggregate.op != .count and (attach_unfiltered_scan or where_index != null)) {
         try requireBoundedDocumentAggregateInputProducer(&plan, bounded_scan_policy);
     }
     return plan;
@@ -820,11 +822,18 @@ fn finishDocumentAggregatePlanWithOptionalIndexesAndBoundedScanPolicyAlloc(
 ) !DocumentAlgebraicAggregatePlan {
     const json = indexes_json orelse {
         try attachDocumentAggregateUnfilteredBoundedScanFallback(plan, bounded_scan_policy);
+        try requireDocumentAggregateInputProducerUnlessMaterialized(plan, bounded_scan_policy);
         return plan.*;
     };
+    if (json.len == 0) {
+        try attachDocumentAggregateUnfilteredBoundedScanFallback(plan, bounded_scan_policy);
+        try requireDocumentAggregateInputProducerUnlessMaterialized(plan, bounded_scan_policy);
+        return plan.*;
+    }
     var matched = documentAlgebraicAggregateMaterializationForPlanAlloc(alloc, json, plan.*) catch |err| switch (err) {
         error.DocumentSqlIndexUnavailable => {
             try attachDocumentAggregateUnfilteredBoundedScanFallback(plan, bounded_scan_policy);
+            try requireDocumentAggregateInputProducerUnlessMaterialized(plan, bounded_scan_policy);
             return plan.*;
         },
         else => return err,
@@ -833,6 +842,15 @@ fn finishDocumentAggregatePlanWithOptionalIndexesAndBoundedScanPolicyAlloc(
     plan.index_name = matched.takeIndexName();
     plan.materialization_name = matched.takeMaterializationName();
     return plan.*;
+}
+
+fn requireDocumentAggregateInputProducerUnlessMaterialized(
+    plan: *DocumentAlgebraicAggregatePlan,
+    bounded_scan_policy: ?source_binding.BoundedScanPolicy,
+) !void {
+    if (plan.aggregate.op == .count) return;
+    if (plan.index_name != null or plan.materialization_name != null) return;
+    try requireBoundedDocumentAggregateInputProducer(plan, bounded_scan_policy);
 }
 
 fn attachDocumentAggregateUnfilteredBoundedScanFallback(
@@ -849,7 +867,6 @@ fn requireBoundedDocumentAggregateInputProducer(
     plan: *DocumentAlgebraicAggregatePlan,
     bounded_scan_policy: ?source_binding.BoundedScanPolicy,
 ) !void {
-    if (plan.group_by != null) return error.UnsupportedSqlShape;
     if (plan.candidate_producer) |*producer| switch (producer.*) {
         .id_lookup => return,
         .bounded_scan => return,
@@ -930,9 +947,15 @@ fn documentAlgebraicMaterializationNameForPlan(value: std.json.Value, plan: Docu
 fn documentAlgebraicMaterializationMatchesPlan(value: std.json.Value, plan: DocumentAlgebraicAggregatePlan) bool {
     if (value != .object) return false;
     const op_value = value.object.get("op") orelse return false;
-    if (op_value != .string or !std.mem.eql(u8, op_value.string, "count")) return false;
-    if (value.object.get("measure") != null or
-        value.object.get("join") != null or
+    if (op_value != .string or !std.mem.eql(u8, op_value.string, @tagName(plan.aggregate.op))) return false;
+    if (plan.aggregate.op == .count) {
+        if (value.object.get("measure") != null) return false;
+    } else {
+        const input = plan.aggregate.input orelse return false;
+        const measure = value.object.get("measure") orelse return false;
+        if (measure != .string or !std.mem.eql(u8, measure.string, input.source_field)) return false;
+    }
+    if (value.object.get("join") != null or
         value.object.get("time") != null or
         value.object.get("bucket") != null)
     {
@@ -1705,17 +1728,27 @@ fn parseDocumentAggregateSpecAlloc(
         };
     }
 
-    if (expression.len >= 4 and expression[0].matchesKeywordTag(.sum) and expression[1].kind == .lparen and expression[expression.len - 1].kind == .rparen) {
+    if (expression.len >= 4 and expression[1].kind == .lparen and expression[expression.len - 1].kind == .rparen) {
+        const op: DocumentAggregateOp = if (expression[0].matchesKeywordTag(.sum))
+            .sum
+        else if (expression[0].matchesKeywordTag(.avg))
+            .avg
+        else if (expression[0].matchesKeywordTag(.min))
+            .min
+        else if (expression[0].matchesKeywordTag(.max))
+            .max
+        else
+            return error.UnsupportedSqlShape;
         var field = (try documentAggregateFieldForExpressionAlloc(alloc, expression[2 .. expression.len - 1], schema, virtual_schema, source_ref, false)) orelse return error.UnsupportedSqlShape;
         errdefer field.deinit(alloc);
         if (field.field_type != .numeric) return error.UnsupportedSqlShape;
         const source_field = field.field_name orelse return error.UnsupportedSqlShape;
-        const output = try alloc.dupe(u8, aliased.output orelse "sum");
+        const output = try alloc.dupe(u8, aliased.output orelse @tagName(op));
         errdefer alloc.free(output);
         const owned_source_field = try alloc.dupe(u8, source_field);
         errdefer alloc.free(owned_source_field);
         return .{
-            .op = .sum,
+            .op = op,
             .output = output,
             .input = .{
                 .field = field.takePath(),
@@ -3258,6 +3291,38 @@ test "document SQL requires algebraic materialization for catalog aggregate plan
     try std.testing.expectEqualStrings("plan", lowered.group_by.?.source_field);
 }
 
+test "document SQL matches numeric algebraic aggregate materializations" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .document,
+        .relational_columns = &.{
+            .{ .name = "status", .path = "status", .field_type = .keyword, .indexed = true, .index_lifecycle = .ready },
+            .{ .name = "amount", .path = "amount", .field_type = .numeric },
+        },
+    };
+    const indexes_json =
+        \\{"alg":{"type":"algebraic","materializations":[{"name":"sum_by_status","op":"sum","group_by":["status"],"measure":"amount"},{"name":"avg_by_status","op":"avg","group_by":["status"],"measure":"amount"},{"name":"max_by_status","op":"max","group_by":["status"],"measure":"amount"}]}}
+    ;
+
+    var sum_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT sum(amount) AS total_amount FROM docs GROUP BY status LIMIT 5");
+    defer sum_sql.deinit(alloc);
+    var sum_lowered = try lowerDocumentAggregatePlanWithOptionalIndexesJsonParsedSqlAlloc(alloc, &sum_sql, schema, indexes_json);
+    defer sum_lowered.deinit(alloc);
+    try std.testing.expectEqualStrings("alg", sum_lowered.index_name.?);
+    try std.testing.expectEqualStrings("sum_by_status", sum_lowered.materialization_name.?);
+
+    var avg_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT avg(amount) AS avg_amount FROM docs GROUP BY status LIMIT 5");
+    defer avg_sql.deinit(alloc);
+    var avg_lowered = try lowerDocumentAggregatePlanWithOptionalIndexesJsonParsedSqlAlloc(alloc, &avg_sql, schema, indexes_json);
+    defer avg_lowered.deinit(alloc);
+    try std.testing.expectEqualStrings("alg", avg_lowered.index_name.?);
+    try std.testing.expectEqualStrings("avg_by_status", avg_lowered.materialization_name.?);
+
+    var wrong_measure = try tokenized.ParsedSql.initAlloc(alloc, "SELECT min(amount) AS min_amount FROM docs GROUP BY status LIMIT 5");
+    defer wrong_measure.deinit(alloc);
+    try std.testing.expectError(error.DocumentSqlRequiresBoundedScan, lowerDocumentAggregatePlanWithOptionalIndexesJsonParsedSqlAlloc(alloc, &wrong_measure, schema, indexes_json));
+}
+
 test "document SQL keeps filtered aggregate as native candidate producer" {
     const alloc = std.testing.allocator;
     const schema = runtime_schema.TableSchema{
@@ -3455,7 +3520,7 @@ test "document SQL aggregate group by accepts index-backed virtual fields" {
     try std.testing.expectEqualStrings("category", lowered.group_by.?.output);
 }
 
-test "document SQL lowers numeric sum aggregate over bounded document producers" {
+test "document SQL lowers numeric summary aggregates over bounded document producers" {
     const alloc = std.testing.allocator;
     const schema = runtime_schema.TableSchema{
         .storage_mode = .document,
@@ -3478,6 +3543,55 @@ test "document SQL lowers numeric sum aggregate over bounded document producers"
     try std.testing.expect(unfiltered_lowered.candidate_producer != null);
     try std.testing.expectEqual(@as(u32, 25), unfiltered_lowered.candidate_producer.?.bounded_scan.max_rows);
 
+    var min_amount = try tokenized.ParsedSql.initAlloc(alloc, "SELECT min(amount) AS min_amount FROM docs");
+    defer min_amount.deinit(alloc);
+    var min_lowered = try lowerDocumentAggregatePlanWithOptionalIndexesAndBoundedScanPolicyParsedSqlAlloc(alloc, &min_amount, schema, null, .{ .max_rows = 25 });
+    defer min_lowered.deinit(alloc);
+    try std.testing.expectEqual(DocumentAggregateOp.min, min_lowered.aggregate.op);
+    try std.testing.expectEqualStrings("min_amount", min_lowered.aggregate.output);
+    try std.testing.expect(min_lowered.aggregate.input != null);
+    try std.testing.expectEqualStrings("/amount", min_lowered.aggregate.input.?.field);
+    try std.testing.expect(min_lowered.candidate_producer != null);
+    try std.testing.expectEqual(@as(u32, 25), min_lowered.candidate_producer.?.bounded_scan.max_rows);
+
+    var avg_amount = try tokenized.ParsedSql.initAlloc(alloc, "SELECT avg(amount) AS avg_amount FROM docs");
+    defer avg_amount.deinit(alloc);
+    var avg_lowered = try lowerDocumentAggregatePlanWithOptionalIndexesAndBoundedScanPolicyParsedSqlAlloc(alloc, &avg_amount, schema, null, .{ .max_rows = 25 });
+    defer avg_lowered.deinit(alloc);
+    try std.testing.expectEqual(DocumentAggregateOp.avg, avg_lowered.aggregate.op);
+    try std.testing.expectEqualStrings("avg_amount", avg_lowered.aggregate.output);
+    try std.testing.expect(avg_lowered.aggregate.input != null);
+    try std.testing.expectEqualStrings("/amount", avg_lowered.aggregate.input.?.field);
+    try std.testing.expect(avg_lowered.candidate_producer != null);
+    try std.testing.expectEqual(@as(u32, 25), avg_lowered.candidate_producer.?.bounded_scan.max_rows);
+
+    var max_amount = try tokenized.ParsedSql.initAlloc(alloc, "SELECT max(amount) AS max_amount FROM docs WHERE status = 'active'");
+    defer max_amount.deinit(alloc);
+    var max_lowered = try lowerDocumentAggregatePlanWithOptionalIndexesAndBoundedScanPolicyParsedSqlAlloc(alloc, &max_amount, schema, null, .{ .max_rows = 25 });
+    defer max_lowered.deinit(alloc);
+    try std.testing.expectEqual(DocumentAggregateOp.max, max_lowered.aggregate.op);
+    try std.testing.expectEqualStrings("max_amount", max_lowered.aggregate.output);
+    try std.testing.expect(max_lowered.aggregate.input != null);
+    try std.testing.expectEqualStrings("/amount", max_lowered.aggregate.input.?.field);
+    try std.testing.expect(max_lowered.candidate_producer != null);
+    try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}", max_lowered.candidate_producer.?.indexed_query.filter_query_json.?);
+    try std.testing.expectEqual(@as(?u32, 25), max_lowered.candidate_producer.?.indexed_query.max_candidate_rows);
+
+    var empty_index_metadata_lowered = try lowerDocumentAggregatePlanWithOptionalIndexesAndBoundedScanPolicyParsedSqlAlloc(alloc, &unfiltered, schema, "", .{ .max_rows = 25 });
+    defer empty_index_metadata_lowered.deinit(alloc);
+    try std.testing.expectEqual(DocumentAggregateOp.sum, empty_index_metadata_lowered.aggregate.op);
+    try std.testing.expect(empty_index_metadata_lowered.candidate_producer != null);
+    try std.testing.expectEqual(@as(u32, 25), empty_index_metadata_lowered.candidate_producer.?.bounded_scan.max_rows);
+
+    const unrelated_indexes_json =
+        \\{"category_fts":{"type":"full_text","field":"category"}}
+    ;
+    var unrelated_index_metadata_lowered = try lowerDocumentAggregatePlanWithOptionalIndexesAndBoundedScanPolicyParsedSqlAlloc(alloc, &unfiltered, schema, unrelated_indexes_json, .{ .max_rows = 25 });
+    defer unrelated_index_metadata_lowered.deinit(alloc);
+    try std.testing.expectEqual(DocumentAggregateOp.sum, unrelated_index_metadata_lowered.aggregate.op);
+    try std.testing.expect(unrelated_index_metadata_lowered.candidate_producer != null);
+    try std.testing.expectEqual(@as(u32, 25), unrelated_index_metadata_lowered.candidate_producer.?.bounded_scan.max_rows);
+
     var filtered = try tokenized.ParsedSql.initAlloc(alloc, "SELECT sum(amount) AS total_amount FROM docs WHERE status = 'active'");
     defer filtered.deinit(alloc);
     try std.testing.expectError(error.DocumentSqlRequiresBoundedScan, lowerDocumentAggregatePlanWithOptionalIndexesAndBoundedScanPolicyParsedSqlAlloc(alloc, &filtered, schema, null, null));
@@ -3491,7 +3605,13 @@ test "document SQL lowers numeric sum aggregate over bounded document producers"
 
     var grouped = try tokenized.ParsedSql.initAlloc(alloc, "SELECT sum(amount) AS total_amount FROM docs GROUP BY status LIMIT 10");
     defer grouped.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentAggregatePlanWithOptionalIndexesAndBoundedScanPolicyParsedSqlAlloc(alloc, &grouped, schema, null, .{ .max_rows = 25 }));
+    var grouped_lowered = try lowerDocumentAggregatePlanWithOptionalIndexesAndBoundedScanPolicyParsedSqlAlloc(alloc, &grouped, schema, null, .{ .max_rows = 25 });
+    defer grouped_lowered.deinit(alloc);
+    try std.testing.expectEqual(DocumentAggregateOp.sum, grouped_lowered.aggregate.op);
+    try std.testing.expect(grouped_lowered.group_by != null);
+    try std.testing.expectEqualStrings("/status", grouped_lowered.group_by.?.field);
+    try std.testing.expect(grouped_lowered.candidate_producer != null);
+    try std.testing.expectEqual(@as(u32, 25), grouped_lowered.candidate_producer.?.bounded_scan.max_rows);
 
     const non_numeric_schema = runtime_schema.TableSchema{
         .storage_mode = .document,

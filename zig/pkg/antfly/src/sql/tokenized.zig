@@ -315,6 +315,7 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
 
     const first = tokens[raw_statement.token_start];
     if (tokenMatchesKeyword(first, .set)) return raw_statement.token_end > raw_statement.token_start + 2;
+    if (tokenMatchesKeyword(first, .reset) or tokenMatchesKeyword(first, .show) or tokenMatchesKeyword(first, .discard)) return raw_statement.token_end > raw_statement.token_start + 1;
     if (tokenMatchesKeyword(first, .prepare)) return raw_statement.token_end > raw_statement.token_start + 2;
     if (tokenMatchesKeyword(first, .execute) or tokenMatchesKeyword(first, .deallocate)) return raw_statement.token_end > raw_statement.token_start + 1;
     if (tokenMatchesKeyword(first, .commit) or tokenMatchesKeyword(first, .rollback)) return raw_statement.token_end > raw_statement.token_start + 1;
@@ -325,7 +326,10 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
     if (tokenMatchesText(first, "declare") or tokenMatchesText(first, "close") or tokenMatchesText(first, "fetch") or tokenMatchesText(first, "move")) {
         return raw_statement.token_end > raw_statement.token_start + 1;
     }
-    return false;
+    return switch (raw_statement.family orelse return false) {
+        .insert, .update, .delete, .truncate, .merge, .ddl => true,
+        .select, .with => false,
+    };
 }
 
 fn parseStatement(

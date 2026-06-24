@@ -96,6 +96,7 @@ pub const BoundedScanPolicy = source_binding.BoundedScanPolicy;
 pub const CatalogTableRef = source_binding.CatalogTableRef;
 pub const default_document_sql_bounded_scan_rows = source_binding.default_document_sql_bounded_scan_rows;
 pub const DocumentBinding = source_binding.DocumentBinding;
+pub const DocumentAggregateInput = document_plan.DocumentAggregateInput;
 pub const DocumentSqlCapabilities = source_binding.DocumentSqlCapabilities;
 pub const DocumentSqlSchema = source_binding.DocumentSqlSchema;
 pub const DocumentSqlVirtualField = source_binding.DocumentSqlVirtualField;

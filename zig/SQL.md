@@ -983,11 +983,19 @@ producer can answer exactly, catalog-backed lowering can choose an explicit
 bounded-scan aggregate producer from `DocumentSqlCapabilities.bounded_scan`;
 execution fails closed if the scan reaches its cap, so counts are not returned
 from partial samples. The same bounded-producer rule now applies to ungrouped
-numeric `SUM(path)` over numeric declared fields or typed paths: `_id` lookup,
-capped native candidates, and policy-bounded scans can compute the exact sum,
-missing/JSON-null inputs are ignored, and an empty non-null input set returns
-`NULL`. Grouped numeric summaries and algebraic partial/result execution still
-fail closed until their producer-specific executors are implemented.
+numeric `SUM(path)`, `AVG(path)`, `MIN(path)`, and `MAX(path)` over numeric
+declared fields or typed paths: `_id` lookup, capped native candidates, and
+policy-bounded scans can compute the exact summary, missing/JSON-null inputs
+are ignored, and an empty non-null input set returns `NULL`. Grouped numeric
+`SUM(path)`, `AVG(path)`, `MIN(path)`, and `MAX(path)` follow the same
+bounded-producer rule and return `NULL` for groups whose matching rows have no
+non-null numeric measure. Configured local algebraic materializations for
+unfiltered `COUNT(*)`, `SUM(path)`, `AVG(path)`, `MIN(path)`, and `MAX(path)`
+can now execute through the document SQL source boundary when the materialized
+`op`, `group_by`, and `measure` exactly match the SQL plan. Filtered
+materialized aggregates, distributed materialization merging, and adaptive
+partial/result execution still fail closed until their producer-specific
+executors are implemented.
 
 Read execution now also has a policy-gated bounded residual scan path for simple
 scalar document predicates. If a predicate cannot use a ready document query,

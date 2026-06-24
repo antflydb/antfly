@@ -12787,7 +12787,7 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
             try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, insert.sync_level);
             try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, insert.batch.req.sync_level);
             try std.testing.expectEqual(@as(u32, 2), insert.batch.inserted);
-            try std.testing.expectEqual(@as(usize, 2), insert.batch.req.operations.len);
+            try std.testing.expectEqual(@as(usize, 2), insert.batch.req.writes.len);
         },
         else => return error.TestUnexpectedResult,
     }

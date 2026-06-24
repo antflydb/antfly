@@ -3088,7 +3088,6 @@ fn resetSessionCatalogPlanFromGeneratedTailAlloc(alloc: std.mem.Allocator, tail:
     var pos: usize = 0;
     grammar.parseResetSearchPathTail(tail, &pos) catch |err| switch (err) {
         error.UnsupportedSqlShape => {},
-        else => return err,
     };
     if (pos > 0) {
         return .reset_search_path;

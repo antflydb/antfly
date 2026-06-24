@@ -1,0 +1,1287 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+const std = @import("std");
+const platform = @import("antfly_platform");
+const builtin = @import("builtin");
+
+const aggregations_mod = @import("aggregations.zig");
+const algebraic_mod = @import("algebraic/mod.zig");
+const doc_set = @import("doc_set.zig");
+const docstore_mod = @import("../docstore.zig");
+const index_manager_mod = @import("catalog/index_manager.zig");
+const planning_adapter_mod = @import("planning_adapter.zig");
+const planning_bindings_mod = @import("planning_bindings.zig");
+const planning_stats_mod = @import("planning_stats.zig");
+const schema_mod = @import("../schema.zig");
+const graph_query_mod = @import("../../graph/query.zig");
+const graph_pattern_mod = @import("../../graph/pattern.zig");
+const search_mod = @import("../../search/search.zig");
+const types = @import("types.zig");
+const db_query_graph = @import("query/graph_exec.zig");
+const db_query_metrics = @import("query_metrics.zig");
+const db_query_result_shape = @import("query/result_shape.zig");
+const db_query_search = @import("query/search_exec.zig");
+const distributed_stats_mod = @import("../../search/distributed_stats.zig");
+const platform_time = @import("../../platform/time.zig");
+const vectorindex_mod = @import("antfly_vectorindex");
+
+const Allocator = std.mem.Allocator;
+const NamedResultSet = db_query_graph.NamedResultSet;
+
+fn benchQueryProfileEnabled() bool {
+    return platform.env.getenv("ANTFLY_BENCH_QUERY_PROFILE") != null;
+}
+
+pub fn Impl(comptime DB: type) type {
+    return struct {
+        const Self = @This();
+
+        pub fn search(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
+            return try Self.searchWithExecutionContext(self, alloc, req, .{});
+        }
+
+        pub fn searchWithExecutionContext(
+            self: *DB,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            exec_ctx: types.ExecutionContext,
+        ) !types.SearchResult {
+            if (req.row_claim != null) {
+                return try Self.searchWithRowClaim(self, alloc, req, exec_ctx);
+            }
+            const bench_profile = benchQueryProfileEnabled();
+            const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            var generation_ns: u64 = 0;
+            var lock_wait_ns: u64 = 0;
+            var locked_search_ns: u64 = 0;
+            if (self.searchRuntimeCanUsePublishedDenseSearch(req)) {
+                const generation_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+                const snapshot_req = try Self.searchRequestAtCurrentIdentityGeneration(self, req);
+                if (bench_profile) generation_ns = platform_time.monotonicNs() - generation_start_ns;
+                const search_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+                const result = try Self.searchLockedWithExecutionContext(self, alloc, snapshot_req, exec_ctx);
+                if (bench_profile) {
+                    locked_search_ns = platform_time.monotonicNs() - search_start_ns;
+                    std.log.info(
+                        "antfly_bench_db_search_wrapper total_us={d} generation_us={d} lock_wait_us={d} locked_search_us={d} published_dense={}",
+                        .{ (platform_time.monotonicNs() - total_start_ns) / 1000, generation_ns / 1000, lock_wait_ns / 1000, locked_search_ns / 1000, true },
+                    );
+                }
+                return result;
+            }
+            const lock_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            self.core.lockApplyShared();
+            if (bench_profile) lock_wait_ns = platform_time.monotonicNs() - lock_start_ns;
+            defer self.core.unlockApplyShared();
+            const generation_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            const snapshot_req = try Self.searchRequestAtCurrentIdentityGeneration(self, req);
+            if (bench_profile) generation_ns = platform_time.monotonicNs() - generation_start_ns;
+            const search_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            const result = try Self.searchLockedWithExecutionContext(self, alloc, snapshot_req, exec_ctx);
+            if (bench_profile) {
+                locked_search_ns = platform_time.monotonicNs() - search_start_ns;
+                std.log.info(
+                    "antfly_bench_db_search_wrapper total_us={d} generation_us={d} lock_wait_us={d} locked_search_us={d} published_dense={}",
+                    .{ (platform_time.monotonicNs() - total_start_ns) / 1000, generation_ns / 1000, lock_wait_ns / 1000, locked_search_ns / 1000, false },
+                );
+            }
+            return result;
+        }
+
+        fn searchLocked(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
+            return try Self.searchLockedWithExecutionContext(self, alloc, try Self.searchRequestAtCurrentIdentityGeneration(self, req), .{});
+        }
+
+        fn searchWithRowClaim(
+            self: *DB,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            exec_ctx: types.ExecutionContext,
+        ) anyerror!types.SearchResult {
+            const claim = req.row_claim orelse return error.InvalidQueryRequest;
+            const txn_id = claim.txn_id orelse return error.InvalidQueryRequest;
+            if (!claim.mode.usesDurableIntent()) return error.InvalidQueryRequest;
+            if (req.count_only) return error.UnsupportedQueryRequest;
+            if (req.return_mode != .parent) return error.UnsupportedQueryRequest;
+            if (req.graph_queries.len > 0) return error.UnsupportedQueryRequest;
+            if (req.graph_metric_queries.len > 0) return error.UnsupportedQueryRequest;
+
+            var search_req = req;
+            search_req.row_claim = null;
+            var result = try Self.searchWithExecutionContext(self, alloc, search_req, exec_ctx);
+            errdefer result.deinit();
+            try self.searchRuntimeApplyRowClaimToSearchResult(&result, txn_id, claim);
+            return result;
+        }
+
+        fn searchLockedWithExecutionContext(
+            self: *DB,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            exec_ctx: types.ExecutionContext,
+        ) !types.SearchResult {
+            const execution_req = directSingleVectorRequest(req) orelse req;
+            if (execution_req.full_text_queries.len > 0 or execution_req.dense_queries.len > 0 or execution_req.sparse_queries.len > 0 or execution_req.merge_config != null) {
+                var composed = try Self.searchComposed(self, alloc, execution_req, exec_ctx);
+                errdefer composed.deinit();
+                try self.searchRuntimeApplyGraphMetricRerank(&composed, execution_req);
+                try db_query_result_shape.externalizeSearchResultArtifactIds(alloc, &composed);
+                return composed;
+            }
+
+            const has_primary = execution_req.full_text != null or execution_req.dense != null or execution_req.sparse != null or !db_query_search.isDefaultMatchAll(execution_req.query) or (execution_req.graph_queries.len == 0 and execution_req.graph_metric_queries.len == 0);
+
+            var base = if (!has_primary and (execution_req.graph_queries.len > 0 or execution_req.graph_metric_queries.len > 0))
+                try db_query_search.emptySearchResult(alloc)
+            else if (execution_req.full_text) |text|
+                try Self.searchTextQuery(self, alloc, execution_req, text)
+            else if (execution_req.dense) |dense|
+                try Self.searchDense(self, alloc, execution_req, dense)
+            else if (execution_req.sparse) |sparse|
+                try Self.searchSparse(self, alloc, execution_req, sparse)
+            else switch (execution_req.query) {
+                .match_none,
+                .match_all,
+                .phrase,
+                .multi_phrase,
+                .term,
+                .fuzzy,
+                .numeric_range,
+                .date_range,
+                .doc_id,
+                .bool_field,
+                .geo_distance,
+                .geo_bbox,
+                .term_range,
+                .ip_range,
+                .geo_shape,
+                .match,
+                .match_phrase,
+                .prefix,
+                .wildcard,
+                .regexp,
+                => try Self.searchText(self, alloc, execution_req),
+                .dense_knn => |dense| try Self.searchDense(self, alloc, execution_req, dense),
+                .sparse_knn => |sparse| try Self.searchSparse(self, alloc, execution_req, sparse),
+                .graph => |graph| try Self.searchGraph(self, alloc, execution_req, graph, null),
+            };
+            errdefer base.deinit();
+
+            if (execution_req.graph_metric_queries.len > 0) {
+                base.graph_metric_results = try self.searchRuntimeExecuteGraphMetricQueries(alloc, execution_req.graph_metric_queries);
+            }
+
+            try self.searchRuntimeApplyGraphMetricRerank(&base, execution_req);
+
+            if (execution_req.graph_queries.len == 0) {
+                try db_query_result_shape.externalizeSearchResultArtifactIds(alloc, &base);
+                return base;
+            }
+
+            base.graph_results = try Self.executeGraphQueries(self, alloc, execution_req, execution_req.graph_queries, base.hits, base.total_hits);
+            try self.searchRuntimeApplyGraphExpandStrategy(alloc, &base, execution_req.expand_strategy);
+            try db_query_result_shape.externalizeSearchResultArtifactIds(alloc, &base);
+            return base;
+        }
+
+        fn directSingleVectorRequest(req: types.SearchRequest) ?types.SearchRequest {
+            if (req.merge_config != null or req.reranker != null or req.pruner != null) return null;
+            if (req.full_text_queries.len != 0) return null;
+            if (req.full_text) |text| switch (text) {
+                .match_all => {},
+                else => return null,
+            };
+            if (!db_query_search.isDefaultMatchAll(req.query)) return null;
+            if (req.graph_queries.len != 0 or req.graph_metric_queries.len != 0 or req.expand_strategy != null) return null;
+            if (req.dense != null or req.sparse != null) return null;
+            if (req.dense_queries.len == 1 and req.sparse_queries.len == 0) {
+                var next = req;
+                next.index_name = req.dense_queries[0].index_name;
+                next.full_text = null;
+                next.dense = req.dense_queries[0].query;
+                next.dense_queries = &.{};
+                return next;
+            }
+            if (req.sparse_queries.len == 1 and req.dense_queries.len == 0) {
+                var next = req;
+                next.index_name = req.sparse_queries[0].index_name;
+                next.full_text = null;
+                next.sparse = req.sparse_queries[0].query;
+                next.sparse_queries = &.{};
+                return next;
+            }
+            return null;
+        }
+
+        fn searchComposed(
+            self: *DB,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            exec_ctx: types.ExecutionContext,
+        ) !types.SearchResult {
+            _ = exec_ctx;
+            return try db_query_search.searchComposed(alloc, req, .{
+                .ctx = self,
+                .resolve_structured_doc_filter = Self.resolveStructuredDocFilterForComposedCallback,
+                .resolve_structured_text_doc_filter = Self.resolveStructuredTextDocFilterForComposedCallback,
+                .search_text_query = Self.searchTextQueryCallback,
+                .search_text = Self.searchTextComposedCallback,
+                .search_dense = Self.searchDenseComposedCallback,
+                .search_sparse = Self.searchSparseComposedCallback,
+                .clone_named_set = Self.cloneNamedSetCallback,
+                .fuse_named_sets = Self.fuseNamedSetsCallback,
+                .resolve_hits_to_doc_set = Self.resolveSearchHitsToDocSetCallback,
+                .attach_graph_results = Self.attachGraphResultsCallback,
+            });
+        }
+
+        fn searchText(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
+            return try db_query_search.searchText(alloc, req, .{
+                .ctx = self,
+                .func = Self.searchTextQueryCallback,
+            });
+        }
+
+        fn searchMatchAll(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
+            return try db_query_search.searchMatchAll(alloc, req, .{
+                .ctx = self,
+                .collect_candidates = Self.collectSearchMatchAllCandidatesCallback,
+                .text_index_entry = Self.textIndexEntryCallback,
+                .resolve_doc_set_doc_ids = Self.resolveDocSetDocIdsCallback,
+                .resolve_doc_ids_to_doc_set = Self.resolveDocIdsToDocSetCallback,
+                .resolve_relational_filter_doc_set = Self.resolveRelationalFilterDocSetCallback,
+                .live_filter_doc_set = Self.liveFilterDocSetCallback,
+                .load_projected_document = Self.loadRequiredProjectedSearchDocumentCallback,
+                .load_stored = Self.loadStoredSearchDocumentCallback,
+                .load_many_stored = Self.loadStoredSearchDocumentManyCallback,
+            });
+        }
+
+        fn searchGraph(self: *DB, alloc: Allocator, req: types.SearchRequest, graph_query: graph_query_mod.GraphQuery, base_hits: ?[]const types.SearchHit) !types.SearchResult {
+            _ = req.index_name;
+            var raw = try db_query_graph.executeSearchGraph(alloc, req, graph_query, base_hits, .{
+                .ctx = self,
+                .execute_graph_query = Self.executeSearchGraphQueryCallback,
+                .load_projected_document = Self.loadProjectedSearchDocumentCallback,
+                .lookup_doc_ordinal = Self.lookupLiveDocOrdinalNoLockCallback,
+            });
+            errdefer raw.deinit();
+            try self.searchRuntimeAnnotateSearchHitOrdinalsNoLock(alloc, req, raw.hits);
+            return try self.searchRuntimeFilterExpiredSearchResult(alloc, raw);
+        }
+
+        fn fuseNamedSets(self: *DB, alloc: Allocator, req: types.SearchRequest, named_sets: []const NamedResultSet) !types.SearchResult {
+            const raw = try db_query_graph.fuseNamedSets(alloc, req, named_sets, .{
+                .ctx = self,
+                .load_projected_document = Self.loadProjectedSearchDocumentCallback,
+            });
+            return try self.searchRuntimeFilterExpiredSearchResult(alloc, raw);
+        }
+
+        fn executeGraphQueries(
+            self: *DB,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            graph_queries: []const types.NamedGraphQuery,
+            base_hits: []const types.SearchHit,
+            base_total_hits: u32,
+        ) ![]types.GraphSearchResult {
+            return try db_query_graph.executeGraphQueries(alloc, req, graph_queries, base_hits, base_total_hits, .{
+                .ctx = self,
+                .func = Self.executeSingleGraphQueryWithSetsCallback,
+                .resolve_hits_to_doc_set = Self.resolveSearchHitsToDocSetCallback,
+                .resolve_nodes_to_doc_set = Self.resolveGraphNodesToDocSetCallback,
+            });
+        }
+
+        pub fn executeGraphQueriesWithSets(
+            self: *DB,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            graph_queries: []const types.NamedGraphQuery,
+            named_sets: []const NamedResultSet,
+        ) ![]types.GraphSearchResult {
+            return try db_query_graph.executeGraphQueriesWithSets(alloc, req, graph_queries, named_sets, .{
+                .ctx = self,
+                .func = Self.executeSingleGraphQueryWithSetsCallback,
+                .resolve_hits_to_doc_set = Self.resolveSearchHitsToDocSetCallback,
+                .resolve_nodes_to_doc_set = Self.resolveGraphNodesToDocSetCallback,
+            });
+        }
+
+        fn executeSingleGraphQueryWithSets(
+            self: *DB,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            named: *const types.NamedGraphQuery,
+            named_sets: []const NamedResultSet,
+        ) !types.GraphSearchResult {
+            var result = switch (named.query.query_type) {
+                .pattern => try Self.executeSinglePatternQueryWithSets(self, alloc, req, named, named_sets),
+                else => try db_query_graph.executeSingleNonPatternQueryWithSets(alloc, req, named, named_sets, .{
+                    .ctx = self,
+                    .find_shortest_path = Self.executeShortestPathCallback,
+                    .find_k_shortest_paths = Self.executeKShortestPathsCallback,
+                    .execute_graph_query = Self.executeGraphQueryCallback,
+                    .load_projected_document = Self.loadProjectedSearchDocumentCallback,
+                    .resolve_doc_set_doc_ids = Self.resolveDocSetDocIdsForGraphCallback,
+                    .lookup_doc_ordinal = Self.lookupLiveDocOrdinalNoLockCallback,
+                }),
+            };
+            errdefer result.deinit(alloc);
+            try self.searchRuntimeAnnotateSearchHitOrdinalsNoLock(alloc, req, result.hits);
+            return result;
+        }
+
+        fn executeSinglePatternQueryWithSets(
+            self: *DB,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            named: *const types.NamedGraphQuery,
+            named_sets: []const NamedResultSet,
+        ) !types.GraphSearchResult {
+            return try db_query_graph.executeSinglePatternQueryWithSets(alloc, req, named, named_sets, .{
+                .ctx = self,
+                .match_pattern = Self.executePatternMatchCallback,
+                .load_projected_document = Self.loadPatternProjectedDocumentCallback,
+                .resolve_doc_set_doc_ids = Self.resolveDocSetDocIdsForGraphCallback,
+                .lookup_doc_ordinal = Self.lookupLiveDocOrdinalNoLockCallback,
+            });
+        }
+
+        fn searchTextQuery(self: *DB, alloc: Allocator, req: types.SearchRequest, text_query: types.TextQuery) !types.SearchResult {
+            var algebraic_filter = try self.searchRuntimeSearchRequestWithTextAlgebraicDocFilterAlloc(req);
+            defer algebraic_filter.deinit();
+            try Self.proveTextQueryAccessPaths(self, algebraic_filter.req.index_name, text_query);
+            const metric_name = Self.textQueryMetricIndexName(self, algebraic_filter.req);
+            const start_ns = platform_time.monotonicNs();
+            defer db_query_metrics.observe(metric_name, .search, platform_time.monotonicNs() -| start_ns);
+            return try db_query_search.searchTextQuery(alloc, algebraic_filter.req, text_query, .{
+                .ctx = self,
+                .text_index_entry = Self.textIndexEntryCallback,
+                .text_index_is_chunk_backed = Self.textIndexIsChunkBackedCallback,
+                .search_match_all = Self.searchMatchAllCallback,
+                .project_stored_search = Self.projectStoredBytesForSearchCallback,
+                .load_projected_document = Self.loadProjectedSearchDocumentCallback,
+                .resolve_doc_set_doc_ids = Self.resolveDocSetDocIdsCallback,
+                .resolve_doc_ids_to_doc_set = Self.resolveDocIdsToDocSetCallback,
+                .resolve_relational_filter_doc_set = Self.resolveRelationalFilterDocSetCallback,
+                .live_filter_doc_set = Self.liveFilterDocSetCallback,
+                .postprocess = Self.postprocessTextSearchResultCallback,
+            });
+        }
+
+        fn proveTextQueryAccessPaths(self: *DB, index_name: ?[]const u8, text_query: types.TextQuery) !void {
+            switch (text_query) {
+                .term => |term| try Self.proveTextFieldAccessPath(self, index_name, term.field, null, .slice),
+                .match => |match| try Self.proveTextFieldAccessPath(self, index_name, match.field, match.analyzer, .slice),
+                .multi_match_bool_prefix => |multi_match| {
+                    for (multi_match.fields) |field| try Self.proveMultiMatchBoolPrefixAccessPaths(self, index_name, field.field);
+                },
+                .prefix => |prefix| try Self.proveTextFieldAccessPath(self, index_name, prefix.field, null, .automaton_select),
+                .wildcard => |wildcard| try Self.proveTextFieldAccessPath(self, index_name, wildcard.field, null, .automaton_select),
+                .regexp => |regexp| try Self.proveTextFieldAccessPath(self, index_name, regexp.field, null, .automaton_select),
+                .fuzzy => |fuzzy| try Self.proveTextFieldAccessPath(self, index_name, fuzzy.field, null, .automaton_select),
+                .bool_query => |bool_query| {
+                    for (bool_query.must) |child| try Self.proveTextQueryAccessPaths(self, index_name, child);
+                    for (bool_query.should) |child| try Self.proveTextQueryAccessPaths(self, index_name, child);
+                    for (bool_query.must_not) |child| try Self.proveTextQueryAccessPaths(self, index_name, child);
+                },
+                else => {},
+            }
+        }
+
+        fn proveTextFieldAccessPath(self: *DB, index_name: ?[]const u8, field: []const u8, analyzer: ?[]const u8, fragment: algebraic_mod.ir.TensorFragment) !void {
+            _ = try self.core.index_manager.planFullTextLexicalAccessPathAlloc(self.alloc, index_name, field, analyzer, fragment) orelse return error.IndexNotFound;
+        }
+
+        fn proveOptionalTextFieldAccessPath(self: *DB, index_name: ?[]const u8, field: []const u8, fragment: algebraic_mod.ir.TensorFragment) !bool {
+            const plan = try self.core.index_manager.planFullTextLexicalAccessPathAlloc(self.alloc, index_name, field, null, fragment);
+            return plan != null;
+        }
+
+        fn proveMultiMatchBoolPrefixAccessPaths(self: *DB, index_name: ?[]const u8, field: []const u8) !void {
+            if (std.mem.endsWith(u8, field, "._index_prefix")) {
+                try Self.proveTextFieldAccessPath(self, index_name, field, null, .slice);
+                return;
+            }
+
+            try Self.proveTextFieldAccessPath(self, index_name, field, null, .slice);
+            try Self.proveTextFieldAccessPath(self, index_name, field, null, .automaton_select);
+            if (isSearchAsYouTypeGeneratedFieldName(field)) return;
+
+            const two_gram = try std.fmt.allocPrint(self.alloc, "{s}._2gram", .{field});
+            defer self.alloc.free(two_gram);
+            const has_two_gram = try Self.proveOptionalTextFieldAccessPath(self, index_name, two_gram, .slice);
+            if (has_two_gram) _ = try Self.proveOptionalTextFieldAccessPath(self, index_name, two_gram, .automaton_select);
+
+            const three_gram = try std.fmt.allocPrint(self.alloc, "{s}._3gram", .{field});
+            defer self.alloc.free(three_gram);
+            const has_three_gram = try Self.proveOptionalTextFieldAccessPath(self, index_name, three_gram, .slice);
+            if (has_three_gram) _ = try Self.proveOptionalTextFieldAccessPath(self, index_name, three_gram, .automaton_select);
+
+            const index_prefix = try std.fmt.allocPrint(self.alloc, "{s}._index_prefix", .{field});
+            defer self.alloc.free(index_prefix);
+            _ = try Self.proveOptionalTextFieldAccessPath(self, index_name, index_prefix, .slice);
+        }
+
+        fn isSearchAsYouTypeGeneratedFieldName(field: []const u8) bool {
+            return std.mem.endsWith(u8, field, "._2gram") or
+                std.mem.endsWith(u8, field, "._3gram") or
+                std.mem.endsWith(u8, field, "._index_prefix");
+        }
+
+        fn textQueryMetricIndexName(self: *DB, req: types.SearchRequest) ?[]const u8 {
+            if (req.index_name) |name| return name;
+            const entry = self.core.textIndexEntry(null) orelse return null;
+            return entry.config.name;
+        }
+
+        fn searchDense(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !types.SearchResult {
+            if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
+            const metric_name = Self.denseQueryMetricIndexName(self, req);
+            const start_ns = platform_time.monotonicNs();
+            defer db_query_metrics.observe(metric_name, .vector, platform_time.monotonicNs() -| start_ns);
+            const bench_profile = benchQueryProfileEnabled();
+            const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            var algebraic_ns: u64 = 0;
+            var prove_ns: u64 = 0;
+            var inner_ns: u64 = 0;
+            const algebraic_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            var algebraic_filter = try self.searchRuntimeSearchRequestWithAlgebraicDocFilterAlloc(req);
+            defer algebraic_filter.deinit();
+            if (bench_profile) algebraic_ns = platform_time.monotonicNs() - algebraic_start_ns;
+            const prove_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            try Self.proveVectorSearchAccessPath(self, algebraic_filter.req.index_name, .dense_vector, hasNativeDocIdConstraints(algebraic_filter.req));
+            if (bench_profile) prove_ns = platform_time.monotonicNs() - prove_start_ns;
+            const inner_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            const result = try db_query_search.searchDense(alloc, algebraic_filter.req, dense, Self.denseSearchExecutor(self));
+            if (bench_profile) {
+                inner_ns = platform_time.monotonicNs() - inner_start_ns;
+                std.log.info(
+                    "antfly_bench_db_dense_wrapper total_us={d} algebraic_us={d} prove_us={d} inner_us={d}",
+                    .{ (platform_time.monotonicNs() - total_start_ns) / 1000, algebraic_ns / 1000, prove_ns / 1000, inner_ns / 1000 },
+                );
+            }
+            return result;
+        }
+
+        fn searchSparse(self: *DB, alloc: Allocator, req: types.SearchRequest, sparse: types.SparseKnnQuery) !types.SearchResult {
+            if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
+            const metric_name = Self.sparseQueryMetricIndexName(self, req);
+            const start_ns = platform_time.monotonicNs();
+            defer db_query_metrics.observe(metric_name, .vector, platform_time.monotonicNs() -| start_ns);
+            const bench_profile = benchQueryProfileEnabled();
+            const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            var algebraic_ns: u64 = 0;
+            var prove_ns: u64 = 0;
+            var inner_ns: u64 = 0;
+            const algebraic_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            var algebraic_filter = try self.searchRuntimeSearchRequestWithAlgebraicDocFilterAlloc(req);
+            defer algebraic_filter.deinit();
+            if (bench_profile) algebraic_ns = platform_time.monotonicNs() - algebraic_start_ns;
+            const prove_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            try Self.proveVectorSearchAccessPath(self, algebraic_filter.req.index_name, .sparse_vector, hasNativeDocIdConstraints(algebraic_filter.req));
+            if (bench_profile) prove_ns = platform_time.monotonicNs() - prove_start_ns;
+            const inner_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+            const result = try db_query_search.searchSparse(alloc, algebraic_filter.req, sparse, Self.sparseSearchExecutor(self));
+            if (bench_profile) {
+                inner_ns = platform_time.monotonicNs() - inner_start_ns;
+                std.log.info(
+                    "antfly_bench_db_sparse_wrapper total_us={d} algebraic_us={d} prove_us={d} inner_us={d}",
+                    .{ (platform_time.monotonicNs() - total_start_ns) / 1000, algebraic_ns / 1000, prove_ns / 1000, inner_ns / 1000 },
+                );
+            }
+            return result;
+        }
+
+        fn searchDenseProfiledAtSnapshot(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
+            if (builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
+            var algebraic_filter = try self.searchRuntimeSearchRequestWithAlgebraicDocFilterAlloc(req);
+            defer algebraic_filter.deinit();
+            try Self.proveVectorSearchAccessPath(self, algebraic_filter.req.index_name, .dense_vector, hasNativeDocIdConstraints(algebraic_filter.req));
+            const profiled = db_query_search.searchDenseProfiled(alloc, algebraic_filter.req, dense, Self.denseSearchExecutor(self));
+            return profiled catch |err| {
+                if (err == error.IndexNotFound) {
+                    const index_configs = self.listIndexes(alloc) catch |list_err| {
+                        std.log.err("dense profiled search missing index requested={s} list_err={s}", .{
+                            req.index_name orelse "<null>",
+                            @errorName(list_err),
+                        });
+                        return err;
+                    };
+                    defer types.freeIndexConfigs(alloc, index_configs);
+                    std.log.err("dense profiled search missing index requested={s} configured_index_count={d}", .{
+                        req.index_name orelse "<null>",
+                        index_configs.len,
+                    });
+                    for (index_configs) |cfg| {
+                        std.log.err("dense profiled search visible index name={s} kind={s}", .{
+                            cfg.name,
+                            @tagName(cfg.kind),
+                        });
+                    }
+                }
+                return err;
+            };
+        }
+
+        fn proveVectorSearchAccessPath(self: *DB, index_name: ?[]const u8, layout: algebraic_mod.ir.PhysicalLayout, constrained: bool) !void {
+            const selected_path = switch (layout) {
+                .dense_vector => self.core.index_manager.denseVectorAccessPath(index_name),
+                .sparse_vector => self.core.index_manager.sparseVectorAccessPath(index_name),
+                else => null,
+            };
+            const access_path = selected_path orelse return error.IndexNotFound;
+            var planned = (try algebraic_mod.planner.planVectorSearchTensorProgramAlloc(self.alloc, access_path.owner, layout, constrained)) orelse return error.InvalidIndexConfig;
+            defer planned.deinit(self.alloc);
+            if (planned.access_paths.len != 1 or
+                planned.access_paths[0].layout != layout or
+                !std.mem.eql(u8, planned.access_paths[0].owner, access_path.owner) or
+                !std.mem.eql(algebraic_mod.ir.Dimension, planned.access_paths[0].output_dims, access_path.output_dims))
+            {
+                return error.InvalidIndexConfig;
+            }
+            if (!algebraic_mod.ir.vectorSearchProgramMatchesTarget(planned.asProgram(), access_path.owner, layout, constrained)) return error.InvalidIndexConfig;
+        }
+
+        fn hasNativeDocIdConstraints(req: types.SearchRequest) bool {
+            return req.filter_doc_ids_positive or
+                req.filter_doc_ids.len > 0 or
+                req.exclude_doc_ids.len > 0 or
+                req.resolved_doc_filter != null or
+                req.doc_filter_bindings.len > 0;
+        }
+
+        fn denseQueryMetricIndexName(self: *DB, req: types.SearchRequest) ?[]const u8 {
+            if (req.index_name) |name| return name;
+            const entry = self.core.denseIndex(null) orelse return null;
+            return entry.config.name;
+        }
+
+        fn sparseQueryMetricIndexName(self: *DB, req: types.SearchRequest) ?[]const u8 {
+            if (req.index_name) |name| return name;
+            const entry = self.core.sparseIndex(null) orelse return null;
+            return entry.config.name;
+        }
+
+        fn denseSearchExecutor(self: *DB) db_query_search.DenseSearchExecutor {
+            return .{
+                .ctx = self,
+                .text_index_entry = Self.textIndexEntryCallback,
+                .dense_index = Self.denseIndexCallback,
+                .lookup_doc_key = Self.denseDocKeyCallback,
+                .lookup_vector_id = Self.denseVectorIdCallback,
+                .lookup_vector_ids_for_ordinals = Self.denseVectorIdsForOrdinalsCallback,
+                .all_docs_visible_fast = Self.allDocsVisibleFastCallback,
+                .lookup_doc_ordinal = Self.lookupLiveDocOrdinalNoLockCallback,
+                .lookup_doc_ordinals = Self.lookupLiveDocOrdinalsNoLockCallback,
+                .lookup_doc_ordinals_for_vector_ids = Self.denseOrdinalsForVectorIdsCallback,
+                .resolve_doc_set_doc_ids = Self.resolveDocSetDocIdsCallback,
+                .resolve_doc_ids_to_doc_set = Self.resolveDocIdsToDocSetCallback,
+                .resolve_relational_filter_doc_set = Self.resolveRelationalFilterDocSetCallback,
+                .live_filter_doc_set = Self.liveFilterDocSetCallback,
+                .load_projected_document = Self.loadRequiredProjectedSearchDocumentCallback,
+                .hbc_search = Self.hbcSearchCallback,
+                .hbc_search_profiled = Self.hbcSearchProfiledCallback,
+                .postprocess = Self.postprocessVectorSearchResultCallback,
+            };
+        }
+
+        fn sparseSearchExecutor(self: *DB) db_query_search.SparseSearchExecutor {
+            return .{
+                .ctx = self,
+                .text_index_entry = Self.textIndexEntryCallback,
+                .sparse_index = Self.sparseIndexCallback,
+                .resolve_doc_set_doc_ids = Self.resolveDocSetDocIdsCallback,
+                .resolve_doc_ids_to_doc_set = Self.resolveDocIdsToDocSetCallback,
+                .resolve_relational_filter_doc_set = Self.resolveRelationalFilterDocSetCallback,
+                .live_filter_doc_set = Self.liveFilterDocSetCallback,
+                .lookup_doc_nums_for_ordinals = Self.sparseDocNumsForOrdinalsCallback,
+                .lookup_doc_ordinal = Self.lookupLiveDocOrdinalNoLockCallback,
+                .lookup_doc_ordinals = Self.lookupLiveDocOrdinalsNoLockCallback,
+                .load_projected_document = Self.loadRequiredProjectedSearchDocumentCallback,
+                .load_projected_documents = Self.loadProjectedSearchDocumentManyCallback,
+                .postprocess = Self.postprocessVectorSearchResultCallback,
+            };
+        }
+
+        pub fn searchRequestAtCurrentIdentityGeneration(self: *DB, req: types.SearchRequest) !types.SearchRequest {
+            var snapshot_req = req;
+            snapshot_req.identity_read_generation = try self.currentIdentityReadGenerationForRequest(snapshot_req.identity_read_generation);
+            try Self.validateResolvedDocFilterWireContext(self, snapshot_req);
+            return snapshot_req;
+        }
+
+        fn validateResolvedDocFilterWireContext(self: *DB, req: types.SearchRequest) !void {
+            const ctx = req.resolved_doc_filter_wire_context orelse return;
+            if (req.resolved_doc_filter == null) return error.InvalidQueryRequest;
+            if (!ctx.namespace.eql(self.core.identity_namespace)) return error.DocIdentityNamespaceMismatch;
+            if (req.identity_read_generation == null or req.identity_read_generation.? != ctx.identity_read_generation) {
+                self.doc_set_planning_stats.recordStaleIdentityGenerationRejection();
+                return error.UnsupportedQueryRequest;
+            }
+        }
+
+        pub fn collectSearchRequestTextStats(self: *DB, alloc: Allocator, req: types.SearchRequest) ![]const distributed_stats_mod.TextFieldStats {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+            return try db_query_search.collectSearchRequestTextStats(alloc, try Self.searchRequestAtCurrentIdentityGeneration(self, req), .{
+                .ctx = self,
+                .text_index_entry = Self.textIndexEntryCallback,
+            });
+        }
+
+        pub fn preflightSearchRequest(self: *DB, alloc: Allocator, req: types.SearchRequest, max_work: u32) !db_query_search.RuntimePreflightSummary {
+            return try Self.preflightSearchRequestWithExecutionContext(self, alloc, req, max_work, .{});
+        }
+
+        pub fn preflightSearchRequestWithExecutionContext(
+            self: *DB,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            max_work: u32,
+            exec_ctx: types.ExecutionContext,
+        ) !db_query_search.RuntimePreflightSummary {
+            return try Self.collectPlanningStatsWithExecutionContext(self, alloc, req, max_work, exec_ctx);
+        }
+
+        pub fn collectPlanningStats(
+            self: *DB,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            max_work: u32,
+        ) !planning_stats_mod.PlanningStatsSummary {
+            return try Self.collectPlanningStatsWithExecutionContext(self, alloc, req, max_work, .{});
+        }
+
+        pub fn collectPlanningStatsWithExecutionContext(
+            self: *DB,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            max_work: u32,
+            exec_ctx: types.ExecutionContext,
+        ) !planning_stats_mod.PlanningStatsSummary {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+            return try Self.collectPlanningStatsLocked(self, alloc, try Self.searchRequestAtCurrentIdentityGeneration(self, req), max_work, exec_ctx);
+        }
+
+        fn collectPlanningStatsLocked(
+            self: *DB,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            max_work: u32,
+            exec_ctx: types.ExecutionContext,
+        ) !planning_stats_mod.PlanningStatsSummary {
+            _ = exec_ctx;
+            try planning_bindings_mod.validateSearchRequestBindings(&self.core, self.alloc, req);
+            return try planning_adapter_mod.collectSearchRequestStatsAlloc(
+                alloc,
+                &self.core,
+                self,
+                planningStatsSearchRequestCallback,
+                req,
+                max_work,
+            );
+        }
+
+        pub fn planningStatsProvider(self: *DB) planning_stats_mod.PlanningStatsProvider {
+            return planning_stats_mod.PlanningStatsProvider.init(self, planningStatsProviderCollectSearchRequestStats);
+        }
+
+        fn planningStatsProviderCollectSearchRequestStats(
+            ptr: *anyopaque,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            max_work: u32,
+        ) !planning_stats_mod.PlanningStatsSummary {
+            const self: *DB = @ptrCast(@alignCast(ptr));
+            return try Self.collectPlanningStats(self, alloc, req, max_work);
+        }
+
+        fn planningStatsSearchRequestCallback(
+            ptr: *anyopaque,
+            alloc: Allocator,
+            req: types.SearchRequest,
+        ) !types.SearchResult {
+            const self: *DB = @ptrCast(@alignCast(ptr));
+            return try Self.searchLocked(self, alloc, req);
+        }
+
+        pub fn collectExplicitTextStats(self: *DB, alloc: Allocator, requests: []const db_query_search.ExplicitTextStatRequest) ![]const distributed_stats_mod.TextFieldStats {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+            return try db_query_search.collectExplicitTextStats(alloc, requests, .{
+                .ctx = self,
+                .text_index_entry = Self.textIndexEntryCallback,
+            });
+        }
+
+        pub fn collectExplicitBackgroundTextStats(
+            self: *DB,
+            alloc: Allocator,
+            requests: []const db_query_search.ExplicitBackgroundTextStatRequest,
+        ) ![]const aggregations_mod.DistributedBackgroundTextStats {
+            self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+            return try db_query_search.collectExplicitBackgroundTextStats(alloc, requests, .{
+                .ctx = self,
+                .text_index_entry = Self.textIndexEntryCallback,
+            });
+        }
+
+        pub fn searchDenseProfiled(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
+            if (self.searchRuntimeCanUsePublishedDenseSearch(req)) {
+                return try Self.searchDenseProfiledAtSnapshot(self, alloc, try Self.searchRequestAtCurrentIdentityGeneration(self, req), dense);
+            }
+            {
+                self.core.lockApplyShared();
+                defer self.core.unlockApplyShared();
+                return try Self.searchDenseProfiledAtSnapshot(self, alloc, try Self.searchRequestAtCurrentIdentityGeneration(self, req), dense);
+            }
+        }
+
+        fn textIndexEntryCallback(
+            ctx: ?*anyopaque,
+            index_name: ?[]const u8,
+        ) anyerror!?*index_manager_mod.IndexManager.TextIndex {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return self.core.textIndexEntry(index_name);
+        }
+
+        fn resolveStructuredDocFilterForComposedCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            req: types.SearchRequest,
+        ) anyerror!?doc_set.ResolvedDocFilter {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try db_query_search.resolveStructuredDocFilterForComposedAlloc(alloc, req, .{
+                .ctx = self,
+                .text_index_entry = Self.textIndexEntryCallback,
+                .resolve_doc_set_doc_ids = Self.resolveDocSetDocIdsCallback,
+                .resolve_doc_ids_to_doc_set = Self.resolveDocIdsToDocSetCallback,
+                .resolve_relational_filter_doc_set = Self.resolveRelationalFilterDocSetCallback,
+                .live_filter_doc_set = Self.liveFilterDocSetCallback,
+                .project_ordinals_to_doc_ids = false,
+                .identity_read_generation = req.identity_read_generation,
+            });
+        }
+
+        fn resolveStructuredTextDocFilterForComposedCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            req: types.SearchRequest,
+        ) anyerror!?db_query_search.ResolvedTextDocNumFilter {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, req, .{
+                .ctx = self,
+                .text_index_entry = Self.textIndexEntryCallback,
+                .resolve_doc_set_doc_ids = Self.resolveDocSetDocIdsCallback,
+                .resolve_doc_ids_to_doc_set = Self.resolveDocIdsToDocSetCallback,
+                .resolve_relational_filter_doc_set = Self.resolveRelationalFilterDocSetCallback,
+                .live_filter_doc_set = Self.liveFilterDocSetCallback,
+                .all_docs_visible = Self.allDocsVisibleCallback,
+                .project_ordinals_to_doc_ids = false,
+                .identity_read_generation = req.identity_read_generation,
+            });
+        }
+
+        fn searchTextQueryCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            text_query: types.TextQuery,
+        ) anyerror!types.SearchResult {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try Self.searchTextQuery(self, alloc, req, text_query);
+        }
+
+        fn searchTextComposedCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            req: types.SearchRequest,
+        ) anyerror!types.SearchResult {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try Self.searchText(self, alloc, req);
+        }
+
+        fn searchDenseComposedCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            dense: types.DenseKnnQuery,
+        ) anyerror!types.SearchResult {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try Self.searchDense(self, alloc, req, dense);
+        }
+
+        fn searchSparseComposedCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            sparse: types.SparseKnnQuery,
+        ) anyerror!types.SearchResult {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try Self.searchSparse(self, alloc, req, sparse);
+        }
+
+        fn cloneNamedSetCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            set: NamedResultSet,
+            include_stored: bool,
+        ) anyerror!types.SearchResult {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeCloneNamedSetAsResult(alloc, set, include_stored);
+        }
+
+        fn fuseNamedSetsCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            named_sets: []const NamedResultSet,
+        ) anyerror!types.SearchResult {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try Self.fuseNamedSets(self, alloc, req, named_sets);
+        }
+
+        fn resolveSearchHitsToDocSetCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            hits: []const types.SearchHit,
+        ) anyerror!doc_set.ResolvedDocSet {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeResolveSearchHitsToDocSet(alloc, req, hits);
+        }
+
+        fn attachGraphResultsCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            base: *types.SearchResult,
+            named_sets: []const NamedResultSet,
+        ) anyerror!void {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            base.graph_results = try Self.executeGraphQueriesWithSets(self, alloc, req, req.graph_queries, named_sets);
+            try self.searchRuntimeApplyGraphExpandStrategy(alloc, base, req.expand_strategy);
+        }
+
+        fn executeSingleGraphQueryWithSetsCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            named: *const types.NamedGraphQuery,
+            named_sets: []const NamedResultSet,
+        ) anyerror!types.GraphSearchResult {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try Self.executeSingleGraphQueryWithSets(self, alloc, req, named, named_sets);
+        }
+
+        fn resolveDocSetDocIdsCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            set: *const doc_set.ResolvedDocSet,
+            generation: ?u64,
+        ) anyerror!?[]const []const u8 {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeResolveDocSetDocIds(alloc, set, generation);
+        }
+
+        fn resolveDocSetDocIdsForGraphCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            set: *const doc_set.ResolvedDocSet,
+            generation: ?u64,
+        ) anyerror!?[][]u8 {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            const ids = (try self.searchRuntimeResolveDocSetDocIds(alloc, set, generation)) orelse return null;
+            defer alloc.free(@constCast(ids));
+            errdefer for (ids) |id| alloc.free(@constCast(id));
+
+            const out = try alloc.alloc([]u8, ids.len);
+            for (ids, 0..) |id, i| out[i] = @constCast(id);
+            return out;
+        }
+
+        fn resolveGraphNodesToDocSetCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            nodes: []const graph_query_mod.GraphResultNode,
+        ) anyerror!doc_set.ResolvedDocSet {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeResolveGraphNodesToDocSet(alloc, req, nodes);
+        }
+
+        fn resolveDocIdsToDocSetCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            doc_ids: []const []const u8,
+            generation: ?u64,
+        ) anyerror!doc_set.ResolvedDocSet {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeResolveDocIdsToDocSet(alloc, doc_ids, generation);
+        }
+
+        fn resolveRelationalFilterDocSetCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            query: search_mod.SearchQuery,
+            generation: ?u64,
+        ) anyerror!?doc_set.ResolvedDocSet {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeResolveRelationalFilterDocSet(alloc, runtime_schema, query, generation);
+        }
+
+        fn liveFilterDocSetCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            set: *const doc_set.ResolvedDocSet,
+            generation: ?u64,
+        ) anyerror!doc_set.ResolvedDocSet {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeLiveFilterDocSet(alloc, set, generation);
+        }
+
+        fn allDocsVisibleCallback(
+            ctx: ?*anyopaque,
+            generation: ?u64,
+        ) anyerror!bool {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeAllDocsVisible(generation);
+        }
+
+        fn textIndexIsChunkBackedCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            index_name: ?[]const u8,
+        ) anyerror!bool {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeTextIndexIsChunkBacked(alloc, index_name);
+        }
+
+        fn searchMatchAllCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            req: types.SearchRequest,
+        ) anyerror!types.SearchResult {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try Self.searchMatchAll(self, alloc, req);
+        }
+
+        fn projectStoredBytesForSearchCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            doc_key: []const u8,
+            raw: []const u8,
+        ) anyerror![]u8 {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeProjectStoredBytesForSearch(alloc, req, doc_key, raw);
+        }
+
+        fn loadProjectedSearchDocumentCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            key: []const u8,
+        ) anyerror!?[]u8 {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeLoadProjectedSearchDocument(alloc, req, key);
+        }
+
+        fn postprocessTextSearchResultCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            raw: types.SearchResult,
+            chunk_backed: bool,
+        ) anyerror!types.SearchResult {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimePostprocessTextSearchResult(alloc, req, raw, chunk_backed);
+        }
+
+        fn denseIndexCallback(
+            ctx: ?*anyopaque,
+            index_name: ?[]const u8,
+        ) anyerror!?*index_manager_mod.IndexManager.DenseIndex {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return self.searchRuntimeDenseIndex(index_name);
+        }
+
+        fn sparseIndexCallback(
+            ctx: ?*anyopaque,
+            index_name: ?[]const u8,
+        ) anyerror!?*index_manager_mod.IndexManager.SparseIndex {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return self.searchRuntimeSparseIndex(index_name);
+        }
+
+        fn denseDocKeyCallback(
+            ctx: ?*anyopaque,
+            index_name: []const u8,
+            vector_id: u64,
+        ) anyerror!?[]u8 {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeDenseDocKey(index_name, vector_id);
+        }
+
+        fn denseVectorIdCallback(
+            ctx: ?*anyopaque,
+            index_name: []const u8,
+            doc_key: []const u8,
+        ) anyerror!?u64 {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeDenseVectorId(index_name, doc_key);
+        }
+
+        fn denseVectorIdsForOrdinalsCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            index_name: []const u8,
+            ordinals: []const u32,
+        ) anyerror![]u64 {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeDenseVectorIdsForOrdinals(alloc, index_name, ordinals);
+        }
+
+        fn allDocsVisibleFastCallback(
+            ctx: ?*anyopaque,
+            generation: ?u64,
+        ) anyerror!bool {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeAllDocsVisibleFast(generation);
+        }
+
+        fn lookupLiveDocOrdinalNoLockCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            doc_id: []const u8,
+            generation: ?u64,
+        ) anyerror!?doc_set.DocOrdinal {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeLookupLiveDocOrdinalNoLock(alloc, doc_id, generation);
+        }
+
+        fn lookupLiveDocOrdinalsNoLockCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            doc_ids: []const []const u8,
+            generation: ?u64,
+        ) anyerror![]?doc_set.DocOrdinal {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeLookupLiveDocOrdinalsNoLock(alloc, doc_ids, generation);
+        }
+
+        fn denseOrdinalsForVectorIdsCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            index_name: []const u8,
+            vector_ids: []const u64,
+            generation: ?u64,
+        ) anyerror![]?doc_set.DocOrdinal {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeDenseOrdinalsForVectorIds(alloc, index_name, vector_ids, generation);
+        }
+
+        fn sparseDocNumsForOrdinalsCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            index_name: []const u8,
+            ordinals: []const u32,
+        ) anyerror![]const u32 {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeSparseDocNumsForOrdinals(alloc, index_name, ordinals);
+        }
+
+        fn loadRequiredProjectedSearchDocumentCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            key: []const u8,
+        ) anyerror![]u8 {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeLoadRequiredProjectedSearchDocument(alloc, req, key);
+        }
+
+        fn loadProjectedSearchDocumentManyCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            keys: []const []const u8,
+        ) anyerror![]?[]u8 {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeLoadProjectedSearchDocumentMany(alloc, req, keys);
+        }
+
+        fn postprocessVectorSearchResultCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            req: types.SearchRequest,
+            raw: types.SearchResult,
+            chunk_backed: bool,
+        ) anyerror!types.SearchResult {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimePostprocessVectorSearchResult(alloc, req, raw, chunk_backed);
+        }
+
+        fn hbcSearchCallback(
+            ctx: ?*anyopaque,
+            entry: *index_manager_mod.IndexManager.DenseIndex,
+            req: vectorindex_mod.SearchRequest,
+        ) anyerror!vectorindex_mod.SearchResults {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeHbcSearch(entry, req);
+        }
+
+        fn hbcSearchProfiledCallback(
+            ctx: ?*anyopaque,
+            entry: *index_manager_mod.IndexManager.DenseIndex,
+            req: vectorindex_mod.SearchRequest,
+        ) anyerror!vectorindex_mod.ProfiledSearchResults {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeHbcSearchProfiled(entry, req);
+        }
+
+        fn collectSearchMatchAllCandidatesCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            req: types.SearchRequest,
+        ) anyerror!db_query_search.MatchAllCandidates {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try db_query_search.collectMatchAllCandidates(alloc, req, .{
+                .ctx = self,
+                .relational_base_rows = self.searchRuntimeHasRelationalBaseRows(),
+                .scan_store_range = Self.scanStoreRangeCallback,
+                .is_expired_key = Self.isExpiredDocumentKeyCallback,
+                .lookup_doc_ordinal = Self.lookupLiveDocOrdinalCallback,
+            });
+        }
+
+        fn scanStoreRangeCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            lower: []const u8,
+            upper: []const u8,
+        ) anyerror![]docstore_mod.OwnedKVPair {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeScanStoreRange(alloc, lower, upper);
+        }
+
+        fn isExpiredDocumentKeyCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            key: []const u8,
+        ) anyerror!bool {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeIsExpiredDocumentKey(alloc, key);
+        }
+
+        fn lookupLiveDocOrdinalCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            doc_id: []const u8,
+            generation: ?u64,
+        ) anyerror!?doc_set.DocOrdinal {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeLookupLiveDocOrdinal(alloc, doc_id, generation);
+        }
+
+        fn loadStoredSearchDocumentCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            key: []const u8,
+        ) anyerror!?[]u8 {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeLoadStoredSearchDocument(alloc, key);
+        }
+
+        fn loadStoredSearchDocumentManyCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            keys: []const []const u8,
+        ) anyerror![]?[]u8 {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeLoadStoredSearchDocumentMany(alloc, keys);
+        }
+
+        fn executePatternMatchCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            named: *const types.NamedGraphQuery,
+            start_key_refs: []const []const u8,
+        ) anyerror![]graph_pattern_mod.PatternMatch {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeMatchPattern(alloc, named, start_key_refs);
+        }
+
+        fn loadPatternProjectedDocumentCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            query: graph_query_mod.GraphQuery,
+            key: []const u8,
+        ) anyerror!?[]u8 {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeLoadPatternProjectedDocument(alloc, query, key);
+        }
+
+        fn executeShortestPathCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            named: *const types.NamedGraphQuery,
+            source: []const u8,
+            target: []const u8,
+        ) anyerror!?types.GraphPath {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeFindShortestPath(alloc, named, source, target);
+        }
+
+        fn executeKShortestPathsCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            named: *const types.NamedGraphQuery,
+            source: []const u8,
+            target: []const u8,
+        ) anyerror![]types.GraphPath {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeFindKShortestPaths(alloc, named, source, target);
+        }
+
+        fn executeGraphQueryCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            named: *const types.NamedGraphQuery,
+            start_key_refs: []const []const u8,
+            target_keys: [][]u8,
+        ) anyerror!graph_query_mod.GraphQueryResult {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeExecuteSearchGraphQuery(alloc, named.query, start_key_refs, target_keys);
+        }
+
+        fn executeSearchGraphQueryCallback(
+            ctx: ?*anyopaque,
+            alloc: Allocator,
+            graph_query: graph_query_mod.GraphQuery,
+            start_key_refs: []const []const u8,
+            target_keys: [][]u8,
+        ) anyerror!graph_query_mod.GraphQueryResult {
+            const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            return try self.searchRuntimeExecuteSearchGraphQuery(alloc, graph_query, start_key_refs, target_keys);
+        }
+    };
+}
