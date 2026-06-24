@@ -92,7 +92,9 @@ items, and first-join generated metadata for left input, right input, and join
 predicate ranges, plus simple top-level comparison expression metadata for
 covered `WHERE`, `HAVING`, and join predicates. Normal function-call argument
 lists are accepted in generated expression grammar, including top-level
-projection functions with comma-separated arguments,
+projection functions with comma-separated arguments, and positive `LIKE`,
+`ILIKE`, `IN (...)`, and `BETWEEN ... AND ...` predicates are accepted and
+classified in generated expression metadata,
 and an initial generated AST-to-plan wrapper that validates those ranges and
 fails closed if the generated read family is incompatible with the existing
 read classifier. Simple query, aggregate, join, and lateral reads now validate
@@ -229,7 +231,9 @@ Suggested migration order:
    input, and join predicate ranges, plus simple top-level comparison
    expression metadata for covered `WHERE`, `HAVING`, and join predicates; and
    normal function-call argument lists are accepted by the generated expression
-   grammar for covered read projections. Generated read ASTs now have a validated wrapper
+   grammar for covered read projections, and positive `LIKE`, `ILIKE`,
+   `IN (...)`, and `BETWEEN ... AND ...` predicates are accepted and classified
+   in generated expression metadata. Generated read ASTs now have a validated wrapper
    into the current typed read lowerer for representative covered read plans
    that rejects malformed generated range payloads. Simple query reads now have
    a direct generated AST-to-query-plan lowering boundary after clause-range
@@ -253,9 +257,10 @@ Suggested migration order:
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, expression-level and
    full join-tree generated query-body ASTs, full expression AST nodes beyond
-   list-level and simple-comparison metadata, broader function/operator
-   expression coverage, per-CTE generated body arrays, recursive CTE planning,
-   direct generated read-plan lowering, and unsupported-shape diagnostics.
+   list-level and simple-comparison/operator metadata, broader function,
+   negated predicate, and quantified predicate expression coverage, per-CTE
+   generated body arrays, recursive CTE planning, direct generated read-plan
+   lowering, and unsupported-shape diagnostics.
 5. Advanced DML: `INSERT ... SELECT`, `UPDATE ... FROM`, `DELETE ... USING`,
    `TRUNCATE`, and `MERGE`.
 6. Antfly extensions: graph traversal DSL, graph metric query surfaces,
@@ -429,8 +434,9 @@ Generated grammar work needs evidence at multiple levels:
   over representative query, aggregate, join, lateral, and non-recursive CTE
   plans, AST-shape coverage for generated-ranged multi-CTE and recursive CTE
   prefixes, first-join component range coverage, and simple comparison
-  expression-shape coverage for read predicates. Seed graph DDL has generated
-  AST-to-plan parity for graph index and graph metric index plans.
+  and positive predicate expression-shape coverage for read predicates. Seed
+  graph DDL has generated AST-to-plan parity for graph index and graph metric
+  index plans.
 - SQL/API parity tests showing SQL and native API requests reach the same
   service contracts.
 - Fuzz or mutation tests for scanner/parser crash resistance and bounded error
