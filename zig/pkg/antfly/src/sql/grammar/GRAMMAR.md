@@ -102,7 +102,8 @@ classified as explicit null-test expression kinds. Top-level `AND` and `OR`
 predicates are classified as logical-expression metadata with left and right
 token ranges and child expression-kind summaries, while `BETWEEN ... AND ...`
 remains classified as a range predicate. Prefix `NOT` predicates are accepted
-and classified with right-side expression-kind summaries,
+and classified with right-side expression-kind summaries. Parenthesized
+expression groups carry inner token ranges and inner expression-kind summaries,
 and an initial generated AST-to-plan wrapper that validates those ranges and
 fails closed if the generated read family is incompatible with the existing
 read classifier. Simple query, aggregate, join, and lateral reads now validate
@@ -250,6 +251,8 @@ Suggested migration order:
    ranges and child expression-kind summaries, while `BETWEEN ... AND ...`
    remains classified as a range predicate. Prefix `NOT` predicates are
    accepted and classified with right-side expression-kind summaries.
+   Parenthesized expression groups carry inner token ranges and inner
+   expression-kind summaries.
    Generated read ASTs now have a validated wrapper
    into the current typed read lowerer for representative covered read plans
    that rejects malformed generated range payloads. Simple query reads now have

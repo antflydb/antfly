@@ -139,11 +139,14 @@ pub const GeneratedSqlExpressionKind = enum {
     logical_or,
     logical_and,
     logical_not,
+    grouped,
 };
 
 pub const GeneratedSqlExpressionAst = struct {
     kind: GeneratedSqlExpressionKind = .token_range,
     tokens: ?GeneratedSqlTokenRange = null,
+    inner_tokens: ?GeneratedSqlTokenRange = null,
+    inner_expression_kind: ?GeneratedSqlExpressionKind = null,
     left_tokens: ?GeneratedSqlTokenRange = null,
     left_expression_kind: ?GeneratedSqlExpressionKind = null,
     negation_tokens: ?GeneratedSqlTokenRange = null,
@@ -355,6 +358,8 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT id FROM usage_records WHERE status = 'open' OR deleted_at IS NULL", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status = 'open' AND deleted_at IS NULL", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE NOT deleted_at IS NULL", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE (status = 'open')", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE NOT (deleted_at IS NULL)", .kind = .read },
     .{ .sql = "SELECT concat_ws(',', status), id FROM usage_records ORDER BY status, id", .kind = .read },
     .{ .sql = "SELECT id, row_number() OVER (PARTITION BY tenant, account ORDER BY id) AS rn FROM usage_records ORDER BY id, tenant", .kind = .read },
     .{ .sql = "SELECT DISTINCT status FROM usage_records ORDER BY status", .kind = .read },
@@ -1173,6 +1178,12 @@ fn recordGeneratedListItem(ast: *GeneratedSqlListAst, range: GeneratedSqlTokenRa
 
 fn buildGeneratedExpressionAst(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) GeneratedSqlExpressionAst {
     var ast = GeneratedSqlExpressionAst{ .tokens = range };
+    if (generatedWrappedExpressionInnerRange(tokens, range)) |inner_range| {
+        ast.kind = .grouped;
+        ast.inner_tokens = inner_range;
+        ast.inner_expression_kind = generatedExpressionKindForRange(tokens, inner_range);
+        return ast;
+    }
     const operator = findTopLevelExpressionOperator(tokens, range) orelse return ast;
     ast.kind = operator.kind;
     if (!operator.prefix) {
@@ -1201,7 +1212,28 @@ fn buildGeneratedExpressionAst(tokens: []const token_mod.Token, range: Generated
 }
 
 fn generatedExpressionKindForRange(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?GeneratedSqlExpressionKind {
+    if (generatedWrappedExpressionInnerRange(tokens, range) != null) return .grouped;
     return if (findTopLevelExpressionOperator(tokens, range)) |operator| operator.kind else null;
+}
+
+fn generatedWrappedExpressionInnerRange(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?GeneratedSqlTokenRange {
+    if (range.start + 2 > range.end or range.end > tokens.len) return null;
+    if (tokens[range.start].kind != .lparen or tokens[range.end - 1].kind != .rparen) return null;
+    var depth: usize = 0;
+    var index = range.start;
+    while (index < range.end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth == 0) return null;
+                depth -= 1;
+                if (depth == 0 and index + 1 != range.end) return null;
+            },
+            else => {},
+        }
+    }
+    if (depth != 0) return null;
+    return .{ .start = range.start + 1, .end = range.end - 1 };
 }
 
 const GeneratedSqlExpressionOperator = struct {
@@ -1836,6 +1868,34 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.where_expression.operator_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 9 }, read.where_expression.right_tokens.?);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.is_null, read.where_expression.right_expression_kind.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const grouped_read_sql = "SELECT id FROM usage_records WHERE (status = 'open')";
+    const grouped_read_result = try parseSqlAlloc(alloc, grouped_read_sql);
+    switch (grouped_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 10 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.grouped, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 9 }, read.where_expression.inner_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.inner_expression_kind.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const logical_not_grouped_read_sql = "SELECT id FROM usage_records WHERE NOT (deleted_at IS NULL)";
+    const logical_not_grouped_read_result = try parseSqlAlloc(alloc, logical_not_grouped_read_sql);
+    switch (logical_not_grouped_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 11 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.logical_not, read.where_expression.kind);
+            try std.testing.expect(read.where_expression.left_tokens == null);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 11 }, read.where_expression.right_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.grouped, read.where_expression.right_expression_kind.?);
         },
         else => return error.TestUnexpectedResult,
     }
