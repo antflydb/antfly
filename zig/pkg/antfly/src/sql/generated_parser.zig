@@ -186,6 +186,8 @@ pub const GeneratedSqlExpressionKind = enum {
     logical_not,
     grouped,
     subquery,
+    unary_positive,
+    unary_negative,
     additive,
     subtractive,
     multiplicative,
@@ -832,6 +834,7 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT id FROM usage_records WHERE NOT (deleted_at IS NULL)", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE score + bonus > 10", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE score * weight > 10", .kind = .read },
+    .{ .sql = "SELECT -amount AS neg_amount, +bonus AS plus_bonus FROM usage_records WHERE amount > -10 ORDER BY -amount DESC", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE payload ->> 'status' = 'open'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE lower(status) = 'open'", .kind = .read },
     .{ .sql = "SELECT concat_ws(',', status), id FROM usage_records ORDER BY status, id", .kind = .read },
@@ -2594,6 +2597,55 @@ fn buildGeneratedExpressionAst(alloc: std.mem.Allocator, tokens: []const token_m
         ast.extract_source_tokens = extract_expression.source_tokens;
         return ast;
     }
+    if (findTopLevelExpressionOperator(tokens, range)) |operator| {
+        ast.kind = operator.kind;
+        if (!operator.prefix) {
+            if (range.start >= operator.index) return ast;
+            if (!operator.postfix and operator.index + 1 >= range.end) return ast;
+            const left_end = if (operator.negation_index) |negation_index|
+                if (negation_index < operator.index) negation_index else operator.index
+            else
+                operator.index;
+            if (range.start >= left_end) return ast;
+            ast.left_tokens = .{ .start = range.start, .end = left_end };
+            ast.left_expression_kind = generatedExpressionKindForRange(tokens, ast.left_tokens.?);
+            ast.left_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, ast.left_tokens.?);
+        } else if (operator.index + 1 >= range.end) {
+            return ast;
+        }
+        if (operator.negation_index) |negation_index| ast.negation_tokens = .{ .start = negation_index, .end = negation_index + 1 };
+        const operator_end = operator.operator_end_index orelse operator.index + 1;
+        ast.operator_tokens = .{ .start = operator.index, .end = operator_end };
+        const right_start = if (operator.quantifier_index) |quantifier_index| blk: {
+            ast.quantifier_tokens = .{ .start = quantifier_index, .end = quantifier_index + 1 };
+            break :blk quantifier_index + 1;
+        } else operator_end;
+        if (right_start >= range.end) return ast;
+        var operand_start = right_start;
+        if (isGeneratedBetweenExpressionKind(operator.kind)) {
+            if (generatedBetweenModifier(tokens[right_start])) |modifier| {
+                if (right_start + 1 >= range.end) return ast;
+                ast.between_modifier_tokens = .{ .start = right_start, .end = right_start + 1 };
+                ast.between_modifier = modifier;
+                operand_start = right_start + 1;
+            }
+        }
+        var right_end = range.end;
+        if (isGeneratedLikeExpressionKind(operator.kind)) {
+            if (findTopLevelKeyword(tokens, operand_start, range.end, .escape)) |escape_index| {
+                if (operand_start >= escape_index or escape_index + 1 >= range.end) return ast;
+                right_end = escape_index;
+                ast.escape_tokens = .{ .start = escape_index, .end = range.end };
+                const escape_expression_tokens = GeneratedSqlTokenRange{ .start = escape_index + 1, .end = range.end };
+                ast.escape_expression_kind = generatedExpressionKindForRange(tokens, escape_expression_tokens);
+                ast.escape_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, escape_expression_tokens);
+            }
+        }
+        ast.right_tokens = .{ .start = operand_start, .end = right_end };
+        ast.right_expression_kind = generatedExpressionKindForRange(tokens, ast.right_tokens.?);
+        ast.right_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, ast.right_tokens.?);
+        return ast;
+    }
     if (generatedFunctionCallExpression(tokens, range)) |function_call| {
         ast.kind = .function_call;
         ast.function_name_tokens = function_call.name_tokens;
@@ -2640,53 +2692,6 @@ fn buildGeneratedExpressionAst(alloc: std.mem.Allocator, tokens: []const token_m
         }
         return ast;
     }
-    const operator = findTopLevelExpressionOperator(tokens, range) orelse return ast;
-    ast.kind = operator.kind;
-    if (!operator.prefix) {
-        if (range.start >= operator.index) return ast;
-        if (!operator.postfix and operator.index + 1 >= range.end) return ast;
-        const left_end = if (operator.negation_index) |negation_index|
-            if (negation_index < operator.index) negation_index else operator.index
-        else
-            operator.index;
-        if (range.start >= left_end) return ast;
-        ast.left_tokens = .{ .start = range.start, .end = left_end };
-        ast.left_expression_kind = generatedExpressionKindForRange(tokens, ast.left_tokens.?);
-        ast.left_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, ast.left_tokens.?);
-    } else if (operator.index + 1 >= range.end) {
-        return ast;
-    }
-    if (operator.negation_index) |negation_index| ast.negation_tokens = .{ .start = negation_index, .end = negation_index + 1 };
-    const operator_end = operator.operator_end_index orelse operator.index + 1;
-    ast.operator_tokens = .{ .start = operator.index, .end = operator_end };
-    const right_start = if (operator.quantifier_index) |quantifier_index| blk: {
-        ast.quantifier_tokens = .{ .start = quantifier_index, .end = quantifier_index + 1 };
-        break :blk quantifier_index + 1;
-    } else operator_end;
-    if (right_start >= range.end) return ast;
-    var operand_start = right_start;
-    if (isGeneratedBetweenExpressionKind(operator.kind)) {
-        if (generatedBetweenModifier(tokens[right_start])) |modifier| {
-            if (right_start + 1 >= range.end) return ast;
-            ast.between_modifier_tokens = .{ .start = right_start, .end = right_start + 1 };
-            ast.between_modifier = modifier;
-            operand_start = right_start + 1;
-        }
-    }
-    var right_end = range.end;
-    if (isGeneratedLikeExpressionKind(operator.kind)) {
-        if (findTopLevelKeyword(tokens, operand_start, range.end, .escape)) |escape_index| {
-            if (operand_start >= escape_index or escape_index + 1 >= range.end) return ast;
-            right_end = escape_index;
-            ast.escape_tokens = .{ .start = escape_index, .end = range.end };
-            const escape_expression_tokens = GeneratedSqlTokenRange{ .start = escape_index + 1, .end = range.end };
-            ast.escape_expression_kind = generatedExpressionKindForRange(tokens, escape_expression_tokens);
-            ast.escape_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, escape_expression_tokens);
-        }
-    }
-    ast.right_tokens = .{ .start = operand_start, .end = right_end };
-    ast.right_expression_kind = generatedExpressionKindForRange(tokens, ast.right_tokens.?);
-    ast.right_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, ast.right_tokens.?);
     return ast;
 }
 
@@ -2711,9 +2716,10 @@ fn generatedExpressionKindForRange(tokens: []const token_mod.Token, range: Gener
     if (generatedCurrentTimestampExpression(tokens, range) != null) return .current_timestamp;
     if (generatedCurrentDateExpression(tokens, range)) return .current_date;
     if (generatedExtractExpression(tokens, range) != null) return .extract_expression;
+    if (findTopLevelExpressionOperator(tokens, range)) |operator| return operator.kind;
     if (generatedFunctionCallExpression(tokens, range) != null) return .function_call;
     if (generatedArrayConstructorExpression(tokens, range) != null) return .array_constructor;
-    return if (findTopLevelExpressionOperator(tokens, range)) |operator| operator.kind else null;
+    return null;
 }
 
 fn generatedSubqueryExpressionInnerRange(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?GeneratedSqlTokenRange {
@@ -3214,6 +3220,8 @@ fn findTopLevelExpressionOperator(tokens: []const token_mod.Token, range: Genera
         return .{ .kind = .logical_not, .index = index, .prefix = true };
     }
     if (tokens[index].matchesKeywordTag(.exists)) return .{ .kind = .exists_subquery, .index = index, .prefix = true };
+    if (tokens[index].kind == .plus and index + 1 < range.end) return .{ .kind = .unary_positive, .index = index, .prefix = true };
+    if (tokens[index].kind == .minus and index + 1 < range.end) return .{ .kind = .unary_negative, .index = index, .prefix = true };
     while (index < range.end) : (index += 1) {
         switch (tokens[index].kind) {
             .lparen, .lbracket => depth += 1,
@@ -3488,7 +3496,10 @@ test "generated SQL parser facade classifies gated corpus" {
 
     const corpus = first_family_corpus ++ simple_ddl_corpus ++ simple_dml_corpus ++ simple_read_corpus ++ simple_graph_corpus ++ unsupported_corpus;
     for (corpus) |case| {
-        const generated_result = try parseSqlAlloc(alloc, case.sql);
+        const generated_result = parseSqlAlloc(alloc, case.sql) catch |err| {
+            std.debug.print("generated parser rejected corpus SQL: {s}\n", .{case.sql});
+            return err;
+        };
         try std.testing.expectEqual(case.kind, generated_result.kind);
     }
 }
@@ -3865,6 +3876,12 @@ test "generated SQL parser facade builds read AST spans" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "generated SQL parser facade builds predicate read AST spans" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
 
     const case_projection_read_sql = "SELECT CASE WHEN email IS NULL THEN 'missing' WHEN email = 'blocked@example.test' THEN 'blocked' ELSE lower(status) END AS email_bucket FROM usage_records WHERE id = 'u1'";
     const case_projection_read_result = try parseSqlAlloc(alloc, case_projection_read_sql);
@@ -4279,6 +4296,12 @@ test "generated SQL parser facade builds read AST spans" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "generated SQL parser facade builds quantified predicate AST spans" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
 
     const any_read_sql = "SELECT id FROM usage_records WHERE score = ANY (1, 2)";
     const any_read_result = try parseSqlAlloc(alloc, any_read_sql);
@@ -4563,6 +4586,12 @@ test "generated SQL parser facade builds read AST spans" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "generated SQL parser facade builds null logical and join AST spans" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
 
     const is_null_read_sql = "SELECT id FROM usage_records WHERE deleted_at IS NULL";
     const is_null_read_result = try parseSqlAlloc(alloc, is_null_read_sql);
@@ -5307,6 +5336,12 @@ test "generated SQL parser facade builds read AST spans" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "generated SQL parser facade builds extended read AST spans" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
 
     const order_nulls_read_sql = "SELECT id FROM usage_records ORDER BY created_at DESC NULLS LAST, score ASC NULLS FIRST";
     const order_nulls_read_result = try parseSqlAlloc(alloc, order_nulls_read_sql);
@@ -5737,20 +5772,20 @@ test "generated SQL parser facade builds read AST spans" {
         .read => |read| {
             try std.testing.expectEqual(GeneratedSqlReadKind.cte, read.kind);
             try std.testing.expectEqual(GeneratedSqlReadKind.set_operation, read.cte_items[0].body_kind.?);
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 12 }, read.cte_items[0].body_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 13 }, read.cte_items[0].body_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, read.cte_items[0].body_select_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.cte_items[0].body_projection_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.cte_items[0].body_source_tokens.?);
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 12 }, read.cte_items[0].body_set_operation_tokens.?);
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 12 }, read.cte_items[0].body_set_operation.tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 13 }, read.cte_items[0].body_set_operation_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 13 }, read.cte_items[0].body_set_operation.tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.cte_items[0].body_set_operation.operator_tokens.?);
             try std.testing.expectEqual(GeneratedSqlSetOperationKind.@"union", read.cte_items[0].body_set_operation.kind.?);
             try std.testing.expect(read.cte_items[0].body_set_operation.all_tokens == null);
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 12 }, read.cte_items[0].body_set_operation.right_query_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 13 }, read.cte_items[0].body_set_operation.right_query_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.cte_items[0].body_set_operation.right_select_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.cte_items[0].body_set_operation.right_projection_tokens.?);
             try std.testing.expectEqual(@as(usize, 1), read.cte_items[0].body_set_operation.right_projection_items.count);
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 12 }, read.cte_items[0].body_set_operation.right_source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read.cte_items[0].body_set_operation.right_source_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -5858,6 +5893,47 @@ test "generated SQL parser facade builds read AST spans" {
             try std.testing.expectEqualStrings("EXPLAIN", spanText(explain_sql, unsupported.command_span));
             try std.testing.expect(unsupported.subject_tokens.?.start == 1);
             try std.testing.expect(unsupported.subject_tokens.?.end == 5);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "generated SQL parser facade builds unary arithmetic expression spans" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const unary_arithmetic_read_sql = "SELECT -amount AS neg_amount, +bonus AS plus_bonus FROM usage_records WHERE amount > -10 ORDER BY -amount DESC";
+    const unary_arithmetic_read_result = try parseSqlAlloc(alloc, unary_arithmetic_read_sql);
+    switch (unary_arithmetic_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(@as(usize, 2), read.projection_items.count);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.unary_negative, read.projection_items.expressions[0].kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.projection_items.expressions[0].operator_tokens.?);
+            try std.testing.expect(read.projection_items.expressions[0].left_tokens == null);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, read.projection_items.expressions[0].right_tokens.?);
+            const negative_projection_right = read.projection_items.expressions[0].right_expression orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, negative_projection_right.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, negative_projection_right.tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.unary_positive, read.projection_items.expressions[1].kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.projection_items.expressions[1].operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.projection_items.expressions[1].right_tokens.?);
+            const positive_projection_right = read.projection_items.expressions[1].right_expression orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, positive_projection_right.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, positive_projection_right.tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 14 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 14, .end = 15 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 15, .end = 17 }, read.where_expression.right_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.unary_negative, read.where_expression.right_expression_kind.?);
+            const right = read.where_expression.right_expression orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.unary_negative, right.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 15, .end = 16 }, right.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 16, .end = 17 }, right.right_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.unary_negative, read.order_first_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 19, .end = 20 }, read.order_first_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 20, .end = 21 }, read.order_first_expression.right_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

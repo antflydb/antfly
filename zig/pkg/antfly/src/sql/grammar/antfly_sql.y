@@ -659,13 +659,13 @@ comparison_expression:
   | concat_expression ILIKE concat_expression like_escape_opt
   | concat_expression LIKE quantified_operator quantified_rhs
   | concat_expression ILIKE quantified_operator quantified_rhs
-  | concat_expression IN LPAREN expression_list RPAREN
+  | concat_expression IN in_rhs
   | concat_expression BETWEEN between_modifier_opt concat_expression AND concat_expression
   | concat_expression NOT LIKE concat_expression like_escape_opt
   | concat_expression NOT ILIKE concat_expression like_escape_opt
   | concat_expression NOT LIKE quantified_operator quantified_rhs
   | concat_expression NOT ILIKE quantified_operator quantified_rhs
-  | concat_expression NOT IN LPAREN expression_list RPAREN
+  | concat_expression NOT IN in_rhs
   | concat_expression NOT BETWEEN between_modifier_opt concat_expression AND concat_expression
   | concat_expression comparison_operator quantified_operator quantified_rhs
   | concat_expression IS NULL
@@ -708,6 +708,11 @@ quantified_operator:
   | SOME
   ;
 
+in_rhs:
+    LPAREN expression_list RPAREN
+  | LPAREN read_statement RPAREN
+  ;
+
 quantified_rhs:
     LPAREN expression_list RPAREN
   | LPAREN read_statement RPAREN
@@ -725,10 +730,16 @@ additive_expression:
   ;
 
 multiplicative_expression:
+    unary_expression
+  | multiplicative_expression STAR unary_expression
+  | multiplicative_expression SLASH unary_expression
+  | multiplicative_expression PERCENT unary_expression
+  ;
+
+unary_expression:
     postfix_expression
-  | multiplicative_expression STAR postfix_expression
-  | multiplicative_expression SLASH postfix_expression
-  | multiplicative_expression PERCENT postfix_expression
+  | PLUS unary_expression
+  | MINUS unary_expression
   ;
 
 postfix_expression:
@@ -748,6 +759,7 @@ primary_expression:
   | ARRAY LBRACKET array_element_list_opt RBRACKET
   | CAST LPAREN expression AS type_name RPAREN
   | CASE case_when_list case_else_opt END
+  | EXISTS LPAREN read_statement RPAREN
   | EXTRACT LPAREN IDENT FROM expression RPAREN
   | CURRENT_DATE
   | CURRENT_TIMESTAMP current_timestamp_precision_opt

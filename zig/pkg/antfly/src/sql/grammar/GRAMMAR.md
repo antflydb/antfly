@@ -124,8 +124,8 @@ left and right token ranges and owned child expression nodes, while
 predicates are accepted and classified with owned right-side expression nodes.
 Parenthesized expression groups carry inner token ranges and owned inner
 expression nodes,
-and comparison operands can expose additive and multiplicative child
-expression-kind summaries, including JSON/path postfix operator summaries,
+and comparison operands can expose unary plus/minus, additive, and
+multiplicative child expression-kind summaries, including JSON/path postfix operator summaries,
 function-call child summaries, and direct function-call name and argument-list
 metadata,
 and an initial generated AST-to-plan wrapper that validates those ranges,
@@ -341,8 +341,9 @@ Suggested migration order:
    Prefix `NOT` predicates are accepted and classified with owned right-side
    expression nodes.
    Parenthesized expression groups carry inner token ranges and owned inner
-   expression nodes, and comparison operands can expose additive and
-   multiplicative child expression-kind summaries, including JSON `->`/`->>`
+   expression nodes, and projection, ordering, and comparison operands can
+   expose unary plus/minus, additive, and multiplicative child expression-kind
+   summaries, including JSON `->`/`->>`
    and JSON path `#>`/`#>>` postfix operator summaries in projections and
    predicates, function-call child summaries, direct function-call
    name and argument-list metadata, PostgreSQL `CAST(expr AS type)` value and

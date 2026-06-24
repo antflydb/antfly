@@ -1051,6 +1051,16 @@ fn validateGeneratedExistsSubqueryExpressionAstStructure(
     try requireGeneratedExpressionAstChild(.subquery, expression.right_tokens, expression.right_expression);
 }
 
+fn validateGeneratedPrefixExpressionAstStructure(expression: generated_parser.GeneratedSqlExpressionAst) !void {
+    if (expression.tokens == null or expression.operator_tokens == null or expression.right_tokens == null) {
+        return error.UnsupportedSqlShape;
+    }
+    if (expression.left_tokens != null or expression.left_expression != null or expression.left_expression_kind != null) {
+        return error.UnsupportedSqlShape;
+    }
+    try requireGeneratedExpressionAstChild(expression.right_expression_kind, expression.right_tokens, expression.right_expression);
+}
+
 fn validateGeneratedFunctionOverMetadata(expression: generated_parser.GeneratedSqlExpressionAst) !void {
     if (expression.over_tokens == null) {
         if (expression.over_name_tokens != null or expression.over_definition_tokens != null or
@@ -1173,6 +1183,9 @@ fn validateGeneratedExpressionAstStructure(expression: generated_parser.Generate
         },
         .exists_subquery => try validateGeneratedExistsSubqueryExpressionAstStructure(expression, false),
         .not_exists_subquery => try validateGeneratedExistsSubqueryExpressionAstStructure(expression, true),
+        .unary_positive,
+        .unary_negative,
+        => try validateGeneratedPrefixExpressionAstStructure(expression),
         .is_null,
         .is_not_null,
         .is_true,
@@ -2251,6 +2264,22 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_comparison_child_parsed_sql, malformed_comparison_child_read_ast),
+    );
+
+    var malformed_unary_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT -id AS neg_id FROM usage_records WHERE kind = 'order'",
+    );
+    defer malformed_unary_expression_parsed_sql.deinit(alloc);
+    const malformed_unary_expression_generated_raw = malformed_unary_expression_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_unary_expression_read_ast = switch (malformed_unary_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_unary_expression_read_ast.projection_items.expressions[0].right_expression_kind = .function_call;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_unary_expression_parsed_sql, malformed_unary_expression_read_ast),
     );
 
     var malformed_exists_subquery_parsed_sql = try tokenized.ParsedSql.initAlloc(
