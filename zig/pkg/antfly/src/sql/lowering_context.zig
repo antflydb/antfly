@@ -215,6 +215,17 @@ pub fn lowerReadPlanFromGeneratedReadAstAlloc(
                 context.params,
             ) };
         },
+        .set_operation => blk: {
+            try validateGeneratedSetOperationReadAst(read_ast);
+            break :blk .{ .set_operation = try context.callbacks.lower_set_operation_optional_source_schema(
+                context.alloc,
+                parsed_sql,
+                context.schema,
+                context.source_schema,
+                context.params,
+                context.function_bindings,
+            ) };
+        },
         .cte => try context.lowerParsed(parsed_sql),
     };
 }
@@ -228,6 +239,7 @@ fn generatedReadAstMatchesReadKind(
         .aggregate => read_kind == .aggregate,
         .join => read_kind == .join,
         .lateral => read_kind == .lateral,
+        .set_operation => read_kind == .set_operation,
         .cte => switch (read_kind) {
             .query, .aggregate, .join, .lateral, .window => true,
             .set_operation, .recursive_cte => false,
@@ -316,6 +328,13 @@ fn validateGeneratedJoinedReadAst(
     }
     if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return error.UnsupportedSqlShape;
     try validateGeneratedReadRangeContainsKeyword(tokens, read_ast.source_tokens.?, keyword);
+}
+
+fn validateGeneratedSetOperationReadAst(read_ast: generated_parser.GeneratedSqlReadAst) !void {
+    if (read_ast.cte_tokens != null) return error.UnsupportedSqlShape;
+    if (read_ast.projection_tokens == null or read_ast.source_tokens == null or read_ast.set_operation_tokens == null) {
+        return error.UnsupportedSqlShape;
+    }
 }
 
 fn validateGeneratedReadTokenRange(

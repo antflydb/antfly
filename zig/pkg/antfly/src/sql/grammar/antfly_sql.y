@@ -35,7 +35,8 @@
 %token EXPLAIN EXISTS EXTENSION FALSE FROM FULL GRAPH GROUP HAVING IDENTITY IF INDEX INSERT INTO
 %token JOIN KEY LATERAL LIMIT MATCHED MERGE METRIC NOT NULL ON OR ORDER PREPARE PRIMARY PUBLIC
 %token NOTHING QUERY RESET RESTART RESTRICT RETURNING ROLLBACK SCHEMA SELECT SET SHOW TABLE TO TRUNCATE
-%token THEN TRUE UPDATE USING VALUES WHEN WHERE WITH
+%token THEN TRUE UNION UPDATE USING VALUES WHEN WHERE WITH
+%token EXCEPT INTERSECT
 
 statement:
     session_statement
@@ -185,8 +186,24 @@ merge_statement:
   ;
 
 read_statement:
+    select_set_statement
+  | with_clause select_set_statement
+  ;
+
+select_set_statement:
     select_statement
-  | with_clause select_statement
+  | select_statement set_operation select_statement
+  ;
+
+set_operation:
+    UNION all_opt
+  | INTERSECT
+  | EXCEPT
+  ;
+
+all_opt:
+    /* empty */
+  | ALL
   ;
 
 select_statement:

@@ -78,6 +78,7 @@ pub const GeneratedSqlReadKind = enum {
     aggregate,
     join,
     lateral,
+    set_operation,
     cte,
 };
 
@@ -264,6 +265,7 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT status FROM usage_records GROUP BY status HAVING status = 'open'", .kind = .read },
     .{ .sql = "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id", .kind = .read },
     .{ .sql = "SELECT id FROM LATERAL (SELECT id FROM usage_records) AS source_rows", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records UNION SELECT id FROM usage_archive", .kind = .read },
     .{ .sql = "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows", .kind = .read },
 };
 
@@ -482,6 +484,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
 
 fn classifyReadKind(tokens: []const token_mod.Token) GeneratedSqlReadKind {
     if (tokens.len > 0 and tokens[0].matchesKeywordTag(.with)) return .cte;
+    if (firstTopLevelSetOperation(tokens, 1, statementTokenEnd(tokens)) != null) return .set_operation;
     for (tokens) |token| {
         if (token.matchesKeywordTag(.lateral)) return .lateral;
     }
@@ -1219,6 +1222,18 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 9 }, read.cte_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.projection_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read.source_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const set_operation_read_sql = "SELECT id FROM usage_records UNION SELECT id FROM usage_archive";
+    const set_operation_read_result = try parseSqlAlloc(alloc, set_operation_read_sql);
+    switch (set_operation_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.set_operation, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.projection_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 9 }, read.set_operation_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

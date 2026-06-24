@@ -843,6 +843,7 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
         .{ .sql = "SELECT status FROM usage_records GROUP BY status HAVING status = 'open'", .generated = .aggregate, .read = .aggregate },
         .{ .sql = "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id", .generated = .join, .read = .join },
         .{ .sql = "SELECT id FROM LATERAL (SELECT id FROM usage_records) AS source_rows", .generated = .lateral, .read = .lateral },
+        .{ .sql = "SELECT id FROM usage_records UNION SELECT id FROM usage_archive", .generated = .set_operation, .read = .set_operation },
         .{ .sql = "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows", .generated = .cte, .read = .query },
     };
 
@@ -870,6 +871,8 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                 } else if (case.generated == .cte) {
                     try std.testing.expect(read_ast.cte_tokens != null);
                     try std.testing.expect(read_ast.projection_tokens != null);
+                } else if (case.generated == .set_operation) {
+                    try std.testing.expect(read_ast.set_operation_tokens != null);
                 }
             },
             else => return error.TestUnexpectedResult,
