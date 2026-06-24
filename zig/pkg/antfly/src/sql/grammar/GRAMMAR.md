@@ -56,7 +56,9 @@ catalog plans directly from generated AST ranges, plus generated AST-to-plan
 parity for seed `CREATE TABLE` and `CREATE INDEX` forms using the same parser
 options as the existing lowerer. Generated `CREATE INDEX` ASTs also retain
 `UNIQUE`, method, element-list, covering-index `INCLUDE (...)`, options, and
-partial-index `WHERE ...` token ranges for later direct DDL cutover. Simple DML now has generated-parser corpus
+partial-index `WHERE ...` token ranges and generated-first create-index
+planning validates those ranges before lowering through the typed DDL planner.
+Simple DML now has generated-parser corpus
 coverage, retained generated raw and AST nodes for covered write statements,
 structured generated DML ranges for target tables, sources, assignments,
 predicates, conflict clauses, returning clauses, values lists, default-values
@@ -257,7 +259,7 @@ Suggested migration order:
    catalog DDL now has structured generated AST payloads and direct generated
    AST-to-plan lowering, and generated create-index metadata covers basic
    PostgreSQL-style unique, covering, partial, method, element-list, and option
-   clauses. Unsupported DDL remains on the existing parser until
+   clauses with generated-first AST-to-plan parity validation. Unsupported DDL remains on the existing parser until
    each shape has raw AST parity.
 3. Simple DML: `INSERT ... VALUES`, primary-key `UPDATE`, primary-key
    `DELETE`, `RETURNING`, and `ON CONFLICT`. Initial generated-parser coverage
@@ -558,7 +560,8 @@ variants for:
   DDL-compatible AST payloads for object names, index target tables, index
   methods, index element lists, covering-index include lists, partial-index
   predicates, index options, extension options, unique-index flags, and drop
-  behavior
+  behavior, plus generated-first AST-to-plan parity checks for covered
+  create-index clauses
 - graph statement, including a generated AST payload for command spans and
   graph-specific AST-to-plan wrappers for seed graph index and graph metric DDL
 - unsupported statement, including generated AST payloads for seed `ANALYZE`,

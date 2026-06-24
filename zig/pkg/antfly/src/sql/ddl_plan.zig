@@ -3046,7 +3046,7 @@ pub fn ddlPlanFromGeneratedAstAlloc(
     var pos: usize = 0;
     return switch (ast.kind) {
         .create_table => .{ .create_table = try parseCreateTablePlanAlloc(alloc, tail, &pos, options.column_definition_options) },
-        .create_index => .{ .create_index = try parseCreateIndexPlanAlloc(alloc, tail, &pos, false, options.create_index_options) },
+        .create_index => .{ .create_index = try createIndexPlanFromGeneratedAstAlloc(alloc, tokens, ast, options.create_index_options) },
         else => try simpleDdlPlanFromGeneratedAstAlloc(alloc, tokens, ast),
     };
 }
@@ -3280,6 +3280,86 @@ fn dropExtensionPlanFromGeneratedDdlAstAlloc(
     return dropExtensionPlanFromSyntax(&syntax);
 }
 
+fn createIndexPlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+    options: CreateIndexOptions,
+) !CreateIndexPlan {
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    if (end < 4 or !tokens[0].matchesKeywordTag(.create)) return error.UnsupportedSqlShape;
+
+    var index: usize = 1;
+    if (ast.unique) {
+        if (index >= end or !tokens[index].matchesKeywordTag(.unique)) return error.UnsupportedSqlShape;
+        index += 1;
+    } else if (index < end and tokens[index].matchesKeywordTag(.unique)) {
+        return error.UnsupportedSqlShape;
+    }
+    const index_keyword = index;
+    if (index >= end or !tokens[index].matchesKeywordTag(.index)) return error.UnsupportedSqlShape;
+    index += 1;
+
+    if (ast.if_not_exists) try expectGeneratedIfNotExists(tokens, &index, end);
+    const name_range = try requireGeneratedTokenRangeAt(ast.object_name_tokens, index, end);
+    index = name_range.end;
+
+    if (index >= end or !tokens[index].matchesKeywordTag(.on)) return error.UnsupportedSqlShape;
+    index += 1;
+    const table_range = ast.index_table_tokens orelse return error.UnsupportedSqlShape;
+    if (table_range.start != index or table_range.end <= table_range.start or table_range.end > end) return error.UnsupportedSqlShape;
+    index = table_range.end;
+
+    if (index < end and tokens[index].matchesKeywordTag(.using)) {
+        index += 1;
+        const method_range = try requireGeneratedTokenRangeAt(ast.index_method_tokens, index, end);
+        index = method_range.end;
+    } else if (ast.index_method_tokens != null) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (index >= end or tokens[index].kind != .lparen) return error.UnsupportedSqlShape;
+    const elements_close = findGeneratedMatchingParen(tokens, index, end) orelse return error.UnsupportedSqlShape;
+    const elements_range = ast.index_elements_tokens orelse return error.UnsupportedSqlShape;
+    if (elements_range.start != index + 1 or elements_range.end != elements_close) return error.UnsupportedSqlShape;
+    index = elements_close + 1;
+
+    if (index < end and tokens[index].matchesKeywordTag(.include)) {
+        if (index + 1 >= end or tokens[index + 1].kind != .lparen) return error.UnsupportedSqlShape;
+        const include_close = findGeneratedMatchingParen(tokens, index + 1, end) orelse return error.UnsupportedSqlShape;
+        const include_range = ast.index_include_tokens orelse return error.UnsupportedSqlShape;
+        if (include_range.start != index + 2 or include_range.end != include_close) return error.UnsupportedSqlShape;
+        index = include_close + 1;
+    } else if (ast.index_include_tokens != null) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (index < end and tokens[index].matchesKeywordTag(.with)) {
+        if (index + 1 >= end or tokens[index + 1].kind != .lparen) return error.UnsupportedSqlShape;
+        const options_close = findGeneratedMatchingParen(tokens, index + 1, end) orelse return error.UnsupportedSqlShape;
+        const options_range = ast.index_options_tokens orelse return error.UnsupportedSqlShape;
+        if (options_range.start != index or options_range.end != options_close + 1) return error.UnsupportedSqlShape;
+        index = options_close + 1;
+    } else if (ast.index_options_tokens != null) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (index < end and tokens[index].matchesKeywordTag(.where)) {
+        const where_range = ast.index_where_tokens orelse return error.UnsupportedSqlShape;
+        if (where_range.start != index + 1 or where_range.end != end) return error.UnsupportedSqlShape;
+        index = end;
+    } else if (ast.index_where_tokens != null) {
+        return error.UnsupportedSqlShape;
+    }
+    if (index != end) return error.UnsupportedSqlShape;
+
+    var pos: usize = 0;
+    var plan = try parseCreateIndexPlanAlloc(alloc, tokens[index_keyword..end], &pos, ast.unique, options);
+    errdefer plan.deinit(alloc);
+    if (plan.unique != ast.unique) return error.UnsupportedSqlShape;
+    return plan;
+}
+
 fn requireGeneratedDdlHeader(
     tokens: []const grammar.Token,
     statement_span: token_mod.SourceSpan,
@@ -3299,6 +3379,24 @@ fn requireGeneratedTokenRangeAt(
     const range = maybe_range orelse return error.UnsupportedSqlShape;
     if (range.start != start or range.end != start + 1 or range.end > end) return error.UnsupportedSqlShape;
     return range;
+}
+
+fn findGeneratedMatchingParen(tokens: []const grammar.Token, open_index: usize, end: usize) ?usize {
+    if (open_index >= end or tokens[open_index].kind != .lparen) return null;
+    var depth: usize = 0;
+    var index = open_index;
+    while (index < end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth == 0) return null;
+                depth -= 1;
+                if (depth == 0) return index;
+            },
+            else => {},
+        }
+    }
+    return null;
 }
 
 fn expectGeneratedIfNotExists(tokens: []const grammar.Token, index: *usize, end: usize) !void {
@@ -12363,6 +12461,60 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
                 try std.testing.expectEqual(legacy.method, generated.method);
                 try std.testing.expectEqual(legacy.columns.len, generated.columns.len);
                 try std.testing.expectEqualStrings(legacy.columns[0], generated.columns[0]);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const covering_partial_sql = "CREATE UNIQUE INDEX usage_records_status_active_idx ON usage_records (status) INCLUDE (tenant_id, amount) WHERE deleted_at IS NULL;";
+    var generated_covering_partial = try generatedDdlPlanForTestAlloc(alloc, covering_partial_sql);
+    defer generated_covering_partial.deinit(alloc);
+    var legacy_covering_partial = try lowerDdlPlanForTestAlloc(alloc, covering_partial_sql);
+    defer legacy_covering_partial.deinit(alloc);
+    switch (generated_covering_partial) {
+        .create_index => |generated| switch (legacy_covering_partial) {
+            .create_index => |legacy| {
+                try std.testing.expectEqualStrings(legacy.index_name, generated.index_name);
+                try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
+                try std.testing.expectEqual(legacy.if_not_exists, generated.if_not_exists);
+                try std.testing.expectEqual(legacy.unique, generated.unique);
+                try std.testing.expectEqual(legacy.method, generated.method);
+                try std.testing.expectEqual(legacy.columns.len, generated.columns.len);
+                try std.testing.expectEqualStrings(legacy.columns[0], generated.columns[0]);
+                try std.testing.expectEqual(legacy.include_columns.len, generated.include_columns.len);
+                try std.testing.expectEqualStrings(legacy.include_columns[0], generated.include_columns[0]);
+                try std.testing.expectEqualStrings(legacy.include_columns[1], generated.include_columns[1]);
+                try std.testing.expectEqual(legacy.where.len, generated.where.len);
+                try std.testing.expectEqualStrings(legacy.where[0].field, generated.where[0].field);
+                try std.testing.expectEqual(legacy.where[0].op, generated.where[0].op);
+                try std.testing.expectEqual(legacy.where_expressions.len, generated.where_expressions.len);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const expression_partial_sql = "CREATE UNIQUE INDEX users_lower_email_active_expr_key ON users (tenant_id, lower(email)) WHERE lower(status) = 'active';";
+    var generated_expression_partial = try generatedDdlPlanForTestAlloc(alloc, expression_partial_sql);
+    defer generated_expression_partial.deinit(alloc);
+    var legacy_expression_partial = try lowerDdlPlanForTestAlloc(alloc, expression_partial_sql);
+    defer legacy_expression_partial.deinit(alloc);
+    switch (generated_expression_partial) {
+        .create_index => |generated| switch (legacy_expression_partial) {
+            .create_index => |legacy| {
+                try std.testing.expectEqualStrings(legacy.index_name, generated.index_name);
+                try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
+                try std.testing.expectEqual(legacy.unique, generated.unique);
+                try std.testing.expectEqual(legacy.columns.len, generated.columns.len);
+                try std.testing.expectEqualStrings(legacy.columns[0], generated.columns[0]);
+                try std.testing.expectEqual(legacy.expressions.len, generated.expressions.len);
+                try std.testing.expectEqual(legacy.expressions[0].op, generated.expressions[0].op);
+                try std.testing.expectEqualStrings(legacy.expressions[0].field, generated.expressions[0].field);
+                try std.testing.expectEqual(legacy.where.len, generated.where.len);
+                try std.testing.expectEqual(legacy.where_expressions.len, generated.where_expressions.len);
+                try std.testing.expectEqual(legacy.where_expressions[0].op, generated.where_expressions[0].op);
+                try std.testing.expectEqual(legacy.where_expressions[0].lhs.kind, generated.where_expressions[0].lhs.kind);
             },
             else => return error.TestUnexpectedResult,
         },
