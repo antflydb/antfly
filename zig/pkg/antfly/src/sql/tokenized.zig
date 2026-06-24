@@ -346,6 +346,7 @@ fn parseStatement(
             .dml => if (tokenized_sql.write_statement_kind) |kind| return .{ .write = .{ .kind = kind, .raw = raw_statement } },
             .read => if (tokenized_sql.read_statement_kind) |kind| return .{ .read = .{ .kind = kind, .raw = raw_statement } },
             .graph => return .{ .ddl = .{ .raw = raw_statement } },
+            .unsupported => {},
             .other => {},
         }
     }
@@ -705,6 +706,15 @@ test "sql adapter parsed sql owns typed statement variants" {
             try std.testing.expect(statement.costs);
             try std.testing.expectEqual(@as(?usize, 1), statement.inner_token_start);
             try std.testing.expectEqual(@as(?usize, 5), statement.inner_token_end);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.unsupported, explain.generatedStatementKind().?);
+            switch (explain.generated_statement.?.ast.?) {
+                .unsupported => |unsupported| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.explain, unsupported.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedReason.explain_not_planned_by_generated_parser, unsupported.reason);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = 5 }, unsupported.subject_tokens.?);
+                },
+                else => return error.TestUnexpectedResult,
+            }
         },
         else => return error.TestUnexpectedResult,
     }

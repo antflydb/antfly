@@ -26,6 +26,7 @@ pub const GeneratedSqlStatementKind = enum {
     dml,
     read,
     graph,
+    unsupported,
     other,
 };
 
@@ -88,6 +89,16 @@ pub const GeneratedSqlGraphKind = enum {
     create_metric,
 };
 
+pub const GeneratedSqlUnsupportedKind = enum {
+    analyze,
+    explain,
+};
+
+pub const GeneratedSqlUnsupportedReason = enum {
+    analyze_not_planned_by_generated_parser,
+    explain_not_planned_by_generated_parser,
+};
+
 pub const GeneratedSqlStatement = union(GeneratedSqlStatementKind) {
     session: GeneratedSqlSessionKind,
     transaction: GeneratedSqlTransactionKind,
@@ -96,6 +107,7 @@ pub const GeneratedSqlStatement = union(GeneratedSqlStatementKind) {
     dml: GeneratedSqlDmlKind,
     read: GeneratedSqlReadKind,
     graph: GeneratedSqlGraphKind,
+    unsupported: GeneratedSqlUnsupportedKind,
     other: void,
 };
 
@@ -200,6 +212,14 @@ pub const GeneratedSqlGraphAst = struct {
     command_span: token_mod.SourceSpan,
 };
 
+pub const GeneratedSqlUnsupportedAst = struct {
+    kind: GeneratedSqlUnsupportedKind,
+    reason: GeneratedSqlUnsupportedReason,
+    statement_span: token_mod.SourceSpan,
+    command_span: token_mod.SourceSpan,
+    subject_tokens: ?GeneratedSqlTokenRange = null,
+};
+
 pub const GeneratedSqlAst = union(enum) {
     session: GeneratedSqlSessionAst,
     transaction: GeneratedSqlTransactionAst,
@@ -208,6 +228,7 @@ pub const GeneratedSqlAst = union(enum) {
     dml: GeneratedSqlDmlAst,
     read: GeneratedSqlReadAst,
     graph: GeneratedSqlGraphAst,
+    unsupported: GeneratedSqlUnsupportedAst,
 };
 
 pub const GeneratedSqlParseResult = struct {
@@ -304,6 +325,11 @@ pub const simple_graph_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CREATE GRAPH METRIC docs_pagerank ON doc_edges WITH (metric = 'pagerank')", .kind = .graph },
 };
 
+pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
+    .{ .sql = "ANALYZE", .kind = .unsupported },
+    .{ .sql = "EXPLAIN SELECT id FROM usage_records", .kind = .unsupported },
+};
+
 pub fn parseSqlAlloc(alloc: std.mem.Allocator, sql: []const u8) !GeneratedSqlParseResult {
     var tokens = try lexer.tokenizeAlloc(alloc, sql);
     defer lexer.freeTokens(alloc, &tokens);
@@ -331,7 +357,7 @@ pub fn parseGeneratedGateTokensAlloc(alloc: std.mem.Allocator, tokens: []const t
     const kind = classifyTokens(tokens);
     if (kind == .other) return null;
     return parseTokensAlloc(alloc, tokens) catch |err| switch (err) {
-        error.UnsupportedSqlShape, error.UnexpectedToken => if (kind == .ddl or kind == .dml or kind == .read) null else err,
+        error.UnsupportedSqlShape, error.UnexpectedToken => if (kind == .ddl or kind == .dml or kind == .read or kind == .unsupported) null else err,
         else => err,
     };
 }
@@ -509,6 +535,8 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.select) or first.matchesKeywordTag(.with)) {
         return .{ .read = classifyReadKind(tokens) };
     }
+    if (first.matchesKeywordTag(.analyze)) return .{ .unsupported = .analyze };
+    if (first.matchesKeywordTag(.explain)) return .{ .unsupported = .explain };
     return .other;
 }
 
@@ -534,6 +562,27 @@ fn classifyReadKind(tokens: []const token_mod.Token) GeneratedSqlReadKind {
     return .query;
 }
 
+fn buildUnsupportedAst(
+    tokens: []const token_mod.Token,
+    end: usize,
+    kind: GeneratedSqlUnsupportedKind,
+    statement_span: token_mod.SourceSpan,
+    command_span: token_mod.SourceSpan,
+) GeneratedSqlUnsupportedAst {
+    _ = tokens;
+    var ast = GeneratedSqlUnsupportedAst{
+        .kind = kind,
+        .reason = switch (kind) {
+            .analyze => .analyze_not_planned_by_generated_parser,
+            .explain => .explain_not_planned_by_generated_parser,
+        },
+        .statement_span = statement_span,
+        .command_span = command_span,
+    };
+    if (kind == .explain and end > 1) ast.subject_tokens = .{ .start = 1, .end = end };
+    return ast;
+}
+
 fn buildGeneratedAst(tokens: []const token_mod.Token, statement: GeneratedSqlStatement) ?GeneratedSqlAst {
     const end = statementTokenEnd(tokens);
     if (end == 0) return null;
@@ -555,6 +604,7 @@ fn buildGeneratedAst(tokens: []const token_mod.Token, statement: GeneratedSqlSta
             .statement_span = statement_span,
             .command_span = command_span,
         } },
+        .unsupported => |kind| .{ .unsupported = buildUnsupportedAst(tokens, end, kind, statement_span, command_span) },
         else => null,
     };
 }
@@ -1145,7 +1195,7 @@ test "generated SQL parser accepts session and control statements" {
 }
 
 test "generated SQL parser facade classifies gated corpus" {
-    const corpus = first_family_corpus ++ simple_ddl_corpus ++ simple_dml_corpus ++ simple_read_corpus ++ simple_graph_corpus;
+    const corpus = first_family_corpus ++ simple_ddl_corpus ++ simple_dml_corpus ++ simple_read_corpus ++ simple_graph_corpus ++ unsupported_corpus;
     for (corpus) |case| {
         const generated_result = try parseSqlAlloc(std.testing.allocator, case.sql);
         try std.testing.expectEqual(case.kind, generated_result.kind);
@@ -1165,6 +1215,8 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .read = .cte }, (try parseSqlAlloc(std.testing.allocator, "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .create_index }, (try parseSqlAlloc(std.testing.allocator, "CREATE GRAPH INDEX docs_edge_graph ON doc_edges")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .create_metric }, (try parseSqlAlloc(std.testing.allocator, "CREATE GRAPH METRIC docs_pagerank ON doc_edges")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .analyze }, (try parseSqlAlloc(std.testing.allocator, "ANALYZE")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .explain }, (try parseSqlAlloc(std.testing.allocator, "EXPLAIN SELECT id FROM usage_records")).statement);
 }
 
 test "generated SQL parser facade builds control AST spans" {
@@ -1561,6 +1613,32 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlGraphKind.create_metric, graph.kind);
             try std.testing.expectEqualStrings("CREATE GRAPH METRIC docs_pagerank ON doc_edges WITH (metric = 'pagerank')", spanText(graph_sql, graph.statement_span));
             try std.testing.expectEqualStrings("CREATE", spanText(graph_sql, graph.command_span));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const analyze_sql = "ANALYZE";
+    const analyze_result = try parseSqlAlloc(alloc, analyze_sql);
+    switch (analyze_result.ast.?) {
+        .unsupported => |unsupported| {
+            try std.testing.expectEqual(GeneratedSqlUnsupportedKind.analyze, unsupported.kind);
+            try std.testing.expectEqual(GeneratedSqlUnsupportedReason.analyze_not_planned_by_generated_parser, unsupported.reason);
+            try std.testing.expectEqualStrings("ANALYZE", spanText(analyze_sql, unsupported.statement_span));
+            try std.testing.expectEqualStrings("ANALYZE", spanText(analyze_sql, unsupported.command_span));
+            try std.testing.expect(unsupported.subject_tokens == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const explain_sql = "EXPLAIN SELECT id FROM usage_records";
+    const explain_result = try parseSqlAlloc(alloc, explain_sql);
+    switch (explain_result.ast.?) {
+        .unsupported => |unsupported| {
+            try std.testing.expectEqual(GeneratedSqlUnsupportedKind.explain, unsupported.kind);
+            try std.testing.expectEqual(GeneratedSqlUnsupportedReason.explain_not_planned_by_generated_parser, unsupported.reason);
+            try std.testing.expectEqualStrings("EXPLAIN SELECT id FROM usage_records", spanText(explain_sql, unsupported.statement_span));
+            try std.testing.expectEqualStrings("EXPLAIN", spanText(explain_sql, unsupported.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 5 }, unsupported.subject_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

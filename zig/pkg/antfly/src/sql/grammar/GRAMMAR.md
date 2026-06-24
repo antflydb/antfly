@@ -118,10 +118,11 @@ graph DDL as a distinct graph statement family and `ParsedSql` retains those
 generated raw and AST nodes. Seed graph index and graph metric statements now
 have graph-specific generated AST-to-plan wrappers that lower to typed index
 plans instead of only routing through the generic DDL family. The generated
-facade now
-returns closed statement-family nodes for the covered families; full production
-AST construction remains the next migration boundary for larger DDL, query,
-DML, and Antfly extension families.
+facade now returns closed statement-family nodes for the covered families and
+an explicit unsupported statement node for seed `ANALYZE` and simple `EXPLAIN`
+forms with stable reason metadata; full production AST construction remains the
+next migration boundary for larger DDL, query, DML, and Antfly extension
+families.
 
 ## Compatibility Policy
 
@@ -355,11 +356,14 @@ variants for:
   initial AST-to-plan wrapper for generated-covered read statements
 - graph statement, including a generated AST payload for command spans and
   graph-specific AST-to-plan wrappers for seed graph index and graph metric DDL
+- unsupported statement, including a generated AST payload for seed `ANALYZE`
+  and simple `EXPLAIN` forms with command spans, subject ranges where present,
+  and stable unsupported reason metadata
 
 Later statement-family cutovers should add closed variants for:
 
 - extension/index statement
-- unsupported PostgreSQL-compatible statement with diagnostic reason
+- broader unsupported PostgreSQL-compatible statements with diagnostic reasons
 
 Those variants should become the normal dispatch boundary for binder and lowerer
 code.
@@ -381,7 +385,10 @@ Generated grammar work needs evidence at multiple levels:
   success for the session, transaction, and prepared statement corpus.
 - Corpus tests for accepted Antfly-specific syntax.
 - Corpus tests for intentionally unsupported PostgreSQL syntax with stable
-  diagnostics.
+  diagnostics. Seed `ANALYZE` and simple `EXPLAIN` forms now produce generated
+  unsupported AST nodes with stable reason metadata while richer existing
+  `EXPLAIN` syntax still falls back to the current parser until generated
+  coverage catches up.
 - AST shape tests for source spans, identifier normalization, literals,
   placeholders, casts, operators, and nested statements. The first AST shape
   tests cover generated session, transaction, prepared, DDL, DML, read, and
