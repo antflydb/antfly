@@ -623,6 +623,20 @@ fn generatedReadAstForParsedSql(
     return null;
 }
 
+fn generatedCteReadAstForParsedSql(
+    parsed_sql: *const sql_adapter.ParsedSql,
+) ?*const sql_adapter.generated_parser.GeneratedSqlReadAst {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            return switch (generated_ast.*) {
+                .read => |*read| if (read.kind == .cte and read.cte_tokens != null and read.set_operation_tokens == null) read else null,
+                else => null,
+            };
+        }
+    }
+    return null;
+}
+
 pub fn lowerSelectAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
@@ -649,7 +663,7 @@ pub fn lowerSelectParsedSqlAlloc(
         .tokens = tokens,
         .schema = schema,
         .params = params,
-        .generated_read_ast = generatedReadAstForParsedSql(parsed_sql, .query),
+        .generated_read_ast = if (cte_adapter_shape) generatedCteReadAstForParsedSql(parsed_sql) else generatedReadAstForParsedSql(parsed_sql, .query),
     };
     var lowered = sql_adapter.parseQueryPlanAlloc(
         alloc,
@@ -732,7 +746,7 @@ pub fn lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(
         .schema = schema,
         .params = params,
         .function_bindings = function_bindings,
-        .generated_read_ast = generatedReadAstForParsedSql(parsed_sql, .query),
+        .generated_read_ast = if (cte_adapter_shape) generatedCteReadAstForParsedSql(parsed_sql) else generatedReadAstForParsedSql(parsed_sql, .query),
     };
     var lowered = sql_adapter.parseQueryPlanAlloc(
         alloc,
@@ -1320,7 +1334,7 @@ fn lowerWindowPlanParsedSqlAlloc(
         .tokens = tokens,
         .schema = schema,
         .params = params,
-        .generated_read_ast = generatedReadAstForParsedSql(parsed_sql, .window),
+        .generated_read_ast = if (cte_adapter_shape) generatedCteReadAstForParsedSql(parsed_sql) else generatedReadAstForParsedSql(parsed_sql, .window),
     };
     var lowered = sql_adapter.parseWindowPlanAlloc(
         alloc,
@@ -2197,13 +2211,14 @@ fn lowerAggregateParsedSqlAlloc(
 ) !LoweredAggregate {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
+    const cte_adapter_shape = sql_adapter.tokensStartWithKeywordTag(tokens, .with);
 
     var parser = Parser{
         .alloc = alloc,
         .tokens = tokens,
         .schema = schema,
         .params = params,
-        .generated_read_ast = generatedReadAstForParsedSql(parsed_sql, .aggregate),
+        .generated_read_ast = if (cte_adapter_shape) generatedCteReadAstForParsedSql(parsed_sql) else generatedReadAstForParsedSql(parsed_sql, .aggregate),
     };
     return Parser.ContextAccessors.parseAggregate(&parser) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
@@ -2237,7 +2252,7 @@ fn lowerAggregatePlanParsedSqlAlloc(
         .tokens = tokens,
         .schema = schema,
         .params = params,
-        .generated_read_ast = generatedReadAstForParsedSql(parsed_sql, .aggregate),
+        .generated_read_ast = if (cte_adapter_shape) generatedCteReadAstForParsedSql(parsed_sql) else generatedReadAstForParsedSql(parsed_sql, .aggregate),
     };
     var lowered = sql_adapter.parseAggregatePlanAlloc(
         alloc,
@@ -2298,7 +2313,7 @@ fn lowerJoinWithSchemasParsedSqlAlloc(
         .schema = schema,
         .joined_source_schema = source_schema,
         .params = params,
-        .generated_read_ast = generatedReadAstForParsedSql(parsed_sql, .join),
+        .generated_read_ast = if (cte_adapter_shape) generatedCteReadAstForParsedSql(parsed_sql) else generatedReadAstForParsedSql(parsed_sql, .join),
     };
     var lowered = sql_adapter.parseJoinPlanAlloc(
         alloc,
@@ -2359,7 +2374,7 @@ fn lowerLateralPlanWithSchemasParsedSqlAlloc(
         .schema = schema,
         .joined_source_schema = source_schema,
         .params = params,
-        .generated_read_ast = generatedReadAstForParsedSql(parsed_sql, .lateral),
+        .generated_read_ast = if (cte_adapter_shape) generatedCteReadAstForParsedSql(parsed_sql) else generatedReadAstForParsedSql(parsed_sql, .lateral),
     };
     var lowered = sql_adapter.parseLateralPlanAlloc(
         alloc,

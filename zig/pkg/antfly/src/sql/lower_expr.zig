@@ -165,7 +165,7 @@ fn validateGeneratedSingleJoinForClause(
     predicate_tokens: generated_parser.GeneratedSqlTokenRange,
 ) !void {
     const read = generated_read_ast orelse return;
-    if (read.kind != expected_read_kind) return error.UnsupportedSqlShape;
+    if (read.kind != expected_read_kind and read.kind != .cte) return error.UnsupportedSqlShape;
     const root_index = read.join_tree_root_index orelse return error.UnsupportedSqlShape;
     if (read.join_items.len != 1 or root_index != 0 or read.join_tree_depth != 1) return error.UnsupportedSqlShape;
     const join = read.join_items[0];
@@ -25113,6 +25113,20 @@ fn generatedReadAstForParsedSql(
     return null;
 }
 
+fn generatedCteReadAstForParsedSql(
+    parsed_sql: *const tokenized.ParsedSql,
+) ?*const generated_parser.GeneratedSqlReadAst {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            return switch (generated_ast.*) {
+                .read => |*read| if (read.kind == .cte and read.cte_tokens != null and read.set_operation_tokens == null) read else null,
+                else => null,
+            };
+        }
+    }
+    return null;
+}
+
 fn lowerQueryPlanForLowerExprTestAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
@@ -25153,7 +25167,7 @@ fn lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
         .schema = schema,
         .params = params,
         .function_bindings = function_bindings,
-        .generated_read_ast = generatedReadAstForParsedSql(parsed_sql, .query),
+        .generated_read_ast = if (cte_adapter_shape) generatedCteReadAstForParsedSql(parsed_sql) else generatedReadAstForParsedSql(parsed_sql, .query),
     };
     var lowered = parseQueryPlanAlloc(
         alloc,
@@ -25206,7 +25220,7 @@ fn lowerParsedJoinForLowerExprTestAlloc(
         .schema = schema,
         .joined_source_schema = schema,
         .params = params,
-        .generated_read_ast = generatedReadAstForParsedSql(parsed_sql, .join),
+        .generated_read_ast = if (cte_adapter_shape) generatedCteReadAstForParsedSql(parsed_sql) else generatedReadAstForParsedSql(parsed_sql, .join),
     };
     var lowered = plan_mod.parseJoinPlanAlloc(
         alloc,
@@ -25257,7 +25271,7 @@ fn lowerParsedLateralForLowerExprTestAlloc(
         .schema = schema,
         .joined_source_schema = schema,
         .params = params,
-        .generated_read_ast = generatedReadAstForParsedSql(parsed_sql, .lateral),
+        .generated_read_ast = if (cte_adapter_shape) generatedCteReadAstForParsedSql(parsed_sql) else generatedReadAstForParsedSql(parsed_sql, .lateral),
     };
     var lowered = plan_mod.parseLateralPlanAlloc(
         alloc,
@@ -25307,7 +25321,7 @@ fn lowerParsedWindowPlanForLowerExprTestAlloc(
         .tokens = tokens,
         .schema = schema,
         .params = params,
-        .generated_read_ast = generatedReadAstForParsedSql(parsed_sql, .window),
+        .generated_read_ast = if (cte_adapter_shape) generatedCteReadAstForParsedSql(parsed_sql) else generatedReadAstForParsedSql(parsed_sql, .window),
     };
     var lowered = plan_mod.parseWindowPlanAlloc(
         alloc,
@@ -25348,7 +25362,7 @@ fn lowerAggregatePlanForLowerExprTestAlloc(
         .tokens = tokens,
         .schema = schema,
         .params = params,
-        .generated_read_ast = generatedReadAstForParsedSql(&parsed_sql, .aggregate),
+        .generated_read_ast = if (cte_adapter_shape) generatedCteReadAstForParsedSql(&parsed_sql) else generatedReadAstForParsedSql(&parsed_sql, .aggregate),
     };
     var lowered = plan_mod.parseAggregatePlanAlloc(
         alloc,
@@ -34166,6 +34180,35 @@ test "sql adapter lower expr lowers non recursive cte query plans" {
     try std.testing.expectEqualStrings("open_orders", hinted.plan.ctes[1].query.source_cte);
     try std.testing.expectEqualStrings("ordered_orders", hinted.plan.query.source_cte);
     try std.testing.expectEqual(@as(u32, 3), hinted.plan.query.limit.?);
+
+    var cte_fetch = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "WITH open_orders AS (SELECT id, status, created_at FROM orders WHERE status = 'open') SELECT id FROM open_orders ORDER BY created_at DESC OFFSET 2 ROWS FETCH FIRST 4 ROWS ONLY",
+        schema,
+        &.{},
+    );
+    defer cte_fetch.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 4), cte_fetch.plan.query.limit.?);
+    try std.testing.expectEqual(@as(u32, 2), cte_fetch.plan.query.offset);
+
+    var malformed_generated_cte_pagination = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH open_orders AS (SELECT id, status, created_at FROM orders WHERE status = 'open') SELECT id FROM open_orders LIMIT 4",
+    );
+    defer malformed_generated_cte_pagination.deinit(alloc);
+    if (malformed_generated_cte_pagination.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |*read| read.limit_tokens = .{ .start = 3, .end = 4 },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_cte_pagination,
+        schema,
+        &.{},
+        .{},
+    ));
 
     var plain = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
