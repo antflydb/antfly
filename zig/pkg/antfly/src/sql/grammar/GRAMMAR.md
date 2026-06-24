@@ -408,7 +408,9 @@ Unsupported DDL remains on the existing parser until
    condition chains, and subquery projections; it also verifies clause-owned
    read lists stay inside their generated projection, grouping, ordering, CTE
    body projection/group/order, named-window partition/order, set-operation
-   right-projection, and join `USING` column ranges.
+   right-projection, and join `USING` column ranges, and that clause-owned
+   first/last expression summary payloads match the first/last expression item
+   spans in their generated lists.
    Simple query reads now have
    a direct generated AST-to-query-plan lowering boundary after clause-range
    validation, and aggregate, join, and lateral reads now have direct generated
@@ -465,8 +467,8 @@ Unsupported DDL remains on the existing parser until
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current
    validated owned expression item arrays, exact child/list expression span and
-   expression- and clause-owned list containment checks, expression-kind
-   structural checks, full multi-join
+   expression- and clause-owned list containment checks, first/last list
+   expression summary checks, expression-kind structural checks, full multi-join
    planning/lowering and richer join-tree semantics beyond the current
    validated left-associative generated join nodes, expression AST
    planning/lowering beyond the current recursive
