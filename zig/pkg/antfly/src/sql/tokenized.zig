@@ -885,6 +885,10 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = 4 }, read_ast.projection_tokens.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read_ast.source_tokens.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 10 }, read_ast.where_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.comparison, read_ast.where_expression.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read_ast.where_expression.left_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read_ast.where_expression.operator_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read_ast.where_expression.right_tokens.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 12, .end = 13 }, read_ast.order_tokens.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 14, .end = 15 }, read_ast.limit_tokens.?);
                     try std.testing.expectEqual(@as(usize, 2), read_ast.projection_items.count);
@@ -907,12 +911,17 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read_ast.join_left_tokens.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read_ast.join_right_tokens.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 10 }, read_ast.join_predicate_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.comparison, read_ast.join_predicate_expression.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read_ast.join_predicate_expression.left_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read_ast.join_predicate_expression.operator_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read_ast.join_predicate_expression.right_tokens.?);
                 } else if (case.generated == .aggregate) {
                     if (std.mem.indexOf(u8, case.sql, "DISTINCT")) |_| {
                         try std.testing.expect(read_ast.distinct_tokens != null);
                     } else {
                         try std.testing.expect(read_ast.group_tokens != null);
                         try std.testing.expect(read_ast.having_tokens != null);
+                        try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.comparison, read_ast.having_expression.kind);
                     }
                 } else if (case.generated == .window) {
                     try std.testing.expect(read_ast.projection_tokens != null);
