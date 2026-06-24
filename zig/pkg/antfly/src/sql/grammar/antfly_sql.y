@@ -410,13 +410,14 @@ order_by_list:
   ;
 
 order_by_item:
-    expression order_direction_opt nulls_order_opt
+    expression order_modifier_opt nulls_order_opt
   ;
 
-order_direction_opt:
+order_modifier_opt:
     /* empty */
   | ASC
   | DESC
+  | USING comparison_operator
   ;
 
 nulls_order_opt:
