@@ -607,6 +607,9 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT status state, id FROM usage_records", .kind = .read },
     .{ .sql = "SELECT CAST(id AS text) AS id_text FROM usage_records WHERE id = 'u1'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE CAST(amount + 1 AS text) = '2'", .kind = .read },
+    .{ .sql = "SELECT id::text AS id_text FROM usage_records WHERE id::text = 'u1'", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE metadata->'flags' = $1::jsonb", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE status = ANY($1::text[])", .kind = .read },
     .{ .sql = "SELECT CASE WHEN email IS NULL THEN 'missing' WHEN email = 'blocked@example.test' THEN 'blocked' ELSE lower(status) END AS email_bucket FROM usage_records WHERE id = 'u1'", .kind = .read },
     .{ .sql = "SELECT CASE WHEN email IS NULL THEN NULL ELSE email END AS maybe_email FROM usage_records WHERE id = 'u1'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE status LIKE 'open%'", .kind = .read },
@@ -2283,20 +2286,22 @@ const GeneratedCastExpression = struct {
 };
 
 fn generatedCastExpression(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?GeneratedCastExpression {
-    if (range.start + 6 > range.end or range.end > tokens.len) return null;
-    if (!tokens[range.start].matchesKeywordTag(.cast)) return null;
-    if (tokens[range.start + 1].kind != .lparen or tokens[range.end - 1].kind != .rparen) return null;
-    const inner_start = range.start + 2;
-    const inner_end = range.end - 1;
-    const as_index = findTopLevelKeyword(tokens, inner_start, inner_end, .as) orelse return null;
-    if (inner_start >= as_index or as_index + 1 >= inner_end) return null;
-    const expression_tokens = GeneratedSqlTokenRange{ .start = inner_start, .end = as_index };
-    const type_tokens = GeneratedSqlTokenRange{ .start = as_index + 1, .end = inner_end };
-    if (!isGeneratedTypeNameRange(tokens, type_tokens)) return null;
-    return .{
-        .expression_tokens = expression_tokens,
-        .type_tokens = type_tokens,
-    };
+    if (range.start >= range.end or range.end > tokens.len) return null;
+    if (range.start + 6 <= range.end and tokens[range.start].matchesKeywordTag(.cast)) {
+        if (tokens[range.start + 1].kind != .lparen or tokens[range.end - 1].kind != .rparen) return null;
+        const inner_start = range.start + 2;
+        const inner_end = range.end - 1;
+        const as_index = findTopLevelKeyword(tokens, inner_start, inner_end, .as) orelse return null;
+        if (inner_start >= as_index or as_index + 1 >= inner_end) return null;
+        const expression_tokens = GeneratedSqlTokenRange{ .start = inner_start, .end = as_index };
+        const type_tokens = GeneratedSqlTokenRange{ .start = as_index + 1, .end = inner_end };
+        if (!isGeneratedTypeNameRange(tokens, type_tokens)) return null;
+        return .{
+            .expression_tokens = expression_tokens,
+            .type_tokens = type_tokens,
+        };
+    }
+    return null;
 }
 
 fn isGeneratedTypeNameRange(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) bool {
@@ -3086,6 +3091,51 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 12 }, cast_expression.cast_type_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 14 }, read.where_expression.operator_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 14, .end = 15 }, read.where_expression.right_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const postfix_cast_read_sql = "SELECT id::text AS id_text FROM usage_records WHERE id::text = 'u1'";
+    const postfix_cast_read_result = try parseSqlAlloc(alloc, postfix_cast_read_sql);
+    switch (postfix_cast_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 4 }, read.projection_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.projection_items.expressions[0].kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.projection_items.expressions[0].tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 10 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.where_expression.left_tokens.?);
+            try std.testing.expect(read.where_expression.left_expression_kind == null);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.where_expression.right_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const jsonb_postfix_cast_read_sql = "SELECT id FROM usage_records WHERE metadata->'flags' = $1::jsonb";
+    const jsonb_postfix_cast_read_result = try parseSqlAlloc(alloc, jsonb_postfix_cast_read_sql);
+    switch (jsonb_postfix_cast_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.json_access, read.where_expression.left_expression_kind.?);
+            try std.testing.expect(read.where_expression.right_expression_kind == null);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.where_expression.right_expression.?.kind);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const array_suffix_postfix_cast_read_sql = "SELECT id FROM usage_records WHERE status = ANY($1::text[])";
+    const array_suffix_postfix_cast_read_result = try parseSqlAlloc(alloc, array_suffix_postfix_cast_read_sql);
+    switch (array_suffix_postfix_cast_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.quantified_comparison, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.grouped, read.where_expression.right_expression_kind.?);
+            const grouped = read.where_expression.right_expression orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, grouped.inner_expression.?.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, grouped.inner_expression.?.tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -4702,10 +4752,11 @@ test "generated SQL parser facade builds control AST spans" {
     switch (explain_result.ast.?) {
         .unsupported => |unsupported| {
             try std.testing.expectEqual(GeneratedSqlUnsupportedKind.explain, unsupported.kind);
-            try std.testing.expectEqual(GeneratedSqlUnsupportedReason.explain_not_planned_by_generated_parser, unsupported.reason);
+            try std.testing.expect(unsupported.reason == .explain_not_planned_by_generated_parser);
             try std.testing.expectEqualStrings("EXPLAIN SELECT id FROM usage_records", spanText(explain_sql, unsupported.statement_span));
             try std.testing.expectEqualStrings("EXPLAIN", spanText(explain_sql, unsupported.command_span));
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 5 }, unsupported.subject_tokens.?);
+            try std.testing.expect(unsupported.subject_tokens.?.start == 1);
+            try std.testing.expect(unsupported.subject_tokens.?.end == 5);
         },
         else => return error.TestUnexpectedResult,
     }

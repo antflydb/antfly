@@ -860,6 +860,9 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
         .{ .sql = "SELECT status state, id FROM usage_records", .generated = .query, .read = .query },
         .{ .sql = "SELECT CAST(id AS text) AS id_text FROM usage_records WHERE id = 'u1'", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE CAST(amount + 1 AS text) = '2'", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id::text AS id_text FROM usage_records WHERE id::text = 'u1'", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records WHERE metadata->'flags' = $1::jsonb", .generated = .query, .read = .query },
+        .{ .sql = "SELECT id FROM usage_records WHERE status = ANY($1::text[])", .generated = .query, .read = .query },
         .{ .sql = "SELECT CASE WHEN email IS NULL THEN 'missing' WHEN email = 'blocked@example.test' THEN 'blocked' ELSE lower(status) END AS email_bucket FROM usage_records WHERE id = 'u1'", .generated = .query, .read = .query },
         .{ .sql = "SELECT CASE WHEN email IS NULL THEN NULL ELSE email END AS maybe_email FROM usage_records WHERE id = 'u1'", .generated = .query, .read = .query },
         .{ .sql = "SELECT id FROM usage_records WHERE status LIKE 'open%'", .generated = .query, .read = .query },
@@ -1030,6 +1033,19 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 10 }, cast_expression.cast_expression_tokens.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.additive, cast_expression.cast_expression_kind.?);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 11, .end = 12 }, cast_expression.cast_type_tokens.?);
+                } else if (std.mem.eql(u8, case.sql, "SELECT id::text AS id_text FROM usage_records WHERE id::text = 'u1'")) {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.token_range, read_ast.projection_items.expressions[0].kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read_ast.projection_items.expressions[0].tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.comparison, read_ast.where_expression.kind);
+                    try std.testing.expect(read_ast.where_expression.left_expression_kind == null);
+                } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records WHERE metadata->'flags' = $1::jsonb")) {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.comparison, read_ast.where_expression.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.json_access, read_ast.where_expression.left_expression_kind.?);
+                    try std.testing.expect(read_ast.where_expression.right_expression_kind == null);
+                } else if (std.mem.eql(u8, case.sql, "SELECT id FROM usage_records WHERE status = ANY($1::text[])")) {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.quantified_comparison, read_ast.where_expression.kind);
+                    const grouped = read_ast.where_expression.right_expression orelse return error.TestUnexpectedResult;
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.token_range, grouped.inner_expression.?.kind);
                 } else if (std.mem.eql(u8, case.sql, "SELECT CASE WHEN email IS NULL THEN 'missing' WHEN email = 'blocked@example.test' THEN 'blocked' ELSE lower(status) END AS email_bucket FROM usage_records WHERE id = 'u1'")) {
                     try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.case_expression, read_ast.projection_items.expressions[0].kind);
                     try std.testing.expectEqual(@as(usize, 2), read_ast.projection_items.expressions[0].case_branch_count);

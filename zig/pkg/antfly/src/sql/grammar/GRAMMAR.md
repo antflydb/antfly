@@ -305,8 +305,9 @@ Suggested migration order:
    expression nodes, and comparison operands can expose additive and
    multiplicative child expression-kind summaries, including JSON/path postfix
    operator summaries, function-call child summaries, direct function-call
-   name and argument-list metadata, PostgreSQL `CAST(expr AS type)` value
-   and target-type ranges, and searched `CASE WHEN ... THEN ... ELSE ... END`
+   name and argument-list metadata, PostgreSQL `CAST(expr AS type)` value and
+   target-type ranges, generated coverage for public-tokenizer-normalized
+   `expr::type` inputs, and searched `CASE WHEN ... THEN ... ELSE ... END`
    branch metadata.
    Generated read ASTs now have a validated wrapper
    into the current typed read lowerer for representative covered read plans
