@@ -104,9 +104,11 @@ metadata, aggregate `FILTER (WHERE ...)` predicate metadata, and ordered-set
 aggregate `WITHIN GROUP (ORDER BY ...)` metadata, and positive `LIKE`,
 `ILIKE`, `IN (...)`, and `BETWEEN ... AND ...` predicates are accepted and
 classified in generated expression metadata along with their `NOT` negated
-forms. `ANY`/`ALL`/`SOME` quantified comparison predicates over parenthesized
-expression lists and parenthesized read subqueries are also accepted and
-classified with explicit quantifier token ranges and subquery token spans.
+forms; `IN` and `NOT IN` predicates over parenthesized read subqueries now
+classify the right operand as generated subquery metadata. `ANY`/`ALL`/`SOME`
+quantified comparison predicates over parenthesized expression lists and
+parenthesized read subqueries are also accepted and classified with explicit
+quantifier token ranges and subquery token spans.
 `EXISTS` and `NOT EXISTS` read-subquery predicates are accepted with explicit
 operator, negation, and subquery token spans.
 `IS NULL` and `IS NOT NULL` predicates are accepted and
@@ -311,7 +313,9 @@ Suggested migration order:
    explicit operator, negation, and subquery token spans,
    and quantified predicates over typed array constructors such as
    `= ANY(ARRAY[...]::text[])` carry generated array-constructor metadata after
-   public tokenization normalizes cast suffixes. PostgreSQL-style quantified
+   public tokenization normalizes cast suffixes. `IN` and `NOT IN` predicates
+   over parenthesized read subqueries classify the right operand as generated
+   subquery metadata. PostgreSQL-style quantified
    pattern predicates such as `LIKE ANY(...)`, `LIKE SOME(...)`, `ILIKE ALL(...)`,
    and their `NOT` variants are also accepted and carry the same generated
    quantifier and right-side array-constructor metadata. Array/range containment

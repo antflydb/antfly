@@ -789,6 +789,8 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT id FROM usage_records WHERE lower(status) NOT ILIKE 'cl!_%' ESCAPE '!'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE lower(name) NOT ILIKE ALL(ARRAY['bot%', 'sys%'])", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE id NOT IN ('u1', 'u2')", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE id IN (SELECT id FROM archived_records WHERE archived IS TRUE)", .kind = .read },
+    .{ .sql = "SELECT id FROM usage_records WHERE id NOT IN (SELECT id FROM archived_records WHERE archived IS TRUE)", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE score NOT BETWEEN 1 AND 10", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE priority NOT BETWEEN ASYMMETRIC 10 AND 20", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE priority NOT BETWEEN SYMMETRIC 20 AND 10", .kind = .read },
@@ -4002,6 +4004,24 @@ test "generated SQL parser facade builds read AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const in_subquery_read_sql = "SELECT id FROM usage_records WHERE id IN (SELECT id FROM archived_records WHERE archived IS TRUE)";
+    const in_subquery_read_result = try parseSqlAlloc(alloc, in_subquery_read_sql);
+    switch (in_subquery_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 17 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.in_list, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 17 }, read.where_expression.right_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.subquery, read.where_expression.right_expression_kind.?);
+            const subquery = read.where_expression.right_expression orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.subquery, subquery.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 16 }, subquery.inner_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const between_read_sql = "SELECT id FROM usage_records WHERE score BETWEEN 1 AND 10";
     const between_read_result = try parseSqlAlloc(alloc, between_read_sql);
     switch (between_read_result.ast.?) {
@@ -4147,6 +4167,25 @@ test "generated SQL parser facade builds read AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.where_expression.negation_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.where_expression.operator_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 13 }, read.where_expression.right_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const not_in_subquery_read_sql = "SELECT id FROM usage_records WHERE id NOT IN (SELECT id FROM archived_records WHERE archived IS TRUE)";
+    const not_in_subquery_read_result = try parseSqlAlloc(alloc, not_in_subquery_read_sql);
+    switch (not_in_subquery_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 18 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.not_in_list, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.where_expression.negation_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 18 }, read.where_expression.right_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.subquery, read.where_expression.right_expression_kind.?);
+            const subquery = read.where_expression.right_expression orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.subquery, subquery.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 17 }, subquery.inner_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
