@@ -98,7 +98,8 @@ classified in generated expression metadata along with their `NOT` negated
 forms. `ANY`/`ALL`/`SOME` quantified comparison predicates over parenthesized
 expression lists are also accepted and classified with explicit quantifier
 token ranges. `IS NULL` and `IS NOT NULL` predicates are accepted and
-classified as explicit null-test expression kinds,
+classified as explicit null-test expression kinds. Top-level `OR` predicates
+are classified as logical-expression metadata with left and right token ranges,
 and an initial generated AST-to-plan wrapper that validates those ranges and
 fails closed if the generated read family is incompatible with the existing
 read classifier. Simple query, aggregate, join, and lateral reads now validate
@@ -241,7 +242,8 @@ Suggested migration order:
    `ANY`/`ALL`/`SOME` quantified comparison predicates over parenthesized
    expression lists are accepted and classified with explicit quantifier token
    ranges. `IS NULL` and `IS NOT NULL` predicates are accepted and classified
-   as explicit null-test expression kinds.
+   as explicit null-test expression kinds. Top-level `OR` predicates are
+   classified as logical-expression metadata with left and right token ranges.
    Generated read ASTs now have a validated wrapper
    into the current typed read lowerer for representative covered read plans
    that rejects malformed generated range payloads. Simple query reads now have
@@ -267,9 +269,9 @@ Suggested migration order:
    broader PostgreSQL-compatible grammar coverage, expression-level and
    full join-tree generated query-body ASTs, full expression AST nodes beyond
    list-level and simple-comparison/operator metadata, broader function
-   coverage, quantified subquery and array predicate coverage, per-CTE
-   generated body arrays, recursive CTE planning, direct generated read-plan
-   lowering, and
+   coverage, broader boolean expression-tree coverage, quantified subquery and
+   array predicate coverage, per-CTE generated body arrays, recursive CTE
+   planning, direct generated read-plan lowering, and
    unsupported-shape diagnostics.
 5. Advanced DML: `INSERT ... SELECT`, `UPDATE ... FROM`, `DELETE ... USING`,
    `TRUNCATE`, and `MERGE`.
