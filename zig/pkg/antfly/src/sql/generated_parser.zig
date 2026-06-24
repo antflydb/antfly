@@ -379,9 +379,31 @@ pub const GeneratedSqlCteAst = struct {
     body_order_tokens: ?GeneratedSqlTokenRange = null,
     body_limit_tokens: ?GeneratedSqlTokenRange = null,
     body_set_operation_tokens: ?GeneratedSqlTokenRange = null,
+    body_projection_items: GeneratedSqlListAst = .{},
+    body_projection_first_expression: GeneratedSqlExpressionAst = .{},
+    body_projection_last_expression: GeneratedSqlExpressionAst = .{},
+    body_where_expression: GeneratedSqlExpressionAst = .{},
+    body_group_items: GeneratedSqlListAst = .{},
+    body_group_first_expression: GeneratedSqlExpressionAst = .{},
+    body_group_last_expression: GeneratedSqlExpressionAst = .{},
+    body_having_expression: GeneratedSqlExpressionAst = .{},
+    body_order_items: GeneratedSqlListAst = .{},
+    body_order_first_expression: GeneratedSqlExpressionAst = .{},
+    body_order_last_expression: GeneratedSqlExpressionAst = .{},
 
     pub fn deinit(self: *GeneratedSqlCteAst, alloc: std.mem.Allocator) void {
         self.column_names.deinit(alloc);
+        self.body_projection_items.deinit(alloc);
+        self.body_projection_first_expression.deinit(alloc);
+        self.body_projection_last_expression.deinit(alloc);
+        self.body_where_expression.deinit(alloc);
+        self.body_group_items.deinit(alloc);
+        self.body_group_first_expression.deinit(alloc);
+        self.body_group_last_expression.deinit(alloc);
+        self.body_having_expression.deinit(alloc);
+        self.body_order_items.deinit(alloc);
+        self.body_order_first_expression.deinit(alloc);
+        self.body_order_last_expression.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -1419,7 +1441,7 @@ fn buildReadCteAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, fi
             .{ .start = cursor + 1, .end = close }
         else
             null;
-        if (cte.body_tokens) |body_tokens| buildReadCteBodyMetadata(tokens, body_tokens, &cte);
+        if (cte.body_tokens) |body_tokens| try buildReadCteBodyMetadata(alloc, tokens, body_tokens, &cte);
 
         try items.append(alloc, cte);
         cte_owned = true;
@@ -1441,7 +1463,7 @@ fn buildReadCteAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, fi
     ast.cte_count = count;
 }
 
-fn buildReadCteBodyMetadata(tokens: []const token_mod.Token, body_tokens: GeneratedSqlTokenRange, cte: *GeneratedSqlCteAst) void {
+fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.Token, body_tokens: GeneratedSqlTokenRange, cte: *GeneratedSqlCteAst) !void {
     const select_index = findTopLevelKeyword(tokens, body_tokens.start, body_tokens.end, .select) orelse return;
     if (select_index != body_tokens.start) return;
     cte.body_kind = classifyReadKindInRange(tokens, body_tokens);
@@ -1462,28 +1484,66 @@ fn buildReadCteBodyMetadata(tokens: []const token_mod.Token, body_tokens: Genera
     const fetch_index = findTopLevelKeyword(tokens, projection_start, body_end, .fetch);
 
     const projection_end = firstOptionalIndex(&[_]?usize{ from_index, where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
-    if (projection_start < projection_end) cte.body_projection_tokens = .{ .start = projection_start, .end = projection_end };
+    if (projection_start < projection_end) {
+        const projection_tokens = GeneratedSqlTokenRange{ .start = projection_start, .end = projection_end };
+        cte.body_projection_tokens = projection_tokens;
+        cte.body_projection_items = try buildTopLevelListAst(alloc, tokens, projection_tokens, .{ .bare_alias = true });
+        if (generatedListExpressionTokens(cte.body_projection_items, 0)) |first_tokens| {
+            cte.body_projection_first_expression = try buildGeneratedExpressionAst(alloc, tokens, first_tokens);
+        }
+        if (generatedListExpressionTokens(cte.body_projection_items, cte.body_projection_items.count -| 1)) |last_tokens| {
+            cte.body_projection_last_expression = try buildGeneratedExpressionAst(alloc, tokens, last_tokens);
+        }
+    }
     if (from_index) |idx| {
         const source_end = firstOptionalIndex(&[_]?usize{ where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
         if (idx + 1 < source_end) cte.body_source_tokens = .{ .start = idx + 1, .end = source_end };
     }
     if (where_index) |idx| {
         const where_end = firstOptionalIndex(&[_]?usize{ group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
-        if (idx + 1 < where_end) cte.body_where_tokens = .{ .start = idx + 1, .end = where_end };
+        if (idx + 1 < where_end) {
+            const where_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = where_end };
+            cte.body_where_tokens = where_tokens;
+            cte.body_where_expression = try buildGeneratedExpressionAst(alloc, tokens, where_tokens);
+        }
     }
     if (group_index) |idx| {
         const group_start = if (idx + 1 < body_end and tokens[idx + 1].matchesKeywordTag(.by)) idx + 2 else idx + 1;
         const group_end = firstOptionalIndex(&[_]?usize{ having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
-        if (group_start < group_end) cte.body_group_tokens = .{ .start = group_start, .end = group_end };
+        if (group_start < group_end) {
+            const group_tokens = GeneratedSqlTokenRange{ .start = group_start, .end = group_end };
+            cte.body_group_tokens = group_tokens;
+            cte.body_group_items = try buildTopLevelListAst(alloc, tokens, group_tokens, .{});
+            if (generatedListExpressionTokens(cte.body_group_items, 0)) |first_tokens| {
+                cte.body_group_first_expression = try buildGeneratedExpressionAst(alloc, tokens, first_tokens);
+            }
+            if (generatedListExpressionTokens(cte.body_group_items, cte.body_group_items.count -| 1)) |last_tokens| {
+                cte.body_group_last_expression = try buildGeneratedExpressionAst(alloc, tokens, last_tokens);
+            }
+        }
     }
     if (having_index) |idx| {
         const having_end = firstOptionalIndex(&[_]?usize{ window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
-        if (idx + 1 < having_end) cte.body_having_tokens = .{ .start = idx + 1, .end = having_end };
+        if (idx + 1 < having_end) {
+            const having_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = having_end };
+            cte.body_having_tokens = having_tokens;
+            cte.body_having_expression = try buildGeneratedExpressionAst(alloc, tokens, having_tokens);
+        }
     }
     if (order_index) |idx| {
         const order_start = if (idx + 1 < body_end and tokens[idx + 1].matchesKeywordTag(.by)) idx + 2 else idx + 1;
         const order_end = firstOptionalIndex(&[_]?usize{ limit_index, offset_index, fetch_index }) orelse body_end;
-        if (order_start < order_end) cte.body_order_tokens = .{ .start = order_start, .end = order_end };
+        if (order_start < order_end) {
+            const order_tokens = GeneratedSqlTokenRange{ .start = order_start, .end = order_end };
+            cte.body_order_tokens = order_tokens;
+            cte.body_order_items = try buildTopLevelListAst(alloc, tokens, order_tokens, .{ .order_modifiers = true });
+            if (generatedListExpressionTokens(cte.body_order_items, 0)) |first_tokens| {
+                cte.body_order_first_expression = try buildGeneratedExpressionAst(alloc, tokens, first_tokens);
+            }
+            if (generatedListExpressionTokens(cte.body_order_items, cte.body_order_items.count -| 1)) |last_tokens| {
+                cte.body_order_last_expression = try buildGeneratedExpressionAst(alloc, tokens, last_tokens);
+            }
+        }
     }
     if (limit_index) |idx| {
         const limit_end = firstOptionalIndex(&[_]?usize{ offset_index, fetch_index }) orelse body_end;
@@ -4874,6 +4934,10 @@ test "generated SQL parser facade builds read AST spans" {
             try std.testing.expectEqual(GeneratedSqlReadKind.query, read.cte_items[0].body_kind.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, read.cte_items[0].body_select_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.cte_items[0].body_projection_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), read.cte_items[0].body_projection_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.cte_items[0].body_projection_items.items[0]);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.cte_items[0].body_projection_items.expressions[0].kind);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.cte_items[0].body_projection_first_expression.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.cte_items[0].body_source_tokens.?);
             try std.testing.expect(!read.cte_recursive);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.projection_tokens.?);

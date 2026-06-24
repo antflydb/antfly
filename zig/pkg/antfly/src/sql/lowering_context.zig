@@ -322,6 +322,17 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: gen
         if (cte.body_limit_tokens) |body_limit_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_limit_tokens);
         if (cte.body_set_operation_tokens) |body_set_operation_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_set_operation_tokens);
         try validateGeneratedReadListAstRanges(tokens, read_ast, cte.column_names);
+        try validateGeneratedReadListAstRanges(tokens, read_ast, cte.body_projection_items);
+        try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, cte.body_projection_first_expression);
+        try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, cte.body_projection_last_expression);
+        try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, cte.body_where_expression);
+        try validateGeneratedReadListAstRanges(tokens, read_ast, cte.body_group_items);
+        try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, cte.body_group_first_expression);
+        try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, cte.body_group_last_expression);
+        try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, cte.body_having_expression);
+        try validateGeneratedReadListAstRanges(tokens, read_ast, cte.body_order_items);
+        try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, cte.body_order_first_expression);
+        try validateGeneratedExpressionAstRangesIfPresent(tokens, read_ast, cte.body_order_last_expression);
     }
     try validateGeneratedCteListMetadata(tokens, read_ast);
     for (read_ast.join_items) |join| {
@@ -432,6 +443,11 @@ fn validateGeneratedCteBodyMetadata(cte: generated_parser.GeneratedSqlCteAst) !v
     const projection_tokens = cte.body_projection_tokens orelse return error.UnsupportedSqlShape;
     if (select_tokens.start != body.start or select_tokens.end != body.start + 1) return error.UnsupportedSqlShape;
     if (projection_tokens.start < select_tokens.end or projection_tokens.end > body.end) return error.UnsupportedSqlShape;
+    if (cte.body_projection_items.count == 0) return error.UnsupportedSqlShape;
+    if (cte.body_projection_items.count != 0 and !std.meta.eql(cte.body_projection_items.first_tokens orelse return error.UnsupportedSqlShape, cte.body_projection_items.items[0])) {
+        return error.UnsupportedSqlShape;
+    }
+    if (!generatedExpressionAstHasMetadata(cte.body_projection_first_expression)) return error.UnsupportedSqlShape;
     const body_ranges = [_]?generated_parser.GeneratedSqlTokenRange{
         cte.body_distinct_tokens,
         cte.body_projection_tokens,
@@ -460,15 +476,27 @@ fn validateGeneratedCteBodyMetadata(cte: generated_parser.GeneratedSqlCteAst) !v
     }
     if (cte.body_where_tokens) |where_tokens| {
         if (where_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
+        if (!generatedExpressionAstHasMetadata(cte.body_where_expression)) return error.UnsupportedSqlShape;
     }
     if (cte.body_group_tokens) |group_tokens| {
         if (group_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
+        if (cte.body_group_items.count == 0) return error.UnsupportedSqlShape;
+        if (!generatedExpressionAstHasMetadata(cte.body_group_first_expression)) return error.UnsupportedSqlShape;
+    } else if (cte.body_group_items.count != 0 or generatedExpressionAstHasMetadata(cte.body_group_first_expression) or generatedExpressionAstHasMetadata(cte.body_group_last_expression)) {
+        return error.UnsupportedSqlShape;
     }
     if (cte.body_having_tokens) |having_tokens| {
         if (having_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
+        if (!generatedExpressionAstHasMetadata(cte.body_having_expression)) return error.UnsupportedSqlShape;
+    } else if (generatedExpressionAstHasMetadata(cte.body_having_expression)) {
+        return error.UnsupportedSqlShape;
     }
     if (cte.body_order_tokens) |order_tokens| {
         if (order_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
+        if (cte.body_order_items.count == 0) return error.UnsupportedSqlShape;
+        if (!generatedExpressionAstHasMetadata(cte.body_order_first_expression)) return error.UnsupportedSqlShape;
+    } else if (cte.body_order_items.count != 0 or generatedExpressionAstHasMetadata(cte.body_order_first_expression) or generatedExpressionAstHasMetadata(cte.body_order_last_expression)) {
+        return error.UnsupportedSqlShape;
     }
     if (cte.body_limit_tokens) |limit_tokens| {
         if (limit_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
@@ -1934,6 +1962,22 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_cte_body_projection_parsed_sql, malformed_cte_body_projection_read_ast),
+    );
+
+    var malformed_cte_body_projection_list_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows",
+    );
+    defer malformed_cte_body_projection_list_parsed_sql.deinit(alloc);
+    const malformed_cte_body_projection_list_generated_raw = malformed_cte_body_projection_list_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_cte_body_projection_list_read_ast = switch (malformed_cte_body_projection_list_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_cte_body_projection_list_read_ast.cte_items[0].body_projection_items.count = 0;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_cte_body_projection_list_parsed_sql, malformed_cte_body_projection_list_read_ast),
     );
 
     var recursive_cte_parsed_sql = try tokenized.ParsedSql.initAlloc(
