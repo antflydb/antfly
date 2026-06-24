@@ -171,18 +171,33 @@ pub const GeneratedSqlExpressionAst = struct {
     tokens: ?GeneratedSqlTokenRange = null,
     inner_tokens: ?GeneratedSqlTokenRange = null,
     inner_expression_kind: ?GeneratedSqlExpressionKind = null,
+    inner_expression: ?*GeneratedSqlExpressionAst = null,
     function_name_tokens: ?GeneratedSqlTokenRange = null,
     argument_tokens: ?GeneratedSqlTokenRange = null,
     argument_items: GeneratedSqlListAst = .{},
     left_tokens: ?GeneratedSqlTokenRange = null,
     left_expression_kind: ?GeneratedSqlExpressionKind = null,
+    left_expression: ?*GeneratedSqlExpressionAst = null,
     negation_tokens: ?GeneratedSqlTokenRange = null,
     operator_tokens: ?GeneratedSqlTokenRange = null,
     quantifier_tokens: ?GeneratedSqlTokenRange = null,
     right_tokens: ?GeneratedSqlTokenRange = null,
     right_expression_kind: ?GeneratedSqlExpressionKind = null,
+    right_expression: ?*GeneratedSqlExpressionAst = null,
 
     pub fn deinit(self: *GeneratedSqlExpressionAst, alloc: std.mem.Allocator) void {
+        if (self.inner_expression) |inner| {
+            inner.deinit(alloc);
+            alloc.destroy(inner);
+        }
+        if (self.left_expression) |left| {
+            left.deinit(alloc);
+            alloc.destroy(left);
+        }
+        if (self.right_expression) |right| {
+            right.deinit(alloc);
+            alloc.destroy(right);
+        }
         self.argument_items.deinit(alloc);
         self.* = .{};
     }
@@ -1406,12 +1421,14 @@ fn recordGeneratedListItem(
     ast.count += 1;
 }
 
-fn buildGeneratedExpressionAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) !GeneratedSqlExpressionAst {
+fn buildGeneratedExpressionAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) anyerror!GeneratedSqlExpressionAst {
     var ast = GeneratedSqlExpressionAst{ .tokens = range };
+    errdefer ast.deinit(alloc);
     if (generatedWrappedExpressionInnerRange(tokens, range)) |inner_range| {
         ast.kind = .grouped;
         ast.inner_tokens = inner_range;
         ast.inner_expression_kind = generatedExpressionKindForRange(tokens, inner_range);
+        ast.inner_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, inner_range);
         return ast;
     }
     if (generatedFunctionCallExpression(tokens, range)) |function_call| {
@@ -1434,6 +1451,7 @@ fn buildGeneratedExpressionAst(alloc: std.mem.Allocator, tokens: []const token_m
         if (range.start >= left_end) return ast;
         ast.left_tokens = .{ .start = range.start, .end = left_end };
         ast.left_expression_kind = generatedExpressionKindForRange(tokens, ast.left_tokens.?);
+        ast.left_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, ast.left_tokens.?);
     } else if (operator.index + 1 >= range.end) {
         return ast;
     }
@@ -1447,7 +1465,19 @@ fn buildGeneratedExpressionAst(alloc: std.mem.Allocator, tokens: []const token_m
     if (right_start >= range.end) return ast;
     ast.right_tokens = .{ .start = right_start, .end = range.end };
     ast.right_expression_kind = generatedExpressionKindForRange(tokens, ast.right_tokens.?);
+    ast.right_expression = try buildGeneratedExpressionNodeAlloc(alloc, tokens, ast.right_tokens.?);
     return ast;
+}
+
+fn buildGeneratedExpressionNodeAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    range: GeneratedSqlTokenRange,
+) !*GeneratedSqlExpressionAst {
+    const node = try alloc.create(GeneratedSqlExpressionAst);
+    errdefer alloc.destroy(node);
+    node.* = try buildGeneratedExpressionAst(alloc, tokens, range);
+    return node;
 }
 
 fn generatedExpressionKindForRange(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?GeneratedSqlExpressionKind {
@@ -2302,9 +2332,13 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlExpressionKind.logical_or, read.where_expression.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 8 }, read.where_expression.left_tokens.?);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.left_expression_kind.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.left_expression.?.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 8 }, read.where_expression.left_expression.?.tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.where_expression.operator_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 12 }, read.where_expression.right_tokens.?);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.is_null, read.where_expression.right_expression_kind.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.is_null, read.where_expression.right_expression.?.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 12 }, read.where_expression.right_expression.?.tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -2336,6 +2370,9 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.where_expression.operator_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 9 }, read.where_expression.right_tokens.?);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.is_null, read.where_expression.right_expression_kind.?);
+            try std.testing.expect(read.where_expression.left_expression == null);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.is_null, read.where_expression.right_expression.?.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 9 }, read.where_expression.right_expression.?.tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -2349,6 +2386,8 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlExpressionKind.grouped, read.where_expression.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 9 }, read.where_expression.inner_tokens.?);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.inner_expression_kind.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.inner_expression.?.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 9 }, read.where_expression.inner_expression.?.tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -2377,8 +2416,12 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 8 }, read.where_expression.left_tokens.?);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.additive, read.where_expression.left_expression_kind.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.additive, read.where_expression.left_expression.?.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 8 }, read.where_expression.left_expression.?.tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.where_expression.operator_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.where_expression.right_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.where_expression.right_expression.?.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.where_expression.right_expression.?.tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

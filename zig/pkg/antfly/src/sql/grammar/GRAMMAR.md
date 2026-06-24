@@ -105,11 +105,11 @@ and
 `IS DISTINCT FROM` / `IS NOT DISTINCT FROM` predicates are accepted with
 multi-token operator ranges. Top-level
 `AND` and `OR` predicates are classified as logical-expression metadata with
-left and right token ranges and child expression-kind summaries, while
+left and right token ranges and owned child expression nodes, while
 `BETWEEN ... AND ...` remains classified as a range predicate. Prefix `NOT`
-predicates are accepted and classified with right-side expression-kind
-summaries. Parenthesized expression groups carry inner token ranges and inner
-expression-kind summaries,
+predicates are accepted and classified with owned right-side expression nodes.
+Parenthesized expression groups carry inner token ranges and owned inner
+expression nodes,
 and comparison operands can expose additive and multiplicative child
 expression-kind summaries, including JSON/path postfix operator summaries,
 function-call child summaries, and direct function-call name and argument-list
@@ -263,12 +263,12 @@ Suggested migration order:
    `IS DISTINCT FROM` / `IS NOT DISTINCT FROM` predicates are accepted with
    multi-token operator ranges. Top-level
    `AND` and `OR` predicates are classified as logical-expression metadata with
-   left and right token ranges and child expression-kind summaries, while
+   left and right token ranges and owned child expression nodes, while
    `BETWEEN ... AND ...` remains classified as a range predicate. Prefix `NOT`
-   predicates are accepted and classified with right-side expression-kind
-   summaries.
-   Parenthesized expression groups carry inner token ranges and inner
-   expression-kind summaries, and comparison operands can expose additive and
+   predicates are accepted and classified with owned right-side expression
+   nodes.
+   Parenthesized expression groups carry inner token ranges and owned inner
+   expression nodes, and comparison operands can expose additive and
    multiplicative child expression-kind summaries, including JSON/path postfix
    operator summaries, function-call child summaries, and direct function-call
    name and argument-list metadata.
@@ -299,8 +299,8 @@ Suggested migration order:
    broader PostgreSQL-compatible grammar coverage, complete projection,
    grouping, and ordering expression AST arrays beyond the current token-range
    item arrays, full join-tree generated
-   query-body ASTs beyond the current first-join operator/type metadata, full pagination AST/lowering coverage, full expression AST
-   nodes beyond list-level and simple-comparison/operator metadata, broader function
+   query-body ASTs beyond the current first-join operator/type metadata, full pagination AST/lowering coverage, broader expression AST
+   nodes beyond the current recursive predicate/operator metadata, broader function
    coverage, broader boolean expression-tree coverage, quantified subquery and
    array predicate coverage, recursive CTE planning, direct generated read-plan lowering, and
    unsupported-shape diagnostics.
