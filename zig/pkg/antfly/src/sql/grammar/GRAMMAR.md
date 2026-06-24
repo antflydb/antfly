@@ -304,8 +304,9 @@ Suggested migration order:
    Parenthesized expression groups carry inner token ranges and owned inner
    expression nodes, and comparison operands can expose additive and
    multiplicative child expression-kind summaries, including JSON/path postfix
-   operator summaries, function-call child summaries, and direct function-call
-   name and argument-list metadata.
+   operator summaries, function-call child summaries, direct function-call
+   name and argument-list metadata, and PostgreSQL `CAST(expr AS type)` value
+   and target-type ranges.
    Generated read ASTs now have a validated wrapper
    into the current typed read lowerer for representative covered read plans
    that rejects malformed generated range payloads. Simple query reads now have
