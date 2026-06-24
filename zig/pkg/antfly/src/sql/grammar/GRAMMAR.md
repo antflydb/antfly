@@ -248,8 +248,9 @@ Suggested migration order:
    `HAVING`, `WINDOW`, `ORDER BY`, `LIMIT`, `OFFSET`, `FETCH`, set-operation,
    and CTE-prefix bodies, plus owned list item and expression arrays for
    top-level projection, grouping, ordering, and function argument lists with
-   first/last expression metadata for those lists, and first-join metadata for
-   join operator/type, left input, right input, and join predicate ranges, plus simple top-level comparison
+   first/last expression metadata for those lists, and owned join item arrays
+   with first-join compatibility metadata for join operator/type, left input,
+   right input, and join predicate ranges, plus simple top-level comparison
    expression metadata for covered `WHERE`, `HAVING`, and join predicates; and
    normal function-call argument lists are accepted by the generated expression
    grammar for covered read projections, and positive `LIKE`, `ILIKE`,
@@ -298,8 +299,8 @@ Suggested migration order:
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression AST semantics beyond the current owned
-   expression item arrays, full join-tree generated
-   query-body ASTs beyond the current first-join operator/type metadata, full pagination AST/lowering coverage, broader expression AST
+   expression item arrays, full join planning/lowering and richer join-tree
+   semantics beyond the current left-associative item arrays, full pagination AST/lowering coverage, broader expression AST
    nodes beyond the current recursive predicate/operator metadata, broader function
    coverage, broader boolean expression-tree coverage, quantified subquery and
    array predicate coverage, recursive CTE planning, direct generated read-plan lowering, and
@@ -476,7 +477,7 @@ Generated grammar work needs evidence at multiple levels:
   generated AST-to-plan parity through a generated-family validation wrapper
   over representative query, aggregate, join, lateral, and non-recursive CTE
   plans, AST-shape coverage for generated-ranged multi-CTE and recursive CTE
-  prefixes, first-join component range coverage, and simple comparison plus
+  prefixes, single- and multi-join component range coverage, and simple comparison plus
   positive/negated predicate expression-shape coverage for read predicates.
   Seed graph DDL has generated AST-to-plan parity for graph index and graph
   metric index plans.

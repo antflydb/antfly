@@ -294,6 +294,13 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: gen
         try validateGeneratedReadTokenRange(tokens, read_ast, cte.name_tokens);
         if (cte.body_tokens) |body_tokens| try validateGeneratedReadTokenRange(tokens, read_ast, body_tokens);
     }
+    for (read_ast.join_items) |join| {
+        try validateGeneratedReadTokenRange(tokens, read_ast, join.tokens);
+        try validateGeneratedReadTokenRange(tokens, read_ast, join.operator_tokens);
+        try validateGeneratedReadTokenRange(tokens, read_ast, join.left_tokens);
+        try validateGeneratedReadTokenRange(tokens, read_ast, join.right_tokens);
+        try validateGeneratedReadTokenRange(tokens, read_ast, join.predicate_tokens);
+    }
 
     switch (read_ast.kind) {
         .query => {

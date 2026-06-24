@@ -213,6 +213,21 @@ pub const GeneratedSqlJoinKind = enum {
     full,
 };
 
+pub const GeneratedSqlJoinAst = struct {
+    tokens: GeneratedSqlTokenRange,
+    operator_tokens: GeneratedSqlTokenRange,
+    kind: GeneratedSqlJoinKind,
+    left_tokens: GeneratedSqlTokenRange,
+    right_tokens: GeneratedSqlTokenRange,
+    predicate_tokens: GeneratedSqlTokenRange,
+    predicate_expression: GeneratedSqlExpressionAst = .{},
+
+    pub fn deinit(self: *GeneratedSqlJoinAst, alloc: std.mem.Allocator) void {
+        self.predicate_expression.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
 pub const GeneratedSqlCteAst = struct {
     name_tokens: GeneratedSqlTokenRange,
     body_tokens: ?GeneratedSqlTokenRange = null,
@@ -299,6 +314,7 @@ pub const GeneratedSqlReadAst = struct {
     join_right_tokens: ?GeneratedSqlTokenRange = null,
     join_predicate_tokens: ?GeneratedSqlTokenRange = null,
     join_predicate_expression: GeneratedSqlExpressionAst = .{},
+    join_items: []GeneratedSqlJoinAst = &.{},
     where_tokens: ?GeneratedSqlTokenRange = null,
     where_expression: GeneratedSqlExpressionAst = .{},
     group_tokens: ?GeneratedSqlTokenRange = null,
@@ -323,6 +339,8 @@ pub const GeneratedSqlReadAst = struct {
 
     pub fn deinit(self: *GeneratedSqlReadAst, alloc: std.mem.Allocator) void {
         if (self.cte_items.len > 0) alloc.free(self.cte_items);
+        for (self.join_items) |*join| join.deinit(alloc);
+        if (self.join_items.len > 0) alloc.free(self.join_items);
         self.projection_items.deinit(alloc);
         self.projection_first_expression.deinit(alloc);
         self.projection_last_expression.deinit(alloc);
@@ -485,6 +503,7 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT id FROM usage_records OFFSET 5 ROWS FETCH NEXT 10 ROWS ONLY", .kind = .read },
     .{ .sql = "SELECT status FROM usage_records GROUP BY status HAVING status = 'open'", .kind = .read },
     .{ .sql = "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id", .kind = .read },
+    .{ .sql = "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id JOIN tenants ON accounts.tenant_id = tenants.id", .kind = .read },
     .{ .sql = "SELECT usage_records.id FROM usage_records LEFT OUTER JOIN accounts ON usage_records.account_id = accounts.id", .kind = .read },
     .{ .sql = "SELECT id FROM LATERAL (SELECT id FROM usage_records) AS source_rows", .kind = .read },
     .{ .sql = "SELECT id, row_number() OVER (ORDER BY id) AS rn FROM usage_records", .kind = .read },
@@ -1157,18 +1176,56 @@ fn buildReadCteAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, fi
 }
 
 fn buildReadJoinAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, source_tokens: GeneratedSqlTokenRange, ast: *GeneratedSqlReadAst) !void {
-    const join_index = findTopLevelKeyword(tokens, source_tokens.start, source_tokens.end, .join) orelse return;
-    const on_index = findTopLevelKeyword(tokens, join_index + 1, source_tokens.end, .on) orelse return;
-    const operator = generatedJoinOperator(tokens, source_tokens, join_index) orelse return;
-    if (source_tokens.start >= operator.tokens.start or join_index + 1 >= on_index or on_index + 1 >= source_tokens.end) return;
+    var items: std.ArrayListUnmanaged(GeneratedSqlJoinAst) = .empty;
+    var items_owned = false;
+    defer if (!items_owned) {
+        for (items.items) |*item| item.deinit(alloc);
+        items.deinit(alloc);
+    };
+
+    var scan = source_tokens.start;
+    while (findTopLevelKeyword(tokens, scan, source_tokens.end, .join)) |join_index| {
+        const on_index = findTopLevelKeyword(tokens, join_index + 1, source_tokens.end, .on) orelse return;
+        const operator = generatedJoinOperator(tokens, source_tokens, join_index) orelse return;
+        if (source_tokens.start >= operator.tokens.start or join_index + 1 >= on_index) return;
+
+        const next_join_index = findTopLevelKeyword(tokens, on_index + 1, source_tokens.end, .join);
+        const predicate_end = if (next_join_index) |next_join|
+            (generatedJoinOperator(tokens, source_tokens, next_join) orelse return).tokens.start
+        else
+            source_tokens.end;
+        if (on_index + 1 >= predicate_end) return;
+
+        try items.ensureUnusedCapacity(alloc, 1);
+        const predicate_tokens = GeneratedSqlTokenRange{ .start = on_index + 1, .end = predicate_end };
+        const item = GeneratedSqlJoinAst{
+            .tokens = .{ .start = source_tokens.start, .end = predicate_end },
+            .operator_tokens = operator.tokens,
+            .kind = operator.kind,
+            .left_tokens = .{ .start = source_tokens.start, .end = operator.tokens.start },
+            .right_tokens = .{ .start = join_index + 1, .end = on_index },
+            .predicate_tokens = predicate_tokens,
+            .predicate_expression = try buildGeneratedExpressionAst(alloc, tokens, predicate_tokens),
+        };
+        items.appendAssumeCapacity(item);
+
+        scan = predicate_end;
+        if (scan >= source_tokens.end) break;
+    }
+
+    if (items.items.len == 0) return;
+
+    ast.join_items = try items.toOwnedSlice(alloc);
+    items_owned = true;
+
+    const first = ast.join_items[0];
     ast.join_tokens = source_tokens;
-    ast.join_operator_tokens = operator.tokens;
-    ast.join_kind = operator.kind;
-    ast.join_left_tokens = .{ .start = source_tokens.start, .end = operator.tokens.start };
-    ast.join_right_tokens = .{ .start = join_index + 1, .end = on_index };
-    const predicate_tokens = GeneratedSqlTokenRange{ .start = on_index + 1, .end = source_tokens.end };
-    ast.join_predicate_tokens = predicate_tokens;
-    ast.join_predicate_expression = try buildGeneratedExpressionAst(alloc, tokens, predicate_tokens);
+    ast.join_operator_tokens = first.operator_tokens;
+    ast.join_kind = first.kind;
+    ast.join_left_tokens = first.left_tokens;
+    ast.join_right_tokens = first.right_tokens;
+    ast.join_predicate_tokens = first.predicate_tokens;
+    ast.join_predicate_expression = try buildGeneratedExpressionAst(alloc, tokens, first.predicate_tokens);
 }
 
 const GeneratedJoinOperator = struct {
@@ -2629,10 +2686,50 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read.join_left_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.join_right_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 10 }, read.join_predicate_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), read.join_items.len);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 10 }, read.join_items[0].tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, read.join_items[0].operator_tokens);
+            try std.testing.expectEqual(GeneratedSqlJoinKind.inner, read.join_items[0].kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read.join_items[0].left_tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.join_items[0].right_tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 10 }, read.join_items[0].predicate_tokens);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.join_items[0].predicate_expression.kind);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.join_predicate_expression.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.join_predicate_expression.left_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, read.join_predicate_expression.operator_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.join_predicate_expression.right_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const multi_joined_read_sql = "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id JOIN tenants ON accounts.tenant_id = tenants.id";
+    const multi_joined_read_result = try parseSqlAlloc(alloc, multi_joined_read_sql);
+    switch (multi_joined_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.join, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 16 }, read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 16 }, read.join_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, read.join_operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlJoinKind.inner, read.join_kind.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read.join_left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.join_right_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 10 }, read.join_predicate_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.join_predicate_expression.kind);
+            try std.testing.expectEqual(@as(usize, 2), read.join_items.len);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 10 }, read.join_items[0].tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, read.join_items[0].operator_tokens);
+            try std.testing.expectEqual(GeneratedSqlJoinKind.inner, read.join_items[0].kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read.join_items[0].left_tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.join_items[0].right_tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 10 }, read.join_items[0].predicate_tokens);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.join_items[0].predicate_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 16 }, read.join_items[1].tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.join_items[1].operator_tokens);
+            try std.testing.expectEqual(GeneratedSqlJoinKind.inner, read.join_items[1].kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 10 }, read.join_items[1].left_tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 12 }, read.join_items[1].right_tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 16 }, read.join_items[1].predicate_tokens);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.join_items[1].predicate_expression.kind);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -2649,6 +2746,14 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read.join_left_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.join_right_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 12 }, read.join_predicate_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), read.join_items.len);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 12 }, read.join_items[0].tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 7 }, read.join_items[0].operator_tokens);
+            try std.testing.expectEqual(GeneratedSqlJoinKind.left, read.join_items[0].kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read.join_items[0].left_tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.join_items[0].right_tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 12 }, read.join_items[0].predicate_tokens);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.join_items[0].predicate_expression.kind);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.join_predicate_expression.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, read.join_predicate_expression.left_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.join_predicate_expression.operator_tokens.?);
