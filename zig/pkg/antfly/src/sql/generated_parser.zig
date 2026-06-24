@@ -7406,6 +7406,153 @@ test "generated SQL parser reports bounded diagnostics for malformed corpus" {
     }
 }
 
+fn appendFuzzSqlPart(buffer: []u8, len: *usize, part: []const u8) void {
+    if (len.* + part.len > buffer.len) return;
+    @memcpy(buffer[len.* .. len.* + part.len], part);
+    len.* += part.len;
+}
+
+fn appendFuzzSqlByte(buffer: []u8, len: *usize, byte: u8) void {
+    if (len.* == buffer.len) return;
+    buffer[len.*] = byte;
+    len.* += 1;
+}
+
+fn generatedParserRandomFuzzSql(random: std.Random, buffer: []u8) []const u8 {
+    const parts = [_][]const u8{
+        "SELECT",
+        "WITH",
+        "RECURSIVE",
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "CREATE",
+        "DROP",
+        "EXPLAIN",
+        "FROM",
+        "WHERE",
+        "GROUP",
+        "ORDER",
+        "BY",
+        "LIMIT",
+        "OFFSET",
+        "FETCH",
+        "FIRST",
+        "ROWS",
+        "ONLY",
+        "AS",
+        "JOIN",
+        "LEFT",
+        "ON",
+        "UNION",
+        "ALL",
+        "VALUES",
+        "SET",
+        "INTO",
+        "TABLE",
+        "INDEX",
+        "GRAPH",
+        "METRIC",
+        "id",
+        "status",
+        "tenant",
+        "usage_records",
+        "source_rows",
+        "1",
+        "42",
+        "'open'",
+        "$1",
+        "(",
+        ")",
+        ",",
+        ".",
+        "*",
+        "=",
+        "<>",
+        "::",
+        "+",
+        "-",
+    };
+    var len: usize = 0;
+    const part_count = random.intRangeLessThan(usize, 1, 36);
+    for (0..part_count) |idx| {
+        if (idx != 0 and random.boolean()) appendFuzzSqlByte(buffer, &len, ' ');
+        appendFuzzSqlPart(buffer, &len, parts[random.intRangeLessThan(usize, 0, parts.len)]);
+    }
+    return buffer[0..len];
+}
+
+fn generatedParserMutatedFuzzSql(random: std.Random, seed: []const u8, buffer: []u8) []const u8 {
+    const replacement = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_(),.*=<>+-' ";
+    var len: usize = 0;
+    for (seed) |byte| {
+        const action = random.intRangeLessThan(u8, 0, 16);
+        switch (action) {
+            0 => {},
+            1 => {
+                appendFuzzSqlByte(buffer, &len, replacement[random.intRangeLessThan(usize, 0, replacement.len)]);
+            },
+            2 => {
+                appendFuzzSqlByte(buffer, &len, byte);
+                appendFuzzSqlByte(buffer, &len, byte);
+            },
+            3 => {
+                appendFuzzSqlByte(buffer, &len, byte);
+                appendFuzzSqlByte(buffer, &len, replacement[random.intRangeLessThan(usize, 0, replacement.len)]);
+            },
+            else => appendFuzzSqlByte(buffer, &len, byte),
+        }
+    }
+    return buffer[0..len];
+}
+
+fn exerciseGeneratedParserFuzzSql(alloc: std.mem.Allocator, sql: []const u8) !void {
+    var tokens = lexer.tokenizeAlloc(alloc, sql) catch |err| switch (err) {
+        error.UnsupportedSqlShape => return,
+        else => return err,
+    };
+    defer lexer.freeTokens(alloc, &tokens);
+
+    var parsed = parseTokensAlloc(alloc, tokens.items) catch |err| switch (err) {
+        error.UnsupportedSqlShape, error.UnexpectedToken => {
+            const diagnostic = diagnosticAlloc(alloc, tokens.items) catch |diagnostic_err| switch (diagnostic_err) {
+                error.UnsupportedSqlShape => return,
+                else => return diagnostic_err,
+            } orelse return error.ExpectedDiagnostic;
+            defer alloc.free(diagnostic.expected);
+            try std.testing.expect(diagnostic.token_index <= tokens.items.len);
+            try std.testing.expect(diagnostic.source_end >= diagnostic.source_start);
+            try std.testing.expect(diagnostic.source_end <= sql.len);
+            try std.testing.expect(diagnostic.expected.len > 0);
+            return;
+        },
+        else => return err,
+    };
+    defer parsed.deinit(alloc);
+}
+
+test "generated SQL parser deterministic fuzz exercises scanner parser and diagnostics" {
+    const seeds = [_][]const u8{
+        "SELECT id, status FROM usage_records WHERE kind = 'order' ORDER BY id LIMIT 5",
+        "WITH source_rows AS (SELECT id FROM usage_records WHERE status = 'open') SELECT id FROM source_rows",
+        "INSERT INTO usage_records (id, status) VALUES ('u1', 'open') ON CONFLICT (id) DO UPDATE SET status = excluded.status",
+        "CREATE TABLE usage_records (id text PRIMARY KEY, status text)",
+        "CREATE GRAPH METRIC docs_pagerank ON doc_edges",
+        "EXPLAIN (FORMAT JSON, ANALYZE ON) SELECT id FROM usage_records",
+    };
+
+    var prng = std.Random.DefaultPrng.init(0x514c_f077);
+    const random = prng.random();
+    for (0..384) |case_index| {
+        var buffer: [256]u8 = undefined;
+        const sql = if (case_index % 3 == 0)
+            generatedParserRandomFuzzSql(random, &buffer)
+        else
+            generatedParserMutatedFuzzSql(random, seeds[random.intRangeLessThan(usize, 0, seeds.len)], &buffer);
+        try exerciseGeneratedParserFuzzSql(std.testing.allocator, sql);
+    }
+}
+
 test "generated SQL parser rejects unsupported token shapes" {
     try std.testing.expectError(error.UnsupportedSqlShape, parseSqlAlloc(std.testing.allocator, "SELECT a ! b"));
 }

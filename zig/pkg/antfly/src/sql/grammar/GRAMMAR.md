@@ -690,7 +690,10 @@ Generated grammar work needs evidence at multiple levels:
 - Fuzz or mutation tests for scanner/parser crash resistance and bounded error
   recovery. A deterministic malformed SQL corpus now exercises generated
   source-aware diagnostics for incomplete read, CTE, DDL, DML, and unsupported
-  statement shapes; broader randomized scanner/parser fuzzing remains future
+  statement shapes. A seeded deterministic scanner/parser fuzz pass now mutates
+  accepted statement seeds and random SQL-token streams, requiring every case to
+  parse, reject as an unsupported token shape, or produce a bounded generated
+  parser diagnostic. Longer-running corpus-scale fuzzing remains future
   evidence.
 - Parser microbenchmarks for corpus throughput, allocation count, parse-table
   size, generated-code compile time, and binary size. The initial
