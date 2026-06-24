@@ -472,6 +472,9 @@ Unsupported DDL remains on the existing parser until
    Prefix, `IS`, and `EXISTS` expression validation now similarly rejects
    unrelated generated payload fields while preserving each shape's required
    child and negation metadata.
+   Grouped, cast, extract, array-constructor, and logical-`NOT` expression
+   validation now also rejects unrelated payload fields while preserving each
+   shape's required child/list metadata.
    Set-operation reads now classify as their own generated read family and
    dispatch to the native set-operation lowerer after validating the generated
    left-query, operator, `UNION ALL`, right-query projection/source, and
@@ -515,7 +518,7 @@ Unsupported DDL remains on the existing parser until
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current
    validated owned expression item arrays, expression-kind structural checks
-   for remaining structured expression shapes, expression operator/kind token
+   for remaining function, case, and subquery expression shapes, expression operator/kind token
    consistency checks for remaining specialized operators beyond the current
    validated binary/operator families, full multi-join
    planning/lowering and richer join-tree semantics beyond the current
