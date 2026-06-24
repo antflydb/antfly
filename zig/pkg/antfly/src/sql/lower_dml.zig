@@ -12393,6 +12393,22 @@ pub fn lowerWritePlanFromGeneratedDmlAstAlloc(
             else => return err,
         }
     }
+    if (dml_ast.kind == .update) {
+        if (updatePointFromGeneratedDmlAstAlloc(alloc, parsed_sql.items(), dml_ast, schema, params, options)) |update| {
+            return .{ .update = update };
+        } else |err| switch (err) {
+            error.UnsupportedSqlShape => {},
+            else => return err,
+        }
+    }
+    if (dml_ast.kind == .delete) {
+        if (deletePointFromGeneratedDmlAstAlloc(alloc, parsed_sql.items(), dml_ast, schema, params, options)) |delete| {
+            return .{ .delete = delete };
+        } else |err| switch (err) {
+            error.UnsupportedSqlShape => {},
+            else => return err,
+        }
+    }
     if (dml_ast.kind == .truncate) {
         if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
         const row_claim = options.row_claim orelse return error.UnsupportedRowsQuery;
@@ -12480,6 +12496,229 @@ fn insertValuesFromGeneratedDmlAstAlloc(
         alloc.free(rows);
         owns_rows = false;
     }
+
+    table_transferred = true;
+    return .{
+        .table_name = table_name,
+        .batch = batch,
+        .sync_level = options.sync_level,
+        .returning_expression_count = returning_expression_count,
+        .returning_all = returning_all,
+    };
+}
+
+fn updatePointFromGeneratedDmlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    ast: generated_parser.GeneratedSqlDmlAst,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+) !plan_mod.LoweredMutation {
+    if (ast.kind != .update) return error.UnsupportedSqlShape;
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (ast.source_tokens != null) return error.UnsupportedSqlShape;
+    const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    if (end < 6 or !tokens[0].matchesKeywordTag(.update)) return error.UnsupportedSqlShape;
+    const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, 1, end);
+    const table_name = try generatedDmlTableReferenceIdentifierAlloc(alloc, tokens, target_range);
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+
+    const assignments_range = ast.assignments_tokens orelse return error.UnsupportedSqlShape;
+    const where_range = ast.where_tokens orelse return error.UnsupportedSqlShape;
+    if (assignments_range.start <= target_range.end or assignments_range.end > end) return error.UnsupportedSqlShape;
+    if (where_range.start >= where_range.end or where_range.end > end) return error.UnsupportedSqlShape;
+    if (where_range.start == 0 or !tokens[where_range.start - 1].matchesKeywordTag(.where)) return error.UnsupportedSqlShape;
+    if (ast.returning_tokens) |returning_range| {
+        if (returning_range.start == 0 or returning_range.start > returning_range.end or returning_range.end > end) return error.UnsupportedSqlShape;
+        if (!tokens[returning_range.start - 1].matchesKeywordTag(.returning)) return error.UnsupportedSqlShape;
+        if (where_range.end != returning_range.start - 1) return error.UnsupportedSqlShape;
+    }
+
+    const parser_context = @import("parser_context.zig");
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens,
+        .schema = schema,
+        .params = params,
+        .unique_resolver = options.unique_resolver,
+    };
+    const parser_options = parser_context.ParserState.ContextAccessors.updateParserOptions(&parser_state);
+
+    var patch = std.ArrayListUnmanaged(FieldJsonValue).empty;
+    errdefer {
+        freeFieldJsonValues(alloc, patch.items);
+        patch.deinit(alloc);
+    }
+    var patch_expr = std.ArrayListUnmanaged(FieldExpressionValue).empty;
+    errdefer {
+        freeFieldExpressionValues(alloc, patch_expr.items);
+        patch_expr.deinit(alloc);
+    }
+    var increment = std.ArrayListUnmanaged(FieldJsonValue).empty;
+    errdefer {
+        freeFieldJsonValues(alloc, increment.items);
+        increment.deinit(alloc);
+    }
+    var increment_expr = std.ArrayListUnmanaged(FieldExpressionValue).empty;
+    errdefer {
+        freeFieldExpressionValues(alloc, increment_expr.items);
+        increment_expr.deinit(alloc);
+    }
+    var json_set = std.ArrayListUnmanaged(JsonSetValue).empty;
+    errdefer {
+        freeJsonSetValues(alloc, json_set.items);
+        json_set.deinit(alloc);
+    }
+    var array_update = std.ArrayListUnmanaged(ArrayTransformValue).empty;
+    errdefer {
+        freeArrayTransformValues(alloc, array_update.items);
+        array_update.deinit(alloc);
+    }
+
+    var rewrite_identity = false;
+    const assignment_hooks: ConflictUpdateSetAssignmentParserOptions = .{
+        .value = parser_options.assignment_value_hooks,
+        .primary_key_assignment = .{ .mark_rewrite = &rewrite_identity },
+    };
+    const assignment_tokens = tokens[0..assignments_range.end];
+    var assignment_pos = assignments_range.start;
+    while (assignment_pos < assignments_range.end) {
+        try parseConflictUpdateSetAssignmentAlloc(
+            alloc,
+            assignment_tokens,
+            &assignment_pos,
+            schema,
+            params,
+            parser_options.conflict_existing_qualifiers,
+            &.{},
+            &.{},
+            &patch,
+            &patch_expr,
+            &increment,
+            &increment_expr,
+            &json_set,
+            &array_update,
+            assignment_hooks,
+        );
+        if (assignment_pos == assignments_range.end) break;
+        if (assignment_tokens[assignment_pos].kind != .comma) return error.UnsupportedSqlShape;
+        assignment_pos += 1;
+        if (assignment_pos == assignments_range.end) return error.UnsupportedSqlShape;
+    }
+    if (patch.items.len == 0 and patch_expr.items.len == 0 and increment.items.len == 0 and increment_expr.items.len == 0 and json_set.items.len == 0 and array_update.items.len == 0) return error.UnsupportedSqlShape;
+    try validateSqlUpdateTargetPaths(schema, patch.items, patch_expr.items, increment.items, increment_expr.items, json_set.items, array_update.items);
+
+    const target_qualifiers = [_][]const u8{table_name};
+    const where_tokens = tokens[0..where_range.end];
+    var where_pos = where_range.start;
+    const where_json = try parsePointWhereJsonAlloc(alloc, where_tokens, &where_pos, params, schema, &target_qualifiers, parser_options.realtime_ns);
+    defer alloc.free(where_json);
+    if (where_pos != where_range.end) return error.UnsupportedSqlShape;
+
+    var returning: plan_mod.ReturningProjection = .{};
+    defer returning.deinit(alloc);
+    if (ast.returning_tokens) |returning_range| {
+        returning = try generatedReturningProjectionAlloc(alloc, tokens, returning_range, schema, table_name);
+    }
+    const returning_expression_count = returning.expressions.len;
+    const returning_all = returning.returnsAll();
+    const explicit_expected_version = if (updateWillLookupExistingRow(schema, returning))
+        null
+    else
+        try expectedVersionForWhereAlloc(alloc, table_name, where_json, schema, options.unique_resolver orelse return error.UnsupportedRowsSelector);
+
+    const body_json = try updateBodyJsonAlloc(alloc, where_json, patch.items, patch_expr.items, increment.items, increment_expr.items, json_set.items, array_update.items, returning, explicit_expected_version, rewrite_identity);
+    defer alloc.free(body_json);
+    var batch = try relational_rows.parseRowsBatchRequestWithResolver(alloc, table_name, body_json, schema, options.unique_resolver orelse return error.UnsupportedRowsSelector);
+    errdefer batch.deinit(alloc);
+    batch.req.sync_level = options.sync_level;
+
+    freeFieldJsonValues(alloc, patch.items);
+    patch.deinit(alloc);
+    freeFieldExpressionValues(alloc, patch_expr.items);
+    patch_expr.deinit(alloc);
+    freeFieldJsonValues(alloc, increment.items);
+    increment.deinit(alloc);
+    freeFieldExpressionValues(alloc, increment_expr.items);
+    increment_expr.deinit(alloc);
+    freeJsonSetValues(alloc, json_set.items);
+    json_set.deinit(alloc);
+    freeArrayTransformValues(alloc, array_update.items);
+    array_update.deinit(alloc);
+
+    table_transferred = true;
+    return .{
+        .table_name = table_name,
+        .batch = batch,
+        .sync_level = options.sync_level,
+        .returning_expression_count = returning_expression_count,
+        .returning_all = returning_all,
+    };
+}
+
+fn deletePointFromGeneratedDmlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    ast: generated_parser.GeneratedSqlDmlAst,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+) !plan_mod.LoweredMutation {
+    if (ast.kind != .delete) return error.UnsupportedSqlShape;
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (ast.source_tokens != null) return error.UnsupportedSqlShape;
+    const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    if (end < 5 or !tokens[0].matchesKeywordTag(.delete) or !tokens[1].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
+    const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, 2, end);
+    const table_name = try generatedDmlTableReferenceIdentifierAlloc(alloc, tokens, target_range);
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+
+    const where_range = ast.where_tokens orelse return error.UnsupportedSqlShape;
+    if (where_range.start >= where_range.end or where_range.end > end) return error.UnsupportedSqlShape;
+    if (where_range.start == 0 or !tokens[where_range.start - 1].matchesKeywordTag(.where)) return error.UnsupportedSqlShape;
+    if (ast.returning_tokens) |returning_range| {
+        if (returning_range.start == 0 or returning_range.start > returning_range.end or returning_range.end > end) return error.UnsupportedSqlShape;
+        if (!tokens[returning_range.start - 1].matchesKeywordTag(.returning)) return error.UnsupportedSqlShape;
+        if (where_range.end != returning_range.start - 1) return error.UnsupportedSqlShape;
+    }
+
+    const parser_context = @import("parser_context.zig");
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens,
+        .schema = schema,
+        .params = params,
+        .unique_resolver = options.unique_resolver,
+    };
+    const parser_options = parser_context.ParserState.ContextAccessors.deleteParserOptions(&parser_state);
+
+    const target_qualifiers = [_][]const u8{table_name};
+    const where_tokens = tokens[0..where_range.end];
+    var where_pos = where_range.start;
+    const where_json = try parsePointWhereJsonAlloc(alloc, where_tokens, &where_pos, params, schema, &target_qualifiers, parser_options.realtime_ns);
+    defer alloc.free(where_json);
+    if (where_pos != where_range.end) return error.UnsupportedSqlShape;
+
+    var returning: plan_mod.ReturningProjection = .{};
+    defer returning.deinit(alloc);
+    if (ast.returning_tokens) |returning_range| {
+        returning = try generatedReturningProjectionAlloc(alloc, tokens, returning_range, schema, table_name);
+    }
+    const returning_expression_count = returning.expressions.len;
+    const returning_all = returning.returnsAll();
+    const explicit_expected_version = if (returning.hasProjection())
+        null
+    else
+        try expectedVersionForWhereAlloc(alloc, table_name, where_json, schema, options.unique_resolver orelse return error.UnsupportedRowsSelector);
+
+    const body_json = try deleteBodyJsonAlloc(alloc, where_json, returning, explicit_expected_version);
+    defer alloc.free(body_json);
+    var batch = try relational_rows.parseRowsBatchRequestWithResolver(alloc, table_name, body_json, schema, options.unique_resolver orelse return error.UnsupportedRowsSelector);
+    errdefer batch.deinit(alloc);
+    batch.req.sync_level = options.sync_level;
 
     table_transferred = true;
     return .{
@@ -12894,6 +13133,60 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var parsed_generated_update = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'disabled' WHERE id = 'u1' RETURNING id",
+    );
+    defer parsed_generated_update.deinit(alloc);
+    const generated_update_ast = switch ((parsed_generated_update.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_update = try updatePointFromGeneratedDmlAstAlloc(
+        alloc,
+        parsed_generated_update.items(),
+        generated_update_ast,
+        schema,
+        &.{},
+        options,
+    );
+    defer generated_update.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", generated_update.table_name);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, generated_update.sync_level);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, generated_update.batch.req.sync_level);
+    try std.testing.expectEqual(@as(usize, 0), generated_update.returning_expression_count);
+    try std.testing.expect(!generated_update.returning_all);
+    try std.testing.expectEqual(@as(u32, 1), generated_update.batch.transformed);
+    try std.testing.expectEqual(@as(usize, 1), generated_update.batch.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\"}", generated_update.batch.returning_rows[0]);
+
+    var parsed_generated_delete = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DELETE FROM usage_records WHERE id = 'u1' RETURNING id",
+    );
+    defer parsed_generated_delete.deinit(alloc);
+    const generated_delete_ast = switch ((parsed_generated_delete.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var generated_delete = try deletePointFromGeneratedDmlAstAlloc(
+        alloc,
+        parsed_generated_delete.items(),
+        generated_delete_ast,
+        schema,
+        &.{},
+        options,
+    );
+    defer generated_delete.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", generated_delete.table_name);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, generated_delete.sync_level);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, generated_delete.batch.req.sync_level);
+    try std.testing.expectEqual(@as(usize, 0), generated_delete.returning_expression_count);
+    try std.testing.expect(!generated_delete.returning_all);
+    try std.testing.expectEqual(@as(u32, 1), generated_delete.batch.deleted);
+    try std.testing.expectEqual(@as(usize, 1), generated_delete.batch.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\"}", generated_delete.batch.returning_rows[0]);
 
     const default_schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword","default":"u_default"},"status":{"type":"keyword","default":"active"},"quantity":{"type":"numeric","default":1}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
