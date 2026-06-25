@@ -13592,8 +13592,10 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
         "INSERT INTO usage_records (id, status, quantity) SELECT id, status, quantity FROM usage_records WHERE status = 'ready'",
         "UPDATE usage_records SET status = 'disabled' WHERE id = 'u1' RETURNING id",
         "UPDATE usage_records SET status = 'disabled' WHERE organization_id = 'o1' RETURNING id",
+        "UPDATE usage_records SET status = 'archived' WHERE usage_records.id IN (SELECT archived_records.id FROM archived_records WHERE organization_id = 'o1') FOR UPDATE SKIP LOCKED RETURNING id",
         "DELETE FROM usage_records WHERE id = 'u1' RETURNING id",
         "DELETE FROM usage_records WHERE organization_id = 'o1' RETURNING id",
+        "DELETE FROM usage_records WHERE usage_records.id IN (SELECT archived_records.id FROM archived_records WHERE status = 'archived') FOR UPDATE SKIP LOCKED RETURNING id",
         "TRUNCATE usage_records",
         "MERGE INTO usage_records USING usage_records AS source ON usage_records.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status",
     };

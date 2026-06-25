@@ -332,7 +332,9 @@ Unsupported DDL remains on the existing parser until
    single-table source `UPDATE`/`DELETE` without joined sources have generated
    range-validated direct mutation-source lowerers; explicit `UPDATE ... FROM`
    and `DELETE ... USING` have generated range-validated direct joined
-   mutation-source lowerers; non-CTE `MERGE` has a generated range-validated
+   mutation-source lowerers; simple `UPDATE` and `DELETE` semijoin mutation
+   sources using `WHERE target_field IN (SELECT source_field FROM source ...)`
+   now have generated-direct parity coverage; non-CTE `MERGE` has a generated range-validated
    direct merge-plan lowerer; and `TRUNCATE` has a direct generated AST-to-plan
    lowerer for the supported table-list, identity, and drop-behavior surface.
    The write-plan lowering context now dispatches through retained generated
@@ -347,7 +349,7 @@ Unsupported DDL remains on the existing parser until
    classifier fallback.
    Switching the full DML family from fallback to required generated parsing
    still requires generated command-body ASTs for broader insert-select source bodies,
-   semijoin/exists joined mutation bodies, full merge arms, and CTE/recursive
+   correlated semijoin/exists joined mutation bodies, full merge arms, and CTE/recursive
    merge forms, plus broader unsupported-shape diagnostics.
 4. Read queries: projections, predicates, joins, CTEs, aggregates, windows,
    set operations, lateral, ordering, limits, and document-table sources.
