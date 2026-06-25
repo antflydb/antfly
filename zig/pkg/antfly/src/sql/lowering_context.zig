@@ -262,6 +262,23 @@ pub fn lowerReadPlanFromGeneratedReadAstAlloc(
     };
 }
 
+pub fn validateGeneratedReadAstForStatement(
+    tokens: []const tokenized.Token,
+    read_ast: generated_parser.GeneratedSqlReadAst,
+) !void {
+    _ = try generatedReadStatementKind(tokens, read_ast);
+    try validateGeneratedReadAstRanges(tokens, read_ast);
+    switch (read_ast.kind) {
+        .query => try validateGeneratedSimpleQueryReadAst(tokens, read_ast),
+        .aggregate => try validateGeneratedAggregateReadAst(tokens, read_ast),
+        .join => try validateGeneratedJoinedReadAst(tokens, read_ast, .join),
+        .lateral => try validateGeneratedJoinedReadAst(tokens, read_ast, .lateral),
+        .window => try validateGeneratedWindowReadAst(tokens, read_ast),
+        .set_operation => try validateGeneratedSetOperationReadAst(tokens, read_ast),
+        .cte => try validateGeneratedCteReadAst(tokens, read_ast),
+    }
+}
+
 fn generatedReadStatementKind(
     tokens: []const tokenized.Token,
     read_ast: generated_parser.GeneratedSqlReadAst,

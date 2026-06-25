@@ -12579,6 +12579,37 @@ fn validateGeneratedDmlReadSourceBodyAst(ast: generated_parser.GeneratedSqlDmlAs
     }
 }
 
+fn validateGeneratedChildReadParsedSql(parsed_sql: *const tokenized.ParsedSql) !void {
+    const generated = parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    if (generated.kind() != .read) return error.UnsupportedSqlShape;
+    const read_ast = switch (generated.ast orelse return error.UnsupportedSqlShape) {
+        .read => |read| read,
+        else => return error.UnsupportedSqlShape,
+    };
+    try lowering_context.validateGeneratedReadAstForStatement(parsed_sql.items(), read_ast);
+}
+
+fn validateGeneratedDmlReadSourceBodyAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    ast: generated_parser.GeneratedSqlDmlAst,
+) !void {
+    try validateGeneratedDmlReadSourceBodyAst(ast);
+    const source_range = ast.source_tokens orelse return error.UnsupportedSqlShape;
+    const tokens = parsed_sql.items();
+    if (source_range.start >= source_range.end or source_range.end > tokens.len) return error.UnsupportedSqlShape;
+    const source_start = tokens[source_range.start].source_start;
+    const source_end = tokens[source_range.end - 1].source_end;
+    const sql = parsed_sql.sql();
+    if (source_start >= source_end or source_end > sql.len) return error.UnsupportedSqlShape;
+    var child = tokenized.ParsedSql.initAlloc(alloc, sql[source_start..source_end]) catch |err| switch (err) {
+        error.UnsupportedSqlShape, error.UnexpectedToken => return error.UnsupportedSqlShape,
+        else => return err,
+    };
+    defer child.deinit(alloc);
+    try validateGeneratedChildReadParsedSql(&child);
+}
+
 fn lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
@@ -12598,7 +12629,7 @@ fn lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(
         .insert_select => {
             if (write_kind != .insert_source) return error.UnsupportedSqlShape;
             try validateGeneratedInsertSourceRanges(tokens, ast, end);
-            try validateGeneratedDmlReadSourceBodyAst(ast);
+            try validateGeneratedDmlReadSourceBodyAlloc(alloc, parsed_sql, ast);
             if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
             const source_schema = options.insert_source_schema orelse schema;
             if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
@@ -12910,7 +12941,7 @@ fn insertSourceFromGeneratedDmlAstAlloc(
     const tokens = parsed_sql.items();
     const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     try validateGeneratedInsertSourceRanges(tokens, ast, end);
-    try validateGeneratedDmlReadSourceBodyAst(ast);
+    try validateGeneratedDmlReadSourceBodyAlloc(alloc, parsed_sql, ast);
 
     const parser_context = @import("parser_context.zig");
     var parser_state = parser_context.ParserState{
@@ -12993,12 +13024,7 @@ fn validateGeneratedDmlRelationSourceBodyAlloc(
         else => return err,
     };
     defer child.deinit(alloc);
-    const generated = child.generated_statement orelse return error.UnsupportedSqlShape;
-    if (generated.kind() != .read) return error.UnsupportedSqlShape;
-    switch (generated.ast orelse return error.UnsupportedSqlShape) {
-        .read => {},
-        else => return error.UnsupportedSqlShape,
-    }
+    try validateGeneratedChildReadParsedSql(&child);
 }
 
 fn validateGeneratedDmlRelationSourceBodyAst(ast: generated_parser.GeneratedSqlDmlAst) !void {
@@ -13869,6 +13895,25 @@ fn unsupportedRecursiveMergeMutationForDmlTestAlloc(
 }
 
 const TestPrimaryResolver = test_support.TestPrimaryResolver;
+
+test "sql adapter lower dml validates generated child read payloads" {
+    const alloc = std.testing.allocator;
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records");
+    defer parsed.deinit(alloc);
+
+    try validateGeneratedChildReadParsedSql(&parsed);
+
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |*read| read.projection_tokens = read.source_tokens,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+
+    try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedChildReadParsedSql(&parsed));
+}
 
 test "sql adapter lower dml lowers generated DML AST through typed write plans" {
     const alloc = std.testing.allocator;

@@ -99,9 +99,9 @@ expressions, and lock options, plus simple, correlated, filtered, computed,
 row-value, and `EXISTS` semijoin joined mutation-source forms for both
 `UPDATE` and `DELETE`, including non-recursive CTE write prefixes. `MERGE`
 statements now validate generated target, source, and
-`ON`/arm ranges, retain lightweight generated read-body payloads for `USING`
-relation source bodies, and parse generated child-read wrappers for those
-sources before direct merge-plan lowering, with generated-direct coverage for
+`ON`/arm ranges, retain generated read-body payloads for `USING` relation
+source bodies, and parse and validate complete generated child-read ASTs for
+those sources before direct merge-plan lowering, with generated-direct coverage for
 multiple matched/not-matched arms, conditional arms, matched
 `DELETE`, matched/not-matched `DO NOTHING`, expression-filtered matched
 `UPDATE`, filtered not-matched `INSERT`, `RETURNING`, and non-recursive CTE
@@ -415,6 +415,11 @@ Unsupported DDL remains on the existing parser until
    Generated-DML-specific coverage now calls the direct generated lowerer
    without retrying the classifier path, so promoted generated DML cases fail
    closed if their AST-to-plan contract regresses.
+   Direct DML relation-source paths now parse nested generated child-read ASTs
+   and validate them through the shared generated read-AST contract before typed
+   write-plan lowering, so `INSERT ... SELECT`, relation-source mutation paths,
+   and `MERGE ... USING` wrappers do not depend only on lightweight range
+   payload checks.
    Incomplete migrated DML clause-boundary shapes for insert, update, delete,
    truncate, and merge now use generated fail-closed diagnostics instead of
    classifier fallback.
