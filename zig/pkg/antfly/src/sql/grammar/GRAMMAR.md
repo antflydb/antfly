@@ -371,7 +371,9 @@ PostgreSQL-style unique, covering, partial, method, element-list, and option
 clauses with generated-first AST-to-plan parity validation. Generated
 `ALTER TABLE` ASTs now retain target-table and operation-tail ranges and
 generated-first ALTER TABLE planning validates those ranges before lowering
-through the typed DDL planner for covered add/drop/rename/validate operations.
+through the typed DDL planner for covered add/drop/rename/validate operations
+and generated-owned add-primary-key, add-unique, add-foreign-key, add-check,
+and add-period constraint families.
 Incomplete covered DDL clause-boundary shapes for create-table, create-index,
 alter-table, and drop-table now use generated fail-closed diagnostics instead
 of classifier fallback.
@@ -433,6 +435,10 @@ Unsupported DDL remains on the existing parser until
    through their recursive CTE predicates validate the generated command body
    without requiring an explicit generated `FROM`/`USING` relation-source
    payload.
+   Generated DML AST kind also owns parsed-statement write-family
+   classification for generated-covered writes, preserves recursive CTE write
+   metadata at the parsed boundary, and fails closed when retained generated
+   kind metadata disagrees with the legacy classifier.
    Incomplete migrated DML clause-boundary shapes for insert, update, delete,
    truncate, and merge now use generated fail-closed diagnostics instead of
    classifier fallback.
@@ -530,6 +536,9 @@ Unsupported DDL remains on the existing parser until
    per-branch condition/result expression lists.
    The read-plan lowering context now dispatches through retained generated
    read ASTs when the generated parser covers the statement, and generated read
+   AST kind owns parsed-statement read-family classification for
+   generated-covered reads, failing closed when retained generated kind
+   metadata disagrees with the legacy classifier. Generated read
    ASTs have a validated wrapper into the current typed read lowerer for
    representative covered read plans
    that rejects malformed generated range payloads, including owned
