@@ -3200,11 +3200,6 @@ fn generatedCreateIndexUsesRuntimeBoundary(tokens: []const grammar.Token, ast: g
     const end = generatedStatementEnd(tokens, ast.statement_span) orelse return false;
     const elements_range = ast.index_elements_tokens orelse return false;
     if (!generatedRangeWithinStatement(elements_range, end)) return false;
-    if (generatedRangeHasKind(tokens, elements_range, .lparen) or
-        generatedRangeHasKind(tokens, elements_range, .rparen))
-    {
-        return false;
-    }
     if (ast.index_where_tokens != null) return false;
     return true;
 }
@@ -3607,10 +3602,11 @@ fn createIndexPlanFromGeneratedAstAlloc(
     }
     if (index != end) return error.UnsupportedSqlShape;
 
-    var pos: usize = 0;
-    var plan = try parseCreateIndexPlanAlloc(alloc, tokens[index_keyword..end], &pos, ast.unique, options);
+    var pos: usize = index_keyword;
+    var plan = try parseCreateIndexPlanAlloc(alloc, tokens, &pos, ast.unique, options);
     errdefer plan.deinit(alloc);
     if (plan.unique != ast.unique) return error.UnsupportedSqlShape;
+    if (!generatedStatementConsumedThrough(tokens, end, pos)) return error.UnsupportedSqlShape;
     return plan;
 }
 
@@ -3738,6 +3734,14 @@ fn generatedStatementEnd(tokens: []const grammar.Token, statement_span: token_mo
 fn generatedStatementTail(tokens: []const grammar.Token, statement_span: token_mod.SourceSpan) ?[]const grammar.Token {
     const end = generatedStatementEnd(tokens, statement_span) orelse return null;
     return tokens[1..end];
+}
+
+fn generatedStatementConsumedThrough(tokens: []const grammar.Token, end: usize, pos: usize) bool {
+    if (pos == end) return true;
+    return end < tokens.len and
+        tokens[end].kind == .semicolon and
+        pos == end + 1 and
+        pos == tokens.len;
 }
 
 pub fn closeCursorPortalPlanFromSyntaxAlloc(

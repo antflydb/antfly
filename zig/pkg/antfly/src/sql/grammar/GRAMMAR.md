@@ -907,17 +907,17 @@ Generated grammar work needs evidence at multiple levels:
   back to legacy DDL probing.
   Runtime DDL lowering now dispatches generated session statements, prepared
   statements, graph DDL, database/schema/extension catalog DDL, generated
-  `CREATE TABLE`, `DROP TABLE`, `DROP INDEX`, simple generated
-  non-partial `CREATE INDEX`, and single-operation generated `ALTER TABLE
-  ADD/DROP/RENAME COLUMN` plus `VALIDATE CONSTRAINT` through the generated
-  AST-to-plan boundary; generated session lowering preserves catalog
-  setting/search-path plans and adapter noops while failing closed when retained
+  `CREATE TABLE`, `DROP TABLE`, `DROP INDEX`, non-partial generated
+  `CREATE INDEX`, and single-operation generated `ALTER TABLE ADD/DROP/RENAME
+  COLUMN` plus `VALIDATE CONSTRAINT` through the generated AST-to-plan
+  boundary; generated session lowering preserves catalog setting/search-path
+  plans and adapter noops while failing closed when retained
   command/name/value metadata is malformed.
   Remaining rich DDL compatibility debt is limited to generated metadata that
-  still cannot represent every semantic subshape natively, especially
-  partial/expression index predicates/elements, serial pseudo-type table
-  allocation, row-security ALTER routing, multi-operation ALTER statements,
-  and broader ALTER/check expression payloads.
+  still cannot represent every semantic subshape natively, especially partial
+  index predicates, serial pseudo-type table allocation, row-security ALTER
+  routing, multi-operation ALTER statements, and broader ALTER/check
+  expression payloads.
   Simple DML has generated field-level checks for update and truncate body
   ranges, direct generated AST-to-plan parity for truncate mutation-source
   plans, direct resolver-free generated AST-to-plan coverage for supported
