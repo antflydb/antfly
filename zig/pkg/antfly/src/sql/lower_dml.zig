@@ -12361,6 +12361,40 @@ fn lowerGeneratedInsertSourceForDmlTestAlloc(
     return try insertSourceFromGeneratedDmlAstAlloc(alloc, &parsed_sql, dml_ast, schema, params, options);
 }
 
+fn lowerGeneratedUpdateJoinedSourceForDmlTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+) !plan_mod.LoweredJoinedMutationSource {
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    const generated_raw = parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    const dml_ast = switch (generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .dml => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    return try updateJoinedSourceFromGeneratedDmlAstAlloc(alloc, &parsed_sql, dml_ast, schema, params, options);
+}
+
+fn lowerGeneratedDeleteJoinedSourceForDmlTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+) !plan_mod.LoweredJoinedMutationSource {
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    const generated_raw = parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    const dml_ast = switch (generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .dml => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    return try deleteJoinedSourceFromGeneratedDmlAstAlloc(alloc, &parsed_sql, dml_ast, schema, params, options);
+}
+
 fn lowerGeneratedMergeForDmlTestAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
@@ -13753,6 +13787,7 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
     const cross_source_options = plan_mod.LowerWritePlanOptions{
         .unique_resolver = resolver_ctx.resolver(),
         .row_claim = claim,
+        .joined_source_schema = source_schema,
         .insert_source_schema = source_schema,
         .sync_level = .full_text,
     };
@@ -14006,6 +14041,32 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
     try std.testing.expect(generated_joined_update.mutation.req.join.left.row_claim != null);
     try std.testing.expectEqual(@as(usize, 1), generated_joined_update.mutation.req.returning.len);
 
+    var generated_rich_joined_update = try lowerGeneratedUpdateJoinedSourceForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET quantity = source.archive_quantity + 1, status = lower(source.archive_status) FROM archived_records AS source WHERE usage_records.source_id = source.archive_id AND lower(source.archive_status) LIKE SOME(ARRAY['ready%', 'queued%']) FOR UPDATE SKIP LOCKED RETURNING id, quantity + 1 AS next_quantity, lower(source.archive_status) AS source_status_key",
+        schema,
+        &.{},
+        cross_source_options,
+    );
+    defer generated_rich_joined_update.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", generated_rich_joined_update.target_table_name);
+    try std.testing.expectEqualStrings("archived_records", generated_rich_joined_update.source_table_name);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, generated_rich_joined_update.sync_level);
+    try std.testing.expectEqual(@as(usize, 1), generated_rich_joined_update.mutation.req.join.on.len);
+    try std.testing.expectEqualStrings("source_id", generated_rich_joined_update.mutation.req.join.on[0].left_field);
+    try std.testing.expectEqualStrings("archive_id", generated_rich_joined_update.mutation.req.join.on[0].right_field);
+    try std.testing.expectEqual(@as(usize, 0), generated_rich_joined_update.mutation.req.source_assignments.len);
+    try std.testing.expectEqual(@as(usize, 2), generated_rich_joined_update.mutation.req.patch_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, generated_rich_joined_update.mutation.req.patch_expressions[0].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, generated_rich_joined_update.mutation.req.patch_expressions[1].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), generated_rich_joined_update.mutation.req.join.right.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_or, generated_rich_joined_update.mutation.req.join.right.expression_predicates[0].lhs.kind);
+    try std.testing.expect(generated_rich_joined_update.mutation.req.join.left.row_claim.?.skip_locked);
+    try std.testing.expectEqual(@as(usize, 1), generated_rich_joined_update.mutation.req.returning.len);
+    try std.testing.expectEqual(@as(usize, 2), generated_rich_joined_update.mutation.req.returning_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, generated_rich_joined_update.mutation.req.returning_expressions[0].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, generated_rich_joined_update.mutation.req.returning_expressions[1].expression.kind);
+
     var parsed_generated_joined_delete = try tokenized.ParsedSql.initAlloc(
         alloc,
         "DELETE FROM usage_records USING usage_records AS source WHERE usage_records.id = source.id FOR UPDATE RETURNING id",
@@ -14031,6 +14092,27 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
     try std.testing.expectEqual(@as(usize, 1), generated_joined_delete.mutation.req.join.on.len);
     try std.testing.expect(generated_joined_delete.mutation.req.join.left.row_claim != null);
     try std.testing.expectEqual(@as(usize, 1), generated_joined_delete.mutation.req.returning.len);
+
+    var generated_rich_joined_delete = try lowerGeneratedDeleteJoinedSourceForDmlTestAlloc(
+        alloc,
+        "DELETE FROM usage_records USING archived_records AS source WHERE usage_records.source_id = source.archive_id AND lower(source.archive_status) LIKE SOME(ARRAY['stale%', 'expired%']) FOR UPDATE RETURNING id, lower(source.archive_status) AS deleted_source_status_key",
+        schema,
+        &.{},
+        cross_source_options,
+    );
+    defer generated_rich_joined_delete.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", generated_rich_joined_delete.target_table_name);
+    try std.testing.expectEqualStrings("archived_records", generated_rich_joined_delete.source_table_name);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, generated_rich_joined_delete.sync_level);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, generated_rich_joined_delete.mutation.req.kind);
+    try std.testing.expectEqual(@as(usize, 1), generated_rich_joined_delete.mutation.req.join.on.len);
+    try std.testing.expectEqualStrings("source_id", generated_rich_joined_delete.mutation.req.join.on[0].left_field);
+    try std.testing.expectEqualStrings("archive_id", generated_rich_joined_delete.mutation.req.join.on[0].right_field);
+    try std.testing.expectEqual(@as(usize, 1), generated_rich_joined_delete.mutation.req.join.right.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_or, generated_rich_joined_delete.mutation.req.join.right.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), generated_rich_joined_delete.mutation.req.returning.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_rich_joined_delete.mutation.req.returning_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, generated_rich_joined_delete.mutation.req.returning_expressions[0].expression.kind);
 
     var parsed_generated_merge = try tokenized.ParsedSql.initAlloc(
         alloc,
