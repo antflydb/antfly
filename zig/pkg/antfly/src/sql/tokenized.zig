@@ -735,7 +735,11 @@ fn parseStatement(
                 return .{ .read = .{ .kind = kind, .raw = raw_statement } };
             } else return .{ .unknown = raw_statement },
             .graph => return .{ .ddl = .{ .raw = raw_statement } },
-            .unsupported => |kind| if (!generatedUnsupportedUsesLegacyPlanner(kind)) return .{ .unsupported = .{ .kind = kind, .raw = raw_statement } },
+            .unsupported => |kind| {
+                if (generatedUnsupportedUsesDdlPlanBoundary(kind)) return .{ .ddl = .{ .raw = raw_statement } };
+                if (kind == .explain) return .{ .explain = parseExplainStatement(raw_statement, tokenized_sql.items()) catch .{ .raw = raw_statement } };
+                return .{ .unsupported = .{ .kind = kind, .raw = raw_statement } };
+            },
             .other => {},
         }
     }
@@ -899,7 +903,7 @@ fn generatedSqlAggregateFunctionName(token: Token) bool {
         token.matchesKeywordTag(.string_agg);
 }
 
-fn generatedUnsupportedUsesLegacyPlanner(kind: generated_parser.GeneratedSqlUnsupportedKind) bool {
+fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUnsupportedKind) bool {
     return switch (kind) {
         .alter_policy,
         .alter_publication,
@@ -921,7 +925,6 @@ fn generatedUnsupportedUsesLegacyPlanner(kind: generated_parser.GeneratedSqlUnsu
         .drop_publication,
         .drop_subscription,
         .drop_trigger,
-        .explain,
         .fetch,
         .grant,
         .listen,
@@ -935,6 +938,7 @@ fn generatedUnsupportedUsesLegacyPlanner(kind: generated_parser.GeneratedSqlUnsu
         .unlisten,
         .vacuum,
         => true,
+        .explain,
         .alter_foreign_table,
         .alter_materialized_view,
         .alter_rule,
@@ -1730,10 +1734,15 @@ test "sql adapter parsed sql owns typed statement variants" {
             },
             else => return error.TestUnexpectedResult,
         }
-        if (generatedUnsupportedUsesLegacyPlanner(case.kind)) {
+        if (generatedUnsupportedUsesDdlPlanBoundary(case.kind)) {
             switch (parsed.statement) {
-                .unsupported => return error.TestUnexpectedResult,
-                else => {},
+                .ddl => {},
+                else => return error.TestUnexpectedResult,
+            }
+        } else if (case.kind == .explain) {
+            switch (parsed.statement) {
+                .explain => {},
+                else => return error.TestUnexpectedResult,
             }
         } else {
             switch (parsed.statement) {

@@ -15120,7 +15120,7 @@ test "sql adapter generated row policy unsupported AST lowers to catalog plans" 
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_subject));
 }
 
-test "sql adapter generated utility unsupported AST lowers to legacy catalog plans" {
+test "sql adapter generated utility unsupported AST lowers to typed catalog plans" {
     const alloc = std.testing.allocator;
 
     const cases = [_]struct {

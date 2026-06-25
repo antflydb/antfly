@@ -291,12 +291,16 @@ family, and `ParsedSql` now requires generated-parser
 success for `CREATE GRAPH` and `ALTER GRAPH` statement heads instead of falling
 back to the legacy DDL classifier on malformed graph DDL. The generated
 facade now returns closed statement-family nodes for the covered families and
-explicit unsupported statement nodes for seed `ANALYZE`, bulk I/O `COPY`,
+generated unsupported AST nodes for seed `ANALYZE`, bulk I/O `COPY`,
 maintenance `VACUUM`/`REINDEX`, utility/control statements such as `CLUSTER`,
 `COMMENT`, `GRANT`/`REVOKE`, `LISTEN`/`NOTIFY`, `LOCK`, `CALL`,
 `CHECKPOINT`, `LOAD`, `REFRESH`, `SECURITY LABEL`, and `UNLISTEN`, plus
 simple cursor and transaction-control statements such as `CLOSE`, `DECLARE`,
-`FETCH`, `MOVE`, `SAVEPOINT`, and `RELEASE`, plus simple `EXPLAIN` forms with stable reason metadata; full production AST construction
+`FETCH`, `MOVE`, `SAVEPOINT`, and `RELEASE`, plus simple `EXPLAIN` forms with stable reason metadata. Generated
+unsupported AST heads that Antfly already plans through typed catalog/control
+planners now route to the parsed DDL family explicitly; generated `EXPLAIN`
+routes to the parsed explain family explicitly; and unsupported heads without
+typed plans route to terminal parsed unsupported statements. Full production AST construction
 remains the next migration boundary for larger DDL, query, DML, and Antfly
 extension families.
 Unsupported generated diagnostics also cover PostgreSQL materialized-view DDL
@@ -343,9 +347,9 @@ Generated unsupported nodes now also participate in the parsed statement
 boundary: generated-covered unsupported heads that are not intentionally
 supported by the existing catalog planner become terminal parsed unsupported
 statements and fail closed before legacy DDL probing. Generated unsupported
-heads that already have legacy catalog/runtime support stay on an explicit
-compatibility allowlist until their generated AST-to-plan implementations are
-promoted; unsupported materialized-view variants such as
+heads that already have typed catalog/runtime support now enter the parsed DDL
+family directly and are accepted only through the validated generated
+unsupported boundary; unsupported materialized-view variants such as
 `ALTER MATERIALIZED VIEW` are intentionally outside that allowlist until Antfly
 has a typed plan for them.
 
@@ -925,9 +929,11 @@ variants for:
   `EXPLAIN ANALYZE` forms with command spans, subject ranges where present,
   and stable unsupported reason metadata. Parsed SQL now distinguishes
   generated unsupported statements from ordinary DDL for unsupported heads that
-  are not on the legacy-supported compatibility allowlist, so lowerers fail
-  closed instead of trying a generic DDL parse for those shapes; unsupported
-  materialized-view variants such as `ALTER MATERIALIZED VIEW` are part of that
+  have no typed catalog/control plan, so lowerers fail closed instead of trying
+  a generic DDL parse for those shapes. Generated unsupported AST heads that
+  already have typed catalog/control plans enter the parsed DDL family and are
+  accepted only through the validated generated unsupported boundary; unsupported
+  materialized-view variants such as `ALTER MATERIALIZED VIEW` are part of the
   fail-closed path rather than the materialized-view catalog boundary.
 
 Later statement-family cutovers should add closed variants for:
