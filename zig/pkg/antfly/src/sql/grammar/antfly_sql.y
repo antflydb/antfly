@@ -442,6 +442,7 @@ select_statement:
 
 distinct_clause_opt:
     /* empty */
+  | ALL
   | DISTINCT
   | DISTINCT ON LPAREN expression_list RPAREN
   ;
@@ -624,8 +625,7 @@ assignment:
   ;
 
 select_list:
-    STAR
-  | select_item_list
+    select_item_list
   ;
 
 select_item_list:
@@ -637,6 +637,7 @@ select_item:
     expression
   | expression AS identifier_name
   | expression identifier_name
+  | STAR
   | qualified_name DOT STAR
   | window_function_expression
   | window_function_expression AS identifier_name
@@ -964,6 +965,7 @@ execute_argument_list_opt:
 function_argument_list_opt:
     /* empty */
   | STAR
+  | DISTINCT STAR
   | function_argument_list
   ;
 
@@ -1168,6 +1170,7 @@ primary_expression:
   | PLACEHOLDER
   | LPAREN expression RPAREN
   | ARRAY LBRACKET array_element_list_opt RBRACKET
+  | LBRACKET array_element_list_opt RBRACKET
   | CAST LPAREN expression AS type_name RPAREN
   | CASE case_when_list case_else_opt END
   | EXISTS LPAREN read_statement RPAREN

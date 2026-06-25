@@ -3692,6 +3692,7 @@ fn generatedReadProjectionStart(
     ast: *GeneratedSqlReadAst,
 ) usize {
     const distinct_index = select_index + 1;
+    if (distinct_index < body_end and tokens[distinct_index].matchesKeywordTag(.all)) return distinct_index + 1;
     if (distinct_index >= body_end or !tokens[distinct_index].matchesKeywordTag(.distinct)) return distinct_index;
     if (distinct_index + 2 < body_end and tokens[distinct_index + 1].matchesKeywordTag(.on) and tokens[distinct_index + 2].kind == .lparen) {
         if (findMatchingParen(tokens, distinct_index + 2, body_end)) |close| {
@@ -4096,6 +4097,7 @@ fn generatedReadProjectionStartInRange(
     distinct_tokens: *?GeneratedSqlTokenRange,
 ) usize {
     const distinct_index = select_index + 1;
+    if (distinct_index < body_end and tokens[distinct_index].matchesKeywordTag(.all)) return distinct_index + 1;
     if (distinct_index >= body_end or !tokens[distinct_index].matchesKeywordTag(.distinct)) return distinct_index;
     if (distinct_index + 2 < body_end and tokens[distinct_index + 1].matchesKeywordTag(.on) and tokens[distinct_index + 2].kind == .lparen) {
         if (findMatchingParen(tokens, distinct_index + 2, body_end)) |close| {
@@ -5071,6 +5073,7 @@ fn buildGeneratedExpressionAstInPlace(
 ) anyerror!void {
     ast.* = GeneratedSqlExpressionAst{ .tokens = range };
     errdefer ast.deinit(alloc);
+    if (generatedQualifiedStarExpression(tokens, range)) return;
     if (generatedSubqueryExpressionInnerRange(tokens, range)) |inner_range| {
         ast.kind = .subquery;
         ast.inner_tokens = inner_range;
@@ -5365,6 +5368,7 @@ fn buildGeneratedCaseBranchLists(
 }
 
 fn generatedExpressionKindForRange(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?GeneratedSqlExpressionKind {
+    if (generatedQualifiedStarExpression(tokens, range)) return .token_range;
     if (generatedSubqueryExpressionInnerRange(tokens, range) != null) return .subquery;
     if (generatedWrappedExpressionInnerRange(tokens, range) != null) return .grouped;
     if (generatedCastExpression(tokens, range) != null) return .cast;
@@ -5378,6 +5382,15 @@ fn generatedExpressionKindForRange(tokens: []const token_mod.Token, range: Gener
     if (generatedFunctionCallExpression(tokens, range) != null) return .function_call;
     if (generatedArrayConstructorExpression(tokens, range) != null) return .array_constructor;
     return null;
+}
+
+fn generatedQualifiedStarExpression(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) bool {
+    if (range.start >= range.end or range.end > tokens.len) return false;
+    if (range.end == range.start + 2) {
+        return tokens[range.start].kind == .identifier and
+            tokens[range.start + 1].kind == .star;
+    }
+    return false;
 }
 
 const GeneratedBetweenBoundExpressionRanges = struct {
@@ -6415,6 +6428,8 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .update }, (try parseSqlAlloc(alloc, "WITH ready_sources AS (SELECT source_pk, source_status FROM source_records WHERE source_status = 'ready') UPDATE usage_records SET status = source.source_status FROM ready_sources AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .merge }, (try parseSqlAlloc(alloc, "WITH source_rows AS (SELECT id, status, amount FROM usage_records WHERE id IN ('cte-merge-source-update', 'cte-merge-source-insert')) MERGE INTO usage_records AS target USING source_rows AS source ON target.id = source.status WHEN MATCHED THEN UPDATE SET status = 'cte-merged', amount = source.amount WHEN NOT MATCHED AND source.id = 'cte-merge-source-insert' THEN INSERT (id, status, amount) VALUES (source.status, 'cte-inserted', source.amount) RETURNING target.id, target.status, target.amount")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .read = .query }, (try parseSqlAlloc(alloc, "SELECT id FROM usage_records")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .read = .aggregate }, (try parseSqlAlloc(alloc, "SELECT COUNT(DISTINCT *) AS row_count FROM usage_records")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .read = .aggregate }, (try parseSqlAlloc(alloc, "SELECT percentile_cont([0.25, 0.75]) WITHIN GROUP (ORDER BY amount) AS bad FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .read = .cte }, (try parseSqlAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .read_row_lock }, (try parseSqlAlloc(alloc, "SELECT id FROM usage_records FOR UPDATE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .read_row_lock }, (try parseSqlAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows FOR SHARE NOWAIT")).statement);
@@ -7298,18 +7313,18 @@ test "generated SQL parser facade builds read AST spans" {
     switch (qualified_star_projection_read_result.ast.?) {
         .read => |read| {
             try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 4 }, read.projection_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 3 }, read.projection_tokens.?);
             try std.testing.expectEqual(@as(usize, 1), read.projection_items.count);
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 4 }, read.projection_items.items[0]);
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 4 }, read.projection_items.expression_items[0]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 3 }, read.projection_items.items[0]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 3 }, read.projection_items.expression_items[0]);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.projection_items.expressions[0].kind);
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 4 }, read.projection_items.expressions[0].tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 3 }, read.projection_items.expressions[0].tokens.?);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.projection_first_expression.kind);
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 4 }, read.projection_first_expression.tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 3 }, read.projection_first_expression.tokens.?);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.projection_last_expression.kind);
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 4 }, read.projection_last_expression.tokens.?);
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 8 }, read.source_tokens.?);
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 12 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 3 }, read.projection_last_expression.tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 7 }, read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 11 }, read.where_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -7319,18 +7334,52 @@ test "generated SQL parser facade builds read AST spans" {
     switch (table_qualified_star_projection_read_result.ast.?) {
         .read => |read| {
             try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 4 }, read.projection_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 3 }, read.projection_tokens.?);
             try std.testing.expectEqual(@as(usize, 1), read.projection_items.count);
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 4 }, read.projection_items.items[0]);
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 4 }, read.projection_items.expression_items[0]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 3 }, read.projection_items.items[0]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 3 }, read.projection_items.expression_items[0]);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.projection_items.expressions[0].kind);
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 4 }, read.projection_items.expressions[0].tokens.?);
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.source_tokens.?);
-            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 10 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 3 }, read.projection_items.expressions[0].tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 9 }, read.where_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expectError(error.UnsupportedSqlShape, parseSqlAlloc(alloc, "SELECT docs. FROM docs"));
+
+    const star_with_extra_projection_read_sql = "SELECT *, lower(status) AS status_key, metadata->>'source' AS source FROM usage_records ORDER BY id ASC LIMIT 5";
+    const star_with_extra_projection_read_result = try parseSqlAlloc(alloc, star_with_extra_projection_read_sql);
+    switch (star_with_extra_projection_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 15 }, read.projection_tokens.?);
+            try std.testing.expectEqual(@as(usize, 3), read.projection_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.projection_items.items[0]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 9 }, read.projection_items.items[1]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 15 }, read.projection_items.items[2]);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.projection_items.expressions[0].kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, read.projection_items.expressions[0].tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.function_call, read.projection_items.expressions[1].kind);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.json_text_access, read.projection_items.expressions[2].kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 16, .end = 17 }, read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 19, .end = 21 }, read.order_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 22, .end = 23 }, read.limit_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const select_all_modifier_read_sql = "SELECT ALL _id FROM docs WHERE _id = 'doc:a'";
+    const select_all_modifier_read_result = try parseSqlAlloc(alloc, select_all_modifier_read_sql);
+    switch (select_all_modifier_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expect(read.distinct_tokens == null);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, read.projection_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 9 }, read.where_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 
     const graph_source_read_sql = "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b') AS gm";
     var graph_source_tokens = try lexer.tokenizeAlloc(alloc, graph_source_read_sql);

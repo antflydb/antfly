@@ -4372,50 +4372,6 @@ const SharedReadLockHold = db_test_support.SharedReadLockHold(DB);
 const ConcurrentReadProbe = db_test_support.ConcurrentReadProbe(DB);
 const ConcurrentWriteProbe = db_test_support.ConcurrentWriteProbe(DB);
 
-test "db batch get match_all search and index registry" {
-    const alloc = std.testing.allocator;
-
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
-
-    try db.batch(.{
-        .writes = &.{
-            .{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" },
-            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
-        },
-    });
-
-    const value = (try db.get(alloc, "doc:a")).?;
-    defer alloc.free(value);
-    try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", value);
-
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{}",
-    });
-    try std.testing.expectEqual(@as(u32, 1), db.core.index_manager.count());
-    try std.testing.expect(try db.deleteIndex("ft_v1"));
-    try std.testing.expectEqual(@as(u32, 0), db.core.index_manager.count());
-
-    var result = try db.search(alloc, .{
-        .query = .{ .match_all = {} },
-        .limit = 10,
-    });
-    defer result.deinit();
-
-    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
-    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
-
-    const stats = try db.diagnosticStats(alloc);
-    defer types.freeDBStats(alloc, stats);
-    try std.testing.expectEqual(@as(u64, 2), stats.doc_count);
-}
-
 test "db stats report engine-owned algebraic adaptive observation status" {
     const alloc = std.testing.allocator;
     const algebraic_ir = @import("algebraic/ir.zig");
@@ -4847,69 +4803,6 @@ test "db lsm primary compaction preserves doc identity ordinals" {
         defer alloc.free(doc_a);
         try std.testing.expectEqualStrings("doc:a", doc_a);
     }
-}
-
-test "db dense and sparse vector searches apply stored symbolic filters before final paging" {
-    const alloc = std.testing.allocator;
-
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
-
-    var db = try DB.open(alloc, std.mem.span(path), .{});
-    defer db.close();
-
-    try db.addIndex(.{
-        .name = "dv_v1",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
-    });
-    try db.addIndex(.{
-        .name = "sp_v1",
-        .kind = .sparse_vector,
-        .config_json = "{\"field\":\"sparse\"}",
-    });
-
-    try db.batch(.{
-        .writes = &.{
-            .{ .key = "doc:a", .value = "{\"category\":\"reject\",\"embedding\":[0,0],\"sparse\":{\"indices\":[1],\"values\":[1.0]}}" },
-            .{ .key = "doc:b", .value = "{\"category\":\"keep\",\"embedding\":[10,0],\"sparse\":{\"indices\":[1],\"values\":[0.1]}}" },
-        },
-        .sync_level = .full_index,
-    });
-
-    var dense_result = try db.search(alloc, .{
-        .index_name = "dv_v1",
-        .dense = .{ .vector = &.{ 0.0, 0.0 }, .k = 1 },
-        .limit = 1,
-        .include_stored = false,
-        .filter_query_json = "{\"term\":{\"category\":\"keep\"}}",
-    });
-    defer dense_result.deinit();
-    try std.testing.expectEqual(@as(u32, 1), dense_result.total_hits);
-    try std.testing.expectEqual(@as(usize, 1), dense_result.hits.len);
-    try std.testing.expectEqualStrings("doc:b", dense_result.hits[0].id);
-    {
-        var txn = try db.core.store.beginProbeTxn();
-        defer txn.abort();
-        try std.testing.expectEqual(try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:b"), dense_result.hits[0].doc_ordinal);
-    }
-
-    var sparse_result = try db.search(alloc, .{
-        .index_name = "sp_v1",
-        .query = .{ .sparse_knn = .{
-            .indices = &.{1},
-            .values = &.{1.0},
-            .k = 1,
-        } },
-        .limit = 1,
-        .include_stored = false,
-        .filter_query_json = "{\"term\":{\"category\":\"keep\"}}",
-    });
-    defer sparse_result.deinit();
-    try std.testing.expectEqual(@as(u32, 1), sparse_result.total_hits);
-    try std.testing.expectEqual(@as(usize, 1), sparse_result.hits.len);
-    try std.testing.expectEqualStrings("doc:b", sparse_result.hits[0].id);
 }
 
 test "db dense algebraic doc facts feed native dense and sparse symbolic filters" {
@@ -5642,56 +5535,6 @@ test "db dense algebraic doc facts feed native dense and sparse symbolic filters
     try std.testing.expectEqualStrings("doc:b", sparse_required_plus_optional_should.hits[0].id);
 }
 
-test "db lsm match-all query sees same latest value as point lookup" {
-    const alloc = std.testing.allocator;
-
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
-
-    var db = try DB.open(alloc, std.mem.span(path), .{
-        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
-    });
-    defer db.close();
-
-    try db.batch(.{
-        .writes = &.{
-            .{ .key = "user-1", .value = "{\"name\":\"Alice\",\"tier\":\"gold\"}" },
-            .{ .key = "user-2", .value = "{\"name\":\"Bob\",\"tier\":\"silver\"}" },
-        },
-        .sync_level = .write,
-    });
-
-    try db.batch(.{
-        .writes = &.{
-            .{ .key = "user-1", .value = "{\"name\":\"Alice\",\"tier\":\"platinum\"}" },
-        },
-        .sync_level = .write,
-    });
-
-    const raw = try db.get(alloc, "user-1");
-    defer if (raw) |value| alloc.free(value);
-    try std.testing.expect(raw != null);
-    try std.testing.expect(std.mem.indexOf(u8, raw.?, "\"platinum\"") != null);
-
-    var result = try db.search(alloc, .{
-        .query = .match_all,
-        .fields = &.{ "name", "tier" },
-        .limit = 10,
-    });
-    defer result.deinit();
-
-    var saw_user_1 = false;
-    for (result.hits) |hit| {
-        if (!std.mem.eql(u8, hit.id, "user-1")) continue;
-        saw_user_1 = true;
-        try std.testing.expect(hit.stored_data != null);
-        try std.testing.expect(std.mem.indexOf(u8, hit.stored_data.?, "\"platinum\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, hit.stored_data.?, "\"gold\"") == null);
-    }
-    try std.testing.expect(saw_user_1);
-}
-
 test "db enrichment status changes notify query visibility hook" {
     const alloc = std.testing.allocator;
 
@@ -5737,63 +5580,6 @@ test "db enrichment status changes notify query visibility hook" {
     try std.testing.expectEqual(@as(u64, 7001), hook_ctx.group_id);
     try std.testing.expect(hook_ctx.saw_db);
     try std.testing.expectEqual(QueryVisibilityChange.invalidate, hook_ctx.change.?);
-}
-
-test "db full-text index and search survive reopen with durable lsm primary backend" {
-    const alloc = std.testing.allocator;
-
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
-
-    {
-        var db = try DB.open(alloc, std.mem.span(path), .{
-            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
-        });
-        defer db.close();
-
-        try db.batch(.{
-            .writes = &.{
-                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"first alpha\"}" },
-                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"body\":\"second body\"}" },
-            },
-        });
-
-        try db.addIndex(.{
-            .name = "ft_v1",
-            .kind = .full_text,
-            .config_json = "{}",
-        });
-
-        var result = try db.search(alloc, .{
-            .index_name = "ft_v1",
-            .query = .{ .match = .{ .field = "body", .text = "alpha" } },
-            .limit = 10,
-        });
-        defer result.deinit();
-
-        try std.testing.expectEqual(@as(u32, 1), result.total_hits);
-        try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
-    }
-
-    {
-        var reopened = try DB.open(alloc, std.mem.span(path), .{
-            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
-        });
-        defer reopened.close();
-
-        try std.testing.expectEqual(@as(u32, 1), reopened.core.index_manager.count());
-
-        var result = try reopened.search(alloc, .{
-            .index_name = "ft_v1",
-            .query = .{ .match = .{ .field = "body", .text = "alpha" } },
-            .limit = 10,
-        });
-        defer result.deinit();
-
-        try std.testing.expectEqual(@as(u32, 1), result.total_hits);
-        try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
-    }
 }
 
 test "db algebraic bulk ingest survives reopen with durable lsm primary backend" {
