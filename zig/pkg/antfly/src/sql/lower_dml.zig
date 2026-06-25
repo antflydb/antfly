@@ -12567,32 +12567,7 @@ fn validateGeneratedDmlReadSourceBodyAst(
 ) !void {
     const source_range = ast.source_tokens orelse return error.UnsupportedSqlShape;
     const source_read = ast.source_read orelse return error.UnsupportedSqlShape;
-    if (source_read.tokens.start != source_range.start or source_read.tokens.end != source_range.end) return error.UnsupportedSqlShape;
-    if (source_read.kind != .query and source_read.kind != .aggregate and source_read.kind != .join and source_read.kind != .window and source_read.kind != .set_operation and source_read.kind != .cte) return error.UnsupportedSqlShape;
-    if (source_read.wrapper_projection_star) return error.UnsupportedSqlShape;
-    if (!parsedSourceReadStartsWithSelect(tokens, source_range)) return error.UnsupportedSqlShape;
-    const projection_range = source_read.projection_tokens orelse return error.UnsupportedSqlShape;
-    if (projection_range.start <= source_range.start or projection_range.end > source_range.end or projection_range.start >= projection_range.end) return error.UnsupportedSqlShape;
-    if (source_read.source_tokens) |read_source_range| {
-        if (read_source_range.start <= projection_range.end or read_source_range.end > source_range.end or read_source_range.start >= read_source_range.end) return error.UnsupportedSqlShape;
-        if (read_source_range.start == 0 or !tokens[read_source_range.start - 1].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
-    }
-    if (source_read.where_tokens) |where_range| {
-        if (where_range.start <= source_range.start or where_range.end > source_range.end or where_range.start >= where_range.end) return error.UnsupportedSqlShape;
-        if (where_range.start == 0 or !tokens[where_range.start - 1].matchesKeywordTag(.where)) return error.UnsupportedSqlShape;
-    }
-    if (source_read.set_operation_tokens) |set_operation_range| {
-        if (set_operation_range.start <= source_range.start or set_operation_range.end > source_range.end or set_operation_range.start >= set_operation_range.end) return error.UnsupportedSqlShape;
-        if (source_read.kind != .set_operation) return error.UnsupportedSqlShape;
-        if (!tokens[set_operation_range.start].matchesKeywordTag(.@"union") and
-            !tokens[set_operation_range.start].matchesKeywordTag(.intersect) and
-            !tokens[set_operation_range.start].matchesKeywordTag(.except))
-        {
-            return error.UnsupportedSqlShape;
-        }
-    } else if (source_read.kind == .set_operation) {
-        return error.UnsupportedSqlShape;
-    }
+    try validateGeneratedDmlReadBodyLayout(tokens, source_range, source_read);
 }
 
 fn parsedSourceReadStartsWithSelect(
@@ -12602,6 +12577,40 @@ fn parsedSourceReadStartsWithSelect(
     return range.start < range.end and
         range.end <= tokens.len and
         tokens[range.start].matchesKeywordTag(.select);
+}
+
+fn validateGeneratedDmlReadBodyLayout(
+    tokens: []const Token,
+    body_range: generated_parser.GeneratedSqlTokenRange,
+    body_read: generated_parser.GeneratedSqlDmlReadBodyAst,
+) !void {
+    if (body_range.start >= body_range.end or body_range.end > tokens.len) return error.UnsupportedSqlShape;
+    if (body_read.tokens.start != body_range.start or body_read.tokens.end != body_range.end) return error.UnsupportedSqlShape;
+    if (body_read.wrapper_projection_star) return error.UnsupportedSqlShape;
+    if (body_read.kind != .query and body_read.kind != .aggregate and body_read.kind != .join and body_read.kind != .window and body_read.kind != .set_operation and body_read.kind != .cte) return error.UnsupportedSqlShape;
+    if (body_read.kind != .cte and !parsedSourceReadStartsWithSelect(tokens, body_range)) return error.UnsupportedSqlShape;
+    const projection_range = body_read.projection_tokens orelse return error.UnsupportedSqlShape;
+    if (projection_range.start <= body_range.start or projection_range.end > body_range.end or projection_range.start >= projection_range.end) return error.UnsupportedSqlShape;
+    if (body_read.source_tokens) |source_range| {
+        if (source_range.start <= projection_range.end or source_range.end > body_range.end or source_range.start >= source_range.end) return error.UnsupportedSqlShape;
+        if (source_range.start == 0 or !tokens[source_range.start - 1].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
+    }
+    if (body_read.where_tokens) |where_range| {
+        if (where_range.start <= body_range.start or where_range.end > body_range.end or where_range.start >= where_range.end) return error.UnsupportedSqlShape;
+        if (where_range.start == 0 or !tokens[where_range.start - 1].matchesKeywordTag(.where)) return error.UnsupportedSqlShape;
+    }
+    if (body_read.set_operation_tokens) |set_operation_range| {
+        if (set_operation_range.start <= body_range.start or set_operation_range.end > body_range.end or set_operation_range.start >= set_operation_range.end) return error.UnsupportedSqlShape;
+        if (body_read.kind != .set_operation) return error.UnsupportedSqlShape;
+        if (!tokens[set_operation_range.start].matchesKeywordTag(.@"union") and
+            !tokens[set_operation_range.start].matchesKeywordTag(.intersect) and
+            !tokens[set_operation_range.start].matchesKeywordTag(.except))
+        {
+            return error.UnsupportedSqlShape;
+        }
+    } else if (body_read.kind == .set_operation) {
+        return error.UnsupportedSqlShape;
+    }
 }
 
 fn validateGeneratedChildReadParsedSql(parsed_sql: *const tokenized.ParsedSql) !void {
@@ -12780,6 +12789,7 @@ fn validateGeneratedRecursiveDmlCtePayloadAlloc(
     end: usize,
 ) !void {
     if (!ast.cte_recursive) return error.UnsupportedSqlShape;
+    const tokens = parsed_sql.items();
     const cte_tokens = ast.cte_tokens orelse return error.UnsupportedSqlShape;
     const cte_prefix = ast.cte_prefix orelse return error.UnsupportedSqlShape;
     if (cte_tokens.start != 1 or cte_tokens.end >= end or cte_tokens.start >= cte_tokens.end) return error.UnsupportedSqlShape;
@@ -12793,12 +12803,7 @@ fn validateGeneratedRecursiveDmlCtePayloadAlloc(
     for (names, bodies, body_reads) |name_tokens, body_tokens, body_read| {
         if (name_tokens.start < cte_list_tokens.start or name_tokens.end > cte_list_tokens.end or name_tokens.start >= name_tokens.end) return error.UnsupportedSqlShape;
         if (body_tokens.start <= name_tokens.end or body_tokens.end > cte_list_tokens.end or body_tokens.start >= body_tokens.end) return error.UnsupportedSqlShape;
-        if (body_read.tokens.start != body_tokens.start or body_read.tokens.end != body_tokens.end) return error.UnsupportedSqlShape;
-        if (body_read.kind != .query and body_read.kind != .aggregate and body_read.kind != .join and body_read.kind != .window and body_read.kind != .set_operation and body_read.kind != .cte) return error.UnsupportedSqlShape;
-        if (body_read.projection_tokens == null) return error.UnsupportedSqlShape;
-        if (body_read.source_tokens) |source_tokens| {
-            if (source_tokens.start <= body_tokens.start or source_tokens.end > body_tokens.end or source_tokens.start >= source_tokens.end) return error.UnsupportedSqlShape;
-        }
+        try validateGeneratedDmlReadBodyLayout(tokens, body_tokens, body_read);
         try validateGeneratedChildReadRangeAlloc(alloc, parsed_sql, body_tokens);
     }
 }
@@ -14049,6 +14054,37 @@ test "sql adapter lower dml validates recursive generated CTE child reads" {
 
     switch (parsed.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
         .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedRecursiveDmlCtePayloadAlloc(alloc, &parsed, dml, end)),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var parsed_where_body = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records WHERE status = 'ready') UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)",
+    );
+    defer parsed_where_body.deinit(alloc);
+    const where_body_end = switch (parsed_where_body.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| generatedDmlStatementEnd(parsed_where_body.items(), dml.statement_span) orelse return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    };
+    switch (parsed_where_body.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| try validateGeneratedRecursiveDmlCtePayloadAlloc(alloc, &parsed_where_body, dml, where_body_end),
+        else => return error.TestUnexpectedResult,
+    }
+    if (parsed_where_body.generated_statement) |*mutable_statement| {
+        if (mutable_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| {
+                    if (dml.cte_prefix) |*cte_prefix| {
+                        const projection_tokens = cte_prefix.first_body_read.projection_tokens orelse return error.TestUnexpectedResult;
+                        cte_prefix.first_body_read.where_tokens = projection_tokens;
+                    } else return error.TestUnexpectedResult;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    switch (parsed_where_body.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedRecursiveDmlCtePayloadAlloc(alloc, &parsed_where_body, dml, where_body_end)),
         else => return error.TestUnexpectedResult,
     }
 }
