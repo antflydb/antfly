@@ -4890,6 +4890,7 @@ pub fn build(b: *std.Build) void {
             "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
             "provisioned query runtime db opens with catalog identity namespace",
             "provisioned query runtime db rejects stale identity namespace",
+            "fanout planner uses io cap and request shape",
             "provisioned table read source executes relational row query plans across ranges",
             "routed rows query plan executes over scanned owner rows with ctes",
             "external lake rows query and aggregate plans route through lake scan hook",

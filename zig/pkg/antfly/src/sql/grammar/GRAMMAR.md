@@ -110,10 +110,12 @@ fail closed through the generated parser instead of falling back to the legacy
 write classifier. Other DML shapes still use an initial generated
 AST-to-plan wrapper that fails closed if the generated DML family does not
 match the existing write classifier before delegating to the current typed DML
-lowerer. Unsupported DML still falls back, and deeper DML cutover still
-requires replacing token-based command-body parsing with complete generated AST
-payloads for recursive CTE DML command bodies beyond retained generated CTE
-body metadata and broader unsupported-shape diagnostics.
+lowerer. DML statement heads now require generated parser success instead of
+falling back to the legacy write classifier; unsupported DML syntax fails at
+the generated grammar boundary, and deeper DML cutover still requires replacing
+token-based command-body parsing with complete generated AST payloads for
+recursive CTE DML command bodies beyond retained generated CTE body metadata
+and broader unsupported-shape diagnostics.
 Representative
 read queries now have generated-parser corpus coverage, retained generated raw
 and AST nodes for covered read statements, top-level generated AST ranges for
@@ -385,11 +387,14 @@ Unsupported DDL remains on the existing parser until
    closed if their AST-to-plan contract regresses.
    Incomplete migrated DML clause-boundary shapes for insert, update, delete,
    truncate, and merge now use generated fail-closed diagnostics instead of
-   classifier fallback.
-   Switching the full DML family from fallback to required generated parsing
-   still requires generated command-body ASTs for recursive CTE DML beyond
-   retained generated CTE body metadata and direct recursive write-plan
-   dispatch, plus broader unsupported-shape diagnostics.
+   classifier fallback, and DML statement heads now require generated parser
+   success instead of falling back to the legacy write classifier on unsupported
+   DML syntax.
+   Switching the full DML family from generated-parser gating plus typed
+   lowerer delegation to complete generated AST-driven lowering still requires
+   generated command-body ASTs for recursive CTE DML beyond retained generated
+   CTE body metadata and direct recursive write-plan dispatch, plus broader
+   unsupported-shape diagnostics.
 4. Read queries: projections, predicates, joins, CTEs, aggregates, windows,
    set operations, lateral, ordering, limits, and document-table sources.
    Initial generated-parser coverage now retains raw and AST read nodes for

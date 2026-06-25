@@ -335,7 +335,8 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
         return raw_statement.token_end > raw_statement.token_start + 1;
     }
     return switch (raw_statement.family orelse return false) {
-        .insert, .update, .delete, .truncate, .merge, .ddl => true,
+        .insert, .update, .delete, .truncate, .merge => false,
+        .ddl => true,
         .select, .with => false,
     };
 }
@@ -705,6 +706,7 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DELETE FROM usage_records WHERE"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "TRUNCATE TABLE"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "MERGE INTO usage_records USING source_rows ON"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "INSERT INTO usage_records OVERRIDING SYSTEM VALUE VALUES ('u1')"));
 
     var complex_ddl = try ParsedSql.initAlloc(alloc, "ALTER TABLE audit_log ALTER COLUMN amount TYPE numeric USING amount + 1;");
     defer complex_ddl.deinit(alloc);

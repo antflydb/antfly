@@ -1705,3 +1705,186 @@ fn relationalRowsExpressionEqual(
     }
     return true;
 }
+
+test "db schema checks execute json row expressions in storage" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"metadata":{"type":"json"}},"required":["id","metadata"],"additionalProperties":false}}}}
+    ;
+    const schema_json_checks =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"metadata":{"type":"json"}},"required":["id","metadata"],"additionalProperties":false}}},"checks":[{"name":"metadata_source_present","expression":{"lhs":{"op":"json_path_exists","args":[{"field":"metadata"}],"path":"source"},"op":"eq","rhs":{"value":true}}},{"name":"metadata_source_text","expression":{"lhs":{"op":"json_extract","args":[{"field":"metadata"}],"path":"source","as_text":true},"op":"eq","rhs":{"value":"api"}}},{"name":"metadata_flags_array","expression":{"lhs":{"op":"json_typeof","args":[{"op":"json_extract","args":[{"field":"metadata"}],"path":"flags"}]},"op":"eq","rhs":{"value":"array"}}},{"name":"metadata_flags_nonempty","expression":{"lhs":{"op":"json_array_length","args":[{"op":"json_extract","args":[{"field":"metadata"}],"path":"flags"}]},"op":"gte","rhs":{"value":1}}}]}
+    ;
+
+    try db.applyTableSchemaJson(alloc, schema_v1, .{});
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"row:a\",\"metadata\":{\"source\":\"api\",\"flags\":[\"hot\"]}}" },
+            .{ .key = "row:b", .value = "{\"id\":\"row:b\",\"metadata\":{\"flags\":[]}}" },
+        },
+    });
+
+    try std.testing.expectError(error.InvalidRowsRequest, db.applyTableSchemaJson(alloc, schema_json_checks, .{}));
+    try db.batch(.{
+        .writes = &.{.{ .key = "row:b", .value = "{\"id\":\"row:b\",\"metadata\":{\"source\":\"api\",\"flags\":[\"cold\"]}}" }},
+    });
+    try db.applyTableSchemaJson(alloc, schema_json_checks, .{});
+    const after_json_checks = db.core.schema orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 4), after_json_checks.checks.len);
+    try std.testing.expect(after_json_checks.checks[0].expression != null);
+}
+
+test "db schema checks execute temporal and case row expressions in storage" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"created_at_ns":{"type":"datetime"}},"required":["id","status","created_at_ns"],"additionalProperties":false}}}}
+    ;
+    const schema_temporal_checks =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"created_at_ns":{"type":"datetime"}},"required":["id","status","created_at_ns"],"additionalProperties":false}}},"checks":[{"name":"created_hour_trunc","expression":{"lhs":{"op":"date_trunc","args":[{"value":"hour"},{"field":"created_at_ns"}]},"op":"eq","rhs":{"value":3600000000000}}},{"name":"created_hour_bin","expression":{"lhs":{"op":"date_bin","args":[{"op":"interval_ns","args":[{"value":3600000000000}]},{"field":"created_at_ns"},{"value":0}]},"op":"eq","rhs":{"value":3600000000000}}},{"name":"created_hour_part","expression":{"lhs":{"op":"date_part","args":[{"value":"hour"},{"field":"created_at_ns"}]},"op":"eq","rhs":{"value":1}}},{"name":"case_status_hour","expression":{"lhs":{"op":"case","cases":[{"when":{"lhs":{"field":"status"},"op":"eq","rhs":{"value":"active"}},"then":{"op":"date_part","args":[{"value":"hour"},{"field":"created_at_ns"}]}}],"else":{"value":0}},"op":"eq","rhs":{"value":1}}}]}
+    ;
+
+    try db.applyTableSchemaJson(alloc, schema_v1, .{});
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"row:a\",\"status\":\"active\",\"created_at_ns\":3700000000000}" },
+            .{ .key = "row:b", .value = "{\"id\":\"row:b\",\"status\":\"inactive\",\"created_at_ns\":7300000000000}" },
+        },
+    });
+
+    try std.testing.expectError(error.InvalidRowsRequest, db.applyTableSchemaJson(alloc, schema_temporal_checks, .{}));
+    try db.batch(.{
+        .writes = &.{.{ .key = "row:b", .value = "{\"id\":\"row:b\",\"status\":\"active\",\"created_at_ns\":3700000000000}" }},
+    });
+    try db.applyTableSchemaJson(alloc, schema_temporal_checks, .{});
+    const after_temporal_checks = db.core.schema orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 4), after_temporal_checks.checks.len);
+    try std.testing.expect(after_temporal_checks.checks[3].expression != null);
+}
+
+test "db schema apply validates added check constraints against existing rows" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const schema_bad_amount_check =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"checks":[{"name":"amount_nonnegative","field":"amount","op":"gte","value":0}]}
+    ;
+    const schema_status_check =
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"checks":[{"name":"status_active_lower","expression":{"lhs":{"op":"lower","args":[{"field":"status"}]},"op":"eq","rhs":{"value":"active"}}}]}
+    ;
+
+    try db.applyTableSchemaJson(alloc, schema_v1, .{});
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"row:a\",\"amount\":-1,\"status\":\"ACTIVE\"}" },
+            .{ .key = "row:b", .value = "{\"id\":\"row:b\",\"amount\":2,\"status\":\"ACTIVE\"}" },
+        },
+    });
+
+    try std.testing.expectError(error.InvalidRowsRequest, db.applyTableSchemaJson(alloc, schema_bad_amount_check, .{}));
+    const after_failed_check = db.core.schema orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), after_failed_check.checks.len);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "row:a", .value = "{\"id\":\"row:a\",\"amount\":1,\"status\":\"ACTIVE\"}" }},
+    });
+    try db.applyTableSchemaJson(alloc, schema_status_check, .{});
+    const after_expression_check = db.core.schema orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), after_expression_check.checks.len);
+    try std.testing.expect(after_expression_check.checks[0].expression != null);
+
+    const local_schema_json = try db.core.store.get(alloc, local_schema_json_key);
+    defer alloc.free(local_schema_json);
+    try std.testing.expect(std.mem.indexOf(u8, local_schema_json, "status_active_lower") != null);
+}
+
+test "db schema apply validates unvalidated check promotion" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const schema_unvalidated =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"checks":[{"name":"amount_nonnegative","field":"amount","op":"gte","value":0,"validation_state":"unvalidated"},{"name":"status_active_lower","expression":{"lhs":{"op":"lower","args":[{"field":"status"}]},"op":"eq","rhs":{"value":"active"}},"validation_state":"unvalidated"}]}
+    ;
+    const schema_enforced =
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"checks":[{"name":"amount_nonnegative","field":"amount","op":"gte","value":0,"validation_state":"enforced"},{"name":"status_active_lower","expression":{"lhs":{"op":"lower","args":[{"field":"status"}]},"op":"eq","rhs":{"value":"active"}},"validation_state":"enforced"}]}
+    ;
+
+    try db.applyTableSchemaJson(alloc, schema_v1, .{});
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"row:a\",\"amount\":-1,\"status\":\"ACTIVE\"}" },
+            .{ .key = "row:b", .value = "{\"id\":\"row:b\",\"amount\":2,\"status\":\"pending\"}" },
+        },
+    });
+    try db.applyTableSchemaJson(alloc, schema_unvalidated, .{});
+    const unvalidated_schema = db.core.schema orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(schema_mod.RelationalCheckValidationState.unvalidated, unvalidated_schema.checks[0].validation_state);
+    try std.testing.expectEqual(schema_mod.RelationalCheckValidationState.unvalidated, unvalidated_schema.checks[1].validation_state);
+
+    try std.testing.expectError(error.InvalidRowsRequest, db.applyTableSchemaJson(alloc, schema_enforced, .{}));
+    const after_failed_enforce = db.core.schema orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(schema_mod.RelationalCheckValidationState.unvalidated, after_failed_enforce.checks[0].validation_state);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"row:a\",\"amount\":1,\"status\":\"ACTIVE\"}" },
+            .{ .key = "row:b", .value = "{\"id\":\"row:b\",\"amount\":2,\"status\":\"active\"}" },
+        },
+    });
+    try db.applyTableSchemaJson(alloc, schema_enforced, .{});
+    const enforced_schema = db.core.schema orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(schema_mod.RelationalCheckValidationState.enforced, enforced_schema.checks[0].validation_state);
+    try std.testing.expectEqual(schema_mod.RelationalCheckValidationState.enforced, enforced_schema.checks[1].validation_state);
+}

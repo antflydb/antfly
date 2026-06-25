@@ -313,6 +313,13 @@ source test that proves the same schema job is reachable through catalog
 routing, group-local DB opening, and vtable dispatch belongs with the source
 boundary until `sources.zig` or `managed_db.zig` owns that path.
 
+In other words, the refactor should not leave a shadow test suite behind in the
+old facade files. The facade test surface should shrink as implementation leaves
+it. What remains there should be intentionally named boundary coverage: public
+API compatibility, source-vtable dispatch, end-to-end route behavior, and
+cross-module integration that would become less clear if pinned to a narrow leaf
+module.
+
 Use these ownership rules while moving tests:
 
 - Unit and regression tests for a moved implementation should move with that

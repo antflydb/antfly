@@ -13476,3 +13476,39 @@ fn freeOwnedConstStringArrayList(alloc: Allocator, rows: *std.ArrayListUnmanaged
     for (rows.items) |row| alloc.free(@constCast(row));
     rows.deinit(alloc);
 }
+
+test "db relational rows check concatenation preserves expression metadata" {
+    const alloc = std.testing.allocator;
+
+    const lower_operands = [_]schema_mod.RelationalRowsExpression{.{ .kind = .field, .field = "status" }};
+    const rhs = [_]schema_mod.RelationalRowsExpression{.{ .kind = .value, .value_json = "\"active\"" }};
+    const base = [_]schema_mod.RelationalCheck{.{
+        .name = "status_active_lower",
+        .expression = .{
+            .lhs = .{ .kind = .lower, .operands = lower_operands[0..] },
+            .op = .eq,
+            .rhs = rhs[0..],
+        },
+    }};
+    const extra = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "tenant_id",
+        .op = .eq,
+        .value_json = "\"t1\"",
+    }};
+
+    const combined = try concatChecksAlloc(alloc, base[0..], extra[0..]);
+    defer {
+        freeChecks(alloc, combined);
+        if (combined.len > 0) alloc.free(combined);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), combined.len);
+    try std.testing.expect(combined[0].expression != null);
+    try std.testing.expectEqual(schema_mod.RelationalRowsExpressionKind.lower, combined[0].expression.?.lhs.kind);
+    try std.testing.expectEqualStrings("status", combined[0].expression.?.lhs.operands[0].field);
+    try std.testing.expect(combined[0].expression.?.lhs.operands[0].field.ptr != lower_operands[0].field.ptr);
+    try std.testing.expectEqualStrings("\"active\"", combined[0].expression.?.rhs[0].value_json);
+    try std.testing.expectEqualStrings("tenant_id", combined[1].field);
+    try std.testing.expect(combined[1].expression == null);
+}

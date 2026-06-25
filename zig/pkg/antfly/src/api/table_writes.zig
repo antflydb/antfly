@@ -60,6 +60,7 @@ const table_write_integrity = @import("table_writes/integrity.zig");
 const table_write_integrity_types = @import("table_writes/integrity_types.zig");
 const table_write_managed_db = @import("table_writes/managed_db.zig");
 const table_write_schema_jobs = @import("table_writes/schema_jobs.zig");
+const table_write_backup_restore = @import("table_writes/backup_restore.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const distributed_txn = @import("distributed_txn.zig");
 const build_options = @import("build_options");
@@ -240,6 +241,9 @@ const shouldDrainManagedDbAfterBatch = table_write_bulk_ingest.shouldDrainManage
 const shouldDrainCachedManagedDbAfterBatch = table_write_bulk_ingest.shouldDrainCachedManagedDbAfterBatch;
 const autoBulkIngestBatchOps = table_write_bulk_ingest.autoBulkIngestBatchOps;
 const autoBulkIngestGroupBatchOps = table_write_bulk_ingest.autoBulkIngestGroupBatchOps;
+
+const moveDroppedGroupPathToTrash = table_write_backup_restore.moveDroppedGroupPathToTrash;
+const deleteGroupPathIfPresent = table_write_backup_restore.deleteGroupPathIfPresent;
 const ManagedDbOpenMode = table_write_managed_db.ManagedDbOpenMode;
 const ManagedDbOpenOptions = table_write_managed_db.ManagedDbOpenOptions;
 const haMirrorForManagedDbOpenMode = table_write_managed_db.haMirrorForManagedDbOpenMode;
@@ -477,8 +481,6 @@ var test_before_drop_table_delete_hook: ?TestExecutionHook = null;
 var test_before_drop_index_work_hook: ?TestExecutionHook = null;
 var test_before_restore_work_hook: ?TestExecutionHook = null;
 
-const dropped_table_trash_dir_name = ".antfly-drop-trash";
-
 fn accumulateTextMemoryAttributionStats(dst: *db_mod.TextMemoryAttributionStats, src: db_mod.TextMemoryAttributionStats) void {
     dst.text_indexes +|= src.text_indexes;
     dst.text_segments +|= src.text_segments;
@@ -579,66 +581,6 @@ const DroppedTableDeleteWork = struct {
         std.heap.page_allocator.destroy(self);
     }
 };
-
-fn droppedTableTrashDirPath(alloc: std.mem.Allocator, replica_root_dir: []const u8) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ replica_root_dir, dropped_table_trash_dir_name });
-}
-
-fn droppedTableTrashPath(
-    alloc: std.mem.Allocator,
-    replica_root_dir: []const u8,
-    table_name: []const u8,
-    group_id: u64,
-) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{s}/{s}/table-{s}-group-{d}-{d}", .{
-        replica_root_dir,
-        dropped_table_trash_dir_name,
-        table_name,
-        group_id,
-        platform_time.monotonicNs(),
-    });
-}
-
-fn moveDroppedGroupPathToTrash(
-    alloc: std.mem.Allocator,
-    replica_root_dir: []const u8,
-    table_name: []const u8,
-    group_id: u64,
-) !?[]u8 {
-    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
-    defer alloc.free(path);
-
-    const trash_dir_path = try droppedTableTrashDirPath(alloc, replica_root_dir);
-    defer alloc.free(trash_dir_path);
-    const trash_path = try droppedTableTrashPath(alloc, replica_root_dir, table_name, group_id);
-    errdefer alloc.free(trash_path);
-
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    try fs_paths.createDirPathPortable(io_impl.io(), trash_dir_path);
-    std.Io.Dir.rename(std.Io.Dir.cwd(), path, std.Io.Dir.cwd(), trash_path, io_impl.io()) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    return trash_path;
-}
-
-fn deleteGroupPathIfPresent(
-    alloc: std.mem.Allocator,
-    replica_root_dir: []const u8,
-    group_id: u64,
-) !void {
-    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
-    defer alloc.free(path);
-
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    std.Io.Dir.cwd().access(io_impl.io(), path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
-    try std.Io.Dir.cwd().deleteTree(io_impl.io(), path);
-}
 
 pub const ProvisionedTableWriteCache = table_write_cache.ProvisionedTableWriteCache;
 
