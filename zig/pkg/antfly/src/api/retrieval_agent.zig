@@ -2628,6 +2628,14 @@ const RecursiveChildTask = struct {
     token_count_method: RecursiveTokenCountMethod,
 };
 
+const RecursiveSkippedChild = struct {
+    child_index: usize,
+    context_object: recursive_agent.ContextObject,
+    estimated_context_tokens: usize,
+    token_count_method: RecursiveTokenCountMethod,
+    max_child_context_tokens: usize,
+};
+
 const RecursiveTokenCountMethod = enum {
     fixed_tokenizer,
     heuristic,
@@ -2725,18 +2733,7 @@ fn executeRecursiveRetrievalGeneration(
         recursive_agent.scheduledConcurrency(recursive_cfg, child_count),
         exec.maxConcurrentChainCalls(cfg.chain),
     );
-    const actual_concurrency = if (child_count == 0) 0 else scheduled_concurrency;
     const truncated_by_budget = child_count < hits.len;
-    try appendStep(arena, steps, live, .{
-        .kind = .recursive_decomposition,
-        .name = "recursive_decomposition",
-        .action = if (truncated_by_budget)
-            try std.fmt.allocPrint(arena, "partitioned {d} of {d} retrieved context objects into recursive child frames before hitting max_subcalls", .{ child_count, hits.len })
-        else
-            try std.fmt.allocPrint(arena, "partitioned retrieved context into {d} recursive child frames", .{child_count}),
-        .status = .success,
-        .details = try buildRecursiveDecompositionDetails(arena, recursive_cfg, hits.len, child_count, scheduled_concurrency, actual_concurrency),
-    });
 
     var summaries = std.ArrayListUnmanaged([]const u8).empty;
     defer summaries.deinit(arena);
@@ -2750,6 +2747,8 @@ fn executeRecursiveRetrievalGeneration(
     defer trace_subcalls.deinit(arena);
     var child_tasks = std.ArrayListUnmanaged(RecursiveChildTask).empty;
     defer child_tasks.deinit(arena);
+    var skipped_children = std.ArrayListUnmanaged(RecursiveSkippedChild).empty;
+    defer skipped_children.deinit(arena);
     var token_budget_skips: usize = 0;
     var wall_time_exhausted = false;
 
@@ -2773,22 +2772,12 @@ fn executeRecursiveRetrievalGeneration(
         if (recursive_cfg.max_child_context_tokens) |max_child_context_tokens| {
             if (token_count.tokens > @as(usize, @intCast(max_child_context_tokens))) {
                 token_budget_skips += 1;
-                try trace_subcalls.append(arena, try buildRecursiveTraceSubcall(
-                    arena,
-                    i,
-                    context_object.id,
-                    .skipped,
-                    token_count.tokens,
-                    token_count.method,
-                    null,
-                    "max_child_context_tokens",
-                ));
-                try appendStep(arena, steps, live, .{
-                    .kind = .recursive_subcall,
-                    .name = try std.fmt.allocPrint(arena, "recursive_subcall_{d}", .{i + 1}),
-                    .action = try std.fmt.allocPrint(arena, "skipped recursive context object {s} because it exceeded max_child_context_tokens", .{hit._id}),
-                    .status = .skipped,
-                    .details = try buildRecursiveSkippedSubcallDetails(arena, i, context_object, token_count.tokens, token_count.method, @as(usize, @intCast(max_child_context_tokens))),
+                try skipped_children.append(arena, .{
+                    .child_index = i,
+                    .context_object = context_object,
+                    .estimated_context_tokens = token_count.tokens,
+                    .token_count_method = token_count.method,
+                    .max_child_context_tokens = @intCast(max_child_context_tokens),
                 });
                 continue;
             }
@@ -2803,6 +2792,37 @@ fn executeRecursiveRetrievalGeneration(
             .messages = messages,
             .estimated_context_tokens = token_count.tokens,
             .token_count_method = token_count.method,
+        });
+    }
+
+    const actual_concurrency = if (child_tasks.items.len == 0) 0 else @min(scheduled_concurrency, child_tasks.items.len);
+    try appendStep(arena, steps, live, .{
+        .kind = .recursive_decomposition,
+        .name = "recursive_decomposition",
+        .action = if (truncated_by_budget)
+            try std.fmt.allocPrint(arena, "partitioned {d} of {d} retrieved context objects into recursive child frames before hitting max_subcalls", .{ child_count, hits.len })
+        else
+            try std.fmt.allocPrint(arena, "partitioned retrieved context into {d} recursive child frames", .{child_count}),
+        .status = .success,
+        .details = try buildRecursiveDecompositionDetails(arena, recursive_cfg, hits.len, child_count, scheduled_concurrency, actual_concurrency),
+    });
+    for (skipped_children.items) |skipped| {
+        try trace_subcalls.append(arena, try buildRecursiveTraceSubcall(
+            arena,
+            skipped.child_index,
+            skipped.context_object.id,
+            .skipped,
+            skipped.estimated_context_tokens,
+            skipped.token_count_method,
+            null,
+            "max_child_context_tokens",
+        ));
+        try appendStep(arena, steps, live, .{
+            .kind = .recursive_subcall,
+            .name = try std.fmt.allocPrint(arena, "recursive_subcall_{d}", .{skipped.child_index + 1}),
+            .action = try std.fmt.allocPrint(arena, "skipped recursive context object {s} because it exceeded max_child_context_tokens", .{skipped.context_object.id}),
+            .status = .skipped,
+            .details = try buildRecursiveSkippedSubcallDetails(arena, skipped.child_index, skipped.context_object, skipped.estimated_context_tokens, skipped.token_count_method, skipped.max_child_context_tokens),
         });
     }
 

@@ -1312,9 +1312,13 @@ test "api retrieval agent recursive mode skips children over context token budge
     try std.testing.expectEqual(@as(usize, 1), fake_generation.calls);
 
     var skipped_subcalls: usize = 0;
+    var decomposition_actual_concurrency: ?i64 = null;
     var merge_skipped_count: ?i64 = null;
     for (parsed.value.steps.?) |step| {
         if (step.kind) |kind| switch (kind) {
+            .recursive_decomposition => {
+                decomposition_actual_concurrency = step.details.?.object.get("actual_concurrency").?.integer;
+            },
             .recursive_subcall => {
                 if (step.status != null and step.status.? == .skipped) {
                     skipped_subcalls += 1;
@@ -1327,6 +1331,7 @@ test "api retrieval agent recursive mode skips children over context token budge
             else => {},
         };
     }
+    try std.testing.expectEqual(@as(i64, 0), decomposition_actual_concurrency.?);
     try std.testing.expectEqual(@as(usize, 2), skipped_subcalls);
     try std.testing.expectEqual(@as(i64, 2), merge_skipped_count.?);
 }
