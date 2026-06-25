@@ -5555,7 +5555,7 @@ pub const ApiHttpServer = struct {
             else => null,
         };
         defer if (row_claim) |claim| if (claim.owner_id.len > 0) self.alloc.free(claim.owner_id);
-        var lowered = sql_adapter.lowerWritePlanWithCatalogParsedSqlAlloc(
+        var lowered = sql_adapter.lowerWritePlanWithCatalogSessionParsedSqlAlloc(
             self.alloc,
             parsed_sql,
             schema,
@@ -5566,6 +5566,7 @@ pub const ApiHttpServer = struct {
                 .sync_level = sync_level,
             },
             self.catalogSource(),
+            session.session(),
         ) catch |err| switch (err) {
             error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try textResponse(self.alloc, 404, "not found") },
             error.DocumentSqlWriteUnsupported => return .{ .response = try textResponse(self.alloc, 400, "document_sql_write_unsupported") },
@@ -5749,12 +5750,13 @@ pub const ApiHttpServer = struct {
             .routine_expressions = routine_bindings,
         };
 
-        var lowered = sql_adapter_runtime.lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(
+        var lowered = sql_adapter_runtime.lowerReadPlanWithCatalogSessionAndFunctionBindingsParsedSqlAlloc(
             self.alloc,
             parsed_sql,
             schema,
             &.{},
             self.catalogSource(),
+            session.session(),
             function_bindings,
         ) catch |err| {
             if (documentSqlReadErrorMessage(err)) |message| return .{ .response = try textResponse(self.alloc, 400, message) };
@@ -5853,12 +5855,13 @@ pub const ApiHttpServer = struct {
             .routine_expressions = routine_bindings,
         };
 
-        var lowered = sql_adapter_runtime.lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(
+        var lowered = sql_adapter_runtime.lowerReadPlanWithCatalogSessionAndFunctionBindingsParsedSqlAlloc(
             self.alloc,
             parsed_sql,
             schema,
             &.{},
             self.catalogSource(),
+            session.session(),
             function_bindings,
         ) catch |err| {
             if (documentSqlReadErrorMessage(err)) |message| return .{ .response = try textResponse(self.alloc, 400, message) };
@@ -7071,6 +7074,25 @@ pub const ApiHttpServer = struct {
         params: []const sql_adapter.SqlValue,
         catalog: ?table_catalog.CatalogSource,
     ) !sql_adapter.LoweredReadPlan {
+        return try self.lowerRelationalSqlReadPlanWithRoutineBindingsAndSessionAlloc(
+            alloc,
+            sql,
+            schema,
+            params,
+            catalog,
+            catalog_resources.SqlCatalogSession.default(),
+        );
+    }
+
+    pub fn lowerRelationalSqlReadPlanWithRoutineBindingsAndSessionAlloc(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        sql: []const u8,
+        schema: runtime_schema_mod.TableSchema,
+        params: []const sql_adapter.SqlValue,
+        catalog: ?table_catalog.CatalogSource,
+        session: catalog_resources.SqlCatalogSession,
+    ) !sql_adapter.LoweredReadPlan {
         const routine_bindings = try self.sql_routine_runtime.listExpressionRoutineBindingsAlloc(alloc);
         defer sql_routines.freeExpressionRoutineBindings(alloc, routine_bindings);
         const function_bindings: sql_adapter.SqlFunctionBindings = .{
@@ -7079,7 +7101,7 @@ pub const ApiHttpServer = struct {
         var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
         defer parsed_sql.deinit(alloc);
         if (catalog) |source_catalog| {
-            return try sql_adapter_runtime.lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, schema, params, source_catalog, function_bindings);
+            return try sql_adapter_runtime.lowerReadPlanWithCatalogSessionAndFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, schema, params, source_catalog, session, function_bindings);
         }
         return try sql_adapter_runtime.lowerReadPlanWithFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, schema, params, function_bindings);
     }

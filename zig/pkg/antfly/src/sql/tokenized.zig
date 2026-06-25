@@ -1546,15 +1546,18 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .vacuum,
         => true,
         .explain,
+        .alter_index,
         .alter_foreign_data_wrapper,
         .alter_foreign_table,
         .alter_materialized_view,
         .alter_policy,
         .alter_rule,
         .alter_server,
+        .alter_system,
         .alter_trigger,
         .alter_user_mapping,
         .checkpoint,
+        .create_access_method,
         .create_foreign_data_wrapper,
         .create_foreign_table,
         .create_language,
@@ -1564,10 +1567,12 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .create_server,
         .create_user_mapping,
         .do_block,
+        .drop_access_method,
         .drop_foreign_data_wrapper,
         .drop_foreign_table,
         .drop_language,
         .drop_materialized_view,
+        .drop_owned,
         .drop_policy,
         .drop_rule,
         .drop_server,
@@ -1576,6 +1581,7 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .move,
         .read_row_lock,
         .refresh,
+        .reassign_owned,
         .security_label,
         => false,
     };
@@ -2180,6 +2186,11 @@ test "sql adapter parsed sql owns typed statement variants" {
         reason: generated_parser.GeneratedSqlUnsupportedReason,
     }{
         .{
+            .sql = "ALTER INDEX usage_status_idx RENAME TO usage_status_idx_v2",
+            .kind = .alter_index,
+            .reason = .alter_index_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "ALTER FOREIGN TABLE foreign_usage_records RENAME TO foreign_usage_archive",
             .kind = .alter_foreign_table,
             .reason = .alter_foreign_table_not_planned_by_generated_parser,
@@ -2203,6 +2214,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "ALTER SERVER usage_server VERSION '15'",
             .kind = .alter_server,
             .reason = .alter_server_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "ALTER SYSTEM SET work_mem = '64MB'",
+            .kind = .alter_system,
+            .reason = .alter_system_not_planned_by_generated_parser,
         },
         .{
             .sql = "ALTER TRIGGER usage_audit ON usage_records RENAME TO usage_audit_v2",
@@ -2243,6 +2259,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)",
             .kind = .copy,
             .reason = .copy_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "CREATE ACCESS METHOD usage_am TYPE INDEX HANDLER usage_handler",
+            .kind = .create_access_method,
+            .reason = .create_access_method_not_planned_by_generated_parser,
         },
         .{
             .sql = "CREATE FOREIGN TABLE foreign_usage_records (id text) SERVER usage_fdw",
@@ -2300,9 +2321,19 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .drop_foreign_data_wrapper_not_planned_by_generated_parser,
         },
         .{
+            .sql = "DROP ACCESS METHOD IF EXISTS usage_am",
+            .kind = .drop_access_method,
+            .reason = .drop_access_method_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "DROP LANGUAGE IF EXISTS usage_lang CASCADE",
             .kind = .drop_language,
             .reason = .drop_language_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "DROP OWNED BY usage_role CASCADE",
+            .kind = .drop_owned,
+            .reason = .drop_owned_not_planned_by_generated_parser,
         },
         .{
             .sql = "FETCH FROM usage_cursor",
@@ -2358,6 +2389,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "RELEASE SAVEPOINT usage_batch",
             .kind = .release,
             .reason = .release_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "REASSIGN OWNED BY old_role TO new_role",
+            .kind = .reassign_owned,
+            .reason = .reassign_owned_not_planned_by_generated_parser,
         },
         .{
             .sql = "REVOKE SELECT ON TABLE usage_records FROM readonly",

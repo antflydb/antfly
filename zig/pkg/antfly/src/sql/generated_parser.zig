@@ -175,6 +175,7 @@ pub const GeneratedSqlUnsupportedKind = enum {
     cluster,
     comment,
     copy,
+    alter_index,
     alter_foreign_table,
     alter_foreign_data_wrapper,
     alter_materialized_view,
@@ -183,8 +184,10 @@ pub const GeneratedSqlUnsupportedKind = enum {
     alter_rule,
     alter_server,
     alter_subscription,
+    alter_system,
     alter_trigger,
     alter_user_mapping,
+    create_access_method,
     create_foreign_table,
     create_foreign_data_wrapper,
     create_language,
@@ -200,7 +203,9 @@ pub const GeneratedSqlUnsupportedKind = enum {
     do_block,
     drop_foreign_table,
     drop_foreign_data_wrapper,
+    drop_access_method,
     drop_language,
+    drop_owned,
     drop_user_mapping,
     explain,
     fetch,
@@ -211,6 +216,7 @@ pub const GeneratedSqlUnsupportedKind = enum {
     move,
     notify,
     refresh,
+    reassign_owned,
     reindex,
     release,
     revoke,
@@ -236,6 +242,7 @@ pub const GeneratedSqlUnsupportedReason = enum {
     cluster_not_planned_by_generated_parser,
     comment_not_planned_by_generated_parser,
     copy_not_planned_by_generated_parser,
+    alter_index_not_planned_by_generated_parser,
     alter_foreign_table_not_planned_by_generated_parser,
     alter_foreign_data_wrapper_not_planned_by_generated_parser,
     alter_materialized_view_not_planned_by_generated_parser,
@@ -244,8 +251,10 @@ pub const GeneratedSqlUnsupportedReason = enum {
     alter_rule_not_planned_by_generated_parser,
     alter_server_not_planned_by_generated_parser,
     alter_subscription_not_planned_by_generated_parser,
+    alter_system_not_planned_by_generated_parser,
     alter_trigger_not_planned_by_generated_parser,
     alter_user_mapping_not_planned_by_generated_parser,
+    create_access_method_not_planned_by_generated_parser,
     create_foreign_table_not_planned_by_generated_parser,
     create_foreign_data_wrapper_not_planned_by_generated_parser,
     create_language_not_planned_by_generated_parser,
@@ -261,7 +270,9 @@ pub const GeneratedSqlUnsupportedReason = enum {
     do_block_not_planned_by_generated_parser,
     drop_foreign_table_not_planned_by_generated_parser,
     drop_foreign_data_wrapper_not_planned_by_generated_parser,
+    drop_access_method_not_planned_by_generated_parser,
     drop_language_not_planned_by_generated_parser,
+    drop_owned_not_planned_by_generated_parser,
     drop_user_mapping_not_planned_by_generated_parser,
     explain_not_planned_by_generated_parser,
     fetch_not_planned_by_generated_parser,
@@ -272,6 +283,7 @@ pub const GeneratedSqlUnsupportedReason = enum {
     move_not_planned_by_generated_parser,
     notify_not_planned_by_generated_parser,
     refresh_not_planned_by_generated_parser,
+    reassign_owned_not_planned_by_generated_parser,
     reindex_not_planned_by_generated_parser,
     release_not_planned_by_generated_parser,
     revoke_not_planned_by_generated_parser,
@@ -1789,11 +1801,13 @@ pub const simple_graph_corpus = [_]GeneratedSqlCorpusCase{
 };
 
 pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
+    .{ .sql = "ALTER INDEX usage_status_idx RENAME TO usage_status_idx_v2", .kind = .unsupported },
     .{ .sql = "ALTER FOREIGN TABLE foreign_usage_records RENAME TO foreign_usage_archive", .kind = .unsupported },
     .{ .sql = "ALTER FOREIGN DATA WRAPPER usage_fdw OPTIONS (ADD host 'localhost')", .kind = .unsupported },
     .{ .sql = "ALTER MATERIALIZED VIEW usage_summary RENAME TO usage_summary_v2", .kind = .unsupported },
     .{ .sql = "ALTER RULE usage_insert ON usage_records RENAME TO usage_insert_v2", .kind = .unsupported },
     .{ .sql = "ALTER SERVER usage_server VERSION '15'", .kind = .unsupported },
+    .{ .sql = "ALTER SYSTEM SET work_mem = '64MB'", .kind = .unsupported },
     .{ .sql = "ALTER TRIGGER usage_audit ON usage_records RENAME TO usage_audit_v2", .kind = .unsupported },
     .{ .sql = "ALTER USER MAPPING FOR usage_user SERVER usage_server OPTIONS (SET user 'remote')", .kind = .unsupported },
     .{ .sql = "ANALYZE", .kind = .unsupported },
@@ -1803,6 +1817,7 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CLUSTER usage_records USING usage_status_idx", .kind = .unsupported },
     .{ .sql = "COMMENT ON TABLE usage_records IS 'billing rows'", .kind = .unsupported },
     .{ .sql = "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)", .kind = .unsupported },
+    .{ .sql = "CREATE ACCESS METHOD usage_am TYPE INDEX HANDLER usage_handler", .kind = .unsupported },
     .{ .sql = "CREATE FOREIGN TABLE foreign_usage_records (id text) SERVER usage_fdw", .kind = .unsupported },
     .{ .sql = "CREATE FOREIGN DATA WRAPPER usage_fdw HANDLER usage_fdw_handler", .kind = .unsupported },
     .{ .sql = "CREATE LANGUAGE usage_lang", .kind = .unsupported },
@@ -1814,7 +1829,9 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "DO 'BEGIN NULL; END'", .kind = .unsupported },
     .{ .sql = "DROP FOREIGN TABLE IF EXISTS foreign_usage_records", .kind = .unsupported },
     .{ .sql = "DROP FOREIGN DATA WRAPPER IF EXISTS usage_fdw CASCADE", .kind = .unsupported },
+    .{ .sql = "DROP ACCESS METHOD IF EXISTS usage_am", .kind = .unsupported },
     .{ .sql = "DROP LANGUAGE IF EXISTS usage_lang CASCADE", .kind = .unsupported },
+    .{ .sql = "DROP OWNED BY usage_role CASCADE", .kind = .unsupported },
     .{ .sql = "EXPLAIN", .kind = .unsupported },
     .{ .sql = "EXPLAIN SELECT id FROM usage_records", .kind = .unsupported },
     .{ .sql = "EXPLAIN ANALYZE INSERT INTO usage_records (id) VALUES ('u1')", .kind = .unsupported },
@@ -1833,6 +1850,7 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "VACUUM (FULL, VERBOSE, ANALYZE) public.usage_records", .kind = .unsupported },
     .{ .sql = "REINDEX INDEX CONCURRENTLY public.usage_status_idx", .kind = .unsupported },
     .{ .sql = "RELEASE SAVEPOINT usage_batch", .kind = .unsupported },
+    .{ .sql = "REASSIGN OWNED BY old_role TO new_role", .kind = .unsupported },
     .{ .sql = "REVOKE SELECT ON TABLE usage_records FROM readonly", .kind = .unsupported },
     .{ .sql = "SAVEPOINT usage_batch", .kind = .unsupported },
     .{ .sql = "SECURITY LABEL ON TABLE usage_records IS 'internal'", .kind = .unsupported },
@@ -2053,6 +2071,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.cast)) return .{ .ddl = .create_cast };
         if (second.matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
         if (second.matchesKeywordTag(.unique) and tokens.len > 2 and tokens[2].matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
+        if (second.matchesKeywordTag(.access) and tokens.len > 2 and tokens[2].matchesKeywordTag(.method)) return .{ .unsupported = .create_access_method };
         if (second.matchesKeywordTag(.foreign) and tokens.len > 2 and tokens[2].matchesKeywordTag(.table)) return .{ .unsupported = .create_foreign_table };
         if (second.matchesKeywordTag(.foreign) and tokens.len > 3 and tokens[2].matchesKeywordTag(.data) and tokens[3].matchesKeyword("wrapper")) return .{ .unsupported = .create_foreign_data_wrapper };
         if (second.matchesKeyword("language")) return .{ .unsupported = .create_language };
@@ -2098,12 +2117,14 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     }
     if (first.matchesKeywordTag(.alter) and tokens.len > 1) {
         const second = tokens[1];
+        if (second.matchesKeywordTag(.index)) return .{ .unsupported = .alter_index };
         if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .unsupported = .alter_materialized_view };
         if (second.matchesKeywordTag(.policy)) return .{ .ddl = .alter_policy };
         if (second.matchesKeywordTag(.publication)) return .{ .ddl = .alter_publication };
         if (second.matchesKeywordTag(.rule)) return .{ .unsupported = .alter_rule };
         if (second.matchesKeywordTag(.server)) return .{ .unsupported = .alter_server };
         if (second.matchesKeywordTag(.subscription)) return .{ .ddl = .alter_subscription };
+        if (second.matchesKeywordTag(.system)) return .{ .unsupported = .alter_system };
         if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .alter_trigger };
         if (second.matchesKeyword("user") and tokens.len > 2 and tokens[2].matchesKeyword("mapping")) return .{ .unsupported = .alter_user_mapping };
         if (second.matchesKeywordTag(.role)) return .{ .ddl = .alter_role };
@@ -2125,6 +2146,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.schema)) return .{ .ddl = .drop_schema };
         if (second.matchesKeywordTag(.database)) return .{ .ddl = .drop_database };
         if (second.matchesKeywordTag(.extension)) return .{ .extension_index = .drop_extension };
+        if (second.matchesKeywordTag(.access) and tokens.len > 2 and tokens[2].matchesKeywordTag(.method)) return .{ .unsupported = .drop_access_method };
         if (second.matchesKeywordTag(.foreign) and tokens.len > 2 and tokens[2].matchesKeywordTag(.table)) return .{ .unsupported = .drop_foreign_table };
         if (second.matchesKeywordTag(.foreign) and tokens.len > 3 and tokens[2].matchesKeywordTag(.data) and tokens[3].matchesKeyword("wrapper")) return .{ .unsupported = .drop_foreign_data_wrapper };
         if (second.matchesKeyword("language")) return .{ .unsupported = .drop_language };
@@ -2134,6 +2156,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.role)) return .{ .ddl = .drop_role };
         if (second.matchesKeywordTag(.collation)) return .{ .ddl = .drop_collation };
         if (second.matchesKeywordTag(.operator)) return .{ .ddl = .drop_operator };
+        if (second.matchesKeywordTag(.owned)) return .{ .unsupported = .drop_owned };
         if (second.matchesKeywordTag(.aggregate)) return .{ .ddl = .drop_aggregate };
         if (second.matchesKeywordTag(.cast)) return .{ .ddl = .drop_cast };
         if (second.matchesKeywordTag(.server)) return .{ .unsupported = .drop_server };
@@ -2180,6 +2203,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.refresh) and tokens.len > 2 and tokens[1].matchesKeywordTag(.materialized) and tokens[2].matchesKeywordTag(.view)) {
         return .{ .ddl = .refresh_materialized_view };
     }
+    if (first.matchesKeywordTag(.reassign) and tokens.len > 1 and tokens[1].matchesKeywordTag(.owned)) return .{ .unsupported = .reassign_owned };
     if (first.matchesKeywordTag(.reindex)) return .{ .unsupported = .reindex };
     if (first.matchesKeywordTag(.release)) return .{ .unsupported = .release };
     if (first.matchesKeywordTag(.revoke)) return .{ .unsupported = .revoke };
@@ -2306,6 +2330,7 @@ fn buildUnsupportedAst(
             .cluster => .cluster_not_planned_by_generated_parser,
             .comment => .comment_not_planned_by_generated_parser,
             .copy => .copy_not_planned_by_generated_parser,
+            .alter_index => .alter_index_not_planned_by_generated_parser,
             .alter_foreign_table => .alter_foreign_table_not_planned_by_generated_parser,
             .alter_foreign_data_wrapper => .alter_foreign_data_wrapper_not_planned_by_generated_parser,
             .alter_materialized_view => .alter_materialized_view_not_planned_by_generated_parser,
@@ -2314,8 +2339,10 @@ fn buildUnsupportedAst(
             .alter_rule => .alter_rule_not_planned_by_generated_parser,
             .alter_server => .alter_server_not_planned_by_generated_parser,
             .alter_subscription => .alter_subscription_not_planned_by_generated_parser,
+            .alter_system => .alter_system_not_planned_by_generated_parser,
             .alter_trigger => .alter_trigger_not_planned_by_generated_parser,
             .alter_user_mapping => .alter_user_mapping_not_planned_by_generated_parser,
+            .create_access_method => .create_access_method_not_planned_by_generated_parser,
             .create_foreign_table => .create_foreign_table_not_planned_by_generated_parser,
             .create_foreign_data_wrapper => .create_foreign_data_wrapper_not_planned_by_generated_parser,
             .create_language => .create_language_not_planned_by_generated_parser,
@@ -2331,7 +2358,9 @@ fn buildUnsupportedAst(
             .do_block => .do_block_not_planned_by_generated_parser,
             .drop_foreign_table => .drop_foreign_table_not_planned_by_generated_parser,
             .drop_foreign_data_wrapper => .drop_foreign_data_wrapper_not_planned_by_generated_parser,
+            .drop_access_method => .drop_access_method_not_planned_by_generated_parser,
             .drop_language => .drop_language_not_planned_by_generated_parser,
+            .drop_owned => .drop_owned_not_planned_by_generated_parser,
             .drop_user_mapping => .drop_user_mapping_not_planned_by_generated_parser,
             .explain => .explain_not_planned_by_generated_parser,
             .fetch => .fetch_not_planned_by_generated_parser,
@@ -2342,6 +2371,7 @@ fn buildUnsupportedAst(
             .move => .move_not_planned_by_generated_parser,
             .notify => .notify_not_planned_by_generated_parser,
             .refresh => .refresh_not_planned_by_generated_parser,
+            .reassign_owned => .reassign_owned_not_planned_by_generated_parser,
             .reindex => .reindex_not_planned_by_generated_parser,
             .release => .release_not_planned_by_generated_parser,
             .revoke => .revoke_not_planned_by_generated_parser,
@@ -6275,8 +6305,10 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .create_metric }, (try parseSqlAlloc(alloc, "CREATE GRAPH METRIC docs_pagerank ON doc_edges")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .alter_metric }, (try parseSqlAlloc(alloc, "ALTER GRAPH INDEX docs_edge_graph ADD METRIC pagerank_v1 USING pagerank")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .analyze }, (try parseSqlAlloc(alloc, "ANALYZE")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_index }, (try parseSqlAlloc(alloc, "ALTER INDEX usage_status_idx RENAME TO usage_status_idx_v2")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_materialized_view }, (try parseSqlAlloc(alloc, "ALTER MATERIALIZED VIEW usage_summary RENAME TO usage_summary_v2")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_rule }, (try parseSqlAlloc(alloc, "ALTER RULE usage_insert ON usage_records RENAME TO usage_insert_v2")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_system }, (try parseSqlAlloc(alloc, "ALTER SYSTEM SET work_mem = '64MB'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_trigger }, (try parseSqlAlloc(alloc, "ALTER TRIGGER usage_audit ON usage_records RENAME TO usage_audit_v2")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .call }, (try parseSqlAlloc(alloc, "CALL refresh_usage_records()")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .checkpoint }, (try parseSqlAlloc(alloc, "CHECKPOINT")).statement);
@@ -6284,7 +6316,10 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .cluster }, (try parseSqlAlloc(alloc, "CLUSTER usage_records USING usage_status_idx")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .comment }, (try parseSqlAlloc(alloc, "COMMENT ON TABLE usage_records IS 'billing rows'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .copy }, (try parseSqlAlloc(alloc, "COPY usage_records FROM STDIN")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_access_method }, (try parseSqlAlloc(alloc, "CREATE ACCESS METHOD usage_am TYPE INDEX HANDLER usage_handler")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .declare }, (try parseSqlAlloc(alloc, "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_access_method }, (try parseSqlAlloc(alloc, "DROP ACCESS METHOD IF EXISTS usage_am")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_owned }, (try parseSqlAlloc(alloc, "DROP OWNED BY usage_role CASCADE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .explain }, (try parseSqlAlloc(alloc, "EXPLAIN SELECT id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .fetch }, (try parseSqlAlloc(alloc, "FETCH FROM usage_cursor")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .grant }, (try parseSqlAlloc(alloc, "GRANT SELECT ON TABLE usage_records TO readonly")).statement);
@@ -6296,6 +6331,7 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .vacuum }, (try parseSqlAlloc(alloc, "VACUUM FULL usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .reindex }, (try parseSqlAlloc(alloc, "REINDEX INDEX usage_records_status_idx")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .release }, (try parseSqlAlloc(alloc, "RELEASE SAVEPOINT usage_batch")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .reassign_owned }, (try parseSqlAlloc(alloc, "REASSIGN OWNED BY old_role TO new_role")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .revoke }, (try parseSqlAlloc(alloc, "REVOKE SELECT ON TABLE usage_records FROM readonly")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .savepoint }, (try parseSqlAlloc(alloc, "SAVEPOINT usage_batch")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .security_label }, (try parseSqlAlloc(alloc, "SECURITY LABEL ON TABLE usage_records IS 'internal'")).statement);
@@ -9659,6 +9695,12 @@ test "generated SQL parser facade builds extended read AST spans" {
         subject_tokens: GeneratedSqlTokenRange,
     }{
         .{
+            .sql = "ALTER INDEX usage_status_idx RENAME TO usage_status_idx_v2",
+            .kind = .alter_index,
+            .reason = .alter_index_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 6 },
+        },
+        .{
             .sql = "ALTER FOREIGN TABLE foreign_usage_records RENAME TO foreign_usage_archive",
             .kind = .alter_foreign_table,
             .reason = .alter_foreign_table_not_planned_by_generated_parser,
@@ -9689,6 +9731,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 5 },
         },
         .{
+            .sql = "ALTER SYSTEM SET work_mem = '64MB'",
+            .kind = .alter_system,
+            .reason = .alter_system_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 6 },
+        },
+        .{
             .sql = "ALTER TRIGGER usage_audit ON usage_records RENAME TO usage_audit_v2",
             .kind = .alter_trigger,
             .reason = .alter_trigger_not_planned_by_generated_parser,
@@ -9717,6 +9765,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .kind = .comment,
             .reason = .comment_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 6 },
+        },
+        .{
+            .sql = "CREATE ACCESS METHOD usage_am TYPE INDEX HANDLER usage_handler",
+            .kind = .create_access_method,
+            .reason = .create_access_method_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 8 },
         },
         .{
             .sql = "CREATE FOREIGN TABLE foreign_usage_records (id text) SERVER usage_fdw",
@@ -9785,10 +9839,22 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 8 },
         },
         .{
+            .sql = "DROP ACCESS METHOD IF EXISTS usage_am",
+            .kind = .drop_access_method,
+            .reason = .drop_access_method_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 6 },
+        },
+        .{
             .sql = "DROP LANGUAGE IF EXISTS usage_lang CASCADE",
             .kind = .drop_language,
             .reason = .drop_language_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 6 },
+        },
+        .{
+            .sql = "DROP OWNED BY usage_role CASCADE",
+            .kind = .drop_owned,
+            .reason = .drop_owned_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 5 },
         },
         .{
             .sql = "GRANT SELECT ON TABLE usage_records TO readonly",
@@ -9825,6 +9891,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .kind = .revoke,
             .reason = .revoke_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 7 },
+        },
+        .{
+            .sql = "REASSIGN OWNED BY old_role TO new_role",
+            .kind = .reassign_owned,
+            .reason = .reassign_owned_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 6 },
         },
         .{
             .sql = "SECURITY LABEL ON TABLE usage_records IS 'internal'",

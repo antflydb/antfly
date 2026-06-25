@@ -53,6 +53,7 @@ pub const TokenKind = enum {
 };
 
 pub const TokenKeyword = enum {
+    access,
     add,
     aggregate,
     all,
@@ -220,6 +221,7 @@ pub const TokenKeyword = enum {
     materialized,
     matched,
     md5,
+    method,
     merge,
     metric,
     metric_freshness,
@@ -251,6 +253,7 @@ pub const TokenKeyword = enum {
     @"or",
     order,
     outer,
+    owned,
     overlay,
     over,
     partition,
@@ -275,6 +278,7 @@ pub const TokenKeyword = enum {
     regexp_match,
     regexp_replace,
     regexp_substr,
+    reassign,
     reindex,
     recursive,
     refresh,
@@ -475,6 +479,7 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expect(!qualified_function.matchesKeywordTag(.full_text_search));
     try std.testing.expect(!qualified_function.matchesQualifiedKeywordTag("public", .full_text_search));
 
+    try std.testing.expectEqual(TokenKeyword.access, keywordFromIdentifier("ACCESS").?);
     try std.testing.expectEqual(TokenKeyword.before, keywordFromIdentifier("BEFORE").?);
     try std.testing.expectEqual(TokenKeyword.between, keywordFromIdentifier("BETWEEN").?);
     try std.testing.expectEqual(TokenKeyword.then, keywordFromIdentifier("THEN").?);
@@ -525,11 +530,13 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.some, keywordFromIdentifier("SOME").?);
     try std.testing.expectEqual(TokenKeyword.matched, keywordFromIdentifier("MATCHED").?);
     try std.testing.expectEqual(TokenKeyword.md5, keywordFromIdentifier("MD5").?);
+    try std.testing.expectEqual(TokenKeyword.method, keywordFromIdentifier("METHOD").?);
     try std.testing.expectEqual(TokenKeyword.move, keywordFromIdentifier("MOVE").?);
     try std.testing.expectEqual(TokenKeyword.not, keywordFromIdentifier("NOT").?);
     try std.testing.expectEqual(TokenKeyword.now, keywordFromIdentifier("NOW").?);
     try std.testing.expectEqual(TokenKeyword.next, keywordFromIdentifier("NEXT").?);
     try std.testing.expectEqual(TokenKeyword.notify, keywordFromIdentifier("NOTIFY").?);
+    try std.testing.expectEqual(TokenKeyword.owned, keywordFromIdentifier("OWNED").?);
     try std.testing.expectEqual(TokenKeyword.following, keywordFromIdentifier("FOLLOWING").?);
     try std.testing.expectEqual(TokenKeyword.fetch, keywordFromIdentifier("FETCH").?);
     try std.testing.expectEqual(TokenKeyword.full, keywordFromIdentifier("FULL").?);
@@ -549,6 +556,7 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.jsonb_extract_path_text, keywordFromIdentifier("JSONB_EXTRACT_PATH_TEXT").?);
     try std.testing.expectEqual(TokenKeyword.jsonb_set, keywordFromIdentifier("JSONB_SET").?);
     try std.testing.expectEqual(TokenKeyword.regexp_substr, keywordFromIdentifier("REGEXP_SUBSTR").?);
+    try std.testing.expectEqual(TokenKeyword.reassign, keywordFromIdentifier("REASSIGN").?);
     try std.testing.expectEqual(TokenKeyword.reindex, keywordFromIdentifier("REINDEX").?);
     try std.testing.expectEqual(TokenKeyword.refresh, keywordFromIdentifier("REFRESH").?);
     try std.testing.expectEqual(TokenKeyword.release, keywordFromIdentifier("RELEASE").?);
@@ -560,6 +568,7 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.settings, keywordFromIdentifier("SETTINGS").?);
     try std.testing.expectEqual(TokenKeyword.string_to_array, keywordFromIdentifier("STRING_TO_ARRAY").?);
     try std.testing.expectEqual(TokenKeyword.summary, keywordFromIdentifier("SUMMARY").?);
+    try std.testing.expectEqual(TokenKeyword.system, keywordFromIdentifier("SYSTEM").?);
     try std.testing.expectEqual(TokenKeyword.text, keywordFromIdentifier("TEXT").?);
     try std.testing.expectEqual(TokenKeyword.timing, keywordFromIdentifier("TIMING").?);
     try std.testing.expectEqual(TokenKeyword.timestamp, keywordFromIdentifier("TIMESTAMP").?);

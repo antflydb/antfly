@@ -2987,3 +2987,33 @@ test "db schema runtime enrichment catalog add allows unrelated definitions afte
         .content_type = "application/json",
     });
 }
+
+test "db schema runtime index inspection lists graph indexes" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_v1",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+
+    try std.testing.expect(db.hasIndex("graph_v1"));
+    try std.testing.expect(!db.hasIndex("missing_graph"));
+
+    const indexes = try db.listIndexes(alloc);
+    defer types.freeIndexConfigs(alloc, indexes);
+    try std.testing.expectEqual(@as(usize, 1), indexes.len);
+    try std.testing.expectEqualStrings("graph_v1", indexes[0].name);
+    try std.testing.expectEqual(types.IndexKind.graph, indexes[0].kind);
+}

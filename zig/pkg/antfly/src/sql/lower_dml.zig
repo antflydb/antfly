@@ -15,6 +15,7 @@
 const std = @import("std");
 
 const binder = @import("binder.zig");
+const catalog_resources = @import("../api/catalog_resources.zig");
 const classifier = @import("classifier.zig");
 const corpus = @import("corpus.zig");
 const db_mod = @import("../storage/db/mod.zig");
@@ -13952,9 +13953,21 @@ fn lowerWritePlanWithCatalogForDmlTestAlloc(
     options: plan_mod.LowerWritePlanOptions,
     catalog: table_catalog.CatalogSource,
 ) !plan_mod.LoweredWritePlan {
+    return try lowerWritePlanWithCatalogSessionForDmlTestAlloc(alloc, sql, schema, params, options, catalog, catalog_resources.SqlCatalogSession.default());
+}
+
+fn lowerWritePlanWithCatalogSessionForDmlTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+) !plan_mod.LoweredWritePlan {
     var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
-    return try lowerWritePlanWithCatalogParsedSqlForDmlTestAlloc(alloc, &parsed_sql, schema, params, options, catalog);
+    return try lowerWritePlanWithCatalogSessionParsedSqlForDmlTestAlloc(alloc, &parsed_sql, schema, params, options, catalog, session);
 }
 
 fn lowerWritePlanWithCatalogParsedSqlForDmlTestAlloc(
@@ -13965,6 +13978,18 @@ fn lowerWritePlanWithCatalogParsedSqlForDmlTestAlloc(
     options: plan_mod.LowerWritePlanOptions,
     catalog: table_catalog.CatalogSource,
 ) !plan_mod.LoweredWritePlan {
+    return try lowerWritePlanWithCatalogSessionParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, options, catalog, catalog_resources.SqlCatalogSession.default());
+}
+
+fn lowerWritePlanWithCatalogSessionParsedSqlForDmlTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+) !plan_mod.LoweredWritePlan {
     if (schema.storage_mode == .document) return error.DocumentSqlWriteUnsupported;
     var context = lowering_context.CatalogWritePlanLoweringContext{
         .alloc = alloc,
@@ -13974,13 +13999,15 @@ fn lowerWritePlanWithCatalogParsedSqlForDmlTestAlloc(
             .lower_with_options = lowerWritePlanParsedSqlForDmlTestAlloc,
         },
     };
-    return try context.lowerParsed(parsed_sql, options, catalog);
+    return try context.lowerParsedWithSession(parsed_sql, options, catalog, session);
 }
 
 pub const lowerWritePlanAlloc = lowerWritePlanForDmlTestAlloc;
 pub const lowerWritePlanParsedSqlAlloc = lowerWritePlanParsedSqlForDmlTestAlloc;
 pub const lowerWritePlanWithCatalogAlloc = lowerWritePlanWithCatalogForDmlTestAlloc;
 pub const lowerWritePlanWithCatalogParsedSqlAlloc = lowerWritePlanWithCatalogParsedSqlForDmlTestAlloc;
+pub const lowerWritePlanWithCatalogSessionAlloc = lowerWritePlanWithCatalogSessionForDmlTestAlloc;
+pub const lowerWritePlanWithCatalogSessionParsedSqlAlloc = lowerWritePlanWithCatalogSessionParsedSqlForDmlTestAlloc;
 
 fn unsupportedRecursiveJoinedMutationSourceForDmlTestAlloc(
     _: std.mem.Allocator,

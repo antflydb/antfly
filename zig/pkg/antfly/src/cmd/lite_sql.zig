@@ -262,7 +262,7 @@ fn executeWriteAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session,
 
     var write_source = table_writes.BoundTableWriteSource.init(target_table, db);
     var unique_resolver_ctx = DbUniqueSelectorResolverContext{ .db = db };
-    var lowered = try sql_adapter_runtime.lowerWritePlanWithCatalogParsedSqlAlloc(
+    var lowered = try sql_adapter_runtime.lowerWritePlanWithCatalogSessionParsedSqlAlloc(
         allocator,
         parsed_sql,
         schema,
@@ -272,6 +272,7 @@ fn executeWriteAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session,
             .sync_level = try sql_adapter.sqlSyncLevelFromSession(session.catalog.session()),
         },
         catalog_source,
+        session.catalog.session(),
     );
     defer lowered.deinit(allocator);
 
@@ -303,12 +304,13 @@ fn executeReadAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session, 
     const schema = try sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(allocator, catalog_source, table_names.left, session.catalog.session());
     defer storage_schema.freeSchema(allocator, schema);
 
-    var lowered = try sql_adapter_runtime.lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(
+    var lowered = try sql_adapter_runtime.lowerReadPlanWithCatalogSessionAndFunctionBindingsParsedSqlAlloc(
         allocator,
         parsed_sql,
         schema,
         &.{},
         catalog_source,
+        session.catalog.session(),
         .{},
     );
     defer lowered.deinit(allocator);

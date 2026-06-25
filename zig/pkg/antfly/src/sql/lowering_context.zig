@@ -15,6 +15,7 @@
 const std = @import("std");
 
 const binder = @import("binder.zig");
+const catalog_resources = @import("../api/catalog_resources.zig");
 const classifier = @import("classifier.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const generated_parser = @import("generated_parser.zig");
@@ -3568,10 +3569,19 @@ pub const CatalogReadPlanLoweringContext = struct {
         parsed_sql: *const tokenized.ParsedSql,
         catalog: table_catalog.CatalogSource,
     ) !plan.LoweredReadPlan {
+        return try self.lowerParsedWithSession(parsed_sql, catalog, catalog_resources.SqlCatalogSession.default());
+    }
+
+    pub fn lowerParsedWithSession(
+        self: *@This(),
+        parsed_sql: *const tokenized.ParsedSql,
+        catalog: table_catalog.CatalogSource,
+        session: catalog_resources.SqlCatalogSession,
+    ) !plan.LoweredReadPlan {
         const old_parsed_sql = self.parsed_sql;
         self.parsed_sql = parsed_sql;
         defer self.parsed_sql = old_parsed_sql;
-        var bound = try binder.bindReadPlanCatalogStatementAlloc(self.alloc, parsed_sql, catalog);
+        var bound = try binder.bindReadPlanCatalogStatementWithSessionAlloc(self.alloc, parsed_sql, catalog, session);
         defer bound.deinit(self.alloc);
         return try binder.lowerReadPlanWithBoundStatementAlloc(self.alloc, &bound, self.hooks());
     }
@@ -6518,10 +6528,20 @@ pub const CatalogWritePlanLoweringContext = struct {
         options: plan.LowerWritePlanOptions,
         catalog: table_catalog.CatalogSource,
     ) !plan.LoweredWritePlan {
+        return try self.lowerParsedWithSession(parsed_sql, options, catalog, catalog_resources.SqlCatalogSession.default());
+    }
+
+    pub fn lowerParsedWithSession(
+        self: *@This(),
+        parsed_sql: *const tokenized.ParsedSql,
+        options: plan.LowerWritePlanOptions,
+        catalog: table_catalog.CatalogSource,
+        session: catalog_resources.SqlCatalogSession,
+    ) !plan.LoweredWritePlan {
         const old_parsed_sql = self.parsed_sql;
         self.parsed_sql = parsed_sql;
         defer self.parsed_sql = old_parsed_sql;
-        var bound = try binder.bindWritePlanCatalogStatementAlloc(self.alloc, parsed_sql, options, catalog);
+        var bound = try binder.bindWritePlanCatalogStatementWithSessionAlloc(self.alloc, parsed_sql, options, catalog, session);
         defer bound.deinit(self.alloc);
         return try binder.lowerWritePlanWithBoundStatementAlloc(self.alloc, &bound, self.hooks());
     }

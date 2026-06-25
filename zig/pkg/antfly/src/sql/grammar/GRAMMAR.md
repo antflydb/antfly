@@ -371,8 +371,10 @@ success for `CREATE GRAPH` and `ALTER GRAPH` statement heads instead of falling
 back to the legacy DDL classifier on malformed graph DDL. The generated
 facade now returns closed statement-family nodes for the covered families and
 generated unsupported AST nodes for seed `ANALYZE`, bulk I/O `COPY`,
-maintenance `VACUUM`/`REINDEX`, utility/control statements such as `CLUSTER`,
-`COMMENT`, `GRANT`/`REVOKE`, `LISTEN`/`NOTIFY`, `LOCK`, `CALL`,
+maintenance `VACUUM`/`REINDEX`, ownership and system administration statements
+such as `ALTER INDEX`, `ALTER SYSTEM`, `CREATE/DROP ACCESS METHOD`,
+`DROP OWNED`, and `REASSIGN OWNED`, utility/control statements such as
+`CLUSTER`, `COMMENT`, `GRANT`/`REVOKE`, `LISTEN`/`NOTIFY`, `LOCK`, `CALL`,
 `CHECKPOINT`, `LOAD`, `REFRESH`, `SECURITY LABEL`, and `UNLISTEN`, plus
 simple cursor and transaction-control statements such as `CLOSE`, `DECLARE`,
 `FETCH`, `MOVE`, `SAVEPOINT`, and `RELEASE`, plus simple `EXPLAIN` forms with stable reason metadata. Generated
@@ -386,7 +388,8 @@ Unsupported generated diagnostics also cover PostgreSQL materialized-view DDL
 entry points that Antfly does not type yet, including
 `ALTER MATERIALIZED VIEW`; procedural blocks with `DO`; foreign-table DDL;
 trigger and rewrite-rule DDL, including `ALTER TRIGGER` and `ALTER RULE`;
-and foreign-server DDL. These common unsupported
+foreign-server DDL; access-method DDL; ownership maintenance statements; and
+`ALTER INDEX`/`ALTER SYSTEM`. These common unsupported
 PostgreSQL dump/admin shapes now have stable unsupported AST reasons instead of
 generic parser fallback. Legacy-supported materialized-view catalog operations
 now use generated DDL AST nodes as a validated boundary before delegating to the

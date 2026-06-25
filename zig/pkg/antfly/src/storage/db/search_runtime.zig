@@ -13284,3 +13284,44 @@ test "db search runtime graph helpers algebraic shortest path applies exact min-
     try std.testing.expectEqualStrings("c", algebraic_k_one[0].nodes[1]);
     try std.testing.expectEqualStrings("d", algebraic_k_one[0].nodes[3]);
 }
+
+test "db search runtime writes and reads timestamp metadata" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .timestamp_ns = 1_700_000_000_000_000_000,
+    });
+
+    const ts = try db.getTimestamp(alloc, "doc:a");
+    try std.testing.expectEqual(@as(u64, 1_700_000_000_000_000_000), ts);
+
+    const first_doc = "doc\x00ttl";
+    const second_doc = "doc\x00ttl:child";
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = first_doc, .value = "{\"title\":\"first\"}" },
+            .{ .key = second_doc, .value = "{\"title\":\"second\"}" },
+        },
+        .timestamp_ns = 1_700_000_000_000_000_101,
+    });
+
+    try std.testing.expectEqual(@as(u64, 1_700_000_000_000_000_101), try db.getTimestamp(alloc, first_doc));
+    try std.testing.expectEqual(@as(u64, 1_700_000_000_000_000_101), try db.getTimestamp(alloc, second_doc));
+
+    try db.batch(.{ .deletes = &.{first_doc} });
+
+    try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(alloc, first_doc));
+    try std.testing.expectEqual(@as(u64, 1_700_000_000_000_000_101), try db.getTimestamp(alloc, second_doc));
+}

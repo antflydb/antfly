@@ -3066,6 +3066,47 @@ fn chunkCacheTupleKeyAlloc(alloc: Allocator, components: []const []const u8) ![]
     return try out.toOwnedSlice(alloc);
 }
 
+test "db write path document extraction templated inline source size is rejected before persistence" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const security = scraping.ContentSecurityConfig{ .max_download_size_bytes = 4 };
+    var remote_content = scraping.RemoteContentConfig{ .security = security };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .remote_content = &remote_content,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .template = "{{url}}",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+
+    try std.testing.expectError(error.StreamTooLong, db.batch(.{
+        .writes = &.{.{
+            .key = "doc:templated-too-large",
+            .value = "{\"url\":\"data:text/plain;base64,aGVsbG8=\"}",
+        }},
+        .sync_level = .write,
+    }));
+
+    const doc_key = try internal_keys.documentKeyAlloc(alloc, "doc:templated-too-large");
+    defer alloc.free(doc_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, doc_key));
+}
+
 test "db write path transform resolves transforms against pending same-batch writes" {
     const DB = @import("mod.zig").DB;
     const db_test_support = @import("test_support.zig");

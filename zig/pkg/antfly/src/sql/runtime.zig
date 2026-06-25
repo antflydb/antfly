@@ -1069,9 +1069,21 @@ pub fn lowerReadPlanWithCatalogAndFunctionBindingsAlloc(
     catalog: table_catalog.CatalogSource,
     function_bindings: SqlFunctionBindings,
 ) !LoweredReadPlan {
+    return try lowerReadPlanWithCatalogSessionAndFunctionBindingsAlloc(alloc, sql, schema, params, catalog, catalog_resources.SqlCatalogSession.default(), function_bindings);
+}
+
+pub fn lowerReadPlanWithCatalogSessionAndFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+    function_bindings: SqlFunctionBindings,
+) !LoweredReadPlan {
     var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
-    return try lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, schema, params, catalog, function_bindings);
+    return try lowerReadPlanWithCatalogSessionAndFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, schema, params, catalog, session, function_bindings);
 }
 
 pub fn lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(
@@ -1080,6 +1092,18 @@ pub fn lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(
     schema: runtime_schema.TableSchema,
     params: []const SqlValue,
     catalog: table_catalog.CatalogSource,
+    function_bindings: SqlFunctionBindings,
+) !LoweredReadPlan {
+    return try lowerReadPlanWithCatalogSessionAndFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, schema, params, catalog, catalog_resources.SqlCatalogSession.default(), function_bindings);
+}
+
+pub fn lowerReadPlanWithCatalogSessionAndFunctionBindingsParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
     function_bindings: SqlFunctionBindings,
 ) !LoweredReadPlan {
     var context = sql_adapter.CatalogReadPlanLoweringContext{
@@ -1093,7 +1117,7 @@ pub fn lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(
             .lower_without_source_schema = lowerReadPlanWithFunctionBindingsParsedSqlAlloc,
         },
     };
-    return try context.lowerParsed(parsed_sql, catalog);
+    return try context.lowerParsedWithSession(parsed_sql, catalog, session);
 }
 
 fn lowerDocumentReadPlanFromBindingParsedSqlAlloc(
@@ -1257,6 +1281,102 @@ test "sql runtime catalog document aggregate lowers schema-derived materializati
         },
         else => return error.TestExpectedEqual,
     }
+}
+
+test "sql runtime catalog lowerers bind explicit session for source schemas" {
+    const alloc = std.testing.allocator;
+    const usage_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const incoming_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"source":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+
+    const TenantCatalog = struct {
+        tables: [2]metadata_table_manager.TableRecord,
+
+        fn init() @This() {
+            return .{ .tables = .{
+                .{
+                    .table_id = 1,
+                    .name = "usage_records",
+                    .database_name = "tenant_ops",
+                    .namespace_name = "analytics",
+                    .placement_role = "data",
+                    .schema_json = usage_schema_json,
+                },
+                .{
+                    .table_id = 2,
+                    .name = "incoming_usage",
+                    .database_name = "tenant_ops",
+                    .namespace_name = "analytics",
+                    .placement_role = "data",
+                    .schema_json = incoming_schema_json,
+                },
+            } };
+        }
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = self.tables[0..],
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const tenant_path = [_][]const u8{"analytics"};
+    const tenant_session: catalog_resources.SqlCatalogSession = .{
+        .current_database_name = "tenant_ops",
+        .search_path = tenant_path[0..],
+    };
+    var catalog = TenantCatalog.init();
+    const catalog_source = catalog.iface();
+    const target_schema = try sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(alloc, catalog_source, "usage_records", tenant_session);
+    defer runtime_schema.freeSchema(alloc, target_schema);
+
+    var read_sql = try sql_adapter.ParsedSql.initAlloc(
+        alloc,
+        "SELECT usage_records.id, incoming_usage.status FROM usage_records JOIN incoming_usage ON usage_records.id = incoming_usage.id",
+    );
+    defer read_sql.deinit(alloc);
+    try std.testing.expectError(
+        error.TableNotFound,
+        lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(alloc, &read_sql, target_schema, &.{}, catalog_source, .{}),
+    );
+    var lowered_read = try lowerReadPlanWithCatalogSessionAndFunctionBindingsParsedSqlAlloc(alloc, &read_sql, target_schema, &.{}, catalog_source, tenant_session, .{});
+    defer lowered_read.deinit(alloc);
+    try std.testing.expectEqual(@as(std.meta.Tag(LoweredReadPlan), .join), std.meta.activeTag(lowered_read));
+
+    var write_sql = try sql_adapter.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) SELECT id, status FROM incoming_usage",
+    );
+    defer write_sql.deinit(alloc);
+    try std.testing.expectError(
+        error.TableNotFound,
+        lowerWritePlanWithCatalogParsedSqlAlloc(alloc, &write_sql, target_schema, &.{}, .{}, catalog_source),
+    );
+    var lowered_write = try lowerWritePlanWithCatalogSessionParsedSqlAlloc(alloc, &write_sql, target_schema, &.{}, .{}, catalog_source, tenant_session);
+    defer lowered_write.deinit(alloc);
+    try std.testing.expectEqual(@as(std.meta.Tag(LoweredWritePlan), .insert_source), std.meta.activeTag(lowered_write));
 }
 
 pub fn lowerExplainPlanAlloc(
@@ -2257,9 +2377,21 @@ pub fn lowerWritePlanWithCatalogAlloc(
     options: LowerWritePlanOptions,
     catalog: table_catalog.CatalogSource,
 ) !LoweredWritePlan {
+    return try lowerWritePlanWithCatalogSessionAlloc(alloc, sql, schema, params, options, catalog, catalog_resources.SqlCatalogSession.default());
+}
+
+pub fn lowerWritePlanWithCatalogSessionAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    options: LowerWritePlanOptions,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+) !LoweredWritePlan {
     var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
-    return try lowerWritePlanWithCatalogParsedSqlAlloc(alloc, &parsed_sql, schema, params, options, catalog);
+    return try lowerWritePlanWithCatalogSessionParsedSqlAlloc(alloc, &parsed_sql, schema, params, options, catalog, session);
 }
 
 pub fn lowerWritePlanWithCatalogParsedSqlAlloc(
@@ -2270,6 +2402,18 @@ pub fn lowerWritePlanWithCatalogParsedSqlAlloc(
     options: LowerWritePlanOptions,
     catalog: table_catalog.CatalogSource,
 ) !LoweredWritePlan {
+    return try lowerWritePlanWithCatalogSessionParsedSqlAlloc(alloc, parsed_sql, schema, params, options, catalog, catalog_resources.SqlCatalogSession.default());
+}
+
+pub fn lowerWritePlanWithCatalogSessionParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    options: LowerWritePlanOptions,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+) !LoweredWritePlan {
     if (schema.storage_mode == .document) return error.DocumentSqlWriteUnsupported;
     var context = sql_adapter.CatalogWritePlanLoweringContext{
         .alloc = alloc,
@@ -2279,7 +2423,7 @@ pub fn lowerWritePlanWithCatalogParsedSqlAlloc(
             .lower_with_options = lowerWritePlanParsedSqlAlloc,
         },
     };
-    return try context.lowerParsed(parsed_sql, options, catalog);
+    return try context.lowerParsedWithSession(parsed_sql, options, catalog, session);
 }
 
 pub fn lowerAggregateAlloc(
