@@ -8896,12 +8896,23 @@ pub fn relationalIndexLifecycleName(lifecycle: runtime_schema.RelationalIndexLif
     };
 }
 
-fn generatedUnsupportedMaterializedViewBoundaryKind(
+const GeneratedUnsupportedCatalogBoundaryFamily = enum {
+    materialized_view,
+    row_policy,
+};
+
+const GeneratedUnsupportedCatalogBoundary = struct {
+    family: GeneratedUnsupportedCatalogBoundaryFamily,
+    kind: generated_parser.GeneratedSqlUnsupportedKind,
+};
+
+fn generatedUnsupportedCatalogBoundary(
     statement: generated_parser.GeneratedSqlStatement,
-) ?generated_parser.GeneratedSqlUnsupportedKind {
+) ?GeneratedUnsupportedCatalogBoundary {
     return switch (statement) {
         .unsupported => |kind| switch (kind) {
-            .create_materialized_view, .drop_materialized_view, .refresh => kind,
+            .create_materialized_view, .drop_materialized_view, .refresh => .{ .family = .materialized_view, .kind = kind },
+            .create_policy, .alter_policy, .drop_policy => .{ .family = .row_policy, .kind = kind },
             else => null,
         },
         else => null,
@@ -8968,15 +8979,15 @@ fn generatedStatementTokenEnd(tokens: []const grammar.Token) usize {
     return end;
 }
 
-fn validateGeneratedUnsupportedMaterializedViewAst(
+fn validateGeneratedUnsupportedCatalogAst(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlUnsupportedAst,
-    expected_kind: generated_parser.GeneratedSqlUnsupportedKind,
+    boundary: GeneratedUnsupportedCatalogBoundary,
 ) !void {
     const end = generatedStatementTokenEnd(tokens);
     if (end == 0) return error.UnsupportedSqlShape;
-    if (ast.kind != expected_kind) return error.UnsupportedSqlShape;
-    if (ast.reason != generatedUnsupportedExpectedReason(expected_kind)) return error.UnsupportedSqlShape;
+    if (ast.kind != boundary.kind) return error.UnsupportedSqlShape;
+    if (ast.reason != generatedUnsupportedExpectedReason(boundary.kind)) return error.UnsupportedSqlShape;
     if (ast.statement_span.start != tokens[0].source_start or ast.statement_span.end != tokens[end - 1].source_end) {
         return error.UnsupportedSqlShape;
     }
@@ -8986,61 +8997,114 @@ fn validateGeneratedUnsupportedMaterializedViewAst(
     if (!std.meta.eql(ast.subject_tokens orelse return error.UnsupportedSqlShape, generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = end })) {
         return error.UnsupportedSqlShape;
     }
-    switch (expected_kind) {
-        .create_materialized_view => {
-            if (end < 3 or !tokens[0].matchesKeyword("create") or !tokens[1].matchesKeyword("materialized") or !tokens[2].matchesKeyword("view")) {
-                return error.UnsupportedSqlShape;
-            }
+    switch (boundary.family) {
+        .materialized_view => switch (boundary.kind) {
+            .create_materialized_view => {
+                if (end < 3 or !tokens[0].matchesKeyword("create") or !tokens[1].matchesKeyword("materialized") or !tokens[2].matchesKeyword("view")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            .drop_materialized_view => {
+                if (end < 3 or !tokens[0].matchesKeyword("drop") or !tokens[1].matchesKeyword("materialized") or !tokens[2].matchesKeyword("view")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            .refresh => {
+                if (end < 3 or !tokens[0].matchesKeyword("refresh") or !tokens[1].matchesKeyword("materialized") or !tokens[2].matchesKeyword("view")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            else => return error.UnsupportedSqlShape,
         },
-        .drop_materialized_view => {
-            if (end < 3 or !tokens[0].matchesKeyword("drop") or !tokens[1].matchesKeyword("materialized") or !tokens[2].matchesKeyword("view")) {
-                return error.UnsupportedSqlShape;
-            }
+        .row_policy => switch (boundary.kind) {
+            .create_policy => {
+                if (end < 2 or !tokens[0].matchesKeyword("create") or !tokens[1].matchesKeyword("policy")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            .alter_policy => {
+                if (end < 2 or !tokens[0].matchesKeyword("alter") or !tokens[1].matchesKeyword("policy")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            .drop_policy => {
+                if (end < 2 or !tokens[0].matchesKeyword("drop") or !tokens[1].matchesKeyword("policy")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            else => return error.UnsupportedSqlShape,
         },
-        .refresh => {
-            if (end < 3 or !tokens[0].matchesKeyword("refresh") or !tokens[1].matchesKeyword("materialized") or !tokens[2].matchesKeyword("view")) {
-                return error.UnsupportedSqlShape;
-            }
-        },
-        else => return error.UnsupportedSqlShape,
     }
 }
 
-fn materializedViewDdlPlanFromGeneratedUnsupportedAstAlloc(
+fn catalogDdlPlanFromGeneratedUnsupportedAstAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
+    pos: *usize,
     ast: generated_parser.GeneratedSqlUnsupportedAst,
-    expected_kind: generated_parser.GeneratedSqlUnsupportedKind,
+    boundary: GeneratedUnsupportedCatalogBoundary,
     options: DdlPlanParserOptions,
 ) !LoweredDdlPlan {
-    try validateGeneratedUnsupportedMaterializedViewAst(tokens, ast, expected_kind);
-    var pos: usize = 0;
-    var plan = try parseDdlPlanAlloc(alloc, tokens, &pos, options);
-    errdefer plan.deinit(alloc);
-    if (pos != tokens.len) return error.UnsupportedSqlShape;
-    switch (expected_kind) {
-        .create_materialized_view => switch (plan) {
-            .materialized_view_catalog => |catalog| switch (catalog) {
-                .create => {},
+    try validateGeneratedUnsupportedCatalogAst(tokens, ast, boundary);
+    const start_pos = pos.*;
+    var plan = parseDdlPlanAlloc(alloc, tokens, pos, options) catch |err| {
+        pos.* = start_pos;
+        return err;
+    };
+    errdefer {
+        plan.deinit(alloc);
+        pos.* = start_pos;
+    }
+    if (pos.* != tokens.len) return error.UnsupportedSqlShape;
+    switch (boundary.family) {
+        .materialized_view => switch (boundary.kind) {
+            .create_materialized_view => switch (plan) {
+                .materialized_view_catalog => |catalog| switch (catalog) {
+                    .create => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            .drop_materialized_view => switch (plan) {
+                .materialized_view_catalog => |catalog| switch (catalog) {
+                    .drop => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            .refresh => switch (plan) {
+                .materialized_view_catalog => |catalog| switch (catalog) {
+                    .refresh => {},
+                    else => return error.UnsupportedSqlShape,
+                },
                 else => return error.UnsupportedSqlShape,
             },
             else => return error.UnsupportedSqlShape,
         },
-        .drop_materialized_view => switch (plan) {
-            .materialized_view_catalog => |catalog| switch (catalog) {
-                .drop => {},
+        .row_policy => switch (boundary.kind) {
+            .create_policy => switch (plan) {
+                .row_security_catalog => |catalog| switch (catalog) {
+                    .create_policy => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            .alter_policy => switch (plan) {
+                .row_security_catalog => |catalog| switch (catalog) {
+                    .alter_policy => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            .drop_policy => switch (plan) {
+                .row_security_catalog => |catalog| switch (catalog) {
+                    .drop_policy => {},
+                    else => return error.UnsupportedSqlShape,
+                },
                 else => return error.UnsupportedSqlShape,
             },
             else => return error.UnsupportedSqlShape,
         },
-        .refresh => switch (plan) {
-            .materialized_view_catalog => |catalog| switch (catalog) {
-                .refresh => {},
-                else => return error.UnsupportedSqlShape,
-            },
-            else => return error.UnsupportedSqlShape,
-        },
-        else => return error.UnsupportedSqlShape,
     }
     return plan;
 }
@@ -9107,8 +9171,8 @@ pub fn lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(
                 },
                 .graph => |graph_ast| return try graphDdlPlanFromGeneratedAstAlloc(alloc, tokens, graph_ast),
                 .unsupported => |unsupported_ast| {
-                    if (generatedUnsupportedMaterializedViewBoundaryKind(generated_statement.statement)) |kind| {
-                        return try materializedViewDdlPlanFromGeneratedUnsupportedAstAlloc(alloc, tokens, unsupported_ast, kind, options);
+                    if (generatedUnsupportedCatalogBoundary(generated_statement.statement)) |boundary| {
+                        return try catalogDdlPlanFromGeneratedUnsupportedAstAlloc(alloc, tokens, &state.pos, unsupported_ast, boundary, options);
                     }
                 },
                 .transaction, .dml, .read => {},
@@ -14201,6 +14265,114 @@ test "sql adapter generated materialized view unsupported AST lowers to catalog 
     var malformed_subject = try tokenized.ParsedSql.initAlloc(
         alloc,
         "DROP MATERIALIZED VIEW users_mv;",
+    );
+    defer malformed_subject.deinit(alloc);
+    if (malformed_subject.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.subject_tokens = .{ .start = 2, .end = malformed_subject.items().len },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_subject));
+}
+
+test "sql adapter generated row policy unsupported AST lowers to catalog plans" {
+    const alloc = std.testing.allocator;
+
+    var create_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CREATE POLICY usage_records_targeted_policy ON usage_records TO app_reader, app_writer USING (tenant_id = current_setting('app.tenant_id'));",
+    );
+    defer create_sql.deinit(alloc);
+    var create_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &create_sql);
+    defer create_plan.deinit(alloc);
+    switch (create_plan) {
+        .row_security_catalog => |catalog| switch (catalog) {
+            .create_policy => |create| {
+                try std.testing.expectEqualStrings("usage_records_targeted_policy", create.policy_name);
+                try std.testing.expectEqualStrings("usage_records", create.table_name);
+                try std.testing.expectEqual(@as(usize, 2), create.role_targets.len);
+                try std.testing.expectEqualStrings("app_reader", create.role_targets[0]);
+                try std.testing.expectEqualStrings("app_writer", create.role_targets[1]);
+                switch (create.predicate) {
+                    .current_setting_equals => |predicate| {
+                        try std.testing.expectEqualStrings("tenant_id", predicate.field);
+                        try std.testing.expectEqualStrings("app.tenant_id", predicate.setting_name);
+                    },
+                    else => return error.TestUnexpectedResult,
+                }
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var alter_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "ALTER POLICY usage_records_tenant_policy ON usage_records WITH CHECK (status = 'ready');",
+    );
+    defer alter_sql.deinit(alloc);
+    var alter_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &alter_sql);
+    defer alter_plan.deinit(alloc);
+    switch (alter_plan) {
+        .row_security_catalog => |catalog| switch (catalog) {
+            .alter_policy => |alter| {
+                try std.testing.expectEqualStrings("usage_records_tenant_policy", alter.policy_name);
+                try std.testing.expectEqualStrings("usage_records", alter.table_name);
+                try std.testing.expect(!alter.role_targets_present);
+                try std.testing.expect(alter.predicate == null);
+                switch (alter.check_predicate orelse return error.TestUnexpectedResult) {
+                    .literal_equals => |predicate| {
+                        try std.testing.expectEqualStrings("status", predicate.field);
+                        try std.testing.expectEqualStrings("\"ready\"", predicate.value_json);
+                    },
+                    else => return error.TestUnexpectedResult,
+                }
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DROP POLICY usage_records_tenant_policy ON usage_records;",
+    );
+    defer drop_sql.deinit(alloc);
+    var drop_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &drop_sql);
+    defer drop_plan.deinit(alloc);
+    switch (drop_plan) {
+        .row_security_catalog => |catalog| switch (catalog) {
+            .drop_policy => |drop| {
+                try std.testing.expectEqualStrings("usage_records_tenant_policy", drop.policy_name);
+                try std.testing.expectEqualStrings("usage_records", drop.table_name);
+                try std.testing.expect(!drop.if_exists);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var malformed_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CREATE POLICY usage_records_targeted_policy ON usage_records USING (tenant_id = 'tenant-a');",
+    );
+    defer malformed_kind.deinit(alloc);
+    if (malformed_kind.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.kind = .drop_policy,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_kind));
+
+    var malformed_subject = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DROP POLICY usage_records_tenant_policy ON usage_records;",
     );
     defer malformed_subject.deinit(alloc);
     if (malformed_subject.generated_statement) |*generated_statement| {
