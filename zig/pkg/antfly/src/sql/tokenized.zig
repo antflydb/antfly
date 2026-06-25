@@ -892,8 +892,6 @@ fn parseStatement(
                     if (classified_kind != kind) return .{ .unknown = raw_statement };
                 }
                 return .{ .read = .{ .kind = kind, .raw = raw_statement } };
-            } else if (tokenized_sql.read_statement_kind) |classified_kind| {
-                return .{ .read = .{ .kind = classified_kind, .raw = raw_statement } };
             } else return .{ .unknown = raw_statement },
             .graph => return .{ .ddl = .{ .raw = raw_statement } },
             .unsupported => |kind| {
@@ -4591,6 +4589,13 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
     }
     generated_query.tokenized_sql.read_statement_kind = .query;
     generated_query.statement = parseStatement(generated_query.raw_statement, malformed_command_span, &generated_query.tokenized_sql);
+    try std.testing.expect(generated_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_query.statement));
+
+    var missing_ast = generated_query.generated_statement.?;
+    missing_ast.ast = null;
+    generated_query.tokenized_sql.read_statement_kind = .query;
+    generated_query.statement = parseStatement(generated_query.raw_statement, missing_ast, &generated_query.tokenized_sql);
     try std.testing.expect(generated_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_query.statement));
 

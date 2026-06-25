@@ -807,7 +807,10 @@ Unsupported DDL remains on the existing parser until
    Parsed generated read classification now fails closed when retained
    generated read metadata is too incomplete to derive a read family, including
    recursive CTEs whose generated final `SELECT` metadata is corrupted, instead
-   of falling back to the legacy read classifier.
+   of falling back to the legacy read classifier. Generated read statements
+   with missing or invalid retained AST payloads now become unknown parsed
+   statements at the parsed-statement boundary even when the legacy classifier
+   can still name the same read family.
    Recursive CTE reads carry an
    explicit recursive flag; and simple non-recursive CTE reads dispatch to the
    typed read lowerer after validating those ranges. Recursive CTE reads now
