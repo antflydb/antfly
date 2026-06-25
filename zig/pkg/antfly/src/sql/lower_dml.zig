@@ -12589,17 +12589,15 @@ fn validateGeneratedChildReadParsedSql(parsed_sql: *const tokenized.ParsedSql) !
     try lowering_context.validateGeneratedReadAstForStatement(parsed_sql.items(), read_ast);
 }
 
-fn validateGeneratedDmlReadSourceBodyAlloc(
+fn validateGeneratedChildReadRangeAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
-    ast: generated_parser.GeneratedSqlDmlAst,
+    range: generated_parser.GeneratedSqlTokenRange,
 ) !void {
-    try validateGeneratedDmlReadSourceBodyAst(ast);
-    const source_range = ast.source_tokens orelse return error.UnsupportedSqlShape;
     const tokens = parsed_sql.items();
-    if (source_range.start >= source_range.end or source_range.end > tokens.len) return error.UnsupportedSqlShape;
-    const source_start = tokens[source_range.start].source_start;
-    const source_end = tokens[source_range.end - 1].source_end;
+    if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    const source_start = tokens[range.start].source_start;
+    const source_end = tokens[range.end - 1].source_end;
     const sql = parsed_sql.sql();
     if (source_start >= source_end or source_end > sql.len) return error.UnsupportedSqlShape;
     var child = tokenized.ParsedSql.initAlloc(alloc, sql[source_start..source_end]) catch |err| switch (err) {
@@ -12608,6 +12606,16 @@ fn validateGeneratedDmlReadSourceBodyAlloc(
     };
     defer child.deinit(alloc);
     try validateGeneratedChildReadParsedSql(&child);
+}
+
+fn validateGeneratedDmlReadSourceBodyAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    ast: generated_parser.GeneratedSqlDmlAst,
+) !void {
+    try validateGeneratedDmlReadSourceBodyAst(ast);
+    const source_range = ast.source_tokens orelse return error.UnsupportedSqlShape;
+    try validateGeneratedChildReadRangeAlloc(alloc, parsed_sql, source_range);
 }
 
 fn lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(
@@ -12623,7 +12631,7 @@ fn lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(
     const tokens = parsed_sql.items();
     const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     _ = try generatedDmlCommandStart(tokens, ast, end);
-    try validateGeneratedRecursiveDmlCtePayload(ast, end);
+    try validateGeneratedRecursiveDmlCtePayloadAlloc(alloc, parsed_sql, ast, end);
     const parser_context = @import("parser_context.zig");
     switch (ast.kind) {
         .insert_select => {
@@ -12732,7 +12740,12 @@ fn lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(
     }
 }
 
-fn validateGeneratedRecursiveDmlCtePayload(ast: generated_parser.GeneratedSqlDmlAst, end: usize) !void {
+fn validateGeneratedRecursiveDmlCtePayloadAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    ast: generated_parser.GeneratedSqlDmlAst,
+    end: usize,
+) !void {
     if (!ast.cte_recursive) return error.UnsupportedSqlShape;
     const cte_tokens = ast.cte_tokens orelse return error.UnsupportedSqlShape;
     const cte_prefix = ast.cte_prefix orelse return error.UnsupportedSqlShape;
@@ -12748,10 +12761,12 @@ fn validateGeneratedRecursiveDmlCtePayload(ast: generated_parser.GeneratedSqlDml
         if (name_tokens.start < cte_list_tokens.start or name_tokens.end > cte_list_tokens.end or name_tokens.start >= name_tokens.end) return error.UnsupportedSqlShape;
         if (body_tokens.start <= name_tokens.end or body_tokens.end > cte_list_tokens.end or body_tokens.start >= body_tokens.end) return error.UnsupportedSqlShape;
         if (body_read.tokens.start != body_tokens.start or body_read.tokens.end != body_tokens.end) return error.UnsupportedSqlShape;
+        if (body_read.kind != .query and body_read.kind != .aggregate and body_read.kind != .join and body_read.kind != .window and body_read.kind != .set_operation and body_read.kind != .cte) return error.UnsupportedSqlShape;
         if (body_read.projection_tokens == null) return error.UnsupportedSqlShape;
         if (body_read.source_tokens) |source_tokens| {
             if (source_tokens.start <= body_tokens.start or source_tokens.end > body_tokens.end or source_tokens.start >= source_tokens.end) return error.UnsupportedSqlShape;
         }
+        try validateGeneratedChildReadRangeAlloc(alloc, parsed_sql, body_tokens);
     }
 }
 
@@ -13913,6 +13928,46 @@ test "sql adapter lower dml validates generated child read payloads" {
     } else return error.TestUnexpectedResult;
 
     try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedChildReadParsedSql(&parsed));
+}
+
+test "sql adapter lower dml validates recursive generated CTE child reads" {
+    const alloc = std.testing.allocator;
+    var parsed = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)",
+    );
+    defer parsed.deinit(alloc);
+
+    const generated_statement = parsed.generated_statement orelse return error.TestUnexpectedResult;
+    const end = switch (generated_statement.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| generatedDmlStatementEnd(parsed.items(), dml.statement_span) orelse return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    };
+    switch (generated_statement.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| try validateGeneratedRecursiveDmlCtePayloadAlloc(alloc, &parsed, dml, end),
+        else => return error.TestUnexpectedResult,
+    }
+
+    if (parsed.generated_statement) |*mutable_statement| {
+        if (mutable_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| {
+                    if (dml.cte_prefix) |*cte_prefix| {
+                        const projection_tokens = cte_prefix.first_body_read.projection_tokens orelse return error.TestUnexpectedResult;
+                        cte_prefix.first_body_tokens = projection_tokens;
+                        cte_prefix.first_body_read.tokens = projection_tokens;
+                        cte_prefix.first_body_read.source_tokens = null;
+                    } else return error.TestUnexpectedResult;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+
+    switch (parsed.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedRecursiveDmlCtePayloadAlloc(alloc, &parsed, dml, end)),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "sql adapter lower dml lowers generated DML AST through typed write plans" {

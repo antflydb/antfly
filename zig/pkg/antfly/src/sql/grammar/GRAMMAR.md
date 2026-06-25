@@ -107,7 +107,8 @@ multiple matched/not-matched arms, conditional arms, matched
 `UPDATE`, filtered not-matched `INSERT`, `RETURNING`, and non-recursive CTE
 write prefixes; recursive CTE insert-source, update, delete, and `MERGE`
 forms now retain generated per-CTE body metadata and validate generated CTE and
-command ranges before dispatching to the typed recursive write-plan variants;
+command ranges plus full generated child-read parses for each recorded CTE body
+before dispatching to the typed recursive write-plan variants;
 and `TRUNCATE`
 lowers directly from generated AST ranges into mutation-source plans. Incomplete
 migrated DML statements that stop at required generated clause boundaries now
@@ -115,11 +116,11 @@ fail closed through the generated parser instead of falling back to the legacy
 write classifier. Other DML shapes still use an initial generated
 AST-to-plan wrapper that fails closed if the generated DML family does not
 match the existing write classifier before delegating to the current typed DML
-lowerer. Deeper DML cutover still requires replacing token-based command-body
-parsing with complete generated AST payloads for recursive CTE DML command
-bodies beyond retained generated CTE body metadata, broader unsupported-shape
-diagnostics, and a later full statement-head promotion once generated coverage
-matches the currently supported typed DML surface.
+lowerer. Deeper DML cutover still requires replacing token-based recursive DML
+command-body lowering with complete generated AST-driven lowering beyond
+validated generated CTE child-read bodies, broader unsupported-shape diagnostics,
+and a later full statement-head promotion once generated coverage matches the
+currently supported typed DML surface.
 Representative
 read queries now have generated-parser corpus coverage, retained generated raw
 and AST nodes for covered read statements, top-level generated AST ranges for
@@ -420,15 +421,19 @@ Unsupported DDL remains on the existing parser until
    write-plan lowering, so `INSERT ... SELECT`, relation-source mutation paths,
    and `MERGE ... USING` wrappers do not depend only on lightweight range
    payload checks.
+   Recursive DML CTE prefixes now reparse each recorded generated CTE body as a
+   child read and validate that child through the shared generated read-AST
+   contract before dispatching to typed recursive write-plan lowering.
    Incomplete migrated DML clause-boundary shapes for insert, update, delete,
    truncate, and merge now use generated fail-closed diagnostics instead of
    classifier fallback.
    Switching the full DML family from generated-parser gating plus typed
    lowerer delegation to complete generated AST-driven lowering still requires
-   generated command-body ASTs for recursive CTE DML beyond retained generated
-   CTE body metadata and direct recursive write-plan dispatch, broader
-   unsupported-shape diagnostics, and full generated statement-head promotion
-   once generated coverage matches the current typed DML lowerer surface.
+   generated command-body AST-driven lowering for recursive CTE DML beyond
+   validated generated CTE child-read bodies and direct recursive write-plan
+   dispatch, broader unsupported-shape diagnostics, and full generated
+   statement-head promotion once generated coverage matches the current typed
+   DML lowerer surface.
 4. Read queries: projections, predicates, joins, CTEs, aggregates, windows,
    set operations, lateral, ordering, limits, and document-table sources.
    Initial generated-parser coverage now retains raw and AST read nodes for
@@ -894,20 +899,18 @@ Generated grammar work needs evidence at multiple levels:
   default-values row batches with conflict actions and returning lists, direct
   generated AST-to-plan coverage for supported same-table and cross-table
   insert-select requests with conflict and returning lists plus retained
-  lightweight generated read-body payloads for insert-select source bodies, direct generated
+  generated child-read validation for insert-select source bodies, direct generated
   AST-to-plan coverage for single-table point update/delete batches with
   returning lists, direct generated AST-to-plan coverage for table-wide and
   single-table source update/delete mutation-source requests without joined
   sources, direct generated AST-to-plan coverage for explicit update-from and
-  delete-using joined mutation-source requests with retained lightweight
-  generated read-body payloads and generated child-read wrapper validation for
+  delete-using joined mutation-source requests with generated child-read wrapper validation for
   relation source bodies, direct generated AST-to-plan
-  coverage for merge plans with retained lightweight generated read-body
-  payloads and generated child-read wrapper validation for `USING` relation
+  coverage for merge plans with generated child-read wrapper validation for `USING` relation
   source bodies, and non-recursive CTE write prefixes across
   insert-source, point update/delete, joined update/delete, and merge,
   generated-direct validation and dispatch with retained generated per-CTE body
-  metadata for recursive CTE insert-source, update, delete, and merge
+  metadata plus generated child-read validation for recursive CTE insert-source, update, delete, and merge
   write-plan variants,
   generated-first write lowering context
   dispatch, and generated-family validation fallback over other representative
