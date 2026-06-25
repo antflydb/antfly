@@ -30215,7 +30215,11 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
     var sink = FakePromotionSink{ .alloc = alloc };
     defer sink.deinit();
 
-    var db = try DB.open(alloc, std.mem.span(path), .{ .entity_sink = sink.sink() });
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .executor = .{ .backend = .manual },
+        .start_index_workers = false,
+        .entity_sink = sink.sink(),
+    });
     defer db.close();
 
     try db.addIndex(.{
