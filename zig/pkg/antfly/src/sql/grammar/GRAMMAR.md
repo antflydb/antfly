@@ -643,7 +643,8 @@ Unsupported DDL remains on the existing parser until
    Generated `WHERE` and aggregate `HAVING` predicates now recursively validate
    retained quantified-comparison, `EXISTS`, grouped, subquery, set-operation
    subquery, array-constructor, and boolean condition-chain boundary payloads
-   before the typed lowerer accepts the generated clause span.
+   before the typed lowerer accepts the generated clause span, including
+   retained subquery `FROM` and `WHERE` keyword layout.
    Generated read validation
    rejects pagination payloads that are missing required expressions, attach
    expressions to `LIMIT ALL`, place expression spans outside their owning
