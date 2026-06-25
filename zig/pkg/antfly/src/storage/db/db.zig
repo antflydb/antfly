@@ -130,6 +130,10 @@ fn notifyAsyncContextVisibilityHook(ptr: *anyopaque) void {
     if (ctx.query_visibility_hook) |hook| hook.notify(.invalidate);
 }
 
+fn lockApply(db: *DB) void {
+    db.core.lockApply();
+}
+
 const denseCatchUpFinishOptions = derived_async.denseCatchUpFinishOptions;
 const denseCatchUpStartupCacheNodes = derived_async.denseCatchUpStartupCacheNodes;
 const denseCatchUpStartupCacheVectors = derived_async.denseCatchUpStartupCacheVectors;
@@ -4319,7 +4323,3 @@ const currentTimeNs = db_internal.currentTimeNs;
 const parsePatternRfc3339ToNs = db_internal.parseRfc3339ToNs;
 
 const flushDeferredExternalBulkExecutorNotification = db_internal.flushDeferredExternalBulkExecutorNotification;
-
-const db_test_support = @import("test_support.zig");
-
-const lockApply = db_test_support.lockApply;
