@@ -196,6 +196,52 @@ fn generatedOrderClauseEnd(
     return range.end;
 }
 
+fn validateGeneratedExpressionListForClause(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    list: generated_parser.GeneratedSqlListAst,
+) !void {
+    if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    if (list.count == 0 or list.items.len != list.count or list.expression_items.len != list.count or list.expressions.len != list.count) return error.UnsupportedSqlShape;
+    if (list.alias_items.len != list.count or list.alias_name_items.len != list.count) return error.UnsupportedSqlShape;
+    if (list.direction_items.len != list.count or list.directions.len != list.count) return error.UnsupportedSqlShape;
+    if (list.order_using_operator_items.len != list.count or list.nulls_order_items.len != list.count or list.nulls_orders.len != list.count) return error.UnsupportedSqlShape;
+    if (list.first_tokens == null or !generatedTokenRangeEqual(list.first_tokens.?, list.items[0])) return error.UnsupportedSqlShape;
+    if (list.last_tokens == null or !generatedTokenRangeEqual(list.last_tokens.?, list.items[list.count - 1])) return error.UnsupportedSqlShape;
+
+    for (list.items, 0..) |item, index| {
+        if (item.start >= item.end or item.start < range.start or item.end > range.end) return error.UnsupportedSqlShape;
+        if (index == 0) {
+            if (item.start != range.start) return error.UnsupportedSqlShape;
+        } else {
+            const previous = list.items[index - 1];
+            if (previous.end + 1 != item.start or previous.end >= tokens.len or tokens[previous.end].kind != .comma) return error.UnsupportedSqlShape;
+        }
+        if (index + 1 == list.count and item.end != range.end) return error.UnsupportedSqlShape;
+        if (list.alias_items[index] != null or list.alias_name_items[index] != null) return error.UnsupportedSqlShape;
+        if (list.direction_items[index] != null or list.directions[index] != null) return error.UnsupportedSqlShape;
+        if (list.order_using_operator_items[index] != null or list.nulls_order_items[index] != null or list.nulls_orders[index] != null) return error.UnsupportedSqlShape;
+
+        const expression_range = list.expression_items[index];
+        if (!generatedTokenRangeEqual(expression_range, item)) return error.UnsupportedSqlShape;
+        if (!generatedTokenRangeEqual(list.expressions[index].tokens orelse return error.UnsupportedSqlShape, expression_range)) return error.UnsupportedSqlShape;
+    }
+}
+
+fn generatedGroupClauseEnd(
+    tokens: []const Token,
+    keyword_index: usize,
+    pos: usize,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !?usize {
+    const read = generated_read_ast orelse return null;
+    if (keyword_index + 1 >= tokens.len or !tokens[keyword_index].matchesKeywordTag(.group) or !tokens[keyword_index + 1].matchesKeywordTag(.by)) return null;
+    const range = read.group_tokens orelse return error.UnsupportedSqlShape;
+    if (range.start != pos or range.end > tokens.len) return error.UnsupportedSqlShape;
+    try validateGeneratedExpressionListForClause(tokens, range, read.group_items);
+    return range.end;
+}
+
 fn parseGeneratedLimitValueForClause(
     tokens: []const Token,
     keyword_index: usize,
@@ -16283,7 +16329,9 @@ pub fn parseAggregateAlloc(
             );
         } else if (parser.matchKeyword(tokens, pos, "group")) {
             if (distinct_group_only) return error.UnsupportedSqlShape;
+            const keyword_index = pos.* - 1;
             try parser.expectKeyword(tokens, pos, "by");
+            const generated_group_end = try generatedGroupClauseEnd(tokens, keyword_index, pos.*, options.generated_read_ast);
             const group_context = options.context_hooks.get_context(options.context_hooks.ptr);
             try parseAggregateGroupByAlloc(
                 alloc,
@@ -16302,6 +16350,9 @@ pub fn parseAggregateAlloc(
                 select,
                 options.select_item_options,
             );
+            if (generated_group_end) |end| {
+                if (pos.* != end) return error.UnsupportedSqlShape;
+            }
         } else if (parser.matchKeyword(tokens, pos, "having")) {
             if (distinct_group_only) return error.UnsupportedSqlShape;
             try parseAggregateHavingAlloc(
@@ -29003,6 +29054,54 @@ fn corruptGeneratedReadFirstOrderExpressionItem(parsed_sql: *tokenized.ParsedSql
         }
     }
     return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadFirstGroupExpressionItem(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |*read| {
+                    if (read.group_items.items.len == 0 or read.group_items.expression_items.len == 0 or read.projection_items.items.len == 0) return error.TestUnexpectedResult;
+                    read.group_items.expression_items[0] = read.projection_items.items[0];
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "sql adapter lower expr lowers grouped aggregate queries with generated group validation" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT status, SUM(amount) AS total FROM usage_records GROUP BY status ORDER BY total DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.group_by.len);
+    try std.testing.expectEqualStrings("status", lowered.aggregate.group_by[0]);
+
+    var malformed_group = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT status, SUM(amount) AS total FROM usage_records GROUP BY status ORDER BY total DESC LIMIT 5",
+    );
+    defer malformed_group.deinit(alloc);
+    try corruptGeneratedReadFirstGroupExpressionItem(&malformed_group);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
+        alloc,
+        &malformed_group,
+        schema,
+        &.{},
+    ));
 }
 
 test "sql adapter lower expr lowers pagination limit all and fetch forms with generated order validation" {
