@@ -33,7 +33,7 @@
 %token ARROW_JSON ARROW_TEXT PATH_ARROW_JSON PATH_ARROW_TEXT
 %token REGEX_MATCH REGEX_IMATCH REGEX_NOT_MATCH REGEX_NOT_IMATCH
 %token ADD ALL ALTER ANALYZE AND ANY ARRAY AS ASC ASYMMETRIC BEGIN BETWEEN BY CASCADE CALL CASE CAST CHECKPOINT CLOSE CLUSTER COMMIT COMMENT CONFLICT CONSTRAINT CONTINUE CURRENT CURRENT_DATE CURRENT_TIMESTAMP
-%token CREATE COPY DATA DATABASE DEALLOCATE DECLARE DEFAULT DELETE DESC DISCARD DISTINCT DO DROP EXECUTE
+%token CREATE COPY DATA DATABASE DEALLOCATE DECLARE DEFAULT DELETE DESC DISCARD DISTINCT DO DOMAIN DROP EXECUTE
 %token ELSE END ESCAPE EXPLAIN EXISTS EXTENSION EXTRACT FALSE FETCH FILTER FIRST FOLLOWING FOR FOREIGN FROM FULL GRANT GRAPH GROUP HAVING IDENTITY IF ILIKE INCLUDE IN INDEX INNER INSERT INTERVAL INTO IS
 %token ISNULL JOIN KEY LABEL LAST LATERAL LEFT LIKE LIMIT LISTEN LOAD LOCK LOCKED MATCHED MATERIALIZED MERGE METRIC MOVE NO NOT NULL NOTIFY NOTNULL NOWAIT NULLS OF ON OR ORDER OUTER OVER PARTITION POLICY PRECEDING PREPARE PRIMARY PUBLIC PUBLICATION
 %token NEXT NOTHING OFFSET ONLY QUERY RANGE RECURSIVE REFRESH REINDEX RELEASE RENAME REPLACE RESET RESTART RESTRICT RETURNING REVOKE RIGHT ROLLBACK ROW ROWS RULE SAVEPOINT SCHEMA SECURITY SELECT SERVER SET SHARE SHOW SKIP SOME SUBSCRIPTION TABLE TEMP TEMPORARY TIMESTAMP TIMESTAMPTZ TO TRUNCATE
@@ -88,10 +88,12 @@ ddl_statement:
   | create_schema_statement
   | create_table_statement
   | create_view_statement
+  | create_domain_statement
   | create_index_statement
   | create_extension_statement
   | alter_table_statement
   | alter_view_statement
+  | alter_domain_statement
   | drop_statement
   | relation_population_statement
   ;
@@ -125,6 +127,10 @@ create_view_replace_opt:
 view_column_list_opt:
     /* empty */
   | LPAREN identifier_list RPAREN
+  ;
+
+create_domain_statement:
+    CREATE DOMAIN qualified_name AS diagnostic_tail
   ;
 
 relation_population_statement:
@@ -176,6 +182,10 @@ alter_view_statement:
     ALTER VIEW qualified_name RENAME TO qualified_name
   ;
 
+alter_domain_statement:
+    ALTER DOMAIN qualified_name diagnostic_tail
+  ;
+
 alter_table_relation_prefix_opt:
     /* empty */
   | IF EXISTS
@@ -190,6 +200,7 @@ drop_statement:
   | DROP DATABASE if_exists_opt qualified_name drop_database_force_opt
   | DROP EXTENSION if_exists_opt qualified_name drop_behavior_opt
   | DROP VIEW if_exists_opt qualified_name drop_behavior_opt
+  | DROP DOMAIN if_exists_opt qualified_name drop_behavior_opt
   ;
 
 drop_database_force_opt:
@@ -1058,6 +1069,7 @@ identifier_name:
   | COMMENT
   | DECLARE
   | FIELD
+  | DOMAIN
   | FRESHNESS
   | FETCH
   | GRAPH_METRIC
@@ -1173,6 +1185,7 @@ diagnostic_token:
   | DEFAULT
   | DELETE
   | DO
+  | DOMAIN
   | DROP
   | EXECUTE
   | EXISTS

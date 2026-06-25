@@ -450,6 +450,10 @@ fn isIncompleteGeneratedDdlBoundary(tokens: []const Token, raw_statement: RawSql
             if (end <= start + 3) return true;
             return isGeneratedDdlTrailingBoundary(last);
         }
+        if (tokenMatchesKeyword(tokens[start + 1], .domain)) {
+            if (end <= start + 3) return true;
+            return isGeneratedDdlTrailingBoundary(last);
+        }
         if (tokenMatchesKeyword(tokens[start + 1], .index)) {
             if (end <= start + 3) return true;
             return isGeneratedDdlTrailingBoundary(last);
@@ -470,9 +474,14 @@ fn isIncompleteGeneratedDdlBoundary(tokens: []const Token, raw_statement: RawSql
         if (end <= start + 3) return true;
         return isGeneratedDdlTrailingBoundary(last);
     }
+    if (tokenMatchesKeyword(first, .alter) and tokenMatchesKeyword(tokens[start + 1], .domain)) {
+        if (end <= start + 3) return true;
+        return isGeneratedDdlTrailingBoundary(last);
+    }
     if (tokenMatchesKeyword(first, .drop)) {
         if (tokenMatchesKeyword(tokens[start + 1], .table) or
             tokenMatchesKeyword(tokens[start + 1], .view) or
+            tokenMatchesKeyword(tokens[start + 1], .domain) or
             tokenMatchesKeyword(tokens[start + 1], .index) or
             tokenMatchesKeyword(tokens[start + 1], .database) or
             tokenMatchesKeyword(tokens[start + 1], .schema) or
@@ -502,6 +511,9 @@ fn isGeneratedDdlTrailingBoundary(token: Token) bool {
         tokenMatchesKeyword(token, .validate) or
         tokenMatchesKeyword(token, .column) or
         tokenMatchesKeyword(token, .constraint) or
+        tokenMatchesKeyword(token, .set) or
+        tokenMatchesKeyword(token, .default) or
+        tokenMatchesKeyword(token, .null) or
         tokenMatchesKeyword(token, .to) or
         tokenMatchesKeyword(token, .as);
 }
@@ -1333,6 +1345,10 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE OR REPLACE VIEW active_usage AS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER VIEW active_usage RENAME TO"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP VIEW IF EXISTS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE DOMAIN"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE DOMAIN positive_amount AS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER DOMAIN positive_amount SET"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP DOMAIN IF EXISTS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT DISTINCT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT DISTINCT ON ("));

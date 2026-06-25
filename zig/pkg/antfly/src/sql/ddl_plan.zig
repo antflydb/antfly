@@ -3270,6 +3270,10 @@ pub fn ddlPlanFromGeneratedAstAlloc(
         .alter_view,
         .drop_view,
         => try viewCatalogPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options),
+        .create_domain,
+        .alter_domain,
+        .drop_domain,
+        => try domainCatalogPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options),
         .create_index => .{ .create_index = try createIndexPlanFromGeneratedAstAlloc(alloc, tokens, ast, options.create_index_options) },
         .alter_table => if (generatedAlterTableUsesRowSecurityRuntimeBoundary(tokens, ast))
             .{ .row_security_catalog = .{ .alter_table = try rowSecurityAlterTablePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } }
@@ -3286,10 +3290,13 @@ fn generatedDdlUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated
         .create_database,
         .create_schema,
         .create_view,
+        .create_domain,
         .create_extension,
         .alter_view,
+        .alter_domain,
         .drop_table,
         .drop_view,
+        .drop_domain,
         .drop_index,
         .drop_schema,
         .drop_database,
@@ -3414,6 +3421,74 @@ fn consumeGeneratedPlanIfExists(tokens: []const grammar.Token, index: *usize, en
         return true;
     }
     return false;
+}
+
+fn domainCatalogPlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+    options: DdlPlanParserOptions,
+) !LoweredDdlPlan {
+    try validateGeneratedDomainDdlAst(tokens, ast);
+    var pos: usize = 0;
+    var plan = try parseDdlPlanAlloc(alloc, tokens, &pos, options);
+    errdefer plan.deinit(alloc);
+    if (pos != tokens.len) return error.UnsupportedSqlShape;
+    switch (ast.kind) {
+        .create_domain => switch (plan) {
+            .domain_catalog => |catalog| switch (catalog) {
+                .create => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .alter_domain => switch (plan) {
+            .domain_catalog => |catalog| switch (catalog) {
+                .alter => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .drop_domain => switch (plan) {
+            .domain_catalog => |catalog| switch (catalog) {
+                .drop => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+    return plan;
+}
+
+fn validateGeneratedDomainDdlAst(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) !void {
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    const object_name = ast.object_name_tokens orelse return error.UnsupportedSqlShape;
+    if (object_name.start >= object_name.end or object_name.end > end) return error.UnsupportedSqlShape;
+    switch (ast.kind) {
+        .create_domain => {
+            if (end < 5 or !tokens[0].matchesKeyword("create") or !tokens[1].matchesKeyword("domain")) return error.UnsupportedSqlShape;
+            if (object_name.start != 2) return error.UnsupportedSqlShape;
+            if (object_name.end >= end or !tokens[object_name.end].matchesKeyword("as")) return error.UnsupportedSqlShape;
+        },
+        .alter_domain => {
+            if (end < 5 or !tokens[0].matchesKeyword("alter") or !tokens[1].matchesKeyword("domain")) return error.UnsupportedSqlShape;
+            if (object_name.start != 2) return error.UnsupportedSqlShape;
+            const operation = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+            if (operation.start != object_name.end or operation.end != end or operation.start >= end) return error.UnsupportedSqlShape;
+            if (!tokens[operation.start].matchesKeyword("set") and !tokens[operation.start].matchesKeyword("drop")) return error.UnsupportedSqlShape;
+        },
+        .drop_domain => {
+            if (end < 3 or !tokens[0].matchesKeyword("drop") or !tokens[1].matchesKeyword("domain")) return error.UnsupportedSqlShape;
+            var name_index: usize = 2;
+            const if_exists = consumeGeneratedPlanIfExists(tokens, &name_index, end);
+            if (if_exists != ast.if_exists) return error.UnsupportedSqlShape;
+            if (object_name.start != name_index) return error.UnsupportedSqlShape;
+            const has_cascade = generatedRangeHasKeyword(tokens, .{ .start = object_name.end, .end = end }, "cascade");
+            if (has_cascade != ast.cascade) return error.UnsupportedSqlShape;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
 }
 
 fn generatedCreateIndexUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) bool {
@@ -4036,6 +4111,7 @@ fn validateGeneratedDdlAstSpans(
         .create_schema,
         .create_table,
         .create_view,
+        .create_domain,
         .create_index,
         .create_extension,
         .create_graph_index,
@@ -4044,9 +4120,11 @@ fn validateGeneratedDdlAstSpans(
         .relation_population => unreachable,
         .alter_table,
         .alter_view,
+        .alter_domain,
         => .alter,
         .drop_table,
         .drop_view,
+        .drop_domain,
         .drop_index,
         .drop_schema,
         .drop_database,
@@ -15223,6 +15301,96 @@ test "sql adapter generated view DDL AST lowers to catalog plans" {
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_operation));
+}
+
+test "sql adapter generated domain DDL AST lowers to catalog plans" {
+    const alloc = std.testing.allocator;
+
+    var create_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CREATE DOMAIN positive_amount AS numeric CHECK (VALUE > 0);",
+    );
+    defer create_sql.deinit(alloc);
+    var create_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &create_sql);
+    defer create_plan.deinit(alloc);
+    switch (create_plan) {
+        .domain_catalog => |catalog| switch (catalog) {
+            .create => |create| {
+                try std.testing.expectEqualStrings("positive_amount", create.domain_name);
+                try std.testing.expectEqual(runtime_schema.AntflyType.numeric, create.field_type);
+                try std.testing.expectEqual(@as(usize, 1), create.checks.len);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var alter_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "ALTER DOMAIN positive_amount SET NOT NULL, SET DEFAULT 42, DROP DEFAULT;",
+    );
+    defer alter_sql.deinit(alloc);
+    var alter_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &alter_sql);
+    defer alter_plan.deinit(alloc);
+    switch (alter_plan) {
+        .domain_catalog => |catalog| switch (catalog) {
+            .alter => |alter| {
+                try std.testing.expectEqualStrings("positive_amount", alter.domain_name);
+                try std.testing.expectEqual(@as(usize, 3), alter.operations.len);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DROP DOMAIN IF EXISTS positive_amount CASCADE;",
+    );
+    defer drop_sql.deinit(alloc);
+    var drop_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &drop_sql);
+    defer drop_plan.deinit(alloc);
+    switch (drop_plan) {
+        .domain_catalog => |catalog| switch (catalog) {
+            .drop => |drop| {
+                try std.testing.expectEqualStrings("positive_amount", drop.domain_name);
+                try std.testing.expect(drop.if_exists);
+                try std.testing.expect(drop.cascade);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var malformed_create = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CREATE DOMAIN positive_amount AS numeric;",
+    );
+    defer malformed_create.deinit(alloc);
+    if (malformed_create.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.object_name_tokens = .{ .start = 1, .end = 2 },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_create));
+
+    var malformed_alter = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "ALTER DOMAIN positive_amount SET NOT NULL;",
+    );
+    defer malformed_alter.deinit(alloc);
+    if (malformed_alter.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.alter_table_operation_tokens = .{ .start = 2, .end = malformed_alter.items().len },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_alter));
 }
 
 test "sql adapter generated row policy unsupported AST lowers to catalog plans" {

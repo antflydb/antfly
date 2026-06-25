@@ -71,6 +71,10 @@ Plain view catalog DDL heads, including `CREATE VIEW`, `CREATE OR REPLACE VIEW`,
 `ALTER VIEW ... RENAME TO`, and `DROP VIEW`, now parse through generated DDL
 ASTs and use a generated runtime boundary before delegating to the existing
 typed view catalog planner.
+Domain catalog DDL heads, including `CREATE DOMAIN`, `ALTER DOMAIN`, and
+`DROP DOMAIN`, now use the same generated DDL boundary with retained object
+spans and validated command/tail metadata before delegating to the existing
+typed domain catalog planner.
 Generated
 `CREATE INDEX` ASTs also retain
 `UNIQUE`, method, element-list, covering-index `INCLUDE (...)`, options, and
@@ -82,10 +86,11 @@ now parse and classify through the generated DDL family with retained target
 name spans before delegating to the existing relation-population planner.
 Incomplete covered DDL clause-boundary shapes for `CREATE TABLE`, lifetime
 prefixed `CREATE [TEMP|TEMPORARY|UNLOGGED] TABLE`, `CREATE VIEW`,
-`CREATE INDEX`, `ALTER TABLE`, `ALTER VIEW`, `DROP TABLE`, and `DROP VIEW` now
-fail closed through the generated parser instead of falling back to the legacy
-DDL classifier, while rich DDL syntax that is not yet generated-covered still
-falls back to the existing typed DDL parser.
+`CREATE DOMAIN`, `CREATE INDEX`, `ALTER TABLE`, `ALTER VIEW`, `ALTER DOMAIN`,
+`DROP TABLE`, `DROP VIEW`, and `DROP DOMAIN` now fail closed through the
+generated parser instead of falling back to the legacy DDL classifier, while
+rich DDL syntax that is not yet generated-covered still falls back to the
+existing typed DDL parser.
 Simple DML now has generated-parser corpus
 coverage, retained generated raw and AST nodes for covered write statements,
 structured generated DML ranges for target tables, sources, assignments,
@@ -1009,7 +1014,8 @@ Generated grammar work needs evidence at multiple levels:
   Runtime DDL lowering now dispatches generated session statements, prepared
   statements, graph DDL, database/schema/extension catalog DDL, generated
   `CREATE TABLE` including serial identity-allocation tables, `DROP TABLE`,
-  `DROP INDEX`, generated `CREATE INDEX` including retained partial predicate
+  `DROP INDEX`, generated domain catalog DDL for `CREATE DOMAIN`,
+  `ALTER DOMAIN`, and `DROP DOMAIN`, generated `CREATE INDEX` including retained partial predicate
   indexes with field or expression predicates, and generated
   `ALTER TABLE ADD/DROP/RENAME COLUMN`, `ADD PRIMARY KEY`, `ADD UNIQUE`,
   `ADD FOREIGN KEY`, `ADD CHECK`, `ADD PERIOD`, plus `VALIDATE CONSTRAINT`

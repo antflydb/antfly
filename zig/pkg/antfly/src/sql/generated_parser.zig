@@ -55,12 +55,15 @@ pub const GeneratedSqlDdlKind = enum {
     create_schema,
     create_table,
     create_view,
+    create_domain,
     create_index,
     create_extension,
     alter_table,
     alter_view,
+    alter_domain,
     drop_table,
     drop_view,
+    drop_domain,
     drop_index,
     drop_schema,
     drop_database,
@@ -1522,9 +1525,11 @@ pub const simple_ddl_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT account_id FROM usage_records WITH NO DATA", .kind = .ddl },
     .{ .sql = "CREATE VIEW active_usage AS SELECT id, status FROM usage_records", .kind = .ddl },
     .{ .sql = "CREATE OR REPLACE VIEW IF NOT EXISTS active_usage AS SELECT id, status FROM usage_records", .kind = .ddl },
+    .{ .sql = "CREATE DOMAIN positive_amount AS numeric CHECK (VALUE > 0)", .kind = .ddl },
     .{ .sql = "ALTER TABLE usage_records ADD COLUMN status text", .kind = .ddl },
     .{ .sql = "ALTER TABLE IF EXISTS ONLY usage_records DROP COLUMN IF EXISTS status RESTRICT", .kind = .ddl },
     .{ .sql = "ALTER VIEW active_usage RENAME TO active_usage_v2", .kind = .ddl },
+    .{ .sql = "ALTER DOMAIN positive_amount SET NOT NULL", .kind = .ddl },
     .{ .sql = "CREATE INDEX usage_records_status_idx ON usage_records (status)", .kind = .extension_index },
     .{ .sql = "CREATE INDEX IF NOT EXISTS usage_records_status_idx ON usage_records (status)", .kind = .extension_index },
     .{ .sql = "CREATE UNIQUE INDEX usage_records_status_active_idx ON usage_records (status) INCLUDE (tenant_id, amount) WHERE deleted_at IS NULL", .kind = .extension_index },
@@ -1532,6 +1537,7 @@ pub const simple_ddl_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "DROP TABLE usage_records", .kind = .ddl },
     .{ .sql = "DROP TABLE IF EXISTS usage_records", .kind = .ddl },
     .{ .sql = "DROP VIEW IF EXISTS active_usage CASCADE", .kind = .ddl },
+    .{ .sql = "DROP DOMAIN IF EXISTS positive_amount CASCADE", .kind = .ddl },
     .{ .sql = "DROP INDEX usage_records_status_idx", .kind = .extension_index },
     .{ .sql = "DROP EXTENSION vector", .kind = .extension_index },
     .{ .sql = "DROP SCHEMA analytics CASCADE", .kind = .ddl },
@@ -1931,6 +1937,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.schema)) return .{ .ddl = .create_schema };
         if (second.matchesKeywordTag(.table)) return .{ .ddl = .create_table };
         if (second.matchesKeywordTag(.view)) return .{ .ddl = .create_view };
+        if (second.matchesKeywordTag(.domain)) return .{ .ddl = .create_domain };
         if (second.matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
         if (second.matchesKeywordTag(.unique) and tokens.len > 2 and tokens[2].matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
         if (second.matchesKeywordTag(.foreign) and tokens.len > 2 and tokens[2].matchesKeywordTag(.table)) return .{ .unsupported = .create_foreign_table };
@@ -1959,6 +1966,9 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.alter) and tokens.len > 1 and tokens[1].matchesKeywordTag(.view)) {
         return .{ .ddl = .alter_view };
     }
+    if (first.matchesKeywordTag(.alter) and tokens.len > 1 and tokens[1].matchesKeywordTag(.domain)) {
+        return .{ .ddl = .alter_domain };
+    }
     if (first.matchesKeywordTag(.alter) and tokens.len > 1) {
         const second = tokens[1];
         if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .unsupported = .alter_materialized_view };
@@ -1973,6 +1983,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         const second = tokens[1];
         if (second.matchesKeywordTag(.table)) return .{ .ddl = .drop_table };
         if (second.matchesKeywordTag(.view)) return .{ .ddl = .drop_view };
+        if (second.matchesKeywordTag(.domain)) return .{ .ddl = .drop_domain };
         if (second.matchesKeywordTag(.index)) return .{ .extension_index = .drop_index };
         if (second.matchesKeywordTag(.schema)) return .{ .ddl = .drop_schema };
         if (second.matchesKeywordTag(.database)) return .{ .ddl = .drop_database };
@@ -2424,6 +2435,11 @@ fn buildDdlAst(
             ast.if_not_exists = consumeGeneratedIfNotExists(tokens, &index, end);
             ast.object_name_tokens = generatedQualifiedNameRange(tokens, index, end);
         },
+        .create_domain => {
+            if (end > 2 and tokens[1].matchesKeywordTag(.domain)) {
+                ast.object_name_tokens = generatedQualifiedNameRange(tokens, 2, end);
+            }
+        },
         .create_index => {
             if (tokens.len > 2 and tokens[1].matchesKeywordTag(.unique) and tokens[2].matchesKeywordTag(.index)) {
                 ast.unique = true;
@@ -2493,6 +2509,14 @@ fn buildDdlAst(
                 }
             }
         },
+        .alter_domain => {
+            if (end > 2 and tokens[1].matchesKeywordTag(.domain)) {
+                ast.object_name_tokens = generatedQualifiedNameRange(tokens, 2, end);
+                if (ast.object_name_tokens) |domain_range| {
+                    if (domain_range.end < end) ast.alter_table_operation_tokens = .{ .start = domain_range.end, .end = end };
+                }
+            }
+        },
         .drop_database => {
             ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
             ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
@@ -2504,6 +2528,11 @@ fn buildDdlAst(
             ast.cascade = findKeyword(tokens, index + 1, end, .cascade) != null;
         },
         .drop_view => {
+            ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
+            ast.object_name_tokens = generatedQualifiedNameRange(tokens, index, end);
+            ast.cascade = findKeyword(tokens, index + 1, end, .cascade) != null;
+        },
+        .drop_domain => {
             ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
             ast.object_name_tokens = generatedQualifiedNameRange(tokens, index, end);
             ast.cascade = findKeyword(tokens, index + 1, end, .cascade) != null;
@@ -5748,6 +5777,9 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_view }, (try parseSqlAlloc(alloc, "CREATE VIEW active_usage AS SELECT id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_view }, (try parseSqlAlloc(alloc, "ALTER VIEW active_usage RENAME TO active_usage_v2")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_view }, (try parseSqlAlloc(alloc, "DROP VIEW active_usage")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_domain }, (try parseSqlAlloc(alloc, "CREATE DOMAIN positive_amount AS numeric")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_domain }, (try parseSqlAlloc(alloc, "ALTER DOMAIN positive_amount SET NOT NULL")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_domain }, (try parseSqlAlloc(alloc, "DROP DOMAIN positive_amount")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .relation_population }, (try parseSqlAlloc(alloc, "SELECT account_id, total INTO usage_archive FROM usage_records WHERE total > 10")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .relation_population }, (try parseSqlAlloc(alloc, "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT account_id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_schema }, (try parseSqlAlloc(alloc, "DROP SCHEMA analytics CASCADE")).statement);
@@ -5884,6 +5916,17 @@ test "generated SQL parser facade builds control AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const create_domain_sql = "CREATE DOMAIN positive_amount AS numeric CHECK (VALUE > 0)";
+    const create_domain_result = try parseSqlAlloc(alloc, create_domain_sql);
+    switch (create_domain_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.create_domain, ddl.kind);
+            try std.testing.expectEqualStrings("CREATE", spanText(create_domain_sql, ddl.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const extension_sql = "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public VERSION '1.3'";
     const extension_result = try parseSqlAlloc(alloc, extension_sql);
     switch (extension_result.ast.?) {
@@ -5979,6 +6022,17 @@ test "generated SQL parser facade builds control AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const alter_domain_sql = "ALTER DOMAIN positive_amount SET NOT NULL";
+    const alter_domain_result = try parseSqlAlloc(alloc, alter_domain_sql);
+    switch (alter_domain_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.alter_domain, ddl.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 6 }, ddl.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const drop_index_sql = "DROP INDEX IF EXISTS usage_status_idx";
     const drop_index_result = try parseSqlAlloc(alloc, drop_index_sql);
     switch (drop_index_result.ast.?) {
@@ -6007,6 +6061,18 @@ test "generated SQL parser facade builds control AST spans" {
     switch (drop_view_result.ast.?) {
         .ddl => |ddl| {
             try std.testing.expectEqual(GeneratedSqlDdlKind.drop_view, ddl.kind);
+            try std.testing.expect(ddl.if_exists);
+            try std.testing.expect(ddl.cascade);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const drop_domain_sql = "DROP DOMAIN IF EXISTS positive_amount CASCADE";
+    const drop_domain_result = try parseSqlAlloc(alloc, drop_domain_sql);
+    switch (drop_domain_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.drop_domain, ddl.kind);
             try std.testing.expect(ddl.if_exists);
             try std.testing.expect(ddl.cascade);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl.object_name_tokens.?);
