@@ -3150,11 +3150,12 @@ fn validateGeneratedDistinctOnListAstRanges(
     const distinct = distinct_tokens.?;
     try validateGeneratedDistinctOnListMetadata(distinct_tokens, distinct_on_items);
     try validateGeneratedReadListAstRanges(tokens, read_ast, distinct_on_items);
+    if (distinct.start >= distinct.end or distinct.end > tokens.len) return error.UnsupportedSqlShape;
+    if (!tokens[distinct.start].matchesKeywordTag(.distinct)) return error.UnsupportedSqlShape;
     if (distinct_on_items.count == 0) return;
 
     if (distinct.start + 4 > distinct.end or distinct.end > tokens.len) return error.UnsupportedSqlShape;
-    if (!tokens[distinct.start].matchesKeywordTag(.distinct) or
-        !tokens[distinct.start + 1].matchesKeywordTag(.on) or
+    if (!tokens[distinct.start + 1].matchesKeywordTag(.on) or
         tokens[distinct.start + 2].kind != .lparen or
         tokens[distinct.end - 1].kind != .rparen)
     {
@@ -5033,6 +5034,23 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_like_any_subquery_parsed_sql, malformed_like_any_subquery_read_ast),
     );
 
+    var malformed_distinct_keyword_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT DISTINCT status FROM usage_records",
+    );
+    defer malformed_distinct_keyword_parsed_sql.deinit(alloc);
+    const malformed_distinct_keyword_generated_raw = malformed_distinct_keyword_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    const malformed_distinct_keyword_read_ast = switch (malformed_distinct_keyword_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    const malformed_distinct_tokens = malformed_distinct_keyword_read_ast.distinct_tokens orelse return error.UnsupportedSqlShape;
+    @constCast(malformed_distinct_keyword_parsed_sql.items())[malformed_distinct_tokens.start].keyword = .from;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_distinct_keyword_parsed_sql, malformed_distinct_keyword_read_ast),
+    );
+
     var malformed_distinct_on_parsed_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
         "SELECT DISTINCT ON (organization_id) organization_id, id FROM usage_records ORDER BY organization_id ASC, created_at DESC",
@@ -5307,6 +5325,24 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_set_operation_parsed_sql, malformed_set_operation_read_ast),
+    );
+
+    var malformed_set_operation_distinct_keyword_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records UNION SELECT DISTINCT id FROM usage_archive",
+    );
+    defer malformed_set_operation_distinct_keyword_parsed_sql.deinit(alloc);
+    const malformed_set_operation_distinct_keyword_generated_raw = malformed_set_operation_distinct_keyword_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    const malformed_set_operation_distinct_keyword_read_ast = switch (malformed_set_operation_distinct_keyword_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    const malformed_set_operation_distinct_tokens =
+        malformed_set_operation_distinct_keyword_read_ast.set_operation.right_distinct_tokens orelse return error.UnsupportedSqlShape;
+    @constCast(malformed_set_operation_distinct_keyword_parsed_sql.items())[malformed_set_operation_distinct_tokens.start].keyword = .from;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_set_operation_distinct_keyword_parsed_sql, malformed_set_operation_distinct_keyword_read_ast),
     );
 
     malformed_set_operation_read_ast = switch (malformed_set_operation_generated_raw.ast orelse return error.UnsupportedSqlShape) {
@@ -5584,6 +5620,24 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_cte_body_projection_list_parsed_sql, malformed_cte_body_projection_list_read_ast),
+    );
+
+    var malformed_cte_body_distinct_keyword_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH source_rows AS (SELECT DISTINCT status FROM usage_records) SELECT status FROM source_rows",
+    );
+    defer malformed_cte_body_distinct_keyword_parsed_sql.deinit(alloc);
+    const malformed_cte_body_distinct_keyword_generated_raw = malformed_cte_body_distinct_keyword_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    const malformed_cte_body_distinct_keyword_read_ast = switch (malformed_cte_body_distinct_keyword_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    const malformed_cte_body_distinct_tokens =
+        malformed_cte_body_distinct_keyword_read_ast.cte_items[0].body_distinct_tokens orelse return error.UnsupportedSqlShape;
+    @constCast(malformed_cte_body_distinct_keyword_parsed_sql.items())[malformed_cte_body_distinct_tokens.start].keyword = .from;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_cte_body_distinct_keyword_parsed_sql, malformed_cte_body_distinct_keyword_read_ast),
     );
 
     var malformed_cte_body_distinct_on_parsed_sql = try tokenized.ParsedSql.initAlloc(
