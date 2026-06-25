@@ -1277,12 +1277,32 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             );
         }
 
+        fn generatedCteBodyReadAstForTokensAlloc(
+            ptr: *ParserType,
+            tokens: []const Token,
+        ) !?generated_parser.GeneratedSqlReadAst {
+            const parent = ptr.generated_read_ast orelse return null;
+            if (parent.kind != .cte) return error.UnsupportedSqlShape;
+            if (tokens.len == 0) return error.UnsupportedSqlShape;
+            for (parent.cte_items) |cte| {
+                const body = cte.body_tokens orelse continue;
+                if (body.end <= body.start or body.end > ptr.tokens.len) return error.UnsupportedSqlShape;
+                if (body.end - body.start != tokens.len) continue;
+                if (ptr.tokens[body.start].source_start != tokens[0].source_start) continue;
+                if (ptr.tokens[body.end - 1].source_end != tokens[tokens.len - 1].source_end) continue;
+                return try generated_parser.cloneCteBodyReadAstAlloc(ptr.alloc, parent.statement_span, cte);
+            }
+            return error.UnsupportedSqlShape;
+        }
+
         pub fn parseCteSelectHook(
             ptr: *anyopaque,
             tokens: []const Token,
             available_ctes: []const db_mod.types.RelationalRowsCte,
         ) anyerror!plan.LoweredSelect {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
+            var generated_body_ast = try Accessors.generatedCteBodyReadAstForTokensAlloc(self, tokens);
+            defer if (generated_body_ast) |*ast| ast.deinit(self.alloc);
             var sub = ParserType{
                 .alloc = self.alloc,
                 .tokens = tokens,
@@ -1291,6 +1311,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .function_bindings = self.function_bindings,
                 .unique_resolver = self.unique_resolver,
                 .available_ctes = available_ctes,
+                .generated_read_ast = if (generated_body_ast) |*ast| ast else null,
             };
             return try Accessors.parseSelect(&sub);
         }
@@ -1301,6 +1322,8 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             available_ctes: []const db_mod.types.RelationalRowsCte,
         ) anyerror!plan.LoweredSelect {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
+            var generated_body_ast = try Accessors.generatedCteBodyReadAstForTokensAlloc(self, tokens);
+            defer if (generated_body_ast) |*ast| ast.deinit(self.alloc);
             var sub = ParserType{
                 .alloc = self.alloc,
                 .tokens = tokens,
@@ -1309,6 +1332,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .function_bindings = self.function_bindings,
                 .unique_resolver = self.unique_resolver,
                 .available_ctes = available_ctes,
+                .generated_read_ast = if (generated_body_ast) |*ast| ast else null,
             };
             return try Accessors.parseSelect(&sub);
         }

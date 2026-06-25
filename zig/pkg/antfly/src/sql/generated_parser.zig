@@ -938,6 +938,442 @@ pub const GeneratedSqlReadAst = struct {
     }
 };
 
+fn rebaseGeneratedSqlTokenRange(
+    range: GeneratedSqlTokenRange,
+    base: usize,
+    end: usize,
+) !GeneratedSqlTokenRange {
+    if (range.start < base or range.end < range.start or range.end > end) return error.UnsupportedSqlShape;
+    return .{ .start = range.start - base, .end = range.end - base };
+}
+
+fn rebaseGeneratedSqlTokenRangeOptional(
+    range: ?GeneratedSqlTokenRange,
+    base: usize,
+    end: usize,
+) !?GeneratedSqlTokenRange {
+    return if (range) |value| try rebaseGeneratedSqlTokenRange(value, base, end) else null;
+}
+
+fn cloneRebasedGeneratedSqlTokenRangeSliceAlloc(
+    alloc: std.mem.Allocator,
+    ranges: []const GeneratedSqlTokenRange,
+    base: usize,
+    end: usize,
+) ![]GeneratedSqlTokenRange {
+    if (ranges.len == 0) return &.{};
+    const cloned = try alloc.alloc(GeneratedSqlTokenRange, ranges.len);
+    errdefer alloc.free(cloned);
+    for (ranges, cloned) |range, *out| out.* = try rebaseGeneratedSqlTokenRange(range, base, end);
+    return cloned;
+}
+
+fn cloneRebasedGeneratedSqlTokenRangeOptionalSliceAlloc(
+    alloc: std.mem.Allocator,
+    ranges: []const ?GeneratedSqlTokenRange,
+    base: usize,
+    end: usize,
+) ![]?GeneratedSqlTokenRange {
+    if (ranges.len == 0) return &.{};
+    const cloned = try alloc.alloc(?GeneratedSqlTokenRange, ranges.len);
+    errdefer alloc.free(cloned);
+    for (ranges, cloned) |range, *out| out.* = try rebaseGeneratedSqlTokenRangeOptional(range, base, end);
+    return cloned;
+}
+
+fn cloneGeneratedSqlOrderDirectionOptionalSliceAlloc(
+    alloc: std.mem.Allocator,
+    directions: []const ?GeneratedSqlOrderDirection,
+) ![]?GeneratedSqlOrderDirection {
+    if (directions.len == 0) return &.{};
+    return try alloc.dupe(?GeneratedSqlOrderDirection, directions);
+}
+
+fn cloneGeneratedSqlNullsOrderOptionalSliceAlloc(
+    alloc: std.mem.Allocator,
+    orders: []const ?GeneratedSqlNullsOrder,
+) ![]?GeneratedSqlNullsOrder {
+    if (orders.len == 0) return &.{};
+    return try alloc.dupe(?GeneratedSqlNullsOrder, orders);
+}
+
+fn cloneRebasedGeneratedExpressionPtrAlloc(
+    alloc: std.mem.Allocator,
+    expression: ?*GeneratedSqlExpressionAst,
+    base: usize,
+    end: usize,
+) anyerror!?*GeneratedSqlExpressionAst {
+    const input = expression orelse return null;
+    const cloned = try alloc.create(GeneratedSqlExpressionAst);
+    errdefer alloc.destroy(cloned);
+    cloned.* = try cloneRebasedGeneratedExpressionAlloc(alloc, input.*, base, end);
+    return cloned;
+}
+
+fn cloneRebasedGeneratedSetOperationPtrAlloc(
+    alloc: std.mem.Allocator,
+    set_operation: ?*GeneratedSqlSetOperationAst,
+    base: usize,
+    end: usize,
+) anyerror!?*GeneratedSqlSetOperationAst {
+    const input = set_operation orelse return null;
+    const cloned = try alloc.create(GeneratedSqlSetOperationAst);
+    errdefer alloc.destroy(cloned);
+    cloned.* = try cloneRebasedGeneratedSetOperationAlloc(alloc, input.*, base, end);
+    return cloned;
+}
+
+fn cloneRebasedGeneratedSubqueryTailPtrAlloc(
+    alloc: std.mem.Allocator,
+    tail: ?*GeneratedSqlSubqueryTailAst,
+    base: usize,
+    end: usize,
+) anyerror!?*GeneratedSqlSubqueryTailAst {
+    const input = tail orelse return null;
+    const cloned = try alloc.create(GeneratedSqlSubqueryTailAst);
+    cloned.* = .{};
+    errdefer {
+        cloned.deinit(alloc);
+        alloc.destroy(cloned);
+    }
+    cloned.order_tokens = try rebaseGeneratedSqlTokenRangeOptional(input.order_tokens, base, end);
+    cloned.order_items = try cloneRebasedGeneratedListAlloc(alloc, input.order_items, base, end);
+    cloned.order_first_expression = try cloneRebasedGeneratedExpressionPtrAlloc(alloc, input.order_first_expression, base, end);
+    cloned.order_last_expression = try cloneRebasedGeneratedExpressionPtrAlloc(alloc, input.order_last_expression, base, end);
+    cloned.limit_tokens = try rebaseGeneratedSqlTokenRangeOptional(input.limit_tokens, base, end);
+    cloned.limit_expression = try cloneRebasedGeneratedExpressionPtrAlloc(alloc, input.limit_expression, base, end);
+    cloned.limit_all = input.limit_all;
+    cloned.offset_tokens = try rebaseGeneratedSqlTokenRangeOptional(input.offset_tokens, base, end);
+    cloned.offset_expression = try cloneRebasedGeneratedExpressionPtrAlloc(alloc, input.offset_expression, base, end);
+    cloned.fetch_tokens = try rebaseGeneratedSqlTokenRangeOptional(input.fetch_tokens, base, end);
+    cloned.fetch_count_tokens = try rebaseGeneratedSqlTokenRangeOptional(input.fetch_count_tokens, base, end);
+    cloned.fetch_count_expression = try cloneRebasedGeneratedExpressionPtrAlloc(alloc, input.fetch_count_expression, base, end);
+    return cloned;
+}
+
+fn cloneRebasedGeneratedExpressionSliceAlloc(
+    alloc: std.mem.Allocator,
+    expressions: []const GeneratedSqlExpressionAst,
+    base: usize,
+    end: usize,
+) anyerror![]GeneratedSqlExpressionAst {
+    if (expressions.len == 0) return &.{};
+    const cloned = try alloc.alloc(GeneratedSqlExpressionAst, expressions.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |*expression| expression.deinit(alloc);
+        alloc.free(cloned);
+    }
+    for (expressions, cloned) |expression, *out| {
+        out.* = try cloneRebasedGeneratedExpressionAlloc(alloc, expression, base, end);
+        initialized += 1;
+    }
+    return cloned;
+}
+
+fn cloneRebasedGeneratedListAlloc(
+    alloc: std.mem.Allocator,
+    list: GeneratedSqlListAst,
+    base: usize,
+    end: usize,
+) !GeneratedSqlListAst {
+    var cloned = GeneratedSqlListAst{};
+    errdefer cloned.deinit(alloc);
+    cloned.first_tokens = try rebaseGeneratedSqlTokenRangeOptional(list.first_tokens, base, end);
+    cloned.last_tokens = try rebaseGeneratedSqlTokenRangeOptional(list.last_tokens, base, end);
+    cloned.items = try cloneRebasedGeneratedSqlTokenRangeSliceAlloc(alloc, list.items, base, end);
+    cloned.expression_items = try cloneRebasedGeneratedSqlTokenRangeSliceAlloc(alloc, list.expression_items, base, end);
+    cloned.alias_items = try cloneRebasedGeneratedSqlTokenRangeOptionalSliceAlloc(alloc, list.alias_items, base, end);
+    cloned.alias_name_items = try cloneRebasedGeneratedSqlTokenRangeOptionalSliceAlloc(alloc, list.alias_name_items, base, end);
+    cloned.direction_items = try cloneRebasedGeneratedSqlTokenRangeOptionalSliceAlloc(alloc, list.direction_items, base, end);
+    cloned.directions = try cloneGeneratedSqlOrderDirectionOptionalSliceAlloc(alloc, list.directions);
+    cloned.order_using_operator_items = try cloneRebasedGeneratedSqlTokenRangeOptionalSliceAlloc(alloc, list.order_using_operator_items, base, end);
+    cloned.nulls_order_items = try cloneRebasedGeneratedSqlTokenRangeOptionalSliceAlloc(alloc, list.nulls_order_items, base, end);
+    cloned.nulls_orders = try cloneGeneratedSqlNullsOrderOptionalSliceAlloc(alloc, list.nulls_orders);
+    cloned.expressions = try cloneRebasedGeneratedExpressionSliceAlloc(alloc, list.expressions, base, end);
+    cloned.count = list.count;
+    return cloned;
+}
+
+fn cloneRebasedGeneratedExpressionAlloc(
+    alloc: std.mem.Allocator,
+    expression: GeneratedSqlExpressionAst,
+    base: usize,
+    end: usize,
+) anyerror!GeneratedSqlExpressionAst {
+    var cloned = expression;
+    cloned.inner_expression = null;
+    cloned.subquery_projection_items = .{};
+    cloned.subquery_where_expression = null;
+    cloned.subquery_set_operation = null;
+    cloned.subquery_tail = null;
+    cloned.argument_items = .{};
+    cloned.argument_order_items = .{};
+    cloned.within_group_order_items = .{};
+    cloned.filter_expression = null;
+    cloned.over_partition_items = .{};
+    cloned.over_order_items = .{};
+    cloned.over_frame_start_expression = null;
+    cloned.over_frame_end_expression = null;
+    cloned.array_items = .{};
+    cloned.cast_expression = null;
+    cloned.case_first_condition = null;
+    cloned.case_first_result = null;
+    cloned.case_condition_items = .{};
+    cloned.case_result_items = .{};
+    cloned.case_else_expression = null;
+    cloned.boolean_first_condition = null;
+    cloned.boolean_last_condition = null;
+    cloned.boolean_condition_items = .{};
+    cloned.extract_source_expression = null;
+    cloned.left_expression = null;
+    cloned.between_lower_expression = null;
+    cloned.between_upper_expression = null;
+    cloned.right_expression = null;
+    cloned.escape_expression = null;
+    errdefer cloned.deinit(alloc);
+
+    cloned.tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.tokens, base, end);
+    cloned.inner_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.inner_tokens, base, end);
+    cloned.inner_expression = try cloneRebasedGeneratedExpressionPtrAlloc(alloc, expression.inner_expression, base, end);
+    cloned.subquery_select_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.subquery_select_tokens, base, end);
+    cloned.subquery_projection_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.subquery_projection_tokens, base, end);
+    cloned.subquery_projection_items = try cloneRebasedGeneratedListAlloc(alloc, expression.subquery_projection_items, base, end);
+    cloned.subquery_source_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.subquery_source_tokens, base, end);
+    cloned.subquery_where_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.subquery_where_tokens, base, end);
+    cloned.subquery_where_expression = try cloneRebasedGeneratedExpressionPtrAlloc(alloc, expression.subquery_where_expression, base, end);
+    cloned.subquery_set_operation_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.subquery_set_operation_tokens, base, end);
+    cloned.subquery_set_operation = try cloneRebasedGeneratedSetOperationPtrAlloc(alloc, expression.subquery_set_operation, base, end);
+    cloned.subquery_tail = try cloneRebasedGeneratedSubqueryTailPtrAlloc(alloc, expression.subquery_tail, base, end);
+    cloned.function_name_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.function_name_tokens, base, end);
+    cloned.argument_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.argument_tokens, base, end);
+    cloned.argument_distinct_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.argument_distinct_tokens, base, end);
+    cloned.argument_value_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.argument_value_tokens, base, end);
+    cloned.argument_items = try cloneRebasedGeneratedListAlloc(alloc, expression.argument_items, base, end);
+    cloned.argument_order_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.argument_order_tokens, base, end);
+    cloned.argument_order_items = try cloneRebasedGeneratedListAlloc(alloc, expression.argument_order_items, base, end);
+    cloned.within_group_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.within_group_tokens, base, end);
+    cloned.within_group_order_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.within_group_order_tokens, base, end);
+    cloned.within_group_order_items = try cloneRebasedGeneratedListAlloc(alloc, expression.within_group_order_items, base, end);
+    cloned.filter_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.filter_tokens, base, end);
+    cloned.filter_predicate_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.filter_predicate_tokens, base, end);
+    cloned.filter_expression = try cloneRebasedGeneratedExpressionPtrAlloc(alloc, expression.filter_expression, base, end);
+    cloned.over_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.over_tokens, base, end);
+    cloned.over_name_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.over_name_tokens, base, end);
+    cloned.over_definition_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.over_definition_tokens, base, end);
+    cloned.over_partition_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.over_partition_tokens, base, end);
+    cloned.over_partition_items = try cloneRebasedGeneratedListAlloc(alloc, expression.over_partition_items, base, end);
+    cloned.over_order_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.over_order_tokens, base, end);
+    cloned.over_order_items = try cloneRebasedGeneratedListAlloc(alloc, expression.over_order_items, base, end);
+    cloned.over_frame_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.over_frame_tokens, base, end);
+    cloned.over_frame_start_expression_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.over_frame_start_expression_tokens, base, end);
+    cloned.over_frame_start_expression = try cloneRebasedGeneratedExpressionPtrAlloc(alloc, expression.over_frame_start_expression, base, end);
+    cloned.over_frame_end_expression_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.over_frame_end_expression_tokens, base, end);
+    cloned.over_frame_end_expression = try cloneRebasedGeneratedExpressionPtrAlloc(alloc, expression.over_frame_end_expression, base, end);
+    cloned.array_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.array_tokens, base, end);
+    cloned.array_items = try cloneRebasedGeneratedListAlloc(alloc, expression.array_items, base, end);
+    cloned.cast_expression_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.cast_expression_tokens, base, end);
+    cloned.cast_expression = try cloneRebasedGeneratedExpressionPtrAlloc(alloc, expression.cast_expression, base, end);
+    cloned.cast_type_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.cast_type_tokens, base, end);
+    cloned.case_first_when_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.case_first_when_tokens, base, end);
+    cloned.case_last_when_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.case_last_when_tokens, base, end);
+    cloned.case_first_condition_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.case_first_condition_tokens, base, end);
+    cloned.case_first_condition = try cloneRebasedGeneratedExpressionPtrAlloc(alloc, expression.case_first_condition, base, end);
+    cloned.case_first_result_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.case_first_result_tokens, base, end);
+    cloned.case_first_result = try cloneRebasedGeneratedExpressionPtrAlloc(alloc, expression.case_first_result, base, end);
+    cloned.case_condition_items = try cloneRebasedGeneratedListAlloc(alloc, expression.case_condition_items, base, end);
+    cloned.case_result_items = try cloneRebasedGeneratedListAlloc(alloc, expression.case_result_items, base, end);
+    cloned.case_else_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.case_else_tokens, base, end);
+    cloned.case_else_expression_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.case_else_expression_tokens, base, end);
+    cloned.case_else_expression = try cloneRebasedGeneratedExpressionPtrAlloc(alloc, expression.case_else_expression, base, end);
+    cloned.boolean_first_condition_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.boolean_first_condition_tokens, base, end);
+    cloned.boolean_first_condition = try cloneRebasedGeneratedExpressionPtrAlloc(alloc, expression.boolean_first_condition, base, end);
+    cloned.boolean_last_condition_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.boolean_last_condition_tokens, base, end);
+    cloned.boolean_last_condition = try cloneRebasedGeneratedExpressionPtrAlloc(alloc, expression.boolean_last_condition, base, end);
+    cloned.boolean_condition_items = try cloneRebasedGeneratedListAlloc(alloc, expression.boolean_condition_items, base, end);
+    cloned.interval_value_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.interval_value_tokens, base, end);
+    cloned.timestamp_type_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.timestamp_type_tokens, base, end);
+    cloned.timestamp_value_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.timestamp_value_tokens, base, end);
+    cloned.current_timestamp_precision_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.current_timestamp_precision_tokens, base, end);
+    cloned.extract_field_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.extract_field_tokens, base, end);
+    cloned.extract_source_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.extract_source_tokens, base, end);
+    cloned.extract_source_expression = try cloneRebasedGeneratedExpressionPtrAlloc(alloc, expression.extract_source_expression, base, end);
+    cloned.left_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.left_tokens, base, end);
+    cloned.left_expression = try cloneRebasedGeneratedExpressionPtrAlloc(alloc, expression.left_expression, base, end);
+    cloned.negation_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.negation_tokens, base, end);
+    cloned.operator_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.operator_tokens, base, end);
+    cloned.between_modifier_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.between_modifier_tokens, base, end);
+    cloned.between_lower_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.between_lower_tokens, base, end);
+    cloned.between_lower_expression = try cloneRebasedGeneratedExpressionPtrAlloc(alloc, expression.between_lower_expression, base, end);
+    cloned.between_upper_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.between_upper_tokens, base, end);
+    cloned.between_upper_expression = try cloneRebasedGeneratedExpressionPtrAlloc(alloc, expression.between_upper_expression, base, end);
+    cloned.quantifier_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.quantifier_tokens, base, end);
+    cloned.right_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.right_tokens, base, end);
+    cloned.right_expression = try cloneRebasedGeneratedExpressionPtrAlloc(alloc, expression.right_expression, base, end);
+    cloned.escape_tokens = try rebaseGeneratedSqlTokenRangeOptional(expression.escape_tokens, base, end);
+    cloned.escape_expression = try cloneRebasedGeneratedExpressionPtrAlloc(alloc, expression.escape_expression, base, end);
+    return cloned;
+}
+
+fn cloneRebasedGeneratedSetOperationAlloc(
+    alloc: std.mem.Allocator,
+    set_operation: GeneratedSqlSetOperationAst,
+    base: usize,
+    end: usize,
+) !GeneratedSqlSetOperationAst {
+    var cloned = GeneratedSqlSetOperationAst{};
+    errdefer cloned.deinit(alloc);
+    cloned.tokens = try rebaseGeneratedSqlTokenRangeOptional(set_operation.tokens, base, end);
+    cloned.operator_tokens = try rebaseGeneratedSqlTokenRangeOptional(set_operation.operator_tokens, base, end);
+    cloned.kind = set_operation.kind;
+    cloned.all_tokens = try rebaseGeneratedSqlTokenRangeOptional(set_operation.all_tokens, base, end);
+    cloned.right_query_tokens = try rebaseGeneratedSqlTokenRangeOptional(set_operation.right_query_tokens, base, end);
+    cloned.right_select_tokens = try rebaseGeneratedSqlTokenRangeOptional(set_operation.right_select_tokens, base, end);
+    cloned.right_distinct_tokens = try rebaseGeneratedSqlTokenRangeOptional(set_operation.right_distinct_tokens, base, end);
+    cloned.right_distinct_on_items = try cloneRebasedGeneratedListAlloc(alloc, set_operation.right_distinct_on_items, base, end);
+    cloned.right_projection_tokens = try rebaseGeneratedSqlTokenRangeOptional(set_operation.right_projection_tokens, base, end);
+    cloned.right_projection_items = try cloneRebasedGeneratedListAlloc(alloc, set_operation.right_projection_items, base, end);
+    cloned.right_projection_first_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, set_operation.right_projection_first_expression, base, end);
+    cloned.right_projection_last_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, set_operation.right_projection_last_expression, base, end);
+    cloned.right_source_tokens = try rebaseGeneratedSqlTokenRangeOptional(set_operation.right_source_tokens, base, end);
+    cloned.right_where_tokens = try rebaseGeneratedSqlTokenRangeOptional(set_operation.right_where_tokens, base, end);
+    cloned.right_where_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, set_operation.right_where_expression, base, end);
+    return cloned;
+}
+
+fn cloneRebasedGeneratedJoinSliceAlloc(
+    alloc: std.mem.Allocator,
+    joins: []const GeneratedSqlJoinAst,
+    base: usize,
+    end: usize,
+) ![]GeneratedSqlJoinAst {
+    if (joins.len == 0) return &.{};
+    const cloned = try alloc.alloc(GeneratedSqlJoinAst, joins.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |*join| join.deinit(alloc);
+        alloc.free(cloned);
+    }
+    for (joins, cloned) |join, *out| {
+        var temp = GeneratedSqlJoinAst{
+            .tokens = try rebaseGeneratedSqlTokenRange(join.tokens, base, end),
+            .operator_tokens = try rebaseGeneratedSqlTokenRange(join.operator_tokens, base, end),
+            .kind = join.kind,
+            .tree_index = join.tree_index,
+            .tree_depth = join.tree_depth,
+            .left_child_index = join.left_child_index,
+            .left_tokens = try rebaseGeneratedSqlTokenRange(join.left_tokens, base, end),
+            .right_tokens = try rebaseGeneratedSqlTokenRange(join.right_tokens, base, end),
+            .condition_kind = join.condition_kind,
+            .condition_tokens = try rebaseGeneratedSqlTokenRange(join.condition_tokens, base, end),
+        };
+        errdefer temp.deinit(alloc);
+        temp.predicate_tokens = try rebaseGeneratedSqlTokenRangeOptional(join.predicate_tokens, base, end);
+        temp.predicate_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, join.predicate_expression, base, end);
+        temp.using_tokens = try rebaseGeneratedSqlTokenRangeOptional(join.using_tokens, base, end);
+        temp.using_column_tokens = try rebaseGeneratedSqlTokenRangeOptional(join.using_column_tokens, base, end);
+        temp.using_columns = try cloneRebasedGeneratedListAlloc(alloc, join.using_columns, base, end);
+        out.* = temp;
+        initialized += 1;
+    }
+    return cloned;
+}
+
+fn cloneRebasedGeneratedWindowSliceAlloc(
+    alloc: std.mem.Allocator,
+    windows: []const GeneratedSqlWindowAst,
+    base: usize,
+    end: usize,
+) ![]GeneratedSqlWindowAst {
+    if (windows.len == 0) return &.{};
+    const cloned = try alloc.alloc(GeneratedSqlWindowAst, windows.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |*window| window.deinit(alloc);
+        alloc.free(cloned);
+    }
+    for (windows, cloned) |window, *out| {
+        var temp = GeneratedSqlWindowAst{
+            .tokens = try rebaseGeneratedSqlTokenRange(window.tokens, base, end),
+            .name_tokens = try rebaseGeneratedSqlTokenRange(window.name_tokens, base, end),
+            .definition_tokens = try rebaseGeneratedSqlTokenRange(window.definition_tokens, base, end),
+            .partition_tokens = try rebaseGeneratedSqlTokenRangeOptional(window.partition_tokens, base, end),
+            .order_tokens = try rebaseGeneratedSqlTokenRangeOptional(window.order_tokens, base, end),
+            .frame_tokens = try rebaseGeneratedSqlTokenRangeOptional(window.frame_tokens, base, end),
+            .frame_start_expression_tokens = try rebaseGeneratedSqlTokenRangeOptional(window.frame_start_expression_tokens, base, end),
+            .frame_start_expression_kind = window.frame_start_expression_kind,
+            .frame_end_expression_tokens = try rebaseGeneratedSqlTokenRangeOptional(window.frame_end_expression_tokens, base, end),
+            .frame_end_expression_kind = window.frame_end_expression_kind,
+        };
+        errdefer temp.deinit(alloc);
+        temp.partition_items = try cloneRebasedGeneratedListAlloc(alloc, window.partition_items, base, end);
+        temp.order_items = try cloneRebasedGeneratedListAlloc(alloc, window.order_items, base, end);
+        temp.frame_start_expression = try cloneRebasedGeneratedExpressionPtrAlloc(alloc, window.frame_start_expression, base, end);
+        temp.frame_end_expression = try cloneRebasedGeneratedExpressionPtrAlloc(alloc, window.frame_end_expression, base, end);
+        out.* = temp;
+        initialized += 1;
+    }
+    return cloned;
+}
+
+pub fn cloneCteBodyReadAstAlloc(
+    alloc: std.mem.Allocator,
+    source_statement_span: token_mod.SourceSpan,
+    cte: GeneratedSqlCteAst,
+) !GeneratedSqlReadAst {
+    const body = cte.body_tokens orelse return error.UnsupportedSqlShape;
+    const body_kind = cte.body_kind orelse return error.UnsupportedSqlShape;
+    var cloned = GeneratedSqlReadAst{
+        .kind = body_kind,
+        .statement_span = source_statement_span,
+        .command_span = source_statement_span,
+    };
+    errdefer cloned.deinit(alloc);
+    cloned.distinct_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_distinct_tokens, body.start, body.end);
+    cloned.distinct_on_items = try cloneRebasedGeneratedListAlloc(alloc, cte.body_distinct_on_items, body.start, body.end);
+    cloned.projection_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_projection_tokens, body.start, body.end);
+    cloned.projection_items = try cloneRebasedGeneratedListAlloc(alloc, cte.body_projection_items, body.start, body.end);
+    cloned.projection_first_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_projection_first_expression, body.start, body.end);
+    cloned.projection_last_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_projection_last_expression, body.start, body.end);
+    cloned.source_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_source_tokens, body.start, body.end);
+    cloned.join_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_join_tokens, body.start, body.end);
+    cloned.join_operator_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_join_operator_tokens, body.start, body.end);
+    cloned.join_kind = cte.body_join_kind;
+    cloned.join_left_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_join_left_tokens, body.start, body.end);
+    cloned.join_right_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_join_right_tokens, body.start, body.end);
+    cloned.join_predicate_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_join_predicate_tokens, body.start, body.end);
+    cloned.join_predicate_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_join_predicate_expression, body.start, body.end);
+    cloned.join_items = try cloneRebasedGeneratedJoinSliceAlloc(alloc, cte.body_join_items, body.start, body.end);
+    cloned.join_tree_root_index = cte.body_join_tree_root_index;
+    cloned.join_tree_depth = cte.body_join_tree_depth;
+    cloned.where_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_where_tokens, body.start, body.end);
+    cloned.where_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_where_expression, body.start, body.end);
+    cloned.group_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_group_tokens, body.start, body.end);
+    cloned.group_items = try cloneRebasedGeneratedListAlloc(alloc, cte.body_group_items, body.start, body.end);
+    cloned.group_first_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_group_first_expression, body.start, body.end);
+    cloned.group_last_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_group_last_expression, body.start, body.end);
+    cloned.having_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_having_tokens, body.start, body.end);
+    cloned.having_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_having_expression, body.start, body.end);
+    cloned.window_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_window_tokens, body.start, body.end);
+    cloned.window_items = try cloneRebasedGeneratedWindowSliceAlloc(alloc, cte.body_window_items, body.start, body.end);
+    cloned.window_count = cte.body_window_count;
+    cloned.order_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_order_tokens, body.start, body.end);
+    cloned.order_items = try cloneRebasedGeneratedListAlloc(alloc, cte.body_order_items, body.start, body.end);
+    cloned.order_first_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_order_first_expression, body.start, body.end);
+    cloned.order_last_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_order_last_expression, body.start, body.end);
+    cloned.limit_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_limit_tokens, body.start, body.end);
+    cloned.limit_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_limit_expression, body.start, body.end);
+    cloned.limit_all = cte.body_limit_all;
+    cloned.offset_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_offset_tokens, body.start, body.end);
+    cloned.offset_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_offset_expression, body.start, body.end);
+    cloned.fetch_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_fetch_tokens, body.start, body.end);
+    cloned.fetch_count_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_fetch_count_tokens, body.start, body.end);
+    cloned.fetch_count_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_fetch_count_expression, body.start, body.end);
+    cloned.set_operation_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_set_operation_tokens, body.start, body.end);
+    cloned.set_operation = try cloneRebasedGeneratedSetOperationAlloc(alloc, cte.body_set_operation, body.start, body.end);
+    return cloned;
+}
+
 pub const GeneratedSqlDmlReadBodyAst = struct {
     tokens: GeneratedSqlTokenRange,
     kind: GeneratedSqlReadKind,

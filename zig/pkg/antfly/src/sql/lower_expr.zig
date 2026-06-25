@@ -36157,6 +36157,28 @@ test "sql adapter lower expr lowers non recursive cte query plans" {
         .{},
     ));
 
+    var malformed_generated_cte_body_pagination = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH open_orders AS (SELECT id FROM orders LIMIT 3) SELECT id FROM open_orders",
+    );
+    defer malformed_generated_cte_body_pagination.deinit(alloc);
+    if (malformed_generated_cte_body_pagination.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |*read| {
+                if (read.cte_items.len == 0) return error.TestUnexpectedResult;
+                read.cte_items[0].body_limit_expression.tokens = read.cte_items[0].body_projection_items.expression_items[0];
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_cte_body_pagination,
+        schema,
+        &.{},
+        .{},
+    ));
+
     var plain = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
         "SELECT id FROM orders WHERE status = 'open'",

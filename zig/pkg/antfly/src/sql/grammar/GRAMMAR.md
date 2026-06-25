@@ -222,7 +222,11 @@ body clause-span metadata for the first body query, including set-operation
 tails, plus owned body projection/group/order lists, predicate expression
 metadata, generated body join-tree metadata with first-join compatibility
 fields, body pagination expression metadata for `LIMIT`, `OFFSET`, and
-`FETCH`, and the lowerer validates those body payloads before dispatch;
+`FETCH`, and the lowerer validates those body payloads before dispatch; CTE
+body sub-parsers now receive a body-local generated read AST cloned from the
+generated CTE metadata, so typed body planning consumes generated body
+projection, predicate, ordering, pagination, join, window, and set-operation
+ranges instead of relying only on outer CTE pre-validation;
 recursive CTE reads carry an explicit generated recursive flag, and simple
 non-recursive CTE reads dispatch directly when those ranges validate; recursive
 CTE reads now validate generated recursive CTE metadata before dispatching to
