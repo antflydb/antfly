@@ -3167,6 +3167,93 @@ pub fn ddlPlanFromGeneratedAstAlloc(
     };
 }
 
+fn generatedDdlUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) bool {
+    return switch (ast.kind) {
+        .create_database,
+        .create_schema,
+        .create_extension,
+        .drop_table,
+        .drop_index,
+        .drop_schema,
+        .drop_database,
+        .drop_extension,
+        => true,
+        .create_table => generatedCreateTableUsesRuntimeBoundary(tokens, ast),
+        .create_index => generatedCreateIndexUsesRuntimeBoundary(tokens, ast),
+        .alter_table => generatedAlterTableUsesRuntimeBoundary(tokens, ast),
+        .create_graph_index, .create_graph_metric => false,
+    };
+}
+
+fn generatedCreateTableUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) bool {
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return false;
+    if (generatedRangeContainsText(tokens, .{ .start = 0, .end = end }, "smallserial") or
+        generatedRangeContainsText(tokens, .{ .start = 0, .end = end }, "serial") or
+        generatedRangeContainsText(tokens, .{ .start = 0, .end = end }, "bigserial"))
+    {
+        return false;
+    }
+    return true;
+}
+
+fn generatedCreateIndexUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) bool {
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return false;
+    const elements_range = ast.index_elements_tokens orelse return false;
+    if (!generatedRangeWithinStatement(elements_range, end)) return false;
+    if (generatedRangeHasKind(tokens, elements_range, .lparen) or
+        generatedRangeHasKind(tokens, elements_range, .rparen))
+    {
+        return false;
+    }
+    if (ast.index_where_tokens != null) return false;
+    return true;
+}
+
+fn generatedAlterTableUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) bool {
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return false;
+    const operation_range = ast.alter_table_operation_tokens orelse return false;
+    if (!generatedRangeWithinStatement(operation_range, end) or operation_range.start >= operation_range.end) return false;
+    if (generatedRangeHasKind(tokens, operation_range, .comma)) return false;
+    const first = tokens[operation_range.start];
+    if (first.matchesKeywordTag(.add)) {
+        return operation_range.start + 1 < operation_range.end and
+            tokens[operation_range.start + 1].matchesKeywordTag(.column);
+    }
+    if (first.matchesKeywordTag(.drop)) {
+        return operation_range.start + 1 < operation_range.end and
+            tokens[operation_range.start + 1].matchesKeywordTag(.column);
+    }
+    if (first.matchesKeywordTag(.rename)) {
+        return operation_range.start + 1 < operation_range.end and
+            tokens[operation_range.start + 1].matchesKeywordTag(.column);
+    }
+    if (first.matchesKeywordTag(.validate)) {
+        return operation_range.start + 1 < operation_range.end and
+            tokens[operation_range.start + 1].matchesKeywordTag(.constraint);
+    }
+    return false;
+}
+
+fn generatedRangeWithinStatement(range: generated_parser.GeneratedSqlTokenRange, end: usize) bool {
+    return range.start <= range.end and range.end <= end;
+}
+
+fn generatedRangeHasKind(tokens: []const grammar.Token, range: generated_parser.GeneratedSqlTokenRange, kind: token_mod.TokenKind) bool {
+    if (range.end > tokens.len or range.start > range.end) return false;
+    for (tokens[range.start..range.end]) |token| {
+        if (token.kind == kind) return true;
+    }
+    return false;
+}
+
+fn generatedRangeContainsText(tokens: []const grammar.Token, range: generated_parser.GeneratedSqlTokenRange, text: []const u8) bool {
+    if (range.end > tokens.len or range.start > range.end) return false;
+    for (tokens[range.start..range.end]) |token| {
+        if (std.ascii.eqlIgnoreCase(token.text, text)) return true;
+    }
+    return false;
+}
+
 pub fn graphDdlPlanFromGeneratedAstAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
@@ -8697,15 +8784,10 @@ pub fn lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(
             switch (generated_ast) {
                 .session => |session_ast| return try sessionDdlPlanFromGeneratedAstAlloc(alloc, tokens, session_ast),
                 .prepared => |prepared_ast| return .{ .prepared_statement = try preparedStatementPlanFromGeneratedAstAlloc(alloc, tokens, prepared_ast) },
-                .ddl, .extension_index => |ddl_ast| switch (ddl_ast.kind) {
-                    .create_database,
-                    .create_schema,
-                    .create_extension,
-                    .drop_database,
-                    .drop_schema,
-                    .drop_extension,
-                    => return try simpleDdlPlanFromGeneratedAstAlloc(alloc, tokens, ddl_ast),
-                    else => {},
+                .ddl, .extension_index => |ddl_ast| {
+                    if (generatedDdlUsesRuntimeBoundary(tokens, ddl_ast)) {
+                        return try ddlPlanFromGeneratedAstAlloc(alloc, tokens, ddl_ast, options);
+                    }
                 },
                 .graph => |graph_ast| return try graphDdlPlanFromGeneratedAstAlloc(alloc, tokens, graph_ast),
                 .transaction, .dml, .read, .unsupported => {},
@@ -12709,6 +12791,81 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
             try std.testing.expectEqual(DdlIndexMethod.antfly_graph, plan.method);
             try std.testing.expectEqualStrings("docs_edge_graph", plan.index_name);
             try std.testing.expectEqualStrings("doc_edges", plan.table_name);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var runtime_create_table = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text PRIMARY KEY, status text NOT NULL);");
+    defer runtime_create_table.deinit(alloc);
+    var runtime_create_table_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_create_table);
+    defer runtime_create_table_plan.deinit(alloc);
+    switch (runtime_create_table_plan) {
+        .create_table => |plan| {
+            try std.testing.expectEqualStrings("generated_usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 2), plan.columns.len);
+            try std.testing.expect(plan.primary_key != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var runtime_drop_table = try tokenized.ParsedSql.initAlloc(alloc, "DROP TABLE IF EXISTS generated_usage_records CASCADE;");
+    defer runtime_drop_table.deinit(alloc);
+    var runtime_drop_table_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_drop_table);
+    defer runtime_drop_table_plan.deinit(alloc);
+    switch (runtime_drop_table_plan) {
+        .drop_table => |plan| {
+            try std.testing.expectEqualStrings("generated_usage_records", plan.table_name);
+            try std.testing.expect(plan.if_exists);
+            try std.testing.expect(plan.cascade);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var runtime_create_index = try tokenized.ParsedSql.initAlloc(alloc, "CREATE UNIQUE INDEX generated_usage_status_idx ON generated_usage_records (status) INCLUDE (tenant_id);");
+    defer runtime_create_index.deinit(alloc);
+    var runtime_create_index_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_create_index);
+    defer runtime_create_index_plan.deinit(alloc);
+    switch (runtime_create_index_plan) {
+        .create_index => |plan| {
+            try std.testing.expectEqualStrings("generated_usage_status_idx", plan.index_name);
+            try std.testing.expectEqualStrings("generated_usage_records", plan.table_name);
+            try std.testing.expect(plan.unique);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqual(@as(usize, 1), plan.include_columns.len);
+            try std.testing.expectEqual(@as(usize, 0), plan.where.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var runtime_drop_index = try tokenized.ParsedSql.initAlloc(alloc, "DROP INDEX IF EXISTS generated_usage_status_idx RESTRICT;");
+    defer runtime_drop_index.deinit(alloc);
+    var runtime_drop_index_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_drop_index);
+    defer runtime_drop_index_plan.deinit(alloc);
+    switch (runtime_drop_index_plan) {
+        .drop_index => |plan| {
+            try std.testing.expectEqualStrings("generated_usage_status_idx", plan.index_name);
+            try std.testing.expect(plan.if_exists);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var runtime_alter_table = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE IF EXISTS ONLY generated_usage_records DROP COLUMN IF EXISTS status RESTRICT;");
+    defer runtime_alter_table.deinit(alloc);
+    var runtime_alter_table_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_alter_table);
+    defer runtime_alter_table_plan.deinit(alloc);
+    switch (runtime_alter_table_plan) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("generated_usage_records", plan.table_name);
+            try std.testing.expect(plan.if_exists);
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+            switch (plan.operations[0]) {
+                .drop_column => |operation| {
+                    try std.testing.expectEqualStrings("status", operation.name);
+                    try std.testing.expect(operation.if_exists);
+                    try std.testing.expectEqual(DropDependencyMode.restrict, operation.dependency_mode);
+                },
+                else => return error.TestUnexpectedResult,
+            }
         },
         else => return error.TestUnexpectedResult,
     }
