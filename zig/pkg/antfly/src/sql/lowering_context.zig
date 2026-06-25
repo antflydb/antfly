@@ -207,7 +207,7 @@ pub fn lowerReadPlanFromGeneratedReadAstAlloc(
             ) };
         },
         .aggregate => blk: {
-            try validateGeneratedAggregateReadAst(read_ast);
+            try validateGeneratedAggregateReadAst(parsed_sql.items(), read_ast);
             break :blk .{ .aggregate = try context.callbacks.lower_aggregate_plan(
                 context.alloc,
                 parsed_sql,
@@ -446,7 +446,13 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: gen
         },
         .aggregate => {
             if (read_ast.projection_tokens == null) return error.UnsupportedSqlShape;
-            if (read_ast.group_tokens == null and read_ast.having_tokens == null and read_ast.distinct_tokens == null) return error.UnsupportedSqlShape;
+            const aggregate_projection = if (read_ast.projection_tokens) |projection|
+                generatedReadRangeHasAggregateFunction(tokens, projection)
+            else
+                false;
+            if (read_ast.group_tokens == null and read_ast.having_tokens == null and read_ast.distinct_tokens == null and !aggregate_projection) {
+                return error.UnsupportedSqlShape;
+            }
         },
         .join => {
             if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return error.UnsupportedSqlShape;
@@ -944,12 +950,18 @@ fn validateGeneratedSimpleQueryReadAst(tokens: []const tokenized.Token, read_ast
     if (read_ast.fetch_tokens) |range| try validateGeneratedReadRangePrecededByKeyword(tokens, range, .fetch);
 }
 
-fn validateGeneratedAggregateReadAst(read_ast: generated_parser.GeneratedSqlReadAst) !void {
+fn validateGeneratedAggregateReadAst(tokens: []const tokenized.Token, read_ast: generated_parser.GeneratedSqlReadAst) !void {
     if (read_ast.cte_tokens != null or read_ast.window_tokens != null or read_ast.set_operation_tokens != null) {
         return error.UnsupportedSqlShape;
     }
     if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return error.UnsupportedSqlShape;
-    if (read_ast.group_tokens == null and read_ast.having_tokens == null and read_ast.distinct_tokens == null) return error.UnsupportedSqlShape;
+    const aggregate_projection = if (read_ast.projection_tokens) |projection|
+        generatedReadRangeHasAggregateFunction(tokens, projection)
+    else
+        false;
+    if (read_ast.group_tokens == null and read_ast.having_tokens == null and read_ast.distinct_tokens == null and !aggregate_projection) {
+        return error.UnsupportedSqlShape;
+    }
 }
 
 fn validateGeneratedJoinedReadAst(
@@ -3875,6 +3887,7 @@ test "sql adapter lowering context lowers generated read AST through typed read 
 
     const cases = [_][]const u8{
         "SELECT id, status FROM usage_records WHERE kind = 'order' ORDER BY created_at DESC LIMIT 5",
+        "SELECT COUNT(*) AS total FROM usage_records WHERE kind = 'order'",
         "SELECT status, SUM(amount) AS total FROM usage_records WHERE kind = 'order' GROUP BY status LIMIT 5",
         "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant = c.tenant AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' LIMIT 5",
         "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' ORDER BY 2 DESC LIMIT 1) AS latest ON true WHERE org.kind = 'organization' LIMIT 10",
@@ -5571,6 +5584,23 @@ test "sql adapter lowering context classifies read sql into typed plan families"
         .query => |lowered| {
             try std.testing.expectEqualStrings("usage_records", lowered.table_name);
             try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.predicates.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var global_aggregate = try lowerReadPlanForLoweringContextTestAlloc(
+        alloc,
+        "SELECT COUNT(*) AS total FROM usage_records WHERE kind = 'order'",
+        schema,
+        &.{},
+    );
+    defer global_aggregate.deinit(alloc);
+    switch (global_aggregate) {
+        .aggregate => |lowered| {
+            try std.testing.expectEqualStrings("usage_records", lowered.table_name);
+            try std.testing.expectEqual(@as(usize, 0), lowered.plan.ctes.len);
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.aggregate.aggregations.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.count, lowered.plan.aggregate.aggregations[0].op);
         },
         else => return error.TestUnexpectedResult,
     }

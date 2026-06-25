@@ -502,9 +502,10 @@ Unsupported DDL remains on the existing parser until
    a direct generated AST-to-query-plan lowering boundary after clause-range
    validation, and aggregate, join, and lateral reads now have direct generated
    AST-to-read-family dispatch boundaries after clause-range validation;
-   generated read classification now recognizes aggregate-function projections
-   such as global `COUNT(*)` reads and aggregate CTE bodies without requiring
-   `GROUP BY` or `HAVING` side effects.
+   generated read classification and generated aggregate-read validation now
+   recognize aggregate-function projections such as global `COUNT(*)` reads
+   and aggregate CTE bodies without requiring `GROUP BY` or `HAVING` side
+   effects.
    Single binary join reads now validate generated join-tree metadata against
    the typed join lowerer before producing a join plan, and generated join
    reads reject malformed left-associative tree root/depth/index/child
