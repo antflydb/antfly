@@ -98,6 +98,7 @@ ddl_statement:
   | alter_domain_statement
   | alter_sequence_statement
   | alter_type_statement
+  | alter_schema_statement
   | drop_statement
   | relation_population_statement
   ;
@@ -204,6 +205,10 @@ alter_sequence_statement:
 
 alter_type_statement:
     ALTER TYPE qualified_name diagnostic_tail
+  ;
+
+alter_schema_statement:
+    ALTER SCHEMA qualified_name RENAME TO qualified_name
   ;
 
 alter_table_relation_prefix_opt:

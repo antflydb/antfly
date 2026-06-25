@@ -83,6 +83,10 @@ Enum type catalog DDL heads, including `CREATE TYPE ... AS ENUM`,
 `ALTER TYPE ... ADD VALUE`, and `DROP TYPE`, now use the generated DDL
 boundary with retained type-name, value-tail, and drop-behavior metadata before
 delegating enum value semantics to the existing typed enum catalog planner.
+Schema namespace rename DDL, `ALTER SCHEMA ... RENAME TO ...`, now shares the
+generated schema namespace boundary with generated `CREATE SCHEMA` and
+`DROP SCHEMA`, retaining old/new schema-name metadata before lowering to the
+typed namespace catalog plan.
 Generated
 `CREATE INDEX` ASTs also retain
 `UNIQUE`, method, element-list, covering-index `INCLUDE (...)`, options, and
@@ -95,11 +99,11 @@ name spans before delegating to the existing relation-population planner.
 Incomplete covered DDL clause-boundary shapes for `CREATE TABLE`, lifetime
 prefixed `CREATE [TEMP|TEMPORARY|UNLOGGED] TABLE`, `CREATE VIEW`,
 `CREATE DOMAIN`, `CREATE SEQUENCE`, `CREATE TYPE`, `CREATE INDEX`,
-`ALTER TABLE`, `ALTER VIEW`, `ALTER DOMAIN`, `ALTER SEQUENCE`, `ALTER TYPE`,
-`DROP TABLE`, `DROP VIEW`, `DROP DOMAIN`, `DROP SEQUENCE`, and `DROP TYPE` now
-fail closed through the generated parser instead of falling back to the legacy
-DDL classifier, while rich DDL syntax that is not yet generated-covered still
-falls back to the existing typed DDL parser.
+`ALTER TABLE`, `ALTER SCHEMA`, `ALTER VIEW`, `ALTER DOMAIN`, `ALTER SEQUENCE`,
+`ALTER TYPE`, `DROP TABLE`, `DROP VIEW`, `DROP DOMAIN`, `DROP SEQUENCE`, and
+`DROP TYPE` now fail closed through the generated parser instead of falling
+back to the legacy DDL classifier, while rich DDL syntax that is not yet
+generated-covered still falls back to the existing typed DDL parser.
 Simple DML now has generated-parser corpus
 coverage, retained generated raw and AST nodes for covered write statements,
 structured generated DML ranges for target tables, sources, assignments,
@@ -1023,6 +1027,7 @@ Generated grammar work needs evidence at multiple levels:
   Runtime DDL lowering now dispatches generated session statements, prepared
   statements, graph DDL, database/schema/extension catalog DDL, generated
   `CREATE TABLE` including serial identity-allocation tables, `DROP TABLE`,
+  generated schema namespace rename DDL for `ALTER SCHEMA ... RENAME TO ...`,
   `DROP INDEX`, generated domain catalog DDL for `CREATE DOMAIN`,
   `ALTER DOMAIN`, and `DROP DOMAIN`, generated sequence catalog DDL for
   `CREATE SEQUENCE`, `ALTER SEQUENCE`, and `DROP SEQUENCE`, generated

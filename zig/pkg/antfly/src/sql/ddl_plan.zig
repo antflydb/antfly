@@ -3238,6 +3238,7 @@ pub fn simpleDdlPlanFromGeneratedAstAlloc(
         .create_database => .{ .database_catalog = .{ .create = try createDatabasePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
         .create_schema => .{ .schema_namespace_catalog = .{ .create = try createSchemaNamespacePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
         .create_extension => .{ .extension_catalog = .{ .create = try createExtensionPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, catalog_resources.default_namespace_name) } },
+        .alter_schema => .{ .schema_namespace_catalog = .{ .rename = try renameSchemaNamespacePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
         .drop_database => .{ .database_catalog = .{ .drop = try dropDatabasePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
         .drop_schema => .{ .schema_namespace_catalog = .{ .drop = try dropSchemaNamespacePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
         .drop_extension => .{ .extension_catalog = .{ .drop = try dropExtensionPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
@@ -3302,6 +3303,7 @@ fn generatedDdlUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated
         .create_sequence,
         .create_enum_type,
         .create_extension,
+        .alter_schema,
         .alter_view,
         .alter_domain,
         .alter_sequence,
@@ -3934,6 +3936,33 @@ fn createExtensionPlanFromGeneratedDdlAstAlloc(
     return try createExtensionPlanFromSyntax(&syntax, default_namespace_name);
 }
 
+fn renameSchemaNamespacePlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+) !RenameSchemaNamespacePlan {
+    const end = try requireGeneratedDdlHeader(tokens, ast.statement_span, .alter, .schema);
+    const name_range = try requireGeneratedTokenRangeAt(ast.object_name_tokens, 2, end);
+    const operation_range = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+    if (operation_range.start != name_range.end or operation_range.end != end) return error.UnsupportedSqlShape;
+    if (operation_range.start + 3 != end or
+        !tokens[operation_range.start].matchesKeywordTag(.rename) or
+        !tokens[operation_range.start + 1].matchesKeywordTag(.to))
+    {
+        return error.UnsupportedSqlShape;
+    }
+    const new_name_range = try requireGeneratedTokenRangeAt(.{
+        .start = operation_range.start + 2,
+        .end = operation_range.start + 3,
+    }, operation_range.start + 2, end);
+    var syntax = grammar.RenameSchemaNamespaceSyntax{
+        .schema_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, name_range),
+        .new_schema_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, new_name_range),
+    };
+    errdefer syntax.deinit(alloc);
+    return renameSchemaNamespacePlanFromSyntax(&syntax);
+}
+
 fn dropDatabasePlanFromGeneratedDdlAstAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
@@ -4283,6 +4312,7 @@ fn validateGeneratedDdlAstSpans(
         => .create,
         .relation_population => unreachable,
         .alter_table,
+        .alter_schema,
         .alter_view,
         .alter_domain,
         .alter_sequence,
@@ -14106,6 +14136,31 @@ test "sql adapter generated simple DDL AST lowers to catalog plans" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var generated_rename_schema = try generatedSimpleDdlPlanForTestAlloc(alloc, "ALTER SCHEMA analytics RENAME TO reporting;");
+    defer generated_rename_schema.deinit(alloc);
+    switch (generated_rename_schema) {
+        .schema_namespace_catalog => |catalog| switch (catalog) {
+            .rename => |plan| {
+                try std.testing.expectEqualStrings("analytics", plan.schema_name);
+                try std.testing.expectEqualStrings("reporting", plan.new_schema_name);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var malformed_rename_schema = try tokenized.ParsedSql.initAlloc(alloc, "ALTER SCHEMA analytics RENAME TO reporting;");
+    defer malformed_rename_schema.deinit(alloc);
+    if (malformed_rename_schema.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.alter_table_operation_tokens = .{ .start = 2, .end = malformed_rename_schema.items().len },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_rename_schema));
 
     var generated_create_extension = try generatedSimpleDdlPlanForTestAlloc(alloc, "CREATE EXTENSION postgis VERSION '3.4.0';");
     defer generated_create_extension.deinit(alloc);

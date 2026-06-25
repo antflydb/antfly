@@ -478,6 +478,10 @@ fn isIncompleteGeneratedDdlBoundary(tokens: []const Token, raw_statement: RawSql
         if (end <= start + 3) return true;
         return isGeneratedDdlTrailingBoundary(last);
     }
+    if (tokenMatchesKeyword(first, .alter) and tokenMatchesKeyword(tokens[start + 1], .schema)) {
+        if (end <= start + 3) return true;
+        return isGeneratedDdlTrailingBoundary(last);
+    }
     if (tokenMatchesKeyword(first, .alter) and tokenMatchesKeyword(tokens[start + 1], .view)) {
         if (end <= start + 3) return true;
         return isGeneratedDdlTrailingBoundary(last);
@@ -1365,6 +1369,7 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE UNLOGGED TABLE IF NOT EXISTS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE VIEW"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE OR REPLACE VIEW active_usage AS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER SCHEMA analytics RENAME TO"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER VIEW active_usage RENAME TO"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP VIEW IF EXISTS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE DOMAIN"));
@@ -2120,6 +2125,22 @@ test "sql adapter parsed sql owns typed statement variants" {
         else => return error.TestUnexpectedResult,
     }
     switch (alter_table.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var alter_schema = try ParsedSql.initAlloc(alloc, "ALTER SCHEMA analytics RENAME TO reporting");
+    defer alter_schema.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, alter_schema.generatedStatementKind().?);
+    switch (alter_schema.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_schema, ddl_ast.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 6 }, ddl_ast.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (alter_schema.statement) {
         .ddl => {},
         else => return error.TestUnexpectedResult,
     }

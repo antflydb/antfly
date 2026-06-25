@@ -61,6 +61,7 @@ pub const GeneratedSqlDdlKind = enum {
     create_index,
     create_extension,
     alter_table,
+    alter_schema,
     alter_view,
     alter_domain,
     alter_sequence,
@@ -1971,6 +1972,9 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.alter) and tokens.len > 1 and tokens[1].matchesKeywordTag(.table)) {
         return .{ .ddl = .alter_table };
     }
+    if (first.matchesKeywordTag(.alter) and tokens.len > 1 and tokens[1].matchesKeywordTag(.schema)) {
+        return .{ .ddl = .alter_schema };
+    }
     if (first.matchesKeywordTag(.alter) and tokens.len > 1 and tokens[1].matchesKeywordTag(.view)) {
         return .{ .ddl = .alter_view };
     }
@@ -2530,6 +2534,14 @@ fn buildDdlAst(
                 if (ast.object_name_tokens) |table_range| {
                     index = table_range.end;
                     if (index < end) ast.alter_table_operation_tokens = .{ .start = index, .end = end };
+                }
+            }
+        },
+        .alter_schema => {
+            if (end > 2 and tokens[1].matchesKeywordTag(.schema)) {
+                ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 2, end);
+                if (ast.object_name_tokens) |schema_range| {
+                    if (schema_range.end < end) ast.alter_table_operation_tokens = .{ .start = schema_range.end, .end = end };
                 }
             }
         },
@@ -5850,6 +5862,7 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_enum_type }, (try parseSqlAlloc(alloc, "DROP TYPE IF EXISTS usage_status CASCADE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .relation_population }, (try parseSqlAlloc(alloc, "SELECT account_id, total INTO usage_archive FROM usage_records WHERE total > 10")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .relation_population }, (try parseSqlAlloc(alloc, "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT account_id FROM usage_records")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_schema }, (try parseSqlAlloc(alloc, "ALTER SCHEMA analytics RENAME TO reporting")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_schema }, (try parseSqlAlloc(alloc, "DROP SCHEMA analytics CASCADE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .create_index }, (try parseSqlAlloc(alloc, "CREATE INDEX usage_status_idx ON usage_records (status)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .drop_index }, (try parseSqlAlloc(alloc, "DROP INDEX usage_status_idx")).statement);
@@ -6098,6 +6111,17 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expect(ddl.if_exists);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, ddl.object_name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 10 }, ddl.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const alter_schema_sql = "ALTER SCHEMA analytics RENAME TO reporting";
+    const alter_schema_result = try parseSqlAlloc(alloc, alter_schema_sql);
+    switch (alter_schema_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.alter_schema, ddl.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 6 }, ddl.alter_table_operation_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
