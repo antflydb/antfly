@@ -25,6 +25,7 @@ const metadata_store_observer = @import("store_observer.zig");
 const metadata_storage = @import("storage/mod.zig");
 const metadata_table_manager = @import("table_manager.zig");
 const metadata_table_workflow = @import("table_workflow.zig");
+const backups_api = @import("../api/backups.zig");
 const api_http_client = @import("../api/http_client.zig");
 const api_http_routes = @import("../api/http_routes.zig");
 const api_http_server = @import("../api/http_server.zig");
@@ -48,6 +49,7 @@ const transition_runtime = @import("../raft/transition_runtime.zig");
 const transition_state = @import("transition_state.zig");
 const raft_engine = @import("raft_engine");
 const data_mod = @import("../data/mod.zig");
+const http_common = @import("../raft/transport/http_common.zig");
 const std_http_executor = @import("../raft/transport/std_http_executor.zig");
 const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const docstore_mod = @import("../storage/docstore.zig");
@@ -4305,6 +4307,42 @@ fn PublicApiRouter(comptime N: usize) type {
     };
 }
 
+fn PublicApiMetadataForwarder(comptime N: usize) type {
+    return struct {
+        node: MetadataHttpNodeSimulation,
+        cluster: *MetadataHttpClusterSimulation,
+        api_base_uris: *const [N][]const u8,
+        executor: http_common.RequestExecutor,
+        forward_count: std.atomic.Value(u64) = .init(0),
+
+        fn iface(self: *@This()) api_http_server.RequestForwarder {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .forward = forward },
+            };
+        }
+
+        fn forward(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !?http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const leader_index = currentMetadataLeaderIndex(self.cluster) orelse return null;
+            const leader_node_id = @as(u64, @intCast(leader_index + 1));
+            const local_node_id = @as(u64, @intCast(self.node.index + 1));
+            if (leader_node_id == local_node_id) return null;
+            const uri = try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.api_base_uris[leader_index], req.uri });
+            defer alloc.free(uri);
+            _ = self.forward_count.fetchAdd(1, .monotonic);
+            return try self.executor.execute(alloc, .{
+                .method = req.method,
+                .uri = uri,
+                .source_node_id = local_node_id,
+                .authorization = req.authorization,
+                .content_type = req.content_type,
+                .body = req.body,
+            });
+        }
+    };
+}
+
 const SimAuthManager = struct {
     store: usermgr.MemoryStore,
     policy_store: casbin.MemoryAdapter,
@@ -4367,6 +4405,7 @@ fn startPublicApiServers(
     status_sources: *[N]PublicApiStatusSource,
     catalog_sources: *[N]PublicApiCatalogSource,
     routers: *[N]PublicApiRouter(N),
+    forwarders: *[N]PublicApiMetadataForwarder(N),
     read_sources: *[N]api_table_reads.HostedProvisionedTableReadSource,
     write_sources: *[N]api_table_writes.HostedProvisionedTableWriteSource,
     options: PublicApiServerOptions(N),
@@ -4382,6 +4421,7 @@ fn startPublicApiServers(
         status_sources[i] = .{ .node = cluster.node(i), .metadata_snapshot_mode = metadata_snapshot_mode };
         catalog_sources[i] = .{ .node = cluster.node(i), .metadata_snapshot_mode = metadata_snapshot_mode };
         routers[i] = .{ .node = cluster.node(i), .cluster = cluster, .api_base_uris = api_base_uris };
+        forwarders[i] = .{ .node = cluster.node(i), .cluster = cluster, .api_base_uris = api_base_uris, .executor = forward_executor.executor() };
         read_sources[i] = api_table_reads.HostedProvisionedTableReadSource.init(
             roots[i],
             catalog_sources[i].iface(),
@@ -4397,10 +4437,11 @@ fn startPublicApiServers(
             forward_executor.executor(),
         );
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
-        const server_config: api_http_server.ApiHttpServerConfig = if (options.auth_managers) |auth_managers| .{
+        var server_config: api_http_server.ApiHttpServerConfig = if (options.auth_managers) |auth_managers| .{
             .auth_enabled = true,
             .user_manager = &auth_managers[i].manager,
         } else .{};
+        server_config.metadata_mutation_forwarder = forwarders[i].iface();
         servers[i] = api_http_server.ApiHttpServer.init(
             alloc,
             server_config,
@@ -4461,6 +4502,7 @@ fn PublicApiTestRig(comptime N: usize) type {
         status_sources: [N]PublicApiStatusSource = undefined,
         catalog_sources: [N]PublicApiCatalogSource = undefined,
         routers: [N]PublicApiRouter(N) = undefined,
+        forwarders: [N]PublicApiMetadataForwarder(N) = undefined,
         read_sources: [N]api_table_reads.HostedProvisionedTableReadSource = undefined,
         write_sources: [N]api_table_writes.HostedProvisionedTableWriteSource = undefined,
         api_base_uris: [N][]const u8 = undefined,
@@ -4535,6 +4577,7 @@ fn PublicApiTestRig(comptime N: usize) type {
                 &self.status_sources,
                 &self.catalog_sources,
                 &self.routers,
+                &self.forwarders,
                 &self.read_sources,
                 &self.write_sources,
                 options,
@@ -5468,6 +5511,122 @@ test "metadata http cluster simulation serves public lifecycle from a non-host n
     var parsed_tables_after_drop = try std.json.parseFromSlice([]TableListEntry, std.heap.page_allocator, listed_tables_after_drop.body, .{ .ignore_unknown_fields = true });
     defer parsed_tables_after_drop.deinit();
     try std.testing.expectEqual(@as(usize, 0), parsed_tables_after_drop.value.len);
+}
+
+test "metadata follower public cluster backup forwards to metadata leader" {
+    var sim_alloc_state: LeanSimAllocator = .init;
+    defer _ = sim_alloc_state.deinit();
+    const sim_alloc = sim_alloc_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store_a = raft_engine.core.MemoryStorage.init(sim_alloc);
+    defer store_a.deinit();
+    var store_b = raft_engine.core.MemoryStorage.init(sim_alloc);
+    defer store_b.deinit();
+    var store_c = raft_engine.core.MemoryStorage.init(sim_alloc);
+    defer store_c.deinit();
+
+    var factory_a = TestDescriptorFactory{ .alloc = sim_alloc, .store = &store_a, .peers = &.{ 1, 2, 3 } };
+    var factory_b = TestDescriptorFactory{ .alloc = sim_alloc, .store = &store_b, .peers = &.{ 1, 2, 3 } };
+    var factory_c = TestDescriptorFactory{ .alloc = sim_alloc, .store = &store_c, .peers = &.{ 1, 2, 3 } };
+
+    const root_a = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-backup-forward-a", .{tmp.sub_path});
+    defer sim_alloc.free(root_a);
+    const root_b = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-backup-forward-b", .{tmp.sub_path});
+    defer sim_alloc.free(root_b);
+    const root_c = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-backup-forward-c", .{tmp.sub_path});
+    defer sim_alloc.free(root_c);
+    const cat_a = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-backup-forward-a.txt", .{tmp.sub_path});
+    defer sim_alloc.free(cat_a);
+    const cat_b = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-backup-forward-b.txt", .{tmp.sub_path});
+    defer sim_alloc.free(cat_b);
+    const cat_c = try std.fmt.allocPrint(sim_alloc, ".zig-cache/tmp/{s}/meta-sim-backup-forward-c.txt", .{tmp.sub_path});
+    defer sim_alloc.free(cat_c);
+
+    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+        makeHostSimConfig(1, 4870, root_a, cat_a),
+        makeHostSimConfig(2, 4870, root_b, cat_b),
+        makeHostSimConfig(3, 4870, root_c, cat_c),
+    };
+    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+        makeHostSimDeps(&factory_a),
+        makeHostSimDeps(&factory_b),
+        makeHostSimDeps(&factory_c),
+    };
+
+    var cluster = try MetadataHttpClusterSimulation.init(sim_alloc, 4870, configs[0..], deps[0..]);
+    defer cluster.deinit();
+    try cluster.startAll();
+    defer cluster.stopAll();
+    try cluster.bootstrapMetadataReplicas();
+    const metadata_leader_index = (try cluster.waitForMetadataLeader(24)) orelse return error.TestExpectedEqual;
+    try cluster.node(metadata_leader_index).campaignMetadataGroup();
+    try cluster.stepAll();
+    try cluster.publishClusterNodes(metadata_leader_index);
+    try cluster.publishClusterStores(metadata_leader_index);
+
+    const roots = [_][]const u8{ root_a, root_b, root_c };
+    var public_api: PublicApiTestRig(3) = undefined;
+    try public_api.initLeaderBackedInPlace(sim_alloc, &cluster, roots);
+    defer public_api.deinit();
+
+    var client = public_api.client;
+    const create_body = try test_contract_helpers.encodeCreateTableRequest(std.heap.page_allocator, "backup forwarding docs");
+    defer std.heap.page_allocator.free(create_body);
+    var created = try client.createTable(public_api.api_base_uris[metadata_leader_index], "docs", create_body);
+    defer created.deinit(std.heap.page_allocator);
+
+    const created_range = try waitForFirstProjectedRange(&cluster, metadata_leader_index, null, null, false, 48);
+    try std.testing.expect(created_range.active_count >= 1);
+    const group_leader_index = (try waitForGroupLeaderIndex(&cluster, created_range.group_id, 96)) orelse return error.TestExpectedEqual;
+
+    const batch_body = try test_contract_helpers.normalizeBatchRequest(std.heap.page_allocator,
+        \\{"inserts":{"doc:a":{"title":"alpha","body":"backup follower forwarding"}}}
+    );
+    defer std.heap.page_allocator.free(batch_body);
+    var batch = try client.fetchBatch(public_api.api_base_uris[group_leader_index], "docs", batch_body);
+    defer batch.deinit(std.heap.page_allocator);
+    try std.testing.expect(std.mem.indexOf(u8, batch.body, "\"inserted\":1") != null);
+
+    const current_leader_index = currentMetadataLeaderIndex(&cluster) orelse metadata_leader_index;
+    const follower_index: usize = if (current_leader_index == 0) 1 else 0;
+    const backup_id = "follower-public-cluster-backup";
+    var backup_io = std.Io.Threaded.init(sim_alloc, .{});
+    defer backup_io.deinit();
+    const cwd_tmp = try std.Io.Dir.cwd().realPathFileAlloc(backup_io.io(), ".zig-cache/tmp", sim_alloc);
+    defer sim_alloc.free(cwd_tmp);
+    const backup_root = try std.fs.path.join(sim_alloc, &.{ cwd_tmp, tmp.sub_path[0..], "backup-forward" });
+    defer sim_alloc.free(backup_root);
+    try std.Io.Dir.cwd().createDirPath(backup_io.io(), backup_root);
+    const backup_location = try std.fmt.allocPrint(sim_alloc, "file://{s}", .{backup_root});
+    defer sim_alloc.free(backup_location);
+    const backup_body = try std.fmt.allocPrint(sim_alloc, "{{\"backup_id\":\"{s}\",\"location\":\"{s}\"}}", .{ backup_id, backup_location });
+    defer sim_alloc.free(backup_body);
+
+    const backup_uri = try std.fmt.allocPrint(sim_alloc, "{s}{s}", .{ public_api.api_base_uris[follower_index], api_http_routes.Routes.backup });
+    defer sim_alloc.free(backup_uri);
+    var backup = try public_api.client_executor.executor().execute(std.heap.page_allocator, .{
+        .method = .POST,
+        .uri = backup_uri,
+        .content_type = "application/json",
+        .body = backup_body,
+    });
+    defer backup.deinit(std.heap.page_allocator);
+    if (backup.status != 200) {
+        std.debug.print("backup through follower failed status={d} body={s}\n", .{ backup.status, backup.body });
+    }
+    try std.testing.expectEqual(@as(u16, 200), backup.status);
+    try std.testing.expect(std.mem.indexOf(u8, backup.body, "\"backup_id\":\"follower-public-cluster-backup\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, backup.body, "\"name\":\"docs\"") != null);
+    try std.testing.expect(public_api.forwarders[follower_index].forward_count.load(.monotonic) > 0);
+
+    var location = try backups_api.openBackupLocation(sim_alloc, backup_location);
+    defer location.deinit(sim_alloc);
+    var manifest = try backups_api.readClusterManifestFromLocation(sim_alloc, &location, backup_id);
+    defer manifest.deinit(sim_alloc);
+    try std.testing.expectEqualStrings(backup_id, manifest.backup_id);
 }
 
 test "metadata http cluster simulation seeds default admin for auth-enabled public api" {

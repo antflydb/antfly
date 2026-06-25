@@ -270,6 +270,7 @@ pub const ApiHttpServerConfig = struct {
     user_manager: ?*usermgr.UserManager = null,
     session_router: ?table_router.HostedGroupRouter = null,
     session_executor: ?http_common.RequestExecutor = null,
+    metadata_mutation_forwarder: ?RequestForwarder = null,
     session_store: ?*transactions_api.DurableSessionStore = null,
     session_store_path: ?[]const u8 = null,
     ha_admin_executor: ?http_common.RequestExecutor = null,
@@ -284,6 +285,19 @@ pub const ApiHttpServerConfig = struct {
     session_owner_lease_ttl_ns: ?u64 = null,
     session_owner_lease_renew_interval_ns: ?u64 = null,
     session_savepoint_limit: ?usize = null,
+};
+
+pub const RequestForwarder = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        forward: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!?http_common.HttpResponse,
+    };
+
+    pub fn forward(self: RequestForwarder, alloc: std.mem.Allocator, req: http_common.HttpRequest) !?http_common.HttpResponse {
+        return try self.vtable.forward(self.ptr, alloc, req);
+    }
 };
 
 pub const trusted_principal_header = "X-Antfly-Trusted-Principal";
@@ -3859,10 +3873,12 @@ pub const ApiHttpServer = struct {
             }
         }
         if (req.method == .POST and std.mem.eql(u8, uri_parts.path, routes.Routes.backup)) {
+            if (try self.forwardMetadataMutationToLeader(req)) |resp| return resp;
             return try self.handlePublicClusterBackup(req.body);
         }
         if (req.method == .POST) {
             if (std.mem.eql(u8, uri_parts.path, routes.Routes.restore)) {
+                if (try self.forwardMetadataMutationToLeader(req)) |resp| return resp;
                 return try self.handlePublicClusterRestore(req.body);
             }
         }
@@ -5335,6 +5351,12 @@ pub const ApiHttpServer = struct {
             if (try self.tryAdoptSession(txn_id)) return null;
             return err;
         };
+    }
+
+    fn forwardMetadataMutationToLeader(self: *ApiHttpServer, req: http_common.HttpRequest) !?http_common.HttpResponse {
+        if (req.source_node_id != null) return null;
+        const forwarder = self.cfg.metadata_mutation_forwarder orelse return null;
+        return try forwarder.forward(self.alloc, req);
     }
 
     fn tryAdoptSession(self: *ApiHttpServer, txn_id: db_mod.types.TxnId) !bool {

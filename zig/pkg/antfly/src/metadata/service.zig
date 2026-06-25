@@ -2325,15 +2325,31 @@ pub const MetadataHttpService = struct {
         const base_uri = self.metadataOrchestrationUrlForNode(target_node_id) orelse return null;
         const uri = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base_uri, req.uri });
         defer alloc.free(uri);
+        const headers = try filteredForwardHeaders(alloc, req.headers);
+        defer if (headers.len > 0) alloc.free(headers);
         return try self.raft.host.http_host.request_executor.execute(alloc, .{
             .method = req.method,
             .uri = uri,
-            .headers = req.headers,
+            .headers = headers,
             .source_node_id = local_node_id,
             .authorization = req.authorization,
             .content_type = req.content_type,
             .body = req.body,
         });
+    }
+
+    fn filteredForwardHeaders(alloc: std.mem.Allocator, headers: []const http_common.RequestHeader) ![]http_common.RequestHeader {
+        if (headers.len == 0) return &.{};
+        var out = std.ArrayListUnmanaged(http_common.RequestHeader).empty;
+        errdefer out.deinit(alloc);
+        for (headers) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "host")) continue;
+            if (std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
+            if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
+            if (std.ascii.eqlIgnoreCase(header.name, "content-type")) continue;
+            try out.append(alloc, header);
+        }
+        return try out.toOwnedSlice(alloc);
     }
 
     fn metadataOrchestrationUrlForNode(self: *const MetadataHttpService, node_id: u64) ?[]const u8 {
