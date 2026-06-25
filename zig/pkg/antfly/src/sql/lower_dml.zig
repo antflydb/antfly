@@ -13859,11 +13859,23 @@ fn generatedDmlCommandStart(
         } else if (tokens.len > 1 and tokens[1].matchesKeywordTag(.recursive)) {
             return error.UnsupportedSqlShape;
         }
+        try validateGeneratedDmlCommandSpan(tokens, ast, cte_tokens.end);
         return cte_tokens.end;
     }
     if (ast.cte_recursive) return error.UnsupportedSqlShape;
     if (tokens.len > 0 and tokens[0].matchesKeywordTag(.with)) return error.UnsupportedSqlShape;
+    try validateGeneratedDmlCommandSpan(tokens, ast, 0);
     return 0;
+}
+
+fn validateGeneratedDmlCommandSpan(
+    tokens: []const Token,
+    ast: generated_parser.GeneratedSqlDmlAst,
+    command_start: usize,
+) !void {
+    if (command_start >= tokens.len) return error.UnsupportedSqlShape;
+    const command = tokens[command_start];
+    if (ast.command_span.start != command.source_start or ast.command_span.end != command.source_end) return error.UnsupportedSqlShape;
 }
 
 fn requireGeneratedDmlTokenRangeAt(
@@ -14224,6 +14236,42 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerWritePlanParsedSqlForDmlTestAlloc(alloc, &malformed_generated_dml, schema, &.{}, options),
+    );
+
+    var malformed_command_span_dml = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, organization_id, quantity) VALUES ('u2', 'active', 'o1', 7) RETURNING id",
+    );
+    defer malformed_command_span_dml.deinit(alloc);
+    if (malformed_command_span_dml.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| dml.command_span.end += 1,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerWritePlanParsedSqlForDmlTestAlloc(alloc, &malformed_command_span_dml, schema, &.{}, options),
+    );
+
+    var malformed_cte_command_span_dml = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH recent_usage AS (SELECT id FROM usage_records WHERE kind = 'order') UPDATE usage_records SET status = 'active' WHERE id = 'u1'",
+    );
+    defer malformed_cte_command_span_dml.deinit(alloc);
+    if (malformed_cte_command_span_dml.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| dml.command_span = malformed_cte_command_span_dml.items()[0].sourceSpan(),
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerWritePlanParsedSqlForDmlTestAlloc(alloc, &malformed_cte_command_span_dml, schema, &.{}, options),
     );
 
     const resolver_free_options = plan_mod.LowerWritePlanOptions{
