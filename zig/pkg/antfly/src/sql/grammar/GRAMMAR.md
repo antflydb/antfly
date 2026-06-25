@@ -606,7 +606,11 @@ Unsupported DDL remains on the existing parser until
    pagination helpers. Generated read order clauses now fail closed when the
    generated order-list item, expression, direction, `USING`, or `NULLS`
    ranges disagree with the token stream or with the span consumed by typed
-   order planning. Generated aggregate `GROUP BY` clauses now similarly
+   order planning. Generated projection clauses now validate generated
+   item/expression/alias spans before typed select-list planning, and typed
+   projection planning must consume the same generated projection span for
+   generated simple, aggregate, window, join, and lateral reads. Generated
+   aggregate `GROUP BY` clauses now similarly
    validate generated item/expression list spans before typed grouping
    planning, and typed grouping must consume the same generated group-list
    span. Generated read `WHERE` clauses on generated simple, aggregate,

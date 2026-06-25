@@ -228,6 +228,76 @@ fn validateGeneratedExpressionListForClause(
     }
 }
 
+fn validateGeneratedProjectionListForClause(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    list: generated_parser.GeneratedSqlListAst,
+) !void {
+    if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    if (list.count == 0 or list.items.len != list.count or list.expression_items.len != list.count or list.expressions.len != list.count) return error.UnsupportedSqlShape;
+    if (list.alias_items.len != list.count or list.alias_name_items.len != list.count) return error.UnsupportedSqlShape;
+    if (list.direction_items.len != list.count or list.directions.len != list.count) return error.UnsupportedSqlShape;
+    if (list.order_using_operator_items.len != list.count or list.nulls_order_items.len != list.count or list.nulls_orders.len != list.count) return error.UnsupportedSqlShape;
+    if (list.first_tokens == null or !generatedTokenRangeEqual(list.first_tokens.?, list.items[0])) return error.UnsupportedSqlShape;
+    if (list.last_tokens == null or !generatedTokenRangeEqual(list.last_tokens.?, list.items[list.count - 1])) return error.UnsupportedSqlShape;
+
+    for (list.items, 0..) |item, index| {
+        if (item.start >= item.end or item.start < range.start or item.end > range.end) return error.UnsupportedSqlShape;
+        if (index == 0) {
+            if (item.start != range.start) return error.UnsupportedSqlShape;
+        } else {
+            const previous = list.items[index - 1];
+            if (previous.end + 1 != item.start or previous.end >= tokens.len or tokens[previous.end].kind != .comma) return error.UnsupportedSqlShape;
+        }
+        if (index + 1 == list.count and item.end != range.end) return error.UnsupportedSqlShape;
+        if (list.direction_items[index] != null or list.directions[index] != null) return error.UnsupportedSqlShape;
+        if (list.order_using_operator_items[index] != null or list.nulls_order_items[index] != null or list.nulls_orders[index] != null) return error.UnsupportedSqlShape;
+
+        const expression_range = list.expression_items[index];
+        if (expression_range.start < item.start or expression_range.end > item.end or expression_range.start >= expression_range.end) return error.UnsupportedSqlShape;
+        if (!generatedTokenRangeEqual(list.expressions[index].tokens orelse return error.UnsupportedSqlShape, expression_range)) return error.UnsupportedSqlShape;
+
+        if (list.alias_items[index]) |alias_range| {
+            const alias_name_range = list.alias_name_items[index] orelse return error.UnsupportedSqlShape;
+            if (alias_range.start != expression_range.end or alias_range.end != item.end) return error.UnsupportedSqlShape;
+            if (alias_name_range.start < alias_range.start or alias_name_range.end != alias_range.end or alias_name_range.start >= alias_name_range.end) return error.UnsupportedSqlShape;
+            if (tokens[alias_range.start].matchesKeywordTag(.as)) {
+                if (alias_name_range.start != alias_range.start + 1) return error.UnsupportedSqlShape;
+            } else if (!generatedTokenRangeEqual(alias_name_range, alias_range)) return error.UnsupportedSqlShape;
+        } else if (list.alias_name_items[index] != null) {
+            return error.UnsupportedSqlShape;
+        } else if (!generatedTokenRangeEqual(expression_range, item)) {
+            return error.UnsupportedSqlShape;
+        }
+    }
+}
+
+fn generatedProjectionClauseEnd(
+    tokens: []const Token,
+    pos: usize,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !?usize {
+    const read = generated_read_ast orelse return null;
+    if (read.projection_tokens) |range| {
+        if (range.start == pos) {
+            if (range.end > tokens.len) return error.UnsupportedSqlShape;
+            try validateGeneratedProjectionListForClause(tokens, range, read.projection_items);
+            return range.end;
+        }
+    }
+    if (read.kind == .set_operation) {
+        if (read.set_operation.right_projection_tokens) |right_range| {
+            if (right_range.start == pos) {
+                if (right_range.end > tokens.len) return error.UnsupportedSqlShape;
+                try validateGeneratedProjectionListForClause(tokens, right_range, read.set_operation.right_projection_items);
+                return right_range.end;
+            }
+        }
+        return null;
+    }
+    return error.UnsupportedSqlShape;
+}
+
 fn generatedGroupClauseEnd(
     tokens: []const Token,
     keyword_index: usize,
@@ -15828,6 +15898,7 @@ pub fn parseSelectAlloc(
     );
     errdefer freeExpressionSlice(alloc, distinct_on);
 
+    const generated_projection_end = try generatedProjectionClauseEnd(tokens, pos.*, options.generated_read_ast);
     const select = try parseSelectListAlloc(
         alloc,
         tokens,
@@ -15852,6 +15923,9 @@ pub fn parseSelectAlloc(
     errdefer plan_mod.freeFieldAliasProjections(alloc, select.field_aliases);
     errdefer freeExpressionProjections(alloc, select.expressions);
     defer if (select.outputs.len > 0) alloc.free(select.outputs);
+    if (generated_projection_end) |end| {
+        if (pos.* != end) return error.UnsupportedSqlShape;
+    }
 
     try parser.expectKeyword(tokens, pos, "from");
     const table_ref = if (direct_graph_source) |source| table_ref: {
@@ -16167,6 +16241,7 @@ pub fn parseAggregateAlloc(
     if (select_distinct and parser.peekKeyword(tokens, pos.*, "on")) return error.UnsupportedSqlShape;
 
     const select_context = options.context_hooks.get_context(options.context_hooks.ptr);
+    const generated_projection_end = try generatedProjectionClauseEnd(tokens, pos.*, options.generated_read_ast);
     const select = try parseAggregateSelectListAlloc(
         alloc,
         tokens,
@@ -16191,6 +16266,9 @@ pub fn parseAggregateAlloc(
     errdefer {
         plan_mod.freeAggregateSpecs(alloc, select.aggregations);
         if (select.aggregations.len > 0) alloc.free(select.aggregations);
+    }
+    if (generated_projection_end) |end| {
+        if (pos.* != end) return error.UnsupportedSqlShape;
     }
     const distinct_group_only = select_distinct and select.aggregations.len == 0;
     if (distinct_group_only) {
@@ -16612,6 +16690,7 @@ pub fn parseWindowSelectAlloc(
     options.named_window_hooks.set_specs(options.named_window_hooks.ptr, parsed_named_windows);
     defer options.named_window_hooks.set_specs(options.named_window_hooks.ptr, previous_named_window_specs);
 
+    const generated_projection_end = try generatedProjectionClauseEnd(tokens, pos.*, options.generated_read_ast);
     const select = try parseWindowSelectListAlloc(
         alloc,
         tokens,
@@ -16642,6 +16721,9 @@ pub fn parseWindowSelectAlloc(
     errdefer strings.freeStringSlice(alloc, select.fields);
     errdefer if (select.windows.len > 0) alloc.free(select.windows);
     errdefer plan_mod.freeWindowSpecs(alloc, select.windows);
+    if (generated_projection_end) |end| {
+        if (pos.* != end) return error.UnsupportedSqlShape;
+    }
     if (select.windows.len == 0) return error.UnsupportedSqlShape;
 
     try parser.expectKeyword(tokens, pos, "from");
@@ -16920,8 +17002,12 @@ pub fn parseJoinAlloc(
     try validateGeneratedJoinExecutableContract(options.generated_read_ast, .join);
     try parser.expectKeyword(tokens, pos, "select");
 
+    const generated_projection_end = try generatedProjectionClauseEnd(tokens, pos.*, options.generated_read_ast);
     const raw_select = try plan_mod.parseJoinProjectionListAlloc(alloc, tokens, pos);
     defer plan_mod.freeQualifiedProjections(alloc, raw_select);
+    if (generated_projection_end) |end| {
+        if (pos.* != end) return error.UnsupportedSqlShape;
+    }
 
     try parser.expectKeyword(tokens, pos, "from");
     const left_tokens_start = pos.*;
@@ -17667,8 +17753,12 @@ pub fn parseLateralAlloc(
     try validateGeneratedJoinExecutableContract(options.generated_read_ast, .lateral);
     try parser.expectKeyword(tokens, pos, "select");
 
+    const generated_projection_end = try generatedProjectionClauseEnd(tokens, pos.*, options.generated_read_ast);
     const raw_select = try plan_mod.parseJoinProjectionListAlloc(alloc, tokens, pos);
     defer plan_mod.freeQualifiedProjections(alloc, raw_select);
+    if (generated_projection_end) |end| {
+        if (pos.* != end) return error.UnsupportedSqlShape;
+    }
 
     try parser.expectKeyword(tokens, pos, "from");
     const left_tokens_start = pos.*;
@@ -29177,6 +29267,22 @@ fn corruptGeneratedReadWhereExpressionRange(parsed_sql: *tokenized.ParsedSql) !v
     return error.TestUnexpectedResult;
 }
 
+fn corruptGeneratedReadFirstProjectionExpressionItem(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |*read| {
+                    if (read.projection_items.items.len == 0 or read.projection_items.expression_items.len == 0 or read.group_items.items.len == 0) return error.TestUnexpectedResult;
+                    read.projection_items.expression_items[0] = read.group_items.items[0];
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 test "sql adapter lower expr lowers grouped aggregate queries with generated group validation" {
     const alloc = std.testing.allocator;
     const schema_json =
@@ -29204,6 +29310,19 @@ test "sql adapter lower expr lowers grouped aggregate queries with generated gro
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
         alloc,
         &malformed_group,
+        schema,
+        &.{},
+    ));
+
+    var malformed_projection = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT status, SUM(amount) AS total FROM usage_records GROUP BY status ORDER BY total DESC LIMIT 5",
+    );
+    defer malformed_projection.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionExpressionItem(&malformed_projection);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
+        alloc,
+        &malformed_projection,
         schema,
         &.{},
     ));
