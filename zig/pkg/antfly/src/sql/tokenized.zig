@@ -659,9 +659,7 @@ fn parseStatement(
                     return .{ .write = .{ .kind = classified_kind, .raw = raw_statement, .recursive = generated.recursive } };
                 }
                 return .{ .write = .{ .kind = generated.defaultWriteKind(), .raw = raw_statement, .recursive = generated.recursive } };
-            } else if (tokenized_sql.write_statement_kind) |kind| {
-                return .{ .write = .{ .kind = kind, .raw = raw_statement } };
-            },
+            } else return .{ .unknown = raw_statement },
             .read => if (generatedReadStatementKind(tokenized_sql.items(), generated_raw)) |kind| {
                 if (tokenized_sql.read_statement_kind) |classified_kind| {
                     if (classified_kind != kind) return .{ .unknown = raw_statement };
@@ -1895,6 +1893,13 @@ test "sql adapter parsed sql write statement kind fails closed on classifier dis
 
     generated_insert.tokenized_sql.write_statement_kind = .delete;
     generated_insert.statement = parseStatement(generated_insert.raw_statement, generated_insert.generated_statement, &generated_insert.tokenized_sql);
+    try std.testing.expect(generated_insert.writeStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_insert.statement));
+
+    var malformed_generated = generated_insert.generated_statement.?;
+    malformed_generated.ast = null;
+    generated_insert.tokenized_sql.write_statement_kind = .insert;
+    generated_insert.statement = parseStatement(generated_insert.raw_statement, malformed_generated, &generated_insert.tokenized_sql);
     try std.testing.expect(generated_insert.writeStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_insert.statement));
 }

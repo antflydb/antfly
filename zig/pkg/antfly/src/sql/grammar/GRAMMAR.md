@@ -475,7 +475,8 @@ Unsupported DDL remains on the existing parser until
    Generated DML AST kind also owns parsed-statement write-family
    classification for generated-covered writes, preserves recursive CTE write
    metadata at the parsed boundary, and fails closed when retained generated
-   kind metadata disagrees with the legacy classifier.
+   kind metadata is missing or disagrees with the legacy classifier instead of
+   falling back to legacy write-family classification.
    Incomplete migrated DML clause-boundary shapes for insert, update, delete,
    truncate, `INSERT ... ON CONFLICT ... DO` tails, and `MERGE` action bodies
    now use generated fail-closed diagnostics instead of classifier fallback.
