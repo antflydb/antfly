@@ -60,8 +60,10 @@ database, schema, and extension create/drop catalog plans and lower those
 catalog plans directly from generated AST ranges. `CREATE`/`DROP`
 database/schema/extension statement heads now require generated parser success
 at the `ParsedSql` boundary, so malformed generated-owned catalog DDL fails
-closed instead of probing the legacy DDL classifier. Generated AST-to-plan
-parity also covers seed `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, and `DROP INDEX`
+closed instead of probing the legacy DDL classifier. Generated DDL lowering
+also validates the retained statement span, command span, and command-kind
+metadata before dispatching to catalog, table, index, or alter-table planning.
+Generated AST-to-plan parity also covers seed `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, and `DROP INDEX`
 forms using the same parser options as the existing lowerer. Generated
 `CREATE INDEX` ASTs also retain
 `UNIQUE`, method, element-list, covering-index `INCLUDE (...)`, options, and

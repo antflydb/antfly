@@ -3233,6 +3233,7 @@ pub fn simpleDdlPlanFromGeneratedAstAlloc(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlDdlAst,
 ) !LoweredDdlPlan {
+    try validateGeneratedDdlAstSpans(tokens, ast);
     return switch (ast.kind) {
         .create_database => .{ .database_catalog = .{ .create = try createDatabasePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
         .create_schema => .{ .schema_namespace_catalog = .{ .create = try createSchemaNamespacePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
@@ -3250,6 +3251,7 @@ pub fn ddlPlanFromGeneratedAstAlloc(
     ast: generated_parser.GeneratedSqlDdlAst,
     options: DdlPlanParserOptions,
 ) !LoweredDdlPlan {
+    try validateGeneratedDdlAstSpans(tokens, ast);
     const tail = generatedStatementTail(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     var pos: usize = 0;
     return switch (ast.kind) {
@@ -3904,6 +3906,34 @@ fn requireGeneratedDdlHeader(
     const end = generatedStatementEnd(tokens, statement_span) orelse return error.UnsupportedSqlShape;
     if (end < 3 or !tokens[0].matchesKeywordTag(first) or !tokens[1].matchesKeywordTag(second)) return error.UnsupportedSqlShape;
     return end;
+}
+
+fn validateGeneratedDdlAstSpans(
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+) !void {
+    _ = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    if (tokens[0].source_start != ast.command_span.start or tokens[0].source_end != ast.command_span.end) {
+        return error.UnsupportedSqlShape;
+    }
+    const expected: token_mod.TokenKeyword = switch (ast.kind) {
+        .create_database,
+        .create_schema,
+        .create_table,
+        .create_index,
+        .create_extension,
+        .create_graph_index,
+        .create_graph_metric,
+        => .create,
+        .alter_table => .alter,
+        .drop_table,
+        .drop_index,
+        .drop_schema,
+        .drop_database,
+        .drop_extension,
+        => .drop,
+    };
+    if (!tokens[0].matchesKeywordTag(expected)) return error.UnsupportedSqlShape;
 }
 
 fn requireGeneratedTokenRangeAt(
@@ -13648,6 +13678,26 @@ test "sql adapter generated simple DDL AST lowers to catalog plans" {
     }
 
     try std.testing.expectError(error.UnsupportedSqlShape, generatedSimpleDdlPlanForTestAlloc(alloc, "CREATE DATABASE tenant_ops WITH OWNER app;"));
+
+    var malformed_command = try tokenized.ParsedSql.initAlloc(alloc, "CREATE DATABASE tenant_ops;");
+    defer malformed_command.deinit(alloc);
+    const malformed_command_raw = malformed_command.generated_statement orelse return error.TestUnexpectedResult;
+    var malformed_command_ast = try generatedDdlCompatibleAst(malformed_command_raw.ast orelse return error.TestUnexpectedResult);
+    malformed_command_ast.command_span.end += 1;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        simpleDdlPlanFromGeneratedAstAlloc(alloc, malformed_command.items(), malformed_command_ast),
+    );
+
+    var mismatched_kind = try tokenized.ParsedSql.initAlloc(alloc, "DROP DATABASE tenant_ops;");
+    defer mismatched_kind.deinit(alloc);
+    const mismatched_kind_raw = mismatched_kind.generated_statement orelse return error.TestUnexpectedResult;
+    var mismatched_kind_ast = try generatedDdlCompatibleAst(mismatched_kind_raw.ast orelse return error.TestUnexpectedResult);
+    mismatched_kind_ast.kind = .create_database;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        simpleDdlPlanFromGeneratedAstAlloc(alloc, mismatched_kind.items(), mismatched_kind_ast),
+    );
 }
 
 test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
@@ -13961,6 +14011,52 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var malformed_command = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_usage_records (id text PRIMARY KEY);");
+    defer malformed_command.deinit(alloc);
+    const malformed_command_raw = malformed_command.generated_statement orelse return error.TestUnexpectedResult;
+    var malformed_command_ast = try generatedDdlCompatibleAst(malformed_command_raw.ast orelse return error.TestUnexpectedResult);
+    malformed_command_ast.command_span.end += 1;
+    var malformed_command_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = malformed_command.items(),
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        ddlPlanFromGeneratedAstAlloc(alloc, malformed_command.items(), malformed_command_ast, .{
+            .schema = malformed_command_state.schema,
+            .field_expression_qualifiers = malformed_command_state.field_expression_qualifiers,
+            .returning_expression_qualifiers = malformed_command_state.returning_expression_qualifiers,
+            .defer_row_expression_field_validation = malformed_command_state.defer_row_expression_field_validation,
+            .column_definition_options = parser_context.ParserState.ContextAccessors.ddlColumnDefinitionOptions(&malformed_command_state),
+            .domain_options = parser_context.ParserState.ContextAccessors.ddlDomainOptions(&malformed_command_state),
+            .create_index_options = parser_context.ParserState.ContextAccessors.createIndexOptions(&malformed_command_state),
+            .row_security_policy_options = parser_context.ParserState.ContextAccessors.rowSecurityPolicyOptions(&malformed_command_state),
+        }),
+    );
+
+    var mismatched_kind = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN status text;");
+    defer mismatched_kind.deinit(alloc);
+    const mismatched_kind_raw = mismatched_kind.generated_statement orelse return error.TestUnexpectedResult;
+    var mismatched_kind_ast = try generatedDdlCompatibleAst(mismatched_kind_raw.ast orelse return error.TestUnexpectedResult);
+    mismatched_kind_ast.kind = .create_table;
+    var mismatched_kind_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = mismatched_kind.items(),
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        ddlPlanFromGeneratedAstAlloc(alloc, mismatched_kind.items(), mismatched_kind_ast, .{
+            .schema = mismatched_kind_state.schema,
+            .field_expression_qualifiers = mismatched_kind_state.field_expression_qualifiers,
+            .returning_expression_qualifiers = mismatched_kind_state.returning_expression_qualifiers,
+            .defer_row_expression_field_validation = mismatched_kind_state.defer_row_expression_field_validation,
+            .column_definition_options = parser_context.ParserState.ContextAccessors.ddlColumnDefinitionOptions(&mismatched_kind_state),
+            .domain_options = parser_context.ParserState.ContextAccessors.ddlDomainOptions(&mismatched_kind_state),
+            .create_index_options = parser_context.ParserState.ContextAccessors.createIndexOptions(&mismatched_kind_state),
+            .row_security_policy_options = parser_context.ParserState.ContextAccessors.rowSecurityPolicyOptions(&mismatched_kind_state),
+        }),
+    );
 
     const drop_table_sql = "DROP TABLE IF EXISTS usage_records CASCADE;";
     var generated_drop_table = try generatedDdlPlanForTestAlloc(alloc, drop_table_sql);
