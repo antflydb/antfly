@@ -2508,7 +2508,47 @@ pub fn lowerExplainPlanWithParsedSqlAlloc(
         .explain => |statement| statement,
         else => return error.UnsupportedSqlShape,
     };
+    try validateGeneratedExplainUnsupportedBoundary(parsed_sql, parsed);
     return try lowerExplainPlanWithParsedPrefixAlloc(alloc, parsed_sql, parsed, hooks);
+}
+
+fn generatedStatementTokenEnd(tokens: []const Token) usize {
+    var end = tokens.len;
+    while (end > 0 and tokens[end - 1].kind == .semicolon) : (end -= 1) {}
+    return end;
+}
+
+fn validateGeneratedExplainUnsupportedBoundary(
+    parsed_sql: *const tokenized.ParsedSql,
+    parsed: tokenized.ParsedExplainStatement,
+) !void {
+    const generated_statement = parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    const generated_ast = generated_statement.ast orelse return error.UnsupportedSqlShape;
+    const unsupported = switch (generated_ast) {
+        .unsupported => |unsupported| unsupported,
+        else => return error.UnsupportedSqlShape,
+    };
+    switch (generated_statement.statement) {
+        .unsupported => |kind| if (kind != .explain) return error.UnsupportedSqlShape,
+        else => return error.UnsupportedSqlShape,
+    }
+    if (unsupported.kind != .explain or unsupported.reason != .explain_not_planned_by_generated_parser) {
+        return error.UnsupportedSqlShape;
+    }
+    const tokens = parsed_sql.items();
+    const end = generatedStatementTokenEnd(tokens);
+    if (end == 0 or !tokens[0].matchesKeyword("explain")) return error.UnsupportedSqlShape;
+    if (unsupported.statement_span.start != tokens[0].source_start or unsupported.statement_span.end != tokens[end - 1].source_end) {
+        return error.UnsupportedSqlShape;
+    }
+    if (unsupported.command_span.start != tokens[0].source_start or unsupported.command_span.end != tokens[0].source_end) {
+        return error.UnsupportedSqlShape;
+    }
+    const inner_start = parsed.inner_token_start orelse return error.UnsupportedSqlShape;
+    const inner_end = parsed.inner_token_end orelse return error.UnsupportedSqlShape;
+    if (!std.meta.eql(unsupported.subject_tokens orelse return error.UnsupportedSqlShape, generated_parser.GeneratedSqlTokenRange{ .start = inner_start, .end = inner_end })) {
+        return error.UnsupportedSqlShape;
+    }
 }
 
 fn lowerExplainPlanWithParsedPrefixAlloc(
@@ -2549,6 +2589,81 @@ fn lowerExplainPlanWithParsedPrefixAlloc(
 fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
     for (values) |value| alloc.free(value);
     if (values.len > 0) alloc.free(values);
+}
+
+fn lowerExplainReadForTest(ptr: *anyopaque, parsed_sql: *const tokenized.ParsedSql) anyerror!LoweredReadPlan {
+    const alloc: *std.mem.Allocator = @ptrCast(@alignCast(ptr));
+    switch (parsed_sql.statement) {
+        .read => {},
+        else => return error.UnsupportedSqlShape,
+    }
+    return .{ .query = .{
+        .table_name = try alloc.dupe(u8, "usage_records"),
+        .plan = .{},
+    } };
+}
+
+fn lowerExplainWriteForTest(_: *anyopaque, _: *const tokenized.ParsedSql) anyerror!LoweredWritePlan {
+    return error.UnsupportedSqlShape;
+}
+
+fn explainPlanLoweringHooksForTest(alloc: *std.mem.Allocator) ExplainPlanLoweringHooks {
+    return .{
+        .ptr = alloc,
+        .lower_read = lowerExplainReadForTest,
+        .lower_write = lowerExplainWriteForTest,
+    };
+}
+
+test "sql adapter explain validates generated unsupported boundary before lowering subject" {
+    const alloc = std.testing.allocator;
+
+    var parsed = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "EXPLAIN SELECT id FROM usage_records;",
+    );
+    defer parsed.deinit(alloc);
+    var mutable_alloc = alloc;
+    var lowered = try lowerExplainPlanWithParsedSqlAlloc(alloc, &parsed, explainPlanLoweringHooksForTest(&mutable_alloc));
+    defer lowered.deinit(alloc);
+    try std.testing.expect(!lowered.analyze);
+    switch (lowered.subject) {
+        .read => |read| switch (read) {
+            .query => |query| try std.testing.expectEqualStrings("usage_records", query.table_name),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var malformed_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "EXPLAIN SELECT id FROM usage_records;",
+    );
+    defer malformed_kind.deinit(alloc);
+    if (malformed_kind.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.kind = .copy,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerExplainPlanWithParsedSqlAlloc(alloc, &malformed_kind, explainPlanLoweringHooksForTest(&mutable_alloc)));
+
+    var malformed_subject = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "EXPLAIN SELECT id FROM usage_records;",
+    );
+    defer malformed_subject.deinit(alloc);
+    if (malformed_subject.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.subject_tokens = .{ .start = 0, .end = malformed_subject.items().len },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerExplainPlanWithParsedSqlAlloc(alloc, &malformed_subject, explainPlanLoweringHooksForTest(&mutable_alloc)));
 }
 
 pub fn cloneExpressionAlloc(
