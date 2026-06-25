@@ -667,9 +667,7 @@ fn parseStatement(
                     if (classified_kind != kind) return .{ .unknown = raw_statement };
                 }
                 return .{ .read = .{ .kind = kind, .raw = raw_statement } };
-            } else if (tokenized_sql.read_statement_kind) |kind| {
-                return .{ .read = .{ .kind = kind, .raw = raw_statement } };
-            },
+            } else return .{ .unknown = raw_statement },
             .graph => return .{ .ddl = .{ .raw = raw_statement } },
             .unsupported => |kind| if (!generatedUnsupportedUsesLegacyPlanner(kind)) return .{ .unsupported = .{ .kind = kind, .raw = raw_statement } },
             .other => {},
@@ -761,8 +759,8 @@ fn generatedCteReadStatementKind(
     tokens: []const Token,
     read_ast: generated_parser.GeneratedSqlReadAst,
 ) ?classifier.SqlReadStatementKind {
-    if (read_ast.cte_recursive) return .recursive_cte;
     if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return null;
+    if (read_ast.cte_recursive) return .recursive_cte;
     if (read_ast.set_operation_tokens != null) return .set_operation;
     if (read_ast.source_tokens) |source| {
         if (generatedReadRangeContainsKeyword(tokens, source, .lateral)) return .lateral;
@@ -2882,6 +2880,23 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
     generated_query.statement = parseStatement(generated_query.raw_statement, generated_query.generated_statement, &generated_query.tokenized_sql);
     try std.testing.expect(generated_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_query.statement));
+
+    var generated_cte = try ParsedSql.initAlloc(alloc, "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows");
+    defer generated_cte.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_cte.generatedStatementKind().?);
+
+    var malformed_generated = generated_cte.generated_statement.?;
+    if (malformed_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |*read_ast| read_ast.projection_tokens = null,
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_cte.statement = parseStatement(generated_cte.raw_statement, malformed_generated, &generated_cte.tokenized_sql);
+    try std.testing.expect(generated_cte.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_cte.statement));
 }
 
 test "sql adapter parsed sql retains generated graph nodes as DDL" {

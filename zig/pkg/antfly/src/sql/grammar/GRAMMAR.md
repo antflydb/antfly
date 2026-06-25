@@ -660,6 +660,10 @@ Unsupported DDL remains on the existing parser until
    first-join compatibility fields, and body pagination
    expression payloads for `LIMIT`, `OFFSET`, and `FETCH`; generated CTE
    lowering validates those body payloads and their clause keyword layout.
+   Parsed generated read classification now fails closed when retained
+   generated read metadata is too incomplete to derive a read family, including
+   recursive CTEs whose generated final `SELECT` metadata is corrupted, instead
+   of falling back to the legacy read classifier.
    Recursive CTE reads carry an
    explicit recursive flag; and simple non-recursive CTE reads dispatch to the
    typed read lowerer after validating those ranges. Recursive CTE reads now
