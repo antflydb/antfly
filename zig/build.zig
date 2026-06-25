@@ -3663,7 +3663,7 @@ pub fn build(b: *std.Build) void {
     lib_db_result_shape_step.dependOn(&run_lib_db_result_shape_tests.step);
 
     const lib_db_reopen_tests = b.addTest(.{
-        .root_module = lib_test_mod,
+        .root_module = db_test_mod,
         .filters = &.{
             "storage.db.search_runtime.test.db search runtime reopen ",
         },
