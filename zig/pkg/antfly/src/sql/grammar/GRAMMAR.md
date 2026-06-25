@@ -733,8 +733,9 @@ Unsupported DDL remains on the existing parser until
    real retained metadata so stale expression payloads fail closed even when no
    token range is present. Incomplete generated read clause-boundary shapes for
    `SELECT`/`WITH`, source clauses, predicates, grouping, having filters,
-   ordering, `DISTINCT`/`DISTINCT ON`, set operations, unambiguous pagination
-   result tails, window clauses, joins, and CTE `AS` bodies now require
+   incomplete boolean and comparison operator tails, ordering,
+   `DISTINCT`/`DISTINCT ON`, set operations, unambiguous pagination result
+   tails, window clauses, joins, and CTE `AS` bodies now require
    generated parsing and fail closed instead of falling back to the legacy read
    classifier.
    Switching reads from fallback to required generated parsing still requires

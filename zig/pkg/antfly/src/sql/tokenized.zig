@@ -483,6 +483,14 @@ fn isIncompleteGeneratedReadBoundary(tokens: []const Token, raw_statement: RawSq
     }
     if (generatedReadHasPriorResultTail(tokens, start, end - 1) and
         (tokenMatchesKeyword(last, .window) or
+            tokenMatchesKeyword(last, .@"and") or
+            tokenMatchesKeyword(last, .@"or") or
+            tokenMatchesKeyword(last, .is) or
+            tokenMatchesKeyword(last, .not) or
+            tokenMatchesKeyword(last, .in) or
+            tokenMatchesKeyword(last, .exists) or
+            tokenMatchesKeyword(last, .like) or
+            tokenMatchesKeyword(last, .ilike) or
             tokenMatchesKeyword(last, .nulls) or
             tokenMatchesKeyword(last, .between) or
             tokenMatchesKeyword(last, .preceding) or
@@ -1184,6 +1192,12 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT DISTINCT ON ("));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE status IS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE status IS NOT"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE status IN"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE status LIKE"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE status = 'active' AND"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT status, COUNT(*) FROM usage_records GROUP BY status HAVING COUNT(*) > 1 OR"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT status, COUNT(*) FROM usage_records GROUP BY"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT status, COUNT(*) FROM usage_records GROUP BY status HAVING"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records ORDER BY"));
