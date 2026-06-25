@@ -27025,8 +27025,8 @@ test "api http server executes document SQL reads through typed document plan in
         .body = "{\"sql\":\"SELECT _id FROM docs WHERE _id = 'doc:a' FOR UPDATE;\"}",
     });
     defer locking_tail_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 400), locking_tail_resp.status);
-    try std.testing.expectEqualStrings("document_sql_locking_unsupported", locking_tail_resp.body);
+    try std.testing.expectEqual(@as(u16, 501), locking_tail_resp.status);
+    try std.testing.expectEqualStrings("unsupported sql statement", locking_tail_resp.body);
 
     var native_search_predicate_resp = try server.handle(.{
         .method = .POST,

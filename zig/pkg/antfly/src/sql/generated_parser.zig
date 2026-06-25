@@ -161,6 +161,7 @@ pub const GeneratedSqlUnsupportedKind = enum {
     reindex,
     release,
     revoke,
+    read_row_lock,
     savepoint,
     security_label,
     drop_materialized_view,
@@ -213,6 +214,7 @@ pub const GeneratedSqlUnsupportedReason = enum {
     reindex_not_planned_by_generated_parser,
     release_not_planned_by_generated_parser,
     revoke_not_planned_by_generated_parser,
+    read_row_lock_not_planned_by_generated_parser,
     savepoint_not_planned_by_generated_parser,
     security_label_not_planned_by_generated_parser,
     drop_materialized_view_not_planned_by_generated_parser,
@@ -1698,6 +1700,9 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "EXPLAIN ANALYZE INSERT INTO usage_records (id) VALUES ('u1')", .kind = .unsupported },
     .{ .sql = "EXPLAIN (FORMAT JSON, VERBOSE, COSTS OFF, ANALYZE ON, BUFFERS, TIMING OFF, SUMMARY OFF, SETTINGS ON, WAL) SELECT id FROM usage_records", .kind = .unsupported },
     .{ .sql = "EXPLAIN (FORMAT YAML) SELECT 1", .kind = .unsupported },
+    .{ .sql = "SELECT id FROM usage_records FOR UPDATE", .kind = .unsupported },
+    .{ .sql = "SELECT id FROM usage_records FOR SHARE NOWAIT", .kind = .unsupported },
+    .{ .sql = "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows FOR NO KEY UPDATE SKIP LOCKED", .kind = .unsupported },
     .{ .sql = "FETCH FROM usage_cursor", .kind = .unsupported },
     .{ .sql = "GRANT SELECT ON TABLE usage_records TO readonly", .kind = .unsupported },
     .{ .sql = "LISTEN usage_events", .kind = .unsupported },
@@ -1972,9 +1977,11 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.merge)) return .{ .dml = .merge };
     if (first.matchesKeywordTag(.with)) {
         if (generatedWriteKindForWithStatement(tokens)) |kind| return .{ .dml = kind };
+        if (generatedReadRowLockStart(tokens, 0, statementTokenEnd(tokens)) != null) return .{ .unsupported = .read_row_lock };
         return .{ .read = classifyReadKind(tokens) };
     }
     if (first.matchesKeywordTag(.select)) {
+        if (generatedReadRowLockStart(tokens, 0, statementTokenEnd(tokens)) != null) return .{ .unsupported = .read_row_lock };
         return .{ .read = classifyReadKind(tokens) };
     }
     if (first.matchesKeywordTag(.analyze)) return .{ .unsupported = .analyze };
@@ -2007,6 +2014,40 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
 
 fn classifyReadKind(tokens: []const token_mod.Token) GeneratedSqlReadKind {
     return classifyReadKindInRange(tokens, .{ .start = 0, .end = statementTokenEnd(tokens) });
+}
+
+fn generatedReadRowLockStart(tokens: []const token_mod.Token, start: usize, end: usize) ?usize {
+    var depth: usize = 0;
+    var index = start;
+    var candidate: ?usize = null;
+    while (index < end and index < tokens.len) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth > 0) depth -= 1;
+            },
+            else => {},
+        }
+        if (depth != 0 or !tokens[index].matchesKeywordTag(.@"for")) continue;
+        if (generatedReadHasCompleteSourceBefore(tokens, start, index)) candidate = index;
+    }
+    return candidate;
+}
+
+fn generatedReadHasCompleteSourceBefore(tokens: []const token_mod.Token, start: usize, end: usize) bool {
+    var depth: usize = 0;
+    var index = start;
+    while (index < end and index < tokens.len) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth > 0) depth -= 1;
+            },
+            else => {},
+        }
+        if (depth == 0 and tokens[index].matchesKeywordTag(.from) and index + 1 < end) return true;
+    }
+    return false;
 }
 
 fn generatedWriteKindForWithStatement(tokens: []const token_mod.Token) ?GeneratedSqlDmlKind {
@@ -2079,6 +2120,7 @@ fn buildUnsupportedAst(
             .reindex => .reindex_not_planned_by_generated_parser,
             .release => .release_not_planned_by_generated_parser,
             .revoke => .revoke_not_planned_by_generated_parser,
+            .read_row_lock => .read_row_lock_not_planned_by_generated_parser,
             .savepoint => .savepoint_not_planned_by_generated_parser,
             .security_label => .security_label_not_planned_by_generated_parser,
             .drop_materialized_view => .drop_materialized_view_not_planned_by_generated_parser,
@@ -5611,6 +5653,8 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .merge }, (try parseSqlAlloc(alloc, "WITH source_rows AS MATERIALIZED (SELECT id FROM usage_records) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN DELETE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .read = .query }, (try parseSqlAlloc(alloc, "SELECT id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .read = .cte }, (try parseSqlAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .read_row_lock }, (try parseSqlAlloc(alloc, "SELECT id FROM usage_records FOR UPDATE")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .read_row_lock }, (try parseSqlAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows FOR SHARE NOWAIT")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .create_index }, (try parseSqlAlloc(alloc, "CREATE GRAPH INDEX docs_edge_graph ON doc_edges")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .create_metric }, (try parseSqlAlloc(alloc, "CREATE GRAPH METRIC docs_pagerank ON doc_edges")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .alter_metric }, (try parseSqlAlloc(alloc, "ALTER GRAPH INDEX docs_edge_graph ADD METRIC pagerank_v1 USING pagerank")).statement);
@@ -8534,6 +8578,19 @@ test "generated SQL parser facade builds extended read AST spans" {
             try std.testing.expectEqualStrings("ANALYZE", spanText(analyze_sql, unsupported.statement_span));
             try std.testing.expectEqualStrings("ANALYZE", spanText(analyze_sql, unsupported.command_span));
             try std.testing.expect(unsupported.subject_tokens == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const row_lock_sql = "SELECT id FROM usage_records FOR UPDATE SKIP LOCKED";
+    const row_lock_result = try parseSqlAlloc(alloc, row_lock_sql);
+    switch (row_lock_result.ast.?) {
+        .unsupported => |unsupported| {
+            try std.testing.expectEqual(GeneratedSqlUnsupportedKind.read_row_lock, unsupported.kind);
+            try std.testing.expectEqual(GeneratedSqlUnsupportedReason.read_row_lock_not_planned_by_generated_parser, unsupported.reason);
+            try std.testing.expectEqualStrings(row_lock_sql, spanText(row_lock_sql, unsupported.statement_span));
+            try std.testing.expectEqualStrings("SELECT", spanText(row_lock_sql, unsupported.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 8 }, unsupported.subject_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

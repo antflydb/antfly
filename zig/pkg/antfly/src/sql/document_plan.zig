@@ -2905,7 +2905,7 @@ test "document SQL rejects unsupported tail keywords as source aliases" {
 
     var locking_tail = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE _id = 'doc:a' FOR UPDATE");
     defer locking_tail.deinit(alloc);
-    try std.testing.expectError(error.DocumentSqlLockingUnsupported, lowerDocumentReadPlanParsedSqlAlloc(alloc, &locking_tail, schema));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &locking_tail, schema));
 
     var window_tail = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WINDOW w AS () LIMIT 10");
     defer window_tail.deinit(alloc);

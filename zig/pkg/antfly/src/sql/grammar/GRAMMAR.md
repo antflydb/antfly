@@ -267,7 +267,11 @@ set-operation payloads are malformed.
 Recursive CTEs still dispatch through the recursive CTE family after validating
 their generated recursive flag.
 Unsupported read shapes
-still fall back, and deeper read cutover still requires full generated
+mostly still fall back, but complete top-level row-locking reads such as
+`SELECT ... FOR UPDATE`/`FOR SHARE` and CTE final reads with row-locking tails
+now parse through the generated read grammar and publish explicit
+`read_row_lock` unsupported AST diagnostics instead of masquerading as normal
+read statements. Deeper read cutover still requires full generated
 query-body AST payloads for expression-level projections and predicates,
 complete multi-join planning and richer join-tree semantics beyond the current
 validated left-associative generated join nodes, complete expression AST nodes,
@@ -758,7 +762,9 @@ Unsupported DDL remains on the existing parser until
    token range is present; optional child expression groups now reject orphan
    kind or child-expression payloads that lack a matching token range before
    lowering.
-   Incomplete generated read clause-boundary shapes for
+   Complete generated row-locking reads now become explicit
+   `read_row_lock` unsupported diagnostics with stable command/source spans,
+   while incomplete generated read clause-boundary shapes for
    `SELECT`/`WITH`, source clauses, predicates, grouping, having filters,
    incomplete boolean and comparison operator tails, ordering,
    `DISTINCT`/`DISTINCT ON`, set operations, unambiguous pagination result

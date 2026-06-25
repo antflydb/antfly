@@ -954,6 +954,7 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .drop_server,
         .load,
         .move,
+        .read_row_lock,
         .security_label,
         => false,
     };
@@ -1616,6 +1617,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "GRANT SELECT ON TABLE usage_records TO readonly",
             .kind = .grant,
             .reason = .grant_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "SELECT id FROM usage_records FOR UPDATE",
+            .kind = .read_row_lock,
+            .reason = .read_row_lock_not_planned_by_generated_parser,
         },
         .{
             .sql = "LISTEN usage_events",
