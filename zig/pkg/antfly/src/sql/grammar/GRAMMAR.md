@@ -1113,7 +1113,8 @@ Generated grammar work needs evidence at multiple levels:
   generated AST-to-plan parity through generated-first read lowering context
   dispatch, generated read AST kind now drives parsed-statement read-family
   classification for generated-covered reads with fail-closed classifier
-  disagreement checks, and generated-family validation wrappers over
+  disagreement checks plus generated pagination payload consistency checks
+  before a parsed read family is assigned, and generated-family validation wrappers over
   representative query, aggregate, join, lateral, and non-recursive CTE plans,
   AST-shape coverage for
   generated-ranged multi-CTE and recursive CTE

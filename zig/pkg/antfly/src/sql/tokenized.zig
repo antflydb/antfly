@@ -973,6 +973,7 @@ fn generatedReadStatementKind(
         .read => |read| read,
         else => return null,
     };
+    if (!generatedReadAstHasValidClassificationPayload(tokens, read_ast)) return null;
     return switch (read_ast.kind) {
         .query => .query,
         .aggregate => .aggregate,
@@ -982,6 +983,106 @@ fn generatedReadStatementKind(
         .set_operation => .set_operation,
         .cte => generatedCteReadStatementKind(tokens, read_ast),
     };
+}
+
+fn generatedReadAstHasValidClassificationPayload(
+    tokens: []const Token,
+    read_ast: generated_parser.GeneratedSqlReadAst,
+) bool {
+    if (!generatedReadPaginationPayloadIsValid(
+        tokens,
+        read_ast.limit_tokens,
+        read_ast.limit_expression,
+        read_ast.limit_all,
+        read_ast.offset_tokens,
+        read_ast.offset_expression,
+        read_ast.fetch_tokens,
+        read_ast.fetch_count_tokens,
+        read_ast.fetch_count_expression,
+    )) return false;
+
+    for (read_ast.cte_items) |cte| {
+        if (!generatedReadPaginationPayloadIsValid(
+            tokens,
+            cte.body_limit_tokens,
+            cte.body_limit_expression,
+            cte.body_limit_all,
+            cte.body_offset_tokens,
+            cte.body_offset_expression,
+            cte.body_fetch_tokens,
+            cte.body_fetch_count_tokens,
+            cte.body_fetch_count_expression,
+        )) return false;
+    }
+    return true;
+}
+
+fn generatedReadPaginationPayloadIsValid(
+    tokens: []const Token,
+    limit_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    limit_expression: generated_parser.GeneratedSqlExpressionAst,
+    limit_all: bool,
+    offset_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    offset_expression: generated_parser.GeneratedSqlExpressionAst,
+    fetch_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    fetch_count_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    fetch_count_expression: generated_parser.GeneratedSqlExpressionAst,
+) bool {
+    if (limit_tokens) |range| {
+        if (!generatedReadTokenRangeIsValid(tokens, range)) return false;
+        if (limit_all) {
+            if (limit_expression.tokens != null) return false;
+        } else if (!generatedReadExpressionTokensEqualRange(limit_expression, range)) {
+            return false;
+        }
+    } else if (limit_all or limit_expression.tokens != null) {
+        return false;
+    }
+
+    if (offset_tokens) |range| {
+        if (!generatedReadTokenRangeIsValid(tokens, range)) return false;
+        if (!generatedReadOffsetExpressionTokensMatchRange(tokens, offset_expression, range)) return false;
+    } else if (offset_expression.tokens != null) {
+        return false;
+    }
+
+    if (fetch_tokens) |range| {
+        if (!generatedReadTokenRangeIsValid(tokens, range)) return false;
+        if (fetch_count_tokens) |count_range| {
+            if (!generatedReadTokenRangeIsValid(tokens, count_range)) return false;
+            if (count_range.start < range.start or count_range.end > range.end) return false;
+            if (!generatedReadExpressionTokensEqualRange(fetch_count_expression, count_range)) return false;
+        } else if (fetch_count_expression.tokens != null) {
+            return false;
+        }
+    } else if (fetch_count_tokens != null or fetch_count_expression.tokens != null) {
+        return false;
+    }
+    return true;
+}
+
+fn generatedReadTokenRangeIsValid(tokens: []const Token, range: generated_parser.GeneratedSqlTokenRange) bool {
+    return range.start < range.end and range.end <= tokens.len;
+}
+
+fn generatedReadExpressionTokensEqualRange(
+    expression: generated_parser.GeneratedSqlExpressionAst,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    const expression_tokens = expression.tokens orelse return false;
+    return std.meta.eql(expression_tokens, range);
+}
+
+fn generatedReadOffsetExpressionTokensMatchRange(
+    tokens: []const Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    const expression_tokens = expression.tokens orelse return false;
+    if (expression_tokens.start != range.start) return false;
+    if (expression_tokens.end == range.end) return true;
+    if (expression_tokens.end + 1 != range.end or expression_tokens.end >= tokens.len) return false;
+    return tokens[expression_tokens.end].matchesKeywordTag(.row) or tokens[expression_tokens.end].matchesKeywordTag(.rows);
 }
 
 fn generatedCteReadStatementKind(
@@ -3512,6 +3613,23 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
     generated_query.statement = parseStatement(generated_query.raw_statement, generated_query.generated_statement, &generated_query.tokenized_sql);
     try std.testing.expect(generated_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_query.statement));
+
+    var generated_offset_query = try ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records OFFSET 2 ROWS");
+    defer generated_offset_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_offset_query.generatedStatementKind().?);
+
+    var malformed_offset_generated = generated_offset_query.generated_statement.?;
+    if (malformed_offset_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |*read_ast| read_ast.offset_expression.tokens = read_ast.offset_tokens.?,
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_offset_query.statement = parseStatement(generated_offset_query.raw_statement, malformed_offset_generated, &generated_offset_query.tokenized_sql);
+    try std.testing.expect(generated_offset_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_offset_query.statement));
 
     var generated_cte = try ParsedSql.initAlloc(alloc, "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows");
     defer generated_cte.deinit(alloc);
