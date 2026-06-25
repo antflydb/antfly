@@ -15725,7 +15725,7 @@ test "provisioned table write source backs up and restores full_text writes from
     try std.testing.expect(std.mem.indexOf(u8, restored.json, "\"alpha\"") != null);
 }
 
-test "provisioned read preparation invalidates readers without closing dirty writer cache" {
+test "provisioned query visibility read preparation invalidates readers without closing dirty writer cache" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-provisioned-write-cache-read-prep";
 
@@ -16382,7 +16382,7 @@ test "dirty auto bulk writer publishes runtime status before read invalidation c
     try std.testing.expect(statuses.items[0].stats.index_count > 0);
 }
 
-test "managed visibility publish hook updates runtime status cache from live writer" {
+test "provisioned query visibility managed publish hook updates runtime status cache from live writer" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -16426,7 +16426,7 @@ test "managed visibility publish hook updates runtime status cache from live wri
     try std.testing.expectEqual(@as(u64, 1), statuses.items[0].stats.indexes[0].doc_count);
 }
 
-test "provisioned read preparation does not block on same-table batch after early dirty publication" {
+test "provisioned query visibility read preparation does not block on same-table batch after early dirty publication" {
     const alloc = std.testing.allocator;
     const replica_root_dir = "/tmp/antfly-api-provisioned-read-prep-active-batch";
 
@@ -18750,7 +18750,7 @@ test "provisioned write cache invalidation closes failed managed enrichment db w
     try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
 }
 
-test "provisioned table write source invalidates cached query db after managed dense replay becomes visible" {
+test "provisioned query visibility table write source invalidates cached query db after managed dense replay becomes visible" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-provisioned-managed-dense-query-visibility";
 
@@ -20609,7 +20609,7 @@ test "provisioned table write source runtime status remains cache-only when dirt
     try std.testing.expectEqual(@as(u64, 9), statuses.items[0].stats.indexes[0].doc_count);
 }
 
-test "provisioned table write source runtime status does not inspect read cache hbc stats when dirty" {
+test "provisioned query visibility table write source runtime status does not inspect read cache hbc stats when dirty" {
     const alloc = std.testing.allocator;
 
     const NoCatalog = struct {
@@ -20718,7 +20718,7 @@ test "provisioned table write source runtime status does not inspect read cache 
     try std.testing.expectEqual(read_cache_stats_before.miss_count, read_cache_stats_after.miss_count);
 }
 
-test "provisioned table write source read cache overlay preserves live replay status" {
+test "provisioned query visibility table write source read cache overlay preserves live replay status" {
     const alloc = std.testing.allocator;
 
     const NoCatalog = struct {
@@ -22206,7 +22206,7 @@ test "provisioned table write source runtime status does not lease writer during
     try write_cache.finishAutoBulkIngestLocked(7001, "docs");
 }
 
-test "read preparation keeps write cache dirty while auto bulk ingest is active" {
+test "provisioned query visibility read preparation keeps write cache dirty while auto bulk ingest is active" {
     const alloc = std.testing.allocator;
 
     const Catalog = struct {
@@ -25735,7 +25735,7 @@ test "provisioned table write source restore table does not hold local db mutex 
     try std.testing.expect(std.mem.indexOf(u8, restored.json, "\"alpha\"") != null);
 }
 
-test "provisioned table write source deinit drains restore repair work group" {
+test "provisioned query visibility table write source deinit drains restore repair work group" {
     if (builtin.os.tag == .freestanding) return;
 
     const NoCatalog = struct {
@@ -25960,7 +25960,7 @@ test "managed startup catch-up defers while shared bulk ingest state is active" 
     try std.testing.expectEqual(startup_hits_before, startup_write_cache.hit_count.load(.monotonic));
 }
 
-test "managed startup catch-up ignores stale dirty bit after writer cache entry is gone" {
+test "provisioned query visibility managed startup catch-up ignores stale dirty bit after writer cache entry is gone" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});

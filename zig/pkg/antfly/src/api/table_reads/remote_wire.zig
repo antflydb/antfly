@@ -20,9 +20,17 @@ const doc_set = @import("../../storage/db/doc_set.zig");
 const graph_mod = @import("../../graph/graph.zig");
 const graph_paths = @import("../../graph/paths.zig");
 const graph_query_mod = @import("../../graph/query.zig");
+const document_sql_runtime = @import("../../sql/document_runtime.zig");
 const distributed_stats_mod = @import("../../search/distributed_stats.zig");
+const distributed_graph = @import("../distributed_graph.zig");
+const http_client = @import("../http_client.zig");
+const http_common = @import("../../raft/transport/http_common.zig");
 const query_api = @import("../query.zig");
 const query_contract = @import("../query_contract.zig");
+const table_read_core = @import("core.zig");
+
+const LookupResponse = table_read_core.LookupResponse;
+const ScanResponse = table_read_core.ScanResponse;
 
 pub fn searchRequestHasResolvedDocFilter(req: db_mod.types.SearchRequest) bool {
     if (comptime @hasField(db_mod.types.SearchRequest, "resolved_doc_filter")) {
@@ -40,6 +48,328 @@ pub fn parseRemoteSearchResultForHostedQuery(alloc: std.mem.Allocator, body: []c
         error.OutOfMemory => error.OutOfMemory,
         else => error.UnsupportedQueryRequest,
     };
+}
+
+pub fn lookupRemote(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    key: []const u8,
+    opts: db_mod.types.LookupOptions,
+) !?LookupResponse {
+    var client = http_client.ApiHttpClient.init(alloc, executor);
+    const fields = try encodeLookupFields(alloc, opts);
+    defer if (fields) |value| alloc.free(value);
+    var result = try client.fetchGroupLookup(base_uri, group_id, table_name, key, fields);
+    defer result.deinit(alloc);
+    return .{
+        .json = try alloc.dupe(u8, result.body),
+        .version = if (result.version) |version| try std.fmt.parseUnsigned(u64, version, 10) else 0,
+    };
+}
+
+pub fn scanRemote(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    from_key: []const u8,
+    to_key: []const u8,
+    opts: db_mod.types.ScanOptions,
+) !?ScanResponse {
+    var client = http_client.ApiHttpClient.init(alloc, executor);
+    const body = try encodeScanRequest(alloc, from_key, to_key, opts);
+    defer alloc.free(body);
+    var result = try client.fetchGroupScan(base_uri, group_id, table_name, body);
+    defer result.deinit(alloc);
+    return .{ .ndjson = try alloc.dupe(u8, result.body) };
+}
+
+pub fn preflightRemote(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    req: db_mod.types.SearchRequest,
+    max_work: u32,
+) !db_mod.RuntimePreflightSummary {
+    var client = http_client.ApiHttpClient.init(alloc, executor);
+    if (searchRequestHasUnserializableResolvedDocFilter(req)) return error.UnsupportedQueryRequest;
+    const body = try encodeQueryRequest(alloc, req);
+    defer alloc.free(body);
+    var summary = try client.fetchGroupQueryPreflight(base_uri, group_id, table_name, body, max_work);
+    summary.remote_shard_count = summary.shard_count;
+    return summary;
+}
+
+pub fn textStatsRemote(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    body: []const u8,
+) !?query_api.QueryResponse {
+    var client = http_client.ApiHttpClient.init(alloc, executor);
+    var result = try client.fetchGroupTextStats(base_uri, group_id, table_name, body);
+    defer result.deinit(alloc);
+    return .{ .json = try alloc.dupe(u8, result.body) };
+}
+
+pub fn algebraicPartialsRemote(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    body: []const u8,
+) !?query_api.QueryResponse {
+    var client = http_client.ApiHttpClient.init(alloc, executor);
+    var result = try client.fetchGroupAlgebraicPartials(base_uri, group_id, table_name, body);
+    defer result.deinit(alloc);
+    return .{ .json = try alloc.dupe(u8, result.body) };
+}
+
+const DocumentAlgebraicAggregateResponseWire = struct {
+    const Row = struct {
+        group_json: ?[]const u8 = null,
+        value_json: []const u8,
+        raw_value: ?[]const u8 = null,
+    };
+
+    rows: []const Row,
+    total_groups: u32,
+};
+
+pub fn parseDocumentAlgebraicAggregateResponseAlloc(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+) !document_sql_runtime.AlgebraicAggregateResponse {
+    var parsed = try std.json.parseFromSlice(DocumentAlgebraicAggregateResponseWire, alloc, body, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const rows = try alloc.alloc(document_sql_runtime.AlgebraicAggregateRow, parsed.value.rows.len);
+    errdefer alloc.free(rows);
+    var initialized: usize = 0;
+    errdefer {
+        for (rows[0..initialized]) |*row| row.deinit(alloc);
+    }
+    for (parsed.value.rows, rows) |row, *out| {
+        out.* = .{
+            .group_json = if (row.group_json) |value| try alloc.dupe(u8, value) else null,
+            .value_json = try alloc.dupe(u8, row.value_json),
+            .raw_value = if (row.raw_value) |value| try alloc.dupe(u8, value) else null,
+        };
+        initialized += 1;
+    }
+    return .{
+        .rows = rows,
+        .total_groups = parsed.value.total_groups,
+    };
+}
+
+pub fn documentAlgebraicAggregateRemote(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    req: document_sql_runtime.AlgebraicAggregateRequest,
+) !document_sql_runtime.AlgebraicAggregateResponse {
+    const body = try std.json.Stringify.valueAlloc(alloc, req, .{});
+    defer alloc.free(body);
+    var client = http_client.ApiHttpClient.init(alloc, executor);
+    var result = try client.fetchGroupDocumentAlgebraicAggregate(base_uri, group_id, table_name, body);
+    defer result.deinit(alloc);
+    return try parseDocumentAlgebraicAggregateResponseAlloc(alloc, result.body);
+}
+
+test "remote document algebraic aggregate preserves typed unavailable and not found errors" {
+    const alloc = std.testing.allocator;
+    const FakeExecutor = struct {
+        status: u16,
+        body: []const u8,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute = execute,
+                },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, response_alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = self.status,
+                .body = try response_alloc.dupe(u8, self.body),
+            };
+        }
+    };
+
+    const req = document_sql_runtime.AlgebraicAggregateRequest{
+        .index_name = "amount_alg",
+        .materialization_name = "avg_by_status",
+        .aggregate_op = .avg,
+        .group_by = null,
+        .limit = null,
+    };
+
+    var unavailable = FakeExecutor{ .status = 424, .body = "DocumentSqlIndexUnavailable" };
+    try std.testing.expectError(error.DocumentSqlIndexUnavailable, documentAlgebraicAggregateRemote(
+        unavailable.executor(),
+        alloc,
+        "http://127.0.0.1:1",
+        7,
+        "docs",
+        req,
+    ));
+
+    var table_missing = FakeExecutor{ .status = 404, .body = "TableNotFound" };
+    try std.testing.expectError(error.TableNotFound, documentAlgebraicAggregateRemote(
+        table_missing.executor(),
+        alloc,
+        "http://127.0.0.1:1",
+        7,
+        "docs",
+        req,
+    ));
+
+    var group_missing = FakeExecutor{ .status = 404, .body = "UnknownGroup" };
+    try std.testing.expectError(error.UnknownGroup, documentAlgebraicAggregateRemote(
+        group_missing.executor(),
+        alloc,
+        "http://127.0.0.1:1",
+        7,
+        "docs",
+        req,
+    ));
+}
+
+pub fn joinPartitionRemote(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    body: []const u8,
+) !?query_api.QueryResponse {
+    var client = http_client.ApiHttpClient.init(alloc, executor);
+    var result = try client.fetchGroupJoinPartition(base_uri, group_id, table_name, body);
+    defer result.deinit(alloc);
+    return .{ .json = try alloc.dupe(u8, result.body) };
+}
+
+pub fn joinRowsRemote(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    body: []const u8,
+) !?query_api.QueryResponse {
+    var client = http_client.ApiHttpClient.init(alloc, executor);
+    var result = try client.fetchGroupJoinRows(base_uri, group_id, table_name, body);
+    defer result.deinit(alloc);
+    return .{ .json = try alloc.dupe(u8, result.body) };
+}
+
+pub fn joinUnmatchedRemote(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    body: []const u8,
+) !?query_api.QueryResponse {
+    var client = http_client.ApiHttpClient.init(alloc, executor);
+    var result = try client.fetchGroupJoinUnmatched(base_uri, group_id, table_name, body);
+    defer result.deinit(alloc);
+    return .{ .json = try alloc.dupe(u8, result.body) };
+}
+
+pub fn joinFinalizeRemote(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    body: []const u8,
+) !?query_api.QueryResponse {
+    var client = http_client.ApiHttpClient.init(alloc, executor);
+    var result = try client.fetchGroupJoinFinalize(base_uri, group_id, table_name, body);
+    defer result.deinit(alloc);
+    return .{ .json = try alloc.dupe(u8, result.body) };
+}
+
+pub fn joinJobStateRemote(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    body: []const u8,
+) !?query_api.QueryResponse {
+    var client = http_client.ApiHttpClient.init(alloc, executor);
+    var result = try client.fetchGroupJoinJobState(base_uri, group_id, table_name, body);
+    defer result.deinit(alloc);
+    return .{ .json = try alloc.dupe(u8, result.body) };
+}
+
+pub fn graphExpandRemote(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    req: distributed_graph.GraphExpandRequest,
+) !distributed_graph.GraphExpandResponse {
+    var client = http_client.ApiHttpClient.init(alloc, executor);
+    const body = try distributed_graph.encodeGraphExpandRequest(alloc, req);
+    defer alloc.free(body);
+    var result = try client.fetchGroupGraphExpand(base_uri, group_id, table_name, body);
+    defer result.deinit(alloc);
+    return try distributed_graph.parseGraphExpandResponse(alloc, result.body);
+}
+
+pub fn graphHydrateRemote(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    req: distributed_graph.GraphHydrateRequest,
+) !distributed_graph.GraphHydrateResponse {
+    var client = http_client.ApiHttpClient.init(alloc, executor);
+    const body = try distributed_graph.encodeGraphHydrateRequest(alloc, req);
+    defer alloc.free(body);
+    var result = try client.fetchGroupGraphHydrate(base_uri, group_id, table_name, body);
+    defer result.deinit(alloc);
+    return try distributed_graph.parseGraphHydrateResponse(alloc, result.body);
+}
+
+pub fn graphEdgesRemote(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    req: distributed_graph.GraphEdgesRequest,
+) !distributed_graph.GraphEdgesResponse {
+    var client = http_client.ApiHttpClient.init(alloc, executor);
+    const body = try distributed_graph.encodeGraphEdgesRequest(alloc, req);
+    defer alloc.free(body);
+    var result = try client.fetchGroupGraphEdges(base_uri, group_id, table_name, body);
+    defer result.deinit(alloc);
+    return try distributed_graph.parseGraphEdgesResponse(alloc, result.body);
 }
 
 pub fn encodeLookupFields(alloc: std.mem.Allocator, opts: db_mod.types.LookupOptions) !?[]u8 {

@@ -3662,16 +3662,6 @@ pub fn build(b: *std.Build) void {
     const lib_db_result_shape_step = b.step("lib-db-result-shape-test", "Run focused DB query doc id boundary tests");
     lib_db_result_shape_step.dependOn(&run_lib_db_result_shape_tests.step);
 
-    const lib_db_reopen_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = &.{
-            "storage.db.search_runtime.test.db search runtime reopen ",
-        },
-    });
-    const run_lib_db_reopen_tests = b.addRunArtifact(lib_db_reopen_tests);
-    const lib_db_reopen_step = b.step("lib-db-reopen-test", "Run root-module DB reopen/compaction tests");
-    lib_db_reopen_step.dependOn(&run_lib_db_reopen_tests.step);
-
     const lib_db_txn_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
@@ -5993,6 +5983,16 @@ pub fn build(b: *std.Build) void {
     const db_search_runtime_test_step = b.step("db-search-runtime-test", "Run focused storage/db search runtime tests");
     db_search_runtime_test_step.dependOn(&run_db_search_runtime_tests.step);
 
+    const lib_db_reopen_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{
+            "storage.db.search_runtime.test.db search runtime reopen ",
+        },
+    });
+    const run_lib_db_reopen_tests = b.addRunArtifact(lib_db_reopen_tests);
+    const lib_db_reopen_step = b.step("lib-db-reopen-test", "Run root-module DB reopen/compaction tests");
+    lib_db_reopen_step.dependOn(&run_lib_db_reopen_tests.step);
+
     const db_ttl_runtime_default_filters = [_][]const u8{
         "storage.db.maintenance.ttl_runtime.test.",
     };
@@ -6014,24 +6014,15 @@ pub fn build(b: *std.Build) void {
 
     const provisioned_query_visibility_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{
-            "provisioned table write source invalidates cached query db after managed dense replay becomes visible",
-            "managed visibility publish hook updates runtime status cache from live writer",
-            "provisioned read preparation invalidates readers without closing dirty writer cache",
-            "provisioned read preparation does not block on same-table batch after early dirty publication",
-            "provisioned table write source runtime status does not inspect read cache hbc stats when dirty",
-            "provisioned table write source read cache overlay preserves live replay status",
-            "read preparation keeps write cache dirty while auto bulk ingest is active",
-            "dirty runtime status refresh finishes expired auto bulk before collecting leases",
-            "managed startup catch-up ignores stale dirty bit after writer cache entry is gone",
-            "provisioned table write source deinit drains restore repair jobs",
-        },
+        .filters = selectTestFilters(b, &.{"provisioned query visibility "}),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
     const run_provisioned_query_visibility_tests = b.addRunArtifact(provisioned_query_visibility_tests);
+    const provisioned_query_visibility_step = b.step("provisioned-query-visibility-test", "Run focused provisioned query visibility tests");
+    provisioned_query_visibility_step.dependOn(&run_provisioned_query_visibility_tests.step);
     unit_test_step.dependOn(&run_provisioned_query_visibility_tests.step);
 
     const sparse_test_mod = makeLmdbModule(b, "pkg/antfly/src/sparse_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);

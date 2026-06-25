@@ -298,6 +298,56 @@ fn generatedProjectionClauseEnd(
     return error.UnsupportedSqlShape;
 }
 
+const GeneratedDistinctClause = struct {
+    end: usize,
+    kind: enum { plain, distinct_on },
+};
+
+fn validateGeneratedDistinctClause(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    list: generated_parser.GeneratedSqlListAst,
+) !GeneratedDistinctClause {
+    if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    if (!tokens[range.start].matchesKeywordTag(.distinct)) return error.UnsupportedSqlShape;
+    if (range.end == range.start + 1) {
+        if (list.count != 0 or list.items.len != 0) return error.UnsupportedSqlShape;
+        return .{ .end = range.end, .kind = .plain };
+    }
+    if (range.start + 4 > range.end or
+        !tokens[range.start + 1].matchesKeywordTag(.on) or
+        tokens[range.start + 2].kind != .lparen or
+        tokens[range.end - 1].kind != .rparen)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    try validateGeneratedExpressionListForClause(tokens, .{ .start = range.start + 3, .end = range.end - 1 }, list);
+    return .{ .end = range.end, .kind = .distinct_on };
+}
+
+fn generatedDistinctClauseEnd(
+    tokens: []const Token,
+    pos: usize,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !?GeneratedDistinctClause {
+    const read = generated_read_ast orelse return null;
+    if (read.distinct_tokens) |range| {
+        if (range.start == pos) {
+            return try validateGeneratedDistinctClause(tokens, range, read.distinct_on_items);
+        }
+        if (read.kind != .set_operation) return error.UnsupportedSqlShape;
+    }
+    if (read.kind == .set_operation) {
+        if (read.set_operation.right_distinct_tokens) |right_range| {
+            if (right_range.start == pos) {
+                return try validateGeneratedDistinctClause(tokens, right_range, read.set_operation.right_distinct_on_items);
+            }
+        }
+    }
+    if (pos < tokens.len and tokens[pos].matchesKeywordTag(.distinct)) return error.UnsupportedSqlShape;
+    return null;
+}
+
 fn generatedSourceClauseEnd(
     tokens: []const Token,
     pos: usize,
@@ -15911,6 +15961,7 @@ pub fn parseSelectAlloc(
         options.context_hooks.set_context(options.context_hooks.ptr, current_context);
     }
 
+    const generated_distinct = try generatedDistinctClauseEnd(tokens, pos.*, options.generated_read_ast);
     const distinct_on = try parseOptionalDistinctOnAlloc(
         alloc,
         tokens,
@@ -15921,6 +15972,11 @@ pub fn parseSelectAlloc(
         options.variadic_hooks,
     );
     errdefer freeExpressionSlice(alloc, distinct_on);
+    if (generated_distinct) |distinct| {
+        if (distinct.kind != .distinct_on or pos.* != distinct.end) return error.UnsupportedSqlShape;
+    } else if (distinct_on.len > 0 and options.generated_read_ast != null) {
+        return error.UnsupportedSqlShape;
+    }
 
     const generated_projection_end = try generatedProjectionClauseEnd(tokens, pos.*, options.generated_read_ast);
     const select = try parseSelectListAlloc(
@@ -16265,8 +16321,14 @@ pub fn parseAggregateAlloc(
         options.context_hooks.set_context(options.context_hooks.ptr, current_context);
     }
 
+    const generated_distinct = try generatedDistinctClauseEnd(tokens, pos.*, options.generated_read_ast);
     const select_distinct = parser.matchKeyword(tokens, pos, "distinct");
     if (select_distinct and parser.peekKeyword(tokens, pos.*, "on")) return error.UnsupportedSqlShape;
+    if (generated_distinct) |distinct| {
+        if (distinct.kind != .plain or pos.* != distinct.end) return error.UnsupportedSqlShape;
+    } else if (select_distinct and options.generated_read_ast != null) {
+        return error.UnsupportedSqlShape;
+    }
 
     const select_context = options.context_hooks.get_context(options.context_hooks.ptr);
     const generated_projection_end = try generatedProjectionClauseEnd(tokens, pos.*, options.generated_read_ast);
@@ -28392,6 +28454,19 @@ test "sql adapter lower expr lowers select distinct to group-only aggregate" {
     try std.testing.expectEqual(@as(u32, 5), lowered.aggregate.limit.?);
     try std.testing.expectEqual(@as(u32, 2), lowered.aggregate.offset);
 
+    var malformed_distinct = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT DISTINCT customer, status FROM usage_records WHERE status = $1 ORDER BY customer ASC NULLS LAST, status DESC NULLS FIRST LIMIT 5 OFFSET 2",
+    );
+    defer malformed_distinct.deinit(alloc);
+    try corruptGeneratedReadDistinctRangeToProjection(&malformed_distinct);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
+        alloc,
+        &malformed_distinct,
+        schema,
+        &.{.{ .string = "open" }},
+    ));
+
     var expression_distinct = try lowerAggregateForLowerExprTestAlloc(
         alloc,
         "SELECT DISTINCT lower(status) AS status_key FROM usage_records WHERE status = $1 ORDER BY status_key ASC LIMIT 4",
@@ -28485,6 +28560,34 @@ test "sql adapter lower expr lowers select distinct to group-only aggregate" {
     try std.testing.expectEqual(@as(usize, 2), distinct_on.plan.query.select.len);
     try std.testing.expectEqual(@as(usize, 2), distinct_on.plan.query.order_by.len);
     try std.testing.expectEqual(@as(u32, 3), distinct_on.plan.query.limit.?);
+
+    var malformed_distinct_on_range = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT DISTINCT ON (customer) customer, id FROM usage_records WHERE status = 'open' ORDER BY customer ASC, created_at DESC LIMIT 3",
+    );
+    defer malformed_distinct_on_range.deinit(alloc);
+    try corruptGeneratedReadDistinctRangeToProjection(&malformed_distinct_on_range);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_distinct_on_range,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_distinct_on_item = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT DISTINCT ON (customer) customer, id FROM usage_records WHERE status = 'open' ORDER BY customer ASC, created_at DESC LIMIT 3",
+    );
+    defer malformed_distinct_on_item.deinit(alloc);
+    try corruptGeneratedReadFirstDistinctOnExpressionItem(&malformed_distinct_on_item);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_distinct_on_item,
+        schema,
+        &.{},
+        .{},
+    ));
 
     try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
         alloc,
@@ -29326,6 +29429,37 @@ fn corruptGeneratedReadSourceRange(parsed_sql: *tokenized.ParsedSql) !void {
                 .read => |*read| {
                     if (read.source_tokens == null or read.projection_items.items.len == 0) return error.TestUnexpectedResult;
                     read.source_tokens = read.projection_items.items[0];
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadDistinctRangeToProjection(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |*read| {
+                    read.distinct_tokens = read.projection_tokens orelse return error.TestUnexpectedResult;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadFirstDistinctOnExpressionItem(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |*read| {
+                    if (read.distinct_on_items.items.len == 0 or read.distinct_on_items.expression_items.len == 0 or read.projection_items.items.len == 0) return error.TestUnexpectedResult;
+                    read.distinct_on_items.expression_items[0] = read.projection_items.items[0];
                     return;
                 },
                 else => return error.TestUnexpectedResult,

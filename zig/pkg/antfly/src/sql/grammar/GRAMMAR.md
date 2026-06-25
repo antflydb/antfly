@@ -610,6 +610,9 @@ Unsupported DDL remains on the existing parser until
    item/expression/alias spans before typed select-list planning, and typed
    projection planning must consume the same generated projection span for
    generated simple, aggregate, window, join, and lateral reads. Generated
+   `DISTINCT` clauses now fail closed when plain `DISTINCT` spans or
+   `DISTINCT ON` item/expression spans disagree with typed query or aggregate
+   distinct parsing. Generated
    source clauses now require typed source planning for generated simple,
    aggregate, window, and set-operation right-hand reads to consume the same
    retained generated source span before later clauses are planned. Generated
