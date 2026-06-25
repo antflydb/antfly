@@ -609,9 +609,10 @@ Unsupported DDL remains on the existing parser until
    order planning. Generated aggregate `GROUP BY` clauses now similarly
    validate generated item/expression list spans before typed grouping
    planning, and typed grouping must consume the same generated group-list
-   span. Generated aggregate `HAVING` clauses now validate the retained
-   generated predicate span and require typed having planning to consume the
-   same clause body.
+   span. Generated read `WHERE` clauses on generated simple, aggregate,
+   window, join, and lateral read lowerers now validate the retained generated
+   predicate span and require typed predicate planning to consume the same
+   clause body; aggregate `HAVING` clauses apply the same guard.
    Generated read validation
    rejects pagination payloads that are missing required expressions, attach
    expressions to `LIMIT ALL`, place expression spans outside their owning
