@@ -3158,7 +3158,17 @@ pub fn ddlPlanFromGeneratedAstAlloc(
     const tail = generatedStatementTail(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     var pos: usize = 0;
     return switch (ast.kind) {
-        .create_table => .{ .create_table = try parseCreateTablePlanAlloc(alloc, tail, &pos, options.column_definition_options) },
+        .create_table => blk: {
+            if (generatedCreateTableMayUseIdentityAllocator(tokens, ast)) {
+                if (identityAllocatorPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options.column_definition_options)) |identity| {
+                    break :blk .{ .identity_allocator_catalog = identity };
+                } else |err| switch (err) {
+                    error.UnsupportedSqlShape => pos = 0,
+                    else => return err,
+                }
+            }
+            break :blk .{ .create_table = try parseCreateTablePlanAlloc(alloc, tail, &pos, options.column_definition_options) };
+        },
         .create_index => .{ .create_index = try createIndexPlanFromGeneratedAstAlloc(alloc, tokens, ast, options.create_index_options) },
         .alter_table => .{ .alter_table = try alterTablePlanFromGeneratedAstAlloc(alloc, tokens, ast, options.column_definition_options) },
         .drop_table => .{ .drop_table = try dropTablePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) },
@@ -3186,14 +3196,13 @@ fn generatedDdlUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated
 }
 
 fn generatedCreateTableUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) bool {
+    return generatedStatementEnd(tokens, ast.statement_span) != null;
+}
+
+fn generatedCreateTableMayUseIdentityAllocator(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) bool {
     const end = generatedStatementEnd(tokens, ast.statement_span) orelse return false;
-    if (generatedRangeContainsText(tokens, .{ .start = 0, .end = end }, "smallserial") or
-        generatedRangeContainsText(tokens, .{ .start = 0, .end = end }, "serial") or
-        generatedRangeContainsText(tokens, .{ .start = 0, .end = end }, "bigserial"))
-    {
-        return false;
-    }
-    return true;
+    return generatedRangeContainsText(tokens, .{ .start = 0, .end = end }, "serial") or
+        generatedRangeContainsText(tokens, .{ .start = 0, .end = end }, "bigserial");
 }
 
 fn generatedCreateIndexUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) bool {
@@ -3527,6 +3536,28 @@ fn dropIndexPlanFromGeneratedDdlAstAlloc(
     };
     errdefer syntax.deinit(alloc);
     return dropIndexPlanFromSyntax(&syntax);
+}
+
+fn identityAllocatorPlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+    options: DdlColumnDefinitionOptions,
+) !IdentityAllocatorPlan {
+    const end = try requireGeneratedDdlHeader(tokens, ast.statement_span, .create, .table);
+    if (ast.if_not_exists) return error.UnsupportedSqlShape;
+
+    var pos: usize = 1;
+    var plan = try parseIdentityAllocatorPlanAlloc(alloc, tokens, &pos, options);
+    errdefer plan.deinit(alloc);
+    if (!generatedStatementConsumedThrough(tokens, end, pos)) return error.UnsupportedSqlShape;
+    if (ast.object_name_tokens) |object_name_tokens| {
+        const name_range = try requireGeneratedTokenRangeAt(object_name_tokens, 2, end);
+        const generated_table_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, name_range);
+        defer alloc.free(@constCast(generated_table_name));
+        if (!std.ascii.eqlIgnoreCase(generated_table_name, plan.table_name)) return error.UnsupportedSqlShape;
+    }
+    return plan;
 }
 
 fn createIndexPlanFromGeneratedAstAlloc(
@@ -12808,6 +12839,35 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
             try std.testing.expectEqualStrings("generated_usage_records", plan.table_name);
             try std.testing.expectEqual(@as(usize, 2), plan.columns.len);
             try std.testing.expect(plan.primary_key != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var runtime_serial_table = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_serial_records (id bigserial PRIMARY KEY, status text);");
+    defer runtime_serial_table.deinit(alloc);
+    var runtime_serial_table_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_serial_table);
+    defer runtime_serial_table_plan.deinit(alloc);
+    switch (runtime_serial_table_plan) {
+        .identity_allocator_catalog => |plan| {
+            try std.testing.expectEqualStrings("generated_serial_records", plan.table_name);
+            try std.testing.expectEqualStrings("id", plan.column.name);
+            try std.testing.expectEqual(IdentityAllocatorKind.bigserial, plan.kind);
+            try std.testing.expect(plan.primary_key);
+            try std.testing.expectEqual(@as(usize, 1), plan.additional_columns.len);
+            try std.testing.expectEqualStrings("status", plan.additional_columns[0].name);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var runtime_serial_named_column = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE generated_serial_named_column (\"serial\" text, status text);");
+    defer runtime_serial_named_column.deinit(alloc);
+    var runtime_serial_named_column_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_serial_named_column);
+    defer runtime_serial_named_column_plan.deinit(alloc);
+    switch (runtime_serial_named_column_plan) {
+        .create_table => |plan| {
+            try std.testing.expectEqualStrings("generated_serial_named_column", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 2), plan.columns.len);
+            try std.testing.expectEqualStrings("serial", plan.columns[0].name);
         },
         else => return error.TestUnexpectedResult,
     }
