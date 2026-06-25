@@ -324,6 +324,7 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
     if (tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .to) or tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .as)) return false;
     if (isGeneratedGraphDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedCatalogDdlHead(tokens, raw_statement)) return false;
+    if (isGeneratedRelationPopulationHead(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedDdlBoundary(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedDmlBoundary(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedReadBoundary(tokens, raw_statement)) return false;
@@ -363,6 +364,46 @@ fn isGeneratedCatalogDdlHead(tokens: []const Token, raw_statement: RawSqlStateme
     return tokenMatchesKeyword(tokens[start + 1], .database) or
         tokenMatchesKeyword(tokens[start + 1], .schema) or
         tokenMatchesKeyword(tokens[start + 1], .extension);
+}
+
+fn isGeneratedRelationPopulationHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
+    const start = raw_statement.token_start;
+    const end = raw_statement.token_end;
+    if (start >= end or end > tokens.len) return false;
+    if (tokenMatchesKeyword(tokens[start], .select)) {
+        return findTopLevelKeyword(tokens, start + 1, end, .into) != null;
+    }
+    if (!tokenMatchesKeyword(tokens[start], .create)) return false;
+    var index = start + 1;
+    consumeRelationLifetime(tokens, &index, end);
+    if (index >= end or !tokenMatchesKeyword(tokens[index], .table)) return false;
+    return findTopLevelKeyword(tokens, index + 1, end, .as) != null;
+}
+
+fn consumeRelationLifetime(tokens: []const Token, index: *usize, end: usize) void {
+    if (index.* >= end) return;
+    if (tokenMatchesKeyword(tokens[index.*], .temp) or
+        tokenMatchesKeyword(tokens[index.*], .temporary) or
+        tokenMatchesKeyword(tokens[index.*], .unlogged))
+    {
+        index.* += 1;
+    }
+}
+
+fn findTopLevelKeyword(tokens: []const Token, start: usize, end: usize, keyword: token_mod.TokenKeyword) ?usize {
+    var depth: usize = 0;
+    var index = start;
+    while (index < end and index < tokens.len) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth > 0) depth -= 1;
+            },
+            else => {},
+        }
+        if (depth == 0 and tokenMatchesKeyword(tokens[index], keyword)) return index;
+    }
+    return null;
 }
 
 fn isIncompleteGeneratedDdlBoundary(tokens: []const Token, raw_statement: RawSqlStatement) bool {
@@ -1308,6 +1349,27 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
         .extension_index => |ddl_ast| try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_database, ddl_ast.kind),
         else => return error.TestUnexpectedResult,
     }
+
+    var generated_select_into = try ParsedSql.initAlloc(alloc, "SELECT account_id, total INTO usage_archive FROM usage_records WHERE total > 10");
+    defer generated_select_into.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, generated_select_into.generatedStatementKind().?);
+    switch (generated_select_into.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.relation_population, ddl_ast.kind),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .ddl), std.meta.activeTag(generated_select_into.statement));
+
+    var generated_create_table_as = try ParsedSql.initAlloc(alloc, "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT account_id FROM usage_records WITH NO DATA");
+    defer generated_create_table_as.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, generated_create_table_as.generatedStatementKind().?);
+    switch (generated_create_table_as.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.relation_population, ddl_ast.kind);
+            try std.testing.expect(ddl_ast.if_not_exists);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .ddl), std.meta.activeTag(generated_create_table_as.statement));
 }
 
 test "sql adapter parsed sql builds non-contiguous child statements from parent tokens" {

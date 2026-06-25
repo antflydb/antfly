@@ -3291,7 +3291,10 @@ fn generatedDdlUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated
         .create_table => generatedCreateTableUsesRuntimeBoundary(tokens, ast),
         .create_index => generatedCreateIndexUsesRuntimeBoundary(tokens, ast),
         .alter_table => generatedAlterTableUsesRowSecurityRuntimeBoundary(tokens, ast) or generatedAlterTableUsesRuntimeBoundary(tokens, ast),
-        .create_graph_index, .create_graph_metric => false,
+        .relation_population,
+        .create_graph_index,
+        .create_graph_metric,
+        => false,
     };
 }
 
@@ -3916,6 +3919,10 @@ fn validateGeneratedDdlAstSpans(
     if (tokens[0].source_start != ast.command_span.start or tokens[0].source_end != ast.command_span.end) {
         return error.UnsupportedSqlShape;
     }
+    if (ast.kind == .relation_population) {
+        if (!tokens[0].matchesKeywordTag(.select) and !tokens[0].matchesKeywordTag(.create)) return error.UnsupportedSqlShape;
+        return;
+    }
     const expected: token_mod.TokenKeyword = switch (ast.kind) {
         .create_database,
         .create_schema,
@@ -3925,6 +3932,7 @@ fn validateGeneratedDdlAstSpans(
         .create_graph_index,
         .create_graph_metric,
         => .create,
+        .relation_population => unreachable,
         .alter_table => .alter,
         .drop_table,
         .drop_index,

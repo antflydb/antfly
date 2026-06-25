@@ -69,6 +69,10 @@ forms using the same parser options as the existing lowerer. Generated
 `UNIQUE`, method, element-list, covering-index `INCLUDE (...)`, options, and
 partial-index `WHERE ...` token ranges and generated-first create-index
 planning validates those ranges before lowering through the typed DDL planner.
+PostgreSQL-style relation population heads, including `SELECT ... INTO` and
+`CREATE [TEMP|TEMPORARY|UNLOGGED] TABLE ... AS SELECT ... [WITH [NO] DATA]`,
+now parse and classify through the generated DDL family with retained target
+name spans before delegating to the existing relation-population planner.
 Incomplete covered DDL clause-boundary shapes for `CREATE TABLE`,
 `CREATE INDEX`, `ALTER TABLE`, and `DROP TABLE` now fail closed through the
 generated parser instead of falling back to the legacy DDL classifier, while
