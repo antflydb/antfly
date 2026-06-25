@@ -3061,6 +3061,97 @@ test "sql adapter parsed sql owns typed statement variants" {
     }
 }
 
+test "sql adapter parsed sql retains generated type system DDL nodes" {
+    const alloc = std.testing.allocator;
+
+    const Case = struct {
+        sql: []const u8,
+        kind: generated_parser.GeneratedSqlDdlKind,
+        object_name_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+        tail_start: ?usize = null,
+        if_exists: bool = false,
+    };
+
+    const cases = [_]Case{
+        .{
+            .sql = "CREATE COLLATION case_insensitive (provider = icu, locale = 'und-u-ks-level2')",
+            .kind = .create_collation,
+            .object_name_tokens = .{ .start = 2, .end = 3 },
+            .tail_start = 3,
+        },
+        .{
+            .sql = "ALTER COLLATION case_insensitive RENAME TO ci_text",
+            .kind = .alter_collation,
+            .object_name_tokens = .{ .start = 2, .end = 3 },
+            .tail_start = 3,
+        },
+        .{
+            .sql = "DROP COLLATION IF EXISTS ci_text",
+            .kind = .drop_collation,
+            .object_name_tokens = .{ .start = 4, .end = 5 },
+            .if_exists = true,
+        },
+        .{
+            .sql = "CREATE OPERATOR === (FUNCTION = text_eq, LEFTARG = text, RIGHTARG = text)",
+            .kind = .create_operator,
+            .tail_start = 2,
+        },
+        .{
+            .sql = "DROP OPERATOR === (text, text)",
+            .kind = .drop_operator,
+            .tail_start = 2,
+        },
+        .{
+            .sql = "CREATE AGGREGATE first_value_text(text) (SFUNC = first_sfunc, STYPE = text)",
+            .kind = .create_aggregate,
+            .object_name_tokens = .{ .start = 2, .end = 3 },
+            .tail_start = 3,
+        },
+        .{
+            .sql = "DROP AGGREGATE first_value_text(text)",
+            .kind = .drop_aggregate,
+            .object_name_tokens = .{ .start = 2, .end = 3 },
+            .tail_start = 3,
+        },
+        .{
+            .sql = "CREATE CAST (jsonb AS text) WITH FUNCTION jsonb_to_text(jsonb) AS ASSIGNMENT",
+            .kind = .create_cast,
+            .tail_start = 2,
+        },
+        .{
+            .sql = "DROP CAST (jsonb AS text)",
+            .kind = .drop_cast,
+            .tail_start = 2,
+        },
+    };
+
+    for (cases) |case| {
+        var parsed = try ParsedSql.initAlloc(alloc, case.sql);
+        defer parsed.deinit(alloc);
+        try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, parsed.generatedStatementKind().?);
+        switch (parsed.generated_statement.?.ast.?) {
+            .ddl => |ddl_ast| {
+                try std.testing.expectEqual(case.kind, ddl_ast.kind);
+                try std.testing.expectEqual(case.object_name_tokens, ddl_ast.object_name_tokens);
+                try std.testing.expectEqual(case.if_exists, ddl_ast.if_exists);
+                if (case.tail_start) |tail_start| {
+                    try std.testing.expectEqual(
+                        generated_parser.GeneratedSqlTokenRange{ .start = tail_start, .end = parsed.items().len },
+                        ddl_ast.alter_table_operation_tokens.?,
+                    );
+                } else {
+                    try std.testing.expect(ddl_ast.alter_table_operation_tokens == null);
+                }
+            },
+            else => return error.TestUnexpectedResult,
+        }
+        switch (parsed.statement) {
+            .ddl => {},
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
 test "sql adapter parsed sql retains generated DML nodes for covered write corpus" {
     const alloc = std.testing.allocator;
 

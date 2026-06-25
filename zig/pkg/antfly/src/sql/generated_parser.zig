@@ -66,6 +66,10 @@ pub const GeneratedSqlDdlKind = enum {
     create_function,
     create_procedure,
     create_role,
+    create_collation,
+    create_operator,
+    create_aggregate,
+    create_cast,
     create_index,
     create_extension,
     alter_table,
@@ -79,6 +83,7 @@ pub const GeneratedSqlDdlKind = enum {
     alter_subscription,
     alter_policy,
     alter_role,
+    alter_collation,
     drop_table,
     drop_view,
     drop_materialized_view,
@@ -92,6 +97,10 @@ pub const GeneratedSqlDdlKind = enum {
     drop_function,
     drop_procedure,
     drop_role,
+    drop_collation,
+    drop_operator,
+    drop_aggregate,
+    drop_cast,
     drop_index,
     drop_schema,
     drop_database,
@@ -1597,6 +1606,10 @@ pub const simple_ddl_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger LANGUAGE plpgsql", .kind = .ddl },
     .{ .sql = "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql", .kind = .ddl },
     .{ .sql = "CREATE ROLE app_writer", .kind = .ddl },
+    .{ .sql = "CREATE COLLATION case_insensitive (provider = icu, locale = 'und-u-ks-level2')", .kind = .ddl },
+    .{ .sql = "CREATE OPERATOR === (FUNCTION = text_eq, LEFTARG = text, RIGHTARG = text)", .kind = .ddl },
+    .{ .sql = "CREATE AGGREGATE first_value_text(text) (SFUNC = first_sfunc, STYPE = text)", .kind = .ddl },
+    .{ .sql = "CREATE CAST (jsonb AS text) WITH FUNCTION jsonb_to_text(jsonb) AS ASSIGNMENT", .kind = .ddl },
     .{ .sql = "ALTER TABLE usage_records ADD COLUMN status text", .kind = .ddl },
     .{ .sql = "ALTER TABLE IF EXISTS ONLY usage_records DROP COLUMN IF EXISTS status RESTRICT", .kind = .ddl },
     .{ .sql = "ALTER VIEW active_usage RENAME TO active_usage_v2", .kind = .ddl },
@@ -1605,6 +1618,7 @@ pub const simple_ddl_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "ALTER SUBSCRIPTION usage_sub DISABLE", .kind = .ddl },
     .{ .sql = "ALTER POLICY usage_policy ON usage_records RENAME TO usage_policy_v2", .kind = .ddl },
     .{ .sql = "ALTER ROLE app_writer IN DATABASE appdb SET app.tenant_id = current_setting('app.tenant_id')", .kind = .ddl },
+    .{ .sql = "ALTER COLLATION case_insensitive RENAME TO ci_text", .kind = .ddl },
     .{ .sql = "CREATE INDEX usage_records_status_idx ON usage_records (status)", .kind = .extension_index },
     .{ .sql = "CREATE INDEX IF NOT EXISTS usage_records_status_idx ON usage_records (status)", .kind = .extension_index },
     .{ .sql = "CREATE UNIQUE INDEX usage_records_status_active_idx ON usage_records (status) INCLUDE (tenant_id, amount) WHERE deleted_at IS NULL", .kind = .extension_index },
@@ -1620,6 +1634,10 @@ pub const simple_ddl_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "DROP FUNCTION IF EXISTS audit_changes(text) CASCADE", .kind = .ddl },
     .{ .sql = "DROP PROCEDURE rotate_usage()", .kind = .ddl },
     .{ .sql = "DROP ROLE IF EXISTS app_writer", .kind = .ddl },
+    .{ .sql = "DROP COLLATION IF EXISTS ci_text", .kind = .ddl },
+    .{ .sql = "DROP OPERATOR === (text, text)", .kind = .ddl },
+    .{ .sql = "DROP AGGREGATE first_value_text(text)", .kind = .ddl },
+    .{ .sql = "DROP CAST (jsonb AS text)", .kind = .ddl },
     .{ .sql = "REFRESH MATERIALIZED VIEW usage_summary", .kind = .ddl },
     .{ .sql = "DROP INDEX usage_records_status_idx", .kind = .extension_index },
     .{ .sql = "DROP EXTENSION vector", .kind = .extension_index },
@@ -2029,6 +2047,10 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.function)) return .{ .ddl = .create_function };
         if (second.matchesKeywordTag(.procedure)) return .{ .ddl = .create_procedure };
         if (second.matchesKeywordTag(.role)) return .{ .ddl = .create_role };
+        if (second.matchesKeywordTag(.collation)) return .{ .ddl = .create_collation };
+        if (second.matchesKeywordTag(.operator)) return .{ .ddl = .create_operator };
+        if (second.matchesKeywordTag(.aggregate)) return .{ .ddl = .create_aggregate };
+        if (second.matchesKeywordTag(.cast)) return .{ .ddl = .create_cast };
         if (second.matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
         if (second.matchesKeywordTag(.unique) and tokens.len > 2 and tokens[2].matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
         if (second.matchesKeywordTag(.foreign) and tokens.len > 2 and tokens[2].matchesKeywordTag(.table)) return .{ .unsupported = .create_foreign_table };
@@ -2085,6 +2107,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .alter_trigger };
         if (second.matchesKeyword("user") and tokens.len > 2 and tokens[2].matchesKeyword("mapping")) return .{ .unsupported = .alter_user_mapping };
         if (second.matchesKeywordTag(.role)) return .{ .ddl = .alter_role };
+        if (second.matchesKeywordTag(.collation)) return .{ .ddl = .alter_collation };
     }
     if (first.matchesKeywordTag(.drop) and tokens.len > 1) {
         const second = tokens[1];
@@ -2109,6 +2132,10 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.policy)) return .{ .ddl = .drop_policy };
         if (second.matchesKeywordTag(.rule)) return .{ .unsupported = .drop_rule };
         if (second.matchesKeywordTag(.role)) return .{ .ddl = .drop_role };
+        if (second.matchesKeywordTag(.collation)) return .{ .ddl = .drop_collation };
+        if (second.matchesKeywordTag(.operator)) return .{ .ddl = .drop_operator };
+        if (second.matchesKeywordTag(.aggregate)) return .{ .ddl = .drop_aggregate };
+        if (second.matchesKeywordTag(.cast)) return .{ .ddl = .drop_cast };
         if (second.matchesKeywordTag(.server)) return .{ .unsupported = .drop_server };
         if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .drop_trigger };
         if (second.matchesKeyword("user") and tokens.len > 2 and tokens[2].matchesKeyword("mapping")) return .{ .unsupported = .drop_user_mapping };
@@ -2654,6 +2681,25 @@ fn buildDdlAst(
                 }
             }
         },
+        .create_collation => {
+            if (end > 2 and tokens[1].matchesKeywordTag(.collation)) {
+                ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 2, end);
+                if (ast.object_name_tokens) |collation_range| {
+                    if (collation_range.end < end) ast.alter_table_operation_tokens = .{ .start = collation_range.end, .end = end };
+                }
+            }
+        },
+        .create_aggregate => {
+            if (end > 2 and tokens[1].matchesKeywordTag(.aggregate)) {
+                ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 2, end);
+                if (ast.object_name_tokens) |aggregate_range| {
+                    if (aggregate_range.end < end) ast.alter_table_operation_tokens = .{ .start = aggregate_range.end, .end = end };
+                }
+            }
+        },
+        .create_operator, .create_cast => {
+            if (end > 2) ast.alter_table_operation_tokens = .{ .start = 2, .end = end };
+        },
         .create_index => {
             if (tokens.len > 2 and tokens[1].matchesKeywordTag(.unique) and tokens[2].matchesKeywordTag(.index)) {
                 ast.unique = true;
@@ -2803,6 +2849,14 @@ fn buildDdlAst(
                 }
             }
         },
+        .alter_collation => {
+            if (end > 2 and tokens[1].matchesKeywordTag(.collation)) {
+                ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 2, end);
+                if (ast.object_name_tokens) |collation_range| {
+                    if (collation_range.end < end) ast.alter_table_operation_tokens = .{ .start = collation_range.end, .end = end };
+                }
+            }
+        },
         .drop_database => {
             ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
             ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
@@ -2878,6 +2932,21 @@ fn buildDdlAst(
             if (ast.object_name_tokens) |role_range| {
                 if (role_range.end < end) ast.alter_table_operation_tokens = .{ .start = role_range.end, .end = end };
             }
+        },
+        .drop_collation => {
+            ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
+            ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
+        },
+        .drop_aggregate => {
+            ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
+            ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
+            if (ast.object_name_tokens) |aggregate_range| {
+                if (aggregate_range.end < end) ast.alter_table_operation_tokens = .{ .start = aggregate_range.end, .end = end };
+            }
+        },
+        .drop_operator, .drop_cast => {
+            ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
+            if (index < end) ast.alter_table_operation_tokens = .{ .start = index, .end = end };
         },
         .drop_index => {
             ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
@@ -6174,6 +6243,15 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_role }, (try parseSqlAlloc(alloc, "CREATE ROLE app_writer")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_role }, (try parseSqlAlloc(alloc, "ALTER ROLE app_writer RESET statement_timeout")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_role }, (try parseSqlAlloc(alloc, "DROP ROLE IF EXISTS app_writer")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_collation }, (try parseSqlAlloc(alloc, "CREATE COLLATION case_insensitive (provider = icu, locale = 'und-u-ks-level2')")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_collation }, (try parseSqlAlloc(alloc, "ALTER COLLATION case_insensitive RENAME TO ci_text")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_collation }, (try parseSqlAlloc(alloc, "DROP COLLATION IF EXISTS ci_text")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_operator }, (try parseSqlAlloc(alloc, "CREATE OPERATOR === (FUNCTION = text_eq, LEFTARG = text, RIGHTARG = text)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_operator }, (try parseSqlAlloc(alloc, "DROP OPERATOR === (text, text)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_aggregate }, (try parseSqlAlloc(alloc, "CREATE AGGREGATE first_value_text(text) (SFUNC = first_sfunc, STYPE = text)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_aggregate }, (try parseSqlAlloc(alloc, "DROP AGGREGATE first_value_text(text)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_cast }, (try parseSqlAlloc(alloc, "CREATE CAST (jsonb AS text) WITH FUNCTION jsonb_to_text(jsonb) AS ASSIGNMENT")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_cast }, (try parseSqlAlloc(alloc, "DROP CAST (jsonb AS text)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .relation_population }, (try parseSqlAlloc(alloc, "SELECT account_id, total INTO usage_archive FROM usage_records WHERE total > 10")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .relation_population }, (try parseSqlAlloc(alloc, "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT account_id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_schema }, (try parseSqlAlloc(alloc, "ALTER SCHEMA analytics RENAME TO reporting")).statement);

@@ -25,6 +25,7 @@ const derived_types = @import("derived/derived_types.zig");
 const doc_identity = @import("doc_identity.zig");
 const doc_set = @import("doc_set.zig");
 const docstore_mod = @import("../docstore.zig");
+const embedder_mod = @import("enrichment/embedder.zig");
 const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const planning_adapter_mod = @import("planning_adapter.zig");
@@ -6500,6 +6501,494 @@ test "db search runtime projection lookup includes chunk artifacts when _chunks 
     try std.testing.expectEqualStrings("hello", chunks[0].object.get("_content").?.string);
     try std.testing.expect(chunks[0].object.get("_artifact_name") == null);
     try std.testing.expectEqual(@as(i64, 1), chunks[1].object.get("_chunk_id").?.integer);
+}
+
+test "db search runtime full-text chunk consumer returns parent and chunk modes" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const waitForSearchResult = db_test_support.waitForSearchResult;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_chunks",
+        .kind = .full_text,
+        .config_json = "{\"chunk_name\":\"body_chunks_v1\"}",
+    });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" },
+        },
+        .sync_level = .full_text,
+    });
+
+    const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
+    defer alloc.free(chunk_prefix);
+    const chunk_records = try db.core.store.scanPrefix(alloc, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, chunk_records);
+    try std.testing.expect(chunk_records.len > 0);
+    try std.testing.expect(db.core.index_manager.textIndex("ft_chunks").?.snapshot().global_doc_count > 0);
+
+    var chunk_result = try waitForSearchResult(alloc, &db, .{
+        .index_name = "ft_chunks",
+        .full_text = .{ .match = .{ .field = "body", .text = "abcdefgh" } },
+        .return_mode = .chunk,
+    }, 1);
+    defer chunk_result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), chunk_result.total_hits);
+    const chunk_zero = try artifact_ids.chunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    defer alloc.free(chunk_zero);
+    try std.testing.expectEqualStrings(chunk_zero, chunk_result.hits[0].id);
+    const chunk_ref = chunk_result.hits[0].artifact_ref orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(types.ArtifactKind.chunk, chunk_ref.kind);
+    try std.testing.expectEqualStrings("doc:a", chunk_ref.document_id);
+    try std.testing.expectEqualStrings("body_chunks_v1", chunk_ref.name);
+    try std.testing.expectEqual(@as(?u32, 0), chunk_ref.chunk_id);
+
+    var parent_result = try db.search(alloc, .{
+        .index_name = "ft_chunks",
+        .full_text = .{ .match = .{ .field = "body", .text = "abcdefgh" } },
+        .return_mode = .parent,
+    });
+    defer parent_result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), parent_result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", parent_result.hits[0].id);
+}
+
+test "db search runtime full-text chunk consumer filters expired parents under ttl" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const waitForSearchResult = db_test_support.waitForSearchResult;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    const ttl_duration_ns: u64 = 60 * std.time.ns_per_s;
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "_default",
+        .ttl_duration_ns = ttl_duration_ns,
+    });
+
+    try db.addIndex(.{
+        .name = "ft_chunks",
+        .kind = .full_text,
+        .config_json = "{\"chunk_name\":\"body_chunks_v1\"}",
+    });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
+    });
+
+    const now_ns = db_internal.currentTimeNs();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:old", .value = "{\"body\":\"abcdefghijklmno\"}" }},
+        .timestamp_ns = now_ns - 2 * ttl_duration_ns,
+        .sync_level = .full_text,
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:fresh", .value = "{\"body\":\"abcdefghijklmno\"}" }},
+        .timestamp_ns = now_ns,
+        .sync_level = .full_text,
+    });
+
+    var chunk_result = try waitForSearchResult(alloc, &db, .{
+        .index_name = "ft_chunks",
+        .full_text = .{ .match = .{ .field = "body", .text = "abcdefgh" } },
+        .return_mode = .chunk,
+    }, 1);
+    defer chunk_result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), chunk_result.total_hits);
+    const fresh_chunk_zero = try artifact_ids.chunkArtifactPublicIdAlloc(alloc, "doc:fresh", "body_chunks_v1", 0);
+    defer alloc.free(fresh_chunk_zero);
+    try std.testing.expectEqualStrings(fresh_chunk_zero, chunk_result.hits[0].id);
+
+    var parent_result = try db.search(alloc, .{
+        .index_name = "ft_chunks",
+        .full_text = .{ .match = .{ .field = "body", .text = "abcdefgh" } },
+        .return_mode = .parent,
+    });
+    defer parent_result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), parent_result.total_hits);
+    try std.testing.expectEqualStrings("doc:fresh", parent_result.hits[0].id);
+}
+
+test "db search runtime getArtifact loads stored chunk artifacts by public id" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const chunk_zero = try artifact_ids.chunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    defer alloc.free(chunk_zero);
+    const internal_key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    defer alloc.free(internal_key);
+    try db.core.store.put(internal_key, "{\"body\":\"abcdefgh\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":0}");
+
+    var artifact = (try db.getArtifact(alloc, chunk_zero)) orelse return error.TestUnexpectedResult;
+    defer artifact.deinit(alloc);
+
+    try std.testing.expectEqualStrings(chunk_zero, artifact.id);
+    try std.testing.expectEqual(types.ArtifactKind.chunk, artifact.artifact_ref.kind);
+    try std.testing.expectEqualStrings("doc:a", artifact.artifact_ref.document_id);
+    try std.testing.expectEqualStrings("body_chunks_v1", artifact.artifact_ref.name);
+    try std.testing.expectEqual(@as(?u32, 0), artifact.artifact_ref.chunk_id);
+    try std.testing.expect(std.mem.indexOf(u8, artifact.value, "\"_chunk_id\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, artifact.value, "\"body\":\"abcdefgh\"") != null);
+}
+
+test "db search runtime full-text chunk parent paging applies after grouping" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const waitForSearchResult = db_test_support.waitForSearchResult;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_chunks",
+        .kind = .full_text,
+        .config_json = "{\"chunk_name\":\"body_chunks_v1\"}",
+    });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":32,\"chunk_overlap\":0}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha alpha alpha alpha\"}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"alpha\"}" },
+        },
+        .sync_level = .full_text,
+    });
+
+    var result = try waitForSearchResult(alloc, &db, .{
+        .index_name = "ft_chunks",
+        .full_text = .{ .term = .{ .field = "body", .term = "alpha" } },
+        .return_mode = .parent,
+        .limit = 1,
+        .offset = 1,
+    }, 1);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+}
+
+test "db search runtime dense chunk consumer supports parent and parent_with_chunks modes" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const waitForSearchResult = db_test_support.waitForSearchResult;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
+    defer alloc.free(chunk_prefix);
+    const chunk_records = try db.core.store.scanPrefix(alloc, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, chunk_records);
+    try std.testing.expect(chunk_records.len > 0);
+    try std.testing.expect(db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count > 0);
+
+    const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
+    defer alloc.free(query_vec);
+
+    var chunk_result = try waitForSearchResult(alloc, &db, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 3 },
+        .return_mode = .chunk,
+        .search_effort = 1.0,
+    }, 1);
+    defer chunk_result.deinit();
+    const chunk_zero = try artifact_ids.chunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    defer alloc.free(chunk_zero);
+    const chunk_one = try artifact_ids.chunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 1);
+    defer alloc.free(chunk_one);
+    const chunk_two = try artifact_ids.chunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 2);
+    defer alloc.free(chunk_two);
+    try std.testing.expectEqual(@as(u32, 3), chunk_result.total_hits);
+    try std.testing.expect(
+        std.mem.eql(u8, chunk_result.hits[0].id, chunk_zero) or
+            std.mem.eql(u8, chunk_result.hits[0].id, chunk_one) or
+            std.mem.eql(u8, chunk_result.hits[0].id, chunk_two),
+    );
+
+    var include = try db.internalResolveDocSetForIdsAlloc(alloc, &.{"doc:a"});
+    errdefer include.deinit(alloc);
+    const ordinal = switch (include) {
+        .ordinals => |ordinals| blk: {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            break :blk ordinals[0];
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    };
+    const vector_ids = try db.core.index_manager.lookupDenseVectorIdsForOrdinalsAlloc(alloc, db.core.store, "dv_v1", &.{ordinal});
+    defer alloc.free(vector_ids);
+    try std.testing.expect(vector_ids.len >= 2);
+
+    var filter = doc_set.ResolvedDocFilter{
+        .include = include,
+        .exclude = .none,
+    };
+    include = .all;
+    defer filter.deinit(alloc);
+
+    var filtered_chunk_result = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 3,
+        .include_stored = false,
+        .return_mode = .parent,
+        .resolved_doc_filter = &filter,
+        .search_effort = 1.0,
+    }, .{ .vector = query_vec, .k = 3 });
+    defer filtered_chunk_result.result.deinit();
+    try std.testing.expect(filtered_chunk_result.profile.raw_hit_count >= 2);
+    try std.testing.expectEqual(@as(u32, 1), filtered_chunk_result.result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", filtered_chunk_result.result.hits[0].id);
+
+    var parent_result = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 3 },
+        .return_mode = .parent,
+        .search_effort = 1.0,
+    });
+    defer parent_result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), parent_result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", parent_result.hits[0].id);
+
+    var parent_with_chunks = try waitForSearchResult(alloc, &db, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 3 },
+        .return_mode = .parent_with_chunks,
+        .max_chunks_per_parent = 1,
+        .search_effort = 1.0,
+    }, 1);
+    defer parent_with_chunks.deinit();
+    try std.testing.expectEqual(@as(u32, 1), parent_with_chunks.total_hits);
+    try std.testing.expectEqualStrings("doc:a", parent_with_chunks.hits[0].id);
+    try std.testing.expectEqual(@as(usize, 1), parent_with_chunks.hits[0].chunk_hits.len);
+    try std.testing.expect(
+        std.mem.eql(u8, parent_with_chunks.hits[0].chunk_hits[0].id, chunk_zero) or
+            std.mem.eql(u8, parent_with_chunks.hits[0].chunk_hits[0].id, chunk_one) or
+            std.mem.eql(u8, parent_with_chunks.hits[0].chunk_hits[0].id, chunk_two),
+    );
+
+    const doc_a_store_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+    defer alloc.free(doc_a_store_key);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(doc_a_store_key);
+        try doc_identity.markDeletedTxn(alloc, &txn, 2, "doc:a");
+        try txn.commit();
+    }
+    db.identity_visibility_summary_cache = null;
+
+    var stale_chunk_result = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 3,
+        .include_stored = false,
+        .return_mode = .chunk,
+        .search_effort = 1.0,
+    }, .{ .vector = query_vec, .k = 3 });
+    defer stale_chunk_result.result.deinit();
+    try std.testing.expectEqual(@as(u32, 0), stale_chunk_result.result.total_hits);
+    try std.testing.expectEqual(@as(u32, 0), stale_chunk_result.profile.raw_hit_count);
+
+    var stale_parent_result = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 3 },
+        .return_mode = .parent,
+        .search_effort = 1.0,
+    });
+    defer stale_parent_result.deinit();
+    try std.testing.expectEqual(@as(u32, 0), stale_parent_result.total_hits);
+}
+
+test "db search runtime dense chunk consumer supports parent and parent_with_chunks modes with durable lsm primary backend" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const waitForSearchResult = db_test_support.waitForSearchResult;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
+    defer alloc.free(chunk_prefix);
+    const chunk_records = try db.core.store.scanPrefix(alloc, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, chunk_records);
+    try std.testing.expect(chunk_records.len > 0);
+    try std.testing.expect(db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count > 0);
+
+    const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
+    defer alloc.free(query_vec);
+
+    var chunk_result = try waitForSearchResult(alloc, &db, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 3 },
+        .return_mode = .chunk,
+        .search_effort = 1.0,
+    }, 1);
+    defer chunk_result.deinit();
+    const chunk_zero = try artifact_ids.chunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    defer alloc.free(chunk_zero);
+    const chunk_one = try artifact_ids.chunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 1);
+    defer alloc.free(chunk_one);
+    const chunk_two = try artifact_ids.chunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 2);
+    defer alloc.free(chunk_two);
+    try std.testing.expectEqual(@as(u32, 3), chunk_result.total_hits);
+    try std.testing.expect(
+        std.mem.eql(u8, chunk_result.hits[0].id, chunk_zero) or
+            std.mem.eql(u8, chunk_result.hits[0].id, chunk_one) or
+            std.mem.eql(u8, chunk_result.hits[0].id, chunk_two),
+    );
+
+    var parent_result = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 3 },
+        .return_mode = .parent,
+        .search_effort = 1.0,
+    });
+    defer parent_result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), parent_result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", parent_result.hits[0].id);
+
+    var parent_with_chunks = try waitForSearchResult(alloc, &db, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 3 },
+        .return_mode = .parent_with_chunks,
+        .max_chunks_per_parent = 1,
+        .search_effort = 1.0,
+    }, 1);
+    defer parent_with_chunks.deinit();
+    try std.testing.expectEqual(@as(u32, 1), parent_with_chunks.total_hits);
+    try std.testing.expectEqualStrings("doc:a", parent_with_chunks.hits[0].id);
+    try std.testing.expectEqual(@as(usize, 1), parent_with_chunks.hits[0].chunk_hits.len);
+    try std.testing.expect(
+        std.mem.eql(u8, parent_with_chunks.hits[0].chunk_hits[0].id, chunk_zero) or
+            std.mem.eql(u8, parent_with_chunks.hits[0].chunk_hits[0].id, chunk_one) or
+            std.mem.eql(u8, parent_with_chunks.hits[0].chunk_hits[0].id, chunk_two),
+    );
 }
 
 test "db search runtime projection lookup includes unified artifact projection when _artifacts is requested" {

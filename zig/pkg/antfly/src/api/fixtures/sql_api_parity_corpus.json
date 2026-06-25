@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "4203d355b794e5f1043c4083c325744eefc5d5b66cb63dad0c0574266b7fa7ba",
-  "source_entry_count": 1026,
-  "entry_count": 1026,
+  "source_sha256": "45d8c2fb3a205ef21e67afea28566652a9ac34aabe044b46bc2120ad46603f93",
+  "source_entry_count": 1029,
+  "entry_count": 1029,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -1320,8 +1320,19 @@
         "table_name": "===",
         "operations": 2
       },
-      "plan": "ddl:drop_operator:operator====:args=2",
+      "plan": "ddl:drop_operator:operator====:args=2:if_exists=false",
       "sql": "DROP OPERATOR === (text, text)"
+    },
+    {
+      "name": "drop operator idempotent catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_operator",
+        "table_name": "===",
+        "operations": 2
+      },
+      "plan": "ddl:drop_operator:operator====:args=2:if_exists=true",
+      "sql": "DROP OPERATOR IF EXISTS === (text, text)"
     },
     {
       "name": "create aggregate catalog ddl",
@@ -1343,8 +1354,19 @@
         "table_name": "first_value_text",
         "operations": 1
       },
-      "plan": "ddl:drop_aggregate:aggregate=first_value_text:args=1",
+      "plan": "ddl:drop_aggregate:aggregate=first_value_text:args=1:if_exists=false",
       "sql": "DROP AGGREGATE first_value_text(text)"
+    },
+    {
+      "name": "drop aggregate idempotent catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_aggregate",
+        "table_name": "first_value_text",
+        "operations": 1
+      },
+      "plan": "ddl:drop_aggregate:aggregate=first_value_text:args=1:if_exists=true",
+      "sql": "DROP AGGREGATE IF EXISTS first_value_text(text)"
     },
     {
       "name": "create cast catalog ddl",
@@ -1363,8 +1385,18 @@
         "ddl_tag": "drop_cast",
         "table_name": "jsonb"
       },
-      "plan": "ddl:drop_cast:source=jsonb:target=text",
+      "plan": "ddl:drop_cast:source=jsonb:target=text:if_exists=false",
       "sql": "DROP CAST (jsonb AS text)"
+    },
+    {
+      "name": "drop cast idempotent catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_cast",
+        "table_name": "jsonb"
+      },
+      "plan": "ddl:drop_cast:source=jsonb:target=text:if_exists=true",
+      "sql": "DROP CAST IF EXISTS (jsonb AS text)"
     },
     {
       "name": "table comment metadata ddl",

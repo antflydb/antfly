@@ -1224,6 +1224,7 @@ pub const CreateOperatorSyntax = struct {
 pub const DropOperatorSyntax = struct {
     operator_name: []const u8,
     argument_count: usize = 0,
+    if_exists: bool = false,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.operator_name));
@@ -1245,6 +1246,7 @@ pub const CreateAggregateSyntax = struct {
 pub const DropAggregateSyntax = struct {
     aggregate_name: []const u8,
     argument_count: usize = 0,
+    if_exists: bool = false,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.aggregate_name));
@@ -1269,6 +1271,7 @@ pub const CreateCastSyntax = struct {
 pub const DropCastSyntax = struct {
     source_type: []const u8,
     target_type: []const u8,
+    if_exists: bool = false,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.source_type));
@@ -6534,13 +6537,18 @@ pub fn parseDropOperatorCatalogTailAlloc(
 ) !DropOperatorSyntax {
     const cursor = parser.Cursor.init(tokens, pos);
     try cursor.expectKeyword("operator");
+    var if_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("exists");
+        if_exists = true;
+    }
     const operator_name = try parseSqlOperatorNameOwnedAlloc(alloc, cursor);
     var operator_transferred = false;
     errdefer if (!operator_transferred) alloc.free(operator_name);
     const argument_count = try countParenthesizedTypeList(cursor);
     try adapterNoopStatementEnd(cursor);
     operator_transferred = true;
-    return .{ .operator_name = operator_name, .argument_count = argument_count };
+    return .{ .operator_name = operator_name, .argument_count = argument_count, .if_exists = if_exists };
 }
 
 pub fn parseCreateAggregateCatalogTailAlloc(
@@ -6567,13 +6575,18 @@ pub fn parseDropAggregateCatalogTailAlloc(
 ) !DropAggregateSyntax {
     const cursor = parser.Cursor.init(tokens, pos);
     try cursor.expectKeyword("aggregate");
+    var if_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("exists");
+        if_exists = true;
+    }
     const aggregate_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
     var aggregate_transferred = false;
     errdefer if (!aggregate_transferred) alloc.free(aggregate_name);
     const argument_count = try countParenthesizedTypeList(cursor);
     try adapterNoopStatementEnd(cursor);
     aggregate_transferred = true;
-    return .{ .aggregate_name = aggregate_name, .argument_count = argument_count };
+    return .{ .aggregate_name = aggregate_name, .argument_count = argument_count, .if_exists = if_exists };
 }
 
 pub fn parseCreateCastCatalogTailAlloc(
@@ -6622,6 +6635,11 @@ pub fn parseDropCastCatalogTailAlloc(
 ) !DropCastSyntax {
     const cursor = parser.Cursor.init(tokens, pos);
     try cursor.expectKeyword("cast");
+    var if_exists = false;
+    if (cursor.matchKeyword("if")) {
+        try cursor.expectKeyword("exists");
+        if_exists = true;
+    }
     try cursor.expectToken(.lparen);
     const source_type = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
     var source_transferred = false;
@@ -6634,7 +6652,7 @@ pub fn parseDropCastCatalogTailAlloc(
     try adapterNoopStatementEnd(cursor);
     source_transferred = true;
     target_transferred = true;
-    return .{ .source_type = source_type, .target_type = target_type };
+    return .{ .source_type = source_type, .target_type = target_type, .if_exists = if_exists };
 }
 
 pub fn parseRelationLifetimePrefix(tokens: []const Token, pos: *usize) !RelationLifetimePrefixSyntax {

@@ -1333,8 +1333,19 @@
         "table_name": "===",
         "operations": 2
       },
-      "plan": "ddl:drop_operator:operator====:args=2",
+      "plan": "ddl:drop_operator:operator====:args=2:if_exists=false",
       "sql": "DROP OPERATOR === (text, text)"
+    },
+    {
+      "name": "drop operator idempotent catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_operator",
+        "table_name": "===",
+        "operations": 2
+      },
+      "plan": "ddl:drop_operator:operator====:args=2:if_exists=true",
+      "sql": "DROP OPERATOR IF EXISTS === (text, text)"
     },
     {
       "name": "create aggregate catalog ddl",
@@ -1356,8 +1367,19 @@
         "table_name": "first_value_text",
         "operations": 1
       },
-      "plan": "ddl:drop_aggregate:aggregate=first_value_text:args=1",
+      "plan": "ddl:drop_aggregate:aggregate=first_value_text:args=1:if_exists=false",
       "sql": "DROP AGGREGATE first_value_text(text)"
+    },
+    {
+      "name": "drop aggregate idempotent catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_aggregate",
+        "table_name": "first_value_text",
+        "operations": 1
+      },
+      "plan": "ddl:drop_aggregate:aggregate=first_value_text:args=1:if_exists=true",
+      "sql": "DROP AGGREGATE IF EXISTS first_value_text(text)"
     },
     {
       "name": "create cast catalog ddl",
@@ -1376,8 +1398,18 @@
         "ddl_tag": "drop_cast",
         "table_name": "jsonb"
       },
-      "plan": "ddl:drop_cast:source=jsonb:target=text",
+      "plan": "ddl:drop_cast:source=jsonb:target=text:if_exists=false",
       "sql": "DROP CAST (jsonb AS text)"
+    },
+    {
+      "name": "drop cast idempotent catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "drop_cast",
+        "table_name": "jsonb"
+      },
+      "plan": "ddl:drop_cast:source=jsonb:target=text:if_exists=true",
+      "sql": "DROP CAST IF EXISTS (jsonb AS text)"
     },
     {
       "name": "table comment metadata ddl",

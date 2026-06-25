@@ -5226,3 +5226,237 @@ test "db lifecycle open default primary backend survives reopen" {
         try std.testing.expectEqual(@as(u64, 2), stats.doc_count);
     }
 }
+
+test "db lifecycle lsm maintenance reclaims due index obsolete paths before primary compaction" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const expectObsoletePathsReclaimable = db_test_support.expectObsoletePathsReclaimable;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .primary_backend = .{ .lsm = .{
+            .flush_threshold = 1,
+            .defer_flush_on_commit = true,
+            .l0_soft_limit_runs = 100,
+            .obsolete_retention_ns = 0,
+        } },
+        .index_backends = .{
+            .dense_lsm_options = .{
+                .flush_threshold = 1,
+                .defer_flush_on_commit = true,
+                .l0_soft_limit_runs = 100,
+                .obsolete_retention_ns = 0,
+            },
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+
+    var key_buf: [16]u8 = undefined;
+    for (0..4) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        try db.batch(.{
+            .writes = &.{.{ .key = key, .value = "{\"embedding\":[1,2]}" }},
+            .sync_level = .write,
+        });
+        switch (db.core.primary_store_owner) {
+            .lsm => |*owner| try owner.handle.backend.sync(true),
+            else => return error.SkipZigTest,
+        }
+    }
+
+    switch (db.core.primary_store_owner) {
+        .lsm => |*owner| try owner.handle.backend.flushBufferedWritesWithOptions(.{ .compact = false, .flush = true }),
+        else => return error.SkipZigTest,
+    }
+
+    switch (db.core.primary_store_owner) {
+        .lsm => |*owner| owner.handle.backend.options.l0_soft_limit_runs = 1,
+        else => return error.SkipZigTest,
+    }
+
+    const dense_entry = db.core.index_manager.denseIndex("dv_v1") orelse return error.TestUnexpectedResult;
+    const dense_backend = switch (dense_entry.index.env_owner) {
+        .lsm => |*handle| handle.backend,
+        else => return error.SkipZigTest,
+    };
+    const dense_root = dense_backend.root_dir orelse return error.TestUnexpectedResult;
+    const obsolete_path = try lsm_backend_mod.repository.runPath(alloc, dense_root, 999_999);
+    defer alloc.free(obsolete_path);
+
+    try lsm_backend_mod.repository.writeFileAbsoluteWithStorage(dense_backend.storage.?, obsolete_path, "obsolete");
+    {
+        const locked = lsm_backend_mod.runtime.lockBackend(lsm_backend_mod.Backend, dense_backend);
+        defer lsm_backend_mod.runtime.unlockBackend(lsm_backend_mod.Backend, dense_backend, locked);
+        try dense_backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete_path));
+        dense_backend.manifest_dirty = false;
+    }
+
+    try expectObsoletePathsReclaimable(dense_backend, 1);
+    try std.testing.expect(try db.runLsmMaintenanceStepBestEffort());
+    try std.testing.expectEqual(@as(u64, 0), dense_backend.snapshotMaintenanceStats().obsolete_paths);
+    try std.testing.expectError(error.FileNotFound, dense_backend.storage.?.readFileAlloc(alloc, obsolete_path, 1024));
+}
+
+test "db lifecycle primary lsm maintenance step does not reclaim index obsolete paths" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const expectObsoletePathsReclaimable = db_test_support.expectObsoletePathsReclaimable;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .primary_backend = .{ .lsm = .{
+            .flush_threshold = 1,
+            .defer_flush_on_commit = true,
+            .l0_soft_limit_runs = 100,
+            .obsolete_retention_ns = 0,
+        } },
+        .index_backends = .{
+            .dense_lsm_options = .{
+                .flush_threshold = 1,
+                .defer_flush_on_commit = true,
+                .l0_soft_limit_runs = 100,
+                .obsolete_retention_ns = 0,
+            },
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+
+    const primary_backend = switch (db.core.primary_store_owner) {
+        .lsm => |*owner| owner.handle.backend,
+        else => return error.SkipZigTest,
+    };
+    const primary_root = primary_backend.root_dir orelse return error.TestUnexpectedResult;
+    const primary_obsolete_path = try lsm_backend_mod.repository.runPath(alloc, primary_root, 888_888);
+    defer alloc.free(primary_obsolete_path);
+
+    const dense_entry = db.core.index_manager.denseIndex("dv_v1") orelse return error.TestUnexpectedResult;
+    const dense_backend = switch (dense_entry.index.env_owner) {
+        .lsm => |*handle| handle.backend,
+        else => return error.SkipZigTest,
+    };
+    const dense_root = dense_backend.root_dir orelse return error.TestUnexpectedResult;
+    const dense_obsolete_path = try lsm_backend_mod.repository.runPath(alloc, dense_root, 999_999);
+    defer alloc.free(dense_obsolete_path);
+
+    try lsm_backend_mod.repository.writeFileAbsoluteWithStorage(primary_backend.storage.?, primary_obsolete_path, "primary obsolete");
+    {
+        const locked = lsm_backend_mod.runtime.lockBackend(lsm_backend_mod.Backend, primary_backend);
+        defer lsm_backend_mod.runtime.unlockBackend(lsm_backend_mod.Backend, primary_backend, locked);
+        try primary_backend.queueObsoleteFilePath(try alloc.dupe(u8, primary_obsolete_path));
+        primary_backend.manifest_dirty = false;
+    }
+
+    try lsm_backend_mod.repository.writeFileAbsoluteWithStorage(dense_backend.storage.?, dense_obsolete_path, "dense obsolete");
+    {
+        const locked = lsm_backend_mod.runtime.lockBackend(lsm_backend_mod.Backend, dense_backend);
+        defer lsm_backend_mod.runtime.unlockBackend(lsm_backend_mod.Backend, dense_backend, locked);
+        try dense_backend.queueObsoleteFilePath(try alloc.dupe(u8, dense_obsolete_path));
+        dense_backend.manifest_dirty = false;
+    }
+
+    try expectObsoletePathsReclaimable(primary_backend, 1);
+    try expectObsoletePathsReclaimable(dense_backend, 1);
+
+    _ = try db.runPrimaryLsmMaintenanceStep();
+
+    try std.testing.expectEqual(@as(u64, 0), primary_backend.snapshotMaintenanceStats().obsolete_paths);
+    try std.testing.expectError(error.FileNotFound, primary_backend.storage.?.readFileAlloc(alloc, primary_obsolete_path, 1024));
+    try std.testing.expectEqual(@as(u64, 1), dense_backend.snapshotMaintenanceStats().obsolete_paths);
+    const dense_bytes = try dense_backend.storage.?.readFileAlloc(alloc, dense_obsolete_path, 1024);
+    alloc.free(dense_bytes);
+}
+
+test "db lifecycle dense target advance is blocked while catch-up bulk session is active" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const AsyncContext = db_internal.AsyncContext(DB);
+    const beginDenseCatchUpSessionTracked = db_internal.beginDenseCatchUpSessionTracked;
+    const finishDenseCatchUpSessionTracked = db_internal.finishDenseCatchUpSessionTracked;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .enable_without_producers = true,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"semantic_idx\"}}",
+    });
+
+    const resources = db.core.asyncResources();
+    var ctx = AsyncContext{
+        .alloc = alloc,
+        .store = resources.store,
+        .index_manager = resources.index_manager,
+        .apply_mutex = resources.apply_mutex,
+    };
+    defer ctx.deinit(alloc);
+
+    try beginDenseCatchUpSessionTracked(&ctx, "semantic_idx");
+    defer finishDenseCatchUpSessionTracked(&ctx, "semantic_idx");
+
+    const can_advance = try DB.derivedAsyncCanAdvanceDerivedToTargetAsync(&ctx, .{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+    }, 1, 2);
+    try std.testing.expect(!can_advance);
+}
+
+test "db lifecycle group created-at metadata is written once and readable" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try std.testing.expect((try db.getGroupCreatedAtMillis(alloc, 42)) == null);
+    try std.testing.expectEqual(@as(u64, 1234), try db.ensureGroupCreatedAtMillis(alloc, 42, 1234));
+    try std.testing.expectEqual(@as(u64, 1234), (try db.getGroupCreatedAtMillis(alloc, 42)).?);
+    try std.testing.expectEqual(@as(u64, 1234), try db.ensureGroupCreatedAtMillis(alloc, 42, 5678));
+}

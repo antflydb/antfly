@@ -924,8 +924,8 @@ pub fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![
                 ),
                 .drop => |drop| try std.fmt.allocPrint(
                     alloc,
-                    "ddl:drop_operator:operator={s}:args={d}",
-                    .{ drop.operator_name, drop.argument_count },
+                    "ddl:drop_operator:operator={s}:args={d}:if_exists={}",
+                    .{ drop.operator_name, drop.argument_count, drop.if_exists },
                 ),
             },
             .aggregate => |aggregate| switch (aggregate) {
@@ -936,8 +936,8 @@ pub fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![
                 ),
                 .drop => |drop| try std.fmt.allocPrint(
                     alloc,
-                    "ddl:drop_aggregate:aggregate={s}:args={d}",
-                    .{ drop.aggregate_name, drop.argument_count },
+                    "ddl:drop_aggregate:aggregate={s}:args={d}:if_exists={}",
+                    .{ drop.aggregate_name, drop.argument_count, drop.if_exists },
                 ),
             },
             .cast => |cast| switch (cast) {
@@ -948,8 +948,8 @@ pub fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![
                 ),
                 .drop => |drop| try std.fmt.allocPrint(
                     alloc,
-                    "ddl:drop_cast:source={s}:target={s}",
-                    .{ drop.source_type, drop.target_type },
+                    "ddl:drop_cast:source={s}:target={s}:if_exists={}",
+                    .{ drop.source_type, drop.target_type, drop.if_exists },
                 ),
             },
         },
@@ -2416,7 +2416,11 @@ test "sql adapter ddl fingerprint owns type system ddl surfaces" {
         },
         .{
             .sql = "DROP OPERATOR === (text, text);",
-            .fingerprint = "ddl:drop_operator:operator====:args=2",
+            .fingerprint = "ddl:drop_operator:operator====:args=2:if_exists=false",
+        },
+        .{
+            .sql = "DROP OPERATOR IF EXISTS === (text, text);",
+            .fingerprint = "ddl:drop_operator:operator====:args=2:if_exists=true",
         },
         .{
             .sql = "CREATE AGGREGATE first_value_text(text) (SFUNC = first_sfunc, STYPE = text);",
@@ -2424,7 +2428,11 @@ test "sql adapter ddl fingerprint owns type system ddl surfaces" {
         },
         .{
             .sql = "DROP AGGREGATE first_value_text(text);",
-            .fingerprint = "ddl:drop_aggregate:aggregate=first_value_text:args=1",
+            .fingerprint = "ddl:drop_aggregate:aggregate=first_value_text:args=1:if_exists=false",
+        },
+        .{
+            .sql = "DROP AGGREGATE IF EXISTS first_value_text(text);",
+            .fingerprint = "ddl:drop_aggregate:aggregate=first_value_text:args=1:if_exists=true",
         },
         .{
             .sql = "CREATE CAST (jsonb AS text) WITH FUNCTION jsonb_to_text(jsonb) AS ASSIGNMENT;",
@@ -2432,7 +2440,11 @@ test "sql adapter ddl fingerprint owns type system ddl surfaces" {
         },
         .{
             .sql = "DROP CAST (jsonb AS text);",
-            .fingerprint = "ddl:drop_cast:source=jsonb:target=text",
+            .fingerprint = "ddl:drop_cast:source=jsonb:target=text:if_exists=false",
+        },
+        .{
+            .sql = "DROP CAST IF EXISTS (jsonb AS text);",
+            .fingerprint = "ddl:drop_cast:source=jsonb:target=text:if_exists=true",
         },
     };
 

@@ -118,6 +118,12 @@ Role authorization DDL heads, including `CREATE ROLE`, `ALTER ROLE`, and
 `DROP ROLE`, now use the generated DDL boundary with retained role-name,
 operation-tail, and `IF EXISTS` metadata before delegating role setting
 semantics to the existing typed authorization catalog planner.
+Type-system catalog DDL heads, including `CREATE COLLATION`,
+`ALTER COLLATION`, `DROP COLLATION`, `CREATE OPERATOR`, `DROP OPERATOR`,
+`CREATE AGGREGATE`, `DROP AGGREGATE`, `CREATE CAST`, and `DROP CAST`, now use
+the generated DDL boundary with retained object-name or signature-tail ranges
+before delegating option/signature semantics to the existing typed type-system
+catalog planner.
 Generated
 `CREATE INDEX` ASTs also retain
 `UNIQUE`, method, element-list, covering-index `INCLUDE (...)`, options, and
@@ -131,11 +137,13 @@ Incomplete covered DDL clause-boundary shapes for `CREATE TABLE`, lifetime
 prefixed `CREATE [TEMP|TEMPORARY|UNLOGGED] TABLE`, `CREATE VIEW`,
 `CREATE DOMAIN`, `CREATE SEQUENCE`, `CREATE TYPE`, `CREATE TABLESPACE`,
 `CREATE PUBLICATION`, `CREATE SUBSCRIPTION`, `CREATE MATERIALIZED VIEW`,
-`CREATE INDEX`, `CREATE ROLE`, `ALTER TABLE`, `ALTER SCHEMA`, `ALTER TABLESPACE`,
-`CREATE POLICY`, `ALTER PUBLICATION`, `ALTER SUBSCRIPTION`, `ALTER POLICY`,
+`CREATE INDEX`, `CREATE ROLE`, `CREATE COLLATION`, `CREATE OPERATOR`,
+`CREATE AGGREGATE`, `CREATE CAST`, `ALTER TABLE`, `ALTER SCHEMA`,
+`ALTER TABLESPACE`, `ALTER COLLATION`, `CREATE POLICY`, `ALTER PUBLICATION`, `ALTER SUBSCRIPTION`, `ALTER POLICY`,
 `ALTER ROLE`, `ALTER VIEW`, `ALTER DOMAIN`, `ALTER SEQUENCE`, `ALTER TYPE`, `DROP TABLE`,
 `DROP VIEW`, `DROP DOMAIN`, `DROP SEQUENCE`, `DROP TYPE`, `DROP TABLESPACE`,
 `DROP PUBLICATION`, `DROP SUBSCRIPTION`, `DROP POLICY`, `DROP ROLE`,
+`DROP COLLATION`, `DROP OPERATOR`, `DROP AGGREGATE`, `DROP CAST`,
 `DROP MATERIALIZED VIEW`, and
 `REFRESH MATERIALIZED VIEW` now fail closed through the generated parser
 instead of falling back to the legacy DDL classifier, while rich DDL syntax
@@ -400,7 +408,12 @@ delegating to the typed routine catalog planner. Legacy-supported role
 authorization operations use validated generated DDL AST nodes for
 `CREATE ROLE`, `ALTER ROLE`, and `DROP ROLE`, and fail closed if generated
 kind, span, role name, operation tail, or `IF EXISTS` metadata is corrupted
-before delegating to the typed authorization catalog planner. Notification channel
+before delegating to the typed authorization catalog planner. Legacy-supported
+type-system catalog operations use validated generated DDL AST nodes for
+`CREATE/ALTER/DROP COLLATION`, `CREATE/DROP OPERATOR`,
+`CREATE/DROP AGGREGATE`, and `CREATE/DROP CAST`, and fail closed if generated
+kind, span, object name, signature tail, or `IF EXISTS` metadata is corrupted
+before delegating to the typed type-system catalog planner. Notification channel
 commands also use the validated unsupported boundary for `LISTEN`, `NOTIFY`,
 and `UNLISTEN` before delegating to typed notification catalog planning.
 Authorization and utility commands use it for `GRANT`, `REVOKE`, `COMMENT`,
@@ -1094,6 +1107,8 @@ Generated grammar work needs evidence at multiple levels:
   `DROP PROCEDURE`,
   generated role authorization DDL for `CREATE ROLE`, `ALTER ROLE`, and
   `DROP ROLE`,
+  generated type-system catalog DDL for `CREATE/ALTER/DROP COLLATION`,
+  `CREATE/DROP OPERATOR`, `CREATE/DROP AGGREGATE`, and `CREATE/DROP CAST`,
   `DROP INDEX`, generated domain catalog DDL for `CREATE DOMAIN`,
   `ALTER DOMAIN`, and `DROP DOMAIN`, generated sequence catalog DDL for
   `CREATE SEQUENCE`, `ALTER SEQUENCE`, and `DROP SEQUENCE`, generated

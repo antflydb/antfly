@@ -54,6 +54,7 @@ pub const TokenKind = enum {
 
 pub const TokenKeyword = enum {
     add,
+    aggregate,
     all,
     alter,
     abs,
@@ -99,6 +100,7 @@ pub const TokenKeyword = enum {
     cluster,
     close,
     column,
+    collation,
     coalesce,
     comment,
     conflict,
@@ -245,6 +247,7 @@ pub const TokenKeyword = enum {
     off,
     on,
     only,
+    operator,
     @"or",
     order,
     outer,
@@ -484,6 +487,7 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.checkpoint, keywordFromIdentifier("CHECKPOINT").?);
     try std.testing.expectEqual(TokenKeyword.cluster, keywordFromIdentifier("CLUSTER").?);
     try std.testing.expectEqual(TokenKeyword.close, keywordFromIdentifier("CLOSE").?);
+    try std.testing.expectEqual(TokenKeyword.collation, keywordFromIdentifier("COLLATION").?);
     try std.testing.expectEqual(TokenKeyword.comment, keywordFromIdentifier("COMMENT").?);
     try std.testing.expectEqual(TokenKeyword.declare, keywordFromIdentifier("DECLARE").?);
     try std.testing.expectEqual(TokenKeyword.domain, keywordFromIdentifier("DOMAIN").?);
@@ -499,6 +503,7 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.function, keywordFromIdentifier("FUNCTION").?);
     try std.testing.expectEqual(TokenKeyword.initcap, keywordFromIdentifier("INITCAP").?);
     try std.testing.expectEqual(TokenKeyword.all, keywordFromIdentifier("ALL").?);
+    try std.testing.expectEqual(TokenKeyword.aggregate, keywordFromIdentifier("AGGREGATE").?);
     try std.testing.expectEqual(TokenKeyword.@"and", keywordFromIdentifier("AND").?);
     try std.testing.expectEqual(TokenKeyword.any, keywordFromIdentifier("ANY").?);
     try std.testing.expectEqual(TokenKeyword.ilike, keywordFromIdentifier("ILIKE").?);
@@ -516,6 +521,7 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.ltrim, keywordFromIdentifier("LTRIM").?);
     try std.testing.expectEqual(TokenKeyword.null, keywordFromIdentifier("NULL").?);
     try std.testing.expectEqual(TokenKeyword.@"or", keywordFromIdentifier("OR").?);
+    try std.testing.expectEqual(TokenKeyword.operator, keywordFromIdentifier("OPERATOR").?);
     try std.testing.expectEqual(TokenKeyword.some, keywordFromIdentifier("SOME").?);
     try std.testing.expectEqual(TokenKeyword.matched, keywordFromIdentifier("MATCHED").?);
     try std.testing.expectEqual(TokenKeyword.md5, keywordFromIdentifier("MD5").?);

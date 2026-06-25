@@ -2319,7 +2319,10 @@ fn fixtureGateEnvPathAlloc(alloc: std.mem.Allocator, name: []const u8) !?[]u8 {
         const eq = std.mem.indexOfScalar(u8, text, '=') orelse continue;
         if (std.mem.eql(u8, text[0..eq], name)) return try alloc.dupe(u8, text[eq + 1 ..]);
     }
-    return null;
+    return std.process.getEnvVarOwned(alloc, name) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
 }
 
 pub fn fixtureGateModeFromEnvAlloc(alloc: std.mem.Allocator) !AppParityFixtureGateMode {
@@ -7488,15 +7491,18 @@ pub const AppParityCorpusCoverage = struct {
     ddl_operator_create_options: bool = false,
     ddl_operator_drop: bool = false,
     ddl_operator_drop_args: bool = false,
+    ddl_operator_drop_if_exists: bool = false,
     ddl_aggregate_create: bool = false,
     ddl_aggregate_create_args: bool = false,
     ddl_aggregate_create_options: bool = false,
     ddl_aggregate_drop: bool = false,
     ddl_aggregate_drop_args: bool = false,
+    ddl_aggregate_drop_if_exists: bool = false,
     ddl_cast_create: bool = false,
     ddl_cast_create_assignment: bool = false,
     ddl_cast_create_function: bool = false,
     ddl_cast_drop: bool = false,
+    ddl_cast_drop_if_exists: bool = false,
     ddl_vacuum_maintenance: bool = false,
     ddl_vacuum_maintenance_options: bool = false,
     ddl_analyze_maintenance: bool = false,
@@ -9410,6 +9416,7 @@ pub const AppParityCorpusCoverage = struct {
                 .drop_operator => {
                     self.ddl_operator_drop = true;
                     self.ddl_operator_drop_args = self.ddl_operator_drop_args or sql_adapter.planHasNonZeroToken(entry.plan, ":args=");
+                    self.ddl_operator_drop_if_exists = self.ddl_operator_drop_if_exists or sql_adapter.planHasExactBoolToken(entry.plan, ":if_exists=", true);
                 },
                 .create_aggregate => {
                     self.ddl_aggregate_create = true;
@@ -9419,13 +9426,17 @@ pub const AppParityCorpusCoverage = struct {
                 .drop_aggregate => {
                     self.ddl_aggregate_drop = true;
                     self.ddl_aggregate_drop_args = self.ddl_aggregate_drop_args or sql_adapter.planHasNonZeroToken(entry.plan, ":args=");
+                    self.ddl_aggregate_drop_if_exists = self.ddl_aggregate_drop_if_exists or sql_adapter.planHasExactBoolToken(entry.plan, ":if_exists=", true);
                 },
                 .create_cast => {
                     self.ddl_cast_create = true;
                     self.ddl_cast_create_assignment = self.ddl_cast_create_assignment or sql_adapter.planHasExactBoolToken(entry.plan, ":assignment=", true);
                     self.ddl_cast_create_function = self.ddl_cast_create_function or sql_adapter.planHasStringToken(entry.plan, ":function=");
                 },
-                .drop_cast => self.ddl_cast_drop = true,
+                .drop_cast => {
+                    self.ddl_cast_drop = true;
+                    self.ddl_cast_drop_if_exists = self.ddl_cast_drop_if_exists or sql_adapter.planHasExactBoolToken(entry.plan, ":if_exists=", true);
+                },
                 .vacuum_maintenance => {
                     self.ddl_vacuum_maintenance = true;
                     self.ddl_vacuum_maintenance_options = self.ddl_vacuum_maintenance_options or

@@ -2327,6 +2327,7 @@ pub const CreateOperatorPlan = struct {
 pub const DropOperatorPlan = struct {
     operator_name: []const u8,
     argument_count: usize = 0,
+    if_exists: bool = false,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.operator_name);
@@ -2361,6 +2362,7 @@ pub const CreateAggregatePlan = struct {
 pub const DropAggregatePlan = struct {
     aggregate_name: []const u8,
     argument_count: usize = 0,
+    if_exists: bool = false,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.aggregate_name);
@@ -2398,6 +2400,7 @@ pub const CreateCastPlan = struct {
 pub const DropCastPlan = struct {
     source_type: []const u8,
     target_type: []const u8,
+    if_exists: bool = false,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.source_type);
@@ -3311,6 +3314,16 @@ pub fn ddlPlanFromGeneratedAstAlloc(
         .alter_role,
         .drop_role,
         => try authorizationCatalogPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options),
+        .create_collation,
+        .alter_collation,
+        .drop_collation,
+        .create_operator,
+        .drop_operator,
+        .create_aggregate,
+        .drop_aggregate,
+        .create_cast,
+        .drop_cast,
+        => try typeSystemCatalogPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options),
         .create_index => .{ .create_index = try createIndexPlanFromGeneratedAstAlloc(alloc, tokens, ast, options.create_index_options) },
         .alter_table => if (generatedAlterTableUsesRowSecurityRuntimeBoundary(tokens, ast))
             .{ .row_security_catalog = .{ .alter_table = try rowSecurityAlterTablePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } }
@@ -3359,6 +3372,15 @@ fn generatedDdlUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated
         .create_role,
         .alter_role,
         .drop_role,
+        .create_collation,
+        .alter_collation,
+        .drop_collation,
+        .create_operator,
+        .drop_operator,
+        .create_aggregate,
+        .drop_aggregate,
+        .create_cast,
+        .drop_cast,
         .create_policy,
         .alter_policy,
         .drop_policy,
@@ -3465,6 +3487,107 @@ fn validateGeneratedRoleDdlAst(tokens: []const grammar.Token, ast: generated_par
         },
         .drop_role => {
             if (end < 3 or !tokens[0].matchesKeyword("drop") or !tokens[1].matchesKeywordTag(.role)) return error.UnsupportedSqlShape;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
+fn typeSystemCatalogPlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+    options: DdlPlanParserOptions,
+) !LoweredDdlPlan {
+    try validateGeneratedTypeSystemDdlAst(tokens, ast);
+    var pos: usize = 0;
+    var plan = try parseDdlPlanAlloc(alloc, tokens, &pos, options);
+    errdefer plan.deinit(alloc);
+    if (pos != tokens.len) return error.UnsupportedSqlShape;
+    switch (plan) {
+        .type_system_catalog => |type_system| switch (ast.kind) {
+            .create_collation, .alter_collation, .drop_collation => switch (type_system) {
+                .collation => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            .create_operator, .drop_operator => switch (type_system) {
+                .operator => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            .create_aggregate, .drop_aggregate => switch (type_system) {
+                .aggregate => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            .create_cast, .drop_cast => switch (type_system) {
+                .cast => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+    return plan;
+}
+
+fn validateGeneratedTypeSystemDdlAst(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) !void {
+    try validateGeneratedDdlAstSpans(tokens, ast);
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    switch (ast.kind) {
+        .create_collation => {
+            const object_name = ast.object_name_tokens orelse return error.UnsupportedSqlShape;
+            if (end < 3 or object_name.start != 2 or object_name.end > end) return error.UnsupportedSqlShape;
+            if (!tokens[0].matchesKeyword("create") or !tokens[1].matchesKeywordTag(.collation)) return error.UnsupportedSqlShape;
+        },
+        .alter_collation => {
+            const object_name = ast.object_name_tokens orelse return error.UnsupportedSqlShape;
+            const operation = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+            if (end < 6 or object_name.start != 2 or operation.start != object_name.end or operation.end != end) return error.UnsupportedSqlShape;
+            if (!tokens[0].matchesKeyword("alter") or !tokens[1].matchesKeywordTag(.collation)) return error.UnsupportedSqlShape;
+            if (!tokens[operation.start].matchesKeyword("rename")) return error.UnsupportedSqlShape;
+        },
+        .drop_collation => {
+            const object_name = ast.object_name_tokens orelse return error.UnsupportedSqlShape;
+            if (end < 3 or !tokens[0].matchesKeyword("drop") or !tokens[1].matchesKeywordTag(.collation)) return error.UnsupportedSqlShape;
+            var name_index: usize = 2;
+            const if_exists = consumeGeneratedPlanIfExists(tokens, &name_index, end);
+            if (if_exists != ast.if_exists or object_name.start != name_index or object_name.end > end) return error.UnsupportedSqlShape;
+        },
+        .create_aggregate => {
+            const object_name = ast.object_name_tokens orelse return error.UnsupportedSqlShape;
+            const operation = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+            if (end < 5 or object_name.start != 2 or operation.start != object_name.end or operation.end != end) return error.UnsupportedSqlShape;
+            if (!tokens[0].matchesKeyword("create") or !tokens[1].matchesKeywordTag(.aggregate)) return error.UnsupportedSqlShape;
+        },
+        .drop_aggregate => {
+            const object_name = ast.object_name_tokens orelse return error.UnsupportedSqlShape;
+            const operation = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+            var name_index: usize = 2;
+            const if_exists = consumeGeneratedPlanIfExists(tokens, &name_index, end);
+            if (if_exists != ast.if_exists or end < 4 or object_name.start != name_index or operation.start != object_name.end or operation.end != end) return error.UnsupportedSqlShape;
+            if (!tokens[0].matchesKeyword("drop") or !tokens[1].matchesKeywordTag(.aggregate)) return error.UnsupportedSqlShape;
+        },
+        .create_operator, .create_cast => {
+            const operation = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+            if (end < 4 or operation.start != 2 or operation.end != end) return error.UnsupportedSqlShape;
+            if (!tokens[0].matchesKeyword("create")) return error.UnsupportedSqlShape;
+            const expected: token_mod.TokenKeyword = switch (ast.kind) {
+                .create_operator => .operator,
+                .create_cast => .cast,
+                else => unreachable,
+            };
+            if (!tokens[1].matchesKeywordTag(expected)) return error.UnsupportedSqlShape;
+        },
+        .drop_operator, .drop_cast => {
+            const operation = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+            var operation_index: usize = 2;
+            const if_exists = consumeGeneratedPlanIfExists(tokens, &operation_index, end);
+            if (if_exists != ast.if_exists or end < 4 or operation.start != operation_index or operation.end != end) return error.UnsupportedSqlShape;
+            if (!tokens[0].matchesKeyword("drop")) return error.UnsupportedSqlShape;
+            const expected: token_mod.TokenKeyword = switch (ast.kind) {
+                .drop_operator => .operator,
+                .drop_cast => .cast,
+                else => unreachable,
+            };
+            if (!tokens[1].matchesKeywordTag(expected)) return error.UnsupportedSqlShape;
         },
         else => return error.UnsupportedSqlShape,
     }
@@ -4839,6 +4962,10 @@ fn validateGeneratedDdlAstSpans(
         .create_function,
         .create_procedure,
         .create_role,
+        .create_collation,
+        .create_operator,
+        .create_aggregate,
+        .create_cast,
         .create_index,
         .create_extension,
         .create_graph_index,
@@ -4856,6 +4983,7 @@ fn validateGeneratedDdlAstSpans(
         .alter_subscription,
         .alter_policy,
         .alter_role,
+        .alter_collation,
         => .alter,
         .drop_table,
         .drop_view,
@@ -4870,6 +4998,10 @@ fn validateGeneratedDdlAstSpans(
         .drop_function,
         .drop_procedure,
         .drop_role,
+        .drop_collation,
+        .drop_operator,
+        .drop_aggregate,
+        .drop_cast,
         .drop_index,
         .drop_schema,
         .drop_database,
@@ -8280,6 +8412,7 @@ pub fn dropOperatorPlanFromSyntax(syntax: *grammar.DropOperatorSyntax) DropOpera
     return .{
         .operator_name = operator_name,
         .argument_count = syntax.argument_count,
+        .if_exists = syntax.if_exists,
     };
 }
 
@@ -8299,6 +8432,7 @@ pub fn dropAggregatePlanFromSyntax(syntax: *grammar.DropAggregateSyntax) DropAgg
     return .{
         .aggregate_name = aggregate_name,
         .argument_count = syntax.argument_count,
+        .if_exists = syntax.if_exists,
     };
 }
 
@@ -8325,6 +8459,7 @@ pub fn dropCastPlanFromSyntax(syntax: *grammar.DropCastSyntax) DropCastPlan {
     return .{
         .source_type = source_type,
         .target_type = target_type,
+        .if_exists = syntax.if_exists,
     };
 }
 
@@ -13951,6 +14086,24 @@ test "sql adapter ddl plan lowers type system catalog ddl plans" {
                 .drop => |drop| {
                     try std.testing.expectEqualStrings("===", drop.operator_name);
                     try std.testing.expectEqual(@as(usize, 2), drop.argument_count);
+                    try std.testing.expect(!drop.if_exists);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_operator_if_exists = try lowerDdlPlanForTestAlloc(alloc, "DROP OPERATOR IF EXISTS === (text, text);");
+    defer drop_operator_if_exists.deinit(alloc);
+    switch (drop_operator_if_exists) {
+        .type_system_catalog => |plan| switch (plan) {
+            .operator => |operator| switch (operator) {
+                .drop => |drop| {
+                    try std.testing.expectEqualStrings("===", drop.operator_name);
+                    try std.testing.expectEqual(@as(usize, 2), drop.argument_count);
+                    try std.testing.expect(drop.if_exists);
                 },
                 else => return error.TestUnexpectedResult,
             },
@@ -13984,6 +14137,24 @@ test "sql adapter ddl plan lowers type system catalog ddl plans" {
                 .drop => |drop| {
                     try std.testing.expectEqualStrings("first_value_text", drop.aggregate_name);
                     try std.testing.expectEqual(@as(usize, 1), drop.argument_count);
+                    try std.testing.expect(!drop.if_exists);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_aggregate_if_exists = try lowerDdlPlanForTestAlloc(alloc, "DROP AGGREGATE IF EXISTS first_value_text(text);");
+    defer drop_aggregate_if_exists.deinit(alloc);
+    switch (drop_aggregate_if_exists) {
+        .type_system_catalog => |plan| switch (plan) {
+            .aggregate => |aggregate| switch (aggregate) {
+                .drop => |drop| {
+                    try std.testing.expectEqualStrings("first_value_text", drop.aggregate_name);
+                    try std.testing.expectEqual(@as(usize, 1), drop.argument_count);
+                    try std.testing.expect(drop.if_exists);
                 },
                 else => return error.TestUnexpectedResult,
             },
@@ -14018,6 +14189,7 @@ test "sql adapter ddl plan lowers type system catalog ddl plans" {
                 .drop => |drop| {
                     try std.testing.expectEqualStrings("jsonb", drop.source_type);
                     try std.testing.expectEqualStrings("text", drop.target_type);
+                    try std.testing.expect(!drop.if_exists);
                 },
                 else => return error.TestUnexpectedResult,
             },
@@ -14025,6 +14197,35 @@ test "sql adapter ddl plan lowers type system catalog ddl plans" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var drop_cast_if_exists = try lowerDdlPlanForTestAlloc(alloc, "DROP CAST IF EXISTS (jsonb AS text);");
+    defer drop_cast_if_exists.deinit(alloc);
+    switch (drop_cast_if_exists) {
+        .type_system_catalog => |plan| switch (plan) {
+            .cast => |cast| switch (cast) {
+                .drop => |drop| {
+                    try std.testing.expectEqualStrings("jsonb", drop.source_type);
+                    try std.testing.expectEqualStrings("text", drop.target_type);
+                    try std.testing.expect(drop.if_exists);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var malformed_generated_collation = try tokenized.ParsedSql.initAlloc(alloc, "ALTER COLLATION case_insensitive RENAME TO ci_text;");
+    defer malformed_generated_collation.deinit(alloc);
+    if (malformed_generated_collation.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.alter_table_operation_tokens = .{ .start = 2, .end = malformed_generated_collation.items().len },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_generated_collation));
 }
 
 test "sql adapter ddl plan lowers maintenance job ddl plans" {
@@ -14883,7 +15084,7 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
                 try std.testing.expect(drop.if_exists);
                 try std.testing.expect(drop.cascade);
                 try std.testing.expectEqualStrings("touch_generated_usage", drop.routine_name);
-                try std.testing.expectEqual(@as(usize, 1), drop.argument_types.len);
+                try std.testing.expectEqual(@as(usize, 1), drop.argument_count);
             },
             else => return error.TestUnexpectedResult,
         },
