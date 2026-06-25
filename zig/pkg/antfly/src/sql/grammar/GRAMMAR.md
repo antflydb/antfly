@@ -650,9 +650,9 @@ Unsupported DDL remains on the existing parser until
    pagination tail, or mismatch explicit `FETCH` count spans; it also
    validates top-level clause keyword layout and payload consistency for
    projection, `DISTINCT`, source, `WHERE`, `GROUP BY`, `HAVING`, `WINDOW`,
-   `ORDER BY`, pagination, set-operation tails, and generated top-level and
-   CTE-body join `ON`/`USING` condition keyword layout before invoking the
-   typed read-family lowerers.
+   `ORDER BY`, pagination, set-operation tails and right-hand `FROM`/`WHERE`
+   clauses, and generated top-level and CTE-body join `ON`/`USING` condition
+   keyword layout before invoking the typed read-family lowerers.
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current

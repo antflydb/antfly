@@ -3228,9 +3228,11 @@ fn validateGeneratedSetOperationAstRanges(
     try validateGeneratedReadListAstBoundaryExpressions(tokens, read_ast, set_operation.right_projection_items, &set_operation.right_projection_first_expression, &set_operation.right_projection_last_expression);
     if (set_operation.right_source_tokens) |source| {
         if (source.start <= projection.end or source.end > right_query.end) return error.UnsupportedSqlShape;
+        try validateGeneratedReadRangePrecededByKeyword(tokens, source, .from);
     }
     if (set_operation.right_where_tokens) |where| {
         if (where.start <= projection.end or where.end > right_query.end) return error.UnsupportedSqlShape;
+        try validateGeneratedReadRangePrecededByKeyword(tokens, where, .where);
         if (!generatedExpressionAstHasMetadata(set_operation.right_where_expression)) return error.UnsupportedSqlShape;
     } else if (generatedExpressionAstHasMetadata(set_operation.right_where_expression)) {
         return error.UnsupportedSqlShape;
@@ -5261,6 +5263,34 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_set_operation_parsed_sql, malformed_set_operation_read_ast),
+    );
+
+    malformed_set_operation_read_ast = switch (malformed_set_operation_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_set_operation_read_ast.set_operation.right_source_tokens =
+        malformed_set_operation_read_ast.set_operation.right_projection_tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_set_operation_parsed_sql, malformed_set_operation_read_ast),
+    );
+
+    var malformed_set_operation_where_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records UNION SELECT id FROM usage_archive WHERE status = 'ready'",
+    );
+    defer malformed_set_operation_where_parsed_sql.deinit(alloc);
+    const malformed_set_operation_where_generated_raw = malformed_set_operation_where_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_set_operation_where_read_ast = switch (malformed_set_operation_where_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_set_operation_where_read_ast.set_operation.right_where_tokens =
+        malformed_set_operation_where_read_ast.set_operation.right_source_tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_set_operation_where_parsed_sql, malformed_set_operation_where_read_ast),
     );
 
     var malformed_window_parsed_sql = try tokenized.ParsedSql.initAlloc(
