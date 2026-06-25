@@ -3013,32 +3013,124 @@ pub fn sessionCatalogPlanFromGeneratedAstAlloc(
     };
 }
 
-fn generatedSessionAstUsesDirectLowerer(
-    tokens: []const grammar.Token,
-    ast: generated_parser.GeneratedSqlSessionAst,
-) bool {
-    return switch (ast.kind) {
-        .set, .reset, .show => generatedSessionNameContainsText(tokens, ast.name_tokens, "search_path"),
-        .discard_all => true,
-    };
-}
-
-fn generatedSessionNameContainsText(
-    tokens: []const grammar.Token,
-    maybe_range: ?generated_parser.GeneratedSqlTokenRange,
-    text: []const u8,
-) bool {
-    const range = maybe_range orelse return false;
-    if (range.end > tokens.len or range.start >= range.end) return false;
-    for (tokens[range.start..range.end]) |token| {
-        if (std.ascii.eqlIgnoreCase(token.text, text)) return true;
-    }
-    return false;
-}
-
 pub fn transactionBoundaryPlanFromGeneratedAst(ast: generated_parser.GeneratedSqlTransactionAst) LoweredDdlPlan {
     _ = ast;
     return .{ .adapter_noop = .{ .reason = .transaction_control } };
+}
+
+pub fn sessionDdlPlanFromGeneratedAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlSessionAst,
+) !LoweredDdlPlan {
+    _ = try validateGeneratedSessionAstRanges(tokens, ast);
+    const tail = generatedStatementTail(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    var pos: usize = 0;
+    return switch (ast.kind) {
+        .set => blk: {
+            if (tokens.len == 0 or !tokens[0].matchesKeywordTag(.set)) return error.UnsupportedSqlShape;
+            if (tail.len > 0 and tail[0].matchesKeyword("session")) {
+                const checkpoint = pos;
+                if (parseSetSessionCharacteristicsPlanTailAlloc(alloc, tail, &pos)) |plan| {
+                    break :blk .{ .session_catalog = .{ .set_setting = plan } };
+                } else |err| switch (err) {
+                    error.UnsupportedSqlShape => pos = checkpoint,
+                    else => return err,
+                }
+            }
+            pos = 0;
+            if (parseSetSearchPathPlanTailAlloc(alloc, tail, &pos)) |plan| {
+                break :blk .{ .session_catalog = .{ .set_search_path = plan } };
+            } else |err| switch (err) {
+                error.UnsupportedSqlShape => pos = 0,
+                else => return err,
+            }
+            if (grammar.parseAdapterNoopSetStatementTail(tail, &pos)) {
+                break :blk .{ .adapter_noop = .{ .reason = .session_setting } };
+            } else |err| switch (err) {
+                error.UnsupportedSqlShape => pos = 0,
+            }
+            if (grammar.parseSetSessionSettingTailAlloc(alloc, tail, &pos)) |plan| {
+                break :blk .{ .session_catalog = .{ .set_setting = plan } };
+            } else |err| switch (err) {
+                error.UnsupportedSqlShape => return err,
+                else => return err,
+            }
+        },
+        .reset => blk: {
+            if (tokens.len == 0 or !tokens[0].matchesKeywordTag(.reset)) return error.UnsupportedSqlShape;
+            if (sessionCatalogPlanFromGeneratedAstAlloc(alloc, tokens, ast)) |plan| {
+                break :blk .{ .session_catalog = plan };
+            } else |err| switch (err) {
+                error.UnsupportedSqlShape => pos = 0,
+                else => return err,
+            }
+            try grammar.parseAdapterNoopResetStatementTail(tail, &pos);
+            break :blk .{ .adapter_noop = .{ .reason = .session_setting } };
+        },
+        .show => blk: {
+            if (tokens.len == 0 or !tokens[0].matchesKeywordTag(.show)) return error.UnsupportedSqlShape;
+            if (sessionCatalogPlanFromGeneratedAstAlloc(alloc, tokens, ast)) |plan| {
+                break :blk .{ .session_catalog = plan };
+            } else |err| switch (err) {
+                error.UnsupportedSqlShape => pos = 0,
+                else => return err,
+            }
+            try grammar.parseAdapterNoopShowStatementTail(tail, &pos);
+            break :blk .{ .adapter_noop = .{ .reason = .session_setting } };
+        },
+        .discard_all => blk: {
+            if (tokens.len == 0 or !tokens[0].matchesKeywordTag(.discard)) return error.UnsupportedSqlShape;
+            break :blk .{ .session_catalog = try sessionCatalogPlanFromGeneratedAstAlloc(alloc, tokens, ast) };
+        },
+    };
+}
+
+fn validateGeneratedSessionAstRanges(
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlSessionAst,
+) !usize {
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    if (end == 0) return error.UnsupportedSqlShape;
+    if (tokens[0].source_start != ast.command_span.start or tokens[0].source_end != ast.command_span.end) {
+        return error.UnsupportedSqlShape;
+    }
+    switch (ast.kind) {
+        .set => {
+            const name = ast.name_tokens orelse return error.UnsupportedSqlShape;
+            try validateGeneratedOptionalSessionRange(name, 1, end);
+            if (ast.value_tokens) |value| {
+                try validateGeneratedOptionalSessionRange(value, 1, end);
+                if (name.end > value.start) return error.UnsupportedSqlShape;
+            }
+        },
+        .reset, .show => {
+            const name = ast.name_tokens orelse return error.UnsupportedSqlShape;
+            try validateGeneratedRequiredSessionRange(name, 1, end);
+            if (ast.value_tokens != null) return error.UnsupportedSqlShape;
+        },
+        .discard_all => {
+            if (ast.name_tokens != null or ast.value_tokens != null) return error.UnsupportedSqlShape;
+        },
+    }
+    return end;
+}
+
+fn validateGeneratedOptionalSessionRange(
+    range: generated_parser.GeneratedSqlTokenRange,
+    min_start: usize,
+    end: usize,
+) !void {
+    if (range.start < min_start or range.start > range.end or range.end > end) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedRequiredSessionRange(
+    range: generated_parser.GeneratedSqlTokenRange,
+    min_start: usize,
+    end: usize,
+) !void {
+    try validateGeneratedOptionalSessionRange(range, min_start, end);
+    if (range.start == range.end) return error.UnsupportedSqlShape;
 }
 
 pub fn simpleDdlPlanFromGeneratedAstAlloc(
@@ -3111,14 +3203,12 @@ fn setSessionCatalogPlanFromGeneratedTailAlloc(alloc: std.mem.Allocator, tail: [
 
 fn resetSessionCatalogPlanFromGeneratedTailAlloc(alloc: std.mem.Allocator, tail: []const grammar.Token) !SessionCatalogPlan {
     var pos: usize = 0;
-    grammar.parseResetSearchPathTail(tail, &pos) catch |err| switch (err) {
-        error.UnsupportedSqlShape => {},
-    };
-    if (pos > 0) {
+    if (grammar.parseResetSearchPathTail(tail, &pos)) {
         return .reset_search_path;
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => pos = 0,
     }
 
-    pos = 0;
     if (grammar.parseResetSessionSettingTailAlloc(alloc, tail, &pos)) |plan| {
         return .{ .reset_setting = plan };
     } else |err| switch (err) {
@@ -8605,11 +8695,7 @@ pub fn lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(
     if (parsed_sql.generated_statement) |generated_statement| {
         if (generated_statement.ast) |generated_ast| {
             switch (generated_ast) {
-                .session => |session_ast| {
-                    if (generatedSessionAstUsesDirectLowerer(tokens, session_ast)) {
-                        return .{ .session_catalog = try sessionCatalogPlanFromGeneratedAstAlloc(alloc, tokens, session_ast) };
-                    }
-                },
+                .session => |session_ast| return try sessionDdlPlanFromGeneratedAstAlloc(alloc, tokens, session_ast),
                 .prepared => |prepared_ast| return .{ .prepared_statement = try preparedStatementPlanFromGeneratedAstAlloc(alloc, tokens, prepared_ast) },
                 .ddl, .extension_index => |ddl_ast| switch (ddl_ast.kind) {
                     .create_database,
@@ -12573,6 +12659,31 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
         else => return error.TestUnexpectedResult,
     }
 
+    var session_setting = try tokenized.ParsedSql.initAlloc(alloc, "SET app.tenant_id = 'tenant-a';");
+    defer session_setting.deinit(alloc);
+    var session_setting_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &session_setting);
+    defer session_setting_plan.deinit(alloc);
+    switch (session_setting_plan) {
+        .session_catalog => |plan| switch (plan) {
+            .set_setting => |setting| {
+                try std.testing.expectEqualStrings("app.tenant_id", setting.name);
+                try std.testing.expectEqualStrings("tenant-a", setting.value);
+                try std.testing.expectEqual(SessionSettingKind.app, setting.kind);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var session_noop = try tokenized.ParsedSql.initAlloc(alloc, "SET client_encoding = 'UTF8';");
+    defer session_noop.deinit(alloc);
+    var session_noop_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &session_noop);
+    defer session_noop_plan.deinit(alloc);
+    switch (session_noop_plan) {
+        .adapter_noop => |noop| try std.testing.expectEqual(AdapterNoopDdlReason.session_setting, noop.reason),
+        else => return error.TestUnexpectedResult,
+    }
+
     var prepared = try tokenized.ParsedSql.initAlloc(alloc, "PREPARE usage_by_status(text) AS SELECT id FROM usage_records WHERE status = $1;");
     defer prepared.deinit(alloc);
     var prepared_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &prepared);
@@ -12613,6 +12724,18 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_generated_ddl));
+
+    var malformed_generated_session = try tokenized.ParsedSql.initAlloc(alloc, "SET search_path TO public;");
+    defer malformed_generated_session.deinit(alloc);
+    if (malformed_generated_session.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .session => |*session_ast| session_ast.name_tokens = .{ .start = 0, .end = 1 },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_generated_session));
 }
 
 test "sql adapter generated create table and index AST lowers to DDL plans" {
