@@ -943,9 +943,11 @@ Generated grammar work needs evidence at multiple levels:
   metadata plus generated child-read validation for recursive CTE insert-source, update, delete, and merge
   write-plan variants,
   generated-first write lowering context
-  dispatch, fail-closed generated DML dispatch when retained generated AST
-  metadata is malformed, and generated-family validation over other
-  representative write plans. Read plans have initial
+  dispatch, generated DML AST kind now drives parsed-statement write-family
+  classification for generated-covered writes with fail-closed classifier
+  disagreement checks, fail-closed generated DML dispatch when retained
+  generated AST metadata is malformed, and generated-family validation over
+  other representative write plans. Read plans have initial
   generated AST-to-plan parity through generated-first read lowering context
   dispatch, generated read AST kind now drives parsed-statement read-family
   classification for generated-covered reads with fail-closed classifier

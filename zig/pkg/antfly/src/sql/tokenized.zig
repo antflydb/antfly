@@ -498,7 +498,16 @@ fn parseStatement(
             .prepared => return .{ .prepared = .{ .raw = raw_statement } },
             .ddl => return .{ .ddl = .{ .raw = raw_statement } },
             .extension_index => return .{ .ddl = .{ .raw = raw_statement } },
-            .dml => if (tokenized_sql.write_statement_kind) |kind| return .{ .write = .{ .kind = kind, .raw = raw_statement } },
+            .dml => if (generatedDmlStatementKind(generated_raw)) |generated| {
+                const classified_recursive_kind = if (generated.recursive) classifier.classifyRecursiveWriteStatement(tokenized_sql.items()) else null;
+                if (classified_recursive_kind orelse tokenized_sql.write_statement_kind) |classified_kind| {
+                    if (!generatedDmlStatementKindMatchesWriteKind(generated.kind, classified_kind)) return .{ .unknown = raw_statement };
+                    return .{ .write = .{ .kind = classified_kind, .raw = raw_statement, .recursive = generated.recursive } };
+                }
+                return .{ .write = .{ .kind = generated.defaultWriteKind(), .raw = raw_statement, .recursive = generated.recursive } };
+            } else if (tokenized_sql.write_statement_kind) |kind| {
+                return .{ .write = .{ .kind = kind, .raw = raw_statement } };
+            },
             .read => if (generatedReadStatementKind(tokenized_sql.items(), generated_raw)) |kind| {
                 if (tokenized_sql.read_statement_kind) |classified_kind| {
                     if (classified_kind != kind) return .{ .unknown = raw_statement };
@@ -524,6 +533,53 @@ fn parseStatement(
     return switch (tokenized_sql.statement_family orelse return .{ .unknown = raw_statement }) {
         .ddl => classifyDdlLikeStatement(raw_statement, tokenized_sql.items()),
         else => .{ .unknown = raw_statement },
+    };
+}
+
+const GeneratedDmlStatementKind = struct {
+    kind: generated_parser.GeneratedSqlDmlKind,
+    recursive: bool = false,
+
+    fn defaultWriteKind(self: @This()) classifier.SqlWriteStatementKind {
+        return switch (self.kind) {
+            .insert_values => .insert,
+            .insert_select => .insert_source,
+            .update => .update,
+            .delete => .delete,
+            .truncate => .truncate,
+            .merge => .merge,
+        };
+    }
+};
+
+fn generatedDmlStatementKind(
+    generated_raw: GeneratedRawSqlStatement,
+) ?GeneratedDmlStatementKind {
+    const ast_value = generated_raw.ast orelse return null;
+    const dml_ast = switch (ast_value) {
+        .dml => |dml| dml,
+        else => return null,
+    };
+    return .{ .kind = dml_ast.kind, .recursive = dml_ast.cte_recursive };
+}
+
+fn generatedDmlStatementKindMatchesWriteKind(
+    generated_kind: generated_parser.GeneratedSqlDmlKind,
+    write_kind: classifier.SqlWriteStatementKind,
+) bool {
+    return switch (generated_kind) {
+        .insert_values => write_kind == .insert,
+        .insert_select => write_kind == .insert_source,
+        .update => switch (write_kind) {
+            .update, .update_source, .update_joined_source => true,
+            else => false,
+        },
+        .delete => switch (write_kind) {
+            .delete, .delete_source, .delete_joined_source => true,
+            else => false,
+        },
+        .truncate => write_kind == .truncate,
+        .merge => write_kind == .merge,
     };
 }
 
@@ -1601,6 +1657,49 @@ test "sql adapter parsed sql retains generated DML nodes for covered write corpu
             else => return error.TestUnexpectedResult,
         }
     }
+}
+
+test "sql adapter parsed sql write statement kind can come from generated AST" {
+    const alloc = std.testing.allocator;
+
+    var generated_insert_source = try ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) SELECT id FROM incoming_usage");
+    defer generated_insert_source.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.dml, generated_insert_source.generatedStatementKind().?);
+
+    generated_insert_source.tokenized_sql.write_statement_kind = null;
+    generated_insert_source.statement = parseStatement(generated_insert_source.raw_statement, generated_insert_source.generated_statement, &generated_insert_source.tokenized_sql);
+    try std.testing.expectEqual(classifier.SqlWriteStatementKind.insert_source, generated_insert_source.writeStatementKind().?);
+
+    var generated_recursive_insert = try ParsedSql.initAlloc(alloc, "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) INSERT INTO archive(id) SELECT id FROM source_rows");
+    defer generated_recursive_insert.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.dml, generated_recursive_insert.generatedStatementKind().?);
+
+    generated_recursive_insert.tokenized_sql.write_statement_kind = null;
+    generated_recursive_insert.statement = parseStatement(generated_recursive_insert.raw_statement, generated_recursive_insert.generated_statement, &generated_recursive_insert.tokenized_sql);
+    try std.testing.expectEqual(classifier.SqlWriteStatementKind.insert_source, generated_recursive_insert.writeStatementKind().?);
+    try std.testing.expect(generated_recursive_insert.isRecursiveWriteStatement());
+
+    var generated_recursive_update = try ParsedSql.initAlloc(
+        alloc,
+        "WITH RECURSIVE source_rows AS (SELECT id, status FROM incoming_usage) UPDATE usage_records SET status = source_rows.status FROM source_rows WHERE usage_records.id = source_rows.id",
+    );
+    defer generated_recursive_update.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.dml, generated_recursive_update.generatedStatementKind().?);
+    try std.testing.expectEqual(classifier.SqlWriteStatementKind.update_joined_source, generated_recursive_update.writeStatementKind().?);
+    try std.testing.expect(generated_recursive_update.isRecursiveWriteStatement());
+}
+
+test "sql adapter parsed sql write statement kind fails closed on classifier disagreement" {
+    const alloc = std.testing.allocator;
+
+    var generated_insert = try ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id, status) VALUES ('u1', 'open')");
+    defer generated_insert.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.dml, generated_insert.generatedStatementKind().?);
+
+    generated_insert.tokenized_sql.write_statement_kind = .delete;
+    generated_insert.statement = parseStatement(generated_insert.raw_statement, generated_insert.generated_statement, &generated_insert.tokenized_sql);
+    try std.testing.expect(generated_insert.writeStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_insert.statement));
 }
 
 test "sql adapter parsed sql retains generated read nodes for covered query corpus" {
