@@ -3241,6 +3241,8 @@ pub fn simpleDdlPlanFromGeneratedAstAlloc(
         .create_database => .{ .database_catalog = .{ .create = try createDatabasePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
         .create_schema => .{ .schema_namespace_catalog = .{ .create = try createSchemaNamespacePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
         .create_extension => .{ .extension_catalog = .{ .create = try createExtensionPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, catalog_resources.default_namespace_name) } },
+        .alter_database => .{ .database_catalog = .{ .alter = try alterDatabasePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
+        .alter_extension => .{ .extension_catalog = .{ .update = try updateExtensionPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
         .alter_schema => .{ .schema_namespace_catalog = .{ .rename = try renameSchemaNamespacePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
         .drop_database => .{ .database_catalog = .{ .drop = try dropDatabasePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
         .drop_schema => .{ .schema_namespace_catalog = .{ .drop = try dropSchemaNamespacePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
@@ -3346,6 +3348,8 @@ fn generatedDdlUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated
         .create_enum_type,
         .create_tablespace,
         .create_extension,
+        .alter_database,
+        .alter_extension,
         .alter_schema,
         .alter_tablespace,
         .alter_view,
@@ -4589,6 +4593,52 @@ fn createExtensionPlanFromGeneratedDdlAstAlloc(
     return try createExtensionPlanFromSyntax(&syntax, default_namespace_name);
 }
 
+fn alterDatabasePlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+) !AlterDatabasePlan {
+    const end = try requireGeneratedDdlHeader(tokens, ast.statement_span, .alter, .database);
+    const name_range = try requireGeneratedTokenRangeAt(ast.object_name_tokens, 2, end);
+    const operation_range = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+    if (operation_range.start != name_range.end or operation_range.end != end or operation_range.start >= operation_range.end) return error.UnsupportedSqlShape;
+
+    var pos: usize = 1;
+    var plan = try parseAlterDatabasePlanTailAlloc(alloc, tokens, &pos);
+    errdefer plan.deinit(alloc);
+    if (!generatedStatementConsumedThrough(tokens, end, pos)) return error.UnsupportedSqlShape;
+
+    const generated_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, name_range);
+    defer alloc.free(@constCast(generated_name));
+    if (!std.ascii.eqlIgnoreCase(generated_name, plan.database_name)) return error.UnsupportedSqlShape;
+    return plan;
+}
+
+fn updateExtensionPlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+) !UpdateExtensionPlan {
+    const end = try requireGeneratedDdlHeader(tokens, ast.statement_span, .alter, .extension);
+    const name_range = try requireGeneratedTokenRangeAt(ast.object_name_tokens, 2, end);
+    const operation_range = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+    if (operation_range.start != name_range.end or operation_range.end != end or operation_range.start >= operation_range.end) return error.UnsupportedSqlShape;
+    if (ast.version_tokens) |version_range| {
+        if (version_range.start < operation_range.start or version_range.end > operation_range.end or version_range.start + 1 != version_range.end) return error.UnsupportedSqlShape;
+        if (tokens[version_range.start].kind != .string) return error.UnsupportedSqlShape;
+    }
+
+    var pos: usize = 1;
+    var plan = try parseUpdateExtensionPlanTailAlloc(alloc, tokens, &pos);
+    errdefer plan.deinit(alloc);
+    if (!generatedStatementConsumedThrough(tokens, end, pos)) return error.UnsupportedSqlShape;
+
+    const generated_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, name_range);
+    defer alloc.free(@constCast(generated_name));
+    if (!std.ascii.eqlIgnoreCase(generated_name, plan.extension_name)) return error.UnsupportedSqlShape;
+    return plan;
+}
+
 fn renameSchemaNamespacePlanFromGeneratedDdlAstAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
@@ -4977,6 +5027,8 @@ fn validateGeneratedDdlAstSpans(
         => .create,
         .relation_population => unreachable,
         .alter_table,
+        .alter_database,
+        .alter_extension,
         .alter_schema,
         .alter_tablespace,
         .alter_view,
@@ -14934,6 +14986,8 @@ test "sql adapter generated simple DDL AST lowers to catalog plans" {
         "CREATE DATABASE tenant_ops;",
         "CREATE SCHEMA IF NOT EXISTS analytics;",
         "CREATE EXTENSION vector;",
+        "ALTER DATABASE tenant_ops SET timezone TO 'UTC';",
+        "ALTER EXTENSION vector UPDATE;",
         "DROP DATABASE tenant_ops;",
         "DROP SCHEMA analytics CASCADE;",
         "DROP EXTENSION IF EXISTS vector CASCADE;",
@@ -14984,6 +15038,37 @@ test "sql adapter generated simple DDL AST lowers to catalog plans" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var generated_alter_database = try generatedSimpleDdlPlanForTestAlloc(alloc, "ALTER DATABASE tenant_ops SET timezone TO 'UTC';");
+    defer generated_alter_database.deinit(alloc);
+    switch (generated_alter_database) {
+        .database_catalog => |catalog| switch (catalog) {
+            .alter => |plan| {
+                try std.testing.expectEqualStrings("tenant_ops", plan.database_name);
+                try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+                switch (plan.operations[0]) {
+                    .set_parameter => |operation| {
+                        try std.testing.expectEqualStrings("timezone", operation.name);
+                        try std.testing.expectEqualStrings("\"UTC\"", operation.value_json);
+                    },
+                }
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var malformed_alter_database = try tokenized.ParsedSql.initAlloc(alloc, "ALTER DATABASE tenant_ops SET timezone TO 'UTC';");
+    defer malformed_alter_database.deinit(alloc);
+    if (malformed_alter_database.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.alter_table_operation_tokens = .{ .start = 2, .end = malformed_alter_database.items().len },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_alter_database));
 
     var generated_create_schema = try generatedSimpleDdlPlanForTestAlloc(alloc, "CREATE SCHEMA IF NOT EXISTS public.analytics;");
     defer generated_create_schema.deinit(alloc);
@@ -15050,6 +15135,44 @@ test "sql adapter generated simple DDL AST lowers to catalog plans" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var generated_update_extension = try generatedSimpleDdlPlanForTestAlloc(alloc, "ALTER EXTENSION postgis UPDATE TO '3.5.0';");
+    defer generated_update_extension.deinit(alloc);
+    switch (generated_update_extension) {
+        .extension_catalog => |catalog| switch (catalog) {
+            .update => |plan| {
+                try std.testing.expectEqualStrings("postgis", plan.extension_name);
+                try std.testing.expectEqualStrings("3.5.0", plan.target_version.?);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var generated_update_extension_latest = try generatedSimpleDdlPlanForTestAlloc(alloc, "ALTER EXTENSION postgis UPDATE;");
+    defer generated_update_extension_latest.deinit(alloc);
+    switch (generated_update_extension_latest) {
+        .extension_catalog => |catalog| switch (catalog) {
+            .update => |plan| {
+                try std.testing.expectEqualStrings("postgis", plan.extension_name);
+                try std.testing.expect(plan.target_version == null);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var malformed_update_extension = try tokenized.ParsedSql.initAlloc(alloc, "ALTER EXTENSION postgis UPDATE TO '3.5.0';");
+    defer malformed_update_extension.deinit(alloc);
+    if (malformed_update_extension.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.version_tokens = .{ .start = 4, .end = 5 },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_update_extension));
 
     var generated_drop_extension = try generatedSimpleDdlPlanForTestAlloc(alloc, "DROP EXTENSION IF EXISTS postgis CASCADE;");
     defer generated_drop_extension.deinit(alloc);

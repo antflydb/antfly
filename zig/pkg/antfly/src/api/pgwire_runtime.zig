@@ -21,7 +21,7 @@ pub const OptionalListenerConfig = struct {
     default_bind_host: []const u8,
     bind_port: ?u16 = null,
     auth_enabled: bool = false,
-    auth_error_message: []const u8 = "pgwire listener does not support auth yet; disable auth or omit --pgwire-port",
+    auth_error_message: []const u8 = "pgwire password authentication requires a public API user manager",
     api_server: ?*http_server.ApiHttpServer = null,
 };
 
@@ -39,14 +39,14 @@ pub fn startOptional(alloc: std.mem.Allocator, cfg: OptionalListenerConfig) !?pg
     const bind_port = cfg.bind_port orelse {
         return null;
     };
-    if (cfg.auth_enabled) {
-        std.log.err("{s}", .{cfg.auth_error_message});
-        return error.InvalidArguments;
-    }
     const api_server = cfg.api_server orelse {
         std.log.err("pgwire listener requires a public API server; omit --pgwire-port", .{});
         return error.InvalidArguments;
     };
+    if ((cfg.auth_enabled or api_server.cfg.trusted_principal_secret != null) and api_server.cfg.user_manager == null) {
+        std.log.err("{s}", .{cfg.auth_error_message});
+        return error.InvalidArguments;
+    }
     return try pgwire.start(alloc, .{
         .bind_host = cfg.bind_host orelse cfg.default_bind_host,
         .bind_port = bind_port,

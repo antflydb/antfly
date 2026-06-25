@@ -3047,7 +3047,7 @@ fn printUsage() void {
         \\  --host <host>                         Public API host (default: 127.0.0.1)
         \\  --port <port>                         Public API port (default: 8080)
         \\  --pgwire-host <host>                  Pgwire bind host (default: --host)
-        \\  --pgwire-port <port>                  Enable unauthenticated pgwire TCP listener on this port
+        \\  --pgwire-port <port>                  Enable pgwire TCP listener on this port
         \\  --id <node-id>                        Local node id (default: 1)
         \\  --health <true|false>                 Enable health/metrics server (default: true)
         \\  --health-port <port>                  Dedicated health/metrics port on --host (default: 4200)

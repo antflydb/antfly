@@ -420,6 +420,7 @@ def _swarm_stateful_command(
     port: int,
     root: Path,
     pgwire_port: int | None = None,
+    auth_enabled: bool = False,
 ) -> list[str]:
     command = [
         binary,
@@ -441,6 +442,8 @@ def _swarm_stateful_command(
         "--snapshot-root-dir",
         str(root / "snapshots"),
     ]
+    if auth_enabled:
+        command.extend(["--auth", "true"])
     if pgwire_port is not None:
         command.extend(["--pgwire-host", host, "--pgwire-port", str(pgwire_port)])
     return command
@@ -649,11 +652,12 @@ class StatefulAntflyServer:
 
 
 class SwarmAntflyServer:
-    def __init__(self, binary: str, host: str, port: int, *, pgwire_port: int | None = None):
+    def __init__(self, binary: str, host: str, port: int, *, pgwire_port: int | None = None, auth_enabled: bool = False):
         self.binary = binary
         self.host = host
         self.port = port
         self.pgwire_port = pgwire_port
+        self.auth_enabled = auth_enabled
         self.url = f"http://{host}:{port}"
         self.pgwire_url = f"http://{host}:{pgwire_port}" if pgwire_port is not None else None
         self.api_url = antfly_public_api_url(self.url, binary=binary)
@@ -674,9 +678,10 @@ class SwarmAntflyServer:
             port=self.port,
             root=self.root,
             pgwire_port=self.pgwire_port,
+            auth_enabled=self.auth_enabled,
         )
         self.proc = subprocess.Popen(command, stdout=self.log_file, stderr=subprocess.STDOUT, cwd=self.root)
-        if not wait_for_server(self.api_url):
+        if not wait_for_server(self.api_url, allow_unauthorized=self.auth_enabled):
             self.stop()
             out = _read_log_tail(self.log_path)
             raise RuntimeError(f"Swarm API server failed to start at {self.api_url}\n{out}")

@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const antfly_client = @import("antfly-client");
+const platform = @import("antfly_platform");
 const lite_sql = @import("../lite_sql.zig");
 const cli = @import("mod.zig");
 
@@ -29,6 +30,8 @@ const SqlCliOptions = struct {
     pgwire_host: []const u8 = "127.0.0.1",
     pgwire_host_set: bool = false,
     pgwire_port: ?u16 = null,
+    pgwire_user: []const u8 = "antfly",
+    pgwire_password: ?[]const u8 = null,
     catalog: cli.CatalogFlags = .{},
 };
 
@@ -112,6 +115,8 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
 
 fn parseArgs(args: *std.process.Args.Iterator) SqlCliOptions {
     var opts = SqlCliOptions{ .catalog = cli.CatalogFlags.defaultsFromEnv() };
+    opts.pgwire_user = defaultPgwireUser();
+    opts.pgwire_password = defaultPgwirePassword();
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--command")) {
             opts.command = args.next() orelse cli.fatal("{s} requires a SQL statement", .{arg});
@@ -130,6 +135,10 @@ fn parseArgs(args: *std.process.Args.Iterator) SqlCliOptions {
         } else if (std.mem.eql(u8, arg, "--pgwire-port")) {
             const raw = args.next() orelse cli.fatal("--pgwire-port requires a port", .{});
             opts.pgwire_port = std.fmt.parseInt(u16, raw, 10) catch cli.fatal("invalid --pgwire-port: {s}", .{raw});
+        } else if (std.mem.eql(u8, arg, "--pgwire-user")) {
+            opts.pgwire_user = args.next() orelse cli.fatal("--pgwire-user requires a user", .{});
+        } else if (std.mem.eql(u8, arg, "--pgwire-password")) {
+            opts.pgwire_password = args.next() orelse cli.fatal("--pgwire-password requires a password", .{});
         } else if (cli.parseCatalogFlag(&opts.catalog, arg, args)) {
             continue;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -164,7 +173,7 @@ fn runPgwire(allocator: std.mem.Allocator, io: std.Io, opts: SqlCliOptions, port
         .reader = &reader_state.interface,
         .writer = &writer_state.interface,
     };
-    try pgwire.startup(opts.catalog);
+    try pgwire.startup(opts.catalog, opts.pgwire_user, opts.pgwire_password);
 
     if (opts.command) |sql| {
         if (!try executePgwireSqlText(allocator, io, &pgwire, sql, true)) {
@@ -473,8 +482,10 @@ fn printUsage() void {
         \\  --port <port>        HTTP API port (default: 8080 when --host is used)
         \\
         \\Pgwire options:
-        \\  --pgwire-host <host>  Pgwire host (default: 127.0.0.1)
-        \\  --pgwire-port <port>  Connect through the PostgreSQL wire adapter
+        \\  --pgwire-host <host>      Pgwire host (default: 127.0.0.1)
+        \\  --pgwire-port <port>      Connect through the PostgreSQL wire adapter
+        \\  --pgwire-user <user>      Pgwire user (default: ANTFLY_PGWIRE_USER, PGUSER, or antfly)
+        \\  --pgwire-password <pass>  Pgwire password (default: ANTFLY_PGWIRE_PASSWORD or PGPASSWORD)
         \\
     , .{});
 }
@@ -484,11 +495,11 @@ const PgwireConnection = struct {
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
 
-    fn startup(self: *PgwireConnection, catalog: cli.CatalogFlags) !void {
+    fn startup(self: *PgwireConnection, catalog: cli.CatalogFlags, user: []const u8, password: ?[]const u8) !void {
         var payload: std.Io.Writer.Allocating = .init(self.allocator);
         defer payload.deinit();
         try payload.writer.writeInt(i32, 196608, .big);
-        try writeStartupParam(&payload.writer, "user", "antfly");
+        try writeStartupParam(&payload.writer, "user", user);
         if (catalog.database) |database| try writeStartupParam(&payload.writer, "database", database);
         if (catalog.namespace) |namespace| {
             const options = try std.fmt.allocPrint(self.allocator, "-c search_path={s}", .{namespace});
@@ -507,8 +518,18 @@ const PgwireConnection = struct {
             defer self.allocator.free(message);
             switch (tag) {
                 'R' => {
-                    if (message.len < 4 or std.mem.readInt(i32, message[0..4], .big) != 0) {
-                        return error.PgwireAuthenticationUnsupported;
+                    if (message.len < 4) return error.InvalidPgwireMessage;
+                    const auth_code = std.mem.readInt(i32, message[0..4], .big);
+                    switch (auth_code) {
+                        0 => {},
+                        3 => {
+                            const value = password orelse {
+                                std.debug.print("pgwire server requested a password; use --pgwire-password or PGPASSWORD\n", .{});
+                                return error.PgwirePasswordRequired;
+                            };
+                            try self.sendPassword(value);
+                        },
+                        else => return error.PgwireAuthenticationUnsupported,
                     }
                 },
                 'S', 'K' => {},
@@ -526,6 +547,14 @@ const PgwireConnection = struct {
                 else => {},
             }
         }
+    }
+
+    fn sendPassword(self: *PgwireConnection, password: []const u8) !void {
+        try self.writer.writeByte('p');
+        try self.writer.writeInt(i32, @intCast(password.len + 5), .big);
+        try self.writer.writeAll(password);
+        try self.writer.writeByte(0);
+        try self.writer.flush();
     }
 
     fn simpleQuery(self: *PgwireConnection, sql: []const u8) !PgwireResult {
@@ -578,6 +607,17 @@ const PgwireConnection = struct {
         return try self.reader.readAlloc(self.allocator, @intCast(len - 4));
     }
 };
+
+fn defaultPgwireUser() []const u8 {
+    return platform.env.getenv("ANTFLY_PGWIRE_USER") orelse
+        platform.env.getenv("PGUSER") orelse
+        "antfly";
+}
+
+fn defaultPgwirePassword() ?[]const u8 {
+    return platform.env.getenv("ANTFLY_PGWIRE_PASSWORD") orelse
+        platform.env.getenv("PGPASSWORD");
+}
 
 const PgwireResult = struct {
     columns: []const []const u8 = &.{},

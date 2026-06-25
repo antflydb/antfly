@@ -22,6 +22,7 @@ const inference_runtime_build = @import("pkg/inference/build/runtime.zig");
 
 const LmdbBackend = antfly_storage_build.LmdbBackend;
 const DBTestFilters = antfly_tests_build.DBTestFilters;
+const DBTestStep = antfly_tests_build.DBTestStep;
 const chainLabeledFilteredTests = antfly_tests_build.chainLabeledFilteredTests;
 const chainLabeledRun = antfly_tests_build.chainLabeledRun;
 const configureEmbeddedModule = antfly_embedded_build.configureModule;
@@ -189,6 +190,21 @@ fn addFilteredTestStep(
     const step = b.step(step_name, description);
     step.dependOn(&run.step);
     return run;
+}
+
+fn addDBFilteredTestStep(
+    b: *std.Build,
+    root_module: *std.Build.Module,
+    db_step: DBTestStep,
+) *std.Build.Step.Run {
+    return addFilteredTestStep(
+        b,
+        root_module,
+        db_step.name,
+        db_step.description,
+        db_step.filters,
+        .{ .simple_runner = db_step.simple_runner },
+    );
 }
 
 fn addDelegatedPackageStep(
@@ -3538,19 +3554,13 @@ pub fn build(b: *std.Build) void {
     };
     const run_lib_data_storage_tests = addFilteredTestStep(b, data_storage_test_mod, "lib-data-storage-test", "Run focused data storage tests", &lib_data_storage_default_filters, .{ .simple_runner = true });
 
-    _ = addFilteredTestStep(b, lib_test_mod, "lib-db-enrichment-test", "Run root-module DB enrichment/replay/cutover tests", &DBTestFilters.enrichment, .{});
-    _ = addFilteredTestStep(b, lib_test_mod, "lib-db-enrichment-worker-test", "Run root-module DB enrichment worker tests", &DBTestFilters.enrichment_worker, .{});
-    _ = addFilteredTestStep(b, lib_test_mod, "lib-db-enrichment-replay-test", "Run root-module DB enrichment replay tests", &DBTestFilters.enrichment_replay, .{});
-    _ = addFilteredTestStep(b, lib_test_mod, "lib-db-enrichment-cutover-test", "Run root-module DB enrichment cutover tests", &DBTestFilters.enrichment_cutover, .{});
-    _ = addFilteredTestStep(b, lib_test_mod, "lib-db-enrichment-split-cutover-test", "Run root-module DB enrichment split cutover tests", &DBTestFilters.enrichment_split_cutover, .{});
-    _ = addFilteredTestStep(b, lib_test_mod, "lib-db-enrichment-merge-cutover-test", "Run root-module DB enrichment merge cutover tests", &DBTestFilters.enrichment_merge_cutover, .{});
-    _ = addFilteredTestStep(b, lib_test_mod, "lib-db-enrichment-split-cutover-reopen-test", "Run root-module DB split cutover reopen test", &DBTestFilters.enrichment_split_cutover_reopen, .{});
-    _ = addFilteredTestStep(b, lib_test_mod, "lib-db-enrichment-merge-cutover-reopen-test", "Run root-module DB merge cutover reopen test", &DBTestFilters.enrichment_merge_cutover_reopen, .{});
-    _ = addFilteredTestStep(b, lib_test_mod, "lib-db-query-test", "Run root-module DB query/indexing tests", &DBTestFilters.query, .{});
-
-    const run_lib_db_result_shape_tests = addFilteredTestStep(b, lib_test_mod, "lib-db-result-shape-test", "Run focused DB query doc id boundary tests", &DBTestFilters.result_shape, .{ .simple_runner = true });
-
-    _ = addFilteredTestStep(b, lib_test_mod, "lib-db-txn-test", "Run focused DB write/TTL/transaction tests", &DBTestFilters.txn, .{});
+    var run_lib_db_result_shape_tests: ?*std.Build.Step.Run = null;
+    for (antfly_tests_build.db_root_module_steps) |db_step| {
+        const run_db_step = addDBFilteredTestStep(b, lib_test_mod, db_step);
+        if (std.mem.eql(u8, db_step.name, "lib-db-result-shape-test")) {
+            run_lib_db_result_shape_tests = run_db_step;
+        }
+    }
 
     const lib_metadata_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -5019,7 +5029,7 @@ pub fn build(b: *std.Build) void {
     docid_lifecycle_test_step.dependOn(&run_api_table_writes_docid_tests.step);
     docid_lifecycle_test_step.dependOn(&run_api_public_table_http_docid_tests.step);
     docid_lifecycle_test_step.dependOn(&run_raft_transition_runtime_docid_tests.step);
-    docid_lifecycle_test_step.dependOn(&run_lib_db_result_shape_tests.step);
+    docid_lifecycle_test_step.dependOn(&run_lib_db_result_shape_tests.?.step);
 
     const docid_operational_hardening_test_step = b.step("docid-operational-hardening-test", "Run extended DOCID lifecycle, metadata chaos, and compaction hardening tests");
     docid_operational_hardening_test_step.dependOn(docid_lifecycle_test_step);
@@ -5044,7 +5054,7 @@ pub fn build(b: *std.Build) void {
     lib_api_docid_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
     lib_api_docid_test_step.dependOn(&run_lib_metadata_vopr_chaos_tests.step);
     lib_api_docid_test_step.dependOn(lib_metadata_public_chaos_test_step);
-    lib_api_docid_test_step.dependOn(&run_lib_db_result_shape_tests.step);
+    lib_api_docid_test_step.dependOn(&run_lib_db_result_shape_tests.?.step);
 
     const lib_api_swarm_backup_restore_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -5445,7 +5455,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lite_native_tests.step);
     unit_test_step.dependOn(&run_lite_cli_tests.step);
     unit_test_step.dependOn(&run_lib_db_tests.step);
-    unit_test_step.dependOn(&run_lib_db_result_shape_tests.step);
+    unit_test_step.dependOn(&run_lib_db_result_shape_tests.?.step);
     unit_test_step.dependOn(&run_serverless_tests.step);
     unit_test_step.dependOn(&run_lib_data_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_data_storage_tests.step);
@@ -5761,11 +5771,6 @@ pub fn build(b: *std.Build) void {
     usermgr_storage_db_test_mod.addImport("antfly_platform", platform_mod);
     db_test_mod.addImport("usermgr_storage", usermgr_storage_db_test_mod);
 
-    const run_db_sim_tests = addFilteredTestStep(b, db_test_mod, "db-sim-test", "Run DB simulation and replay tests", &DBTestFilters.sim, .{});
-    sim_test_step.dependOn(&run_db_sim_tests.step);
-
-    _ = addFilteredTestStep(b, db_test_mod, "db-split-restore-lifecycle-test", "Run DB split/restore lifecycle regression tests", &DBTestFilters.split_restore_lifecycle, .{});
-
     const storage_workload_sim_step = b.step("storage-sim-test", "Run legacy deterministic storage workload simulations that still use real storage I/O");
     storage_workload_sim_step.dependOn(&run_wal_sim_tests.step);
     storage_workload_sim_step.dependOn(&run_persistent_sim_tests.step);
@@ -5790,19 +5795,14 @@ pub fn build(b: *std.Build) void {
     const db_test_step = b.step("db-test", "Run storage/db unit tests");
     db_test_step.dependOn(&run_db_unit_tests.step);
 
-    _ = addFilteredTestStep(b, db_test_mod, "db-schema-test", "Run focused storage/db schema validation tests", &DBTestFilters.schema, .{});
-    _ = addFilteredTestStep(b, db_test_mod, "db-write-path-test", "Run focused storage/db write-path tests", &DBTestFilters.write_path, .{});
-    _ = addFilteredTestStep(b, db_test_mod, "db-foreign-key-test", "Run focused storage/db foreign-key unit tests", &DBTestFilters.foreign_key, .{});
-    _ = addFilteredTestStep(b, db_test_mod, "db-temporal-test", "Run focused storage/db application-time temporal unit tests", &DBTestFilters.temporal, .{});
-    _ = addFilteredTestStep(b, db_test_mod, "db-relational-rows-test", "Run focused storage/db relational row tests", &DBTestFilters.relational_rows, .{});
-    _ = addFilteredTestStep(b, db_test_mod, "db-search-runtime-test", "Run focused storage/db search runtime tests", &DBTestFilters.search_runtime, .{});
-    _ = addFilteredTestStep(b, db_test_mod, "db-graph-runtime-test", "Run focused storage/db graph runtime tests", &DBTestFilters.graph_runtime, .{});
-    _ = addFilteredTestStep(b, db_test_mod, "db-resolution-runtime-test", "Run focused storage/db resolution workflow tests", &DBTestFilters.resolution_runtime, .{});
-    _ = addFilteredTestStep(b, db_test_mod, "db-derived-async-test", "Run focused storage/db derived async tests", &DBTestFilters.derived_async, .{});
-    _ = addFilteredTestStep(b, db_test_mod, "db-lifecycle-test", "Run focused storage/db lifecycle tests", &DBTestFilters.lifecycle, .{});
-    _ = addFilteredTestStep(b, db_test_mod, "lib-db-reopen-test", "Run root-module DB reopen/compaction tests", &DBTestFilters.reopen, .{});
-    _ = addFilteredTestStep(b, db_test_mod, "db-ttl-runtime-test", "Run focused storage/db TTL runtime tests", &DBTestFilters.ttl_runtime, .{});
-    _ = addFilteredTestStep(b, db_test_mod, "db-enrichment-test", "Run storage/db enrichment-related unit tests", &DBTestFilters.enrichment_any, .{});
+    var run_db_sim_tests: ?*std.Build.Step.Run = null;
+    for (antfly_tests_build.db_storage_module_steps) |db_step| {
+        const run_db_step = addDBFilteredTestStep(b, db_test_mod, db_step);
+        if (std.mem.eql(u8, db_step.name, "db-sim-test")) {
+            run_db_sim_tests = run_db_step;
+        }
+    }
+    sim_test_step.dependOn(&run_db_sim_tests.?.step);
 
     const sparse_test_mod = makeLmdbModule(b, "pkg/antfly/src/sparse_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     sparse_test_mod.addImport("bloom", bloom_mod);

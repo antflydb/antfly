@@ -73,6 +73,8 @@ pub const GeneratedSqlDdlKind = enum {
     create_index,
     create_extension,
     alter_table,
+    alter_database,
+    alter_extension,
     alter_schema,
     alter_tablespace,
     alter_view,
@@ -1707,6 +1709,8 @@ pub const simple_ddl_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CREATE CAST (jsonb AS text) WITH FUNCTION jsonb_to_text(jsonb) AS ASSIGNMENT", .kind = .ddl },
     .{ .sql = "ALTER TABLE usage_records ADD COLUMN status text", .kind = .ddl },
     .{ .sql = "ALTER TABLE IF EXISTS ONLY usage_records DROP COLUMN IF EXISTS status RESTRICT", .kind = .ddl },
+    .{ .sql = "ALTER DATABASE tenant_ops SET timezone TO 'UTC'", .kind = .ddl },
+    .{ .sql = "ALTER EXTENSION postgis UPDATE TO '3.5.0'", .kind = .ddl },
     .{ .sql = "ALTER VIEW active_usage RENAME TO active_usage_v2", .kind = .ddl },
     .{ .sql = "ALTER DOMAIN positive_amount SET NOT NULL", .kind = .ddl },
     .{ .sql = "ALTER PUBLICATION usage_pub ADD TABLE usage_records", .kind = .ddl },
@@ -2271,6 +2275,12 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     }
     if (first.matchesKeywordTag(.alter) and tokens.len > 1 and tokens[1].matchesKeywordTag(.table)) {
         return .{ .ddl = .alter_table };
+    }
+    if (first.matchesKeywordTag(.alter) and tokens.len > 1 and tokens[1].matchesKeywordTag(.database)) {
+        return .{ .ddl = .alter_database };
+    }
+    if (first.matchesKeywordTag(.alter) and tokens.len > 1 and tokens[1].matchesKeywordTag(.extension)) {
+        return .{ .ddl = .alter_extension };
     }
     if (first.matchesKeywordTag(.alter) and tokens.len > 1 and tokens[1].matchesKeywordTag(.schema)) {
         return .{ .ddl = .alter_schema };
@@ -3036,6 +3046,29 @@ fn buildDdlAst(
                 if (ast.object_name_tokens) |table_range| {
                     index = table_range.end;
                     if (index < end) ast.alter_table_operation_tokens = .{ .start = index, .end = end };
+                }
+            }
+        },
+        .alter_database => {
+            if (end > 2 and tokens[1].matchesKeywordTag(.database)) {
+                ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 2, end);
+                if (ast.object_name_tokens) |database_range| {
+                    if (database_range.end < end) ast.alter_table_operation_tokens = .{ .start = database_range.end, .end = end };
+                }
+            }
+        },
+        .alter_extension => {
+            if (end > 2 and tokens[1].matchesKeywordTag(.extension)) {
+                ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 2, end);
+                if (ast.object_name_tokens) |extension_range| {
+                    if (extension_range.end < end) ast.alter_table_operation_tokens = .{ .start = extension_range.end, .end = end };
+                    if (extension_range.end + 2 < end and
+                        tokens[extension_range.end].matchesKeywordTag(.update) and
+                        tokens[extension_range.end + 1].matchesKeywordTag(.to) and
+                        tokens[extension_range.end + 2].kind == .string)
+                    {
+                        ast.version_tokens = .{ .start = extension_range.end + 2, .end = extension_range.end + 3 };
+                    }
                 }
             }
         },
@@ -7050,6 +7083,29 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expect(ddl.if_exists);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, ddl.object_name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 10 }, ddl.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const alter_database_sql = "ALTER DATABASE tenant_ops SET timezone TO 'UTC'";
+    const alter_database_result = try parseSqlAlloc(alloc, alter_database_sql);
+    switch (alter_database_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.alter_database, ddl.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 7 }, ddl.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const alter_extension_sql = "ALTER EXTENSION postgis UPDATE TO '3.5.0'";
+    const alter_extension_result = try parseSqlAlloc(alloc, alter_extension_sql);
+    switch (alter_extension_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.alter_extension, ddl.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 6 }, ddl.alter_table_operation_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, ddl.version_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

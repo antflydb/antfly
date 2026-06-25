@@ -3702,7 +3702,7 @@ pub const DB = struct {
     pub fn searchRuntimeCloneNamedSetAsResult(
         self: *DB,
         alloc: Allocator,
-        set: NamedResultSet,
+        set: db_query_graph.NamedResultSet,
         include_stored: bool,
     ) !types.SearchResult {
         return try search_runtime_impl.cloneNamedSetAsResult(self, alloc, set, include_stored);
@@ -4299,27 +4299,3 @@ pub const DB = struct {
         return try internal_impl.lookupLiveDocOrdinalNoLock(self, alloc, doc_id, generation);
     }
 };
-
-const systemVersionedHistoryRecordCommitSequence = relational_rows.systemVersionedHistoryRecordCommitSequence;
-
-const rowClaimIntentKeyAlloc = relational_rows.rowClaimIntentKeyAlloc;
-
-const DocumentExtractionUnitDescriptor = write_path.DocumentExtractionUnitDescriptor;
-const documentUnitPayloadAlloc = write_path.documentUnitPayloadAlloc;
-const documentExtractionUnitFingerprintAlloc = write_path.documentExtractionUnitFingerprintAlloc;
-const documentExtractionUnitRangeCount = write_path.documentExtractionUnitRangeCount;
-const documentExtractionUnitRangeIndex = write_path.documentExtractionUnitRangeIndex;
-const documentExtractionManifestPayloadAlloc = write_path.documentExtractionManifestPayloadAlloc;
-
-const NamedResultSet = db_query_graph.NamedResultSet;
-
-const applyGraphUnion = db_query_graph.applyGraphUnion;
-
-const applyGraphIntersection = db_query_graph.applyGraphIntersection;
-const cloneNamedSetAsResult = db_query_graph.cloneNamedSetAsResult;
-
-const currentTimeNs = db_internal.currentTimeNs;
-
-const parsePatternRfc3339ToNs = db_internal.parseRfc3339ToNs;
-
-const flushDeferredExternalBulkExecutorNotification = db_internal.flushDeferredExternalBulkExecutorNotification;

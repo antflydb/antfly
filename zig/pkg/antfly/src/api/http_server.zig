@@ -7959,17 +7959,7 @@ pub const ApiHttpServer = struct {
             defer self.alloc.free(raw);
             try std.base64.standard.Decoder.decode(raw, encoded);
             const colon_pos = std.mem.indexOfScalar(u8, raw, ':') orelse return error.Unauthorized;
-            var user = try manager.authenticateUser(raw[0..colon_pos], raw[colon_pos + 1 ..]);
-            defer user.deinit(self.alloc);
-            return .{
-                .username = try self.alloc.dupe(u8, user.username),
-                .permissions = try manager.getPermissionsForUser(user.username),
-                .row_filter = try manager.getRowFilters(user.username),
-                .metadata_json = try self.alloc.dupe(u8, user.metadata_json),
-                .roles = try manager.getRolesForUser(user.username),
-                .role_settings = try manager.getEffectiveRoleSettings(user.username),
-                .role_runtime_settings = try manager.getEffectiveRoleRuntimeSettings(user.username),
-            };
+            return try self.authenticateUserPassword(raw[0..colon_pos], raw[colon_pos + 1 ..]);
         }
 
         if (std.mem.startsWith(u8, value, "ApiKey ") or std.mem.startsWith(u8, value, "Bearer ")) {
@@ -7992,6 +7982,21 @@ pub const ApiHttpServer = struct {
         }
 
         return error.Unauthorized;
+    }
+
+    pub fn authenticateUserPassword(self: *ApiHttpServer, username: []const u8, password: []const u8) !AuthenticatedIdentity {
+        const manager = self.cfg.user_manager orelse return error.Unauthorized;
+        var user = try manager.authenticateUser(username, password);
+        defer user.deinit(self.alloc);
+        return .{
+            .username = try self.alloc.dupe(u8, user.username),
+            .permissions = try manager.getPermissionsForUser(user.username),
+            .row_filter = try manager.getRowFilters(user.username),
+            .metadata_json = try self.alloc.dupe(u8, user.metadata_json),
+            .roles = try manager.getRolesForUser(user.username),
+            .role_settings = try manager.getEffectiveRoleSettings(user.username),
+            .role_runtime_settings = try manager.getEffectiveRoleRuntimeSettings(user.username),
+        };
     }
 
     fn authenticateTrustedPrincipal(self: *ApiHttpServer, token: []const u8, secret: []const u8) !AuthenticatedIdentity {

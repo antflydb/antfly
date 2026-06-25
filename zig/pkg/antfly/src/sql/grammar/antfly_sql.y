@@ -102,6 +102,8 @@ ddl_statement:
   | create_index_statement
   | create_extension_statement
   | alter_table_statement
+  | alter_database_statement
+  | alter_extension_statement
   | alter_view_statement
   | alter_domain_statement
   | alter_sequence_statement
@@ -264,6 +266,14 @@ extension_version_opt:
 
 alter_table_statement:
     ALTER TABLE alter_table_relation_prefix_opt qualified_name diagnostic_tail_opt
+  ;
+
+alter_database_statement:
+    ALTER DATABASE qualified_name diagnostic_tail
+  ;
+
+alter_extension_statement:
+    ALTER EXTENSION qualified_name diagnostic_tail
   ;
 
 alter_view_statement:
@@ -1539,6 +1549,7 @@ diagnostic_token:
   | UNIQUE
   | UNLISTEN
   | UNLOGGED
+  | UPDATE
   | USING
   | VACUUM
   | VIEW

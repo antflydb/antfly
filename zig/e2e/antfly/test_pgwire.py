@@ -63,6 +63,19 @@ def pgwire_server():
 
 
 @pytest.fixture(scope="module")
+def auth_pgwire_server():
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    if not Path(binary).exists():
+        pytest.skip(f"antfly binary not found: {binary}")
+
+    port = find_free_port()
+    pgwire_port = find_free_port()
+    server = SwarmAntflyServer(binary, "127.0.0.1", port, pgwire_port=pgwire_port, auth_enabled=True)
+    yield server
+    server.stop()
+
+
+@pytest.fixture(scope="module")
 def antfly_bin() -> str:
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     if not Path(binary).exists():
@@ -262,6 +275,38 @@ def test_pgwire_simple_query_accepts_multiple_statements(pgwire_server):
     rows = [message["values"] for message in messages if message["type"] == "row"]
     assert commands == ["CREATE TABLE", "INSERT 0 1", "SELECT 1"]
     assert rows == [["row:b", "closed"]]
+
+
+def test_pgwire_auth_uses_public_api_user_manager(auth_pgwire_server, antfly_bin):
+    table = _table_name("pgwire_auth")
+    cli_table = _table_name("pgwire_auth_cli")
+
+    with socket.create_connection((auth_pgwire_server.host, auth_pgwire_server.pgwire_port), timeout=5) as sock:
+        with pytest.raises(AssertionError, match="28P01"):
+            _pgwire_startup(sock, user="admin", password="wrong")
+
+    with socket.create_connection((auth_pgwire_server.host, auth_pgwire_server.pgwire_port), timeout=5) as sock:
+        _pgwire_startup(sock, user="admin", password="admin")
+        messages = _pgwire_simple_query(sock, f"CREATE TABLE {table} (id text PRIMARY KEY);")
+
+    assert [message["tag"] for message in messages if message["type"] == "command"] == ["CREATE TABLE"]
+
+    cli_created = _run_cli(
+        antfly_bin,
+        auth_pgwire_server,
+        "sql",
+        "--pgwire-host",
+        auth_pgwire_server.host,
+        "--pgwire-port",
+        str(auth_pgwire_server.pgwire_port),
+        "--pgwire-user",
+        "admin",
+        "--pgwire-password",
+        "admin",
+        "-c",
+        f"CREATE TABLE {cli_table} (id text PRIMARY KEY);",
+    )
+    assert _json_values(cli_created.stdout)[0]["kind"] == "ddl"
 
 
 def test_pgwire_postgres_compatibility_probes_return_rows(pgwire_server):
@@ -522,9 +567,9 @@ def test_metadata_pgwire_simple_query_uses_public_api_sql(metadata_pgwire_server
     assert commands == ["CREATE TABLE"]
 
 
-def _pgwire_startup(sock: socket.socket) -> tuple[int, int]:
+def _pgwire_startup(sock: socket.socket, *, user: str = "antfly", password: str | None = None) -> tuple[int, int]:
     payload = struct.pack("!i", 196608)
-    for key, value in (("user", "antfly"),):
+    for key, value in (("user", user),):
         payload += key.encode() + b"\x00" + value.encode() + b"\x00"
     payload += b"\x00"
     sock.sendall(struct.pack("!i", len(payload) + 4) + payload)
@@ -532,7 +577,18 @@ def _pgwire_startup(sock: socket.socket) -> tuple[int, int]:
     while True:
         tag, payload = _pgwire_read_message(sock)
         if tag == b"E":
-            raise AssertionError(f"pgwire startup error: {payload!r}")
+            error = _pgwire_error_response(payload)
+            raise AssertionError(f"pgwire startup error {error.get('sqlstate')}: {error.get('message')}")
+        if tag == b"R":
+            auth_code = struct.unpack("!i", payload[:4])[0]
+            if auth_code == 0:
+                continue
+            if auth_code == 3:
+                assert password is not None, "pgwire server requested a password"
+                encoded = password.encode() + b"\x00"
+                sock.sendall(b"p" + struct.pack("!i", len(encoded) + 4) + encoded)
+                continue
+            raise AssertionError(f"unsupported pgwire auth code: {auth_code}")
         if tag == b"K":
             assert len(payload) == 8
             backend_key = struct.unpack("!ii", payload)

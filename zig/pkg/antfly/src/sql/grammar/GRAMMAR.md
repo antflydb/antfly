@@ -56,7 +56,7 @@ command-kind validation.
 Simple DDL has generated-parser corpus coverage but still falls back to the
 existing parser when the seed grammar does not yet cover the shape; generated
 simple DDL ASTs now carry structured object, option, and behavior fields for
-database, schema, and extension create/drop catalog plans and lower those
+database create/alter/drop, schema create/drop, and extension create/alter/drop catalog plans and lower those
 catalog plans directly from generated AST ranges. `CREATE`/`DROP`
 database/schema/extension statement heads now require generated parser success
 at the `ParsedSql` boundary, so malformed generated-owned catalog DDL fails
@@ -519,7 +519,8 @@ Suggested migration order:
    `DROP`, `CREATE INDEX`, scalar/vector/full-text/graph index forms, graph
    metric declarations, and extension declarations. Simple database, schema,
    table, index, and extension DDL now has generated-parser corpus coverage
-   when it matches the seed grammar. Database, schema, and extension create/drop
+   when it matches the seed grammar. Database create/alter/drop, schema
+create/drop, and extension create/alter/drop
 catalog DDL now has structured generated AST payloads, direct generated
 AST-to-plan lowering, and strict generated parsing at the parsed-statement
 boundary, generated table/index drops validate generated object,
@@ -1115,6 +1116,7 @@ Generated grammar work needs evidence at multiple levels:
   back to legacy DDL probing.
   Runtime DDL lowering now dispatches generated session statements, prepared
   statements, graph DDL, database/schema/extension catalog DDL, generated
+  `ALTER DATABASE ... SET ...` and `ALTER EXTENSION ... UPDATE` catalog DDL,
   `CREATE TABLE` including serial identity-allocation tables, `DROP TABLE`,
   generated schema namespace rename DDL for `ALTER SCHEMA ... RENAME TO ...`,
   generated tablespace catalog DDL for `CREATE TABLESPACE`, `ALTER TABLESPACE`,

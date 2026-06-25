@@ -1358,7 +1358,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --api-host <host>              Metadata admin API bind host (default: raft host)
         \\  --api-port <port>              Metadata admin API bind port (default: 0)
         \\  --pgwire-host <host>           Pgwire bind host (default: --api-host)
-        \\  --pgwire-port <port>           Enable unauthenticated pgwire TCP listener on this port
+        \\  --pgwire-port <port>           Enable pgwire TCP listener on this port
         \\  --cluster <json>               Metadata raft peer URLs, e.g. {{"1":"http://127.0.0.1:9017"}}
         \\  --join                         Join an existing metadata cluster (not yet supported)
         \\  --health <true|false>          Enable health/metrics server (default: true)

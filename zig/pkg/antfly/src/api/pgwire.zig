@@ -59,6 +59,11 @@ const Portal = struct {
     result_formats: []i16 = &.{},
 };
 
+const FrontendMessage = struct {
+    tag: u8,
+    payload: []u8,
+};
+
 const CancelEntry = struct {
     secret_key: i32,
     connection: *Connection,
@@ -274,6 +279,8 @@ const Connection = struct {
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
     session_id: ?u64 = null,
+    startup_user: ?[]u8 = null,
+    authenticated_identity: ?http_server.AuthenticatedIdentity = null,
     database: ?[]u8 = null,
     namespace: ?[]u8 = null,
     ready_for_query_status: u8 = 'I',
@@ -291,6 +298,8 @@ const Connection = struct {
 
     fn deinit(self: *Connection) void {
         self.state.unregisterCancelHandle(self);
+        if (self.authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (self.startup_user) |startup_user| self.alloc.free(startup_user);
         if (self.database) |database| self.alloc.free(database);
         if (self.namespace) |namespace| self.alloc.free(namespace);
         if (self.unnamed_statement) |sql| self.alloc.free(sql);
@@ -351,11 +360,7 @@ const Connection = struct {
                 },
                 protocol_version_3 => {
                     try self.applyStartupParams(payload[4..]);
-                    if (self.api_server.cfg.auth_enabled) {
-                        try self.sendError("0A000", "pgwire authentication is not implemented");
-                        try self.writer.flush();
-                        return error.PgwireAuthNotSupported;
-                    }
+                    try self.authenticateStartupIfRequired();
                     try self.state.registerCancelHandle(self);
                     try self.sendAuthenticationOk();
                     try self.sendParameterStatus("server_version", "16.0-antfly");
@@ -376,6 +381,54 @@ const Connection = struct {
                 },
             }
         }
+    }
+
+    fn authenticateStartupIfRequired(self: *Connection) !void {
+        if (!self.pgwireAuthenticationRequired()) return;
+        const username = self.startup_user orelse {
+            try self.sendError("28000", "pgwire startup requires user");
+            try self.writer.flush();
+            return error.PgwireAuthenticationFailed;
+        };
+        if (username.len == 0) {
+            try self.sendError("28000", "pgwire startup requires user");
+            try self.writer.flush();
+            return error.PgwireAuthenticationFailed;
+        }
+        if (self.api_server.cfg.user_manager == null) {
+            try self.sendError("0A000", "pgwire password authentication requires user manager");
+            try self.writer.flush();
+            return error.PgwireAuthNotSupported;
+        }
+
+        try self.sendAuthenticationCleartextPassword();
+        try self.writer.flush();
+        const message = try self.readFrontendMessageAlloc();
+        defer self.alloc.free(message.payload);
+        if (message.tag != 'p') {
+            try self.sendError("08P01", "expected pgwire password message");
+            try self.writer.flush();
+            return error.InvalidPgwireMessage;
+        }
+        const password_end = std.mem.indexOfScalar(u8, message.payload, 0) orelse {
+            try self.sendError("08P01", "invalid pgwire password message");
+            try self.writer.flush();
+            return error.InvalidPgwireMessage;
+        };
+        var identity = self.api_server.authenticateUserPassword(username, message.payload[0..password_end]) catch |err| switch (err) {
+            error.InvalidPassword, error.UserNotFound, error.Unauthorized => {
+                try self.sendError("28P01", "password authentication failed");
+                try self.writer.flush();
+                return error.PgwireAuthenticationFailed;
+            },
+            else => return err,
+        };
+        errdefer identity.deinit(self.api_server.alloc);
+        self.authenticated_identity = identity;
+    }
+
+    fn pgwireAuthenticationRequired(self: *Connection) bool {
+        return self.api_server.cfg.auth_enabled or self.api_server.cfg.trusted_principal_secret != null;
     }
 
     fn handleCancelRequest(self: *Connection, payload: []const u8) !void {
@@ -403,6 +456,9 @@ const Connection = struct {
             if (std.mem.eql(u8, key, "database") and value.len != 0) {
                 if (self.database) |old| self.alloc.free(old);
                 self.database = try self.alloc.dupe(u8, value);
+            } else if (std.mem.eql(u8, key, "user")) {
+                if (self.startup_user) |old| self.alloc.free(old);
+                self.startup_user = try self.alloc.dupe(u8, value);
             } else if (std.mem.eql(u8, key, "options")) {
                 if (startupSearchPath(value)) |namespace| {
                     if (self.namespace) |old| self.alloc.free(old);
@@ -775,7 +831,7 @@ const Connection = struct {
             .namespace = self.namespace,
             .read_only = true,
             .params = params,
-        }, null);
+        }, self.authenticated_identity);
     }
 
     fn executeSql(self: *Connection, sql: []const u8, params: []const sql_adapter.SqlValue) !http_server.ApiHttpServer.PublicSqlResultOrResponse {
@@ -786,7 +842,7 @@ const Connection = struct {
             .namespace = self.namespace,
             .read_only = false,
             .params = params,
-        }, null);
+        }, self.authenticated_identity);
     }
 
     fn encodeSqlResult(
@@ -993,6 +1049,12 @@ const Connection = struct {
         try self.sendMessage('R', &payload);
     }
 
+    fn sendAuthenticationCleartextPassword(self: *Connection) !void {
+        var payload: [4]u8 = undefined;
+        std.mem.writeInt(i32, &payload, 3, .big);
+        try self.sendMessage('R', &payload);
+    }
+
     fn sendParameterStatus(self: *Connection, name: []const u8, value: []const u8) !void {
         var payload: std.Io.Writer.Allocating = .init(self.alloc);
         defer payload.deinit();
@@ -1082,6 +1144,16 @@ const Connection = struct {
         try self.writer.writeByte(tag);
         try self.writer.writeInt(i32, @intCast(payload.len + 4), .big);
         try self.writer.writeAll(payload);
+    }
+
+    fn readFrontendMessageAlloc(self: *Connection) !FrontendMessage {
+        const tag = try self.reader.takeByte();
+        const len = try self.reader.takeInt(i32, .big);
+        if (len < 4 or len > max_packet_len) return error.InvalidPgwireMessage;
+        return .{
+            .tag = tag,
+            .payload = try self.reader.readAlloc(self.alloc, @intCast(len - 4)),
+        };
     }
 };
 
