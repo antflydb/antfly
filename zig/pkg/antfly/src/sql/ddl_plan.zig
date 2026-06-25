@@ -2923,11 +2923,77 @@ pub fn preparedStatementPlanFromGeneratedAstAlloc(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlPreparedAst,
 ) !PreparedStatementPlan {
+    try validateGeneratedPreparedAstRanges(tokens, ast);
     return switch (ast.kind) {
         .prepare => .{ .prepare = try prepareStatementPlanFromGeneratedAstAlloc(alloc, tokens, ast) },
         .execute => .{ .execute = try executePreparedStatementPlanFromGeneratedAstAlloc(alloc, tokens, ast) },
         .deallocate => .{ .deallocate = try deallocatePreparedStatementPlanFromGeneratedAstAlloc(alloc, tokens, ast) },
     };
+}
+
+fn validateGeneratedPreparedAstRanges(
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlPreparedAst,
+) !void {
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    if (tokens[0].source_start != ast.command_span.start or tokens[0].source_end != ast.command_span.end) {
+        return error.UnsupportedSqlShape;
+    }
+    const expected: token_mod.TokenKeyword = switch (ast.kind) {
+        .prepare => .prepare,
+        .execute => .execute,
+        .deallocate => .deallocate,
+    };
+    if (!tokens[0].matchesKeywordTag(expected)) return error.UnsupportedSqlShape;
+
+    switch (ast.kind) {
+        .prepare => {
+            try validateGeneratedPreparedRequiredRangeAt(ast.name_tokens, 1, 2, end);
+            const inner = ast.inner_statement_tokens orelse return error.UnsupportedSqlShape;
+            try validateGeneratedPreparedRange(tokens, inner, 3, end);
+            if (inner.start == 0 or !tokens[inner.start - 1].matchesKeywordTag(.as)) return error.UnsupportedSqlShape;
+            if (ast.parameter_tokens) |parameter_tokens| {
+                if (parameter_tokens.start != 2 or parameter_tokens.end + 1 != inner.start) return error.UnsupportedSqlShape;
+                _ = try countGeneratedParenthesizedList(tokens, parameter_tokens);
+            } else if (inner.start != 3) {
+                return error.UnsupportedSqlShape;
+            }
+            if (ast.argument_tokens != null) return error.UnsupportedSqlShape;
+        },
+        .execute => {
+            try validateGeneratedPreparedRequiredRangeAt(ast.name_tokens, 1, 2, end);
+            if (ast.argument_tokens) |argument_tokens| {
+                if (argument_tokens.start != 2 or argument_tokens.end != end) return error.UnsupportedSqlShape;
+                _ = try countGeneratedParenthesizedList(tokens, argument_tokens);
+            } else if (end != 2) {
+                return error.UnsupportedSqlShape;
+            }
+            if (ast.parameter_tokens != null or ast.inner_statement_tokens != null) return error.UnsupportedSqlShape;
+        },
+        .deallocate => {
+            try validateGeneratedPreparedRequiredRangeAt(ast.name_tokens, 1, end, end);
+            if (ast.parameter_tokens != null or ast.argument_tokens != null or ast.inner_statement_tokens != null) return error.UnsupportedSqlShape;
+        },
+    }
+}
+
+fn validateGeneratedPreparedRange(
+    tokens: []const grammar.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    min_start: usize,
+    end: usize,
+) !void {
+    if (range.start < min_start or range.start >= range.end or range.end > end or range.end > tokens.len) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedPreparedRequiredRangeAt(
+    maybe_range: ?generated_parser.GeneratedSqlTokenRange,
+    start: usize,
+    end: usize,
+    statement_end: usize,
+) !void {
+    const range = maybe_range orelse return error.UnsupportedSqlShape;
+    if (range.start != start or range.end != end or range.end > statement_end) return error.UnsupportedSqlShape;
 }
 
 pub fn prepareStatementPlanFromGeneratedAstAlloc(
@@ -2971,7 +3037,11 @@ pub fn deallocatePreparedStatementPlanFromGeneratedAstAlloc(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlPreparedAst,
 ) !DeallocatePreparedStatementPlan {
-    const statement_name = try generatedSingleIdentifierText(tokens, ast.name_tokens orelse return error.UnsupportedSqlShape);
+    const name_tokens = ast.name_tokens orelse return error.UnsupportedSqlShape;
+    if (name_tokens.start + 1 == name_tokens.end and tokens[name_tokens.start].matchesKeywordTag(.all)) {
+        return .{ .all = true };
+    }
+    const statement_name = try generatedSingleIdentifierText(tokens, name_tokens);
     return .{ .statement_name = try alloc.dupe(u8, statement_name) };
 }
 
@@ -14426,6 +14496,65 @@ test "sql adapter generated prepared AST lowers to prepared statement plans" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var generated_deallocate_all = try generatedPreparedStatementPlanForTestAlloc(alloc, "DEALLOCATE ALL;");
+    defer generated_deallocate_all.deinit(alloc);
+    switch (generated_deallocate_all) {
+        .deallocate => |generated| try std.testing.expect(generated.all),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var malformed_span = try tokenized.ParsedSql.initAlloc(alloc, "PREPARE usage_plan AS SELECT id FROM usage_records;");
+    defer malformed_span.deinit(alloc);
+    const malformed_span_raw = malformed_span.generated_statement orelse return error.TestUnexpectedResult;
+    var malformed_span_ast = switch (malformed_span_raw.ast orelse return error.TestUnexpectedResult) {
+        .prepared => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    malformed_span_ast.statement_span.start += 1;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        preparedStatementPlanFromGeneratedAstAlloc(alloc, malformed_span.items(), malformed_span_ast),
+    );
+
+    var malformed_command = try tokenized.ParsedSql.initAlloc(alloc, "EXECUTE usage_plan('open');");
+    defer malformed_command.deinit(alloc);
+    const malformed_command_raw = malformed_command.generated_statement orelse return error.TestUnexpectedResult;
+    var malformed_command_ast = switch (malformed_command_raw.ast orelse return error.TestUnexpectedResult) {
+        .prepared => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    malformed_command_ast.command_span.end += 1;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        preparedStatementPlanFromGeneratedAstAlloc(alloc, malformed_command.items(), malformed_command_ast),
+    );
+
+    var malformed_prepare_layout = try tokenized.ParsedSql.initAlloc(alloc, "PREPARE usage_plan(text) AS SELECT id FROM usage_records;");
+    defer malformed_prepare_layout.deinit(alloc);
+    const malformed_prepare_layout_raw = malformed_prepare_layout.generated_statement orelse return error.TestUnexpectedResult;
+    var malformed_prepare_layout_ast = switch (malformed_prepare_layout_raw.ast orelse return error.TestUnexpectedResult) {
+        .prepared => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    malformed_prepare_layout_ast.inner_statement_tokens.?.start -= 1;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        preparedStatementPlanFromGeneratedAstAlloc(alloc, malformed_prepare_layout.items(), malformed_prepare_layout_ast),
+    );
+
+    var mismatched_kind = try tokenized.ParsedSql.initAlloc(alloc, "DEALLOCATE usage_plan;");
+    defer mismatched_kind.deinit(alloc);
+    const mismatched_kind_raw = mismatched_kind.generated_statement orelse return error.TestUnexpectedResult;
+    var mismatched_kind_ast = switch (mismatched_kind_raw.ast orelse return error.TestUnexpectedResult) {
+        .prepared => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    mismatched_kind_ast.kind = .execute;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        preparedStatementPlanFromGeneratedAstAlloc(alloc, mismatched_kind.items(), mismatched_kind_ast),
+    );
 }
 
 fn generatedPreparedStatementPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !PreparedStatementPlan {

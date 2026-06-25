@@ -43,9 +43,11 @@ transaction, and prepared statements now require generated parser success;
 they also carry the first generated AST payload with source spans and token
 ranges for command names, values, prepared-statement arguments, and nested
 prepared statements. This AST is retained by `ParsedSql`; prepared statements
-now have an AST-to-plan conversion path with parity coverage against the
-existing token-based lowerer, including typed `PREPARE name(type, ...) AS ...`
-parameter lists. Session catalog commands now have generated AST-to-plan parity
+now have an AST-to-plan conversion path with retained statement/command span,
+command-kind, name, parameter, argument, and nested-statement range validation
+plus parity coverage against the existing token-based lowerer, including typed
+`PREPARE name(type, ...) AS ...` parameter lists and generated `DEALLOCATE ALL`.
+Session catalog commands now have generated AST-to-plan parity
 for the generated-covered `SET`, `RESET`, `SHOW`, and `DISCARD ALL` forms.
 Transaction boundary commands now dispatch through generated AST-to-plan
 lowering for generated-covered `BEGIN`, `COMMIT`, and `ROLLBACK`
