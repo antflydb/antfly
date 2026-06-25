@@ -941,6 +941,7 @@ pub const GeneratedSqlDmlReadBodyAst = struct {
     source_tokens: ?GeneratedSqlTokenRange = null,
     where_tokens: ?GeneratedSqlTokenRange = null,
     set_operation_tokens: ?GeneratedSqlTokenRange = null,
+    wrapper_projection_star: bool = false,
 };
 
 pub const GeneratedSqlDmlAst = struct {
@@ -1973,9 +1974,20 @@ fn buildDmlChildReadAst(
     tokens: []const token_mod.Token,
     ast: *GeneratedSqlDmlAst,
 ) void {
-    if (ast.kind != .insert_select) return;
     const source_tokens = ast.source_tokens orelse return;
     if (source_tokens.start >= source_tokens.end or source_tokens.end > tokens.len) return;
+    switch (ast.kind) {
+        .insert_select => buildDmlSelectSourceReadAst(tokens, ast, source_tokens),
+        .update, .delete, .merge => buildDmlRelationSourceReadAst(tokens, ast, source_tokens),
+        else => {},
+    }
+}
+
+fn buildDmlSelectSourceReadAst(
+    tokens: []const token_mod.Token,
+    ast: *GeneratedSqlDmlAst,
+    source_tokens: GeneratedSqlTokenRange,
+) void {
     if (!tokens[source_tokens.start].matchesKeywordTag(.select)) return;
     const statement_span = sourceSpanForTokenRange(tokens, source_tokens) orelse return;
     var read_body = GeneratedSqlDmlReadBodyAst{
@@ -2011,6 +2023,22 @@ fn buildDmlChildReadAst(
         if (idx + 1 < where_end) read_body.where_tokens = .{ .start = idx + 1, .end = where_end };
     }
     ast.source_read = read_body;
+}
+
+fn buildDmlRelationSourceReadAst(
+    tokens: []const token_mod.Token,
+    ast: *GeneratedSqlDmlAst,
+    source_tokens: GeneratedSqlTokenRange,
+) void {
+    const statement_span = sourceSpanForTokenRange(tokens, source_tokens) orelse return;
+    ast.source_read = .{
+        .tokens = source_tokens,
+        .kind = classifyReadKindInRange(tokens, source_tokens),
+        .statement_span = statement_span,
+        .command_span = tokens[source_tokens.start].sourceSpan(),
+        .source_tokens = source_tokens,
+        .wrapper_projection_star = true,
+    };
 }
 
 fn buildReadAst(
@@ -5213,6 +5241,51 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 15 }, dml.assignments_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 16, .end = 24 }, dml.where_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 25, .end = 26 }, dml.returning_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const joined_update_sql = "UPDATE usage_records SET status = source.status FROM archived_records AS source WHERE usage_records.source_id = source.archive_id";
+    const joined_update_result = try parseSqlAlloc(alloc, joined_update_sql);
+    switch (joined_update_result.ast.?) {
+        .dml => |dml| {
+            try std.testing.expectEqual(GeneratedSqlDmlKind.update, dml.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 10 }, dml.source_tokens.?);
+            const source_read = dml.source_read orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 10 }, source_read.tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 10 }, source_read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, source_read.kind);
+            try std.testing.expect(source_read.wrapper_projection_star);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const joined_delete_sql = "DELETE FROM usage_records USING archived_records AS source WHERE usage_records.source_id = source.archive_id";
+    const joined_delete_result = try parseSqlAlloc(alloc, joined_delete_sql);
+    switch (joined_delete_result.ast.?) {
+        .dml => |dml| {
+            try std.testing.expectEqual(GeneratedSqlDmlKind.delete, dml.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 7 }, dml.source_tokens.?);
+            const source_read = dml.source_read orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 7 }, source_read.tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 7 }, source_read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, source_read.kind);
+            try std.testing.expect(source_read.wrapper_projection_star);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const merge_sql = "MERGE INTO usage_records USING archived_records AS source ON usage_records.source_id = source.archive_id WHEN MATCHED THEN DELETE";
+    const merge_result = try parseSqlAlloc(alloc, merge_sql);
+    switch (merge_result.ast.?) {
+        .dml => |dml| {
+            try std.testing.expectEqual(GeneratedSqlDmlKind.merge, dml.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 7 }, dml.source_tokens.?);
+            const source_read = dml.source_read orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 7 }, source_read.tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 7 }, source_read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, source_read.kind);
+            try std.testing.expect(source_read.wrapper_projection_star);
         },
         else => return error.TestUnexpectedResult,
     }

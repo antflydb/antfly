@@ -12622,7 +12622,7 @@ fn lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(
                 .update, .update_source => try validateGeneratedUpdateSourceRanges(tokens, ast, end),
                 .update_joined_source => {
                     try validateGeneratedUpdateJoinedRanges(tokens, ast, end);
-                    try validateGeneratedDmlRelationSourceBodyAlloc(alloc, parsed_sql, ast.source_tokens orelse return error.UnsupportedSqlShape);
+                    try validateGeneratedDmlRelationSourceBodyAlloc(alloc, parsed_sql, ast);
                 },
                 else => return error.UnsupportedSqlShape,
             }
@@ -12651,7 +12651,7 @@ fn lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(
                 .delete, .delete_source => try validateGeneratedDeleteSourceRanges(tokens, ast, end),
                 .delete_joined_source => {
                     try validateGeneratedDeleteJoinedRanges(tokens, ast, end);
-                    try validateGeneratedDmlRelationSourceBodyAlloc(alloc, parsed_sql, ast.source_tokens orelse return error.UnsupportedSqlShape);
+                    try validateGeneratedDmlRelationSourceBodyAlloc(alloc, parsed_sql, ast);
                 },
                 else => return error.UnsupportedSqlShape,
             }
@@ -12678,7 +12678,7 @@ fn lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(
         .merge => {
             if (write_kind != .merge) return error.UnsupportedSqlShape;
             try validateGeneratedMergeRanges(tokens, ast, end);
-            try validateGeneratedDmlRelationSourceBodyAlloc(alloc, parsed_sql, ast.source_tokens orelse return error.UnsupportedSqlShape);
+            try validateGeneratedDmlRelationSourceBodyAlloc(alloc, parsed_sql, ast);
             if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
             const source_schema = options.joined_source_schema orelse schema;
             if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
@@ -12951,8 +12951,10 @@ fn validateGeneratedInsertSourceRanges(
 fn validateGeneratedDmlRelationSourceBodyAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
-    source_range: generated_parser.GeneratedSqlTokenRange,
+    ast: generated_parser.GeneratedSqlDmlAst,
 ) !void {
+    try validateGeneratedDmlRelationSourceBodyAst(ast);
+    const source_range = ast.source_tokens orelse return error.UnsupportedSqlShape;
     const tokens = parsed_sql.items();
     if (source_range.start >= source_range.end or source_range.end > tokens.len) return error.UnsupportedSqlShape;
     const source_start = tokens[source_range.start].source_start;
@@ -12973,6 +12975,17 @@ fn validateGeneratedDmlRelationSourceBodyAlloc(
         .read => {},
         else => return error.UnsupportedSqlShape,
     }
+}
+
+fn validateGeneratedDmlRelationSourceBodyAst(ast: generated_parser.GeneratedSqlDmlAst) !void {
+    const source_range = ast.source_tokens orelse return error.UnsupportedSqlShape;
+    const source_read = ast.source_read orelse return error.UnsupportedSqlShape;
+    if (!source_read.wrapper_projection_star) return error.UnsupportedSqlShape;
+    if (source_read.tokens.start != source_range.start or source_read.tokens.end != source_range.end) return error.UnsupportedSqlShape;
+    const read_source_range = source_read.source_tokens orelse return error.UnsupportedSqlShape;
+    if (read_source_range.start != source_range.start or read_source_range.end != source_range.end) return error.UnsupportedSqlShape;
+    if (source_read.projection_tokens != null or source_read.where_tokens != null or source_read.set_operation_tokens != null) return error.UnsupportedSqlShape;
+    if (source_read.kind != .query and source_read.kind != .join and source_read.kind != .lateral) return error.UnsupportedSqlShape;
 }
 
 fn updateSourceFromGeneratedDmlAstAlloc(
@@ -13118,7 +13131,7 @@ fn updateJoinedSourceFromGeneratedDmlAstAlloc(
     const tokens = parsed_sql.items();
     const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     try validateGeneratedUpdateJoinedRanges(tokens, ast, end);
-    try validateGeneratedDmlRelationSourceBodyAlloc(alloc, parsed_sql, ast.source_tokens orelse return error.UnsupportedSqlShape);
+    try validateGeneratedDmlRelationSourceBodyAlloc(alloc, parsed_sql, ast);
 
     const parser_context = @import("parser_context.zig");
     var parser_state = parser_context.ParserState{
@@ -13162,7 +13175,7 @@ fn deleteJoinedSourceFromGeneratedDmlAstAlloc(
     const tokens = parsed_sql.items();
     const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     try validateGeneratedDeleteJoinedRanges(tokens, ast, end);
-    try validateGeneratedDmlRelationSourceBodyAlloc(alloc, parsed_sql, ast.source_tokens orelse return error.UnsupportedSqlShape);
+    try validateGeneratedDmlRelationSourceBodyAlloc(alloc, parsed_sql, ast);
 
     const parser_context = @import("parser_context.zig");
     var parser_state = parser_context.ParserState{
@@ -13255,7 +13268,7 @@ fn mergeMutationFromGeneratedDmlAstAlloc(
     const tokens = parsed_sql.items();
     const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     try validateGeneratedMergeRanges(tokens, ast, end);
-    try validateGeneratedDmlRelationSourceBodyAlloc(alloc, parsed_sql, ast.source_tokens orelse return error.UnsupportedSqlShape);
+    try validateGeneratedDmlRelationSourceBodyAlloc(alloc, parsed_sql, ast);
 
     const parser_context = @import("parser_context.zig");
     var parser_state = parser_context.ParserState{

@@ -85,7 +85,8 @@ single-table source `UPDATE` and `DELETE` statements without joined
 mutation-source lowering. Explicit `UPDATE ... FROM` and `DELETE ... USING`
 joined mutation-source statements now validate generated target, source,
 predicate, and returning ranges before direct joined mutation-source lowering,
-parse generated child-read wrappers for relation source bodies, and
+retain lightweight generated read-body payloads for relation source bodies,
+parse generated child-read wrappers for those relation sources, and
 generated-direct parity now covers explicit joined
 `UPDATE ... FROM` and `DELETE ... USING` bodies with separate source schemas,
 computed source assignments, expression predicates, source-qualified returning
@@ -93,8 +94,10 @@ expressions, and lock options, plus simple, correlated, filtered, computed,
 row-value, and `EXISTS` semijoin joined mutation-source forms for both
 `UPDATE` and `DELETE`, including non-recursive CTE write prefixes. `MERGE`
 statements now validate generated target, source, and
-`ON`/arm ranges before direct merge-plan lowering, with generated-direct
-coverage for multiple matched/not-matched arms, conditional arms, matched
+`ON`/arm ranges, retain lightweight generated read-body payloads for `USING`
+relation source bodies, and parse generated child-read wrappers for those
+sources before direct merge-plan lowering, with generated-direct coverage for
+multiple matched/not-matched arms, conditional arms, matched
 `DELETE`, matched/not-matched `DO NOTHING`, expression-filtered matched
 `UPDATE`, filtered not-matched `INSERT`, `RETURNING`, and non-recursive CTE
 write prefixes; recursive CTE insert-source, update, delete, and `MERGE`
@@ -108,9 +111,8 @@ AST-to-plan wrapper that fails closed if the generated DML family does not
 match the existing write classifier before delegating to the current typed DML
 lowerer. Unsupported DML still falls back, and deeper DML cutover still
 requires replacing token-based command-body parsing with complete generated AST
-payloads for recursive CTE DML beyond generated range validation and retained
-generated read-body AST payloads for joined mutation and merge relation source
-bodies beyond generated child-read wrapper validation.
+payloads for recursive CTE DML beyond generated range validation and broader
+unsupported-shape diagnostics.
 Representative
 read queries now have generated-parser corpus coverage, retained generated raw
 and AST nodes for covered read statements, top-level generated AST ranges for
@@ -381,9 +383,7 @@ Unsupported DDL remains on the existing parser until
    classifier fallback.
    Switching the full DML family from fallback to required generated parsing
    still requires generated command-body ASTs for recursive CTE DML beyond
-   generated range validation and direct recursive write-plan dispatch,
-   retained generated read-body AST payloads for joined mutation and merge
-   relation source bodies beyond generated child-read wrapper validation, and
+   generated range validation and direct recursive write-plan dispatch, plus
    broader unsupported-shape diagnostics.
 4. Read queries: projections, predicates, joins, CTEs, aggregates, windows,
    set operations, lateral, ordering, limits, and document-table sources.
@@ -791,9 +791,12 @@ Generated grammar work needs evidence at multiple levels:
   returning lists, direct generated AST-to-plan coverage for table-wide and
   single-table source update/delete mutation-source requests without joined
   sources, direct generated AST-to-plan coverage for explicit update-from and
-  delete-using joined mutation-source requests with generated child-read
-  wrapper validation for relation source bodies, direct generated AST-to-plan
-  coverage for merge plans and non-recursive CTE write prefixes across
+  delete-using joined mutation-source requests with retained lightweight
+  generated read-body payloads and generated child-read wrapper validation for
+  relation source bodies, direct generated AST-to-plan
+  coverage for merge plans with retained lightweight generated read-body
+  payloads and generated child-read wrapper validation for `USING` relation
+  source bodies, and non-recursive CTE write prefixes across
   insert-source, point update/delete, joined update/delete, and merge,
   generated-direct validation and dispatch for recursive CTE insert-source,
   update, delete, and merge write-plan variants,
