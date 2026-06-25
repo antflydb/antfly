@@ -309,17 +309,22 @@ policy predicates that require parser-context function bindings, before
 delegating to the typed row-security catalog planner. Notification channel
 commands also use the validated unsupported boundary for `LISTEN`, `NOTIFY`,
 and `UNLISTEN` before delegating to typed notification catalog planning.
-Maintenance commands use the same validated generated unsupported boundary for
-`VACUUM`, `ANALYZE`, `REINDEX`, and `CLUSTER` before delegating to typed
-maintenance planning. Legacy-supported cursor and savepoint commands use the
-validated unsupported boundary for `DECLARE`, `FETCH`, `CLOSE`, `SAVEPOINT`,
-and `RELEASE` before delegating to typed cursor/savepoint planning; `MOVE`
-remains an unsupported generated diagnostic because there is no typed cursor
-plan for it yet. Bulk I/O commands use the validated unsupported boundary for
-`COPY` before delegating to typed bulk I/O planning. `EXPLAIN` uses the
-validated unsupported boundary before delegating to typed explain planning,
-including generated subject-range validation before the inner read/write
-statement is reparsed.
+Logical-replication catalog commands use the same boundary for
+`CREATE`/`ALTER`/`DROP PUBLICATION` and `CREATE`/`ALTER`/`DROP SUBSCRIPTION`;
+authorization and utility commands use it for `GRANT`, `REVOKE`, `COMMENT`,
+`CALL`, and `LOCK`; and update-policy trigger commands use it for
+`CREATE TRIGGER` and `DROP TRIGGER`. Maintenance commands use the same
+validated generated unsupported boundary for `VACUUM`, `ANALYZE`, `REINDEX`,
+and `CLUSTER` before delegating to typed maintenance planning.
+Legacy-supported cursor and savepoint commands use the validated unsupported
+boundary for `DECLARE`, `FETCH`, `CLOSE`, `SAVEPOINT`, and `RELEASE` before
+delegating to typed cursor/savepoint planning; `MOVE` remains an unsupported
+generated diagnostic because there is no typed cursor plan for it yet. Bulk
+I/O commands use the validated unsupported boundary for `COPY` before
+delegating to typed bulk I/O planning. `EXPLAIN` uses the validated
+unsupported boundary before delegating to typed explain planning, including
+generated subject-range validation before the inner read/write statement is
+reparsed.
 Generated unsupported nodes now also participate in the parsed statement
 boundary: generated-covered unsupported heads that are not intentionally
 supported by the existing catalog planner become terminal parsed unsupported

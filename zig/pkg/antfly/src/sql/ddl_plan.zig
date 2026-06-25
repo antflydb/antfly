@@ -8897,12 +8897,18 @@ pub fn relationalIndexLifecycleName(lifecycle: runtime_schema.RelationalIndexLif
 }
 
 const GeneratedUnsupportedCatalogBoundaryFamily = enum {
+    authorization,
     bulk_io,
+    comment,
     cursor_savepoint,
+    logical_replication,
     maintenance,
     materialized_view,
     notification,
+    procedure_call,
     row_policy,
+    transaction_control,
+    update_policy_trigger,
 };
 
 const GeneratedUnsupportedCatalogBoundary = struct {
@@ -8915,12 +8921,18 @@ fn generatedUnsupportedCatalogBoundary(
 ) ?GeneratedUnsupportedCatalogBoundary {
     return switch (statement) {
         .unsupported => |kind| switch (kind) {
+            .grant, .revoke => .{ .family = .authorization, .kind = kind },
             .copy => .{ .family = .bulk_io, .kind = kind },
+            .comment => .{ .family = .comment, .kind = kind },
             .close, .declare, .fetch, .release, .savepoint => .{ .family = .cursor_savepoint, .kind = kind },
+            .alter_publication, .alter_subscription, .create_publication, .create_subscription, .drop_publication, .drop_subscription => .{ .family = .logical_replication, .kind = kind },
             .analyze, .cluster, .reindex, .vacuum => .{ .family = .maintenance, .kind = kind },
             .create_materialized_view, .drop_materialized_view, .refresh => .{ .family = .materialized_view, .kind = kind },
             .listen, .notify, .unlisten => .{ .family = .notification, .kind = kind },
+            .call => .{ .family = .procedure_call, .kind = kind },
             .create_policy, .alter_policy, .drop_policy => .{ .family = .row_policy, .kind = kind },
+            .lock => .{ .family = .transaction_control, .kind = kind },
+            .create_trigger, .drop_trigger => .{ .family = .update_policy_trigger, .kind = kind },
             else => null,
         },
         else => null,
@@ -9006,9 +9018,30 @@ fn validateGeneratedUnsupportedCatalogAst(
         return error.UnsupportedSqlShape;
     }
     switch (boundary.family) {
+        .authorization => switch (boundary.kind) {
+            .grant => {
+                if (end < 1 or !tokens[0].matchesKeyword("grant")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            .revoke => {
+                if (end < 1 or !tokens[0].matchesKeyword("revoke")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            else => return error.UnsupportedSqlShape,
+        },
         .bulk_io => switch (boundary.kind) {
             .copy => {
                 if (end < 1 or !tokens[0].matchesKeyword("copy")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .comment => switch (boundary.kind) {
+            .comment => {
+                if (end < 1 or !tokens[0].matchesKeyword("comment")) {
                     return error.UnsupportedSqlShape;
                 }
             },
@@ -9037,6 +9070,39 @@ fn validateGeneratedUnsupportedCatalogAst(
             },
             .savepoint => {
                 if (end < 1 or !tokens[0].matchesKeyword("savepoint")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .logical_replication => switch (boundary.kind) {
+            .alter_publication => {
+                if (end < 2 or !tokens[0].matchesKeyword("alter") or !tokens[1].matchesKeyword("publication")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            .alter_subscription => {
+                if (end < 2 or !tokens[0].matchesKeyword("alter") or !tokens[1].matchesKeyword("subscription")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            .create_publication => {
+                if (end < 2 or !tokens[0].matchesKeyword("create") or !tokens[1].matchesKeyword("publication")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            .create_subscription => {
+                if (end < 2 or !tokens[0].matchesKeyword("create") or !tokens[1].matchesKeyword("subscription")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            .drop_publication => {
+                if (end < 2 or !tokens[0].matchesKeyword("drop") or !tokens[1].matchesKeyword("publication")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            .drop_subscription => {
+                if (end < 2 or !tokens[0].matchesKeyword("drop") or !tokens[1].matchesKeyword("subscription")) {
                     return error.UnsupportedSqlShape;
                 }
             },
@@ -9101,6 +9167,14 @@ fn validateGeneratedUnsupportedCatalogAst(
             },
             else => return error.UnsupportedSqlShape,
         },
+        .procedure_call => switch (boundary.kind) {
+            .call => {
+                if (end < 1 or !tokens[0].matchesKeyword("call")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            else => return error.UnsupportedSqlShape,
+        },
         .row_policy => switch (boundary.kind) {
             .create_policy => {
                 if (end < 2 or !tokens[0].matchesKeyword("create") or !tokens[1].matchesKeyword("policy")) {
@@ -9114,6 +9188,27 @@ fn validateGeneratedUnsupportedCatalogAst(
             },
             .drop_policy => {
                 if (end < 2 or !tokens[0].matchesKeyword("drop") or !tokens[1].matchesKeyword("policy")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .transaction_control => switch (boundary.kind) {
+            .lock => {
+                if (end < 1 or !tokens[0].matchesKeyword("lock")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .update_policy_trigger => switch (boundary.kind) {
+            .create_trigger => {
+                if (end < 2 or !tokens[0].matchesKeyword("create") or !tokens[1].matchesKeyword("trigger")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            .drop_trigger => {
+                if (end < 2 or !tokens[0].matchesKeyword("drop") or !tokens[1].matchesKeyword("trigger")) {
                     return error.UnsupportedSqlShape;
                 }
             },
@@ -9142,9 +9237,33 @@ fn catalogDdlPlanFromGeneratedUnsupportedAstAlloc(
     }
     if (pos.* != tokens.len) return error.UnsupportedSqlShape;
     switch (boundary.family) {
+        .authorization => switch (boundary.kind) {
+            .grant => switch (plan) {
+                .authorization_catalog => |catalog| switch (catalog) {
+                    .grant_privilege => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            .revoke => switch (plan) {
+                .authorization_catalog => |catalog| switch (catalog) {
+                    .revoke_privilege => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
         .bulk_io => switch (boundary.kind) {
             .copy => switch (plan) {
                 .bulk_io => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .comment => switch (boundary.kind) {
+            .comment => switch (plan) {
+                .comment_metadata => {},
                 else => return error.UnsupportedSqlShape,
             },
             else => return error.UnsupportedSqlShape,
@@ -9181,6 +9300,69 @@ fn catalogDdlPlanFromGeneratedUnsupportedAstAlloc(
             .savepoint => switch (plan) {
                 .savepoint_transaction => |savepoint| switch (savepoint) {
                     .savepoint => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .logical_replication => switch (boundary.kind) {
+            .alter_publication => switch (plan) {
+                .logical_replication => |logical| switch (logical) {
+                    .publication => |publication| switch (publication) {
+                        .alter => {},
+                        else => return error.UnsupportedSqlShape,
+                    },
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            .alter_subscription => switch (plan) {
+                .logical_replication => |logical| switch (logical) {
+                    .subscription => |subscription| switch (subscription) {
+                        .alter => {},
+                        else => return error.UnsupportedSqlShape,
+                    },
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            .create_publication => switch (plan) {
+                .logical_replication => |logical| switch (logical) {
+                    .publication => |publication| switch (publication) {
+                        .create => {},
+                        else => return error.UnsupportedSqlShape,
+                    },
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            .create_subscription => switch (plan) {
+                .logical_replication => |logical| switch (logical) {
+                    .subscription => |subscription| switch (subscription) {
+                        .create => {},
+                        else => return error.UnsupportedSqlShape,
+                    },
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            .drop_publication => switch (plan) {
+                .logical_replication => |logical| switch (logical) {
+                    .publication => |publication| switch (publication) {
+                        .drop => {},
+                        else => return error.UnsupportedSqlShape,
+                    },
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            .drop_subscription => switch (plan) {
+                .logical_replication => |logical| switch (logical) {
+                    .subscription => |subscription| switch (subscription) {
+                        .drop => {},
+                        else => return error.UnsupportedSqlShape,
+                    },
                     else => return error.UnsupportedSqlShape,
                 },
                 else => return error.UnsupportedSqlShape,
@@ -9266,6 +9448,13 @@ fn catalogDdlPlanFromGeneratedUnsupportedAstAlloc(
             },
             else => return error.UnsupportedSqlShape,
         },
+        .procedure_call => switch (boundary.kind) {
+            .call => switch (plan) {
+                .procedure_call => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
         .row_policy => switch (boundary.kind) {
             .create_policy => switch (plan) {
                 .row_security_catalog => |catalog| switch (catalog) {
@@ -9285,6 +9474,33 @@ fn catalogDdlPlanFromGeneratedUnsupportedAstAlloc(
                 .row_security_catalog => |catalog| switch (catalog) {
                     .drop_policy => {},
                     else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .transaction_control => switch (boundary.kind) {
+            .lock => switch (plan) {
+                .transaction_control => |transaction| switch (transaction) {
+                    .table_lock => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .update_policy_trigger => switch (boundary.kind) {
+            .create_trigger => switch (plan) {
+                .create_update_policy => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            .drop_trigger => switch (plan) {
+                .alter_table => |alter| {
+                    if (alter.operations.len != 1) return error.UnsupportedSqlShape;
+                    switch (alter.operations[0]) {
+                        .drop_update_policy => {},
+                        else => return error.UnsupportedSqlShape,
+                    }
                 },
                 else => return error.UnsupportedSqlShape,
             },
@@ -14575,6 +14791,126 @@ test "sql adapter generated row policy unsupported AST lowers to catalog plans" 
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
                 .unsupported => |*unsupported| unsupported.subject_tokens = .{ .start = 2, .end = malformed_subject.items().len },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_subject));
+}
+
+test "sql adapter generated utility unsupported AST lowers to legacy catalog plans" {
+    const alloc = std.testing.allocator;
+
+    const cases = [_]struct {
+        sql: []const u8,
+        kind: generated_parser.GeneratedSqlUnsupportedKind,
+    }{
+        .{ .sql = "CALL rotate_usage();", .kind = .call },
+        .{ .sql = "COMMENT ON TABLE usage_records IS 'usage';", .kind = .comment },
+        .{ .sql = "GRANT SELECT ON TABLE usage_records TO app_reader;", .kind = .grant },
+        .{ .sql = "REVOKE SELECT ON TABLE usage_records FROM app_reader;", .kind = .revoke },
+        .{ .sql = "LOCK TABLE usage_records IN SHARE MODE;", .kind = .lock },
+        .{ .sql = "CREATE PUBLICATION pub_usage FOR TABLE usage_records;", .kind = .create_publication },
+        .{ .sql = "ALTER PUBLICATION pub_usage ADD TABLE audit_records;", .kind = .alter_publication },
+        .{ .sql = "DROP PUBLICATION IF EXISTS pub_usage;", .kind = .drop_publication },
+        .{ .sql = "CREATE SUBSCRIPTION sub_usage CONNECTION 'host=db' PUBLICATION pub_usage;", .kind = .create_subscription },
+        .{ .sql = "ALTER SUBSCRIPTION sub_usage DISABLE;", .kind = .alter_subscription },
+        .{ .sql = "DROP SUBSCRIPTION IF EXISTS sub_usage;", .kind = .drop_subscription },
+        .{ .sql = "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION touch_updated_at('updated_at_ns');", .kind = .create_trigger },
+        .{ .sql = "DROP TRIGGER IF EXISTS update_timestamp ON usage_records;", .kind = .drop_trigger },
+    };
+
+    for (cases) |case| {
+        var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, case.sql);
+        defer parsed_sql.deinit(alloc);
+        var lowered = try lowerDdlPlanParsedSqlAlloc(alloc, &parsed_sql);
+        defer lowered.deinit(alloc);
+        switch (case.kind) {
+            .call => switch (lowered) {
+                .procedure_call => {},
+                else => return error.TestUnexpectedResult,
+            },
+            .comment => switch (lowered) {
+                .comment_metadata => {},
+                else => return error.TestUnexpectedResult,
+            },
+            .grant => switch (lowered) {
+                .authorization_catalog => |catalog| switch (catalog) {
+                    .grant_privilege => {},
+                    else => return error.TestUnexpectedResult,
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            .revoke => switch (lowered) {
+                .authorization_catalog => |catalog| switch (catalog) {
+                    .revoke_privilege => {},
+                    else => return error.TestUnexpectedResult,
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            .lock => switch (lowered) {
+                .transaction_control => |transaction| switch (transaction) {
+                    .table_lock => {},
+                    else => return error.TestUnexpectedResult,
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            .create_publication, .alter_publication, .drop_publication => switch (lowered) {
+                .logical_replication => |logical| switch (logical) {
+                    .publication => {},
+                    else => return error.TestUnexpectedResult,
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            .create_subscription, .alter_subscription, .drop_subscription => switch (lowered) {
+                .logical_replication => |logical| switch (logical) {
+                    .subscription => {},
+                    else => return error.TestUnexpectedResult,
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            .create_trigger => switch (lowered) {
+                .create_update_policy => {},
+                else => return error.TestUnexpectedResult,
+            },
+            .drop_trigger => switch (lowered) {
+                .alter_table => |alter| {
+                    try std.testing.expectEqual(@as(usize, 1), alter.operations.len);
+                    switch (alter.operations[0]) {
+                        .drop_update_policy => {},
+                        else => return error.TestUnexpectedResult,
+                    }
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    var malformed_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CALL rotate_usage();",
+    );
+    defer malformed_kind.deinit(alloc);
+    if (malformed_kind.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.kind = .grant,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_kind));
+
+    var malformed_subject = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "GRANT SELECT ON TABLE usage_records TO app_reader;",
+    );
+    defer malformed_subject.deinit(alloc);
+    if (malformed_subject.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.subject_tokens = .{ .start = 0, .end = malformed_subject.items().len },
                 else => return error.TestUnexpectedResult,
             }
         } else return error.TestUnexpectedResult;
