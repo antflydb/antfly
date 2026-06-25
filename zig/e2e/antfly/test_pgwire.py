@@ -254,6 +254,9 @@ def test_pgwire_extended_query_binds_text_parameters(pgwire_server):
     assert [message["tag"] for message in create_messages if message["type"] == "command"] == ["CREATE TABLE"]
     assert [message["tag"] for message in insert_messages if message["type"] == "command"] == ["INSERT 0 1"]
     assert [message["tag"] for message in select_messages if message["type"] == "command"] == ["SELECT 1"]
+    assert [message for message in select_messages if message["type"] == "columns"] == [
+        {"type": "columns", "columns": ["id", "status"], "oids": [PG_TEXT_OID, PG_TEXT_OID]}
+    ]
     assert [message["values"] for message in select_messages if message["type"] == "row"] == [["row:extended", "ready"]]
 
 

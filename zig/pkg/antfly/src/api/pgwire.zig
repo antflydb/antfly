@@ -208,8 +208,10 @@ const Connection = struct {
     namespace: ?[]u8 = null,
     unnamed_statement: ?[]u8 = null,
     unnamed_portal: ?[]u8 = null,
+    unnamed_portal_described: bool = false,
     prepared_statements: std.StringHashMapUnmanaged([]u8) = .empty,
     portals: std.StringHashMapUnmanaged([]u8) = .empty,
+    described_portals: std.StringHashMapUnmanaged(void) = .empty,
 
     fn deinit(self: *Connection) void {
         if (self.database) |database| self.alloc.free(database);
@@ -218,6 +220,7 @@ const Connection = struct {
         if (self.unnamed_portal) |sql| self.alloc.free(sql);
         pgwire_module.freeSqlMap(self.alloc, &self.prepared_statements);
         pgwire_module.freeSqlMap(self.alloc, &self.portals);
+        pgwire_module.freeVoidMapKeys(self.alloc, &self.described_portals);
         self.* = undefined;
     }
 
@@ -329,7 +332,7 @@ const Connection = struct {
                 const statement = std.mem.trim(u8, rest[0..end], " \t\r\n");
                 if (statement.len != 0) {
                     executed = true;
-                    if (!try self.executeAndEncodeOne(statement, true)) return;
+                    if (!try self.executeAndEncodeOne(statement, true, true)) return;
                 }
                 rest = rest[end + 1 ..];
                 continue;
@@ -338,7 +341,7 @@ const Connection = struct {
             const trailing = std.mem.trim(u8, rest, " \t\r\n");
             if (trailing.len != 0) {
                 executed = true;
-                if (!try self.executeAndEncodeOne(trailing, true)) return;
+                if (!try self.executeAndEncodeOne(trailing, true, true)) return;
             }
             break;
         }
@@ -427,10 +430,12 @@ const Connection = struct {
             } else {
                 try self.sendNoData();
             },
-            'P' => if (self.portalSql(name) == null) {
-                try self.sendError("34000", "portal does not exist");
-            } else {
-                try self.sendNoData();
+            'P' => {
+                const sql = self.portalSql(name) orelse {
+                    try self.sendError("34000", "portal does not exist");
+                    return;
+                };
+                if (try self.describeAndEncodeOne(sql)) try self.markPortalDescribed(name);
             },
             else => return error.InvalidPgwireMessage,
         }
@@ -445,7 +450,7 @@ const Connection = struct {
             try self.sendError("34000", "portal does not exist");
             return;
         };
-        _ = try self.executeAndEncodeOne(sql, false);
+        _ = try self.executeAndEncodeOne(sql, false, !self.portalDescribed(portal_name));
     }
 
     fn handleClose(self: *Connection, payload: []const u8) !void {
@@ -494,8 +499,10 @@ const Connection = struct {
         if (name.len == 0) {
             if (self.unnamed_portal) |old| self.alloc.free(old);
             self.unnamed_portal = owned_sql;
+            self.unnamed_portal_described = false;
             return;
         }
+        self.removeDescribedPortal(name);
         try pgwire_module.putOwnedSql(self.alloc, &self.portals, name, owned_sql);
     }
 
@@ -508,15 +515,68 @@ const Connection = struct {
         if (name.len == 0) {
             if (self.unnamed_portal) |old| self.alloc.free(old);
             self.unnamed_portal = null;
+            self.unnamed_portal_described = false;
             return;
         }
+        self.removeDescribedPortal(name);
         if (self.portals.fetchRemove(name)) |removed| {
             self.alloc.free(removed.key);
             self.alloc.free(removed.value);
         }
     }
 
-    fn executeAndEncodeOne(self: *Connection, sql: []const u8, send_ready_on_error: bool) !bool {
+    fn markPortalDescribed(self: *Connection, name: []const u8) !void {
+        if (name.len == 0) {
+            self.unnamed_portal_described = true;
+            return;
+        }
+        const owned_name = try self.alloc.dupe(u8, name);
+        errdefer self.alloc.free(owned_name);
+        if (self.described_portals.fetchRemove(name)) |removed| self.alloc.free(removed.key);
+        try self.described_portals.put(self.alloc, owned_name, {});
+    }
+
+    fn removeDescribedPortal(self: *Connection, name: []const u8) void {
+        if (name.len == 0) {
+            self.unnamed_portal_described = false;
+            return;
+        }
+        if (self.described_portals.fetchRemove(name)) |removed| self.alloc.free(removed.key);
+    }
+
+    fn portalDescribed(self: *Connection, name: []const u8) bool {
+        if (name.len == 0) return self.unnamed_portal_described;
+        return self.described_portals.contains(name);
+    }
+
+    fn describeAndEncodeOne(self: *Connection, sql: []const u8) !bool {
+        var outcome = self.describeSql(sql) catch |err| {
+            std.log.warn("pgwire sql describe failed err={}", .{err});
+            try self.sendError("XX000", "internal sql describe error");
+            return false;
+        };
+        switch (outcome) {
+            .response => |*response| {
+                defer response.deinit(self.api_server.alloc);
+                try self.sendError(pgwire_module.sqlstateForHttpStatus(response.status), response.body);
+                return false;
+            },
+            .result => |*result| {
+                defer result.deinit(self.api_server.alloc);
+                self.session_id = result.session_id;
+                if (!result.has_row_description) {
+                    try self.sendNoData();
+                    return false;
+                }
+                const columns = try pgwire_module.pgwireColumnsForRelationalColumnsAlloc(self.alloc, result.columns);
+                defer self.alloc.free(columns);
+                try self.sendRowDescription(columns);
+                return true;
+            },
+        }
+    }
+
+    fn executeAndEncodeOne(self: *Connection, sql: []const u8, send_ready_on_error: bool, include_row_description: bool) !bool {
         var outcome = self.executeSql(sql) catch |err| {
             std.log.warn("pgwire sql execution failed err={}", .{err});
             try self.sendError("XX000", "internal sql execution error");
@@ -532,10 +592,20 @@ const Connection = struct {
             },
             .result => |*result| {
                 defer result.deinit(self.api_server.alloc);
-                try self.encodeSqlResult(sql, result);
+                try self.encodeSqlResult(sql, result, include_row_description);
                 return true;
             },
         }
+    }
+
+    fn describeSql(self: *Connection, sql: []const u8) !http_server.ApiHttpServer.PublicSqlDescribeResultOrResponse {
+        return try self.api_server.handlePublicSqlDescribeRequestResult(.{
+            .sql = sql,
+            .session_id = self.session_id,
+            .database = self.database,
+            .namespace = self.namespace,
+            .read_only = true,
+        }, null);
     }
 
     fn executeSql(self: *Connection, sql: []const u8) !http_server.ApiHttpServer.PublicSqlResultOrResponse {
@@ -548,7 +618,7 @@ const Connection = struct {
         }, null);
     }
 
-    fn encodeSqlResult(self: *Connection, sql: []const u8, result: *const http_server.ApiHttpServer.PublicSqlResult) !void {
+    fn encodeSqlResult(self: *Connection, sql: []const u8, result: *const http_server.ApiHttpServer.PublicSqlResult, include_row_description: bool) !void {
         self.session_id = result.session_id;
         switch (result.result) {
             .ddl => |applied| try self.sendCommandComplete(pgwire_module.commandTagForDdlSql(self.alloc, sql) orelse pgwire_module.commandTagForDdlApplied(applied)),
@@ -558,13 +628,13 @@ const Connection = struct {
                 defer self.alloc.free(tag);
                 const columns = try pgwire_module.readResultColumnsAlloc(self.alloc, read);
                 defer if (columns) |typed_columns| self.alloc.free(typed_columns);
-                try self.sendJsonRows(rows, columns, tag);
+                try self.sendJsonRows(rows, columns, tag, include_row_description);
             },
             .rows_batch => |rows_batch| {
                 if (rows_batch.returning_rows.len > 0) {
                     const tag = try pgwire_module.commandTagForRows(self.alloc, result.statement_kind, rows_batch.returning_rows.len);
                     defer self.alloc.free(tag);
-                    try self.sendJsonRows(rows_batch.returning_rows, null, tag);
+                    try self.sendJsonRows(rows_batch.returning_rows, null, tag, include_row_description);
                 } else {
                     const tag = try pgwire_module.commandTagForRowsBatch(self.alloc, result.statement_kind, rows_batch);
                     defer self.alloc.free(tag);
@@ -575,7 +645,7 @@ const Connection = struct {
                 if (mutation_source.returning_rows.len > 0) {
                     const tag = try pgwire_module.commandTagForRows(self.alloc, result.statement_kind, mutation_source.returning_rows.len);
                     defer self.alloc.free(tag);
-                    try self.sendJsonRows(mutation_source.returning_rows, null, tag);
+                    try self.sendJsonRows(mutation_source.returning_rows, null, tag, include_row_description);
                 } else {
                     const tag = try pgwire_module.commandTagForMutationSource(self.alloc, result.statement_kind, mutation_source);
                     defer self.alloc.free(tag);
@@ -634,13 +704,10 @@ const Connection = struct {
         rows: []const []const u8,
         schema_columns: ?[]const PgwireColumn,
         tag: []const u8,
+        include_row_description: bool,
     ) !void {
         if (schema_columns) |columns| {
-            var row_description: std.Io.Writer.Allocating = .init(self.alloc);
-            defer row_description.deinit();
-            try row_description.writer.writeInt(i16, @intCast(columns.len), .big);
-            for (columns) |column| try pgwire_module.appendColumnDescription(&row_description.writer, column);
-            try self.sendMessage('T', row_description.written());
+            if (include_row_description) try self.sendRowDescription(columns);
             for (rows) |row_json| {
                 var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, row_json, .{ .allocate = .alloc_always });
                 defer parsed.deinit();
@@ -653,8 +720,10 @@ const Connection = struct {
         var row_description: std.Io.Writer.Allocating = .init(self.alloc);
         defer row_description.deinit();
         if (rows.len == 0) {
-            try row_description.writer.writeInt(i16, 0, .big);
-            try self.sendMessage('T', row_description.written());
+            if (include_row_description) {
+                try row_description.writer.writeInt(i16, 0, .big);
+                try self.sendMessage('T', row_description.written());
+            }
             try self.sendCommandComplete(tag);
             return;
         }
@@ -662,8 +731,10 @@ const Connection = struct {
         var first_row = try std.json.parseFromSlice(std.json.Value, self.alloc, rows[0], .{ .allocate = .alloc_always });
         defer first_row.deinit();
         if (first_row.value != .object) {
-            try row_description.writer.writeInt(i16, 0, .big);
-            try self.sendMessage('T', row_description.written());
+            if (include_row_description) {
+                try row_description.writer.writeInt(i16, 0, .big);
+                try self.sendMessage('T', row_description.written());
+            }
             try self.sendCommandComplete(tag);
             return;
         }
@@ -675,9 +746,7 @@ const Connection = struct {
         var column_index: usize = 0;
         while (column_it.next()) |entry| : (column_index += 1) columns[column_index] = .{ .name = entry.key_ptr.* };
 
-        try row_description.writer.writeInt(i16, @intCast(columns.len), .big);
-        for (columns) |column| try pgwire_module.appendColumnDescription(&row_description.writer, column);
-        try self.sendMessage('T', row_description.written());
+        if (include_row_description) try self.sendRowDescription(columns);
         try self.sendDataRowForColumnNames(first_row.value, columns);
         for (rows[1..]) |row_json| {
             var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, row_json, .{ .allocate = .alloc_always });
@@ -685,6 +754,14 @@ const Connection = struct {
             try self.sendDataRowForColumnNames(parsed.value, columns);
         }
         try self.sendCommandComplete(tag);
+    }
+
+    fn sendRowDescription(self: *Connection, columns: []const PgwireColumn) !void {
+        var row_description: std.Io.Writer.Allocating = .init(self.alloc);
+        defer row_description.deinit();
+        try row_description.writer.writeInt(i16, @intCast(columns.len), .big);
+        for (columns) |column| try pgwire_module.appendColumnDescription(&row_description.writer, column);
+        try self.sendMessage('T', row_description.written());
     }
 
     fn sendDataRowsForColumnNames(self: *Connection, rows: []const std.json.Value, columns: []const PgwireColumn) !void {
@@ -860,6 +937,12 @@ fn freeSqlMap(alloc: std.mem.Allocator, map: *std.StringHashMapUnmanaged([]u8)) 
     map.deinit(alloc);
 }
 
+fn freeVoidMapKeys(alloc: std.mem.Allocator, map: *std.StringHashMapUnmanaged(void)) void {
+    var it = map.iterator();
+    while (it.next()) |entry| alloc.free(entry.key_ptr.*);
+    map.deinit(alloc);
+}
+
 fn parameterFormat(formats: []const i16, index: usize) i16 {
     if (formats.len == 0) return text_format;
     if (formats.len == 1) return formats[0];
@@ -991,8 +1074,12 @@ fn readResultRows(read: anytype) []const []const u8 {
 
 fn readResultColumnsAlloc(alloc: std.mem.Allocator, read: anytype) !?[]const PgwireColumn {
     if (read.columns.len == 0) return null;
-    const columns = try alloc.alloc(PgwireColumn, read.columns.len);
-    for (read.columns, 0..) |column, i| columns[i] = pgwireColumnForRelationalColumn(column);
+    return try pgwireColumnsForRelationalColumnsAlloc(alloc, read.columns);
+}
+
+fn pgwireColumnsForRelationalColumnsAlloc(alloc: std.mem.Allocator, relational_columns: []const runtime_schema.RelationalColumn) ![]const PgwireColumn {
+    const columns = try alloc.alloc(PgwireColumn, relational_columns.len);
+    for (relational_columns, 0..) |column, i| columns[i] = pgwireColumnForRelationalColumn(column);
     return columns;
 }
 

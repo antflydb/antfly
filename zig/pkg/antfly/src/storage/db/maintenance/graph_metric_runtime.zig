@@ -18,10 +18,12 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const apply_rw_lock_mod = @import("../apply_rw_lock.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
+const lease_mod = @import("../lease.zig");
 const ownership_mod = @import("../ownership.zig");
 const graph_mod = @import("../../../graph/graph.zig");
 const graph_query_mod = @import("../../../graph/query.zig");
 const platform_clock = @import("../../../platform/clock.zig");
+const types = @import("../types.zig");
 const background_runtime_mod = @import("../../background_runtime.zig");
 
 pub const Role = enum {
@@ -1105,6 +1107,433 @@ fn lockApplyExclusiveBackoff(runtime: *GraphMetricRuntime) bool {
         sleepMs(runtime, 1);
     }
     return true;
+}
+
+test "db graph metric runtime lease ownership blocks duplicate owners and allows takeover" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    var manual_clock = platform_clock.ManualClock{};
+    manual_clock.setRealtimeNs(1_000 * std.time.ns_per_ms);
+    const resources = db.core.asyncResources();
+    var owner_a = try GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .runtime_id = "runtime-owned-a",
+            .lease_owned = true,
+            .owner_id = "runtime-owner-a",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-owned-worker-a",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer owner_a.deinit();
+    var owner_b = try GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .runtime_id = "runtime-owned-b",
+            .lease_owned = true,
+            .owner_id = "runtime-owner-b",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-owned-worker-b",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer owner_b.deinit();
+
+    const owner_a_tick = try owner_a.runOnceDetailed();
+    try std.testing.expect(owner_a_tick.durableProgressed());
+    try std.testing.expectEqual(@as(usize, 1), owner_a_tick.builds_started);
+    {
+        const stats = owner_a.stats();
+        try std.testing.expect(stats.lease_owned);
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-owner-a"), stats.owner_id_hash);
+        try std.testing.expectEqual(owner_a.stats().lease_key_hash, owner_b.stats().lease_key_hash);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.lease_acquire_failures);
+        try std.testing.expectEqual(@as(u64, 0), stats.lost_leases);
+        try std.testing.expectEqual(@as(u64, 1_000), stats.last_acquired_ms);
+    }
+
+    const blocked_tick = try owner_b.runOnceDetailed();
+    try std.testing.expect(!blocked_tick.durableProgressed());
+    try std.testing.expectEqual(@as(usize, 0), blocked_tick.builds_started);
+    try std.testing.expectEqual(@as(usize, 0), blocked_tick.worker_steps);
+    try std.testing.expectEqual(@as(usize, 0), blocked_tick.coordinator_steps);
+    {
+        const stats = owner_b.stats();
+        try std.testing.expect(stats.lease_owned);
+        try std.testing.expect(!stats.has_lease);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-owner-b"), stats.owner_id_hash);
+        try std.testing.expectEqual(@as(u64, 0), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 1), stats.lease_acquire_failures);
+        try std.testing.expectEqual(@as(u64, 1), stats.ticks_started);
+        try std.testing.expectEqual(@as(u64, 1), stats.ticks_completed);
+        try std.testing.expectEqual(@as(u64, 1), stats.idle_ticks);
+    }
+
+    manual_clock.advanceMs(101);
+    const takeover_tick = try owner_b.runOnceDetailed();
+    try std.testing.expect(takeover_tick.durableProgressed());
+    {
+        const stats = owner_b.stats();
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 1), stats.takeover_count);
+        try std.testing.expectEqual(@as(u64, 1_101), stats.last_acquired_ms);
+    }
+
+    const lost_tick = try owner_a.runOnceDetailed();
+    try std.testing.expect(!lost_tick.durableProgressed());
+    {
+        const stats = owner_a.stats();
+        try std.testing.expect(!stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.lost_leases);
+        try std.testing.expectEqual(@as(u64, 1), stats.lease_acquire_failures);
+    }
+
+    db.graph_metric_runtime = &owner_b;
+    defer db.graph_metric_runtime = null;
+    {
+        const mapped_stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, mapped_stats);
+        try std.testing.expect(mapped_stats.graph_metric_runtime.lease_owned);
+        try std.testing.expect(mapped_stats.graph_metric_runtime.has_lease);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-owner-b"), mapped_stats.graph_metric_runtime.owner_id_hash);
+        try std.testing.expectEqual(owner_b.stats().lease_key_hash, mapped_stats.graph_metric_runtime.lease_key_hash);
+        try std.testing.expectEqual(@as(u64, 1), mapped_stats.graph_metric_runtime.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 1), mapped_stats.graph_metric_runtime.takeover_count);
+        try std.testing.expectEqual(@as(u64, 1), mapped_stats.graph_metric_runtime.lease_acquire_failures);
+        try std.testing.expectEqual(@as(u64, 1_101), mapped_stats.graph_metric_runtime.last_acquired_ms);
+    }
+}
+
+test "db graph metric runtime lease releases durable owner lease on deinit" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    var manual_clock = platform_clock.ManualClock{};
+    manual_clock.setRealtimeNs(5_000 * std.time.ns_per_ms);
+    const resources = db.core.asyncResources();
+    var owner_a = try GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .runtime_id = "runtime-release-a",
+            .lease_owned = true,
+            .owner_id = "runtime-release-owner-a",
+            .lease_ttl_ms = 30_000,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-release-worker-a",
+                .max_rounds = 1,
+                .max_metrics_per_round = 1,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    var owner_a_active = true;
+    errdefer if (owner_a_active) owner_a.deinit();
+
+    const owner_a_tick = try owner_a.runOnceDetailed();
+    try std.testing.expect(!owner_a_tick.durableProgressed());
+    {
+        const stats = owner_a.stats();
+        try std.testing.expect(stats.lease_owned);
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.takeover_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.lease_acquire_failures);
+    }
+    const owner_a_lease_key_hash = owner_a.stats().lease_key_hash;
+    {
+        var lease = try lease_mod.Lease.init(alloc, resources.store, default_combined_lease_key);
+        defer lease.deinit();
+        var record = (try lease.load(alloc)) orelse return error.TestExpectedGraphMetricRuntimeLease;
+        defer lease_mod.deinitRecord(alloc, &record);
+        try std.testing.expectEqualStrings("runtime-release-owner-a", record.owner_id);
+        try std.testing.expectEqual(@as(u64, 35_000), record.expires_at_ms);
+    }
+
+    owner_a.deinit();
+    owner_a_active = false;
+    {
+        var lease = try lease_mod.Lease.init(alloc, resources.store, default_combined_lease_key);
+        defer lease.deinit();
+        try std.testing.expect((try lease.load(alloc)) == null);
+    }
+
+    var owner_b = try GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .runtime_id = "runtime-release-b",
+            .lease_owned = true,
+            .owner_id = "runtime-release-owner-b",
+            .lease_ttl_ms = 30_000,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-release-worker-b",
+                .max_rounds = 1,
+                .max_metrics_per_round = 1,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer owner_b.deinit();
+
+    const owner_b_tick = try owner_b.runOnceDetailed();
+    try std.testing.expect(!owner_b_tick.durableProgressed());
+    {
+        const stats = owner_b.stats();
+        try std.testing.expect(stats.lease_owned);
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(owner_a_lease_key_hash, stats.lease_key_hash);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-release-owner-b"), stats.owner_id_hash);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.takeover_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.lease_acquire_failures);
+        try std.testing.expectEqual(@as(u64, 5_000), stats.last_acquired_ms);
+    }
+}
+
+test "db graph metric runtime lease stale deinit preserves replacement owner lease" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    var manual_clock = platform_clock.ManualClock{};
+    manual_clock.setRealtimeNs(6_000 * std.time.ns_per_ms);
+    const resources = db.core.asyncResources();
+    var owner_a = try GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .runtime_id = "runtime-stale-release-a",
+            .lease_owned = true,
+            .owner_id = "runtime-stale-release-owner-a",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-stale-release-worker-a",
+                .max_rounds = 1,
+                .max_metrics_per_round = 1,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    var owner_a_active = true;
+    errdefer if (owner_a_active) owner_a.deinit();
+
+    const owner_a_tick = try owner_a.runOnceDetailed();
+    try std.testing.expect(!owner_a_tick.durableProgressed());
+    {
+        const stats = owner_a.stats();
+        try std.testing.expect(stats.lease_owned);
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.takeover_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.lease_acquire_failures);
+        try std.testing.expectEqual(@as(u64, 6_000), stats.last_acquired_ms);
+    }
+    const lease_key_hash = owner_a.stats().lease_key_hash;
+    {
+        var lease = try lease_mod.Lease.init(alloc, resources.store, default_combined_lease_key);
+        defer lease.deinit();
+        var record = (try lease.load(alloc)) orelse return error.TestExpectedGraphMetricRuntimeLease;
+        defer lease_mod.deinitRecord(alloc, &record);
+        try std.testing.expectEqualStrings("runtime-stale-release-owner-a", record.owner_id);
+        try std.testing.expectEqual(@as(u64, 6_100), record.expires_at_ms);
+    }
+
+    manual_clock.advanceMs(101);
+    var owner_b = try GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .runtime_id = "runtime-stale-release-b",
+            .lease_owned = true,
+            .owner_id = "runtime-stale-release-owner-b",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-stale-release-worker-b",
+                .max_rounds = 1,
+                .max_metrics_per_round = 1,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer owner_b.deinit();
+
+    const owner_b_tick = try owner_b.runOnceDetailed();
+    try std.testing.expect(!owner_b_tick.durableProgressed());
+    {
+        const stats = owner_b.stats();
+        try std.testing.expect(stats.lease_owned);
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(lease_key_hash, stats.lease_key_hash);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-stale-release-owner-b"), stats.owner_id_hash);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 1), stats.takeover_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.lease_acquire_failures);
+        try std.testing.expectEqual(@as(u64, 6_101), stats.last_acquired_ms);
+    }
+    {
+        var lease = try lease_mod.Lease.init(alloc, resources.store, default_combined_lease_key);
+        defer lease.deinit();
+        var record = (try lease.load(alloc)) orelse return error.TestExpectedGraphMetricRuntimeLease;
+        defer lease_mod.deinitRecord(alloc, &record);
+        try std.testing.expectEqualStrings("runtime-stale-release-owner-b", record.owner_id);
+        try std.testing.expectEqual(@as(u64, 6_201), record.expires_at_ms);
+    }
+
+    owner_a.deinit();
+    owner_a_active = false;
+    {
+        var lease = try lease_mod.Lease.init(alloc, resources.store, default_combined_lease_key);
+        defer lease.deinit();
+        var record = (try lease.load(alloc)) orelse return error.TestExpectedGraphMetricRuntimeLease;
+        defer lease_mod.deinitRecord(alloc, &record);
+        try std.testing.expectEqualStrings("runtime-stale-release-owner-b", record.owner_id);
+        try std.testing.expectEqual(@as(u64, 6_201), record.expires_at_ms);
+    }
+
+    var owner_c = try GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .runtime_id = "runtime-stale-release-c",
+            .lease_owned = true,
+            .owner_id = "runtime-stale-release-owner-c",
+            .lease_ttl_ms = 100,
+            .clock = manual_clock.clock(),
+            .planned_options = .{
+                .worker_id = "runtime-stale-release-worker-c",
+                .max_rounds = 1,
+                .max_metrics_per_round = 1,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer owner_c.deinit();
+
+    const owner_c_tick = try owner_c.runOnceDetailed();
+    try std.testing.expect(!owner_c_tick.durableProgressed());
+    {
+        const stats = owner_c.stats();
+        try std.testing.expect(stats.lease_owned);
+        try std.testing.expect(!stats.has_lease);
+        try std.testing.expectEqual(lease_key_hash, stats.lease_key_hash);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-stale-release-owner-c"), stats.owner_id_hash);
+        try std.testing.expectEqual(@as(u64, 0), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.takeover_count);
+        try std.testing.expectEqual(@as(u64, 1), stats.lease_acquire_failures);
+    }
+
+    const owner_b_renew_tick = try owner_b.runOnceDetailed();
+    try std.testing.expect(!owner_b_renew_tick.durableProgressed());
+    {
+        const stats = owner_b.stats();
+        try std.testing.expect(stats.has_lease);
+        try std.testing.expectEqual(@as(u64, 1), stats.acquisition_count);
+        try std.testing.expectEqual(@as(u64, 1), stats.takeover_count);
+        try std.testing.expectEqual(@as(u64, 0), stats.lost_leases);
+    }
 }
 
 test "db graph metric runtime query public reads fail not ready before first publish" {

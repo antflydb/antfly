@@ -3002,8 +3002,7 @@ pub fn build(b: *std.Build) void {
         "query encoder emits graph metric rerank score details",
         "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime query ",
         "graph metric order and filter dependencies attach status without projection",
-        "db graph metric runtime releases durable owner lease on deinit",
-        "db graph metric runtime stale deinit preserves replacement owner lease",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime lease ",
         "graph metric failed planned build cleans abandoned scores and job namespace",
         "graph metric failed planned build retains bounded diagnostics",
         "graph metric repeated failed planned builds bound diagnostics and cleanup abandoned namespaces",
@@ -3170,8 +3169,7 @@ pub fn build(b: *std.Build) void {
         run_graph_metric_operations_tests.addArgs(&.{ "--skip-test-filter", filter });
     }
     const graph_metric_cleanup_default_filters = [_][]const u8{
-        "db graph metric runtime releases durable owner lease on deinit",
-        "db graph metric runtime stale deinit preserves replacement owner lease",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime lease ",
         "graph pagerank planned cleanup resumes after non-final cleanup page reopen",
         "graph pagerank cleanup page resumes from durable cursor after reopen",
         "graph eigenvector cleanup page resumes after reopen with published scores visible",
