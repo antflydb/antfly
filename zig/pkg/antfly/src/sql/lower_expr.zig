@@ -242,6 +242,20 @@ fn generatedGroupClauseEnd(
     return range.end;
 }
 
+fn generatedHavingClauseEnd(
+    tokens: []const Token,
+    keyword_index: usize,
+    pos: usize,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !?usize {
+    const read = generated_read_ast orelse return null;
+    if (keyword_index >= tokens.len or !tokens[keyword_index].matchesKeywordTag(.having)) return null;
+    const range = read.having_tokens orelse return error.UnsupportedSqlShape;
+    if (range.start != pos or range.end > tokens.len) return error.UnsupportedSqlShape;
+    if (!generatedTokenRangeEqual(read.having_expression.tokens orelse return error.UnsupportedSqlShape, range)) return error.UnsupportedSqlShape;
+    return range.end;
+}
+
 fn parseGeneratedLimitValueForClause(
     tokens: []const Token,
     keyword_index: usize,
@@ -16355,6 +16369,8 @@ pub fn parseAggregateAlloc(
             }
         } else if (parser.matchKeyword(tokens, pos, "having")) {
             if (distinct_group_only) return error.UnsupportedSqlShape;
+            const keyword_index = pos.* - 1;
+            const generated_having_end = try generatedHavingClauseEnd(tokens, keyword_index, pos.*, options.generated_read_ast);
             try parseAggregateHavingAlloc(
                 alloc,
                 tokens,
@@ -16380,6 +16396,9 @@ pub fn parseAggregateAlloc(
                     .bare_boolean_hooks = options.bare_boolean_hooks,
                 },
             );
+            if (generated_having_end) |end| {
+                if (pos.* != end) return error.UnsupportedSqlShape;
+            }
         } else if (parser.matchKeyword(tokens, pos, "order")) {
             const keyword_index = pos.* - 1;
             try parser.expectKeyword(tokens, pos, "by");
@@ -29072,6 +29091,23 @@ fn corruptGeneratedReadFirstGroupExpressionItem(parsed_sql: *tokenized.ParsedSql
     return error.TestUnexpectedResult;
 }
 
+fn corruptGeneratedReadHavingExpressionRange(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |*read| {
+                    const group_tokens = read.group_tokens orelse return error.TestUnexpectedResult;
+                    if (read.having_tokens == null or read.having_expression.tokens == null) return error.TestUnexpectedResult;
+                    read.having_expression.tokens = group_tokens;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 test "sql adapter lower expr lowers grouped aggregate queries with generated group validation" {
     const alloc = std.testing.allocator;
     const schema_json =
@@ -29099,6 +29135,29 @@ test "sql adapter lower expr lowers grouped aggregate queries with generated gro
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
         alloc,
         &malformed_group,
+        schema,
+        &.{},
+    ));
+
+    var having = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT status, SUM(amount) AS total FROM usage_records GROUP BY status HAVING total > 10 ORDER BY total DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer having.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), having.aggregate.having_predicates.len);
+    try std.testing.expectEqualStrings("total", having.aggregate.having_predicates[0].field);
+
+    var malformed_having = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT status, SUM(amount) AS total FROM usage_records GROUP BY status HAVING total > 10 ORDER BY total DESC LIMIT 5",
+    );
+    defer malformed_having.deinit(alloc);
+    try corruptGeneratedReadHavingExpressionRange(&malformed_having);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
+        alloc,
+        &malformed_having,
         schema,
         &.{},
     ));
