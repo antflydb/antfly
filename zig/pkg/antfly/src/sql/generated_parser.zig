@@ -1706,6 +1706,7 @@ pub const simple_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT status AS state, id FROM usage_records", .kind = .read },
     .{ .sql = "SELECT status state, id FROM usage_records", .kind = .read },
     .{ .sql = "SELECT CAST(id AS text) AS id_text FROM usage_records WHERE id = 'u1'", .kind = .read },
+    .{ .sql = "SELECT CAST(id AS text) AS id_text, CAST(active AS bool) AS active_bool, CAST(created_at_ns AS timestamptz) AS created_at FROM usage_records WHERE id = $1", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE CAST(amount + 1 AS text) = '2'", .kind = .read },
     .{ .sql = "SELECT id::text AS id_text FROM usage_records WHERE id::text = 'u1'", .kind = .read },
     .{ .sql = "SELECT id FROM usage_records WHERE metadata->'flags' = $1::jsonb", .kind = .read },
@@ -7443,6 +7444,25 @@ test "generated SQL parser facade builds read AST spans" {
             try std.testing.expectEqual(GeneratedSqlExpressionKind.cast, read.projection_first_expression.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, read.projection_first_expression.cast_expression_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.projection_first_expression.cast_type_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const typed_cast_projection_read_sql = "SELECT CAST(id AS text) AS id_text, CAST(active AS bool) AS active_bool, CAST(created_at_ns AS timestamptz) AS created_at FROM usage_records WHERE id = $1";
+    const typed_cast_projection_read_result = try parseSqlAlloc(alloc, typed_cast_projection_read_sql);
+    switch (typed_cast_projection_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 27 }, read.projection_tokens.?);
+            try std.testing.expectEqual(@as(usize, 3), read.projection_items.count);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.cast, read.projection_items.expressions[0].kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.projection_items.expressions[0].cast_type_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.cast, read.projection_items.expressions[1].kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 14, .end = 15 }, read.projection_items.expressions[1].cast_type_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.cast, read.projection_items.expressions[2].kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 23, .end = 24 }, read.projection_items.expressions[2].cast_type_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 28, .end = 29 }, read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 30, .end = 33 }, read.where_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

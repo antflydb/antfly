@@ -1278,6 +1278,12 @@ identifier_name:
 
 type_name:
     qualified_name array_type_suffix_opt
+  | type_keyword_name array_type_suffix_opt
+  ;
+
+type_keyword_name:
+    TIMESTAMP
+  | TIMESTAMPTZ
   ;
 
 array_type_suffix_opt:

@@ -15,6 +15,7 @@
 const std = @import("std");
 const http_server = @import("http_server.zig");
 const platform_clock = @import("../platform/clock.zig");
+const platform_sync = @import("antfly_platform").sync;
 const sql_adapter = @import("../sql/mod.zig");
 const runtime_schema = @import("../storage/schema.zig");
 
@@ -130,13 +131,12 @@ const State = struct {
 
     fn registerCancelHandle(self: *State, connection: *Connection) !void {
         if (connection.backend_pid != 0) return;
-        const secret_key = randomPositiveI32();
-
-        self.cancel_mutex.lock();
+        platform_sync.lockYielding(&self.cancel_mutex);
         defer self.cancel_mutex.unlock();
         while (true) {
             const pid = self.allocateBackendPid();
             if (self.cancel_connections.contains(pid)) continue;
+            const secret_key = try randomPositiveI32(self.alloc);
             try self.cancel_connections.put(self.alloc, pid, .{
                 .secret_key = secret_key,
                 .connection = connection,
@@ -149,7 +149,7 @@ const State = struct {
 
     fn unregisterCancelHandle(self: *State, connection: *Connection) void {
         if (connection.backend_pid == 0) return;
-        self.cancel_mutex.lock();
+        platform_sync.lockYielding(&self.cancel_mutex);
         defer self.cancel_mutex.unlock();
         _ = self.cancel_connections.remove(connection.backend_pid);
         connection.backend_pid = 0;
@@ -157,7 +157,7 @@ const State = struct {
     }
 
     fn cancelBackendRequest(self: *State, backend_pid: i32, secret_key: i32) bool {
-        self.cancel_mutex.lock();
+        platform_sync.lockYielding(&self.cancel_mutex);
         defer self.cancel_mutex.unlock();
         const entry = self.cancel_connections.get(backend_pid) orelse return false;
         if (entry.secret_key != secret_key) return false;
@@ -1644,8 +1644,12 @@ fn dollarQuoteDelimiter(sql: []const u8) ?[]const u8 {
     return sql[0 .. i + 1];
 }
 
-fn randomPositiveI32() i32 {
-    const raw = std.crypto.random.int(u32) & 0x7fff_ffff;
+fn randomPositiveI32(alloc: std.mem.Allocator) !i32 {
+    var bytes: [4]u8 = undefined;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    try io_impl.io().randomSecure(&bytes);
+    const raw = std.mem.readInt(u32, &bytes, .big) & 0x7fff_ffff;
     return @intCast(if (raw == 0) 1 else raw);
 }
 

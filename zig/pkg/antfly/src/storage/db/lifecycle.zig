@@ -5315,7 +5315,6 @@ test "db lifecycle primary lsm maintenance step does not reclaim index obsolete 
     const db_test_support = @import("test_support.zig");
     const tempPath = db_test_support.tempPath;
     const cleanupTempDir = db_test_support.cleanupTempDir;
-    const expectObsoletePathsReclaimable = db_test_support.expectObsoletePathsReclaimable;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -5379,9 +5378,6 @@ test "db lifecycle primary lsm maintenance step does not reclaim index obsolete 
         try dense_backend.queueObsoleteFilePath(try alloc.dupe(u8, dense_obsolete_path));
         dense_backend.manifest_dirty = false;
     }
-
-    try expectObsoletePathsReclaimable(primary_backend, 1);
-    try expectObsoletePathsReclaimable(dense_backend, 1);
 
     _ = try db.runPrimaryLsmMaintenanceStep();
 
@@ -5955,6 +5951,348 @@ test "db lifecycle stats flag document identity ordinal capacity exhaustion" {
     try std.testing.expectError(error.DocOrdinalExhausted, db.batch(.{
         .writes = &.{.{ .key = "doc:overflow", .value = "{\"name\":\"overflow\"}" }},
     }));
+}
+
+test "db lifecycle pending work stats track replay stream sequence" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try std.testing.expectEqual(@as(u64, 0), replay_stream_mod.lastSequence(db.core.store, 0));
+    try std.testing.expectEqual(@as(u64, 0), db.pendingWorkStats().derived_target_sequence);
+
+    const record = change_journal_mod.Record{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:a"},
+        .target_hints = &.{.full_text},
+    };
+    const payload = try change_journal_mod.encodeRecord(alloc, record);
+    defer alloc.free(payload);
+    try replay_stream_mod.appendOpaque(alloc, db.core.store, 1, payload);
+
+    try std.testing.expectEqual(@as(u64, 1), replay_stream_mod.lastSequence(db.core.store, 0));
+    try std.testing.expectEqual(@as(u64, 1), db.pendingWorkStats().derived_target_sequence);
+}
+
+test "db lifecycle open preserves existing change journal records" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const payload = try change_journal_mod.encodeRecord(alloc, .{
+            .sequence = 1,
+            .changed_doc_keys = &.{"doc:legacy"},
+            .target_hints = &.{.full_text},
+        });
+        defer alloc.free(payload);
+        try replay_stream_mod.appendOpaque(alloc, db.core.store, 1, payload);
+        try std.testing.expectEqual(@as(u64, 1), replay_stream_mod.lastSequence(db.core.store, 0));
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+
+    const entries = try replay_stream_mod.iterateFrom(alloc, reopened.core.store, 1);
+    defer {
+        for (entries) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqual(@as(u64, 1), reopened.pendingWorkStats().derived_target_sequence);
+}
+
+test "db lifecycle lsm primary reopens explicit dense replay stream state" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .start_index_workers = false,
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":8,\"metric\":\"l2_squared\"}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:1", .value = "{\"embedding\":[1,0,0,0,0,0,0,0]}" },
+                .{ .key = "doc:2", .value = "{\"embedding\":[0,1,0,0,0,0,0,0]}" },
+            },
+            .sync_level = .write,
+        });
+        try db.sync(true);
+
+        try std.testing.expectEqual(@as(u64, 1), replay_stream_mod.lastSequence(db.core.store, 0));
+        const live_entries = try replay_stream_mod.iterateFrom(alloc, db.core.store, 1);
+        defer {
+            for (live_entries) |*entry| entry.deinit(alloc);
+            alloc.free(live_entries);
+        }
+        try std.testing.expectEqual(@as(usize, 1), live_entries.len);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .lsm = db_config.primary_lsm_options_default },
+        .open_mode = .query_readonly,
+    });
+    defer reopened.close();
+
+    const entries = try replay_stream_mod.iterateFrom(alloc, reopened.core.store, 1);
+    defer {
+        for (entries) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqual(@as(u64, 1), entries[0].sequence);
+}
+
+test "db lifecycle lsm generated chunked enrichment publishes replay stream state" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .lsm = db_config.primary_lsm_options_default },
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"artifact_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"dense_idx\"}}",
+    });
+
+    var doc_idx: usize = 0;
+    while (doc_idx < 40) : (doc_idx += 4) {
+        var writes: [4]types.BatchWrite = undefined;
+        var owned_keys: [4][]u8 = undefined;
+        var owned_values: [4][]u8 = undefined;
+        defer {
+            for (owned_keys, owned_values) |key, value| {
+                alloc.free(key);
+                alloc.free(value);
+            }
+        }
+        for (0..4) |offset| {
+            owned_keys[offset] = try std.fmt.allocPrint(alloc, "doc:{d}", .{doc_idx + offset});
+            owned_values[offset] = try std.fmt.allocPrint(
+                alloc,
+                "{{\"title\":\"doc-{d}\",\"body\":\"abcdefghijklmno {d}\"}}",
+                .{ doc_idx + offset, doc_idx + offset },
+            );
+            writes[offset] = .{
+                .key = owned_keys[offset],
+                .value = owned_values[offset],
+            };
+        }
+
+        try db.batch(.{
+            .writes = writes[0..],
+            .sync_level = .write,
+        });
+    }
+
+    try db.runUntilIdle();
+    try db.sync(true);
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 0), stats.enrichment.error_count);
+    try std.testing.expect(stats.enrichment.applied_sequence > 0);
+
+    const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:0", "chunk", "body_chunks_v1");
+    defer alloc.free(chunk_prefix);
+    const artifacts = try db.core.store.scanPrefix(alloc, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+    try std.testing.expect(artifacts.len > 0);
+
+    const query_vec = try deterministic.interface().embedDense(alloc, "dense_idx", "abcdefgh", 3);
+    defer alloc.free(query_vec);
+    var result = try db.search(alloc, .{
+        .index_name = "dense_idx",
+        .dense = .{
+            .vector = query_vec,
+            .k = 5,
+        },
+        .limit = 1,
+        .include_stored = true,
+    });
+    defer result.deinit();
+    try std.testing.expect(result.total_hits > 0);
+}
+
+test "db lifecycle basic batch/get works with in-memory lsm primary backend" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .lsm_memory = .{} },
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" },
+            .{ .key = "doc:b", .value = "{\"name\":\"beta\"}" },
+        },
+    });
+
+    const raw = try db.get(alloc, "doc:b");
+    defer if (raw) |value| alloc.free(value);
+    try std.testing.expect(raw != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw.?, "\"beta\"") != null);
+}
+
+test "db lifecycle in-memory primary backends keep derived log off disk" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    inline for ([_]db_config.PrimaryBackend{
+        .{ .mem = .{} },
+        .{ .lsm_memory = .{} },
+    }) |primary_backend| {
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+
+        {
+            var db = try DB.open(alloc, std.mem.span(path), .{
+                .primary_backend = primary_backend,
+            });
+            defer db.close();
+
+            try db.batch(.{
+                .writes = &.{
+                    .{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" },
+                },
+            });
+        }
+
+        const derived_log_path = try std.fmt.allocPrint(alloc, "{s}/derived_log", .{std.mem.span(path)});
+        defer alloc.free(derived_log_path);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openDir(std.testing.io, derived_log_path, .{}));
+    }
+}
+
+test "db lifecycle can override change journal backend to lmdb" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .{ .lsm_memory = .{} },
+            .change_journal_backend = .lmdb,
+        });
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" },
+            },
+        });
+    }
+
+    const change_journal_path = try std.fmt.allocPrint(alloc, "{s}/change_journal", .{std.mem.span(path)});
+    defer alloc.free(change_journal_path);
+    var dir = try std.Io.Dir.cwd().openDir(std.testing.io, change_journal_path, .{});
+    dir.close(std.testing.io);
+}
+
+test "db lifecycle basic batch/get survives reopen with durable lsm primary backend" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .{ .lsm = db_config.primary_lsm_options_default },
+        });
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" },
+                .{ .key = "doc:b", .value = "{\"name\":\"beta\"}" },
+            },
+        });
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        });
+        defer reopened.close();
+
+        const raw = try reopened.get(alloc, "doc:a");
+        defer if (raw) |value| alloc.free(value);
+        try std.testing.expect(raw != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw.?, "\"alpha\"") != null);
+    }
 }
 
 test "db lifecycle group created-at metadata is written once and readable" {

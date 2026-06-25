@@ -683,8 +683,9 @@ Unsupported DDL remains on the existing parser until
    and JSON path `#>`/`#>>` postfix operator summaries in projections and
    predicates, function-call child summaries, direct function-call
    name and argument-list metadata, PostgreSQL `CAST(expr AS type)` value and
-   target-type ranges, generated coverage for public-tokenizer-normalized
-   `expr::type` inputs, generated `INTERVAL '...'` literal value ranges for
+   target-type ranges, including temporal keyword cast targets such as
+   `TIMESTAMP` and `TIMESTAMPTZ`, generated coverage for
+   public-tokenizer-normalized `expr::type` inputs, generated `INTERVAL '...'` literal value ranges for
    lowerer-backed date/time functions such as `date_bin`, generated `TIMESTAMP
    '...'` / `TIMESTAMPTZ '...'` literal type/value ranges, generated
    `CURRENT_DATE` and `CURRENT_TIMESTAMP(...)` temporal keyword ranges,
