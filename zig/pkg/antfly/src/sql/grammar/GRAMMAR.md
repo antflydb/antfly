@@ -519,7 +519,8 @@ Unsupported DDL remains on the existing parser until
    expression-owned lists stay inside their owning generated expression clause
    for function arguments, aggregate-local ordering, `WITHIN GROUP` ordering,
    inline window partitions/orderings, array elements, `CASE` branches, boolean
-   condition chains, and subquery projections; it also verifies clause-owned
+   condition chains, subquery projections, and subquery result-tail ordering
+   and pagination expressions; it also verifies clause-owned
    read lists stay inside their generated projection, grouping, ordering, CTE
    body projection/group/order, named-window partition/order, set-operation
    right-projection, and join `USING` column ranges, and that clause-owned
@@ -915,7 +916,8 @@ Generated grammar work needs evidence at multiple levels:
   operator, or `NULLS FIRST`/`LAST` metadata disagrees with the underlying
   order-item tokens. Subquery expression tests cover generated
   `ORDER BY`, `LIMIT`, `OFFSET`, and `FETCH` tail payloads plus fail-closed
-  malformed subquery tail validation.
+  malformed subquery tail validation, including recursive checks for retained
+  subquery result-tail expression payloads.
   Graph DDL has generated AST-to-plan parity for graph index and graph metric
   index plans, including rich graph index declarations and
   `ALTER GRAPH INDEX ... ADD METRIC`, malformed graph DDL is rejected through

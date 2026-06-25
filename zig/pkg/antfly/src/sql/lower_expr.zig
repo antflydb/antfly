@@ -405,6 +405,83 @@ fn validateGeneratedSetOperationPayloads(
     }
 }
 
+fn validateGeneratedSubqueryTailPayloads(
+    tokens: []const Token,
+    inner_tokens: generated_parser.GeneratedSqlTokenRange,
+    tail: generated_parser.GeneratedSqlSubqueryTailAst,
+) anyerror!void {
+    var previous_end = inner_tokens.start;
+    if (tail.order_tokens) |order_tokens| {
+        if (order_tokens.start < inner_tokens.start or order_tokens.end > inner_tokens.end or order_tokens.start >= order_tokens.end) return error.UnsupportedSqlShape;
+        if (order_tokens.start < inner_tokens.start + 2) return error.UnsupportedSqlShape;
+        if (order_tokens.start < 2 or !tokens[order_tokens.start - 2].matchesKeywordTag(.order) or !tokens[order_tokens.start - 1].matchesKeywordTag(.by)) return error.UnsupportedSqlShape;
+        if (order_tokens.start < previous_end) return error.UnsupportedSqlShape;
+        try validateGeneratedOrderListForClause(tokens, order_tokens, tail.order_items);
+        const first_expression = tail.order_first_expression orelse return error.UnsupportedSqlShape;
+        const last_expression = tail.order_last_expression orelse return error.UnsupportedSqlShape;
+        if (!generatedTokenRangeEqual(first_expression.tokens orelse return error.UnsupportedSqlShape, tail.order_items.expression_items[0])) return error.UnsupportedSqlShape;
+        if (!generatedTokenRangeEqual(last_expression.tokens orelse return error.UnsupportedSqlShape, tail.order_items.expression_items[tail.order_items.count - 1])) return error.UnsupportedSqlShape;
+        try validateGeneratedExpressionPayloads(tokens, first_expression.*);
+        try validateGeneratedExpressionPayloads(tokens, last_expression.*);
+        previous_end = order_tokens.end;
+    } else if (tail.order_items.count != 0 or tail.order_first_expression != null or tail.order_last_expression != null) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (tail.limit_tokens) |limit_tokens| {
+        if (limit_tokens.start < inner_tokens.start or limit_tokens.end > inner_tokens.end or limit_tokens.start >= limit_tokens.end) return error.UnsupportedSqlShape;
+        if (limit_tokens.start <= inner_tokens.start) return error.UnsupportedSqlShape;
+        if (limit_tokens.start == 0 or !tokens[limit_tokens.start - 1].matchesKeywordTag(.limit)) return error.UnsupportedSqlShape;
+        if (limit_tokens.start < previous_end) return error.UnsupportedSqlShape;
+        if (tail.limit_all) {
+            if (limit_tokens.end != limit_tokens.start + 1 or !tokens[limit_tokens.start].matchesKeywordTag(.all)) return error.UnsupportedSqlShape;
+            if (tail.limit_expression != null) return error.UnsupportedSqlShape;
+        } else {
+            const expression = tail.limit_expression orelse return error.UnsupportedSqlShape;
+            if (!generatedTokenRangeEqual(expression.tokens orelse return error.UnsupportedSqlShape, limit_tokens)) return error.UnsupportedSqlShape;
+            try validateGeneratedExpressionPayloads(tokens, expression.*);
+        }
+        previous_end = limit_tokens.end;
+    } else if (tail.limit_expression != null or tail.limit_all) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (tail.offset_tokens) |offset_tokens| {
+        if (offset_tokens.start < inner_tokens.start or offset_tokens.end > inner_tokens.end or offset_tokens.start >= offset_tokens.end) return error.UnsupportedSqlShape;
+        if (offset_tokens.start <= inner_tokens.start) return error.UnsupportedSqlShape;
+        if (offset_tokens.start == 0 or !tokens[offset_tokens.start - 1].matchesKeywordTag(.offset)) return error.UnsupportedSqlShape;
+        if (offset_tokens.start < previous_end) return error.UnsupportedSqlShape;
+        const expression = tail.offset_expression orelse return error.UnsupportedSqlShape;
+        const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
+        if (expression_tokens.start != offset_tokens.start or expression_tokens.end > offset_tokens.end) return error.UnsupportedSqlShape;
+        if (expression_tokens.end != offset_tokens.end) {
+            if (expression_tokens.end + 1 != offset_tokens.end) return error.UnsupportedSqlShape;
+            if (!tokens[expression_tokens.end].matchesKeywordTag(.row) and !tokens[expression_tokens.end].matchesKeywordTag(.rows)) return error.UnsupportedSqlShape;
+        }
+        try validateGeneratedExpressionPayloads(tokens, expression.*);
+        previous_end = offset_tokens.end;
+    } else if (tail.offset_expression != null) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (tail.fetch_tokens) |fetch_tokens| {
+        if (fetch_tokens.start < inner_tokens.start or fetch_tokens.end > inner_tokens.end or fetch_tokens.start >= fetch_tokens.end) return error.UnsupportedSqlShape;
+        if (fetch_tokens.start <= inner_tokens.start) return error.UnsupportedSqlShape;
+        if (fetch_tokens.start == 0 or !tokens[fetch_tokens.start - 1].matchesKeywordTag(.fetch)) return error.UnsupportedSqlShape;
+        if (fetch_tokens.start < previous_end) return error.UnsupportedSqlShape;
+        if (tail.fetch_count_tokens) |count_tokens| {
+            if (count_tokens.start < fetch_tokens.start or count_tokens.end > fetch_tokens.end or count_tokens.start >= count_tokens.end) return error.UnsupportedSqlShape;
+            const expression = tail.fetch_count_expression orelse return error.UnsupportedSqlShape;
+            if (!generatedTokenRangeEqual(expression.tokens orelse return error.UnsupportedSqlShape, count_tokens)) return error.UnsupportedSqlShape;
+            try validateGeneratedExpressionPayloads(tokens, expression.*);
+        } else if (tail.fetch_count_expression != null) {
+            return error.UnsupportedSqlShape;
+        }
+    } else if (tail.fetch_count_tokens != null or tail.fetch_count_expression != null) {
+        return error.UnsupportedSqlShape;
+    }
+}
+
 fn validateGeneratedSubqueryPayloads(
     tokens: []const Token,
     expression: generated_parser.GeneratedSqlExpressionAst,
@@ -435,6 +512,9 @@ fn validateGeneratedSubqueryPayloads(
         try validateGeneratedSetOperationPayloads(tokens, set_operation_tokens, set_operation.*);
     } else if (expression.subquery_set_operation != null) {
         return error.UnsupportedSqlShape;
+    }
+    if (expression.subquery_tail) |tail| {
+        try validateGeneratedSubqueryTailPayloads(tokens, inner_tokens, tail.*);
     }
 }
 
@@ -30208,6 +30288,65 @@ fn corruptGeneratedReadFirstProjectionFunctionArgumentExpressionRange(parsed_sql
     return error.TestUnexpectedResult;
 }
 
+fn corruptGeneratedSubqueryTailLimitExpressionRange(
+    expression: *generated_parser.GeneratedSqlExpressionAst,
+    replacement: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (expression.subquery_tail) |tail| {
+        if (tail.limit_expression) |limit_expression| {
+            limit_expression.tokens = replacement;
+            return true;
+        }
+    }
+    if (expression.inner_expression) |inner| {
+        if (corruptGeneratedSubqueryTailLimitExpressionRange(inner, replacement)) return true;
+    }
+    if (expression.left_expression) |left| {
+        if (corruptGeneratedSubqueryTailLimitExpressionRange(left, replacement)) return true;
+    }
+    if (expression.right_expression) |right| {
+        if (corruptGeneratedSubqueryTailLimitExpressionRange(right, replacement)) return true;
+    }
+    if (expression.cast_expression) |cast_expression| {
+        if (corruptGeneratedSubqueryTailLimitExpressionRange(cast_expression, replacement)) return true;
+    }
+    if (expression.filter_expression) |filter_expression| {
+        if (corruptGeneratedSubqueryTailLimitExpressionRange(filter_expression, replacement)) return true;
+    }
+    for (expression.argument_items.expressions) |*argument_expression| {
+        if (corruptGeneratedSubqueryTailLimitExpressionRange(argument_expression, replacement)) return true;
+    }
+    for (expression.array_items.expressions) |*array_expression| {
+        if (corruptGeneratedSubqueryTailLimitExpressionRange(array_expression, replacement)) return true;
+    }
+    for (expression.case_condition_items.expressions) |*condition_expression| {
+        if (corruptGeneratedSubqueryTailLimitExpressionRange(condition_expression, replacement)) return true;
+    }
+    for (expression.case_result_items.expressions) |*result_expression| {
+        if (corruptGeneratedSubqueryTailLimitExpressionRange(result_expression, replacement)) return true;
+    }
+    if (expression.case_else_expression) |else_expression| {
+        if (corruptGeneratedSubqueryTailLimitExpressionRange(else_expression, replacement)) return true;
+    }
+    return false;
+}
+
+fn corruptGeneratedReadWhereSubqueryTailLimitExpressionRange(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |*read| {
+                    const source_tokens = read.source_tokens orelse return error.TestUnexpectedResult;
+                    if (corruptGeneratedSubqueryTailLimitExpressionRange(&read.where_expression, source_tokens)) return;
+                    return error.TestUnexpectedResult;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn corruptGeneratedReadSourceRange(parsed_sql: *tokenized.ParsedSql) !void {
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
@@ -32020,6 +32159,20 @@ test "sql adapter lower expr lowers scalar any predicates" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
         alloc,
         &malformed_quantifier_range,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_subquery_tail_limit = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE id IN (SELECT id FROM usage_records ORDER BY id ASC LIMIT 1 OFFSET 0 ROWS FETCH FIRST 1 ROW ONLY)",
+    );
+    defer malformed_subquery_tail_limit.deinit(alloc);
+    try corruptGeneratedReadWhereSubqueryTailLimitExpressionRange(&malformed_subquery_tail_limit);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_subquery_tail_limit,
         schema,
         &.{},
         .{},
