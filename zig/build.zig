@@ -6027,17 +6027,6 @@ pub fn build(b: *std.Build) void {
     const db_enrichment_test_step = b.step("db-enrichment-test", "Run storage/db enrichment-related unit tests");
     db_enrichment_test_step.dependOn(&run_db_enrichment_tests.step);
 
-    const provisioned_write_cache_failed_close_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = &.{"provisioned write cache invalidation closes failed managed enrichment db without aborting"},
-    });
-    const run_provisioned_write_cache_failed_close_tests = b.addRunArtifact(provisioned_write_cache_failed_close_tests);
-    const provisioned_write_cache_failed_close_step = b.step(
-        "provisioned-write-cache-failed-close-test",
-        "Run the focused provisioned write-cache failed-enrichment close regression",
-    );
-    provisioned_write_cache_failed_close_step.dependOn(&run_provisioned_write_cache_failed_close_tests.step);
-
     const provisioned_query_visibility_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{
@@ -6058,11 +6047,6 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_provisioned_query_visibility_tests = b.addRunArtifact(provisioned_query_visibility_tests);
-    const provisioned_query_visibility_step = b.step(
-        "provisioned-query-visibility-test",
-        "Run the focused managed dense query-visibility cache invalidation regression",
-    );
-    provisioned_query_visibility_step.dependOn(&run_provisioned_query_visibility_tests.step);
     unit_test_step.dependOn(&run_provisioned_query_visibility_tests.step);
 
     const sparse_test_mod = makeLmdbModule(b, "pkg/antfly/src/sparse_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
