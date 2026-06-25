@@ -12579,6 +12579,7 @@ fn lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(
         .insert_select => {
             if (write_kind != .insert_source) return error.UnsupportedSqlShape;
             try validateGeneratedInsertSourceRanges(tokens, ast, end);
+            try validateGeneratedDmlReadSourceBodyAlloc(alloc, tokens, ast.source_tokens orelse return error.UnsupportedSqlShape);
             if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
             const source_schema = options.insert_source_schema orelse schema;
             if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
@@ -12860,6 +12861,7 @@ fn insertSourceFromGeneratedDmlAstAlloc(
     const tokens = parsed_sql.items();
     const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     try validateGeneratedInsertSourceRanges(tokens, ast, end);
+    try validateGeneratedDmlReadSourceBodyAlloc(alloc, tokens, ast.source_tokens orelse return error.UnsupportedSqlShape);
 
     const parser_context = @import("parser_context.zig");
     var parser_state = parser_context.ParserState{
@@ -12919,6 +12921,24 @@ fn validateGeneratedInsertSourceRanges(
     } else if (returning_keyword) |returning_start| {
         if (source_range.end != returning_start) return error.UnsupportedSqlShape;
     } else if (source_range.end != end) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedDmlReadSourceBodyAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    source_range: generated_parser.GeneratedSqlTokenRange,
+) !void {
+    if (source_range.start >= source_range.end or source_range.end > tokens.len) return error.UnsupportedSqlShape;
+    var result = generated_parser.parseTokensAlloc(alloc, tokens[source_range.start..source_range.end]) catch |err| switch (err) {
+        error.UnsupportedSqlShape, error.UnexpectedToken => return error.UnsupportedSqlShape,
+        else => return err,
+    };
+    defer result.deinit(alloc);
+    if (result.kind != .read) return error.UnsupportedSqlShape;
+    switch (result.ast orelse return error.UnsupportedSqlShape) {
+        .read => {},
+        else => return error.UnsupportedSqlShape,
+    }
 }
 
 fn updateSourceFromGeneratedDmlAstAlloc(

@@ -70,7 +70,8 @@ plans, including `ON CONFLICT` actions and field/all-field/expression
 `ON CONFLICT` actions and returning lists, now lower directly from generated
 AST ranges into relational row batches. Supported explicit-column
 `INSERT ... SELECT` plans, including `ON CONFLICT` actions and returning lists,
-now validate generated source, conflict, and returning ranges before direct
+now validate generated source, conflict, and returning ranges and parse the
+source `SELECT` body through the generated read parser before direct
 insert-source lowering, with generated-direct coverage for computed source
 projections, expression predicates, ordering, pagination, `RETURNING *`
 plus expressions, cross-table sources, conflict-update predicates and
@@ -107,9 +108,9 @@ match the existing write classifier before delegating to the current typed DML
 lowerer. Unsupported DML still falls back, and deeper DML cutover still
 requires replacing token-based command-body parsing with complete generated AST
 payloads for recursive CTE DML beyond generated range validation,
-insert-select source bodies that need generated read-body ASTs beyond statement
-ranges, and joined mutation source bodies that need generated read-body ASTs
-beyond statement ranges.
+retained generated read-body AST payloads for insert-select source bodies
+beyond generated child-read parse validation, and joined mutation source bodies
+that need generated read-body ASTs beyond statement ranges.
 Representative
 read queries now have generated-parser corpus coverage, retained generated raw
 and AST nodes for covered read statements, top-level generated AST ranges for
@@ -381,10 +382,10 @@ Unsupported DDL remains on the existing parser until
    Switching the full DML family from fallback to required generated parsing
    still requires generated command-body ASTs for recursive CTE DML beyond
    generated range validation and direct recursive write-plan dispatch,
-   insert-select source bodies that need generated read-body ASTs beyond
-   statement ranges, joined mutation source bodies that need generated
-   read-body ASTs beyond statement ranges, and broader unsupported-shape
-   diagnostics.
+   retained generated read-body AST payloads for insert-select source bodies
+   beyond generated child-read parse validation, joined mutation source bodies
+   that need generated read-body ASTs beyond statement ranges, and broader
+   unsupported-shape diagnostics.
 4. Read queries: projections, predicates, joins, CTEs, aggregates, windows,
    set operations, lateral, ordering, limits, and document-table sources.
    Initial generated-parser coverage now retains raw and AST read nodes for
@@ -785,7 +786,8 @@ Generated grammar work needs evidence at multiple levels:
   named constraint conflict targets, conflict actions, and returning lists,
   default-values row batches with conflict actions and returning lists, direct
   generated AST-to-plan coverage for supported same-table and cross-table
-  insert-select requests with conflict and returning lists, direct generated
+  insert-select requests with conflict and returning lists plus generated
+  child-read parse validation for insert-select source bodies, direct generated
   AST-to-plan coverage for single-table point update/delete batches with
   returning lists, direct generated AST-to-plan coverage for table-wide and
   single-table source update/delete mutation-source requests without joined
