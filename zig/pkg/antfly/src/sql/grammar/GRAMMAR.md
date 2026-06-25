@@ -590,7 +590,8 @@ Unsupported DDL remains on the existing parser until
    predicate expression payloads, generated body join-tree metadata with
    first-join compatibility fields, and body pagination
    expression payloads for `LIMIT`, `OFFSET`, and `FETCH`; generated CTE
-   lowering validates those body payloads. Recursive CTE reads carry an
+   lowering validates those body payloads and their clause keyword layout.
+   Recursive CTE reads carry an
    explicit recursive flag; and simple non-recursive CTE reads dispatch to the
    typed read lowerer after validating those ranges. Recursive CTE reads now
    validate generated recursive CTE ranges and the recursive flag before
@@ -914,7 +915,11 @@ Generated grammar work needs evidence at multiple levels:
   bare alias ranges disagree with the underlying list-item tokens, and
   generated ordering lists now fail closed when typed `ASC`/`DESC`, `USING`
   operator, or `NULLS FIRST`/`LAST` metadata disagrees with the underlying
-  order-item tokens. Subquery expression tests cover generated
+  order-item tokens. Generated CTE body clause spans now fail closed when
+  retained `WHERE`, `GROUP BY`, `HAVING`, `WINDOW`, `ORDER BY`, `LIMIT`,
+  `OFFSET`, or `FETCH` payload ranges are not preceded by their matching
+  clause keywords.
+  Subquery expression tests cover generated
   `ORDER BY`, `LIMIT`, `OFFSET`, and `FETCH` tail payloads plus fail-closed
   malformed subquery tail validation, including recursive checks for retained
   subquery result-tail expression payloads.
