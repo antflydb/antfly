@@ -424,7 +424,10 @@ recorded routine-name boundary. Legacy-supported role
 authorization operations use validated generated DDL AST nodes for
 `CREATE ROLE`, `ALTER ROLE`, and `DROP ROLE`, and fail closed if generated
 kind, span, role name, operation tail, or `IF EXISTS` metadata is corrupted
-before delegating to the typed authorization catalog planner. Legacy-supported
+before delegating to the typed authorization catalog planner; role validation
+also requires the generated role-name range to start after the exact
+role/user/group alias header and any generated operation tail to begin at the
+recorded role-name boundary. Legacy-supported
 type-system catalog operations use validated generated DDL AST nodes for
 `CREATE/ALTER/DROP COLLATION`, `CREATE/DROP OPERATOR`,
 `CREATE/DROP AGGREGATE`, and `CREATE/DROP CAST`, while

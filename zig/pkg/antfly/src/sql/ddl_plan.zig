@@ -3500,13 +3500,32 @@ fn validateGeneratedRoleDdlAst(tokens: []const grammar.Token, ast: generated_par
     switch (ast.kind) {
         .create_role => {
             if (end < 3 or !tokens[0].matchesKeyword("create") or !grammar.isRoleAliasKeywordToken(tokens[1])) return error.UnsupportedSqlShape;
+            if (object_name_tokens.start != 2 or object_name_tokens.end != 3) return error.UnsupportedSqlShape;
+            if (object_name_tokens.end < end) {
+                const operation = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+                if (operation.start != object_name_tokens.end or operation.end != end) return error.UnsupportedSqlShape;
+            } else if (ast.alter_table_operation_tokens != null) {
+                return error.UnsupportedSqlShape;
+            }
         },
         .alter_role => {
             if (end < 5 or !tokens[0].matchesKeyword("alter") or !grammar.isRoleAliasKeywordToken(tokens[1])) return error.UnsupportedSqlShape;
-            if (ast.alter_table_operation_tokens == null) return error.UnsupportedSqlShape;
+            if (object_name_tokens.start != 2 or object_name_tokens.end != 3) return error.UnsupportedSqlShape;
+            const operation = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+            if (operation.start != object_name_tokens.end or operation.end != end or operation.start >= end) return error.UnsupportedSqlShape;
         },
         .drop_role => {
             if (end < 3 or !tokens[0].matchesKeyword("drop") or !grammar.isRoleAliasKeywordToken(tokens[1])) return error.UnsupportedSqlShape;
+            var name_index: usize = 2;
+            const if_exists = consumeGeneratedPlanIfExists(tokens, &name_index, end);
+            if (if_exists != ast.if_exists) return error.UnsupportedSqlShape;
+            if (object_name_tokens.start != name_index or object_name_tokens.end != name_index + 1) return error.UnsupportedSqlShape;
+            if (object_name_tokens.end < end) {
+                const operation = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+                if (operation.start != object_name_tokens.end or operation.end != end) return error.UnsupportedSqlShape;
+            } else if (ast.alter_table_operation_tokens != null) {
+                return error.UnsupportedSqlShape;
+            }
         },
         else => return error.UnsupportedSqlShape,
     }
@@ -13839,6 +13858,81 @@ test "sql adapter ddl plan lowers authorization catalog ddl plans" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var malformed_create_role_name = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CREATE ROLE generated_app_writer;",
+    );
+    defer malformed_create_role_name.deinit(alloc);
+    if (malformed_create_role_name.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_role, ddl.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
+                    ddl.object_name_tokens = .{ .start = 1, .end = 2 };
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_create_role_name));
+
+    var malformed_alter_role_tail = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "ALTER ROLE generated_app_writer RESET statement_timeout;",
+    );
+    defer malformed_alter_role_tail.deinit(alloc);
+    if (malformed_alter_role_tail.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_role, ddl.kind);
+                    ddl.alter_table_operation_tokens = .{ .start = 2, .end = malformed_alter_role_tail.items().len - 1 };
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_alter_role_tail));
+
+    var malformed_drop_role_if_exists = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DROP ROLE IF EXISTS generated_app_writer;",
+    );
+    defer malformed_drop_role_if_exists.deinit(alloc);
+    if (malformed_drop_role_if_exists.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.drop_role, ddl.kind);
+                    try std.testing.expect(ddl.if_exists);
+                    ddl.if_exists = false;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_drop_role_if_exists));
+
+    var malformed_drop_role_tail = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DROP ROLE generated_app_writer;",
+    );
+    defer malformed_drop_role_tail.deinit(alloc);
+    if (malformed_drop_role_tail.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.drop_role, ddl.kind);
+                    try std.testing.expect(ddl.alter_table_operation_tokens == null);
+                    ddl.alter_table_operation_tokens = .{ .start = 2, .end = malformed_drop_role_tail.items().len - 1 };
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_drop_role_tail));
 }
 
 test "sql adapter ddl plan lowers partition and row security catalog ddl plans" {
