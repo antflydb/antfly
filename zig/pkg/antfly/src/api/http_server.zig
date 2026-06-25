@@ -18787,7 +18787,7 @@ pub const RequiredPermission = struct {
 };
 
 pub fn requiredPermissionForRequest(method: http_common.Method, path: []const u8) ?RequiredPermission {
-    if (method == .POST and std.mem.eql(u8, path, routes.Routes.sql)) return .{
+    if (method == .POST and std.mem.eql(u8, path, routes.Routes.db_v1_sql)) return .{
         .resource_type = .database,
         .resource = catalog_resources.default_database_name,
         .permission_type = .admin,

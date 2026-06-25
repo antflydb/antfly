@@ -1058,7 +1058,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/backup", .operation_id = "backup" },
     .{ .method = "POST", .path = "/restore", .operation_id = "restore" },
     .{ .method = "GET", .path = "/backups", .operation_id = "listBackups" },
-    .{ .method = "POST", .path = "/sql", .operation_id = "executeSql" },
+    .{ .method = "POST", .path = "/db/v1/sql", .operation_id = "executeSql" },
     .{ .method = "POST", .path = "/query", .operation_id = "globalQuery" },
     .{ .method = "POST", .path = "/eval", .operation_id = "evaluate" },
     .{ .method = "POST", .path = "/agents/query-builder", .operation_id = "queryBuilderAgent" },

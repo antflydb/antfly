@@ -95,7 +95,7 @@ def extension_public_path(path: str) -> str:
 
 
 def antfly_public_path(path: str) -> str:
-    if path.startswith("/auth/v1/"):
+    if path.startswith("/auth/v1/") or path.startswith("/db/v1/"):
         return path
     return prefixed_path("/db/v1", path)
 

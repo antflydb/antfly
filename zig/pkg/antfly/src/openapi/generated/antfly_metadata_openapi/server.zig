@@ -872,7 +872,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/backup", .operation_id = "backup" },
     .{ .method = "POST", .path = "/restore", .operation_id = "restore" },
     .{ .method = "GET", .path = "/backups", .operation_id = "listBackups" },
-    .{ .method = "POST", .path = "/sql", .operation_id = "executeSql" },
+    .{ .method = "POST", .path = "/db/v1/sql", .operation_id = "executeSql" },
     .{ .method = "POST", .path = "/query", .operation_id = "globalQuery" },
     .{ .method = "POST", .path = "/eval", .operation_id = "evaluate" },
     .{ .method = "POST", .path = "/agents/query-builder", .operation_id = "queryBuilderAgent" },
@@ -1085,7 +1085,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/backup", backup);
             try server.post("/restore", restore);
             try server.get("/backups", listBackups);
-            try server.post("/sql", executeSql);
+            try server.post("/db/v1/sql", executeSql);
             try server.post("/query", globalQuery);
             try server.post("/eval", evaluate);
             try server.post("/agents/query-builder", queryBuilderAgent);
@@ -1352,7 +1352,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         }
 
         /// Execute SQL text in a logical SQL session
-        /// POST /sql
+        /// POST /db/v1/sql
         fn executeSql(ctx: *httpx.Context) anyerror!httpx.Response {
             const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
             return impl.executeSql(ctx);

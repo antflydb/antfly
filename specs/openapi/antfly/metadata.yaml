@@ -9683,7 +9683,7 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "500":
           $ref: "#/components/responses/InternalServerError"
-  /sql:
+  /db/v1/sql:
     post:
       summary: Execute SQL text in a logical SQL session
       tags:

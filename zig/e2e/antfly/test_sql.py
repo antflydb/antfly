@@ -375,7 +375,7 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     )
 
     direct_by_id = stateful_api.post(
-        "/sql",
+        "/db/v1/sql",
         {"sql": f"SELECT _id, title FROM {table} WHERE _id = 'doc:a';"},
     )
     assert direct_by_id["kind"] == "read"
@@ -383,7 +383,7 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     assert direct_by_id["result"]["rows"] == [{"_id": "doc:a", "title": "alpha"}]
 
     write_response = stateful_api.s.post(
-        f"{stateful_api.url}/sql",
+        f"{stateful_api.url}/db/v1/sql",
         json={"sql": f"INSERT INTO {table} (_id, _doc) VALUES ('doc:z', '{{}}');"},
         timeout=10,
     )
@@ -391,7 +391,7 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     assert write_response.text == "document_sql_write_unsupported"
 
     view_response = stateful_api.s.post(
-        f"{stateful_api.url}/sql",
+        f"{stateful_api.url}/db/v1/sql",
         json={
             "sql": (
                 f"CREATE VIEW {table}_view(doc_id, title) AS "
@@ -404,7 +404,7 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     assert view_response.text == "document_sql_view_mapping_unsupported"
 
     array_response = stateful_api.s.post(
-        f"{stateful_api.url}/sql",
+        f"{stateful_api.url}/db/v1/sql",
         json={"sql": f"SELECT _id FROM {table} WHERE tags = 'urgent' LIMIT 10;"},
         timeout=10,
     )
@@ -489,7 +489,7 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     ]
 
     join_response = stateful_api.s.post(
-        f"{stateful_api.url}/sql",
+        f"{stateful_api.url}/db/v1/sql",
         json={
             "sql": (
                 f"SELECT {table}._id FROM {table} "
@@ -533,7 +533,7 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     ]
     for sql, expected_body in unsupported_shape_cases:
         unsupported_response = stateful_api.s.post(
-            f"{stateful_api.url}/sql",
+            f"{stateful_api.url}/db/v1/sql",
             json={"sql": sql},
             timeout=10,
         )
@@ -541,7 +541,7 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
         assert unsupported_response.text == expected_body
 
     native_search_predicate_response = stateful_api.s.post(
-        f"{stateful_api.url}/sql",
+        f"{stateful_api.url}/db/v1/sql",
         json={
             "sql": (
                 f"SELECT _id FROM {table} "
@@ -558,7 +558,7 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     )
 
     native_full_text_predicate_response = stateful_api.s.post(
-        f"{stateful_api.url}/sql",
+        f"{stateful_api.url}/db/v1/sql",
         json={
             "sql": (
                 f"SELECT _id FROM {table} "
@@ -684,7 +684,7 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     assert {row["category"] for row in category_rows} == {"release"}
 
     unbounded_scan_response = stateful_api.s.post(
-        f"{stateful_api.url}/sql",
+        f"{stateful_api.url}/db/v1/sql",
         json={"sql": f"SELECT _id, status FROM {table} WHERE status = 'active';"},
         timeout=10,
     )
@@ -942,7 +942,7 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     ]
 
     virtual_field_by_id = stateful_api.post(
-        "/sql",
+        "/db/v1/sql",
         {"sql": f"SELECT _id, category FROM {table} WHERE _id = 'doc:a';"},
     )
     assert virtual_field_by_id["kind"] == "read"
@@ -952,7 +952,7 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     ]
 
     virtual_star_by_id = stateful_api.post(
-        "/sql",
+        "/db/v1/sql",
         {"sql": f"SELECT * FROM {table} WHERE _id = 'doc:a';"},
     )
     assert virtual_star_by_id["kind"] == "read"

@@ -634,6 +634,10 @@ Unsupported DDL remains on the existing parser until
    name, argument, `DISTINCT`, ordered-argument, `WITHIN GROUP`, and `FILTER`
    predicate spans before the typed aggregate lowerer accepts supported
    aggregate specs.
+   Generated `WHERE` and aggregate `HAVING` predicates now recursively validate
+   retained quantified-comparison, `EXISTS`, grouped, subquery, set-operation
+   subquery, and array-constructor payloads before the typed lowerer accepts
+   the generated clause span.
    Generated read validation
    rejects pagination payloads that are missing required expressions, attach
    expressions to `LIMIT ALL`, place expression spans outside their owning
@@ -652,7 +656,8 @@ Unsupported DDL remains on the existing parser until
    predicate/operator/subquery-tail metadata and structural checks, broader function
    coverage outside the currently validated aggregate and window projection
    surfaces, broader boolean expression-tree coverage, quantified and `EXISTS`
-   subquery planning/lowering, remaining specialized expression operators, richer
+   subquery semantic planning/lowering beyond retained generated payload
+   validation, remaining specialized expression operators, richer
    inline window-expression semantic planning beyond current generated `OVER`
    clause span validation,
    recursive full CTE body planning beyond the current body

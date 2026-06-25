@@ -700,21 +700,21 @@ def test_stateful_auth_enforces_row_filters_on_document_sql(stateful_auth_api: A
 
     visible_lookup = _wait_until(
         lambda: stateful_auth_api.post(
-            "/sql",
+            "/db/v1/sql",
             {"sql": "SELECT _id, tier FROM docs_sql WHERE _id = 'doc:gold';"},
         )
     )
     assert visible_lookup["result"]["rows"] == [{"_id": "doc:gold", "tier": "gold"}]
 
     hidden_lookup = stateful_auth_api.post(
-        "/sql",
+        "/db/v1/sql",
         {"sql": "SELECT _id, tier FROM docs_sql WHERE _id = 'doc:silver';"},
     )
     assert hidden_lookup["result"]["rows"] == []
 
     scan_rows = _wait_until(
         lambda: stateful_auth_api.post(
-            "/sql",
+            "/db/v1/sql",
             {
                 "sql": (
                     "SELECT _id, tier FROM docs_sql "
@@ -726,7 +726,7 @@ def test_stateful_auth_enforces_row_filters_on_document_sql(stateful_auth_api: A
     assert scan_rows["result"]["rows"] == [{"_id": "doc:gold", "tier": "gold"}]
 
     counted = stateful_auth_api.post(
-        "/sql",
+        "/db/v1/sql",
         {"sql": "SELECT count(*) AS row_count FROM docs_sql;"},
     )
     assert counted["statement_kind"] == "aggregate"
