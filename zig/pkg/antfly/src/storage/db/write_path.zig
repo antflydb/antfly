@@ -3922,6 +3922,195 @@ test "db write path bulk ingest finish publishes primary store before external d
     try std.testing.expect(result.total_hits > 0);
 }
 
+test "db write path replay buildDerivedBatch stores thin document and embedding replay records" {
+    const alloc = std.testing.allocator;
+
+    const req = types.BatchRequest{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dv_v1\":[1,0],\"sp_v1\":{\"indices\":[1,5],\"values\":[0.5,0.75]}}}" },
+        },
+    };
+
+    var extracted = try mapper.extractWrite(alloc, req.writes[0].key, req.writes[0].value);
+    defer extracted.deinit(alloc);
+
+    extracted.dense_embeddings[0].artifact_key = try alloc.dupe(u8, "artifact:dense:doc:a");
+    extracted.sparse_embeddings[0].artifact_key = try alloc.dupe(u8, "artifact:sparse:doc:a");
+
+    var derived_batch = try buildDerivedBatch(alloc, req, &.{extracted}, &.{}, &.{});
+    defer derived_types.deinitDerivedBatch(alloc, &derived_batch);
+
+    try std.testing.expectEqual(@as(usize, 1), derived_batch.documents.len);
+    try std.testing.expectEqual(derived_types.DerivedAction.upsert, derived_batch.documents[0].action);
+    try std.testing.expect(derived_batch.documents[0].cleaned_value == null);
+
+    try std.testing.expectEqual(@as(usize, 1), derived_batch.dense_embeddings.len);
+    try std.testing.expectEqualStrings("artifact:dense:doc:a", derived_batch.dense_embeddings[0].artifact_key.?);
+    try std.testing.expectEqual(@as(usize, 0), derived_batch.dense_embeddings[0].vector.len);
+
+    try std.testing.expectEqual(@as(usize, 1), derived_batch.sparse_embeddings.len);
+    try std.testing.expectEqualStrings("artifact:sparse:doc:a", derived_batch.sparse_embeddings[0].artifact_key.?);
+    try std.testing.expectEqual(@as(usize, 2), derived_batch.sparse_embeddings[0].indices.len);
+    try std.testing.expectEqual(@as(u32, 1), derived_batch.sparse_embeddings[0].indices[0]);
+    try std.testing.expectEqual(@as(u32, 5), derived_batch.sparse_embeddings[0].indices[1]);
+    try std.testing.expectEqual(@as(usize, 2), derived_batch.sparse_embeddings[0].values.len);
+    try std.testing.expectEqual(@as(f32, 0.5), derived_batch.sparse_embeddings[0].values[0]);
+    try std.testing.expectEqual(@as(f32, 0.75), derived_batch.sparse_embeddings[0].values[1]);
+}
+
+test "db write path replay encodeThinReplayRecordPayload preserves async write replay contract" {
+    const alloc = std.testing.allocator;
+
+    const req = types.BatchRequest{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dv_v1\":[1,0],\"sp_v1\":{\"indices\":[1,5],\"values\":[0.5,0.75]}}}" },
+        },
+        .deletes = &.{"doc:gone"},
+    };
+
+    var extracted = try mapper.extractWrite(alloc, req.writes[0].key, req.writes[0].value);
+    defer extracted.deinit(alloc);
+
+    extracted.dense_embeddings[0].artifact_key = try alloc.dupe(u8, "artifact:dense:doc:a");
+    extracted.sparse_embeddings[0].artifact_key = try alloc.dupe(u8, "artifact:sparse:doc:a");
+
+    const payload = try encodeThinReplayRecordPayload(
+        alloc,
+        req,
+        &.{extracted},
+        &.{},
+        &.{},
+        &.{true},
+        42,
+        false,
+    );
+    defer alloc.free(payload);
+
+    var decoded = try change_journal_mod.decodeRecord(alloc, payload);
+    defer decoded.deinit();
+
+    try std.testing.expectEqual(@as(u64, 42), decoded.record.sequence);
+    try std.testing.expectEqual(@as(usize, 1), decoded.record.changed_doc_keys.len);
+    try std.testing.expectEqualStrings("doc:a", decoded.record.changed_doc_keys[0]);
+    try std.testing.expectEqual(@as(usize, 1), decoded.record.deleted_doc_keys.len);
+    try std.testing.expectEqualStrings("doc:gone", decoded.record.deleted_doc_keys[0]);
+    try std.testing.expectEqual(@as(usize, 1), decoded.record.overwritten_doc_keys.len);
+    try std.testing.expectEqualStrings("doc:a", decoded.record.overwritten_doc_keys[0]);
+    try std.testing.expectEqual(@as(usize, 2), decoded.record.changed_artifact_keys.len);
+    try std.testing.expectEqualStrings("artifact:dense:doc:a", decoded.record.changed_artifact_keys[0]);
+    try std.testing.expectEqualStrings("artifact:sparse:doc:a", decoded.record.changed_artifact_keys[1]);
+    try std.testing.expect(change_journal_mod.recordHasHint(decoded.record, .full_text));
+    try std.testing.expect(change_journal_mod.recordHasHint(decoded.record, .dense_vector));
+    try std.testing.expect(change_journal_mod.recordHasHint(decoded.record, .sparse_vector));
+    try std.testing.expect(!change_journal_mod.recordHasHint(decoded.record, .enrichment));
+}
+
+test "db write path replay encodeThinReplayRecordPayload treats embedding-only writes as artifact replay" {
+    const alloc = std.testing.allocator;
+
+    const req = types.BatchRequest{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"_embeddings\":{\"dv_v1\":[1,0]}}" },
+        },
+    };
+
+    var extracted = try mapper.extractWrite(alloc, req.writes[0].key, req.writes[0].value);
+    defer extracted.deinit(alloc);
+
+    extracted.dense_embeddings[0].artifact_key = try alloc.dupe(u8, "artifact:dense:doc:a");
+
+    const payload = try encodeThinReplayRecordPayload(
+        alloc,
+        req,
+        &.{extracted},
+        &.{},
+        &.{},
+        &.{false},
+        43,
+        false,
+    );
+    defer alloc.free(payload);
+
+    var decoded = try change_journal_mod.decodeRecord(alloc, payload);
+    defer decoded.deinit();
+
+    try std.testing.expectEqual(@as(u64, 43), decoded.record.sequence);
+    try std.testing.expectEqual(@as(usize, 0), decoded.record.changed_doc_keys.len);
+    try std.testing.expectEqual(@as(usize, 1), decoded.record.changed_artifact_keys.len);
+    try std.testing.expectEqualStrings("artifact:dense:doc:a", decoded.record.changed_artifact_keys[0]);
+    try std.testing.expect(!change_journal_mod.recordHasHint(decoded.record, .full_text));
+    try std.testing.expect(change_journal_mod.recordHasHint(decoded.record, .dense_vector));
+}
+
+test "db write path replay thin replay marks artifact-derived target hints" {
+    const alloc = std.testing.allocator;
+
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(asset_key);
+    const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", "page:000001", 0);
+    defer alloc.free(chunk_key);
+    const graph_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
+    defer alloc.free(graph_key);
+
+    const payload = try encodeThinReplayRecordPayload(
+        alloc,
+        .{},
+        &.{},
+        &.{ asset_key, chunk_key, graph_key },
+        &.{},
+        &.{},
+        44,
+        false,
+    );
+    defer alloc.free(payload);
+
+    var decoded = try change_journal_mod.decodeRecord(alloc, payload);
+    defer decoded.deinit();
+
+    try std.testing.expectEqual(@as(u64, 44), decoded.record.sequence);
+    try std.testing.expectEqual(@as(usize, 3), decoded.record.changed_artifact_keys.len);
+    try std.testing.expectEqualStrings(asset_key, decoded.record.changed_artifact_keys[0]);
+    try std.testing.expectEqualStrings(chunk_key, decoded.record.changed_artifact_keys[1]);
+    try std.testing.expectEqualStrings(graph_key, decoded.record.changed_artifact_keys[2]);
+    try std.testing.expect(change_journal_mod.recordHasHint(decoded.record, .full_text));
+    try std.testing.expect(change_journal_mod.recordHasHint(decoded.record, .resolution));
+    try std.testing.expect(change_journal_mod.recordHasHint(decoded.record, .graph));
+}
+
+test "db write path replay encodeThinReplayRecordPayload marks generated enrichment replay for async writes" {
+    const alloc = std.testing.allocator;
+
+    const req = types.BatchRequest{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"needs generated embedding\"}" },
+        },
+    };
+
+    var extracted = try mapper.extractWrite(alloc, req.writes[0].key, req.writes[0].value);
+    defer extracted.deinit(alloc);
+
+    const payload = try encodeThinReplayRecordPayload(
+        alloc,
+        req,
+        &.{extracted},
+        &.{},
+        &.{},
+        &.{false},
+        7,
+        true,
+    );
+    defer alloc.free(payload);
+
+    var decoded = try change_journal_mod.decodeRecord(alloc, payload);
+    defer decoded.deinit();
+
+    try std.testing.expectEqual(@as(u64, 7), decoded.record.sequence);
+    try std.testing.expectEqual(@as(usize, 1), decoded.record.changed_doc_keys.len);
+    try std.testing.expectEqualStrings("doc:a", decoded.record.changed_doc_keys[0]);
+    try std.testing.expect(change_journal_mod.recordHasHint(decoded.record, .full_text));
+    try std.testing.expect(change_journal_mod.recordHasHint(decoded.record, .enrichment));
+}
+
 test "db chunk cache keys preserve embedded separators" {
     const alloc = std.testing.allocator;
 

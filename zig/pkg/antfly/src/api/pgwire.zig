@@ -16,6 +16,7 @@ const std = @import("std");
 const http_server = @import("http_server.zig");
 const platform_clock = @import("../platform/clock.zig");
 const sql_adapter = @import("../sql/mod.zig");
+const runtime_schema = @import("../storage/schema.zig");
 
 const pgwire_module = @This();
 
@@ -23,10 +24,24 @@ const protocol_version_3: i32 = 196608;
 const ssl_request_code: i32 = 80877103;
 const cancel_request_code: i32 = 80877102;
 const max_packet_len: i32 = 16 * 1024 * 1024;
+const bool_oid: i32 = 16;
+const bool_type_size: i16 = 1;
 const text_oid: i32 = 25;
 const text_type_size: i16 = -1;
+const numeric_oid: i32 = 1700;
+const jsonb_oid: i32 = 3802;
+const timestamptz_oid: i32 = 1184;
+const timestamptz_type_size: i16 = 8;
 const text_format: i16 = 0;
 const binary_format: i16 = 1;
+
+const PgwireColumn = struct {
+    name: []const u8,
+    type_oid: i32 = text_oid,
+    type_size: i16 = text_type_size,
+    antfly_type: ?runtime_schema.AntflyType = null,
+    array_item_type: ?runtime_schema.AntflyType = null,
+};
 
 pub const Config = struct {
     bind_host: []const u8,
@@ -541,8 +556,8 @@ const Connection = struct {
                 const rows = pgwire_module.readResultRows(read);
                 const tag = try pgwire_module.commandTagForRows(self.alloc, "SELECT", rows.len);
                 defer self.alloc.free(tag);
-                const columns = try pgwire_module.readResultColumnNamesAlloc(self.alloc, read);
-                defer if (columns) |names| self.alloc.free(names);
+                const columns = try pgwire_module.readResultColumnsAlloc(self.alloc, read);
+                defer if (columns) |typed_columns| self.alloc.free(typed_columns);
                 try self.sendJsonRows(rows, columns, tag);
             },
             .rows_batch => |rows_batch| {
@@ -573,14 +588,14 @@ const Connection = struct {
     fn sendRows(
         self: *Connection,
         rows: []const std.json.Value,
-        schema_columns: ?[]const []const u8,
+        schema_columns: ?[]const PgwireColumn,
         tag: []const u8,
     ) !void {
         var row_description: std.Io.Writer.Allocating = .init(self.alloc);
         defer row_description.deinit();
         if (schema_columns) |columns| {
             try row_description.writer.writeInt(i16, @intCast(columns.len), .big);
-            for (columns) |column| try pgwire_module.appendTextColumnDescription(&row_description.writer, column);
+            for (columns) |column| try pgwire_module.appendColumnDescription(&row_description.writer, column);
             try self.sendMessage('T', row_description.written());
             try self.sendDataRowsForColumnNames(rows, columns);
             try self.sendCommandComplete(tag);
@@ -597,7 +612,7 @@ const Connection = struct {
         const first_row_columns = rows[0].object;
         try row_description.writer.writeInt(i16, @intCast(first_row_columns.count()), .big);
         var column_it = first_row_columns.iterator();
-        while (column_it.next()) |entry| try pgwire_module.appendTextColumnDescription(&row_description.writer, entry.key_ptr.*);
+        while (column_it.next()) |entry| try pgwire_module.appendColumnDescription(&row_description.writer, .{ .name = entry.key_ptr.* });
         try self.sendMessage('T', row_description.written());
 
         for (rows) |row| {
@@ -606,7 +621,7 @@ const Connection = struct {
             try data.writer.writeInt(i16, @intCast(first_row_columns.count()), .big);
             var value_it = first_row_columns.iterator();
             while (value_it.next()) |entry| {
-                try self.appendDataValue(&data.writer, row, entry.key_ptr.*);
+                try self.appendDataValue(&data.writer, row, .{ .name = entry.key_ptr.* });
             }
             try self.sendMessage('D', data.written());
         }
@@ -617,14 +632,14 @@ const Connection = struct {
     fn sendJsonRows(
         self: *Connection,
         rows: []const []const u8,
-        schema_columns: ?[]const []const u8,
+        schema_columns: ?[]const PgwireColumn,
         tag: []const u8,
     ) !void {
         if (schema_columns) |columns| {
             var row_description: std.Io.Writer.Allocating = .init(self.alloc);
             defer row_description.deinit();
             try row_description.writer.writeInt(i16, @intCast(columns.len), .big);
-            for (columns) |column| try pgwire_module.appendTextColumnDescription(&row_description.writer, column);
+            for (columns) |column| try pgwire_module.appendColumnDescription(&row_description.writer, column);
             try self.sendMessage('T', row_description.written());
             for (rows) |row_json| {
                 var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, row_json, .{ .allocate = .alloc_always });
@@ -654,14 +669,14 @@ const Connection = struct {
         }
 
         const first_row_columns = first_row.value.object;
-        const columns = try self.alloc.alloc([]const u8, first_row_columns.count());
+        const columns = try self.alloc.alloc(PgwireColumn, first_row_columns.count());
         defer self.alloc.free(columns);
         var column_it = first_row_columns.iterator();
         var column_index: usize = 0;
-        while (column_it.next()) |entry| : (column_index += 1) columns[column_index] = entry.key_ptr.*;
+        while (column_it.next()) |entry| : (column_index += 1) columns[column_index] = .{ .name = entry.key_ptr.* };
 
         try row_description.writer.writeInt(i16, @intCast(columns.len), .big);
-        for (columns) |column| try pgwire_module.appendTextColumnDescription(&row_description.writer, column);
+        for (columns) |column| try pgwire_module.appendColumnDescription(&row_description.writer, column);
         try self.sendMessage('T', row_description.written());
         try self.sendDataRowForColumnNames(first_row.value, columns);
         for (rows[1..]) |row_json| {
@@ -672,13 +687,13 @@ const Connection = struct {
         try self.sendCommandComplete(tag);
     }
 
-    fn sendDataRowsForColumnNames(self: *Connection, rows: []const std.json.Value, columns: []const []const u8) !void {
+    fn sendDataRowsForColumnNames(self: *Connection, rows: []const std.json.Value, columns: []const PgwireColumn) !void {
         for (rows) |row| {
             try self.sendDataRowForColumnNames(row, columns);
         }
     }
 
-    fn sendDataRowForColumnNames(self: *Connection, row: std.json.Value, columns: []const []const u8) !void {
+    fn sendDataRowForColumnNames(self: *Connection, row: std.json.Value, columns: []const PgwireColumn) !void {
         var data: std.Io.Writer.Allocating = .init(self.alloc);
         defer data.deinit();
         try data.writer.writeInt(i16, @intCast(columns.len), .big);
@@ -686,12 +701,12 @@ const Connection = struct {
         try self.sendMessage('D', data.written());
     }
 
-    fn appendDataValue(self: *Connection, writer: *std.Io.Writer, row: std.json.Value, column: []const u8) !void {
+    fn appendDataValue(self: *Connection, writer: *std.Io.Writer, row: std.json.Value, column: PgwireColumn) !void {
         if (row != .object) {
             try writer.writeInt(i32, -1, .big);
             return;
         }
-        const value = row.object.get(column) orelse {
+        const value = row.object.get(column.name) orelse {
             try writer.writeInt(i32, -1, .big);
             return;
         };
@@ -699,7 +714,7 @@ const Connection = struct {
             try writer.writeInt(i32, -1, .big);
             return;
         }
-        const text = try pgwire_module.jsonValueTextAlloc(self.alloc, value);
+        const text = try pgwire_module.pgwireValueTextAlloc(self.alloc, value, column);
         defer self.alloc.free(text);
         try writer.writeInt(i32, @intCast(text.len), .big);
         try writer.writeAll(text);
@@ -974,11 +989,37 @@ fn readResultRows(read: anytype) []const []const u8 {
     };
 }
 
-fn readResultColumnNamesAlloc(alloc: std.mem.Allocator, read: anytype) !?[]const []const u8 {
+fn readResultColumnsAlloc(alloc: std.mem.Allocator, read: anytype) !?[]const PgwireColumn {
     if (read.columns.len == 0) return null;
-    const names = try alloc.alloc([]const u8, read.columns.len);
-    for (read.columns, 0..) |column, i| names[i] = column.name;
-    return names;
+    const columns = try alloc.alloc(PgwireColumn, read.columns.len);
+    for (read.columns, 0..) |column, i| columns[i] = pgwireColumnForRelationalColumn(column);
+    return columns;
+}
+
+fn pgwireColumnForRelationalColumn(column: runtime_schema.RelationalColumn) PgwireColumn {
+    const pg_type = pgwireTypeForAntflyType(column.field_type, column.array_item_type);
+    return .{
+        .name = column.name,
+        .type_oid = pg_type.oid,
+        .type_size = pg_type.size,
+        .antfly_type = column.field_type,
+        .array_item_type = column.array_item_type,
+    };
+}
+
+fn pgwireTypeForAntflyType(
+    field_type: runtime_schema.AntflyType,
+    array_item_type: ?runtime_schema.AntflyType,
+) struct { oid: i32, size: i16 } {
+    _ = array_item_type;
+    return switch (field_type) {
+        .keyword, .text, .link, .html, .search_as_you_type => .{ .oid = text_oid, .size = text_type_size },
+        .numeric => .{ .oid = numeric_oid, .size = text_type_size },
+        .boolean => .{ .oid = bool_oid, .size = bool_type_size },
+        .datetime => .{ .oid = timestamptz_oid, .size = timestamptz_type_size },
+        .json, .array => .{ .oid = jsonb_oid, .size = text_type_size },
+        .embedding, .geopoint, .geoshape, .blob => .{ .oid = text_oid, .size = text_type_size },
+    };
 }
 
 fn commandTagForDdlSql(alloc: std.mem.Allocator, sql: []const u8) ?[]const u8 {
@@ -1114,15 +1155,49 @@ fn jsonValueTextAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
     };
 }
 
-fn appendTextColumnDescription(writer: *std.Io.Writer, name: []const u8) !void {
-    try writer.writeAll(name);
+fn pgwireValueTextAlloc(alloc: std.mem.Allocator, value: std.json.Value, column: PgwireColumn) ![]u8 {
+    if (column.antfly_type == .datetime) {
+        if (try jsonValueNanoseconds(value)) |ns| return try timestampNsTextAlloc(alloc, ns);
+    }
+    return try jsonValueTextAlloc(alloc, value);
+}
+
+fn jsonValueNanoseconds(value: std.json.Value) !?u64 {
+    return switch (value) {
+        .integer => |number| if (number >= 0) @intCast(number) else null,
+        .float => |number| if (number >= 0) @intFromFloat(number) else null,
+        .number_string => |text| try std.fmt.parseInt(u64, text, 10),
+        else => null,
+    };
+}
+
+fn timestampNsTextAlloc(alloc: std.mem.Allocator, ns: u64) ![]u8 {
+    const seconds = @divFloor(ns, std.time.ns_per_s);
+    const micros = @divFloor(ns % std.time.ns_per_s, std.time.ns_per_us);
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = seconds };
+    const year_day = epoch_seconds.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+    return try std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}Z", .{
+        year_day.year,
+        month_day.month.numeric(),
+        month_day.day_index + 1,
+        day_seconds.getHoursIntoDay(),
+        day_seconds.getMinutesIntoHour(),
+        day_seconds.getSecondsIntoMinute(),
+        micros,
+    });
+}
+
+fn appendColumnDescription(writer: *std.Io.Writer, column: PgwireColumn) !void {
+    try writer.writeAll(column.name);
     try writer.writeByte(0);
     try writer.writeInt(i32, 0, .big);
     try writer.writeInt(i16, 0, .big);
-    try writer.writeInt(i32, text_oid, .big);
-    try writer.writeInt(i16, text_type_size, .big);
+    try writer.writeInt(i32, column.type_oid, .big);
+    try writer.writeInt(i16, column.type_size, .big);
     try writer.writeInt(i32, -1, .big);
-    try writer.writeInt(i16, 0, .big);
+    try writer.writeInt(i16, text_format, .big);
 }
 
 fn sqlstateForHttpStatus(status: u16) []const u8 {

@@ -46,6 +46,7 @@ const hbc_mod = @import("../hbc_adapter.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const internal_keys = @import("../internal_keys.zig");
 const mapper = @import("document_mapper.zig");
+const mem_backend_mod = @import("../mem_backend.zig");
 const promotion_runtime_mod = @import("promotion_runtime.zig");
 const replay_stream_mod = @import("derived/replay_stream.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
@@ -5121,6 +5122,458 @@ pub fn Impl(comptime DB: type) type {
             );
         }
     };
+}
+
+test "db derived async replay reopen preserves applied watermark above retained replay floor" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+        });
+        try db.core.saveAppliedSequence("dv_v1", 7);
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reopened.close();
+
+        const applied = try reopened.core.loadAppliedSequence(alloc, "dv_v1");
+        try std.testing.expectEqual(@as(u64, 7), applied);
+        try std.testing.expect(reopened.core.nextDerivedAppendSequence() >= 8);
+    }
+}
+
+test "db derived async replay writer open resumes generated enrichment replay from journal" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"generated vector text\"}" },
+            },
+            .sync_level = .write,
+        });
+
+        const replay_entries = try replay_stream_mod.iterateFrom(alloc, db.core.store, 1);
+        defer {
+            for (replay_entries) |*entry| entry.deinit(alloc);
+            alloc.free(replay_entries);
+        }
+        try std.testing.expectEqual(@as(usize, 1), replay_entries.len);
+    }
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer reopened.close();
+
+    const stats_before = try reopened.stats(alloc);
+    defer types.freeDBStats(alloc, stats_before);
+    try std.testing.expect(stats_before.enrichment.enabled);
+    try std.testing.expectEqual(@as(u64, 1), stats_before.enrichment.target_sequence);
+
+    try reopened.runUntilIdle();
+
+    const stats_after = try reopened.stats(alloc);
+    defer types.freeDBStats(alloc, stats_after);
+    try std.testing.expectEqual(@as(u64, 2), stats_after.enrichment.applied_sequence);
+    try std.testing.expectEqual(@as(u64, 2), stats_after.enrichment.target_sequence);
+
+    const query_vec = try deterministic.interface().embedDense(alloc, "", "generated vector text", 3);
+    defer alloc.free(query_vec);
+
+    var result = try reopened.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{
+            .vector = query_vec,
+            .k = 1,
+        },
+        .limit = 1,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "db derived async replay collectDocumentWrites batches sorted document reads and falls back to inline values" {
+    const alloc = std.testing.allocator;
+
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const stored_a = try replayDocumentStoreKeyAlloc(alloc, "a", false);
+    defer alloc.free(stored_a);
+    const stored_c = try replayDocumentStoreKeyAlloc(alloc, "c", false);
+    defer alloc.free(stored_c);
+    try store.putBatch(&.{
+        .{ .key = stored_a, .value = "{\"title\":\"alpha\"}" },
+        .{ .key = stored_c, .value = "{\"title\":\"charlie\"}" },
+    }, &.{});
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "a", .action = .upsert, .cleaned_value = null },
+        .{ .key = "b", .action = .upsert, .cleaned_value = "{\"title\":\"bravo\"}" },
+        .{ .key = "c", .action = .upsert, .cleaned_value = null },
+    };
+
+    var writes = try collectDocumentWrites(alloc, &store, &docs, .{ .start = "", .end = "" });
+    defer writes.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), writes.items.len);
+    try std.testing.expectEqualStrings("a", writes.items[0].key);
+    try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", writes.items[0].value);
+    try std.testing.expectEqualStrings("b", writes.items[1].key);
+    try std.testing.expectEqualStrings("{\"title\":\"bravo\"}", writes.items[1].value);
+    try std.testing.expectEqualStrings("c", writes.items[2].key);
+    try std.testing.expectEqualStrings("{\"title\":\"charlie\"}", writes.items[2].value);
+}
+
+test "db derived async replay collectDocumentWrites skips missing out-of-range replay docs" {
+    const alloc = std.testing.allocator;
+
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const stored_z = try replayDocumentStoreKeyAlloc(alloc, "doc:z", false);
+    defer alloc.free(stored_z);
+    try store.putBatch(&.{
+        .{ .key = stored_z, .value = "{\"title\":\"zeta\"}" },
+    }, &.{});
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "doc:a", .action = .upsert, .cleaned_value = null },
+        .{ .key = "doc:z", .action = .upsert, .cleaned_value = null },
+    };
+
+    var writes = try collectDocumentWrites(alloc, &store, &docs, .{ .start = "doc:m", .end = "" });
+    defer writes.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), writes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), writes.missing_required);
+    try std.testing.expectEqualStrings("doc:z", writes.items[0].key);
+    try std.testing.expectEqualStrings("{\"title\":\"zeta\"}", writes.items[0].value);
+}
+
+test "db derived async replay text replay delete keys include upserted derived document keys" {
+    const alloc = std.testing.allocator;
+
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = "chunk:1", .action = .upsert, .cleaned_value = "{\"text\":\"new\"}" },
+        .{ .key = "ignored", .action = .delete },
+        .{ .key = "chunk:1", .action = .upsert, .cleaned_value = "{\"text\":\"newer\"}" },
+    };
+    const deleted = [_][]const u8{"deleted:1"};
+    const overwritten = [_][]const u8{ "chunk:1", "overwritten:1" };
+    const batch = derived_types.DerivedBatch{
+        .documents = &docs,
+        .deleted_keys = &deleted,
+        .overwritten_doc_keys = &overwritten,
+    };
+
+    const keys = try collectTextReplayDeleteKeys(alloc, batch);
+    defer alloc.free(keys);
+
+    try std.testing.expectEqual(@as(usize, 3), keys.len);
+    try std.testing.expectEqualStrings("deleted:1", keys[0]);
+    try std.testing.expectEqualStrings("chunk:1", keys[1]);
+    try std.testing.expectEqualStrings("overwritten:1", keys[2]);
+}
+
+test "db derived async replay skips dense embedding writes when artifact payload is missing" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var appended_sequence: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+        });
+
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+        defer alloc.free(stored_key);
+        try db.core.store.put(stored_key, "{\"title\":\"alpha\"}");
+
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
+        defer alloc.free(artifact_key);
+
+        const derived_batch = derived_types.DerivedBatch{
+            .dense_embeddings = &.{
+                .{
+                    .index_name = "dv_v1",
+                    .doc_key = "doc:a",
+                    .artifact_key = artifact_key,
+                    .vector = &[_]f32{ 1, 0 },
+                },
+            },
+        };
+
+        appended_sequence = try db.derivedAsyncAppendDerivedBatchRecord(derived_batch);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+
+    var result = try reopened.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{
+            .vector = &[_]f32{ 1, 0 },
+            .k = 1,
+        },
+        .limit = 1,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), result.total_hits);
+
+    const dense_applied = try reopened.core.loadAppliedSequence(alloc, "dv_v1");
+    try std.testing.expectEqual(appended_sequence, dense_applied);
+}
+
+test "db derived async replay skips and deletes corrupt dense embedding artifacts" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var appended_sequence: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+        });
+
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+        defer alloc.free(stored_key);
+        try db.core.store.put(stored_key, "{\"title\":\"alpha\"}");
+
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
+        defer alloc.free(artifact_key);
+        try db.core.store.put(artifact_key, "bad-artifact");
+
+        const derived_batch = derived_types.DerivedBatch{
+            .dense_embeddings = &.{
+                .{
+                    .index_name = "dv_v1",
+                    .doc_key = "doc:a",
+                    .artifact_key = artifact_key,
+                    .vector = &[_]f32{ 1, 0 },
+                },
+            },
+        };
+
+        appended_sequence = try db.derivedAsyncAppendDerivedBatchRecord(derived_batch);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+
+    var result = try reopened.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{
+            .vector = &[_]f32{ 1, 0 },
+            .k = 1,
+        },
+        .limit = 1,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), result.total_hits);
+
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
+    defer alloc.free(artifact_key);
+    try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, artifact_key));
+
+    const dense_applied = try reopened.core.loadAppliedSequence(alloc, "dv_v1");
+    try std.testing.expectEqual(appended_sequence, dense_applied);
+}
+
+test "db derived async replay applies sparse embeddings from artifact payloads" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "sp_v1",
+            .kind = .sparse_vector,
+            .config_json = "{\"field\":\"sparse_embedding\"}",
+        });
+
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+        defer alloc.free(stored_key);
+        try db.core.store.put(stored_key, "{\"title\":\"alpha\"}");
+
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "sp_v1");
+        defer alloc.free(artifact_key);
+        try db_test_support.putSparseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &.{ 1, 5 }, &.{ 0.5, 0.75 });
+
+        const derived_batch = derived_types.DerivedBatch{
+            .sparse_embeddings = &.{
+                .{
+                    .index_name = "sp_v1",
+                    .doc_key = "doc:a",
+                    .artifact_key = artifact_key,
+                    .indices = &.{9},
+                    .values = &.{9.0},
+                },
+            },
+        };
+
+        _ = try db.derivedAsyncAppendDerivedBatchRecord(derived_batch);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+
+    var sparse_index = reopened.core.index_manager.sparseIndex("sp_v1").?.index;
+    const stats = sparse_index.stats();
+    try std.testing.expectEqual(@as(u64, 1), stats.doc_count);
+}
+
+test "db derived async replay skips and deletes corrupt sparse embedding artifacts" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var appended_sequence: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "sp_v1",
+            .kind = .sparse_vector,
+            .config_json = "{\"field\":\"sparse_embedding\"}",
+        });
+
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+        defer alloc.free(stored_key);
+        try db.core.store.put(stored_key, "{\"title\":\"alpha\"}");
+
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "sp_v1");
+        defer alloc.free(artifact_key);
+        try db.core.store.put(artifact_key, "bad-artifact");
+
+        const derived_batch = derived_types.DerivedBatch{
+            .sparse_embeddings = &.{
+                .{
+                    .index_name = "sp_v1",
+                    .doc_key = "doc:a",
+                    .artifact_key = artifact_key,
+                    .indices = &.{9},
+                    .values = &.{9.0},
+                },
+            },
+        };
+
+        appended_sequence = try db.derivedAsyncAppendDerivedBatchRecord(derived_batch);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+
+    var sparse_index = reopened.core.index_manager.sparseIndex("sp_v1").?.index;
+    const stats = sparse_index.stats();
+    try std.testing.expectEqual(@as(u64, 0), stats.doc_count);
+
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "sp_v1");
+    defer alloc.free(artifact_key);
+    try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, artifact_key));
+
+    const sparse_applied = try reopened.core.loadAppliedSequence(alloc, "sp_v1");
+    try std.testing.expectEqual(appended_sequence, sparse_applied);
 }
 
 test "db derived async replay batch persists per-index applied sequence watermark" {

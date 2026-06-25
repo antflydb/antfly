@@ -12810,15 +12810,41 @@ fn validateGeneratedRecursiveDmlCtePayloadAlloc(
     const cte_list_tokens = cte_prefix.list_tokens;
     if (cte_list_tokens.start <= cte_tokens.start or cte_list_tokens.end != cte_tokens.end or cte_list_tokens.start >= cte_list_tokens.end) return error.UnsupportedSqlShape;
     if (cte_prefix.count == 0 or !cte_prefix.recursive) return error.UnsupportedSqlShape;
-    const names = [_]generated_parser.GeneratedSqlTokenRange{ cte_prefix.first_name_tokens, cte_prefix.last_name_tokens };
-    const bodies = [_]generated_parser.GeneratedSqlTokenRange{ cte_prefix.first_body_tokens, cte_prefix.last_body_tokens };
-    const body_reads = [_]generated_parser.GeneratedSqlDmlReadBodyAst{ cte_prefix.first_body_read, cte_prefix.last_body_read };
-    for (names, bodies, body_reads) |name_tokens, body_tokens, body_read| {
-        if (name_tokens.start < cte_list_tokens.start or name_tokens.end > cte_list_tokens.end or name_tokens.start >= name_tokens.end) return error.UnsupportedSqlShape;
-        if (body_tokens.start <= name_tokens.end or body_tokens.end > cte_list_tokens.end or body_tokens.start >= body_tokens.end) return error.UnsupportedSqlShape;
-        try validateGeneratedDmlReadBodyLayout(tokens, body_tokens, body_read);
-        try validateGeneratedChildReadRangeAlloc(alloc, parsed_sql, body_tokens);
+    if (cte_prefix.items.len != cte_prefix.count) return error.UnsupportedSqlShape;
+    if (cte_prefix.items.len == 0) return error.UnsupportedSqlShape;
+    if (!generatedDmlTokenRangeEql(cte_prefix.first_name_tokens, cte_prefix.items[0].name_tokens) or
+        !generatedDmlTokenRangeEql(cte_prefix.first_body_tokens, cte_prefix.items[0].body_tokens))
+    {
+        return error.UnsupportedSqlShape;
     }
+    const last = cte_prefix.items[cte_prefix.items.len - 1];
+    if (!generatedDmlTokenRangeEql(cte_prefix.last_name_tokens, last.name_tokens) or
+        !generatedDmlTokenRangeEql(cte_prefix.last_body_tokens, last.body_tokens))
+    {
+        return error.UnsupportedSqlShape;
+    }
+    var previous_end = cte_list_tokens.start;
+    for (cte_prefix.items) |item| {
+        if (item.name_tokens.start < previous_end or
+            item.name_tokens.end > cte_list_tokens.end or
+            item.name_tokens.start >= item.name_tokens.end)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        if (item.body_tokens.start <= item.name_tokens.end or
+            item.body_tokens.end > cte_list_tokens.end or
+            item.body_tokens.start >= item.body_tokens.end)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        try validateGeneratedDmlReadBodyLayout(tokens, item.body_tokens, item.body_read);
+        try validateGeneratedChildReadRangeAlloc(alloc, parsed_sql, item.body_tokens);
+        previous_end = item.body_tokens.end;
+    }
+}
+
+fn generatedDmlTokenRangeEql(a: generated_parser.GeneratedSqlTokenRange, b: generated_parser.GeneratedSqlTokenRange) bool {
+    return a.start == b.start and a.end == b.end;
 }
 
 fn insertValuesFromGeneratedDmlAstAlloc(
@@ -14107,6 +14133,40 @@ test "sql adapter lower dml validates recursive generated CTE child reads" {
     };
     switch (generated_statement.ast orelse return error.TestUnexpectedResult) {
         .dml => |dml| try validateGeneratedRecursiveDmlCtePayloadAlloc(alloc, &parsed, dml, end),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var parsed_multi = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH RECURSIVE seed_rows AS (SELECT id FROM usage_records), source_rows AS (SELECT id FROM seed_rows), final_rows AS (SELECT id FROM source_rows) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM final_rows)",
+    );
+    defer parsed_multi.deinit(alloc);
+    const multi_end = switch (parsed_multi.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| generatedDmlStatementEnd(parsed_multi.items(), dml.statement_span) orelse return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    };
+    switch (parsed_multi.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| try validateGeneratedRecursiveDmlCtePayloadAlloc(alloc, &parsed_multi, dml, multi_end),
+        else => return error.TestUnexpectedResult,
+    }
+    if (parsed_multi.generated_statement) |*mutable_statement| {
+        if (mutable_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| {
+                    if (dml.cte_prefix) |*cte_prefix| {
+                        try std.testing.expectEqual(@as(usize, 3), cte_prefix.items.len);
+                        const projection_tokens = cte_prefix.items[1].body_read.projection_tokens orelse return error.TestUnexpectedResult;
+                        cte_prefix.items[1].body_tokens = projection_tokens;
+                        cte_prefix.items[1].body_read.tokens = projection_tokens;
+                        cte_prefix.items[1].body_read.source_tokens = null;
+                    } else return error.TestUnexpectedResult;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    switch (parsed_multi.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedRecursiveDmlCtePayloadAlloc(alloc, &parsed_multi, dml, multi_end)),
         else => return error.TestUnexpectedResult,
     }
 

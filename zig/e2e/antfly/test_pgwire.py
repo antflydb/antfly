@@ -40,6 +40,12 @@ from conftest import (
     wait_for_server,
 )
 
+PG_BOOL_OID = 16
+PG_TEXT_OID = 25
+PG_TIMESTAMPTZ_OID = 1184
+PG_NUMERIC_OID = 1700
+PG_JSONB_OID = 3802
+
 
 @pytest.fixture(scope="module")
 def pgwire_server():
@@ -260,8 +266,46 @@ def test_pgwire_empty_select_preserves_row_description(pgwire_server):
         messages = _pgwire_simple_query(sock, f"SELECT id, status, amount FROM {table} WHERE id = 'missing';")
 
     assert [message["columns"] for message in messages if message["type"] == "columns"] == [["id", "status", "amount"]]
+    assert [message["oids"] for message in messages if message["type"] == "columns"] == [[PG_TEXT_OID, PG_TEXT_OID, PG_NUMERIC_OID]]
     assert [message["tag"] for message in messages if message["type"] == "command"] == ["SELECT 0"]
     assert [message["values"] for message in messages if message["type"] == "row"] == []
+
+
+def test_pgwire_row_description_uses_relational_type_oids(pgwire_server):
+    table = _table_name("pgwire_types")
+
+    with socket.create_connection((pgwire_server.host, pgwire_server.pgwire_port), timeout=5) as sock:
+        _pgwire_startup(sock)
+        _pgwire_simple_query(
+            sock,
+            f"CREATE TABLE {table} ("
+            "id text PRIMARY KEY, "
+            "amount numeric, "
+            "active boolean, "
+            "created_at timestamptz, "
+            "attrs jsonb"
+            ");",
+        )
+        _pgwire_simple_query(
+            sock,
+            f"INSERT INTO {table} (id, amount, active, created_at, attrs) "
+            "VALUES ('row:typed', 12.5, true, '2026-06-25T12:34:56Z', '{\"tier\":\"gold\"}'::jsonb);",
+        )
+        messages = _pgwire_simple_query(sock, f"SELECT id, amount, active, created_at, attrs FROM {table} WHERE id = 'row:typed';")
+
+    column_messages = [message for message in messages if message["type"] == "columns"]
+    assert column_messages == [
+        {
+            "type": "columns",
+            "columns": ["id", "amount", "active", "created_at", "attrs"],
+            "oids": [PG_TEXT_OID, PG_NUMERIC_OID, PG_BOOL_OID, PG_TIMESTAMPTZ_OID, PG_JSONB_OID],
+        }
+    ]
+    rows = [message["values"] for message in messages if message["type"] == "row"]
+    assert len(rows) == 1
+    assert rows[0][0:3] == ["row:typed", "12.5", "true"]
+    assert rows[0][3].startswith("2026-06-25T12:34:56")
+    assert json.loads(rows[0][4]) == {"tier": "gold"}
 
 
 def test_metadata_pgwire_simple_query_uses_public_api_sql(metadata_pgwire_server):
@@ -300,8 +344,9 @@ def _pgwire_simple_query(sock: socket.socket, sql: str) -> list[dict[str, Any]]:
     while True:
         tag, payload = _pgwire_read_message(sock)
         if tag == b"T":
-            columns = _pgwire_row_description(payload)
-            messages.append({"type": "columns", "columns": columns})
+            description = _pgwire_row_description(payload)
+            columns = [column["name"] for column in description]
+            messages.append({"type": "columns", "columns": columns, "oids": [column["type_oid"] for column in description]})
         elif tag == b"D":
             messages.append({"type": "row", "values": _pgwire_data_row(payload)})
         elif tag == b"C":
@@ -341,8 +386,9 @@ def _pgwire_extended_query(sock: socket.socket, sql: str, params: list[str | Non
     while True:
         tag, payload = _pgwire_read_message(sock)
         if tag == b"T":
-            columns = _pgwire_row_description(payload)
-            messages.append({"type": "columns", "columns": columns})
+            description = _pgwire_row_description(payload)
+            columns = [column["name"] for column in description]
+            messages.append({"type": "columns", "columns": columns, "oids": [column["type_oid"] for column in description]})
         elif tag == b"D":
             messages.append({"type": "row", "values": _pgwire_data_row(payload)})
         elif tag == b"C":
@@ -368,14 +414,22 @@ def _pgwire_read_message(sock: socket.socket) -> tuple[bytes, bytes]:
     return tag, _recv_exact(sock, length - 4)
 
 
-def _pgwire_row_description(payload: bytes) -> list[str]:
+def _pgwire_row_description(payload: bytes) -> list[dict[str, Any]]:
     count = struct.unpack("!h", payload[:2])[0]
     offset = 2
-    columns: list[str] = []
+    columns: list[dict[str, Any]] = []
     for _ in range(count):
         end = payload.index(b"\x00", offset)
-        columns.append(payload[offset:end].decode())
-        offset = end + 1 + 18
+        name = payload[offset:end].decode()
+        offset = end + 1
+        offset += 4
+        offset += 2
+        type_oid = struct.unpack("!i", payload[offset : offset + 4])[0]
+        offset += 4
+        offset += 2
+        offset += 4
+        offset += 2
+        columns.append({"name": name, "type_oid": type_oid})
     return columns
 
 
