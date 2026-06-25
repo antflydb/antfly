@@ -182,6 +182,8 @@ pub const GeneratedSqlUnsupportedKind = enum {
     alter_foreign_table,
     alter_foreign_data_wrapper,
     alter_materialized_view,
+    alter_operator_class,
+    alter_operator_family,
     alter_policy,
     alter_publication,
     alter_rule,
@@ -190,6 +192,9 @@ pub const GeneratedSqlUnsupportedKind = enum {
     alter_system,
     alter_statistics,
     alter_text_search_configuration,
+    alter_text_search_dictionary,
+    alter_text_search_parser,
+    alter_text_search_template,
     alter_trigger,
     alter_user_mapping,
     create_access_method,
@@ -199,6 +204,8 @@ pub const GeneratedSqlUnsupportedKind = enum {
     create_foreign_data_wrapper,
     create_language,
     create_materialized_view,
+    create_operator_class,
+    create_operator_family,
     create_policy,
     create_publication,
     create_rule,
@@ -206,6 +213,9 @@ pub const GeneratedSqlUnsupportedKind = enum {
     create_subscription,
     create_statistics,
     create_text_search_configuration,
+    create_text_search_dictionary,
+    create_text_search_parser,
+    create_text_search_template,
     create_transform,
     create_trigger,
     create_user_mapping,
@@ -218,8 +228,13 @@ pub const GeneratedSqlUnsupportedKind = enum {
     drop_event_trigger,
     drop_language,
     drop_owned,
+    drop_operator_class,
+    drop_operator_family,
     drop_statistics,
     drop_text_search_configuration,
+    drop_text_search_dictionary,
+    drop_text_search_parser,
+    drop_text_search_template,
     drop_transform,
     drop_user_mapping,
     explain,
@@ -264,6 +279,8 @@ pub const GeneratedSqlUnsupportedReason = enum {
     alter_foreign_table_not_planned_by_generated_parser,
     alter_foreign_data_wrapper_not_planned_by_generated_parser,
     alter_materialized_view_not_planned_by_generated_parser,
+    alter_operator_class_not_planned_by_generated_parser,
+    alter_operator_family_not_planned_by_generated_parser,
     alter_policy_not_planned_by_generated_parser,
     alter_publication_not_planned_by_generated_parser,
     alter_rule_not_planned_by_generated_parser,
@@ -272,6 +289,9 @@ pub const GeneratedSqlUnsupportedReason = enum {
     alter_system_not_planned_by_generated_parser,
     alter_statistics_not_planned_by_generated_parser,
     alter_text_search_configuration_not_planned_by_generated_parser,
+    alter_text_search_dictionary_not_planned_by_generated_parser,
+    alter_text_search_parser_not_planned_by_generated_parser,
+    alter_text_search_template_not_planned_by_generated_parser,
     alter_trigger_not_planned_by_generated_parser,
     alter_user_mapping_not_planned_by_generated_parser,
     create_access_method_not_planned_by_generated_parser,
@@ -281,6 +301,8 @@ pub const GeneratedSqlUnsupportedReason = enum {
     create_foreign_data_wrapper_not_planned_by_generated_parser,
     create_language_not_planned_by_generated_parser,
     create_materialized_view_not_planned_by_generated_parser,
+    create_operator_class_not_planned_by_generated_parser,
+    create_operator_family_not_planned_by_generated_parser,
     create_policy_not_planned_by_generated_parser,
     create_publication_not_planned_by_generated_parser,
     create_rule_not_planned_by_generated_parser,
@@ -288,6 +310,9 @@ pub const GeneratedSqlUnsupportedReason = enum {
     create_subscription_not_planned_by_generated_parser,
     create_statistics_not_planned_by_generated_parser,
     create_text_search_configuration_not_planned_by_generated_parser,
+    create_text_search_dictionary_not_planned_by_generated_parser,
+    create_text_search_parser_not_planned_by_generated_parser,
+    create_text_search_template_not_planned_by_generated_parser,
     create_transform_not_planned_by_generated_parser,
     create_trigger_not_planned_by_generated_parser,
     create_user_mapping_not_planned_by_generated_parser,
@@ -300,8 +325,13 @@ pub const GeneratedSqlUnsupportedReason = enum {
     drop_event_trigger_not_planned_by_generated_parser,
     drop_language_not_planned_by_generated_parser,
     drop_owned_not_planned_by_generated_parser,
+    drop_operator_class_not_planned_by_generated_parser,
+    drop_operator_family_not_planned_by_generated_parser,
     drop_statistics_not_planned_by_generated_parser,
     drop_text_search_configuration_not_planned_by_generated_parser,
+    drop_text_search_dictionary_not_planned_by_generated_parser,
+    drop_text_search_parser_not_planned_by_generated_parser,
+    drop_text_search_template_not_planned_by_generated_parser,
     drop_transform_not_planned_by_generated_parser,
     drop_user_mapping_not_planned_by_generated_parser,
     explain_not_planned_by_generated_parser,
@@ -1850,11 +1880,16 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "ALTER FOREIGN TABLE foreign_usage_records RENAME TO foreign_usage_archive", .kind = .unsupported },
     .{ .sql = "ALTER FOREIGN DATA WRAPPER usage_fdw OPTIONS (ADD host 'localhost')", .kind = .unsupported },
     .{ .sql = "ALTER MATERIALIZED VIEW usage_summary RENAME TO usage_summary_v2", .kind = .unsupported },
+    .{ .sql = "ALTER OPERATOR CLASS usage_ops USING btree RENAME TO usage_ops_v2", .kind = .unsupported },
+    .{ .sql = "ALTER OPERATOR FAMILY usage_family USING btree RENAME TO usage_family_v2", .kind = .unsupported },
     .{ .sql = "ALTER RULE usage_insert ON usage_records RENAME TO usage_insert_v2", .kind = .unsupported },
     .{ .sql = "ALTER SERVER usage_server VERSION '15'", .kind = .unsupported },
     .{ .sql = "ALTER SYSTEM SET work_mem = '64MB'", .kind = .unsupported },
     .{ .sql = "ALTER STATISTICS usage_stats SET STATISTICS 100", .kind = .unsupported },
     .{ .sql = "ALTER TEXT SEARCH CONFIGURATION usage_search RENAME TO usage_search_v2", .kind = .unsupported },
+    .{ .sql = "ALTER TEXT SEARCH DICTIONARY usage_dict OWNER TO app_role", .kind = .unsupported },
+    .{ .sql = "ALTER TEXT SEARCH PARSER usage_parser RENAME TO usage_parser_v2", .kind = .unsupported },
+    .{ .sql = "ALTER TEXT SEARCH TEMPLATE usage_template RENAME TO usage_template_v2", .kind = .unsupported },
     .{ .sql = "ALTER TRIGGER usage_audit ON usage_records RENAME TO usage_audit_v2", .kind = .unsupported },
     .{ .sql = "ALTER USER MAPPING FOR usage_user SERVER usage_server OPTIONS (SET user 'remote')", .kind = .unsupported },
     .{ .sql = "ANALYZE", .kind = .unsupported },
@@ -1870,11 +1905,16 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CREATE FOREIGN TABLE foreign_usage_records (id text) SERVER usage_fdw", .kind = .unsupported },
     .{ .sql = "CREATE FOREIGN DATA WRAPPER usage_fdw HANDLER usage_fdw_handler", .kind = .unsupported },
     .{ .sql = "CREATE LANGUAGE usage_lang", .kind = .unsupported },
+    .{ .sql = "CREATE OPERATOR CLASS usage_ops DEFAULT FOR TYPE text USING btree AS OPERATOR 1 < (text, text)", .kind = .unsupported },
+    .{ .sql = "CREATE OPERATOR FAMILY usage_family USING btree", .kind = .unsupported },
     .{ .sql = "CREATE RULE usage_insert AS ON INSERT TO usage_records DO ALSO NOTIFY usage_events", .kind = .unsupported },
     .{ .sql = "CREATE SERVER usage_server FOREIGN DATA WRAPPER postgres_fdw", .kind = .unsupported },
     .{ .sql = "CREATE STATISTICS usage_stats ON tenant_id, status FROM usage_records", .kind = .unsupported },
     .{ .sql = "CREATE TRIGGER usage_audit BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage()", .kind = .unsupported },
     .{ .sql = "CREATE TEXT SEARCH CONFIGURATION usage_search (COPY = pg_catalog.english)", .kind = .unsupported },
+    .{ .sql = "CREATE TEXT SEARCH DICTIONARY usage_dict (TEMPLATE = simple)", .kind = .unsupported },
+    .{ .sql = "CREATE TEXT SEARCH PARSER usage_parser (START = prsd_start)", .kind = .unsupported },
+    .{ .sql = "CREATE TEXT SEARCH TEMPLATE usage_template (LEXIZE = dsimple_lexize)", .kind = .unsupported },
     .{ .sql = "CREATE TRANSFORM FOR jsonb LANGUAGE plpgsql FROM SQL WITH FUNCTION jsonb_to_plpgsql(internal)", .kind = .unsupported },
     .{ .sql = "CREATE USER MAPPING FOR usage_user SERVER usage_server OPTIONS (user 'remote')", .kind = .unsupported },
     .{ .sql = "DECLARE usage_cursor NO SCROLL CURSOR FOR SELECT id FROM usage_records", .kind = .unsupported },
@@ -1886,8 +1926,13 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "DROP EVENT TRIGGER IF EXISTS usage_ddl_start", .kind = .unsupported },
     .{ .sql = "DROP LANGUAGE IF EXISTS usage_lang CASCADE", .kind = .unsupported },
     .{ .sql = "DROP OWNED BY usage_role CASCADE", .kind = .unsupported },
+    .{ .sql = "DROP OPERATOR CLASS IF EXISTS usage_ops USING btree", .kind = .unsupported },
+    .{ .sql = "DROP OPERATOR FAMILY IF EXISTS usage_family USING btree", .kind = .unsupported },
     .{ .sql = "DROP STATISTICS IF EXISTS usage_stats", .kind = .unsupported },
     .{ .sql = "DROP TEXT SEARCH CONFIGURATION IF EXISTS usage_search", .kind = .unsupported },
+    .{ .sql = "DROP TEXT SEARCH DICTIONARY IF EXISTS usage_dict", .kind = .unsupported },
+    .{ .sql = "DROP TEXT SEARCH PARSER IF EXISTS usage_parser", .kind = .unsupported },
+    .{ .sql = "DROP TEXT SEARCH TEMPLATE IF EXISTS usage_template", .kind = .unsupported },
     .{ .sql = "DROP TRANSFORM FOR jsonb LANGUAGE plpgsql", .kind = .unsupported },
     .{ .sql = "EXPLAIN", .kind = .unsupported },
     .{ .sql = "EXPLAIN SELECT id FROM usage_records", .kind = .unsupported },
@@ -2143,7 +2188,11 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.procedure)) return .{ .ddl = .create_procedure };
         if (second.matchesKeywordTag(.role)) return .{ .ddl = .create_role };
         if (second.matchesKeywordTag(.collation)) return .{ .ddl = .create_collation };
-        if (second.matchesKeywordTag(.operator)) return .{ .ddl = .create_operator };
+        if (second.matchesKeywordTag(.operator)) {
+            if (tokens.len > 2 and tokens[2].matchesKeyword("class")) return .{ .unsupported = .create_operator_class };
+            if (tokens.len > 2 and tokens[2].matchesKeyword("family")) return .{ .unsupported = .create_operator_family };
+            return .{ .ddl = .create_operator };
+        }
         if (second.matchesKeywordTag(.aggregate)) return .{ .ddl = .create_aggregate };
         if (second.matchesKeywordTag(.cast)) return .{ .ddl = .create_cast };
         if (second.matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
@@ -2161,7 +2210,13 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.rule)) return .{ .unsupported = .create_rule };
         if (second.matchesKeywordTag(.server)) return .{ .unsupported = .create_server };
         if (second.matchesKeyword("statistics")) return .{ .unsupported = .create_statistics };
-        if (second.matchesKeywordTag(.text) and tokens.len > 3 and tokens[2].matchesKeyword("search") and tokens[3].matchesKeyword("configuration")) return .{ .unsupported = .create_text_search_configuration };
+        if (second.matchesKeywordTag(.text) and tokens.len > 3 and tokens[2].matchesKeyword("search")) {
+            const text_search_kind = tokens[3];
+            if (text_search_kind.matchesKeyword("configuration")) return .{ .unsupported = .create_text_search_configuration };
+            if (text_search_kind.matchesKeyword("dictionary")) return .{ .unsupported = .create_text_search_dictionary };
+            if (text_search_kind.matchesKeyword("parser")) return .{ .unsupported = .create_text_search_parser };
+            if (text_search_kind.matchesKeyword("template")) return .{ .unsupported = .create_text_search_template };
+        }
         if (second.matchesKeyword("transform")) return .{ .unsupported = .create_transform };
         if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .create_trigger };
         if (second.matchesKeyword("user") and tokens.len > 2 and tokens[2].matchesKeyword("mapping")) return .{ .unsupported = .create_user_mapping };
@@ -2204,6 +2259,8 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeyword("event") and tokens.len > 2 and tokens[2].matchesKeywordTag(.trigger)) return .{ .unsupported = .alter_event_trigger };
         if (second.matchesKeywordTag(.index)) return .{ .unsupported = .alter_index };
         if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .unsupported = .alter_materialized_view };
+        if (second.matchesKeywordTag(.operator) and tokens.len > 2 and tokens[2].matchesKeyword("class")) return .{ .unsupported = .alter_operator_class };
+        if (second.matchesKeywordTag(.operator) and tokens.len > 2 and tokens[2].matchesKeyword("family")) return .{ .unsupported = .alter_operator_family };
         if (second.matchesKeywordTag(.policy)) return .{ .ddl = .alter_policy };
         if (second.matchesKeywordTag(.publication)) return .{ .ddl = .alter_publication };
         if (second.matchesKeywordTag(.rule)) return .{ .unsupported = .alter_rule };
@@ -2211,7 +2268,13 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.subscription)) return .{ .ddl = .alter_subscription };
         if (second.matchesKeywordTag(.system)) return .{ .unsupported = .alter_system };
         if (second.matchesKeyword("statistics")) return .{ .unsupported = .alter_statistics };
-        if (second.matchesKeywordTag(.text) and tokens.len > 3 and tokens[2].matchesKeyword("search") and tokens[3].matchesKeyword("configuration")) return .{ .unsupported = .alter_text_search_configuration };
+        if (second.matchesKeywordTag(.text) and tokens.len > 3 and tokens[2].matchesKeyword("search")) {
+            const text_search_kind = tokens[3];
+            if (text_search_kind.matchesKeyword("configuration")) return .{ .unsupported = .alter_text_search_configuration };
+            if (text_search_kind.matchesKeyword("dictionary")) return .{ .unsupported = .alter_text_search_dictionary };
+            if (text_search_kind.matchesKeyword("parser")) return .{ .unsupported = .alter_text_search_parser };
+            if (text_search_kind.matchesKeyword("template")) return .{ .unsupported = .alter_text_search_template };
+        }
         if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .alter_trigger };
         if (second.matchesKeyword("user") and tokens.len > 2 and tokens[2].matchesKeyword("mapping")) return .{ .unsupported = .alter_user_mapping };
         if (second.matchesKeywordTag(.role)) return .{ .ddl = .alter_role };
@@ -2244,13 +2307,23 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.rule)) return .{ .unsupported = .drop_rule };
         if (second.matchesKeywordTag(.role)) return .{ .ddl = .drop_role };
         if (second.matchesKeywordTag(.collation)) return .{ .ddl = .drop_collation };
-        if (second.matchesKeywordTag(.operator)) return .{ .ddl = .drop_operator };
+        if (second.matchesKeywordTag(.operator)) {
+            if (tokens.len > 2 and tokens[2].matchesKeyword("class")) return .{ .unsupported = .drop_operator_class };
+            if (tokens.len > 2 and tokens[2].matchesKeyword("family")) return .{ .unsupported = .drop_operator_family };
+            return .{ .ddl = .drop_operator };
+        }
         if (second.matchesKeywordTag(.owned)) return .{ .unsupported = .drop_owned };
         if (second.matchesKeywordTag(.aggregate)) return .{ .ddl = .drop_aggregate };
         if (second.matchesKeywordTag(.cast)) return .{ .ddl = .drop_cast };
         if (second.matchesKeywordTag(.server)) return .{ .unsupported = .drop_server };
         if (second.matchesKeyword("statistics")) return .{ .unsupported = .drop_statistics };
-        if (second.matchesKeywordTag(.text) and tokens.len > 3 and tokens[2].matchesKeyword("search") and tokens[3].matchesKeyword("configuration")) return .{ .unsupported = .drop_text_search_configuration };
+        if (second.matchesKeywordTag(.text) and tokens.len > 3 and tokens[2].matchesKeyword("search")) {
+            const text_search_kind = tokens[3];
+            if (text_search_kind.matchesKeyword("configuration")) return .{ .unsupported = .drop_text_search_configuration };
+            if (text_search_kind.matchesKeyword("dictionary")) return .{ .unsupported = .drop_text_search_dictionary };
+            if (text_search_kind.matchesKeyword("parser")) return .{ .unsupported = .drop_text_search_parser };
+            if (text_search_kind.matchesKeyword("template")) return .{ .unsupported = .drop_text_search_template };
+        }
         if (second.matchesKeyword("transform")) return .{ .unsupported = .drop_transform };
         if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .drop_trigger };
         if (second.matchesKeyword("user") and tokens.len > 2 and tokens[2].matchesKeyword("mapping")) return .{ .unsupported = .drop_user_mapping };
@@ -2429,6 +2502,8 @@ fn buildUnsupportedAst(
             .alter_foreign_table => .alter_foreign_table_not_planned_by_generated_parser,
             .alter_foreign_data_wrapper => .alter_foreign_data_wrapper_not_planned_by_generated_parser,
             .alter_materialized_view => .alter_materialized_view_not_planned_by_generated_parser,
+            .alter_operator_class => .alter_operator_class_not_planned_by_generated_parser,
+            .alter_operator_family => .alter_operator_family_not_planned_by_generated_parser,
             .alter_policy => .alter_policy_not_planned_by_generated_parser,
             .alter_publication => .alter_publication_not_planned_by_generated_parser,
             .alter_rule => .alter_rule_not_planned_by_generated_parser,
@@ -2437,6 +2512,9 @@ fn buildUnsupportedAst(
             .alter_system => .alter_system_not_planned_by_generated_parser,
             .alter_statistics => .alter_statistics_not_planned_by_generated_parser,
             .alter_text_search_configuration => .alter_text_search_configuration_not_planned_by_generated_parser,
+            .alter_text_search_dictionary => .alter_text_search_dictionary_not_planned_by_generated_parser,
+            .alter_text_search_parser => .alter_text_search_parser_not_planned_by_generated_parser,
+            .alter_text_search_template => .alter_text_search_template_not_planned_by_generated_parser,
             .alter_trigger => .alter_trigger_not_planned_by_generated_parser,
             .alter_user_mapping => .alter_user_mapping_not_planned_by_generated_parser,
             .create_access_method => .create_access_method_not_planned_by_generated_parser,
@@ -2446,6 +2524,8 @@ fn buildUnsupportedAst(
             .create_foreign_data_wrapper => .create_foreign_data_wrapper_not_planned_by_generated_parser,
             .create_language => .create_language_not_planned_by_generated_parser,
             .create_materialized_view => .create_materialized_view_not_planned_by_generated_parser,
+            .create_operator_class => .create_operator_class_not_planned_by_generated_parser,
+            .create_operator_family => .create_operator_family_not_planned_by_generated_parser,
             .create_policy => .create_policy_not_planned_by_generated_parser,
             .create_publication => .create_publication_not_planned_by_generated_parser,
             .create_rule => .create_rule_not_planned_by_generated_parser,
@@ -2453,6 +2533,9 @@ fn buildUnsupportedAst(
             .create_subscription => .create_subscription_not_planned_by_generated_parser,
             .create_statistics => .create_statistics_not_planned_by_generated_parser,
             .create_text_search_configuration => .create_text_search_configuration_not_planned_by_generated_parser,
+            .create_text_search_dictionary => .create_text_search_dictionary_not_planned_by_generated_parser,
+            .create_text_search_parser => .create_text_search_parser_not_planned_by_generated_parser,
+            .create_text_search_template => .create_text_search_template_not_planned_by_generated_parser,
             .create_transform => .create_transform_not_planned_by_generated_parser,
             .create_trigger => .create_trigger_not_planned_by_generated_parser,
             .create_user_mapping => .create_user_mapping_not_planned_by_generated_parser,
@@ -2465,8 +2548,13 @@ fn buildUnsupportedAst(
             .drop_event_trigger => .drop_event_trigger_not_planned_by_generated_parser,
             .drop_language => .drop_language_not_planned_by_generated_parser,
             .drop_owned => .drop_owned_not_planned_by_generated_parser,
+            .drop_operator_class => .drop_operator_class_not_planned_by_generated_parser,
+            .drop_operator_family => .drop_operator_family_not_planned_by_generated_parser,
             .drop_statistics => .drop_statistics_not_planned_by_generated_parser,
             .drop_text_search_configuration => .drop_text_search_configuration_not_planned_by_generated_parser,
+            .drop_text_search_dictionary => .drop_text_search_dictionary_not_planned_by_generated_parser,
+            .drop_text_search_parser => .drop_text_search_parser_not_planned_by_generated_parser,
+            .drop_text_search_template => .drop_text_search_template_not_planned_by_generated_parser,
             .drop_transform => .drop_transform_not_planned_by_generated_parser,
             .drop_user_mapping => .drop_user_mapping_not_planned_by_generated_parser,
             .explain => .explain_not_planned_by_generated_parser,
@@ -3321,16 +3409,23 @@ fn buildReadAst(
     statement_span: token_mod.SourceSpan,
     command_span: token_mod.SourceSpan,
 ) !GeneratedSqlReadAst {
-    var ast = GeneratedSqlReadAst{
+    const ast = try alloc.create(GeneratedSqlReadAst);
+    defer alloc.destroy(ast);
+    ast.* = .{
         .kind = kind,
         .statement_span = statement_span,
         .command_span = command_span,
     };
-    errdefer ast.deinit(alloc);
-    const select_index = findTopLevelKeyword(tokens, 0, end, .select) orelse return ast;
+    var ast_moved = false;
+    errdefer if (!ast_moved) ast.deinit(alloc);
+    const select_index = findTopLevelKeyword(tokens, 0, end, .select) orelse {
+        const result = ast.*;
+        ast_moved = true;
+        return result;
+    };
     if (select_index > 0 and tokens[0].matchesKeywordTag(.with)) {
         ast.cte_tokens = .{ .start = 1, .end = select_index };
-        try buildReadCteAst(alloc, tokens, select_index, &ast);
+        try buildReadCteAst(alloc, tokens, select_index, ast);
     }
 
     const body_end = firstTopLevelSetOperation(tokens, select_index + 1, end) orelse end;
@@ -3341,7 +3436,7 @@ fn buildReadAst(
         ast.set_operation = try buildGeneratedSetOperationAst(alloc, tokens, set_operation_tokens);
     }
 
-    const projection_start = generatedReadProjectionStart(tokens, select_index, body_end, &ast);
+    const projection_start = generatedReadProjectionStart(tokens, select_index, body_end, ast);
     if (generatedDistinctOnExpressionTokens(tokens, ast.distinct_tokens)) |distinct_on_tokens| {
         ast.distinct_on_items = try buildTopLevelListAst(alloc, tokens, distinct_on_tokens, .{});
     }
@@ -3373,8 +3468,8 @@ fn buildReadAst(
         if (idx + 1 < source_end) {
             const source_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = source_end };
             ast.source_tokens = source_tokens;
-            try buildGeneratedReadGraphSourceAst(alloc, tokens, source_tokens, &ast);
-            try buildReadJoinAst(alloc, tokens, source_tokens, &ast);
+            try buildGeneratedReadGraphSourceAst(alloc, tokens, source_tokens, ast);
+            try buildReadJoinAst(alloc, tokens, source_tokens, ast);
         }
     }
     if (where_index) |idx| {
@@ -3465,10 +3560,12 @@ fn buildReadAst(
         }
     }
     if (ast.set_operation_tokens) |set_operation_tokens| {
-        try buildGeneratedReadResultTailAst(alloc, tokens, set_operation_tokens.end, end, &ast);
+        try buildGeneratedReadResultTailAst(alloc, tokens, set_operation_tokens.end, end, ast);
     }
 
-    return ast;
+    const result = ast.*;
+    ast_moved = true;
+    return result;
 }
 
 fn generatedSetOperationResultTailStart(
@@ -3766,7 +3863,9 @@ fn buildReadCteAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, fi
         if (index + 2 >= final_select_index) return;
 
         const name_tokens = GeneratedSqlTokenRange{ .start = index, .end = index + 1 };
-        var cte = GeneratedSqlCteAst{ .name_tokens = name_tokens };
+        const cte = try alloc.create(GeneratedSqlCteAst);
+        defer alloc.destroy(cte);
+        cte.* = .{ .name_tokens = name_tokens };
         var cte_owned = false;
         errdefer if (!cte_owned) cte.deinit(alloc);
 
@@ -3805,9 +3904,9 @@ fn buildReadCteAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, fi
             .{ .start = cursor + 1, .end = close }
         else
             null;
-        if (cte.body_tokens) |body_tokens| try buildReadCteBodyMetadata(alloc, tokens, body_tokens, &cte);
+        if (cte.body_tokens) |body_tokens| try buildReadCteBodyMetadata(alloc, tokens, body_tokens, cte);
 
-        try items.append(alloc, cte);
+        try items.append(alloc, cte.*);
         cte_owned = true;
         count += 1;
         if (count == 1) {
@@ -3837,7 +3936,7 @@ fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.
     if (body_end < body_tokens.end) {
         const set_operation_tokens = GeneratedSqlTokenRange{ .start = body_end, .end = body_tokens.end };
         cte.body_set_operation_tokens = set_operation_tokens;
-        cte.body_set_operation = try buildGeneratedSetOperationAst(alloc, tokens, set_operation_tokens);
+        try buildGeneratedSetOperationAstInto(alloc, tokens, set_operation_tokens, &cte.body_set_operation);
     }
 
     const projection_start = generatedReadProjectionStartInRange(tokens, select_index, body_end, &cte.body_distinct_tokens);
@@ -3860,10 +3959,10 @@ fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.
         cte.body_projection_tokens = projection_tokens;
         cte.body_projection_items = try buildTopLevelListAst(alloc, tokens, projection_tokens, .{ .bare_alias = true });
         if (generatedListExpressionTokens(cte.body_projection_items, 0)) |first_tokens| {
-            cte.body_projection_first_expression = try buildGeneratedExpressionAst(alloc, tokens, first_tokens);
+            try buildGeneratedExpressionAstInto(alloc, tokens, first_tokens, &cte.body_projection_first_expression);
         }
         if (generatedListExpressionTokens(cte.body_projection_items, cte.body_projection_items.count -| 1)) |last_tokens| {
-            cte.body_projection_last_expression = try buildGeneratedExpressionAst(alloc, tokens, last_tokens);
+            try buildGeneratedExpressionAstInto(alloc, tokens, last_tokens, &cte.body_projection_last_expression);
         }
     }
     if (from_index) |idx| {
@@ -3884,7 +3983,7 @@ fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.
                 cte.body_join_right_tokens = first.right_tokens;
                 cte.body_join_predicate_tokens = first.predicate_tokens;
                 if (first.predicate_tokens) |predicate_tokens| {
-                    cte.body_join_predicate_expression = try buildGeneratedExpressionAst(alloc, tokens, predicate_tokens);
+                    try buildGeneratedExpressionAstInto(alloc, tokens, predicate_tokens, &cte.body_join_predicate_expression);
                 }
             }
         }
@@ -3894,7 +3993,7 @@ fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.
         if (idx + 1 < where_end) {
             const where_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = where_end };
             cte.body_where_tokens = where_tokens;
-            cte.body_where_expression = try buildGeneratedExpressionAst(alloc, tokens, where_tokens);
+            try buildGeneratedExpressionAstInto(alloc, tokens, where_tokens, &cte.body_where_expression);
         }
     }
     if (group_index) |idx| {
@@ -3905,10 +4004,10 @@ fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.
             cte.body_group_tokens = group_tokens;
             cte.body_group_items = try buildTopLevelListAst(alloc, tokens, group_tokens, .{});
             if (generatedListExpressionTokens(cte.body_group_items, 0)) |first_tokens| {
-                cte.body_group_first_expression = try buildGeneratedExpressionAst(alloc, tokens, first_tokens);
+                try buildGeneratedExpressionAstInto(alloc, tokens, first_tokens, &cte.body_group_first_expression);
             }
             if (generatedListExpressionTokens(cte.body_group_items, cte.body_group_items.count -| 1)) |last_tokens| {
-                cte.body_group_last_expression = try buildGeneratedExpressionAst(alloc, tokens, last_tokens);
+                try buildGeneratedExpressionAstInto(alloc, tokens, last_tokens, &cte.body_group_last_expression);
             }
         }
     }
@@ -3917,7 +4016,7 @@ fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.
         if (idx + 1 < having_end) {
             const having_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = having_end };
             cte.body_having_tokens = having_tokens;
-            cte.body_having_expression = try buildGeneratedExpressionAst(alloc, tokens, having_tokens);
+            try buildGeneratedExpressionAstInto(alloc, tokens, having_tokens, &cte.body_having_expression);
         }
     }
     if (window_index) |idx| {
@@ -3937,10 +4036,10 @@ fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.
             cte.body_order_tokens = order_tokens;
             cte.body_order_items = try buildTopLevelListAst(alloc, tokens, order_tokens, .{ .order_modifiers = true });
             if (generatedListExpressionTokens(cte.body_order_items, 0)) |first_tokens| {
-                cte.body_order_first_expression = try buildGeneratedExpressionAst(alloc, tokens, first_tokens);
+                try buildGeneratedExpressionAstInto(alloc, tokens, first_tokens, &cte.body_order_first_expression);
             }
             if (generatedListExpressionTokens(cte.body_order_items, cte.body_order_items.count -| 1)) |last_tokens| {
-                cte.body_order_last_expression = try buildGeneratedExpressionAst(alloc, tokens, last_tokens);
+                try buildGeneratedExpressionAstInto(alloc, tokens, last_tokens, &cte.body_order_last_expression);
             }
         }
     }
@@ -3952,7 +4051,7 @@ fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.
             if (limit_tokens.end == limit_tokens.start + 1 and tokens[limit_tokens.start].matchesKeywordTag(.all)) {
                 cte.body_limit_all = true;
             } else {
-                cte.body_limit_expression = try buildGeneratedExpressionAst(alloc, tokens, limit_tokens);
+                try buildGeneratedExpressionAstInto(alloc, tokens, limit_tokens, &cte.body_limit_expression);
             }
         }
     }
@@ -3962,7 +4061,7 @@ fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.
             const offset_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = offset_end };
             cte.body_offset_tokens = offset_tokens;
             if (generatedOffsetExpressionTokens(tokens, offset_tokens)) |expression_tokens| {
-                cte.body_offset_expression = try buildGeneratedExpressionAst(alloc, tokens, expression_tokens);
+                try buildGeneratedExpressionAstInto(alloc, tokens, expression_tokens, &cte.body_offset_expression);
             }
         }
     }
@@ -3972,10 +4071,30 @@ fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.
             cte.body_fetch_tokens = fetch_tokens;
             if (generatedFetchCountTokens(tokens, fetch_tokens)) |count_tokens| {
                 cte.body_fetch_count_tokens = count_tokens;
-                cte.body_fetch_count_expression = try buildGeneratedExpressionAst(alloc, tokens, count_tokens);
+                try buildGeneratedExpressionAstInto(alloc, tokens, count_tokens, &cte.body_fetch_count_expression);
             }
         }
     }
+}
+
+fn buildGeneratedExpressionAstInto(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    range: GeneratedSqlTokenRange,
+    out: *GeneratedSqlExpressionAst,
+) !void {
+    out.* = .{};
+    try buildGeneratedExpressionAstInPlace(alloc, tokens, range, out);
+}
+
+fn buildGeneratedSetOperationAstInto(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    range: GeneratedSqlTokenRange,
+    out: *GeneratedSqlSetOperationAst,
+) !void {
+    out.* = .{};
+    try buildGeneratedSetOperationAstInPlace(alloc, tokens, range, out);
 }
 
 fn buildGeneratedWindowAstList(
@@ -4526,7 +4645,7 @@ fn buildReadJoinAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, s
     ast.join_right_tokens = first.right_tokens;
     ast.join_predicate_tokens = first.predicate_tokens;
     if (first.predicate_tokens) |predicate_tokens| {
-        ast.join_predicate_expression = try buildGeneratedExpressionAst(alloc, tokens, predicate_tokens);
+        try buildGeneratedExpressionAstInto(alloc, tokens, predicate_tokens, &ast.join_predicate_expression);
     }
 }
 
@@ -4571,7 +4690,7 @@ fn buildGeneratedJoinItemsAst(
         switch (condition.kind) {
             .on => {
                 item.predicate_tokens = condition.body_tokens;
-                item.predicate_expression = try buildGeneratedExpressionAst(alloc, tokens, condition.body_tokens);
+                try buildGeneratedExpressionAstInto(alloc, tokens, condition.body_tokens, &item.predicate_expression);
             },
             .using => {
                 item.using_tokens = condition.tokens;
@@ -6447,6 +6566,12 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_collation }, (try parseSqlAlloc(alloc, "DROP COLLATION IF EXISTS ci_text")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_operator }, (try parseSqlAlloc(alloc, "CREATE OPERATOR === (FUNCTION = text_eq, LEFTARG = text, RIGHTARG = text)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_operator }, (try parseSqlAlloc(alloc, "DROP OPERATOR === (text, text)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_operator_class }, (try parseSqlAlloc(alloc, "ALTER OPERATOR CLASS usage_ops USING btree RENAME TO usage_ops_v2")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_operator_family }, (try parseSqlAlloc(alloc, "ALTER OPERATOR FAMILY usage_family USING btree RENAME TO usage_family_v2")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_operator_class }, (try parseSqlAlloc(alloc, "CREATE OPERATOR CLASS usage_ops DEFAULT FOR TYPE text USING btree AS OPERATOR 1 < (text, text)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_operator_family }, (try parseSqlAlloc(alloc, "CREATE OPERATOR FAMILY usage_family USING btree")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_operator_class }, (try parseSqlAlloc(alloc, "DROP OPERATOR CLASS IF EXISTS usage_ops USING btree")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_operator_family }, (try parseSqlAlloc(alloc, "DROP OPERATOR FAMILY IF EXISTS usage_family USING btree")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_aggregate }, (try parseSqlAlloc(alloc, "CREATE AGGREGATE first_value_text(text) (SFUNC = first_sfunc, STYPE = text)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_aggregate }, (try parseSqlAlloc(alloc, "DROP AGGREGATE first_value_text(text)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_cast }, (try parseSqlAlloc(alloc, "CREATE CAST (jsonb AS text) WITH FUNCTION jsonb_to_text(jsonb) AS ASSIGNMENT")).statement);
@@ -6521,6 +6646,9 @@ test "generated SQL parser facade exposes typed read and unsupported statement n
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_statistics }, (try parseSqlAlloc(alloc, "ALTER STATISTICS usage_stats SET STATISTICS 100")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_system }, (try parseSqlAlloc(alloc, "ALTER SYSTEM SET work_mem = '64MB'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_text_search_configuration }, (try parseSqlAlloc(alloc, "ALTER TEXT SEARCH CONFIGURATION usage_search RENAME TO usage_search_v2")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_text_search_dictionary }, (try parseSqlAlloc(alloc, "ALTER TEXT SEARCH DICTIONARY usage_dict OWNER TO app_role")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_text_search_parser }, (try parseSqlAlloc(alloc, "ALTER TEXT SEARCH PARSER usage_parser RENAME TO usage_parser_v2")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_text_search_template }, (try parseSqlAlloc(alloc, "ALTER TEXT SEARCH TEMPLATE usage_template RENAME TO usage_template_v2")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_trigger }, (try parseSqlAlloc(alloc, "ALTER TRIGGER usage_audit ON usage_records RENAME TO usage_audit_v2")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .call }, (try parseSqlAlloc(alloc, "CALL refresh_usage_records()")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .checkpoint }, (try parseSqlAlloc(alloc, "CHECKPOINT")).statement);
@@ -6548,7 +6676,13 @@ test "generated SQL parser facade exposes typed read and unsupported statement n
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .notify }, (try parseSqlAlloc(alloc, "NOTIFY usage_events, 'changed'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_statistics }, (try parseSqlAlloc(alloc, "CREATE STATISTICS usage_stats ON tenant_id, status FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_text_search_configuration }, (try parseSqlAlloc(alloc, "CREATE TEXT SEARCH CONFIGURATION usage_search (COPY = pg_catalog.english)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_text_search_dictionary }, (try parseSqlAlloc(alloc, "CREATE TEXT SEARCH DICTIONARY usage_dict (TEMPLATE = simple)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_text_search_parser }, (try parseSqlAlloc(alloc, "CREATE TEXT SEARCH PARSER usage_parser (START = prsd_start)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_text_search_template }, (try parseSqlAlloc(alloc, "CREATE TEXT SEARCH TEMPLATE usage_template (LEXIZE = dsimple_lexize)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_transform }, (try parseSqlAlloc(alloc, "CREATE TRANSFORM FOR jsonb LANGUAGE plpgsql FROM SQL WITH FUNCTION jsonb_to_plpgsql(internal)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_text_search_dictionary }, (try parseSqlAlloc(alloc, "DROP TEXT SEARCH DICTIONARY IF EXISTS usage_dict")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_text_search_parser }, (try parseSqlAlloc(alloc, "DROP TEXT SEARCH PARSER IF EXISTS usage_parser")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_text_search_template }, (try parseSqlAlloc(alloc, "DROP TEXT SEARCH TEMPLATE IF EXISTS usage_template")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_transform }, (try parseSqlAlloc(alloc, "DROP TRANSFORM FOR jsonb LANGUAGE plpgsql")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .vacuum }, (try parseSqlAlloc(alloc, "VACUUM FULL usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .reindex }, (try parseSqlAlloc(alloc, "REINDEX INDEX usage_records_status_idx")).statement);
@@ -10101,6 +10235,18 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 7 },
         },
         .{
+            .sql = "ALTER OPERATOR CLASS usage_ops USING btree RENAME TO usage_ops_v2",
+            .kind = .alter_operator_class,
+            .reason = .alter_operator_class_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 9 },
+        },
+        .{
+            .sql = "ALTER OPERATOR FAMILY usage_family USING btree RENAME TO usage_family_v2",
+            .kind = .alter_operator_family,
+            .reason = .alter_operator_family_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 9 },
+        },
+        .{
             .sql = "ALTER RULE usage_insert ON usage_records RENAME TO usage_insert_v2",
             .kind = .alter_rule,
             .reason = .alter_rule_not_planned_by_generated_parser,
@@ -10128,6 +10274,24 @@ test "generated SQL parser facade builds extended read AST spans" {
             .sql = "ALTER TEXT SEARCH CONFIGURATION usage_search RENAME TO usage_search_v2",
             .kind = .alter_text_search_configuration,
             .reason = .alter_text_search_configuration_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 8 },
+        },
+        .{
+            .sql = "ALTER TEXT SEARCH DICTIONARY usage_dict OWNER TO app_role",
+            .kind = .alter_text_search_dictionary,
+            .reason = .alter_text_search_dictionary_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 8 },
+        },
+        .{
+            .sql = "ALTER TEXT SEARCH PARSER usage_parser RENAME TO usage_parser_v2",
+            .kind = .alter_text_search_parser,
+            .reason = .alter_text_search_parser_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 8 },
+        },
+        .{
+            .sql = "ALTER TEXT SEARCH TEMPLATE usage_template RENAME TO usage_template_v2",
+            .kind = .alter_text_search_template,
+            .reason = .alter_text_search_template_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 8 },
         },
         .{
@@ -10197,6 +10361,18 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 3 },
         },
         .{
+            .sql = "CREATE OPERATOR CLASS usage_ops DEFAULT FOR TYPE text USING btree AS OPERATOR 1 < (text, text)",
+            .kind = .create_operator_class,
+            .reason = .create_operator_class_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 19 },
+        },
+        .{
+            .sql = "CREATE OPERATOR FAMILY usage_family USING btree",
+            .kind = .create_operator_family,
+            .reason = .create_operator_family_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 6 },
+        },
+        .{
             .sql = "CREATE RULE usage_insert AS ON INSERT TO usage_records DO ALSO NOTIFY usage_events",
             .kind = .create_rule,
             .reason = .create_rule_not_planned_by_generated_parser,
@@ -10218,6 +10394,24 @@ test "generated SQL parser facade builds extended read AST spans" {
             .sql = "CREATE TEXT SEARCH CONFIGURATION usage_search (COPY = pg_catalog.english)",
             .kind = .create_text_search_configuration,
             .reason = .create_text_search_configuration_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 10 },
+        },
+        .{
+            .sql = "CREATE TEXT SEARCH DICTIONARY usage_dict (TEMPLATE = simple)",
+            .kind = .create_text_search_dictionary,
+            .reason = .create_text_search_dictionary_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 10 },
+        },
+        .{
+            .sql = "CREATE TEXT SEARCH PARSER usage_parser (START = prsd_start)",
+            .kind = .create_text_search_parser,
+            .reason = .create_text_search_parser_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 10 },
+        },
+        .{
+            .sql = "CREATE TEXT SEARCH TEMPLATE usage_template (LEXIZE = dsimple_lexize)",
+            .kind = .create_text_search_template,
+            .reason = .create_text_search_template_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 10 },
         },
         .{
@@ -10293,6 +10487,18 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 5 },
         },
         .{
+            .sql = "DROP OPERATOR CLASS IF EXISTS usage_ops USING btree",
+            .kind = .drop_operator_class,
+            .reason = .drop_operator_class_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 8 },
+        },
+        .{
+            .sql = "DROP OPERATOR FAMILY IF EXISTS usage_family USING btree",
+            .kind = .drop_operator_family,
+            .reason = .drop_operator_family_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 8 },
+        },
+        .{
             .sql = "DROP STATISTICS IF EXISTS usage_stats",
             .kind = .drop_statistics,
             .reason = .drop_statistics_not_planned_by_generated_parser,
@@ -10302,6 +10508,24 @@ test "generated SQL parser facade builds extended read AST spans" {
             .sql = "DROP TEXT SEARCH CONFIGURATION IF EXISTS usage_search",
             .kind = .drop_text_search_configuration,
             .reason = .drop_text_search_configuration_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 7 },
+        },
+        .{
+            .sql = "DROP TEXT SEARCH DICTIONARY IF EXISTS usage_dict",
+            .kind = .drop_text_search_dictionary,
+            .reason = .drop_text_search_dictionary_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 7 },
+        },
+        .{
+            .sql = "DROP TEXT SEARCH PARSER IF EXISTS usage_parser",
+            .kind = .drop_text_search_parser,
+            .reason = .drop_text_search_parser_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 7 },
+        },
+        .{
+            .sql = "DROP TEXT SEARCH TEMPLATE IF EXISTS usage_template",
+            .kind = .drop_text_search_template,
+            .reason = .drop_text_search_template_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 7 },
         },
         .{

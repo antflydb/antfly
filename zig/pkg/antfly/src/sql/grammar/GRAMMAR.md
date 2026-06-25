@@ -381,8 +381,9 @@ such as `ALTER INDEX`, `ALTER SYSTEM`, `CREATE/DROP ACCESS METHOD`,
 `CHECKPOINT`, `LOAD`, `REFRESH`, `SECURITY LABEL`, and `UNLISTEN`, plus
 simple cursor and transaction-control statements such as `CLOSE`, `DECLARE`,
 `FETCH`, `MOVE`, `SAVEPOINT`, and `RELEASE`, plus common PostgreSQL extension
-catalog families for conversions, event triggers, extended statistics, and
-text-search configurations, plus simple `EXPLAIN` forms with stable reason metadata. Generated
+catalog families for conversions, event triggers, extended statistics, operator
+class/family objects, and text-search configuration/dictionary/parser/template
+objects, plus simple `EXPLAIN` forms with stable reason metadata. Generated
 unsupported AST heads that Antfly already plans through typed catalog/control
 planners now route to the parsed DDL family explicitly; generated `EXPLAIN`
 routes to the parsed explain family explicitly; and unsupported heads without
@@ -395,7 +396,8 @@ entry points that Antfly does not type yet, including
 trigger and rewrite-rule DDL, including `ALTER TRIGGER` and `ALTER RULE`;
 foreign-server DDL; access-method DDL; ownership maintenance statements; and
 `ALTER INDEX`/`ALTER SYSTEM`. PostgreSQL conversion, event-trigger, extended
-statistics, and text-search configuration DDL now share the same generated
+statistics, operator class/family, and text-search
+configuration/dictionary/parser/template DDL now share the same generated
 unsupported AST and reason coverage. These common unsupported
 PostgreSQL dump/admin shapes now have stable unsupported AST reasons instead of
 generic parser fallback. Legacy-supported materialized-view catalog operations
@@ -421,9 +423,12 @@ kind, span, role name, operation tail, or `IF EXISTS` metadata is corrupted
 before delegating to the typed authorization catalog planner. Legacy-supported
 type-system catalog operations use validated generated DDL AST nodes for
 `CREATE/ALTER/DROP COLLATION`, `CREATE/DROP OPERATOR`,
-`CREATE/DROP AGGREGATE`, and `CREATE/DROP CAST`, and fail closed if generated
-kind, span, object name, signature tail, or `IF EXISTS` metadata is corrupted
-before delegating to the typed type-system catalog planner. Notification channel
+`CREATE/DROP AGGREGATE`, and `CREATE/DROP CAST`, while
+`CREATE/ALTER/DROP OPERATOR CLASS/FAMILY` remain explicit unsupported
+generated AST nodes with stable reasons. Supported type-system DDL fails
+closed if generated kind, span, object name, signature tail, or `IF EXISTS`
+metadata is corrupted before delegating to the typed type-system catalog
+planner. Notification channel
 commands also use the validated unsupported boundary for `LISTEN`, `NOTIFY`,
 and `UNLISTEN` before delegating to typed notification catalog planning.
 Authorization and utility commands use it for `GRANT`, `REVOKE`, `COMMENT`,
@@ -1087,7 +1092,8 @@ Generated grammar work needs evidence at multiple levels:
   transaction-control commands `SAVEPOINT`/`RELEASE`, PostgreSQL foreign-data
   declarations for foreign data wrappers, foreign tables, servers, and user
   mappings, plus language, rule, trigger, conversion, event-trigger, extended
-  statistics, and text-search configuration DDL, and bare, simple, optioned,
+  statistics, operator class/family, and text-search
+  configuration/dictionary/parser/template DDL, and bare, simple, optioned,
   and `EXPLAIN ANALYZE` forms now produce generated unsupported AST nodes with
   stable reason metadata and subject ranges where available.
 - AST shape tests for source spans, identifier normalization, literals,
