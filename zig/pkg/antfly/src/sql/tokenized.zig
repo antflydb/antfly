@@ -456,6 +456,7 @@ fn isIncompleteGeneratedReadBoundary(tokens: []const Token, raw_statement: RawSq
     {
         return true;
     }
+    if (isIncompleteGeneratedReadRowLockTail(tokens, start, end)) return true;
     if (tokenMatchesKeyword(last, .all) and end > start + 1 and tokenMatchesKeyword(tokens[end - 2], .@"union")) return true;
     if (tokenMatchesKeyword(last, .select) or
         tokenMatchesKeyword(last, .from) or
@@ -504,6 +505,73 @@ fn isIncompleteGeneratedReadBoundary(tokens: []const Token, raw_statement: RawSq
             tokenMatchesKeyword(last, .recursive) or
             tokenMatchesKeyword(last, .materialized) or
             tokenMatchesKeyword(last, .not);
+    }
+    return false;
+}
+
+fn isIncompleteGeneratedReadRowLockTail(tokens: []const Token, start: usize, end: usize) bool {
+    if (start >= end or end > tokens.len) return false;
+    const lock_start = generatedReadRowLockStart(tokens, start, end) orelse return false;
+    const lock_len = end - lock_start;
+    if (lock_len == 1) return true;
+    const last = tokens[end - 1];
+    if (tokenMatchesKeyword(last, .of)) {
+        return generatedReadLockModeEndsBefore(tokens, lock_start + 1, end - 1);
+    }
+    if (tokenMatchesText(last, "skip")) {
+        return generatedReadLockModeEndsBefore(tokens, lock_start + 1, end - 1);
+    }
+    if (lock_len == 2 and
+        (tokenMatchesKeyword(last, .no) or tokenMatchesKeyword(last, .key)))
+    {
+        return true;
+    }
+    if (lock_len == 3 and
+        tokenMatchesKeyword(tokens[lock_start + 1], .no) and
+        tokenMatchesKeyword(last, .key))
+    {
+        return true;
+    }
+    return false;
+}
+
+fn generatedReadRowLockStart(tokens: []const Token, start: usize, end: usize) ?usize {
+    var depth: usize = 0;
+    var index = start;
+    var candidate: ?usize = null;
+    while (index < end and index < tokens.len) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth > 0) depth -= 1;
+            },
+            else => {},
+        }
+        if (depth != 0 or !tokenMatchesKeyword(tokens[index], .@"for")) continue;
+        if (generatedReadHasCompleteSourceBefore(tokens, start, index)) candidate = index;
+    }
+    return candidate;
+}
+
+fn generatedReadLockModeEndsBefore(tokens: []const Token, start: usize, end: usize) bool {
+    if (start >= end or end > tokens.len) return false;
+    const len = end - start;
+    if (len == 1) {
+        return tokenMatchesKeyword(tokens[start], .update) or
+            tokenMatchesKeyword(tokens[start], .share);
+    }
+    if (len == 2 and
+        tokenMatchesKeyword(tokens[start], .key) and
+        tokenMatchesKeyword(tokens[start + 1], .share))
+    {
+        return true;
+    }
+    if (len == 3 and
+        tokenMatchesKeyword(tokens[start], .no) and
+        tokenMatchesKeyword(tokens[start + 1], .key) and
+        tokenMatchesKeyword(tokens[start + 2], .update))
+    {
+        return true;
     }
     return false;
 }
@@ -1209,6 +1277,14 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records INTERSECT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records EXCEPT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT row_number() OVER usage_window FROM usage_records WINDOW"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records FOR"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records FOR UPDATE OF"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records FOR SHARE OF"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records FOR NO"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records FOR NO KEY"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records FOR KEY"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records FOR KEY SHARE OF"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records FOR UPDATE SKIP"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "WITH"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "WITH RECURSIVE"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "WITH source_rows AS"));
