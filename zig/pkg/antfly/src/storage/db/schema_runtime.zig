@@ -14,6 +14,7 @@
 
 const std = @import("std");
 
+const algebraic_ir = @import("algebraic/ir.zig");
 const db_internal = @import("internal.zig");
 const derived_types = @import("derived/derived_types.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
@@ -2751,6 +2752,229 @@ test "db staged algebraic pending waits for first durable schema" {
         defer alloc.free(local_schema_json);
         try std.testing.expectEqualStrings(schema_v2, local_schema_json);
     }
+}
+
+test "db schema runtime algebraic adaptive stats report engine-owned observation status" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "schema_version": 42,
+        \\  "capability_fingerprint": "cap:v1",
+        \\  "capability_lifecycle_status": "stale",
+        \\  "capability_change_added_fields": 1,
+        \\  "capability_change_removed_fields": 2,
+        \\  "capability_change_changed_type_fields": 3,
+        \\  "skipped_dynamic_fields": 4,
+        \\  "skipped_complex_fields": 5,
+        \\  "skipped_unbounded_fields": 6,
+        \\  "group_fields": [{"name":"customer","path":"customer","type":"string"},{"name":"tenant","path":"tenant","type":"string"}],
+        \\  "measure_fields": [{"name":"amount","path":"amount","type":"number"}],
+        \\  "adaptive": {"observe": true, "lazy_materialization": true, "min_observations": 1, "min_estimated_scan_rows_saved": 1},
+        \\  "materializations": []
+        \\}
+    ;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "alg",
+            .kind = .algebraic,
+            .config_json = cfg,
+        });
+
+        const entry = db.core.index_manager.algebraicIndex("alg").?;
+        const constraints = [_]algebraic_ir.Constraint{.{ .field = "tenant", .value = "t1" }};
+        entry.index.recordObservedQueryShapeWithStore(db.core.store, .{
+            .kind = .terms,
+            .aggregation_name = "amount_by_customer",
+            .bucket_field = "customer",
+            .constraints = constraints[0..],
+            .metric = .{ .name = "amount", .op = .sum, .field = "amount" },
+        }, "no_materialization");
+
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(usize, 1), stats.indexes.len);
+        try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].algebraic_observed_query_shape_count);
+        try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].algebraic_recommendation_count);
+        try std.testing.expect(stats.indexes[0].algebraic_last_observed_query_shape != null);
+        try std.testing.expect(stats.indexes[0].algebraic_last_recommended_materialization != null);
+        try std.testing.expect(std.mem.indexOf(u8, stats.indexes[0].algebraic_last_recommended_materialization.?, "recommendation:v1") != null);
+
+        const materialization_states = try db.listAlgebraicMaterializationStates(alloc, "alg");
+        defer types.freeAlgebraicMaterializationStates(alloc, materialization_states);
+        try std.testing.expectEqual(@as(usize, 1), materialization_states.len);
+        try std.testing.expectEqualStrings("alg", materialization_states[0].index_name);
+        try std.testing.expectEqualStrings("recommended", materialization_states[0].lifecycle);
+        try std.testing.expectEqual(@as(u64, 1), materialization_states[0].observation_count);
+        try std.testing.expect(std.mem.indexOf(u8, materialization_states[0].recommendation, "recommendation:v1") != null);
+
+        const observations = try db.listAlgebraicQueryObservations(alloc, "alg");
+        defer types.freeAlgebraicQueryObservations(alloc, observations);
+        try std.testing.expectEqual(@as(usize, 1), observations.len);
+        try std.testing.expectEqualStrings("alg", observations[0].index_name);
+        try std.testing.expectEqual(@as(u64, 1), observations[0].count);
+        try std.testing.expectEqualStrings("no_materialization", observations[0].reason);
+        try std.testing.expectEqualStrings("recommended", observations[0].lifecycle);
+        try std.testing.expect(observations[0].recommendation != null);
+        try std.testing.expect(std.mem.indexOf(u8, observations[0].shape, "shape:v1") != null);
+
+        try std.testing.expectEqual(@as(u64, 1), try db.evaluateAlgebraicAdaptiveCandidates());
+        const backfilling_states = try db.listAlgebraicMaterializationStates(alloc, "alg");
+        defer types.freeAlgebraicMaterializationStates(alloc, backfilling_states);
+        try std.testing.expectEqual(@as(usize, 1), backfilling_states.len);
+        try std.testing.expectEqualStrings("backfilling", backfilling_states[0].lifecycle);
+        try std.testing.expectEqual(@as(u64, 1), backfilling_states[0].observation_count);
+
+        const backfilling_observations = try db.listAlgebraicQueryObservations(alloc, "alg");
+        defer types.freeAlgebraicQueryObservations(alloc, backfilling_observations);
+        try std.testing.expectEqual(@as(usize, 1), backfilling_observations.len);
+        try std.testing.expectEqualStrings("backfilling", backfilling_observations[0].lifecycle);
+
+        const missing_states = try db.listAlgebraicMaterializationStates(alloc, "missing");
+        defer types.freeAlgebraicMaterializationStates(alloc, missing_states);
+        try std.testing.expectEqual(@as(usize, 0), missing_states.len);
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        defer reopened.close();
+
+        const stats = try reopened.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(usize, 1), stats.indexes.len);
+        try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].algebraic_observed_query_shape_count);
+        try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].algebraic_recommendation_count);
+        try std.testing.expect(stats.indexes[0].algebraic_last_observed_query_shape != null);
+        try std.testing.expect(stats.indexes[0].algebraic_last_recommended_materialization != null);
+
+        const materialization_states = try reopened.listAlgebraicMaterializationStates(alloc, null);
+        defer types.freeAlgebraicMaterializationStates(alloc, materialization_states);
+        try std.testing.expectEqual(@as(usize, 1), materialization_states.len);
+        try std.testing.expectEqualStrings("alg", materialization_states[0].index_name);
+        try std.testing.expectEqualStrings("backfilling", materialization_states[0].lifecycle);
+        try std.testing.expectEqual(@as(u64, 1), materialization_states[0].observation_count);
+
+        const observations = try reopened.listAlgebraicQueryObservations(alloc, null);
+        defer types.freeAlgebraicQueryObservations(alloc, observations);
+        try std.testing.expectEqual(@as(usize, 1), observations.len);
+        try std.testing.expectEqualStrings("alg", observations[0].index_name);
+        try std.testing.expectEqualStrings("backfilling", observations[0].lifecycle);
+        try std.testing.expectEqual(@as(u64, 1), observations[0].count);
+    }
+}
+
+test "db schema runtime algebraic evaluates policy-gated adaptive candidates" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "schema_version": 42,
+        \\  "capability_fingerprint": "cap:v1",
+        \\  "capability_lifecycle_status": "stale",
+        \\  "capability_change_added_fields": 1,
+        \\  "capability_change_removed_fields": 2,
+        \\  "capability_change_changed_type_fields": 3,
+        \\  "skipped_dynamic_fields": 4,
+        \\  "skipped_complex_fields": 5,
+        \\  "skipped_unbounded_fields": 6,
+        \\  "group_fields": [{"name":"customer","path":"customer","type":"string"},{"name":"tenant","path":"tenant","type":"string"}],
+        \\  "measure_fields": [{"name":"amount","path":"amount","type":"number"}],
+        \\  "adaptive": {"observe": true, "lazy_materialization": true, "dematerialization": true, "min_observations": 1, "min_estimated_scan_rows_saved": 1, "dematerialize_after_observation_misses": 2},
+        \\  "materializations": []
+        \\}
+    ;
+    try db.addIndex(.{
+        .name = "alg",
+        .kind = .algebraic,
+        .config_json = cfg,
+    });
+
+    const entry = db.core.index_manager.algebraicIndex("alg").?;
+    const constraints = [_]algebraic_ir.Constraint{.{ .field = "tenant", .value = "t1" }};
+    entry.index.recordObservedQueryShapeWithStore(db.core.store, .{
+        .kind = .terms,
+        .aggregation_name = "amount_by_customer",
+        .bucket_field = "customer",
+        .constraints = constraints[0..],
+        .metric = .{ .name = "amount", .op = .sum, .field = "amount" },
+    }, "no_materialization");
+
+    try std.testing.expectEqual(@as(u64, 1), try db.evaluateAlgebraicAdaptiveCandidates());
+    const candidates = try db.listAlgebraicAdaptiveCandidates(alloc, "alg");
+    defer types.freeAlgebraicAdaptiveCandidates(alloc, candidates);
+    try std.testing.expectEqual(@as(usize, 1), candidates.len);
+    try std.testing.expect(std.mem.startsWith(u8, candidates[0].materialization_id, "am_"));
+    try std.testing.expectEqualStrings("backfilling", candidates[0].lifecycle);
+    try std.testing.expectEqualStrings("auto_backfill_started", candidates[0].decision);
+    try std.testing.expect(candidates[0].estimated_scan_rows_saved >= 1);
+    try std.testing.expect(candidates[0].estimated_write_cost >= 1);
+    try std.testing.expect(candidates[0].estimated_write_amplification > 1);
+
+    const progress = try db.listAlgebraicAdaptiveProgress(alloc, "alg");
+    defer types.freeAlgebraicAdaptiveProgress(alloc, progress);
+    try std.testing.expectEqual(@as(usize, 1), progress.len);
+    try std.testing.expectEqualStrings(candidates[0].materialization_id, progress[0].materialization_id);
+    try std.testing.expectEqualStrings("backfilling", progress[0].lifecycle);
+
+    const stats = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(usize, 1), stats.indexes.len);
+    try std.testing.expectEqual(@as(u32, 42), stats.indexes[0].algebraic_schema_version);
+    try std.testing.expectEqualStrings("cap:v1", stats.indexes[0].algebraic_capability_fingerprint.?);
+    try std.testing.expectEqualStrings("stale", stats.indexes[0].algebraic_capability_lifecycle_status.?);
+    try std.testing.expect(!stats.indexes[0].algebraic_planner_lifecycle_ready);
+    try std.testing.expectEqualStrings("capability_lifecycle_not_ready", stats.indexes[0].algebraic_planner_lifecycle_blocking_reason.?);
+    try std.testing.expectEqual(@as(u32, 1), stats.indexes[0].algebraic_capability_change_added_fields);
+    try std.testing.expectEqual(@as(u32, 2), stats.indexes[0].algebraic_capability_change_removed_fields);
+    try std.testing.expectEqual(@as(u32, 3), stats.indexes[0].algebraic_capability_change_changed_type_fields);
+    try std.testing.expectEqual(@as(u32, 4), stats.indexes[0].algebraic_skipped_dynamic_fields);
+    try std.testing.expectEqual(@as(u32, 5), stats.indexes[0].algebraic_skipped_complex_fields);
+    try std.testing.expectEqual(@as(u32, 6), stats.indexes[0].algebraic_skipped_unbounded_fields);
+    try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].algebraic_adaptive_candidate_count);
+    try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].algebraic_adaptive_progress_count);
+    try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].algebraic_adaptive_backfilling_count);
+    try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].algebraic_adaptive_decision_history_count);
+    try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].algebraic_adaptive_policy_drift_count);
+    const top_candidate = stats.indexes[0].algebraic_top_candidate orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(candidates[0].recommendation, top_candidate.recommendation);
+    try std.testing.expectEqualStrings(candidates[0].materialization_id, top_candidate.materialization_id);
+    try std.testing.expectEqualStrings("backfilling", top_candidate.lifecycle);
+    try std.testing.expectEqualStrings("auto_backfill_started", top_candidate.decision);
+    try std.testing.expectEqual(candidates[0].score, top_candidate.score);
+    try std.testing.expectEqual(@as(usize, 1), stats.indexes[0].algebraic_candidate_decision_history.len);
+    try std.testing.expectEqualStrings("auto_backfill_started", stats.indexes[0].algebraic_candidate_decision_history[0].decision);
+    const active_progress = stats.indexes[0].algebraic_active_progress orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(progress[0].recommendation, active_progress.recommendation);
+    try std.testing.expectEqualStrings(progress[0].materialization_id, active_progress.materialization_id);
+    try std.testing.expectEqualStrings("backfilling", active_progress.lifecycle);
+    try std.testing.expectEqual(progress[0].target_sequence, active_progress.target_sequence);
 }
 
 test "db schema runtime enrichment catalog delete rejects referenced definitions" {

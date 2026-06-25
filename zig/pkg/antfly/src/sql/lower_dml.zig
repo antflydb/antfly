@@ -12862,7 +12862,8 @@ fn insertValuesFromGeneratedDmlAstAlloc(
     const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     const start = try generatedDmlCommandStart(tokens, ast, end);
     if (start + 4 >= end or !tokens[start].matchesKeywordTag(.insert) or !tokens[start + 1].matchesKeywordTag(.into)) return error.UnsupportedSqlShape;
-    const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, start + 2, end);
+    const target_start = try generatedInsertTargetTableStart(tokens, start, end);
+    const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
     const table_name = try generatedDmlTableReferenceIdentifierAlloc(alloc, tokens, target_range);
     var table_transferred = false;
     errdefer if (!table_transferred) alloc.free(table_name);
@@ -13069,7 +13070,8 @@ fn validateGeneratedInsertSourceRanges(
 ) !void {
     const start = try generatedDmlCommandStart(tokens, ast, end);
     if (start + 5 >= end or !tokens[start].matchesKeywordTag(.insert) or !tokens[start + 1].matchesKeywordTag(.into)) return error.UnsupportedSqlShape;
-    const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, start + 2, end);
+    const target_start = try generatedInsertTargetTableStart(tokens, start, end);
+    const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
     const column_range = ast.insert_columns_tokens orelse return error.UnsupportedSqlShape;
     if (column_range.start != target_range.end or column_range.end <= column_range.start + 1 or column_range.end > end) return error.UnsupportedSqlShape;
     if (tokens[column_range.start].kind != .lparen or tokens[column_range.end - 1].kind != .rparen) return error.UnsupportedSqlShape;
@@ -13094,6 +13096,33 @@ fn validateGeneratedInsertSourceRanges(
     } else if (returning_keyword) |returning_start| {
         if (source_range.end != returning_start) return error.UnsupportedSqlShape;
     } else if (source_range.end != end) return error.UnsupportedSqlShape;
+}
+
+fn generatedInsertTargetTableStart(tokens: []const Token, start: usize, end: usize) !usize {
+    if (start + 2 >= end) return error.UnsupportedSqlShape;
+    if (tokens[start + 2].matchesKeywordTag(.only)) {
+        if (start + 3 >= end) return error.UnsupportedSqlShape;
+        return start + 3;
+    }
+    return start + 2;
+}
+
+fn generatedUpdateTargetTableStart(tokens: []const Token, start: usize, end: usize) !usize {
+    if (start + 1 >= end) return error.UnsupportedSqlShape;
+    if (tokens[start + 1].matchesKeywordTag(.only)) {
+        if (start + 2 >= end) return error.UnsupportedSqlShape;
+        return start + 2;
+    }
+    return start + 1;
+}
+
+fn generatedDeleteTargetTableStart(tokens: []const Token, start: usize, end: usize) !usize {
+    if (start + 2 >= end or !tokens[start + 1].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
+    if (tokens[start + 2].matchesKeywordTag(.only)) {
+        if (start + 3 >= end) return error.UnsupportedSqlShape;
+        return start + 3;
+    }
+    return start + 2;
 }
 
 fn validateGeneratedDmlRelationSourceBodyAlloc(
@@ -13218,7 +13247,8 @@ fn validateGeneratedUpdateSourceRanges(
 ) !void {
     const start = try generatedDmlCommandStart(tokens, ast, end);
     if (start + 3 >= end or !tokens[start].matchesKeywordTag(.update)) return error.UnsupportedSqlShape;
-    _ = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, start + 1, end);
+    const target_start = try generatedUpdateTargetTableStart(tokens, start, end);
+    _ = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
     const assignments_range = ast.assignments_tokens orelse return error.UnsupportedSqlShape;
     if (assignments_range.start == 0 or assignments_range.start >= assignments_range.end or assignments_range.end > end) return error.UnsupportedSqlShape;
     if (!tokens[assignments_range.start - 1].matchesKeywordTag(.set)) return error.UnsupportedSqlShape;
@@ -13232,7 +13262,8 @@ fn validateGeneratedDeleteSourceRanges(
 ) !void {
     const start = try generatedDmlCommandStart(tokens, ast, end);
     if (start + 2 >= end or !tokens[start].matchesKeywordTag(.delete) or !tokens[start + 1].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
-    const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, start + 2, end);
+    const target_start = try generatedDeleteTargetTableStart(tokens, start, end);
+    const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
     try validateGeneratedDmlTailRanges(tokens, end, target_range.end, ast.where_tokens, ast.returning_tokens);
 }
 
@@ -13361,7 +13392,8 @@ fn validateGeneratedUpdateJoinedRanges(
 ) !void {
     const start = try generatedDmlCommandStart(tokens, ast, end);
     if (start + 7 >= end or !tokens[start].matchesKeywordTag(.update)) return error.UnsupportedSqlShape;
-    _ = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, start + 1, end);
+    const target_start = try generatedUpdateTargetTableStart(tokens, start, end);
+    _ = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
     const assignments_range = ast.assignments_tokens orelse return error.UnsupportedSqlShape;
     if (assignments_range.start == 0 or assignments_range.start >= assignments_range.end or assignments_range.end > end) return error.UnsupportedSqlShape;
     if (!tokens[assignments_range.start - 1].matchesKeywordTag(.set)) return error.UnsupportedSqlShape;
@@ -13382,14 +13414,17 @@ fn validateGeneratedDeleteJoinedRanges(
 ) !void {
     const start = try generatedDmlCommandStart(tokens, ast, end);
     if (start + 6 >= end or !tokens[start].matchesKeywordTag(.delete) or !tokens[start + 1].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
-    const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, start + 2, end);
+    const target_start = try generatedDeleteTargetTableStart(tokens, start, end);
+    const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
     if (ast.source_tokens) |source_range| {
         if (source_range.start == 0 or source_range.start >= source_range.end or source_range.end > end) return error.UnsupportedSqlShape;
         if (!tokens[source_range.start - 1].matchesKeywordTag(.using)) return error.UnsupportedSqlShape;
-        if (source_range.start - 1 != target_range.end) return error.UnsupportedSqlShape;
+        if (source_range.start - 1 < target_range.end) return error.UnsupportedSqlShape;
         try validateGeneratedJoinedTailRanges(tokens, end, source_range.end, ast.where_tokens, ast.returning_tokens);
     } else {
-        try validateGeneratedJoinedTailRanges(tokens, end, target_range.end, ast.where_tokens, ast.returning_tokens);
+        const where_range = ast.where_tokens orelse return error.UnsupportedSqlShape;
+        if (where_range.start == 0 or where_range.start - 1 < target_range.end) return error.UnsupportedSqlShape;
+        try validateGeneratedJoinedTailRanges(tokens, end, where_range.start - 1, ast.where_tokens, ast.returning_tokens);
     }
 }
 
@@ -13481,7 +13516,8 @@ fn updatePointFromGeneratedDmlAstAlloc(
     const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     const start = try generatedDmlCommandStart(tokens, ast, end);
     if (start + 5 >= end or !tokens[start].matchesKeywordTag(.update)) return error.UnsupportedSqlShape;
-    const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, start + 1, end);
+    const target_start = try generatedUpdateTargetTableStart(tokens, start, end);
+    const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
     const table_name = try generatedDmlTableReferenceIdentifierAlloc(alloc, tokens, target_range);
     var table_transferred = false;
     errdefer if (!table_transferred) alloc.free(table_name);
@@ -13633,7 +13669,8 @@ fn deletePointFromGeneratedDmlAstAlloc(
     const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     const start = try generatedDmlCommandStart(tokens, ast, end);
     if (start + 4 >= end or !tokens[start].matchesKeywordTag(.delete) or !tokens[start + 1].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
-    const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, start + 2, end);
+    const target_start = try generatedDeleteTargetTableStart(tokens, start, end);
+    const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, target_start, end);
     const table_name = try generatedDmlTableReferenceIdentifierAlloc(alloc, tokens, target_range);
     var table_transferred = false;
     errdefer if (!table_transferred) alloc.free(table_name);
@@ -13814,6 +13851,7 @@ fn truncateSyntaxFromGeneratedDmlAstAlloc(
     if (start + 1 >= end or !tokens[start].matchesKeywordTag(.truncate)) return error.UnsupportedSqlShape;
     var index: usize = start + 1;
     if (index < end and tokens[index].matchesKeywordTag(.table)) index += 1;
+    if (index < end and tokens[index].matchesKeywordTag(.only)) index += 1;
 
     const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, index, end);
     const table_name = try generatedDmlTableReferenceIdentifierAlloc(alloc, tokens, target_range);
@@ -14835,6 +14873,21 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
     try std.testing.expectEqual(@as(usize, 1), generated_joined_delete.mutation.req.join.on.len);
     try std.testing.expect(generated_joined_delete.mutation.req.join.left.row_claim != null);
     try std.testing.expectEqual(@as(usize, 1), generated_joined_delete.mutation.req.returning.len);
+
+    var generated_aliased_joined_delete = try lowerGeneratedDeleteJoinedSourceForDmlTestAlloc(
+        alloc,
+        "DELETE FROM usage_records AS target USING usage_records AS source WHERE target.amount = source.amount AND target.id = 'joined-target' AND source.id = 'joined-source' FOR UPDATE OF target RETURNING target.id, target.status",
+        schema,
+        &.{},
+        options,
+    );
+    defer generated_aliased_joined_delete.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", generated_aliased_joined_delete.target_table_name);
+    try std.testing.expectEqualStrings("usage_records", generated_aliased_joined_delete.source_table_name);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, generated_aliased_joined_delete.mutation.req.kind);
+    try std.testing.expectEqual(@as(usize, 1), generated_aliased_joined_delete.mutation.req.join.on.len);
+    try std.testing.expect(generated_aliased_joined_delete.mutation.req.join.left.row_claim != null);
+    try std.testing.expectEqual(@as(usize, 2), generated_aliased_joined_delete.mutation.req.returning.len);
 
     var generated_rich_joined_delete = try lowerGeneratedDeleteJoinedSourceForDmlTestAlloc(
         alloc,
@@ -20080,6 +20133,18 @@ test "sql adapter lower dml lowers truncate into claimed table-emptying mutation
     try std.testing.expectEqual(@as(?u32, null), continue_identity.mutation.req.source.limit);
     try std.testing.expect(continue_identity.mutation.req.source.row_claim != null);
     try std.testing.expect(!continue_identity.restart_identity);
+
+    var qualified_continue_identity = try lowerTruncateMutationSourceForTestAlloc(
+        alloc,
+        "TRUNCATE TABLE ONLY public.usage_records CONTINUE IDENTITY RESTRICT",
+        schema,
+        claim,
+    );
+    defer qualified_continue_identity.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", qualified_continue_identity.table_name);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, qualified_continue_identity.mutation.req.kind);
+    try std.testing.expect(qualified_continue_identity.mutation.req.source.row_claim != null);
+    try std.testing.expect(!qualified_continue_identity.restart_identity);
 
     var restart_identity = try lowerTruncateMutationSourceForTestAlloc(
         alloc,

@@ -6408,6 +6408,43 @@ test "db search runtime projection lookup returns full stored json by default" {
     try std.testing.expectEqualStrings(raw, result.json);
 }
 
+test "db search runtime projection scan returns hashes and projected documents" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"x\"}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"body\":\"y\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"body\":\"z\"}" },
+        },
+    });
+
+    var result = try db.scan(alloc, "doc:a", "doc:c", .{
+        .include_documents = true,
+        .fields = &.{"title"},
+        .include_all_fields = false,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), result.hashes.len);
+    try std.testing.expectEqualStrings("doc:b", result.hashes[0].id);
+    try std.testing.expectEqualStrings("doc:c", result.hashes[1].id);
+    try std.testing.expectEqual(@as(usize, 2), result.documents.len);
+    try std.testing.expect(std.mem.indexOf(u8, result.documents[0].json, "\"title\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.documents[0].json, "\"body\"") == null);
+}
+
 test "db search runtime projection search projects stored fields for hydrated hits" {
     const DB = @import("mod.zig").DB;
     const db_test_support = @import("test_support.zig");
@@ -7750,6 +7787,740 @@ test "db search runtime identity vector symbolic filters fail closed when algebr
         try std.testing.expectEqual(@as(u64, 2), status_value.vector_filter_unsupported_count);
         try std.testing.expectEqual(@as(u64, 2), status_value.vector_filter_fail_closed_count);
     }
+}
+
+test "db search runtime identity algebraic doc facts feed native dense and sparse symbolic filters" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+    try db.addIndex(.{
+        .name = "sp_v1",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse\"}",
+    });
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.addIndex(.{
+        .name = "alg",
+        .kind = .algebraic,
+        .config_json =
+        \\{
+        \\  "version": 1,
+        \\  "table": "docs",
+        \\  "group_fields": [
+        \\    {"name":"category","path":"category","type":"string"},
+        \\    {"name":"published","path":"published","type":"boolean"},
+        \\    {"name":"ip","path":"ip","type":"string"},
+        \\    {"name":"score","path":"score","type":"number"}
+        \\  ],
+        \\  "measure_fields": [
+        \\    {"name":"code","path":"code","type":"string"}
+        \\  ],
+        \\  "materializations": [{"name":"count_by_category","op":"count","group_by":["category"]}]
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"shared token\",\"category\":\"reject\",\"published\":false,\"ip\":\"192.168.1.10\",\"score\":1.0,\"code\":\"drop\",\"meta\":{\"tier\":\"bronze\"},\"location\":{\"lat\":40.7128,\"lon\":-74.0060},\"embedding\":[0,0],\"sparse\":{\"indices\":[1],\"values\":[1.0]}}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"shared token\",\"category\":\"keep\",\"published\":true,\"ip\":\"10.1.2.3\",\"score\":5.0,\"code\":\"keep-code\",\"meta\":{\"tier\":\"gold\"},\"location\":{\"lat\":37.7749,\"lon\":-122.4194},\"embedding\":[10,0],\"sparse\":{\"indices\":[1],\"values\":[0.1]}}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const alg_entry = db.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
+    const keep_doc_ids = (try alg_entry.index.docIdsForFilterJsonAlloc(db.core.store, "{\"term\":{\"category\":\"keep\"}}")) orelse return error.TestUnexpectedResult;
+    defer alg_entry.index.freeDocIds(keep_doc_ids);
+    try std.testing.expectEqual(@as(usize, 1), keep_doc_ids.len);
+    try std.testing.expectEqualStrings("doc:b", keep_doc_ids[0]);
+    try std.testing.expect((try db.core.index_manager.lookupDenseVectorId(db.core.store, "dv_v1", "doc:b")) != null);
+
+    const location_lat_ids = (try alg_entry.index.docIdsForFilterJsonAlloc(db.core.store, "{\"numeric_range\":{\"path\":\"/location/lat\",\"min\":37.0,\"max\":38.0}}")) orelse return error.TestUnexpectedResult;
+    defer alg_entry.index.freeDocIds(location_lat_ids);
+    try std.testing.expectEqual(@as(usize, 1), location_lat_ids.len);
+    try std.testing.expectEqualStrings("doc:b", location_lat_ids[0]);
+
+    const geo_doc_ids = (try alg_entry.index.docIdsForFilterJsonAlloc(db.core.store, "{\"geo_distance\":{\"path\":\"/location\",\"lat\":37.7749,\"lon\":-122.4194,\"radius_meters\":2000}}")) orelse return error.TestUnexpectedResult;
+    defer alg_entry.index.freeDocIds(geo_doc_ids);
+    try std.testing.expectEqual(@as(usize, 1), geo_doc_ids.len);
+    try std.testing.expectEqualStrings("doc:b", geo_doc_ids[0]);
+
+    const geo_shape_doc_ids = (try alg_entry.index.docIdsForFilterJsonAlloc(db.core.store, "{\"geo_shape\":{\"path\":\"/location\",\"relation\":\"intersects\",\"polygons\":[[{\"lat\":37.0,\"lon\":-123.0},{\"lat\":38.0,\"lon\":-123.0},{\"lat\":38.0,\"lon\":-122.0},{\"lat\":37.0,\"lon\":-122.0}]]}}")) orelse return error.TestUnexpectedResult;
+    defer alg_entry.index.freeDocIds(geo_shape_doc_ids);
+    try std.testing.expectEqual(@as(usize, 1), geo_shape_doc_ids.len);
+    try std.testing.expectEqualStrings("doc:b", geo_shape_doc_ids[0]);
+
+    var dense_keep = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"term\":{\"category\":\"keep\"}}",
+        .exclusion_query_json = "{\"term\":{\"path\":\"/meta/tier\",\"value\":\"bronze\"}}",
+        .require_algebraic_filter_resolution = true,
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_keep.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_keep.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_keep.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_keep.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_keep.profile.raw_hit_count);
+    {
+        const status_value = alg_entry.index.status();
+        try std.testing.expectEqual(@as(u64, 1), status_value.vector_filter_attempt_count);
+        try std.testing.expectEqual(@as(u64, 1), status_value.vector_filter_resolved_count);
+        try std.testing.expectEqual(@as(u64, 1), status_value.vector_filter_include_doc_id_count);
+        try std.testing.expectEqual(@as(u64, 1), status_value.vector_filter_exclude_doc_id_count);
+    }
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .exclusion_query_json = "{\"wildcard\":{\"/meta/tier\":\"*old\"}}",
+        .require_algebraic_filter_resolution = true,
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 }));
+    {
+        const status_value = alg_entry.index.status();
+        try std.testing.expectEqual(@as(u64, 2), status_value.vector_filter_attempt_count);
+        try std.testing.expectEqual(@as(u64, 1), status_value.vector_filter_unsupported_count);
+        try std.testing.expectEqual(@as(u64, 1), status_value.vector_filter_fail_closed_count);
+    }
+    {
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expect(stats.doc_set_planning.unsupported_filter_shape_count >= 1);
+    }
+
+    const binding_defs = [_]types.NamedDocFilterBinding{
+        .{ .name = "kept", .filter_query_json = "{\"term\":{\"category\":\"keep\"}}" },
+        .{ .name = "published", .filter_query_json = "{\"bool_field\":{\"field\":\"published\",\"value\":true}}" },
+    };
+    var sparse_with_binding = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 2,
+        } },
+        .limit = 2,
+        .include_stored = false,
+        .doc_filter_bindings = binding_defs[0..],
+        .filter_query_json = "{\"bool\":{\"must\":[{\"ref\":\"kept\"},{\"ref\":\"published\"}]}}",
+        .require_algebraic_filter_resolution = true,
+    });
+    defer sparse_with_binding.deinit();
+    try std.testing.expectEqual(@as(u32, 1), sparse_with_binding.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), sparse_with_binding.hits.len);
+    try std.testing.expectEqualStrings("doc:b", sparse_with_binding.hits[0].id);
+
+    var full_text_with_binding = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "body", .text = "shared" } },
+        .limit = 2,
+        .include_stored = false,
+        .doc_filter_bindings = binding_defs[0..],
+        .filter_query_json = "{\"bool\":{\"must\":[{\"ref\":\"kept\"},{\"ref\":\"published\"}]}}",
+        .require_algebraic_filter_resolution = true,
+    });
+    defer full_text_with_binding.deinit();
+    try std.testing.expectEqual(@as(u32, 1), full_text_with_binding.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), full_text_with_binding.hits.len);
+    try std.testing.expectEqualStrings("doc:b", full_text_with_binding.hits[0].id);
+    {
+        const status_value = alg_entry.index.status();
+        try std.testing.expectEqual(@as(u64, 4), status_value.vector_filter_attempt_count);
+        try std.testing.expectEqual(@as(u64, 3), status_value.vector_filter_resolved_count);
+    }
+
+    var full_text_direct_algebraic = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "body", .text = "shared" } },
+        .limit = 2,
+        .include_stored = false,
+        .filter_query_json = "{\"term\":{\"category\":\"keep\"}}",
+        .require_algebraic_filter_resolution = true,
+    });
+    defer full_text_direct_algebraic.deinit();
+    try std.testing.expectEqual(@as(u32, 1), full_text_direct_algebraic.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), full_text_direct_algebraic.hits.len);
+    try std.testing.expectEqualStrings("doc:b", full_text_direct_algebraic.hits[0].id);
+    {
+        const status_value = alg_entry.index.status();
+        try std.testing.expectEqual(@as(u64, 5), status_value.vector_filter_attempt_count);
+        try std.testing.expectEqual(@as(u64, 4), status_value.vector_filter_resolved_count);
+        try std.testing.expectEqual(@as(u64, 1), status_value.vector_filter_unsupported_count);
+    }
+
+    var dense_terms = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"terms\":{\"field\":\"category\",\"values\":[\"missing\",\"keep\"]}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_terms.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_terms.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_terms.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_terms.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_terms.profile.raw_hit_count);
+
+    var dense_score_range = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"numeric_range\":{\"field\":\"score\",\"min\":2.0}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_score_range.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_score_range.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_score_range.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_score_range.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_score_range.profile.raw_hit_count);
+
+    var dense_standard_score_range = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"range\":{\"score\":{\"gte\":2.0}}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_standard_score_range.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_standard_score_range.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_standard_score_range.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_standard_score_range.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_standard_score_range.profile.raw_hit_count);
+
+    var dense_bool_field = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"bool_field\":{\"field\":\"published\",\"value\":true}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_bool_field.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_bool_field.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_bool_field.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_bool_field.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_bool_field.profile.raw_hit_count);
+
+    var dense_measure_prefix = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"prefix\":{\"field\":\"code\",\"role\":\"measure\",\"value\":\"keep\"}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_measure_prefix.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_measure_prefix.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_measure_prefix.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_measure_prefix.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_measure_prefix.profile.raw_hit_count);
+
+    var dense_measure_wildcard = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"wildcard\":{\"field\":\"code\",\"role\":\"measure\",\"pattern\":\"keep-*\"}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_measure_wildcard.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_measure_wildcard.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_measure_wildcard.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_measure_wildcard.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_measure_wildcard.profile.raw_hit_count);
+
+    var dense_measure_regexp = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"regexp\":{\"field\":\"code\",\"role\":\"measure\",\"pattern\":\"keep-.*\"}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_measure_regexp.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_measure_regexp.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_measure_regexp.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_measure_regexp.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_measure_regexp.profile.raw_hit_count);
+
+    var dense_fuzzy = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"fuzzy\":{\"field\":\"code\",\"role\":\"measure\",\"query\":\"keep-cide\",\"max_edits\":1,\"prefix_length\":5}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_fuzzy.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_fuzzy.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_fuzzy.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_fuzzy.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_fuzzy.profile.raw_hit_count);
+
+    var dense_match = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"match\":{\"field\":\"code\",\"role\":\"measure\",\"text\":\"KEEP\"}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_match.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_match.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_match.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_match.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_match.profile.raw_hit_count);
+
+    var dense_path_term = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"term\":{\"path\":\"/meta/tier\",\"value\":\"gold\"}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_path_term.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_path_term.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_path_term.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_path_term.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_path_term.profile.raw_hit_count);
+
+    var dense_path_prefix = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"prefix\":{\"path\":\"/meta/tier\",\"value\":\"go\"}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_path_prefix.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_path_prefix.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_path_prefix.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_path_prefix.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_path_prefix.profile.raw_hit_count);
+
+    var dense_ip_range = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"ip_range\":{\"field\":\"ip\",\"cidr\":\"10.0.0.0/8\"}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_ip_range.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_ip_range.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_ip_range.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_ip_range.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_ip_range.profile.raw_hit_count);
+
+    var dense_geo_distance = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"geo_distance\":{\"path\":\"/location\",\"lat\":37.7749,\"lon\":-122.4194,\"radius_meters\":2000}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_geo_distance.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_geo_distance.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_geo_distance.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_geo_distance.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_geo_distance.profile.raw_hit_count);
+
+    var dense_geo_shape = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"geo_shape\":{\"path\":\"/location\",\"relation\":\"intersects\",\"polygons\":[[{\"lat\":37.0,\"lon\":-123.0},{\"lat\":38.0,\"lon\":-123.0},{\"lat\":38.0,\"lon\":-122.0},{\"lat\":37.0,\"lon\":-122.0}]]}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_geo_shape.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_geo_shape.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_geo_shape.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_geo_shape.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_geo_shape.profile.raw_hit_count);
+
+    var dense_disjuncts = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"disjuncts\":[{\"term\":{\"category\":\"missing\"}},{\"bool_field\":{\"field\":\"published\",\"value\":true}}]}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_disjuncts.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_disjuncts.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_disjuncts.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_disjuncts.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_disjuncts.profile.raw_hit_count);
+
+    var dense_required_plus_optional_should = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"bool\":{\"must\":[{\"term\":{\"category\":\"keep\"}}],\"should\":[{\"term\":{\"category\":\"reject\"}}]}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_required_plus_optional_should.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_required_plus_optional_should.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_required_plus_optional_should.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_required_plus_optional_should.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_required_plus_optional_should.profile.raw_hit_count);
+
+    var dense_missing = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"term\":{\"category\":\"missing\"}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_missing.result.deinit();
+    try std.testing.expectEqual(@as(u32, 0), dense_missing.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), dense_missing.result.hits.len);
+    try std.testing.expectEqual(@as(u32, 0), dense_missing.profile.raw_hit_count);
+
+    var dense_match_none = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"match_none\":{}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_match_none.result.deinit();
+    try std.testing.expectEqual(@as(u32, 0), dense_match_none.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), dense_match_none.result.hits.len);
+    try std.testing.expectEqual(@as(u32, 0), dense_match_none.profile.raw_hit_count);
+
+    var dense_intersect = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_doc_ids = &.{ "doc:a", "doc:b" },
+        .filter_doc_ids_positive = true,
+        .filter_query_json = "{\"term\":{\"category\":\"keep\"}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_intersect.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_intersect.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_intersect.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_intersect.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_intersect.profile.raw_hit_count);
+
+    var dense_doc_id_filter = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"doc_id\":{\"ids\":[\"doc:b\",\"missing\"]}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 1 });
+    defer dense_doc_id_filter.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_doc_id_filter.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_doc_id_filter.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_doc_id_filter.result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), dense_doc_id_filter.profile.raw_hit_count);
+
+    var dense_must_not = try db.searchDenseProfiled(alloc, .{
+        .index_name = "dv_v1",
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"bool\":{\"must_not\":[{\"term\":{\"category\":\"reject\"}}]}}",
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 2 });
+    defer dense_must_not.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_must_not.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_must_not.result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", dense_must_not.result.hits[0].id);
+
+    var sparse_keep = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 1,
+        } },
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"term\":{\"category\":\"keep\"}}",
+    });
+    defer sparse_keep.deinit();
+    try std.testing.expectEqual(@as(u32, 1), sparse_keep.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), sparse_keep.hits.len);
+    try std.testing.expectEqualStrings("doc:b", sparse_keep.hits[0].id);
+
+    var sparse_terms = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 1,
+        } },
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"terms\":{\"field\":\"category\",\"values\":[\"missing\",\"keep\"]}}",
+    });
+    defer sparse_terms.deinit();
+    try std.testing.expectEqual(@as(u32, 1), sparse_terms.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), sparse_terms.hits.len);
+    try std.testing.expectEqualStrings("doc:b", sparse_terms.hits[0].id);
+
+    var sparse_missing = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 1,
+        } },
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"term\":{\"category\":\"missing\"}}",
+    });
+    defer sparse_missing.deinit();
+    try std.testing.expectEqual(@as(u32, 0), sparse_missing.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), sparse_missing.hits.len);
+
+    var sparse_match_none = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 1,
+        } },
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"match_none\":{}}",
+    });
+    defer sparse_match_none.deinit();
+    try std.testing.expectEqual(@as(u32, 0), sparse_match_none.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), sparse_match_none.hits.len);
+
+    var sparse_score_range = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 1,
+        } },
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"numeric_range\":{\"field\":\"score\",\"min\":2.0}}",
+    });
+    defer sparse_score_range.deinit();
+    try std.testing.expectEqual(@as(u32, 1), sparse_score_range.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), sparse_score_range.hits.len);
+    try std.testing.expectEqualStrings("doc:b", sparse_score_range.hits[0].id);
+
+    var sparse_standard_score_range = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 1,
+        } },
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"range\":{\"score\":{\"gte\":2.0}}}",
+    });
+    defer sparse_standard_score_range.deinit();
+    try std.testing.expectEqual(@as(u32, 1), sparse_standard_score_range.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), sparse_standard_score_range.hits.len);
+    try std.testing.expectEqualStrings("doc:b", sparse_standard_score_range.hits[0].id);
+
+    var sparse_bool_field = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 1,
+        } },
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"bool_field\":{\"field\":\"published\",\"value\":true}}",
+    });
+    defer sparse_bool_field.deinit();
+    try std.testing.expectEqual(@as(u32, 1), sparse_bool_field.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), sparse_bool_field.hits.len);
+    try std.testing.expectEqualStrings("doc:b", sparse_bool_field.hits[0].id);
+
+    var sparse_measure_prefix = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 1,
+        } },
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"prefix\":{\"field\":\"code\",\"role\":\"measure\",\"value\":\"keep\"}}",
+    });
+    defer sparse_measure_prefix.deinit();
+    try std.testing.expectEqual(@as(u32, 1), sparse_measure_prefix.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), sparse_measure_prefix.hits.len);
+    try std.testing.expectEqualStrings("doc:b", sparse_measure_prefix.hits[0].id);
+
+    var sparse_measure_wildcard = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 1,
+        } },
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"wildcard\":{\"field\":\"code\",\"role\":\"measure\",\"pattern\":\"keep-*\"}}",
+    });
+    defer sparse_measure_wildcard.deinit();
+    try std.testing.expectEqual(@as(u32, 1), sparse_measure_wildcard.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), sparse_measure_wildcard.hits.len);
+    try std.testing.expectEqualStrings("doc:b", sparse_measure_wildcard.hits[0].id);
+
+    var sparse_measure_regexp = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 1,
+        } },
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"regexp\":{\"field\":\"code\",\"role\":\"measure\",\"pattern\":\"keep-.*\"}}",
+    });
+    defer sparse_measure_regexp.deinit();
+    try std.testing.expectEqual(@as(u32, 1), sparse_measure_regexp.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), sparse_measure_regexp.hits.len);
+    try std.testing.expectEqualStrings("doc:b", sparse_measure_regexp.hits[0].id);
+
+    var sparse_fuzzy = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 1,
+        } },
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"fuzzy\":{\"field\":\"code\",\"role\":\"measure\",\"query\":\"keep-cide\",\"max_edits\":1,\"prefix_length\":5}}",
+    });
+    defer sparse_fuzzy.deinit();
+    try std.testing.expectEqual(@as(u32, 1), sparse_fuzzy.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), sparse_fuzzy.hits.len);
+    try std.testing.expectEqualStrings("doc:b", sparse_fuzzy.hits[0].id);
+
+    var sparse_match = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 1,
+        } },
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"match\":{\"field\":\"code\",\"role\":\"measure\",\"text\":\"KEEP\"}}",
+    });
+    defer sparse_match.deinit();
+    try std.testing.expectEqual(@as(u32, 1), sparse_match.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), sparse_match.hits.len);
+    try std.testing.expectEqualStrings("doc:b", sparse_match.hits[0].id);
+
+    var sparse_path_term = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 1,
+        } },
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"term\":{\"path\":\"/meta/tier\",\"value\":\"gold\"}}",
+    });
+    defer sparse_path_term.deinit();
+    try std.testing.expectEqual(@as(u32, 1), sparse_path_term.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), sparse_path_term.hits.len);
+    try std.testing.expectEqualStrings("doc:b", sparse_path_term.hits[0].id);
+
+    var sparse_path_prefix = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 1,
+        } },
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"prefix\":{\"path\":\"/meta/tier\",\"value\":\"go\"}}",
+    });
+    defer sparse_path_prefix.deinit();
+    try std.testing.expectEqual(@as(u32, 1), sparse_path_prefix.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), sparse_path_prefix.hits.len);
+    try std.testing.expectEqualStrings("doc:b", sparse_path_prefix.hits[0].id);
+
+    var sparse_ip_range = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 1,
+        } },
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"ip_range\":{\"field\":\"ip\",\"cidr\":\"10.0.0.0/8\"}}",
+    });
+    defer sparse_ip_range.deinit();
+    try std.testing.expectEqual(@as(u32, 1), sparse_ip_range.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), sparse_ip_range.hits.len);
+    try std.testing.expectEqualStrings("doc:b", sparse_ip_range.hits[0].id);
+
+    var sparse_geo_bbox = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 1,
+        } },
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"geo_bbox\":{\"field\":\"/location\",\"min_lat\":37.70,\"min_lon\":-122.50,\"max_lat\":37.80,\"max_lon\":-122.30}}",
+    });
+    defer sparse_geo_bbox.deinit();
+    try std.testing.expectEqual(@as(u32, 1), sparse_geo_bbox.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), sparse_geo_bbox.hits.len);
+    try std.testing.expectEqualStrings("doc:b", sparse_geo_bbox.hits[0].id);
+
+    var sparse_geo_shape = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 1,
+        } },
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"geo_shape\":{\"path\":\"/location\",\"relation\":\"intersects\",\"polygons\":[[{\"lat\":37.0,\"lon\":-123.0},{\"lat\":38.0,\"lon\":-123.0},{\"lat\":38.0,\"lon\":-122.0},{\"lat\":37.0,\"lon\":-122.0}]]}}",
+    });
+    defer sparse_geo_shape.deinit();
+    try std.testing.expectEqual(@as(u32, 1), sparse_geo_shape.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), sparse_geo_shape.hits.len);
+    try std.testing.expectEqualStrings("doc:b", sparse_geo_shape.hits[0].id);
+
+    var sparse_disjuncts = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 1,
+        } },
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"disjuncts\":[{\"term\":{\"category\":\"missing\"}},{\"bool_field\":{\"field\":\"published\",\"value\":true}}]}",
+    });
+    defer sparse_disjuncts.deinit();
+    try std.testing.expectEqual(@as(u32, 1), sparse_disjuncts.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), sparse_disjuncts.hits.len);
+    try std.testing.expectEqualStrings("doc:b", sparse_disjuncts.hits[0].id);
+
+    var sparse_required_plus_optional_should = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .query = .{ .sparse_knn = .{
+            .indices = &.{1},
+            .values = &.{1.0},
+            .k = 1,
+        } },
+        .limit = 1,
+        .include_stored = false,
+        .filter_query_json = "{\"bool\":{\"filter\":[{\"term\":{\"category\":\"keep\"}}],\"should\":[{\"term\":{\"category\":\"reject\"}}],\"minimum_should_match\":0}}",
+    });
+    defer sparse_required_plus_optional_should.deinit();
+    try std.testing.expectEqual(@as(u32, 1), sparse_required_plus_optional_should.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), sparse_required_plus_optional_should.hits.len);
+    try std.testing.expectEqualStrings("doc:b", sparse_required_plus_optional_should.hits[0].id);
 }
 
 test "db search runtime indexing lsm match-all query sees same latest value as point lookup" {
@@ -12185,6 +12956,135 @@ test "db search runtime identity match_all consumes resolved ordinal filter" {
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+}
+
+test "db search runtime identity treats reserved namespace bytes as user document ids" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    const raw_id = "\x03raw\x00doc";
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = raw_id, .value = "{\"name\":\"binary\"}" },
+        },
+    });
+
+    const raw = try db.get(alloc, raw_id);
+    defer if (raw) |value| alloc.free(value);
+    try std.testing.expect(raw != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw.?, "\"binary\"") != null);
+
+    var resolved = try db.internalResolveDocSetForIdsAlloc(alloc, &.{raw_id});
+    defer resolved.deinit(alloc);
+    switch (resolved) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(@as(usize, 1), ordinals.len);
+            try std.testing.expectEqual(@as(doc_set.DocOrdinal, 1), ordinals[0]);
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+
+    const resolved_doc_ids = (try db.internalDocIdsForResolvedDocSetAlloc(alloc, &resolved)).?;
+    defer {
+        for (resolved_doc_ids) |doc_id| alloc.free(@constCast(doc_id));
+        alloc.free(resolved_doc_ids);
+    }
+    try std.testing.expectEqual(@as(usize, 1), resolved_doc_ids.len);
+    try std.testing.expectEqualSlices(u8, raw_id, resolved_doc_ids[0]);
+}
+
+test "db search runtime identity batch and scan round trip adversarial document ids" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    const raw_ids = [_][]const u8{
+        "",
+        "\x00",
+        "\x00\x00",
+        "\x00a",
+        ":",
+        ":e:",
+        ":i:",
+        ":t",
+        "abc\x00def",
+        "abc:",
+        "abc\xffdef",
+        "\xff",
+    };
+
+    var writes: [raw_ids.len]types.BatchWrite = undefined;
+    for (raw_ids, 0..) |raw_id, i| {
+        writes[i] = .{
+            .key = raw_id,
+            .value = try std.fmt.allocPrint(alloc, "{{\"ordinal\":{d}}}", .{i}),
+        };
+    }
+    defer for (writes) |write| alloc.free(@constCast(write.value));
+
+    try db.batch(.{ .writes = writes[0..] });
+
+    for (raw_ids, 0..) |raw_id, i| {
+        const raw = (try db.get(alloc, raw_id)) orelse return error.TestExpectedEqual;
+        defer alloc.free(raw);
+        const expected = try std.fmt.allocPrint(alloc, "{{\"ordinal\":{d}}}", .{i});
+        defer alloc.free(expected);
+        try std.testing.expectEqualStrings(expected, raw);
+    }
+
+    var resolved = try db.internalResolveDocSetForIdsAlloc(alloc, raw_ids[0..]);
+    defer resolved.deinit(alloc);
+    switch (resolved) {
+        .ordinals => |ordinals| {
+            try std.testing.expectEqual(raw_ids.len, ordinals.len);
+            for (ordinals, 0..) |ordinal, i| {
+                try std.testing.expectEqual(@as(doc_set.DocOrdinal, @intCast(i + 1)), ordinal);
+            }
+        },
+        else => return error.ExpectedOrdinalDocSet,
+    }
+
+    const resolved_doc_ids = (try db.internalDocIdsForResolvedDocSetAlloc(alloc, &resolved)).?;
+    defer {
+        for (resolved_doc_ids) |doc_id| alloc.free(@constCast(doc_id));
+        alloc.free(resolved_doc_ids);
+    }
+    try std.testing.expectEqual(raw_ids.len, resolved_doc_ids.len);
+    for (raw_ids, 0..) |raw_id, i| {
+        try std.testing.expectEqualSlices(u8, raw_id, resolved_doc_ids[i]);
+    }
+
+    var scanned = try db.scan(alloc, "", "", .{ .include_documents = true });
+    defer scanned.deinit(alloc);
+    try std.testing.expectEqual(raw_ids.len, scanned.hashes.len);
+    try std.testing.expectEqual(raw_ids.len, scanned.documents.len);
+    for (raw_ids, 0..) |raw_id, i| {
+        try std.testing.expectEqualSlices(u8, raw_id, scanned.hashes[i].id);
+        try std.testing.expectEqualSlices(u8, raw_id, scanned.documents[i].id);
+    }
 }
 
 test "db search runtime identity resolved doc-set projection honors identity read generation" {

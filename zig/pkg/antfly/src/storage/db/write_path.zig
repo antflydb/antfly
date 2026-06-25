@@ -3066,7 +3066,7 @@ fn chunkCacheTupleKeyAlloc(alloc: Allocator, components: []const []const u8) ![]
     return try out.toOwnedSlice(alloc);
 }
 
-test "db write path allocates final document ordinal then rejects new documents" {
+test "db write path doc identity allocates final document ordinal then rejects new documents" {
     const DB = @import("mod.zig").DB;
     const db_test_support = @import("test_support.zig");
     const tempPath = db_test_support.tempPath;
@@ -3119,7 +3119,7 @@ test "db write path allocates final document ordinal then rejects new documents"
     }));
 }
 
-test "db write path allocates final document ordinal with all index families present" {
+test "db write path doc identity allocates final document ordinal with all index families present" {
     const DB = @import("mod.zig").DB;
     const db_test_support = @import("test_support.zig");
     const tempPath = db_test_support.tempPath;
@@ -3207,7 +3207,7 @@ test "db write path allocates final document ordinal with all index families pre
     }));
 }
 
-test "db write path rejects new document writes at ordinal exhaustion for every sync level" {
+test "db write path doc identity rejects new document writes at ordinal exhaustion for every sync level" {
     const DB = @import("mod.zig").DB;
     const db_test_support = @import("test_support.zig");
     const tempPath = db_test_support.tempPath;

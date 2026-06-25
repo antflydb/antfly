@@ -810,7 +810,7 @@ test "db restore snapshot recreates logical store for durable lsm primary backen
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
 }
 
-test "db restore snapshot rejects invalid doc identity metadata" {
+test "db split restore doc identity snapshot rejects invalid metadata" {
     const alloc = std.testing.allocator;
 
     var src_buf: [256]u8 = undefined;
@@ -860,7 +860,7 @@ test "db restore snapshot rejects invalid doc identity metadata" {
     }));
 }
 
-test "db deferred restore rejects strict doc identity namespace mismatch" {
+test "db split restore doc identity deferred restore rejects strict namespace mismatch" {
     const alloc = std.testing.allocator;
 
     var src_buf: [256]u8 = undefined;
@@ -1121,7 +1121,7 @@ test "db restore snapshot replays managed chunked dense embeddings for durable l
     try std.testing.expectEqualStrings("doc:a", after.hits[0].id);
 }
 
-test "db explicit restore runtime repair repairs managed chunked dense embeddings once for restored shard" {
+test "db split restore doc identity runtime repair repairs managed chunked dense embeddings once for restored shard" {
     const alloc = std.testing.allocator;
 
     var src_buf: [256]u8 = undefined;
@@ -1216,7 +1216,7 @@ test "db explicit restore runtime repair repairs managed chunked dense embedding
     try std.Io.Dir.cwd().access(std.testing.io, repair_marker_path, .{});
 }
 
-test "db incomplete deferred restore import recovers before runtime repair" {
+test "db split restore doc identity incomplete deferred restore import recovers before runtime repair" {
     const alloc = std.testing.allocator;
 
     var src_buf: [256]u8 = undefined;

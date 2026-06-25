@@ -33,11 +33,11 @@
 %token ARROW_JSON ARROW_TEXT PATH_ARROW_JSON PATH_ARROW_TEXT
 %token REGEX_MATCH REGEX_IMATCH REGEX_NOT_MATCH REGEX_NOT_IMATCH
 %token ACCESS ADD AGGREGATE ALL ALTER ANALYZE AND ANY ARRAY AS ASC ASYMMETRIC BEGIN BETWEEN BY CASCADE CALL CASE CAST CHECKPOINT CLOSE CLUSTER COLLATION COMMIT COMMENT CONFLICT CONSTRAINT CONTINUE CURRENT CURRENT_DATE CURRENT_TIMESTAMP
-%token CREATE COPY DATA DATABASE DEALLOCATE DECLARE DEFAULT DELETE DESC DISCARD DISTINCT DO DOMAIN DROP EXECUTE
+%token CREATE COPY DATA DATABASE DATE DEALLOCATE DECLARE DEFAULT DELETE DESC DISCARD DISTINCT DO DOMAIN DROP EXECUTE
 %token ELSE END ESCAPE EXPLAIN EXISTS EXTENSION EXTRACT FALSE FETCH FILTER FIRST FOLLOWING FOR FOREIGN FROM FULL FUNCTION GRANT GRAPH GROUP HAVING IDENTITY IF ILIKE INCLUDE IN INDEX INNER INSERT INTERVAL INTO IS
-%token ISNULL JOIN KEY LABEL LAST LATERAL LEFT LIKE LIMIT LISTEN LOAD LOCK LOCKED MATCHED MATERIALIZED MERGE METHOD METRIC MOVE NO NOT NULL NOTIFY NOTNULL NOWAIT NULLS OF ON OR ORDER OUTER OVER OWNED PARTITION POLICY PRECEDING PREPARE PRIMARY PUBLIC PUBLICATION
-%token NEXT NOTHING OFFSET ONLY OPERATOR PROCEDURE QUERY RANGE REASSIGN RECURSIVE REFRESH REINDEX RELEASE RENAME REPLACE RESET RESTART RESTRICT RETURNING REVOKE RIGHT ROLLBACK ROLE ROW ROWS RULE SAVEPOINT SCHEMA SECURITY SELECT SERVER SET SHARE SHOW SKIP SOME SUBSCRIPTION SYSTEM TABLE TEMP TEMPORARY TIMESTAMP TIMESTAMPTZ TO TRUNCATE
-%token SEQUENCE SYMMETRIC TABLESPACE THEN TRUE TRIGGER UNION UNIQUE UNKNOWN UNLISTEN UNLOGGED UPDATE USING VACUUM VALUES VIEW WHEN WHERE WINDOW WITH WITHIN
+%token ISNULL JOIN KEY LABEL LAST LATERAL LEFT LIKE LIMIT LISTEN LOAD LOCK LOCKED MATCHED MATERIALIZED MERGE METHOD METRIC MOVE NO NOT NULL NOTIFY NOTNULL NOWAIT NULLS OF ON OR ORDER OUTER OVER OVERLAY OWNED PARTITION PLACING POLICY POSITION PRECEDING PREPARE PRIMARY PUBLIC PUBLICATION
+%token NEXT NOTHING OFFSET ONLY OPERATOR PORTION PROCEDURE QUERY RANGE REASSIGN RECURSIVE REFRESH REINDEX RELEASE RENAME REPLACE RESET RESTART RESTRICT RETURNING REVOKE RIGHT ROLLBACK ROLE ROW ROWS RULE SAVEPOINT SCHEMA SECURITY SELECT SERVER SET SHARE SHOW SKIP SOME SUBSCRIPTION SYSTEM TABLE TEMP TEMPORARY TIMESTAMP TIMESTAMPTZ TO TRUNCATE
+%token SEQUENCE SUBSTRING SYMMETRIC TABLESPACE THEN TRUE TRIGGER UNION UNIQUE UNKNOWN UNLISTEN UNLOGGED UPDATE USING VACUUM VALUES VIEW WHEN WHERE WINDOW WITH WITHIN
 %token EXCEPT INTERSECT UNBOUNDED
 %token BASE_WEIGHT FIELD FRESHNESS GRAPH_METRIC KEY KIND METRIC METRIC_FRESHNESS MISSING_SCORE NAME SOURCE SOURCES TYPE WEIGHT
 
@@ -372,18 +372,49 @@ dml_statement:
   ;
 
 insert_statement:
-    INSERT INTO qualified_name insert_columns_opt VALUES value_tuple_list conflict_clause_opt returning_clause_opt
-  | INSERT INTO qualified_name DEFAULT VALUES conflict_clause_opt returning_clause_opt
-  | INSERT INTO qualified_name insert_columns_opt read_statement conflict_clause_opt returning_clause_opt
+    INSERT INTO insert_target insert_columns_opt VALUES value_tuple_list conflict_clause_opt returning_clause_opt
+  | INSERT INTO insert_target DEFAULT VALUES conflict_clause_opt returning_clause_opt
+  | INSERT INTO insert_target insert_columns_opt read_statement conflict_clause_opt returning_clause_opt
+  ;
+
+insert_target:
+    qualified_name
+  | qualified_name AS identifier_name
+  | ONLY qualified_name
+  | ONLY qualified_name AS identifier_name
   ;
 
 update_statement:
-    UPDATE qualified_name SET assignment_list where_clause_opt row_lock_clause_opt returning_clause_opt
-  | UPDATE qualified_name SET assignment_list FROM table_reference_list where_clause_opt row_lock_clause_opt returning_clause_opt
+    UPDATE update_target update_for_portion_opt SET assignment_list update_from_clause_opt where_clause_opt order_by_clause_opt pagination_clause_list_opt row_lock_clause_opt returning_clause_opt
+  ;
+
+update_target:
+    qualified_name table_alias_opt
+  | ONLY qualified_name table_alias_opt
   ;
 
 delete_statement:
-    DELETE FROM qualified_name using_clause_opt where_clause_opt row_lock_clause_opt returning_clause_opt
+    DELETE FROM delete_target delete_for_portion_opt using_clause_opt where_clause_opt order_by_clause_opt pagination_clause_list_opt row_lock_clause_opt returning_clause_opt
+  ;
+
+delete_target:
+    qualified_name table_alias_opt
+  | ONLY qualified_name table_alias_opt
+  ;
+
+update_from_clause_opt:
+    /* empty */
+  | FROM table_reference_list
+  ;
+
+update_for_portion_opt:
+    /* empty */
+  | FOR PORTION OF identifier_name FROM expression TO expression
+  ;
+
+delete_for_portion_opt:
+    /* empty */
+  | FOR PORTION OF identifier_name FROM expression TO expression
   ;
 
 truncate_statement:
@@ -396,8 +427,13 @@ table_keyword_opt:
   ;
 
 truncate_table_list:
+    truncate_table_item
+  | truncate_table_list COMMA truncate_table_item
+  ;
+
+truncate_table_item:
     qualified_name
-  | truncate_table_list COMMA qualified_name
+  | ONLY qualified_name
   ;
 
 truncate_identity_opt:
@@ -407,12 +443,18 @@ truncate_identity_opt:
   ;
 
 merge_statement:
-    MERGE INTO qualified_name table_alias_opt USING table_reference ON expression merge_action_list returning_clause_opt
+    MERGE INTO merge_target table_alias_opt USING table_reference ON expression merge_action_list returning_clause_opt
+  ;
+
+merge_target:
+    qualified_name
+  | ONLY qualified_name
   ;
 
 table_alias_opt:
     /* empty */
   | AS identifier_name
+  | identifier_name
   ;
 
 read_statement:
@@ -622,6 +664,9 @@ assignment_list:
 
 assignment:
     qualified_name EQ expression
+  | LPAREN identifier_list RPAREN EQ expression
+  | LPAREN identifier_list RPAREN EQ LPAREN expression_list RPAREN
+  | LPAREN identifier_list RPAREN EQ ROW LPAREN expression_list RPAREN
   ;
 
 select_list:
@@ -645,8 +690,8 @@ select_item:
   ;
 
 window_function_expression:
-    qualified_name LPAREN function_argument_list_opt RPAREN OVER LPAREN window_definition RPAREN
-  | qualified_name LPAREN function_argument_list_opt RPAREN OVER identifier_name
+    qualified_name LPAREN function_argument_list_opt RPAREN within_group_clause_opt filter_clause_opt OVER LPAREN window_definition RPAREN
+  | qualified_name LPAREN function_argument_list_opt RPAREN within_group_clause_opt filter_clause_opt OVER identifier_name
   ;
 
 window_definition:
@@ -708,6 +753,11 @@ table_reference_list:
 table_reference:
     qualified_name
   | qualified_name AS identifier_name
+  | qualified_name identifier_name
+  | qualified_name OFFSET
+  | ONLY qualified_name
+  | ONLY qualified_name AS identifier_name
+  | ONLY qualified_name identifier_name
   | qualified_name LPAREN function_argument_list_opt RPAREN table_function_alias_opt
   | table_reference join_operator table_reference join_condition
   | LATERAL LPAREN read_statement RPAREN AS identifier_name
@@ -795,6 +845,7 @@ pagination_clause_list:
 pagination_clause:
     LIMIT expression
   | LIMIT ALL
+  | OFFSET NUMBER row_rows_opt
   | OFFSET expression row_rows_opt
   | FETCH fetch_first_next fetch_count_opt row_rows ONLY
   ;
@@ -831,7 +882,7 @@ conflict_clause_opt:
   ;
 
 conflict_target:
-    LPAREN identifier_list RPAREN conflict_target_where_opt
+    LPAREN expression_list RPAREN conflict_target_where_opt
   | ON CONSTRAINT identifier_name
   ;
 
@@ -1167,7 +1218,9 @@ postfix_expression:
 primary_expression:
     literal
   | qualified_name
+  | DEFAULT
   | PLACEHOLDER
+  | LPAREN expression COMMA expression_list RPAREN
   | LPAREN expression RPAREN
   | ARRAY LBRACKET array_element_list_opt RBRACKET
   | LBRACKET array_element_list_opt RBRACKET
@@ -1177,12 +1230,27 @@ primary_expression:
   | EXTRACT LPAREN identifier_name FROM expression RPAREN
   | CURRENT_DATE
   | CURRENT_TIMESTAMP current_timestamp_precision_opt
+  | SUBSTRING LPAREN expression FROM expression substring_for_clause_opt RPAREN
+  | OVERLAY LPAREN expression PLACING expression FROM expression overlay_for_clause_opt RPAREN
+  | POSITION LPAREN concat_expression IN expression RPAREN
+  | LEFT LPAREN function_argument_list_opt RPAREN within_group_clause_opt filter_clause_opt
+  | RIGHT LPAREN function_argument_list_opt RPAREN within_group_clause_opt filter_clause_opt
   | qualified_name LPAREN function_argument_list_opt RPAREN within_group_clause_opt filter_clause_opt
   ;
 
 current_timestamp_precision_opt:
     /* empty */
   | LPAREN NUMBER RPAREN
+  ;
+
+overlay_for_clause_opt:
+    /* empty */
+  | FOR expression
+  ;
+
+substring_for_clause_opt:
+    /* empty */
+  | FOR expression
   ;
 
 case_when_list:
@@ -1209,6 +1277,7 @@ literal:
     STRING
   | NUMBER
   | INTERVAL STRING
+  | DATE STRING
   | TIMESTAMP STRING
   | TIMESTAMPTZ STRING
   | TRUE
@@ -1246,7 +1315,6 @@ identifier_name:
   | FIELD
   | DOMAIN
   | FRESHNESS
-  | FETCH
   | FUNCTION
   | GRAPH_METRIC
   | GRANT
@@ -1297,7 +1365,8 @@ type_name:
   ;
 
 type_keyword_name:
-    TIMESTAMP
+    DATE
+  | TIMESTAMP
   | TIMESTAMPTZ
   ;
 

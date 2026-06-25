@@ -3632,6 +3632,7 @@ pub fn parseDmlTargetAliasAlloc(
     tokens: []const Token,
     pos: *usize,
 ) !TableAlias {
+    _ = parser.matchKeywordTag(tokens, pos, .only);
     const name = try grammar.parseSqlTableReferenceIdentifierOwnedAlloc(alloc, tokens, pos);
     var name_transferred = false;
     errdefer if (!name_transferred) alloc.free(name);

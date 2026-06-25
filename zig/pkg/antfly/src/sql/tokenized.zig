@@ -344,9 +344,9 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
         return raw_statement.token_end > raw_statement.token_start + 1;
     }
     return switch (raw_statement.family orelse return false) {
-        .insert, .update, .delete, .truncate, .merge => true,
+        .insert, .update, .delete, .truncate, .merge => false,
         .ddl => true,
-        .select, .with => true,
+        .select, .with => false,
     };
 }
 

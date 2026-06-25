@@ -5837,7 +5837,7 @@ test "db lifecycle identity namespace reassignment is unavailable on status-only
     }
 }
 
-test "db lifecycle stats expose document identity coverage and tombstones" {
+test "db lifecycle doc identity stats expose coverage and tombstones" {
     const DB = @import("mod.zig").DB;
     const db_test_support = @import("test_support.zig");
     const tempPath = db_test_support.tempPath;
@@ -5921,7 +5921,7 @@ test "db lifecycle stats expose document identity coverage and tombstones" {
     try std.testing.expect(repaired_diagnostic.doc_identity.rebuild_required);
 }
 
-test "db lifecycle stats flag document identity ordinal capacity exhaustion" {
+test "db lifecycle doc identity stats flag ordinal capacity exhaustion" {
     const DB = @import("mod.zig").DB;
     const db_test_support = @import("test_support.zig");
     const tempPath = db_test_support.tempPath;
@@ -6192,6 +6192,35 @@ test "db lifecycle basic batch/get works with in-memory lsm primary backend" {
     try std.testing.expect(std.mem.indexOf(u8, raw.?, "\"beta\"") != null);
 }
 
+test "db lifecycle basic batch/get works with memory primary backend" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" },
+            .{ .key = "doc:b", .value = "{\"name\":\"beta\"}" },
+        },
+    });
+
+    const raw = try db.get(alloc, "doc:a");
+    defer if (raw) |value| alloc.free(value);
+    try std.testing.expect(raw != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw.?, "\"alpha\"") != null);
+}
+
 test "db lifecycle in-memory primary backends keep derived log off disk" {
     const DB = @import("mod.zig").DB;
     const db_test_support = @import("test_support.zig");
@@ -6292,6 +6321,80 @@ test "db lifecycle basic batch/get survives reopen with durable lsm primary back
         defer if (raw) |value| alloc.free(value);
         try std.testing.expect(raw != null);
         try std.testing.expect(std.mem.indexOf(u8, raw.?, "\"alpha\"") != null);
+    }
+}
+
+test "db lifecycle doc identity lsm primary compaction preserves ordinals" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const primary_backend: db_config.PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = primary_backend,
+        });
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" },
+                .{ .key = "doc:b", .value = "{\"body\":\"beta\"}" },
+            },
+            .sync_level = .write,
+        });
+        try db.core.store.flushBufferedWritesWithOptions(.{ .compact = true });
+
+        {
+            var txn = try db.core.store.beginProbeTxn();
+            defer txn.abort();
+            try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, 1), try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:a"));
+            try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, 2), try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:b"));
+            const doc_b = (try doc_identity.lookupDocIdTxn(alloc, &txn, 2)) orelse return error.TestUnexpectedResult;
+            defer alloc.free(doc_b);
+            try std.testing.expectEqualStrings("doc:b", doc_b);
+        }
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:c", .value = "{\"body\":\"gamma\"}" },
+                .{ .key = "doc:a", .value = "{\"body\":\"alpha updated\"}" },
+            },
+            .deletes = &.{"doc:b"},
+            .sync_level = .write,
+        });
+        try db.core.store.flushBufferedWritesWithOptions(.{ .compact = true });
+
+        var compacted_txn = try db.core.store.beginProbeTxn();
+        defer compacted_txn.abort();
+        try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, 1), try doc_identity.lookupOrdinalTxn(alloc, &compacted_txn, "doc:a"));
+        try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, 2), try doc_identity.lookupOrdinalTxn(alloc, &compacted_txn, "doc:b"));
+        try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, 3), try doc_identity.lookupOrdinalTxn(alloc, &compacted_txn, "doc:c"));
+        const doc_c = (try doc_identity.lookupDocIdTxn(alloc, &compacted_txn, 3)) orelse return error.TestUnexpectedResult;
+        defer alloc.free(doc_c);
+        try std.testing.expectEqualStrings("doc:c", doc_c);
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = primary_backend,
+        });
+        defer reopened.close();
+
+        var txn = try reopened.core.store.beginProbeTxn();
+        defer txn.abort();
+        try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, 1), try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:a"));
+        try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, 2), try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:b"));
+        try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, 3), try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:c"));
+        const doc_a = (try doc_identity.lookupDocIdTxn(alloc, &txn, 1)) orelse return error.TestUnexpectedResult;
+        defer alloc.free(doc_a);
+        try std.testing.expectEqualStrings("doc:a", doc_a);
     }
 }
 

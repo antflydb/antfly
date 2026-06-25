@@ -1981,15 +1981,20 @@ pub fn tokenIdsAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token) 
     errdefer ids.deinit(alloc);
     for (tokens, 0..) |tok, index| {
         if (tok.kind == .semicolon and trailingSemicolonOnly(tokens, index)) break;
+        const prev = if (index > 0) tokens[index - 1] else null;
         const next = if (index + 1 < tokens.len) tokens[index + 1] else null;
-        try appendTokenIds(alloc, &ids, tok, next);
+        try appendTokenIds(alloc, &ids, tok, prev, next);
     }
     return try ids.toOwnedSlice(alloc);
 }
 
-fn appendTokenIds(alloc: std.mem.Allocator, ids: *std.ArrayListUnmanaged(u16), tok: token_mod.Token, next: ?token_mod.Token) !void {
+fn appendTokenIds(alloc: std.mem.Allocator, ids: *std.ArrayListUnmanaged(u16), tok: token_mod.Token, prev: ?token_mod.Token, next: ?token_mod.Token) !void {
     switch (tok.kind) {
         .identifier => {
+            if (generatedParserTreatsKeywordAsIdentifier(tok, prev, next)) {
+                try appendIdentifierIds(alloc, ids, tok.text, false);
+                return;
+            }
             if (try keywordSymbolIdAlloc(alloc, tok)) |id| {
                 try ids.append(alloc, id);
                 return;
@@ -2032,6 +2037,12 @@ fn appendTokenIds(alloc: std.mem.Allocator, ids: *std.ArrayListUnmanaged(u16), t
         .path_arrow_text => try appendSymbol(ids, alloc, "PATH_ARROW_TEXT"),
         .semicolon => try appendSymbol(ids, alloc, "SEMICOLON"),
     }
+}
+
+fn generatedParserTreatsKeywordAsIdentifier(tok: token_mod.Token, prev: ?token_mod.Token, next: ?token_mod.Token) bool {
+    if (tok.matchesKeywordTag(.offset)) return next != null and next.?.matchesKeywordTag(.limit);
+    if (tok.matchesKeywordTag(.fetch)) return prev != null and prev.?.matchesKeywordTag(.as);
+    return false;
 }
 
 fn appendIdentifierIds(alloc: std.mem.Allocator, ids: *std.ArrayListUnmanaged(u16), text: []const u8, allow_trailing_dot: bool) !void {
@@ -4654,8 +4665,13 @@ fn generatedJoinOperator(tokens: []const token_mod.Token, source_tokens: Generat
 
 fn buildInsertDmlAst(tokens: []const token_mod.Token, start: usize, end: usize, ast: *GeneratedSqlDmlAst) void {
     if (start + 3 >= end or !tokens[start + 1].matchesKeywordTag(.into)) return;
-    ast.target_table_tokens = generatedSingleTokenRangeIfIdentifier(tokens, start + 2, end);
-    var index: usize = start + 3;
+    var target_index: usize = start + 2;
+    if (target_index < end and tokens[target_index].matchesKeywordTag(.only)) target_index += 1;
+    ast.target_table_tokens = generatedSingleTokenRangeIfIdentifier(tokens, target_index, end);
+    var index: usize = if (ast.target_table_tokens) |target| target.end else start + 3;
+    if (index + 1 < end and tokens[index].matchesKeywordTag(.as) and tokens[index + 1].kind == .identifier) {
+        index += 2;
+    }
     if (index + 1 < end and tokens[index].matchesKeywordTag(.default) and tokens[index + 1].matchesKeywordTag(.values)) {
         ast.default_values = true;
         const conflict_index = findTopLevelKeywordSequence(tokens, index + 2, end, .on, .conflict);
@@ -4697,8 +4713,14 @@ fn buildInsertDmlAst(tokens: []const token_mod.Token, start: usize, end: usize, 
 }
 
 fn buildUpdateDmlAst(tokens: []const token_mod.Token, start: usize, end: usize, ast: *GeneratedSqlDmlAst) void {
-    ast.target_table_tokens = generatedSingleTokenRangeIfIdentifier(tokens, start + 1, end);
-    const set_index = findTopLevelKeyword(tokens, start + 2, end, .set) orelse return;
+    var target_index: usize = start + 1;
+    if (target_index < end and tokens[target_index].matchesKeywordTag(.only)) target_index += 1;
+    ast.target_table_tokens = generatedSingleTokenRangeIfIdentifier(tokens, target_index, end);
+    var search_start: usize = if (ast.target_table_tokens) |target| target.end else start + 2;
+    if (search_start + 1 < end and tokens[search_start].matchesKeywordTag(.as) and tokens[search_start + 1].kind == .identifier) {
+        search_start += 2;
+    }
+    const set_index = findTopLevelKeyword(tokens, search_start, end, .set) orelse return;
     const from_index = findTopLevelKeyword(tokens, set_index + 1, end, .from);
     const where_index = findTopLevelKeyword(tokens, set_index + 1, end, .where);
     const returning_index = findTopLevelKeyword(tokens, set_index + 1, end, .returning);
@@ -4719,10 +4741,13 @@ fn buildUpdateDmlAst(tokens: []const token_mod.Token, start: usize, end: usize, 
 
 fn buildDeleteDmlAst(tokens: []const token_mod.Token, start: usize, end: usize, ast: *GeneratedSqlDmlAst) void {
     if (start + 2 >= end or !tokens[start + 1].matchesKeywordTag(.from)) return;
-    ast.target_table_tokens = generatedSingleTokenRangeIfIdentifier(tokens, start + 2, end);
-    const using_index = findTopLevelKeyword(tokens, start + 3, end, .using);
-    const where_index = findTopLevelKeyword(tokens, start + 3, end, .where);
-    const returning_index = findTopLevelKeyword(tokens, start + 3, end, .returning);
+    var target_index = start + 2;
+    if (target_index < end and tokens[target_index].matchesKeywordTag(.only)) target_index += 1;
+    ast.target_table_tokens = generatedSingleTokenRangeIfIdentifier(tokens, target_index, end);
+    const scan_start = if (ast.target_table_tokens) |target| target.end else target_index;
+    const using_index = findTopLevelKeyword(tokens, scan_start, end, .using);
+    const where_index = findTopLevelKeyword(tokens, scan_start, end, .where);
+    const returning_index = findTopLevelKeyword(tokens, scan_start, end, .returning);
     if (using_index) |idx| {
         const source_end = minOptionalIndex(where_index, returning_index) orelse end;
         if (idx + 1 < source_end) ast.source_tokens = .{ .start = idx + 1, .end = source_end };
@@ -4739,6 +4764,7 @@ fn buildDeleteDmlAst(tokens: []const token_mod.Token, start: usize, end: usize, 
 fn buildTruncateDmlAst(tokens: []const token_mod.Token, start: usize, end: usize, ast: *GeneratedSqlDmlAst) void {
     var index: usize = start + 1;
     if (index < end and tokens[index].matchesKeywordTag(.table)) index += 1;
+    if (index < end and tokens[index].matchesKeywordTag(.only)) index += 1;
     ast.target_table_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
     if (ast.target_table_tokens) |target| index = target.end;
 
@@ -6420,16 +6446,48 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .extension_index = .drop_extension }, (try parseSqlAlloc(alloc, "DROP EXTENSION vector")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .insert_values }, (try parseSqlAlloc(alloc, "INSERT INTO usage_records (id) VALUES ('u1')")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .insert_values }, (try parseSqlAlloc(alloc, "INSERT INTO usage_records DEFAULT VALUES")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .insert_values }, (try parseSqlAlloc(alloc, "INSERT INTO usage_records AS u (id, status) VALUES ('u8', 'ready') RETURNING u.id, u.status AS returned_status")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .insert_values }, (try parseSqlAlloc(alloc, "INSERT INTO products (product_id, product_name, price, valid_at) VALUES (4, 'constructor', 26.5, daterange(DATE '2025-02-01', DATE '2025-03-01')) RETURNING *")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .insert_values }, (try parseSqlAlloc(alloc, "INSERT INTO users (id, email, name) VALUES ('u2', 'A@EXAMPLE.TEST', 'new') ON CONFLICT (lower(email)) DO UPDATE SET name = excluded.name RETURNING id, name")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .insert_values }, (try parseSqlAlloc(alloc, "INSERT INTO users (id, tenant_id, email, status, name) VALUES ('u2', 't1', 'A@EXAMPLE.TEST', 'active', 'new') ON CONFLICT (tenant_id, (lower(email))) DO UPDATE SET name = excluded.name RETURNING id, name")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .insert_select }, (try parseSqlAlloc(alloc, "INSERT INTO ONLY public.usage_records (id, status, amount) SELECT archive_id, archive_status, archive_amount FROM ONLY public.archived_records WHERE archive_status = 'ready' RETURNING id, status")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .update }, (try parseSqlAlloc(alloc, "UPDATE usage_records SET status = 'done' WHERE id = 'u1'")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .update }, (try parseSqlAlloc(alloc, "UPDATE usage_records SET status = 'processing' WHERE status = 'queued' ORDER BY id ASC OFFSET 1 ROW FETCH FIRST ROW ONLY FOR UPDATE RETURNING id")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .update }, (try parseSqlAlloc(alloc, "UPDATE prices FOR PORTION OF valid_time FROM 3 TO 7 SET price = 99 WHERE sku = 'sku:a' RETURNING *")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .update }, (try parseSqlAlloc(alloc, "UPDATE usage_records SET (quantity, status) = ROW(source.source_quantity, DEFAULT) FROM source_records AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id, quantity, status")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .update }, (try parseSqlAlloc(alloc, "UPDATE usage_records SET (status, email) = ($1, lower(email)) WHERE id = $2 RETURNING status, email")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .insert_values }, (try parseSqlAlloc(alloc, "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'ACTIVE') ON CONFLICT (email) DO UPDATE SET status = overlay(status placing excluded.next_status from 2 for 1) RETURNING id, status")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .delete }, (try parseSqlAlloc(alloc, "DELETE FROM usage_records AS u WHERE status = 'expired' FOR UPDATE RETURNING u.*")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .delete }, (try parseSqlAlloc(alloc, "DELETE FROM ONLY public.usage_records WHERE id = $1 RETURNING id, LOWER(status) AS status_key")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .delete }, (try parseSqlAlloc(alloc, "DELETE FROM usage_records WHERE status = 'expired' ORDER BY expires_at ASC LIMIT 10 RETURNING id")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .delete }, (try parseSqlAlloc(alloc, "DELETE FROM prices FOR PORTION OF valid_time FROM 2 TO 8 WHERE sku = 'sku:b' RETURNING *")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .truncate }, (try parseSqlAlloc(alloc, "TRUNCATE TABLE ONLY usage_records RESTRICT")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .truncate }, (try parseSqlAlloc(alloc, "TRUNCATE TABLE ONLY public.usage_records CONTINUE IDENTITY RESTRICT")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .insert_select }, (try parseSqlAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records) INSERT INTO archive(id) SELECT id FROM source_rows")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .update }, (try parseSqlAlloc(alloc, "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .delete }, (try parseSqlAlloc(alloc, "WITH source_rows AS NOT MATERIALIZED (SELECT id FROM usage_records) DELETE FROM usage_records USING source_rows WHERE usage_records.id = source_rows.id")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .merge }, (try parseSqlAlloc(alloc, "WITH source_rows AS MATERIALIZED (SELECT id FROM usage_records) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN DELETE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .update }, (try parseSqlAlloc(alloc, "WITH ready_sources AS (SELECT source_pk, source_status FROM source_records WHERE source_status = 'ready') UPDATE usage_records SET status = source.source_status FROM ready_sources AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .merge }, (try parseSqlAlloc(alloc, "WITH source_rows AS (SELECT id, status, amount FROM usage_records WHERE id IN ('cte-merge-source-update', 'cte-merge-source-insert')) MERGE INTO usage_records AS target USING source_rows AS source ON target.id = source.status WHEN MATCHED THEN UPDATE SET status = 'cte-merged', amount = source.amount WHEN NOT MATCHED AND source.id = 'cte-merge-source-insert' THEN INSERT (id, status, amount) VALUES (source.status, 'cte-inserted', source.amount) RETURNING target.id, target.status, target.amount")).statement);
+}
+
+test "generated SQL parser facade exposes typed read and unsupported statement nodes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
     try std.testing.expectEqual(GeneratedSqlStatement{ .read = .query }, (try parseSqlAlloc(alloc, "SELECT id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .read = .aggregate }, (try parseSqlAlloc(alloc, "SELECT COUNT(DISTINCT *) AS row_count FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .read = .aggregate }, (try parseSqlAlloc(alloc, "SELECT percentile_cont([0.25, 0.75]) WITHIN GROUP (ORDER BY amount) AS bad FROM usage_records")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .read = .query }, (try parseSqlAlloc(alloc, "SELECT substring(status FROM 2 FOR 3) AS status_mid FROM usage_records WHERE substr(status, 1, 2) = $1 ORDER BY substring(status FROM 2) ASC LIMIT 5")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .read = .query }, (try parseSqlAlloc(alloc, "SELECT overlay(status placing 'X' from 2 for 3) AS status_overlay FROM usage_records WHERE overlay(status placing 'X' from 2) = $1 ORDER BY overlay(status placing 'Y' from 2 for 1) ASC LIMIT 5")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .read = .query }, (try parseSqlAlloc(alloc, "SELECT strpos(status, '-') AS dash_pos FROM usage_records WHERE position('-' in status) > $1 ORDER BY strpos(status, '-') ASC LIMIT 5")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .read = .query }, (try parseSqlAlloc(alloc, "SELECT _id FROM docs offset LIMIT 10")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .read = .query }, (try parseSqlAlloc(alloc, "SELECT _id FROM docs FETCH FIRST 10 ROWS ONLY")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .read = .query }, (try parseSqlAlloc(alloc, "SELECT _id FROM docs AS fetch LIMIT 10")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .read = .join }, (try parseSqlAlloc(alloc, "SELECT d._id FROM docs d JOIN other o ON d._id = o.doc_id WHERE d.status = 'active' LIMIT 10")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .read = .aggregate }, (try parseSqlAlloc(alloc, "SELECT count(*) AS row_count FROM docs d WHERE d.status = 'active' GROUP BY d.status LIMIT 5")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .read = .window }, (try parseSqlAlloc(alloc, "SELECT tenant, id, bool_or(enabled) FILTER (WHERE status = 'open') OVER (PARTITION BY tenant ORDER BY amount DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS any_enabled FROM usage_records WHERE status = 'open' ORDER BY any_enabled DESC LIMIT 5")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .read = .cte }, (try parseSqlAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .read_row_lock }, (try parseSqlAlloc(alloc, "SELECT id FROM usage_records FOR UPDATE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .read_row_lock }, (try parseSqlAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows FOR SHARE NOWAIT")).statement);
@@ -6480,6 +6538,25 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .savepoint }, (try parseSqlAlloc(alloc, "SAVEPOINT usage_batch")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .security_label }, (try parseSqlAlloc(alloc, "SECURITY LABEL ON TABLE usage_records IS 'internal'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .unlisten }, (try parseSqlAlloc(alloc, "UNLISTEN *")).statement);
+}
+
+test "generated SQL parser facade accepts promoted DML and read edge shapes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .update }, (try parseSqlAlloc(alloc, "UPDATE usage_records SET status = 'processing' WHERE status = 'queued' ORDER BY id ASC OFFSET 1 ROW FETCH FIRST ROW ONLY FOR UPDATE RETURNING id")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .update }, (try parseSqlAlloc(alloc, "UPDATE prices FOR PORTION OF valid_time FROM 3 TO 7 SET price = 99 WHERE sku = 'sku:a' RETURNING *")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .update }, (try parseSqlAlloc(alloc, "UPDATE usage_records SET (quantity, status) = ROW(source.source_quantity, DEFAULT) FROM source_records AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id, quantity, status")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .delete }, (try parseSqlAlloc(alloc, "DELETE FROM usage_records AS u WHERE status = 'expired' FOR UPDATE RETURNING u.*")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .delete }, (try parseSqlAlloc(alloc, "DELETE FROM usage_records WHERE status = 'expired' ORDER BY expires_at ASC LIMIT 10 RETURNING id")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .delete }, (try parseSqlAlloc(alloc, "DELETE FROM ONLY public.usage_records WHERE id = $1 RETURNING id, LOWER(status) AS status_key")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .update }, (try parseSqlAlloc(alloc, "UPDATE usage_records SET status = 'archived' WHERE (usage_records.id, usage_records.status) IN (SELECT archived_records.organization_id, archived_records.status FROM archived_records) FOR UPDATE SKIP LOCKED RETURNING id")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .merge }, (try parseSqlAlloc(alloc, "MERGE INTO ONLY public.usage_records AS target USING ONLY public.archived_records AS source ON target.id = source.archive_id WHEN MATCHED THEN UPDATE SET status = source.archive_status WHEN NOT MATCHED THEN INSERT (id, status, amount) VALUES (source.archive_id, source.archive_status, source.archive_amount) RETURNING target.id, target.status")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .dml = .truncate }, (try parseSqlAlloc(alloc, "TRUNCATE TABLE ONLY usage_records RESTRICT")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .read = .join }, (try parseSqlAlloc(alloc, "SELECT d._id FROM docs d JOIN other o ON d._id = o.doc_id WHERE d.status = 'active' LIMIT 10")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .read = .aggregate }, (try parseSqlAlloc(alloc, "SELECT count(*) AS row_count FROM docs d WHERE d.status = 'active' GROUP BY d.status LIMIT 5")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .read = .window }, (try parseSqlAlloc(alloc, "SELECT tenant, id, bool_or(enabled) FILTER (WHERE status = 'open') OVER (PARTITION BY tenant ORDER BY amount DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS any_enabled FROM usage_records WHERE status = 'open' ORDER BY any_enabled DESC LIMIT 5")).statement);
 }
 
 test "generated SQL parser facade builds control AST spans" {

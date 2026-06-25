@@ -1472,7 +1472,7 @@ test "db transactions unique constraint mutations enforce owner handoff" {
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, unique_key));
 }
 
-test "db transactions intent writes reject new documents at ordinal exhaustion" {
+test "db transactions doc identity intent writes reject new documents at ordinal exhaustion" {
     const DB = @import("mod.zig").DB;
     const db_test_support = @import("test_support.zig");
     const tempPath = db_test_support.tempPath;
