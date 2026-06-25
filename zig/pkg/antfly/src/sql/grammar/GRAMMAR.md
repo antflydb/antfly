@@ -275,7 +275,15 @@ entry points, including `CREATE MATERIALIZED VIEW` and
 trigger and rewrite-rule DDL; row-security policy DDL; logical-replication
 publication and subscription DDL; and foreign-server DDL. These common
 unsupported PostgreSQL dump/admin shapes now have stable unsupported AST
-reasons instead of generic parser fallback.
+reasons instead of generic parser fallback. Generated unsupported nodes now
+also participate in the parsed statement boundary: generated-covered
+unsupported heads that are not intentionally supported by the existing catalog
+planner become terminal parsed unsupported statements and fail closed before
+legacy DDL probing. Generated unsupported heads that already have legacy
+catalog/runtime support, such as `EXPLAIN`, `COPY`, materialized-view catalog
+DDL, row-policy catalog DDL, notification commands, maintenance commands, and
+cursor/savepoint catalog commands, stay on an explicit compatibility allowlist
+until their generated AST-to-plan implementations are promoted.
 
 ## Compatibility Policy
 
@@ -752,7 +760,10 @@ variants for:
   `SAVEPOINT`, `RELEASE`, `CREATE MATERIALIZED VIEW`, and
   `DROP MATERIALIZED VIEW`, plus bare, simple, optioned, and
   `EXPLAIN ANALYZE` forms with command spans, subject ranges where present,
-  and stable unsupported reason metadata
+  and stable unsupported reason metadata. Parsed SQL now distinguishes
+  generated unsupported statements from ordinary DDL for unsupported heads that
+  are not on the legacy-supported compatibility allowlist, so lowerers fail
+  closed instead of trying a generic DDL parse for those shapes.
 
 Later statement-family cutovers should add closed variants for:
 

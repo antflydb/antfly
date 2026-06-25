@@ -1888,3 +1888,697 @@ test "db schema apply validates unvalidated check promotion" {
     try std.testing.expectEqual(schema_mod.RelationalCheckValidationState.enforced, enforced_schema.checks[0].validation_state);
     try std.testing.expectEqual(schema_mod.RelationalCheckValidationState.enforced, enforced_schema.checks[1].validation_state);
 }
+
+test "db direct schema apply rejects storage mode switches" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const document_schema =
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"}}}}}}
+    ;
+    const relational_schema =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+
+    try db.applyTableSchemaJson(alloc, document_schema, .{});
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, db.applyTableSchemaJson(alloc, relational_schema, .{}));
+
+    const durable_schema = (try schema_mod.loadSchema(db.core.store, alloc)) orelse return error.TestUnexpectedResult;
+    defer schema_mod.freeSchema(alloc, durable_schema);
+    try std.testing.expectEqual(schema_mod.StorageMode.document, durable_schema.storage_mode);
+}
+
+test "db direct schema apply rejects relational base column changes" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const relational_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    const changed_columns_schema =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"keyword"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+
+    try db.applyTableSchemaJson(alloc, relational_schema, .{});
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, db.applyTableSchemaJson(alloc, changed_columns_schema, .{}));
+
+    const durable_schema = (try schema_mod.loadSchema(db.core.store, alloc)) orelse return error.TestUnexpectedResult;
+    defer schema_mod.freeSchema(alloc, durable_schema);
+    try std.testing.expectEqual(schema_mod.StorageMode.relational, durable_schema.storage_mode);
+    try std.testing.expectEqual(schema_mod.AntflyType.numeric, durable_schema.relational_columns[1].field_type);
+}
+
+test "db direct schema apply appends literal default and generated columns through row rewrite" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"amount":{"type":"numeric"},"status":{"type":"keyword","default":"ACTIVE"},"note":{"type":"keyword"},"title_lc":{"type":"keyword","generated":{"op":"lower","field":"title"}},"status_lc":{"type":"keyword","generated":{"op":"lower","field":"status"}},"status_expr_lc":{"type":"keyword","generated":{"op":"expression","expression":{"op":"lower","args":[{"field":"status"}]}}}},"required":["title"],"additionalProperties":false}}}}
+    ;
+
+    try db.applyTableSchemaJson(alloc, schema_v1, .{});
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"one\",\"amount\":3}" }},
+    });
+
+    try db.applyTableSchemaJson(alloc, schema_v2, .{});
+
+    const materialized = (try db.get(alloc, "doc:a")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(materialized);
+    try std.testing.expectEqualStrings("{\"title\":\"one\",\"amount\":3,\"status\":\"ACTIVE\",\"title_lc\":\"one\",\"status_lc\":\"active\",\"status_expr_lc\":\"active\"}", materialized);
+
+    const status_column = try internal_keys.relationalColumnKeyAlloc(alloc, "doc:a", "status");
+    defer alloc.free(status_column);
+    const status_value = try db.core.store.get(alloc, status_column);
+    defer alloc.free(status_value);
+
+    const status_index = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "status", "doc:a");
+    defer alloc.free(status_index);
+    const status_index_value = try db.core.store.get(alloc, status_index);
+    defer alloc.free(status_index_value);
+
+    const note_column = try internal_keys.relationalColumnKeyAlloc(alloc, "doc:a", "note");
+    defer alloc.free(note_column);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, note_column));
+
+    const title_lc_index = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "title_lc", "doc:a");
+    defer alloc.free(title_lc_index);
+    const title_lc_index_value = try db.core.store.get(alloc, title_lc_index);
+    defer alloc.free(title_lc_index_value);
+
+    const status_expr_lc_index = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "status_expr_lc", "doc:a");
+    defer alloc.free(status_expr_lc_index);
+    const status_expr_lc_index_value = try db.core.store.get(alloc, status_expr_lc_index);
+    defer alloc.free(status_expr_lc_index_value);
+
+    const durable_schema = (try schema_mod.loadSchema(db.core.store, alloc)) orelse return error.TestUnexpectedResult;
+    defer schema_mod.freeSchema(alloc, durable_schema);
+    try std.testing.expectEqual(@as(usize, 7), durable_schema.relational_columns.len);
+    const durable_generated = durable_schema.relational_columns[6].generated orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(schema_mod.RelationalGeneratedOp.expression, durable_generated.op);
+    const durable_expression = durable_generated.expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(types.RelationalRowsExpressionKind.lower, durable_expression.kind);
+}
+
+test "db direct schema apply rejects generated columns without deterministic backfill sources" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    const missing_source_schema =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"note":{"type":"keyword"},"note_lc":{"type":"keyword","generated":{"op":"lower","field":"note"}}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    const generated_source_schema =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"title_lc":{"type":"keyword","generated":{"op":"lower","field":"title"}},"title_lc_md5":{"type":"keyword","generated":{"op":"md5","field":"title_lc"}}},"required":["title"],"additionalProperties":false}}}}
+    ;
+
+    try db.applyTableSchemaJson(alloc, schema_v1, .{});
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, db.applyTableSchemaJson(alloc, missing_source_schema, .{}));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, db.applyTableSchemaJson(alloc, generated_source_schema, .{}));
+}
+
+test "db first relational schema apply rejects existing document rows" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:existing", .value = "{\"title\":\"already document mode\"}" }},
+    });
+
+    const relational_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, db.applyTableSchemaJson(alloc, relational_schema, .{}));
+    const schema = try schema_mod.loadSchema(db.core.store, alloc);
+    defer if (schema) |loaded| schema_mod.freeSchema(alloc, loaded);
+    try std.testing.expect(schema == null);
+}
+
+test "db executes claimed schema rewrite job expressions over relational rows" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"},"status_key":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}}}
+    ;
+
+    try db.applyTableSchemaJson(alloc, schema_v1, .{});
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"one\",\"status\":\"ACTIVE\"}" }},
+    });
+    try db.applyTableSchemaJson(alloc, schema_v2, .{});
+
+    const expression = types.RelationalRowsExpression{
+        .kind = .lower,
+        .operands = &.{.{
+            .kind = .field,
+            .field = "status",
+        }},
+    };
+    const job = metadata_table_manager.SchemaRewriteJobRecord{
+        .job_id = 44,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_v2),
+        .action = "rewrite",
+        .reason = "row_images",
+        .start_row_key = "",
+        .end_row_key = null,
+        .state = metadata_table_manager.schema_rewrite_running,
+        .target_column = "status_key",
+        .expression = expression,
+        .lease_owner = "worker-a",
+        .lease_expires_at_ms = 10_000,
+    };
+
+    var result = try db.executeClaimedSchemaRewriteJob(alloc, job);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), result.report.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 1), result.report.rewritten_rows);
+    try std.testing.expectEqualStrings("", result.progress_row_key);
+    const finish = result.finishRequest(job);
+    try std.testing.expectEqual(@as(u64, 1), finish.completed_row_count);
+    try std.testing.expectEqualStrings("worker-a", finish.lease_owner);
+
+    const materialized = (try db.get(alloc, "doc:a")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(materialized);
+    try std.testing.expect(std.mem.indexOf(u8, materialized, "\"status_key\":\"active\"") != null);
+
+    const status_key_index = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "status_key", "doc:a");
+    defer alloc.free(status_key_index);
+    const status_key_index_value = try db.core.store.get(alloc, status_key_index);
+    defer alloc.free(status_key_index_value);
+
+    var unclaimed = job;
+    unclaimed.state = metadata_table_manager.schema_rewrite_declared;
+    try std.testing.expectError(error.SchemaRewriteJobNotRunning, db.executeClaimedSchemaRewriteJob(alloc, unclaimed));
+
+    var stale = job;
+    stale.schema_generation = 99;
+    try std.testing.expectError(error.InvalidSchemaRewriteGeneration, db.executeClaimedSchemaRewriteJob(alloc, stale));
+}
+
+test "db executes claimed schema validation jobs over relational rows" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id","status","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id","status","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_email_key","columns":["email"],"validation_state":"enforced"}],"checks":[{"name":"users_status_known","field":"status","op":"eq","value":"active","validation_state":"enforced"}]}
+    ;
+
+    try db.applyTableSchemaJson(alloc, schema_v1, .{});
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"id\":\"a\",\"status\":\"active\",\"email\":\"a@example.test\"}" }},
+    });
+    try db.applyTableSchemaJson(alloc, schema_v2, .{});
+
+    const job = metadata_table_manager.SchemaRewriteJobRecord{
+        .job_id = 47,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_v2),
+        .action = "validate",
+        .reason = "constraints",
+        .start_row_key = "",
+        .end_row_key = null,
+        .state = metadata_table_manager.schema_rewrite_running,
+        .lease_owner = "worker-a",
+        .lease_expires_at_ms = 10_000,
+    };
+
+    var result = try db.executeClaimedSchemaRewriteJob(alloc, job);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), result.report.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 0), result.report.rewritten_rows);
+    try std.testing.expectEqual(@as(u64, 1), result.report.unchanged_rows);
+    try std.testing.expectEqualStrings("", result.progress_row_key);
+    const finish = result.finishRequest(job);
+    try std.testing.expectEqual(@as(u64, 1), finish.completed_row_count);
+
+    var invalid_payload = job;
+    invalid_payload.target_column = "status";
+    try std.testing.expectError(error.InvalidSchemaRewriteJob, db.executeClaimedSchemaRewriteJob(alloc, invalid_payload));
+}
+
+test "db executes claimed full schema rewrite jobs over relational rows" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}}}
+    ;
+
+    try db.applyTableSchemaJson(alloc, schema_v1, .{});
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"one\",\"status\":\"ACTIVE\"}" }},
+    });
+
+    const status_index = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "status", "doc:a");
+    defer alloc.free(status_index);
+    const initial_status_index_value = try db.core.store.get(alloc, status_index);
+    defer alloc.free(initial_status_index_value);
+
+    try db.applyTableSchemaJson(alloc, schema_v2, .{});
+
+    const job = metadata_table_manager.SchemaRewriteJobRecord{
+        .job_id = 46,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_v2),
+        .action = "rewrite",
+        .reason = "row_images",
+        .start_row_key = "",
+        .end_row_key = null,
+        .state = metadata_table_manager.schema_rewrite_running,
+        .full_row_rewrite = true,
+        .lease_owner = "worker-a",
+        .lease_expires_at_ms = 10_000,
+    };
+
+    var result = try db.executeClaimedSchemaRewriteJob(alloc, job);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), result.report.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 1), result.report.rewritten_rows);
+    try std.testing.expectEqual(@as(u64, 0), result.report.renamed_cells);
+    try std.testing.expectEqual(@as(u64, 0), result.report.dropped_cells);
+
+    const materialized = (try db.get(alloc, "doc:a")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(materialized);
+    try std.testing.expect(std.mem.indexOf(u8, materialized, "\"title\":\"one\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, materialized, "\"status\":\"ACTIVE\"") != null);
+
+    const title_index = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "title", "doc:a");
+    defer alloc.free(title_index);
+    const title_index_value = try db.core.store.get(alloc, title_index);
+    defer alloc.free(title_index_value);
+    const rewritten_status_index_value = try db.core.store.get(alloc, status_index);
+    defer alloc.free(rewritten_status_index_value);
+}
+
+test "db executes claimed schema rewrite row plans over relational rows" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"},"legacy_status":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"state":{"type":"keyword"}},"required":["title","state"],"additionalProperties":false}}}}
+    ;
+
+    try db.applyTableSchemaJson(alloc, schema_v1, .{});
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"one\",\"status\":\"ACTIVE\",\"legacy_status\":\"old\"}" }},
+    });
+    try db.applyTableSchemaJson(alloc, schema_v2, .{});
+
+    const job = metadata_table_manager.SchemaRewriteJobRecord{
+        .job_id = 45,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_v2),
+        .action = "rewrite",
+        .reason = "row_images",
+        .start_row_key = "",
+        .end_row_key = null,
+        .state = metadata_table_manager.schema_rewrite_running,
+        .rewrite_renames = &.{.{ .old_path = "status", .new_path = "state" }},
+        .rewrite_drops = &.{"legacy_status"},
+        .lease_owner = "worker-a",
+        .lease_expires_at_ms = 10_000,
+    };
+
+    var result = try db.executeClaimedSchemaRewriteJob(alloc, job);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), result.report.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 1), result.report.rewritten_rows);
+    try std.testing.expectEqual(@as(u64, 1), result.report.renamed_cells);
+    try std.testing.expectEqual(@as(u64, 1), result.report.dropped_cells);
+
+    const materialized = (try db.get(alloc, "doc:a")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(materialized);
+    try std.testing.expect(std.mem.indexOf(u8, materialized, "\"state\":\"ACTIVE\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, materialized, "\"status\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, materialized, "\"legacy_status\"") == null);
+
+    const state_index = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "state", "doc:a");
+    defer alloc.free(state_index);
+    const state_index_value = try db.core.store.get(alloc, state_index);
+    defer alloc.free(state_index_value);
+    const old_status_index = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "status", "doc:a");
+    defer alloc.free(old_status_index);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, old_status_index));
+}
+
+test "db drains metadata schema rewrite jobs through claim and finish lifecycle" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"},"status_key":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}}}
+    ;
+
+    try db.applyTableSchemaJson(alloc, schema_v1, .{});
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"one\",\"status\":\"ACTIVE\"}" }},
+    });
+    try db.applyTableSchemaJson(alloc, schema_v2, .{});
+
+    const TestSchemaRewriteService = struct {
+        manager: metadata_table_manager.TableManager,
+
+        fn deinit(self: *@This()) void {
+            self.manager.deinit();
+        }
+
+        pub fn listProjectedSchemaRewriteJobs(self: *@This(), allocator: std.mem.Allocator) ![]metadata_table_manager.SchemaRewriteJobRecord {
+            return try self.manager.listSchemaRewriteJobs(allocator);
+        }
+
+        pub fn freeProjectedSchemaRewriteJobs(self: *@This(), allocator: std.mem.Allocator, records: []metadata_table_manager.SchemaRewriteJobRecord) void {
+            self.manager.freeSchemaRewriteJobs(allocator, records);
+        }
+
+        pub fn beginSchemaRewriteJob(self: *@This(), request: metadata_table_manager.SchemaRewriteJobBeginRequest) !void {
+            try self.manager.beginSchemaRewriteJob(request);
+        }
+
+        pub fn finishSchemaRewriteJob(self: *@This(), request: metadata_table_manager.SchemaRewriteJobFinishRequest) !void {
+            try self.manager.finishSchemaRewriteJob(request);
+        }
+
+        pub fn invalidateSchemaRewriteJob(self: *@This(), request: metadata_table_manager.SchemaRewriteJobInvalidateRequest) !void {
+            try self.manager.invalidateSchemaRewriteJob(request);
+        }
+    };
+
+    var service = TestSchemaRewriteService{ .manager = metadata_table_manager.TableManager.init(alloc) };
+    defer service.deinit();
+    try service.manager.upsertTable(.{
+        .table_id = 7,
+        .name = "usage_records",
+        .schema_json = schema_v2,
+    });
+    try service.manager.upsertSchemaRewriteJob(.{
+        .job_id = 44,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_v2),
+        .action = "rewrite",
+        .reason = "row_images",
+        .start_row_key = "",
+        .end_row_key = null,
+        .target_column = "status_key",
+        .expression = .{
+            .kind = .lower,
+            .operands = &.{.{
+                .kind = .field,
+                .field = "status",
+            }},
+        },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), try db.drainSchemaRewriteJobsForIdle(alloc, &service, .{
+        .worker_id = "worker-a",
+        .group_id = 9001,
+        .now_ms = 1000,
+        .lease_ttl_ms = 5000,
+        .max_jobs = 4,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), try db.drainSchemaRewriteJobsForIdle(alloc, &service, .{
+        .worker_id = "worker-a",
+        .group_id = 9001,
+        .now_ms = 2000,
+        .lease_ttl_ms = 5000,
+        .max_jobs = 4,
+    }));
+
+    const jobs = try service.manager.listSchemaRewriteJobs(alloc);
+    defer service.manager.freeSchemaRewriteJobs(alloc, jobs);
+    try std.testing.expectEqual(@as(usize, 1), jobs.len);
+    try std.testing.expectEqualStrings(metadata_table_manager.schema_rewrite_ready, jobs[0].state);
+    try std.testing.expectEqual(@as(u64, 1), jobs[0].completed_row_count);
+    try std.testing.expectEqualStrings("", jobs[0].progress_row_key);
+    try std.testing.expectEqualStrings("", jobs[0].last_error);
+
+    const materialized = (try db.get(alloc, "doc:a")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(materialized);
+    try std.testing.expect(std.mem.indexOf(u8, materialized, "\"status_key\":\"active\"") != null);
+}
+
+test "db schema rewrite drain skips stale claim races and continues" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"},"status_key":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}}}
+    ;
+    try db.applyTableSchemaJson(alloc, schema_v1, .{});
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"one\",\"status\":\"ACTIVE\"}" }},
+    });
+    try db.applyTableSchemaJson(alloc, schema_v2, .{});
+
+    const TestSchemaRewriteService = struct {
+        manager: metadata_table_manager.TableManager,
+        raced_job_id: u64,
+        race_claims: usize = 0,
+
+        fn deinit(self: *@This()) void {
+            self.manager.deinit();
+        }
+
+        pub fn listProjectedSchemaRewriteJobs(self: *@This(), allocator: std.mem.Allocator) ![]metadata_table_manager.SchemaRewriteJobRecord {
+            return try self.manager.listSchemaRewriteJobs(allocator);
+        }
+
+        pub fn freeProjectedSchemaRewriteJobs(self: *@This(), allocator: std.mem.Allocator, records: []metadata_table_manager.SchemaRewriteJobRecord) void {
+            self.manager.freeSchemaRewriteJobs(allocator, records);
+        }
+
+        pub fn beginSchemaRewriteJob(self: *@This(), request: metadata_table_manager.SchemaRewriteJobBeginRequest) !void {
+            if (request.job_id == self.raced_job_id) {
+                self.race_claims += 1;
+                return error.SchemaRewriteJobClaimBusy;
+            }
+            try self.manager.beginSchemaRewriteJob(request);
+        }
+
+        pub fn finishSchemaRewriteJob(self: *@This(), request: metadata_table_manager.SchemaRewriteJobFinishRequest) !void {
+            try self.manager.finishSchemaRewriteJob(request);
+        }
+
+        pub fn invalidateSchemaRewriteJob(self: *@This(), request: metadata_table_manager.SchemaRewriteJobInvalidateRequest) !void {
+            try self.manager.invalidateSchemaRewriteJob(request);
+        }
+    };
+
+    const generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_v2);
+    var service = TestSchemaRewriteService{
+        .manager = metadata_table_manager.TableManager.init(alloc),
+        .raced_job_id = 41,
+    };
+    defer service.deinit();
+    try service.manager.upsertTable(.{
+        .table_id = 7,
+        .name = "usage_records",
+        .schema_json = schema_v2,
+    });
+    try service.manager.upsertSchemaRewriteJob(.{
+        .job_id = 41,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = generation,
+        .action = "rewrite",
+        .reason = "row_images",
+        .start_row_key = "",
+        .end_row_key = null,
+        .target_column = "status_key",
+        .expression = .{
+            .kind = .lower,
+            .operands = &.{.{ .kind = .field, .field = "status" }},
+        },
+    });
+    try service.manager.upsertSchemaRewriteJob(.{
+        .job_id = 42,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = generation,
+        .action = "rewrite",
+        .reason = "row_images",
+        .start_row_key = "",
+        .end_row_key = null,
+        .target_column = "status_key",
+        .expression = .{
+            .kind = .lower,
+            .operands = &.{.{ .kind = .field, .field = "status" }},
+        },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), try db.drainSchemaRewriteJobsForIdle(alloc, &service, .{
+        .worker_id = "worker-a",
+        .group_id = 9001,
+        .now_ms = 1000,
+        .lease_ttl_ms = 5000,
+        .max_jobs = 1,
+    }));
+    try std.testing.expectEqual(@as(usize, 1), service.race_claims);
+
+    const jobs = try service.manager.listSchemaRewriteJobs(alloc);
+    defer service.manager.freeSchemaRewriteJobs(alloc, jobs);
+    try std.testing.expectEqual(@as(usize, 2), jobs.len);
+    var raced_state: []const u8 = "";
+    var completed_state: []const u8 = "";
+    for (jobs) |job| {
+        if (job.job_id == 41) raced_state = job.state;
+        if (job.job_id == 42) completed_state = job.state;
+    }
+    try std.testing.expectEqualStrings(metadata_table_manager.schema_rewrite_declared, raced_state);
+    try std.testing.expectEqualStrings(metadata_table_manager.schema_rewrite_ready, completed_state);
+
+    const materialized = (try db.get(alloc, "doc:a")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(materialized);
+    try std.testing.expect(std.mem.indexOf(u8, materialized, "\"status_key\":\"active\"") != null);
+}

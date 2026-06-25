@@ -5604,3 +5604,84 @@ test "db foreign key integrity job records persist intent and completion" {
     try std.testing.expectEqual(@as(u64, 25_000), persisted.first_violation_at_ns.?);
     try std.testing.expectEqual(@as(u64, 25_000), persisted.last_violation_at_ns.?);
 }
+
+test "db direct schema apply validates and builds added unique constraints" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]}]}
+    ;
+
+    try db.applyTableSchemaJson(alloc, schema_v1, .{});
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:a", .value = "{\"id\":\"user:a\",\"email\":\"a@example.com\"}" },
+            .{ .key = "user:b", .value = "{\"id\":\"user:b\",\"email\":\"b@example.com\"}" },
+        },
+    });
+
+    try db.applyTableSchemaJson(alloc, schema_v2, .{});
+
+    const unique_value = try relational_store_mod.bytesTupleValueAlloc(alloc, &.{"a@example.com"});
+    defer alloc.free(unique_value);
+    const unique_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_email_key", unique_value);
+    defer alloc.free(unique_key);
+    const owner = try db.core.store.get(alloc, unique_key);
+    defer alloc.free(owner);
+    try std.testing.expectEqualStrings("user:a", owner);
+
+    try std.testing.expectError(error.UniqueConstraintViolation, db.batch(.{
+        .writes = &.{.{ .key = "user:c", .value = "{\"id\":\"user:c\",\"email\":\"a@example.com\"}" }},
+    }));
+}
+
+test "db direct schema apply rejects added unique constraints with duplicate existing rows" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]}]}
+    ;
+
+    try db.applyTableSchemaJson(alloc, schema_v1, .{});
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:a", .value = "{\"id\":\"user:a\",\"email\":\"same@example.com\"}" },
+            .{ .key = "user:b", .value = "{\"id\":\"user:b\",\"email\":\"same@example.com\"}" },
+        },
+    });
+
+    try std.testing.expectError(error.UniqueConstraintViolation, db.applyTableSchemaJson(alloc, schema_v2, .{}));
+    const durable_schema = (try schema_mod.loadSchema(db.core.store, alloc)) orelse return error.TestUnexpectedResult;
+    defer schema_mod.freeSchema(alloc, durable_schema);
+    try std.testing.expectEqual(@as(usize, 0), durable_schema.unique_constraints.len);
+}

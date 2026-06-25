@@ -8559,6 +8559,10 @@ pub fn lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     function_bindings: lower_expr.SqlFunctionBindings,
 ) !LoweredDdlPlan {
+    switch (parsed_sql.statement) {
+        .unsupported => return error.UnsupportedSqlShape,
+        else => {},
+    }
     const tokens = parsed_sql.items();
     var state = parser_context.ParserState{
         .alloc = alloc,
@@ -13244,6 +13248,17 @@ test "sql adapter ddl plan lowers routine expression bindings into ddl plans" {
 
 test "sql adapter ddl plan rejects unsupported ddl shapes explicitly" {
     const alloc = std.testing.allocator;
+    var generated_unsupported = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CREATE RULE usage_insert AS ON INSERT TO usage_records DO ALSO NOTIFY usage_events",
+    );
+    defer generated_unsupported.deinit(alloc);
+    switch (generated_unsupported.statement) {
+        .unsupported => |statement| try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.create_rule, statement.kind),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &generated_unsupported));
+
     var replace_if_not_exists = try lowerDdlPlanForTestAlloc(
         alloc,
         "CREATE OR REPLACE TABLE IF NOT EXISTS audit_log (id uuid PRIMARY KEY)",

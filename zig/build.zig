@@ -5976,16 +5976,13 @@ pub fn build(b: *std.Build) void {
     const db_schema_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{
-            "db schema apply validates added check constraints against existing rows",
-            "db schema checks execute json row expressions in storage",
-            "db schema checks execute temporal and case row expressions in storage",
-            "db schema apply validates unvalidated check promotion",
-            "relational scalar expression partial predicates maintain indexes and unique owners",
-            "relational boolean and pattern expression partial predicates maintain indexes and unique owners",
-            "relational array and json object expression partial predicates maintain indexes and unique owners",
-            "relational temporal and case expression partial predicates maintain indexes and unique owners",
-            "db executes claimed schema validation jobs over relational rows",
-            "db system-versioned relational tables capture durable row history",
+            "db schema checks",
+            "db schema apply validates",
+            "db direct schema apply",
+            "schema rewrite",
+            "partial predicates maintain indexes and unique owners",
+            "db executes claimed schema validation jobs",
+            "db system-versioned relational tables",
         },
     });
     const run_db_schema_tests = b.addRunArtifact(db_schema_tests);
@@ -6002,15 +5999,7 @@ pub fn build(b: *std.Build) void {
 
     const db_temporal_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{
-            "db relational temporal primary keys enforce without-overlaps intervals",
-            "db relational temporal foreign keys require covered parent periods",
-            "db relational temporal foreign key repair rebuilds coverage refs",
-            "db relational temporal portion mutation requires temporal primary identity",
-            "db relational temporal mutation source splits portions transactionally",
-            "db relational temporal mutation source preserves foreign key coverage",
-            "db relational temporal workload combines portion splits foreign key repair and owner validation",
-        },
+        .filters = &.{"db relational temporal"},
     });
     const run_db_temporal_tests = b.addRunArtifact(db_temporal_tests);
     const db_temporal_test_step = b.step("db-temporal-test", "Run focused storage/db application-time temporal unit tests");

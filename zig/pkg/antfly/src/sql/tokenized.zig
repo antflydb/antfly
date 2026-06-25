@@ -83,6 +83,11 @@ pub const ParsedSessionStatement = struct {
     raw: RawSqlStatement,
 };
 
+pub const ParsedUnsupportedStatement = struct {
+    kind: generated_parser.GeneratedSqlUnsupportedKind,
+    raw: RawSqlStatement,
+};
+
 pub const GeneratedRawSqlStatement = struct {
     raw: RawSqlStatement,
     statement: generated_parser.GeneratedSqlStatement,
@@ -106,6 +111,7 @@ pub const ParsedStatement = union(enum) {
     transaction: ParsedTransactionStatement,
     prepared: ParsedPreparedStatement,
     session: ParsedSessionStatement,
+    unsupported: ParsedUnsupportedStatement,
     unknown: RawSqlStatement,
 
     pub fn raw(self: ParsedStatement) RawSqlStatement {
@@ -117,6 +123,7 @@ pub const ParsedStatement = union(enum) {
             .transaction => |statement| statement.raw,
             .prepared => |statement| statement.raw,
             .session => |statement| statement.raw,
+            .unsupported => |statement| statement.raw,
             .unknown => |statement| statement,
         };
     }
@@ -484,7 +491,7 @@ fn parseStatement(
             .dml => if (tokenized_sql.write_statement_kind) |kind| return .{ .write = .{ .kind = kind, .raw = raw_statement } },
             .read => if (tokenized_sql.read_statement_kind) |kind| return .{ .read = .{ .kind = kind, .raw = raw_statement } },
             .graph => return .{ .ddl = .{ .raw = raw_statement } },
-            .unsupported => {},
+            .unsupported => |kind| if (!generatedUnsupportedUsesLegacyPlanner(kind)) return .{ .unsupported = .{ .kind = kind, .raw = raw_statement } },
             .other => {},
         }
     }
@@ -500,6 +507,59 @@ fn parseStatement(
     return switch (tokenized_sql.statement_family orelse return .{ .unknown = raw_statement }) {
         .ddl => classifyDdlLikeStatement(raw_statement, tokenized_sql.items()),
         else => .{ .unknown = raw_statement },
+    };
+}
+
+fn generatedUnsupportedUsesLegacyPlanner(kind: generated_parser.GeneratedSqlUnsupportedKind) bool {
+    return switch (kind) {
+        .alter_policy,
+        .alter_publication,
+        .alter_subscription,
+        .analyze,
+        .call,
+        .close,
+        .cluster,
+        .comment,
+        .copy,
+        .create_materialized_view,
+        .create_policy,
+        .create_publication,
+        .create_subscription,
+        .create_trigger,
+        .declare,
+        .drop_materialized_view,
+        .drop_policy,
+        .drop_publication,
+        .drop_subscription,
+        .drop_trigger,
+        .explain,
+        .fetch,
+        .grant,
+        .listen,
+        .lock,
+        .notify,
+        .refresh,
+        .reindex,
+        .release,
+        .revoke,
+        .savepoint,
+        .unlisten,
+        .vacuum,
+        => true,
+        .alter_foreign_table,
+        .alter_server,
+        .checkpoint,
+        .create_foreign_table,
+        .create_rule,
+        .create_server,
+        .do_block,
+        .drop_foreign_table,
+        .drop_rule,
+        .drop_server,
+        .load,
+        .move,
+        .security_label,
+        => false,
     };
 }
 
@@ -1195,6 +1255,22 @@ test "sql adapter parsed sql owns typed statement variants" {
                 }
             },
             else => return error.TestUnexpectedResult,
+        }
+        if (generatedUnsupportedUsesLegacyPlanner(case.kind)) {
+            switch (parsed.statement) {
+                .unsupported => return error.TestUnexpectedResult,
+                else => {},
+            }
+        } else {
+            switch (parsed.statement) {
+                .unsupported => |unsupported| {
+                    try std.testing.expectEqual(case.kind, unsupported.kind);
+                    try std.testing.expectEqualStrings(case.sql, unsupported.raw.sql(parsed.sql()));
+                },
+                else => return error.TestUnexpectedResult,
+            }
+            try std.testing.expect(parsed.readStatementKind() == null);
+            try std.testing.expect(parsed.writeStatementKind() == null);
         }
     }
 
