@@ -1291,6 +1291,7 @@ fn validateGeneratedPredicateExpressionMatchesRange(
 }
 
 fn generatedExpressionAstHasMetadata(expression: generated_parser.GeneratedSqlExpressionAst) bool {
+    if (generatedExpressionAstHasScalarShapeMetadata(expression)) return true;
     if (expression.tokens != null or
         expression.inner_tokens != null or
         expression.function_name_tokens != null or
@@ -4174,6 +4175,22 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_having_clause_parsed_sql, malformed_having_clause_read_ast),
+    );
+
+    var stale_having_shape_metadata_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT status, COUNT(*) FROM usage_records GROUP BY status",
+    );
+    defer stale_having_shape_metadata_parsed_sql.deinit(alloc);
+    const stale_having_shape_metadata_generated_raw = stale_having_shape_metadata_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var stale_having_shape_metadata_read_ast = switch (stale_having_shape_metadata_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    stale_having_shape_metadata_read_ast.having_expression.case_branch_count = 1;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &stale_having_shape_metadata_parsed_sql, stale_having_shape_metadata_read_ast),
     );
 
     var malformed_order_list_containment_parsed_sql = try tokenized.ParsedSql.initAlloc(

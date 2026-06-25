@@ -673,7 +673,10 @@ Unsupported DDL remains on the existing parser until
    right-hand `FROM`/`WHERE` clauses, CTE-body `SELECT`/source clauses,
    expression-subquery `SELECT` clauses, and generated top-level and CTE-body
    join `ON`/`USING` condition keyword layout before invoking the typed
-   read-family lowerers.
+   read-family lowerers. Optional generated expression fields now treat
+   scalar-only shape metadata, such as child-kind tags and branch counts, as
+   real retained metadata so stale expression payloads fail closed even when no
+   token range is present.
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current
@@ -936,7 +939,9 @@ Generated grammar work needs evidence at multiple levels:
   bare alias ranges disagree with the underlying list-item tokens, and
   generated ordering lists now fail closed when typed `ASC`/`DESC`, `USING`
   operator, or `NULLS FIRST`/`LAST` metadata disagrees with the underlying
-  order-item tokens. Generated CTE body clause spans now fail closed when
+  order-item tokens. Optional generated expression payload checks now also
+  reject scalar-only stale shape metadata, including orphan branch counts and
+  child-kind tags. Generated CTE body clause spans now fail closed when
   retained `WHERE`, `GROUP BY`, `HAVING`, `WINDOW`, `ORDER BY`, `LIMIT`,
   `OFFSET`, or `FETCH` payload ranges are not preceded by their matching
   clause keywords.
