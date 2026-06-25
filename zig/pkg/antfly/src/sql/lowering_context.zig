@@ -1481,7 +1481,7 @@ fn validateGeneratedAntflySourceArgumentItems(
 ) !void {
     if (item.argument_items.len != item.argument_count) return error.UnsupportedSqlShape;
     var previous_end: usize = item.argument_tokens.start;
-    for (item.argument_items) |argument| {
+    for (item.argument_items, 0..) |argument, index| {
         if (argument.tokens.start < previous_end) return error.UnsupportedSqlShape;
         if (argument.tokens.start < item.argument_tokens.start or argument.tokens.end > item.argument_tokens.end) return error.UnsupportedSqlShape;
         if (!std.meta.eql(argument.name_tokens, generated_parser.GeneratedSqlTokenRange{ .start = argument.tokens.start, .end = argument.tokens.start + 1 })) return error.UnsupportedSqlShape;
@@ -1492,6 +1492,11 @@ fn validateGeneratedAntflySourceArgumentItems(
         if (tokens[argument.operator_tokens.start].kind != .eq) return error.UnsupportedSqlShape;
         if (argument.operator_tokens.end == argument.operator_tokens.start + 2 and tokens[argument.operator_tokens.start + 1].kind != .gt) return error.UnsupportedSqlShape;
         if (argument.operator_tokens.end != argument.operator_tokens.start + 1 and argument.operator_tokens.end != argument.operator_tokens.start + 2) return error.UnsupportedSqlShape;
+        for (item.argument_items[0..index]) |previous| {
+            if (std.ascii.eqlIgnoreCase(tokens[previous.name_tokens.start].text, tokens[argument.name_tokens.start].text)) {
+                return error.UnsupportedSqlShape;
+            }
+        }
         previous_end = argument.tokens.end;
     }
 }
@@ -4485,6 +4490,22 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_graph_source_parsed_sql, malformed_graph_source_read_ast),
     );
+
+    var duplicate_antfly_argument_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT * FROM antfly.full_text_search(index => 'docs_body_fts', query => 'refund', query => 'policy', limit => 10) AS hits",
+    );
+    defer duplicate_antfly_argument_parsed_sql.deinit(alloc);
+    const duplicate_antfly_argument_generated_raw = duplicate_antfly_argument_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    const duplicate_antfly_argument_read_ast = switch (duplicate_antfly_argument_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &duplicate_antfly_argument_parsed_sql, duplicate_antfly_argument_read_ast),
+    );
+
     malformed_graph_source_read_ast = switch (malformed_graph_source_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
         else => return error.UnsupportedSqlShape,

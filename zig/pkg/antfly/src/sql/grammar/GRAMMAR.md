@@ -933,8 +933,9 @@ Unsupported DDL remains on the existing parser until
    function kind metadata across joined sources, graph function subset metadata,
    graph-specific semantic argument payloads for table/index selectors,
    start/target selectors, pattern returns, metric names, and query text, and
-   fail-closed generated-read validation that rejects corrupted or missing
-   required graph payloads before typed lowering.
+   fail-closed generated-read validation that rejects duplicate named
+   arguments and corrupted or missing required graph payloads before typed
+   lowering.
    Broader graph traversal, graph metric query planning, and graph DSL cutover
    still require direct generated graph-query planning beyond retained semantic
    payload validation and broader unsupported-shape diagnostics.
@@ -1240,8 +1241,8 @@ Generated grammar work needs evidence at multiple levels:
   `ALTER GRAPH INDEX ... ADD METRIC`, malformed graph DDL is rejected through
   the generated parser instead of legacy DDL fallback, and generated read AST tests cover canonical
   `antfly.*` table-function source ranges and named-argument item ranges,
-  including joined graph sources, plus fail-closed malformed Antfly and
-  graph-source validation.
+  including duplicate argument rejection and joined graph sources, plus
+  fail-closed malformed Antfly and graph-source validation.
 - SQL/API parity tests showing SQL and native API requests reach the same
   service contracts.
 - Fuzz or mutation tests for scanner/parser crash resistance and bounded error
