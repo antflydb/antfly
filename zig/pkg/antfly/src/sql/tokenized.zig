@@ -326,6 +326,7 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
     if (isGeneratedCatalogDdlHead(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedDdlBoundary(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedDmlBoundary(tokens, raw_statement)) return false;
+    if (isIncompleteGeneratedReadBoundary(tokens, raw_statement)) return false;
 
     const first = tokens[raw_statement.token_start];
     if (tokenMatchesKeyword(first, .set)) return raw_statement.token_end > raw_statement.token_start + 2;
@@ -433,6 +434,80 @@ fn isGeneratedDdlTrailingBoundary(token: Token) bool {
         tokenMatchesKeyword(token, .constraint) or
         tokenMatchesKeyword(token, .to) or
         tokenMatchesKeyword(token, .as);
+}
+
+fn isIncompleteGeneratedReadBoundary(tokens: []const Token, raw_statement: RawSqlStatement) bool {
+    const start = raw_statement.token_start;
+    const end = raw_statement.token_end;
+    if (start >= end or end > tokens.len) return false;
+    if (raw_statement.family != .select and raw_statement.family != .with) return false;
+    const first = tokens[start];
+    const last = tokens[end - 1];
+    if (end == start + 1) {
+        return tokenMatchesKeyword(first, .select) or tokenMatchesKeyword(first, .with);
+    }
+    if (tokenMatchesKeyword(last, .select) or
+        tokenMatchesKeyword(last, .from) or
+        tokenMatchesKeyword(last, .where) or
+        tokenMatchesKeyword(last, .having) or
+        tokenMatchesKeyword(last, .join) or
+        tokenMatchesKeyword(last, .lateral) or
+        tokenMatchesKeyword(last, .on) or
+        tokenMatchesKeyword(last, .using))
+    {
+        return true;
+    }
+    if ((tokenMatchesKeyword(last, .limit) or
+        tokenMatchesKeyword(last, .offset) or
+        tokenMatchesKeyword(last, .fetch) or
+        tokenMatchesKeyword(last, .first) or
+        tokenMatchesKeyword(last, .next)) and
+        generatedReadHasPriorResultTail(tokens, start, end - 1))
+    {
+        return true;
+    }
+    if (tokenMatchesKeyword(last, .by) and end > start + 1) {
+        const previous = tokens[end - 2];
+        return tokenMatchesKeyword(previous, .group) or tokenMatchesKeyword(previous, .order);
+    }
+    if (tokenMatchesKeyword(first, .with)) {
+        return last.kind == .lparen or
+            tokenMatchesKeyword(last, .as) or
+            tokenMatchesKeyword(last, .recursive) or
+            tokenMatchesKeyword(last, .materialized) or
+            tokenMatchesKeyword(last, .not);
+    }
+    return false;
+}
+
+fn generatedReadHasPriorResultTail(tokens: []const Token, start: usize, end: usize) bool {
+    var depth: usize = 0;
+    var index = start;
+    while (index < end and index < tokens.len) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth > 0) depth -= 1;
+            },
+            else => {},
+        }
+        if (depth != 0) continue;
+        if (tokenMatchesKeyword(tokens[index], .where) or
+            tokenMatchesKeyword(tokens[index], .having) or
+            tokenMatchesKeyword(tokens[index], .limit) or
+            tokenMatchesKeyword(tokens[index], .offset) or
+            tokenMatchesKeyword(tokens[index], .fetch))
+        {
+            return true;
+        }
+        if ((tokenMatchesKeyword(tokens[index], .group) or tokenMatchesKeyword(tokens[index], .order)) and
+            index + 1 < end and
+            tokenMatchesKeyword(tokens[index + 1], .by))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn isIncompleteGeneratedDmlBoundary(tokens: []const Token, raw_statement: RawSqlStatement) bool {
@@ -1019,6 +1094,22 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "TRUNCATE TABLE"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "MERGE INTO usage_records USING source_rows ON"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "INSERT INTO usage_records OVERRIDING SYSTEM VALUE VALUES ('u1')"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT status, COUNT(*) FROM usage_records GROUP BY"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT status, COUNT(*) FROM usage_records GROUP BY status HAVING"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records ORDER BY"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records ORDER BY id LIMIT"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE status = 'active' OFFSET"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records ORDER BY id FETCH"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT usage_records.id FROM usage_records JOIN"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT usage_records.id FROM usage_records JOIN accounts ON"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "WITH"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "WITH RECURSIVE"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "WITH source_rows AS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "WITH source_rows AS ("));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records) SELECT"));
 
     var complex_ddl = try ParsedSql.initAlloc(alloc, "ALTER TABLE audit_log ALTER COLUMN amount TYPE numeric USING amount + 1;");
     defer complex_ddl.deinit(alloc);

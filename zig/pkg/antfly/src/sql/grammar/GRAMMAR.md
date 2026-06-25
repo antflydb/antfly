@@ -725,7 +725,11 @@ Unsupported DDL remains on the existing parser until
    read-family lowerers. Optional generated expression fields now treat
    scalar-only shape metadata, such as child-kind tags and branch counts, as
    real retained metadata so stale expression payloads fail closed even when no
-   token range is present.
+   token range is present. Incomplete generated read clause-boundary shapes for
+   `SELECT`/`WITH`, source clauses, predicates, grouping, having filters,
+   ordering, unambiguous pagination result tails, joins, and CTE `AS` bodies
+   now require generated parsing and fail closed instead of falling back to the
+   legacy read classifier.
    Switching reads from fallback to required generated parsing still requires
    broader PostgreSQL-compatible grammar coverage, richer projection,
    grouping, and ordering expression planning semantics beyond the current
