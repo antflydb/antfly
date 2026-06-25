@@ -805,7 +805,9 @@ Unsupported DDL remains on the existing parser until
    Generated read validation
    rejects pagination payloads that are missing required expressions, attach
    expressions to `LIMIT ALL`, place expression spans outside their owning
-   pagination tail, or mismatch explicit `FETCH` count spans; it also
+   pagination tail, attach `OFFSET` expression spans to anything except the
+   exact offset value plus an optional `ROW`/`ROWS` suffix, or mismatch
+   explicit `FETCH` count spans; it also
    validates top-level clause keyword layout and payload consistency for
    projection, plain `DISTINCT` and `DISTINCT ON`, source, `WHERE`, `GROUP BY`,
    `HAVING`, `WINDOW`, `ORDER BY`, pagination, set-operation tails and

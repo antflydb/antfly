@@ -43,6 +43,11 @@ const PgwireColumn = struct {
     array_item_type: ?runtime_schema.AntflyType = null,
 };
 
+const PreparedStatement = struct {
+    sql: []u8,
+    parameter_oids: []i32 = &.{},
+};
+
 pub const Config = struct {
     bind_host: []const u8,
     bind_port: u16,
@@ -207,9 +212,10 @@ const Connection = struct {
     database: ?[]u8 = null,
     namespace: ?[]u8 = null,
     unnamed_statement: ?[]u8 = null,
+    unnamed_statement_parameter_oids: []i32 = &.{},
     unnamed_portal: ?[]u8 = null,
     unnamed_portal_described: bool = false,
-    prepared_statements: std.StringHashMapUnmanaged([]u8) = .empty,
+    prepared_statements: std.StringHashMapUnmanaged(PreparedStatement) = .empty,
     portals: std.StringHashMapUnmanaged([]u8) = .empty,
     described_portals: std.StringHashMapUnmanaged(void) = .empty,
 
@@ -217,8 +223,9 @@ const Connection = struct {
         if (self.database) |database| self.alloc.free(database);
         if (self.namespace) |namespace| self.alloc.free(namespace);
         if (self.unnamed_statement) |sql| self.alloc.free(sql);
+        if (self.unnamed_statement_parameter_oids.len > 0) self.alloc.free(self.unnamed_statement_parameter_oids);
         if (self.unnamed_portal) |sql| self.alloc.free(sql);
-        pgwire_module.freeSqlMap(self.alloc, &self.prepared_statements);
+        pgwire_module.freePreparedStatementMap(self.alloc, &self.prepared_statements);
         pgwire_module.freeSqlMap(self.alloc, &self.portals);
         pgwire_module.freeVoidMapKeys(self.alloc, &self.described_portals);
         self.* = undefined;
@@ -358,10 +365,12 @@ const Connection = struct {
         const sql = try cursor.takeCString();
         const parameter_count = try cursor.takeInt(i16);
         if (parameter_count < 0) return error.InvalidPgwireMessage;
+        const parameter_oids = try self.alloc.alloc(i32, @intCast(parameter_count));
+        errdefer self.alloc.free(parameter_oids);
         var i: usize = 0;
-        while (i < @as(usize, @intCast(parameter_count))) : (i += 1) _ = try cursor.takeInt(i32);
+        while (i < @as(usize, @intCast(parameter_count))) : (i += 1) parameter_oids[i] = try cursor.takeInt(i32);
         try cursor.expectEnd();
-        try self.setPreparedStatement(name, sql);
+        try self.setPreparedStatement(name, sql, parameter_oids);
         try self.sendParseComplete();
     }
 
@@ -369,7 +378,7 @@ const Connection = struct {
         var cursor = PayloadCursor.init(payload);
         const portal_name = try cursor.takeCString();
         const statement_name = try cursor.takeCString();
-        const statement_sql = self.preparedStatementSql(statement_name) orelse {
+        const statement = self.preparedStatement(statement_name) orelse {
             try self.sendError("26000", "prepared statement does not exist");
             return;
         };
@@ -412,7 +421,7 @@ const Connection = struct {
         }
         try cursor.expectEnd();
 
-        const bound_sql = try pgwire_module.bindSqlParametersAlloc(self.alloc, statement_sql, parameters);
+        const bound_sql = try pgwire_module.bindSqlParametersAlloc(self.alloc, statement.sql, parameters);
         errdefer self.alloc.free(bound_sql);
         try self.setPortal(portal_name, bound_sql);
         try self.sendBindComplete();
@@ -425,10 +434,17 @@ const Connection = struct {
         const name = try cursor.takeCString();
         try cursor.expectEnd();
         switch (target) {
-            'S' => if (self.preparedStatementSql(name) == null) {
-                try self.sendError("26000", "prepared statement does not exist");
-            } else {
-                try self.sendNoData();
+            'S' => {
+                const statement = self.preparedStatement(name) orelse {
+                    try self.sendError("26000", "prepared statement does not exist");
+                    return;
+                };
+                try self.sendParameterDescription(statement.parameter_oids);
+                if (statement.parameter_oids.len != 0) {
+                    try self.sendNoData();
+                } else {
+                    _ = try self.describeAndEncodeOne(statement.sql);
+                }
             },
             'P' => {
                 const sql = self.portalSql(name) orelse {
@@ -467,31 +483,41 @@ const Connection = struct {
         try self.sendCloseComplete();
     }
 
-    fn setPreparedStatement(self: *Connection, name: []const u8, sql: []const u8) !void {
+    fn setPreparedStatement(self: *Connection, name: []const u8, sql: []const u8, owned_parameter_oids: []i32) !void {
         const owned_sql = try self.alloc.dupe(u8, sql);
-        errdefer self.alloc.free(owned_sql);
+        errdefer {
+            self.alloc.free(owned_sql);
+            if (owned_parameter_oids.len > 0) self.alloc.free(owned_parameter_oids);
+        }
         if (name.len == 0) {
             if (self.unnamed_statement) |old| self.alloc.free(old);
+            if (self.unnamed_statement_parameter_oids.len > 0) self.alloc.free(self.unnamed_statement_parameter_oids);
             self.unnamed_statement = owned_sql;
+            self.unnamed_statement_parameter_oids = owned_parameter_oids;
             return;
         }
-        try pgwire_module.putOwnedSql(self.alloc, &self.prepared_statements, name, owned_sql);
+        try pgwire_module.putOwnedPreparedStatement(self.alloc, &self.prepared_statements, name, .{
+            .sql = owned_sql,
+            .parameter_oids = owned_parameter_oids,
+        });
     }
 
-    fn preparedStatementSql(self: *Connection, name: []const u8) ?[]const u8 {
-        if (name.len == 0) return self.unnamed_statement;
+    fn preparedStatement(self: *Connection, name: []const u8) ?PreparedStatement {
+        if (name.len == 0) return if (self.unnamed_statement) |sql| .{ .sql = sql, .parameter_oids = self.unnamed_statement_parameter_oids } else null;
         return self.prepared_statements.get(name);
     }
 
     fn removePreparedStatement(self: *Connection, name: []const u8) !void {
         if (name.len == 0) {
             if (self.unnamed_statement) |old| self.alloc.free(old);
+            if (self.unnamed_statement_parameter_oids.len > 0) self.alloc.free(self.unnamed_statement_parameter_oids);
             self.unnamed_statement = null;
+            self.unnamed_statement_parameter_oids = &.{};
             return;
         }
         if (self.prepared_statements.fetchRemove(name)) |removed| {
             self.alloc.free(removed.key);
-            self.alloc.free(removed.value);
+            pgwire_module.freePreparedStatement(self.alloc, removed.value);
         }
     }
 
@@ -845,6 +871,14 @@ const Connection = struct {
         try self.sendMessage('n', "");
     }
 
+    fn sendParameterDescription(self: *Connection, parameter_oids: []const i32) !void {
+        var payload: std.Io.Writer.Allocating = .init(self.alloc);
+        defer payload.deinit();
+        try payload.writer.writeInt(i16, @intCast(parameter_oids.len), .big);
+        for (parameter_oids) |oid| try payload.writer.writeInt(i32, oid, .big);
+        try self.sendMessage('t', payload.written());
+    }
+
     fn sendCommandComplete(self: *Connection, tag: []const u8) !void {
         var payload: std.Io.Writer.Allocating = .init(self.alloc);
         defer payload.deinit();
@@ -926,6 +960,35 @@ fn putOwnedSql(
         alloc.free(removed.value);
     }
     try map.put(alloc, owned_name, owned_sql);
+}
+
+fn putOwnedPreparedStatement(
+    alloc: std.mem.Allocator,
+    map: *std.StringHashMapUnmanaged(PreparedStatement),
+    name: []const u8,
+    owned_statement: PreparedStatement,
+) !void {
+    const owned_name = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned_name);
+    if (map.fetchRemove(name)) |removed| {
+        alloc.free(removed.key);
+        freePreparedStatement(alloc, removed.value);
+    }
+    try map.put(alloc, owned_name, owned_statement);
+}
+
+fn freePreparedStatement(alloc: std.mem.Allocator, statement: PreparedStatement) void {
+    alloc.free(statement.sql);
+    if (statement.parameter_oids.len > 0) alloc.free(statement.parameter_oids);
+}
+
+fn freePreparedStatementMap(alloc: std.mem.Allocator, map: *std.StringHashMapUnmanaged(PreparedStatement)) void {
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        alloc.free(entry.key_ptr.*);
+        freePreparedStatement(alloc, entry.value_ptr.*);
+    }
+    map.deinit(alloc);
 }
 
 fn freeSqlMap(alloc: std.mem.Allocator, map: *std.StringHashMapUnmanaged([]u8)) void {

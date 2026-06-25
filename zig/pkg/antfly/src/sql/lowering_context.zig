@@ -1581,6 +1581,22 @@ fn validateGeneratedOptionalExpressionAstContainedByRange(
     if (expression_tokens.start < range.start or expression_tokens.end > range.end) return error.UnsupportedSqlShape;
 }
 
+fn validateGeneratedOffsetExpressionAstMatchesRange(
+    tokens: []const tokenized.Token,
+    read_ast: generated_parser.GeneratedSqlReadAst,
+    range: generated_parser.GeneratedSqlTokenRange,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    try validateGeneratedOptionalExpressionAstContainedByRange(tokens, read_ast, range, expression);
+    const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
+    if (expression_tokens.start != range.start) return error.UnsupportedSqlShape;
+    if (expression_tokens.end == range.end) return;
+    if (expression_tokens.end + 1 != range.end) return error.UnsupportedSqlShape;
+    if (!tokens[expression_tokens.end].matchesKeywordTag(.row) and !tokens[expression_tokens.end].matchesKeywordTag(.rows)) {
+        return error.UnsupportedSqlShape;
+    }
+}
+
 fn validateGeneratedReadPaginationPayloads(
     tokens: []const tokenized.Token,
     read_ast: generated_parser.GeneratedSqlReadAst,
@@ -1610,7 +1626,7 @@ fn validateGeneratedReadPaginationPayloads(
 
     if (offset_tokens) |range| {
         const expression = offset_expression orelse return error.UnsupportedSqlShape;
-        try validateGeneratedOptionalExpressionAstContainedByRange(tokens, read_ast, range, expression.*);
+        try validateGeneratedOffsetExpressionAstMatchesRange(tokens, read_ast, range, expression.*);
     } else if (offset_expression != null and generatedExpressionAstHasMetadata(offset_expression.?.*)) {
         return error.UnsupportedSqlShape;
     }
@@ -4421,6 +4437,15 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_offset_expression_parsed_sql, malformed_offset_expression_read_ast),
+    );
+    malformed_offset_expression_read_ast = switch (malformed_offset_expression_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_offset_expression_read_ast.offset_expression.tokens = malformed_offset_expression_read_ast.offset_tokens.?;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedReadAstForStatement(malformed_offset_expression_parsed_sql.items(), malformed_offset_expression_read_ast),
     );
 
     var malformed_fetch_count_expression_parsed_sql = try tokenized.ParsedSql.initAlloc(

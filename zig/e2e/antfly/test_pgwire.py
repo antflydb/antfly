@@ -260,6 +260,26 @@ def test_pgwire_extended_query_binds_text_parameters(pgwire_server):
     assert [message["values"] for message in select_messages if message["type"] == "row"] == [["row:extended", "ready"]]
 
 
+def test_pgwire_statement_describe_returns_parameters_and_row_description(pgwire_server):
+    table = _table_name("pgwire_describe")
+
+    with socket.create_connection((pgwire_server.host, pgwire_server.pgwire_port), timeout=5) as sock:
+        _pgwire_startup(sock)
+        _pgwire_simple_query(sock, f"CREATE TABLE {table} (id text PRIMARY KEY, status text);")
+
+        read_messages = _pgwire_describe_statement(sock, f"SELECT id, status FROM {table};", [])
+        parameterized_messages = _pgwire_describe_statement(sock, f"SELECT id FROM {table} WHERE status = $1;", [PG_TEXT_OID])
+
+    assert read_messages == [
+        {"type": "parameters", "oids": []},
+        {"type": "columns", "columns": ["id", "status"], "oids": [PG_TEXT_OID, PG_TEXT_OID]},
+    ]
+    assert parameterized_messages == [
+        {"type": "parameters", "oids": [PG_TEXT_OID]},
+        {"type": "nodata"},
+    ]
+
+
 def test_pgwire_empty_select_preserves_row_description(pgwire_server):
     table = _table_name("pgwire_empty")
 
@@ -392,6 +412,8 @@ def _pgwire_extended_query(sock: socket.socket, sql: str, params: list[str | Non
             description = _pgwire_row_description(payload)
             columns = [column["name"] for column in description]
             messages.append({"type": "columns", "columns": columns, "oids": [column["type_oid"] for column in description]})
+        elif tag == b"t":
+            messages.append({"type": "parameters", "oids": _pgwire_parameter_description(payload)})
         elif tag == b"D":
             messages.append({"type": "row", "values": _pgwire_data_row(payload)})
         elif tag == b"C":
@@ -401,9 +423,46 @@ def _pgwire_extended_query(sock: socket.socket, sql: str, params: list[str | Non
         elif tag == b"Z":
             return messages
         elif tag in {b"1", b"2", b"3", b"n", b"s"}:
+            if tag == b"n":
+                messages.append({"type": "nodata"})
             continue
         else:
             messages.append({"type": "message", "tag": tag.decode(errors="replace"), "columns": columns})
+
+
+def _pgwire_describe_statement(sock: socket.socket, sql: str, parameter_oids: list[int]) -> list[dict[str, Any]]:
+    statement_name = b"describe_stmt"
+    parse_payload = statement_name + b"\x00" + sql.encode() + b"\x00" + struct.pack("!h", len(parameter_oids))
+    for oid in parameter_oids:
+        parse_payload += struct.pack("!i", oid)
+    _pgwire_send_message(sock, b"P", parse_payload)
+    _pgwire_send_message(sock, b"D", b"S" + statement_name + b"\x00")
+    _pgwire_send_message(sock, b"S", b"")
+
+    messages: list[dict[str, Any]] = []
+    while True:
+        tag, payload = _pgwire_read_message(sock)
+        if tag == b"t":
+            messages.append({"type": "parameters", "oids": _pgwire_parameter_description(payload)})
+        elif tag == b"T":
+            description = _pgwire_row_description(payload)
+            messages.append(
+                {
+                    "type": "columns",
+                    "columns": [column["name"] for column in description],
+                    "oids": [column["type_oid"] for column in description],
+                }
+            )
+        elif tag == b"n":
+            messages.append({"type": "nodata"})
+        elif tag == b"E":
+            raise AssertionError(f"pgwire statement describe error: {payload!r}")
+        elif tag == b"Z":
+            return messages
+        elif tag in {b"1", b"2", b"3"}:
+            continue
+        else:
+            messages.append({"type": "message", "tag": tag.decode(errors="replace")})
 
 
 def _pgwire_send_message(sock: socket.socket, tag: bytes, payload: bytes) -> None:
@@ -434,6 +493,16 @@ def _pgwire_row_description(payload: bytes) -> list[dict[str, Any]]:
         offset += 2
         columns.append({"name": name, "type_oid": type_oid})
     return columns
+
+
+def _pgwire_parameter_description(payload: bytes) -> list[int]:
+    count = struct.unpack("!h", payload[:2])[0]
+    offset = 2
+    oids: list[int] = []
+    for _ in range(count):
+        oids.append(struct.unpack("!i", payload[offset : offset + 4])[0])
+        offset += 4
+    return oids
 
 
 def _pgwire_data_row(payload: bytes) -> list[str | None]:
