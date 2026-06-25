@@ -326,6 +326,11 @@ delegating to typed bulk I/O planning. `EXPLAIN` uses the validated
 unsupported boundary before delegating to typed explain planning, including
 generated subject-range validation before the inner read/write statement is
 reparsed.
+Generated unsupported utility command heads that require a subject, such as
+`CALL`, `COPY`, `GRANT`, `LISTEN`, `LOCK`, `NOTIFY`, `REINDEX`, `REVOKE`,
+`SAVEPOINT`, and `UNLISTEN`, now fail closed through the generated parser when
+the statement stops at the command head instead of falling through to legacy
+DDL probing.
 Generated unsupported nodes now also participate in the parsed statement
 boundary: generated-covered unsupported heads that are not intentionally
 supported by the existing catalog planner become terminal parsed unsupported

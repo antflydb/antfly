@@ -327,6 +327,7 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
     if (isIncompleteGeneratedDdlBoundary(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedDmlBoundary(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedReadBoundary(tokens, raw_statement)) return false;
+    if (isIncompleteGeneratedUnsupportedBoundary(tokens, raw_statement)) return false;
 
     const first = tokens[raw_statement.token_start];
     if (tokenMatchesKeyword(first, .set)) return raw_statement.token_end > raw_statement.token_start + 2;
@@ -600,6 +601,35 @@ fn isIncompleteGeneratedDmlBoundary(tokens: []const Token, raw_statement: RawSql
             tokenMatchesKeyword(last, .values);
     }
     return false;
+}
+
+fn isIncompleteGeneratedUnsupportedBoundary(tokens: []const Token, raw_statement: RawSqlStatement) bool {
+    const start = raw_statement.token_start;
+    const end = raw_statement.token_end;
+    if (start >= end or end > tokens.len) return false;
+    if (end != start + 1) return false;
+    const first = tokens[start];
+    return tokenMatchesKeyword(first, .call) or
+        tokenMatchesKeyword(first, .close) or
+        tokenMatchesKeyword(first, .cluster) or
+        tokenMatchesKeyword(first, .comment) or
+        tokenMatchesKeyword(first, .copy) or
+        tokenMatchesText(first, "declare") or
+        tokenMatchesText(first, "do") or
+        tokenMatchesKeyword(first, .fetch) or
+        tokenMatchesKeyword(first, .grant) or
+        tokenMatchesKeyword(first, .listen) or
+        tokenMatchesText(first, "load") or
+        tokenMatchesText(first, "lock") or
+        tokenMatchesText(first, "move") or
+        tokenMatchesKeyword(first, .notify) or
+        tokenMatchesKeyword(first, .refresh) or
+        tokenMatchesKeyword(first, .reindex) or
+        tokenMatchesText(first, "release") or
+        tokenMatchesKeyword(first, .revoke) or
+        tokenMatchesKeyword(first, .savepoint) or
+        tokenMatchesKeyword(first, .security) or
+        tokenMatchesKeyword(first, .unlisten);
 }
 
 fn parseStatement(
@@ -1129,6 +1159,16 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP EXTENSION vector, postgis"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE GRAPH INDEX docs_edge_graph ON"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER GRAPH INDEX docs_edge_graph ADD"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CALL"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "COPY"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "GRANT"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "LISTEN"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "LOCK"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "NOTIFY"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "REINDEX"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "REVOKE"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SAVEPOINT"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "UNLISTEN"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "INSERT INTO usage_records VALUES"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) VALUES ('u1') ON CONFLICT (id) DO"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "UPDATE usage_records SET"));
