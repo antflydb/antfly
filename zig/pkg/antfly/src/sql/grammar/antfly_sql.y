@@ -754,7 +754,6 @@ table_reference:
     qualified_name
   | qualified_name AS identifier_name
   | qualified_name identifier_name
-  | qualified_name OFFSET
   | ONLY qualified_name
   | ONLY qualified_name AS identifier_name
   | ONLY qualified_name identifier_name
@@ -847,6 +846,7 @@ pagination_clause:
   | LIMIT ALL
   | OFFSET NUMBER row_rows_opt
   | OFFSET expression row_rows_opt
+  | OFFSET NUMBER row_rows_opt FETCH fetch_first_next fetch_count_opt row_rows ONLY
   | FETCH fetch_first_next fetch_count_opt row_rows ONLY
   ;
 

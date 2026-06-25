@@ -6615,6 +6615,110 @@ test "db search runtime full-text chunk consumer returns parent and chunk modes"
     try std.testing.expectEqualStrings("doc:a", parent_result.hits[0].id);
 }
 
+test "db search runtime full-text chunk default index searches template chunk text when chunker full text indexing is enabled" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const waitForSearchResult = db_test_support.waitForSearchResult;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "full_text_index_v0",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.addIndex(.{
+        .name = "semantic_template_chunked_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"source_template\":\"{{title}}\",\"artifact_name\":\"semantic_template_chunked_idx_chunks\",\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"full_text_index\":{},\"text\":{\"target_tokens\":4,\"overlap_tokens\":1,\"separator\":\" \"}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"Alpha routing only in template chunks\",\"body\":\"body text without the keyword\"}" },
+        },
+        .sync_level = .full_text,
+    });
+
+    var result = try waitForSearchResult(alloc, &db, .{
+        .index_name = "full_text_index_v0",
+        .full_text = .{ .match = .{ .field = "body", .text = "routing" } },
+        .return_mode = .parent,
+    }, 1);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "db search runtime full-text chunk full_text sync level covers template chunk routing" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "full_text_index_v0",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.addIndex(.{
+        .name = "semantic_template_chunked_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"source_template\":\"{{title}}\",\"artifact_name\":\"semantic_template_chunked_idx_chunks\",\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"full_text_index\":{},\"text\":{\"target_tokens\":4,\"overlap_tokens\":1,\"separator\":\" \"}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"Alpha routing only in template chunks\",\"body\":\"body text without the keyword\"}" },
+        },
+        .sync_level = .full_text,
+    });
+
+    const pending = db.pendingWorkStats();
+    try std.testing.expectEqual(pending.enrichment.target_sequence, pending.enrichment.applied_sequence);
+    try std.testing.expect(pending.enrichment.applied_sequence >= 1);
+
+    var result = try db.search(alloc, .{
+        .index_name = "full_text_index_v0",
+        .full_text = .{ .match = .{ .field = "body", .text = "routing" } },
+        .return_mode = .parent,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
 test "db search runtime full-text chunk consumer filters expired parents under ttl" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
