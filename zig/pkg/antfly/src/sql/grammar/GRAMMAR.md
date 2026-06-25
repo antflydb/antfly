@@ -76,11 +76,12 @@ PostgreSQL-style relation population heads, including `SELECT ... INTO` and
 `CREATE [TEMP|TEMPORARY|UNLOGGED] TABLE ... AS SELECT ... [WITH [NO] DATA]`,
 now parse and classify through the generated DDL family with retained target
 name spans before delegating to the existing relation-population planner.
-Incomplete covered DDL clause-boundary shapes for `CREATE TABLE`,
-`CREATE INDEX`, `ALTER TABLE`, and `DROP TABLE` now fail closed through the
-generated parser instead of falling back to the legacy DDL classifier, while
-rich DDL syntax that is not yet generated-covered still falls back to the
-existing typed DDL parser.
+Incomplete covered DDL clause-boundary shapes for `CREATE TABLE`, lifetime
+prefixed `CREATE [TEMP|TEMPORARY|UNLOGGED] TABLE`, `CREATE INDEX`,
+`ALTER TABLE`, and `DROP TABLE` now fail closed through the generated parser
+instead of falling back to the legacy DDL classifier, while rich DDL syntax
+that is not yet generated-covered still falls back to the existing typed DDL
+parser.
 Simple DML now has generated-parser corpus
 coverage, retained generated raw and AST nodes for covered write statements,
 structured generated DML ranges for target tables, sources, assignments,

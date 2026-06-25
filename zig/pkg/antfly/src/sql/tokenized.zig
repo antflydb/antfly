@@ -382,12 +382,15 @@ fn isGeneratedRelationPopulationHead(tokens: []const Token, raw_statement: RawSq
 
 fn consumeRelationLifetime(tokens: []const Token, index: *usize, end: usize) void {
     if (index.* >= end) return;
-    if (tokenMatchesKeyword(tokens[index.*], .temp) or
-        tokenMatchesKeyword(tokens[index.*], .temporary) or
-        tokenMatchesKeyword(tokens[index.*], .unlogged))
-    {
+    if (tokenMatchesRelationLifetime(tokens[index.*])) {
         index.* += 1;
     }
+}
+
+fn tokenMatchesRelationLifetime(token: Token) bool {
+    return tokenMatchesKeyword(token, .temp) or
+        tokenMatchesKeyword(token, .temporary) or
+        tokenMatchesKeyword(token, .unlogged);
 }
 
 fn findTopLevelKeyword(tokens: []const Token, start: usize, end: usize, keyword: token_mod.TokenKeyword) ?usize {
@@ -418,6 +421,15 @@ fn isIncompleteGeneratedDdlBoundary(tokens: []const Token, raw_statement: RawSql
             tokenMatchesKeyword(first, .drop);
     }
     if (tokenMatchesKeyword(first, .create)) {
+        var table_index = start + 1;
+        if (table_index < end and tokenMatchesRelationLifetime(tokens[table_index])) {
+            table_index += 1;
+            if (table_index >= end) return true;
+            if (tokenMatchesKeyword(tokens[table_index], .table)) {
+                if (end <= table_index + 2) return true;
+                return isGeneratedDdlTrailingBoundary(last);
+            }
+        }
         if (tokenMatchesKeyword(tokens[start + 1], .unique)) {
             if (end <= start + 2) return true;
             if (tokenMatchesKeyword(tokens[start + 2], .index) and end <= start + 4) return true;
@@ -1297,6 +1309,10 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN NOT MATCHED THEN INSERT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN NOT MATCHED THEN INSERT (id) VALUES"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "INSERT INTO usage_records OVERRIDING SYSTEM VALUE VALUES ('u1')"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE TEMP"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE TEMP TABLE"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE TEMPORARY TABLE usage_session_records ("));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE UNLOGGED TABLE IF NOT EXISTS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT DISTINCT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT DISTINCT ON ("));
