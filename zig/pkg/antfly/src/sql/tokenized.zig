@@ -301,13 +301,10 @@ fn parseGeneratedRawStatementAlloc(
     tokens: []const Token,
     raw_statement: RawSqlStatement,
 ) !?GeneratedRawSqlStatement {
-    const result = generated_parser.parseGeneratedGateTokensAlloc(alloc, tokens) catch |err| switch (err) {
-        error.UnsupportedSqlShape, error.UnexpectedToken => {
-            if (allowsGeneratedGrammarFallback(tokens, raw_statement)) return null;
-            return err;
-        },
-        else => return err,
-    };
+    const result = if (allowsGeneratedGrammarFallback(tokens, raw_statement))
+        try generated_parser.parseGeneratedGateTokensAlloc(alloc, tokens)
+    else
+        try generated_parser.parseGeneratedGateTokensStrictAlloc(alloc, tokens);
     if (result) |parsed| {
         return .{ .raw = raw_statement, .statement = parsed.statement, .ast = parsed.ast };
     }
@@ -319,6 +316,7 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
     if (tokens[raw_statement.token_end - 1].kind == .eq or tokens[raw_statement.token_end - 1].kind == .comma) return false;
     if (tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .to) or tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .as)) return false;
     if (isGeneratedGraphDdlHead(tokens, raw_statement)) return false;
+    if (isIncompleteGeneratedDdlBoundary(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedDmlBoundary(tokens, raw_statement)) return false;
 
     const first = tokens[raw_statement.token_start];
@@ -335,9 +333,9 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
         return raw_statement.token_end > raw_statement.token_start + 1;
     }
     return switch (raw_statement.family orelse return false) {
-        .insert, .update, .delete, .truncate, .merge => false,
+        .insert, .update, .delete, .truncate, .merge => true,
         .ddl => true,
-        .select, .with => false,
+        .select, .with => true,
     };
 }
 
@@ -346,6 +344,78 @@ fn isGeneratedGraphDdlHead(tokens: []const Token, raw_statement: RawSqlStatement
     if (start + 1 >= raw_statement.token_end or raw_statement.token_end > tokens.len) return false;
     return (tokenMatchesKeyword(tokens[start], .create) or tokenMatchesKeyword(tokens[start], .alter)) and
         tokenMatchesKeyword(tokens[start + 1], .graph);
+}
+
+fn isIncompleteGeneratedDdlBoundary(tokens: []const Token, raw_statement: RawSqlStatement) bool {
+    const start = raw_statement.token_start;
+    const end = raw_statement.token_end;
+    if (start >= end or end > tokens.len) return false;
+    const first = tokens[start];
+    const last = tokens[end - 1];
+    if (end == start + 1) {
+        return tokenMatchesKeyword(first, .create) or
+            tokenMatchesKeyword(first, .alter) or
+            tokenMatchesKeyword(first, .drop);
+    }
+    if (tokenMatchesKeyword(first, .create)) {
+        if (tokenMatchesKeyword(tokens[start + 1], .unique)) {
+            if (end <= start + 2) return true;
+            if (tokenMatchesKeyword(tokens[start + 2], .index) and end <= start + 4) return true;
+            return isGeneratedDdlTrailingBoundary(last);
+        }
+        if (tokenMatchesKeyword(tokens[start + 1], .table)) {
+            if (end <= start + 3) return true;
+            return isGeneratedDdlTrailingBoundary(last);
+        }
+        if (tokenMatchesKeyword(tokens[start + 1], .index)) {
+            if (end <= start + 3) return true;
+            return isGeneratedDdlTrailingBoundary(last);
+        }
+        if (tokenMatchesKeyword(tokens[start + 1], .database) or
+            tokenMatchesKeyword(tokens[start + 1], .schema) or
+            tokenMatchesKeyword(tokens[start + 1], .extension))
+        {
+            if (end <= start + 2) return true;
+            return isGeneratedDdlTrailingBoundary(last);
+        }
+    }
+    if (tokenMatchesKeyword(first, .alter) and tokenMatchesKeyword(tokens[start + 1], .table)) {
+        if (end <= start + 3) return true;
+        return isGeneratedDdlTrailingBoundary(last);
+    }
+    if (tokenMatchesKeyword(first, .drop)) {
+        if (tokenMatchesKeyword(tokens[start + 1], .table) or
+            tokenMatchesKeyword(tokens[start + 1], .index) or
+            tokenMatchesKeyword(tokens[start + 1], .database) or
+            tokenMatchesKeyword(tokens[start + 1], .schema) or
+            tokenMatchesKeyword(tokens[start + 1], .extension))
+        {
+            if (end <= start + 2) return true;
+            return isGeneratedDdlTrailingBoundary(last);
+        }
+    }
+    return false;
+}
+
+fn isGeneratedDdlTrailingBoundary(token: Token) bool {
+    if (token.kind == .comma or token.kind == .lparen or token.kind == .eq) return true;
+    return tokenMatchesKeyword(token, .@"if") or
+        tokenMatchesKeyword(token, .not) or
+        tokenMatchesKeyword(token, .exists) or
+        tokenMatchesKeyword(token, .only) or
+        tokenMatchesKeyword(token, .on) or
+        tokenMatchesKeyword(token, .using) or
+        tokenMatchesKeyword(token, .with) or
+        tokenMatchesKeyword(token, .where) or
+        tokenMatchesKeyword(token, .include) or
+        tokenMatchesKeyword(token, .add) or
+        tokenMatchesKeyword(token, .drop) or
+        tokenMatchesKeyword(token, .rename) or
+        tokenMatchesKeyword(token, .validate) or
+        tokenMatchesKeyword(token, .column) or
+        tokenMatchesKeyword(token, .constraint) or
+        tokenMatchesKeyword(token, .to) or
+        tokenMatchesKeyword(token, .as);
 }
 
 fn isIncompleteGeneratedDmlBoundary(tokens: []const Token, raw_statement: RawSqlStatement) bool {
@@ -394,9 +464,7 @@ fn isIncompleteGeneratedDmlBoundary(tokens: []const Token, raw_statement: RawSql
             tokenMatchesKeyword(last, .when) or
             tokenMatchesKeyword(last, .matched) or
             tokenMatchesKeyword(last, .then) or
-            tokenMatchesKeyword(last, .update) or
-            tokenMatchesKeyword(last, .delete) or
-            tokenMatchesKeyword(last, .set);
+            tokenMatchesKeyword(last, .update);
     }
     return false;
 }
@@ -699,6 +767,10 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
 
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SET search_path TO"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "PREPARE read_stmt AS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE TABLE usage_records ("));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE INDEX usage_status_idx ON"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records ADD"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP TABLE IF EXISTS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE GRAPH INDEX docs_edge_graph ON"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER GRAPH INDEX docs_edge_graph ADD"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "INSERT INTO usage_records VALUES"));

@@ -1301,12 +1301,16 @@ pub fn parseFirstFamilyTokensAlloc(alloc: std.mem.Allocator, tokens: []const tok
 }
 
 pub fn parseGeneratedGateTokensAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token) !?GeneratedSqlParseResult {
+    return parseGeneratedGateTokensStrictAlloc(alloc, tokens) catch |err| switch (err) {
+        error.UnsupportedSqlShape, error.UnexpectedToken => return null,
+        else => return err,
+    };
+}
+
+pub fn parseGeneratedGateTokensStrictAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token) !?GeneratedSqlParseResult {
     const kind = classifyTokens(tokens);
     if (kind == .other) return null;
-    return parseTokensAlloc(alloc, tokens) catch |err| switch (err) {
-        error.UnsupportedSqlShape, error.UnexpectedToken => if (kind == .ddl or kind == .dml or kind == .read or kind == .extension_index or kind == .unsupported) null else err,
-        else => err,
-    };
+    return try parseTokensAlloc(alloc, tokens);
 }
 
 pub fn isFirstFamilyTokens(tokens: []const token_mod.Token) bool {

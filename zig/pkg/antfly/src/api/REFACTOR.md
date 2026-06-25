@@ -260,6 +260,12 @@ Keep the existing focused test roots stable:
 - `api-table-reads-docid-test`
 - `api-table-writes-docid-test`
 
+Yes: tests should generally move with the production behavior they prove. The
+important caveat is that this is an ownership move, not a mechanical file move.
+Leaf implementation tests should travel with the extracted leaf module; boundary
+and integration tests should stay at the boundary until that boundary itself is
+extracted.
+
 As modules move, the tests that exercise the moved behavior should usually move
 in the same extraction chunk. Test movement is part of the refactor, not a
 follow-up cleanup. The goal is that a reader can open the module that owns a

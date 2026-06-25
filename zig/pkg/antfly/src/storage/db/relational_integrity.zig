@@ -4668,3 +4668,939 @@ pub fn Impl(comptime DB: type) type {
         }
     };
 }
+
+test "db schema apply supports unvalidated foreign key then enforced validation flip" {
+    const db_mod = @import("mod.zig");
+    const DB = db_mod.DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const schema_unvalidated =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","validation_state":"unvalidated"}]}
+    ;
+    const schema_enforced =
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","validation_state":"enforced"}]}
+    ;
+
+    try db.applyTableSchemaJson(alloc, schema_v1, .{});
+    try db.batch(.{
+        .writes = &.{.{ .key = "order:orphan", .value = "{\"id\":\"order:orphan\",\"customer_id\":\"customer:missing\"}" }},
+    });
+
+    try db.applyTableSchemaJson(alloc, schema_unvalidated, .{});
+    try db.batch(.{
+        .writes = &.{.{ .key = "order:still_unvalidated", .value = "{\"id\":\"order:still_unvalidated\",\"customer_id\":\"customer:also_missing\"}" }},
+    });
+    try db.batch(.{
+        .deletes = &.{"customer:missing"},
+    });
+    const unvalidated_schema = db.core.schema orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(schema_mod.ForeignKeyValidationState.unvalidated, unvalidated_schema.foreign_keys[0].validation_state);
+
+    try std.testing.expectError(error.ForeignKeyViolation, db.applyTableSchemaJson(alloc, schema_enforced, .{}));
+    const after_failed_enforce = db.core.schema orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(schema_mod.ForeignKeyValidationState.unvalidated, after_failed_enforce.foreign_keys[0].validation_state);
+    const failed_progress = (try db.loadForeignKeyIntegrityProgressRecord(.validate, null, "", "")) orelse return error.TestUnexpectedResult;
+    defer db.freeForeignKeyIntegrityProgressRecord(failed_progress);
+    try std.testing.expectEqualStrings("validate", failed_progress.mode);
+    try std.testing.expect(failed_progress.completed);
+    try std.testing.expect(!failed_progress.valid);
+    try std.testing.expectEqual(@as(u64, 2), failed_progress.report.missing_parent_rows);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "customer:missing", .value = "{\"id\":\"customer:missing\"}" },
+            .{ .key = "customer:also_missing", .value = "{\"id\":\"customer:also_missing\"}" },
+        },
+    });
+    try db.applyTableSchemaJson(alloc, schema_enforced, .{});
+    const enforced_schema = db.core.schema orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(schema_mod.ForeignKeyValidationState.enforced, enforced_schema.foreign_keys[0].validation_state);
+
+    const fk_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "orders_customer_id_fkey", "customers", "customer:missing", "row", "order:orphan");
+    defer alloc.free(fk_ref);
+    const ref_value = try db.core.store.get(alloc, fk_ref);
+    defer alloc.free(ref_value);
+    try std.testing.expectEqualStrings("", ref_value);
+
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .writes = &.{.{ .key = "order:new_orphan", .value = "{\"id\":\"order:new_orphan\",\"customer_id\":\"customer:nope\"}" }},
+    }));
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .deletes = &.{"customer:missing"},
+    }));
+
+    const local_schema_json = try db.core.store.get(alloc, db_mod.local_schema_json_key);
+    defer alloc.free(local_schema_json);
+    try std.testing.expect(std.mem.indexOf(u8, local_schema_json, "\"validation_state\":\"enforced\"") != null);
+}
+
+test "db schema apply drops foreign key refs and stops enforcement" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const schema_enforced =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict"}]}
+    ;
+    const schema_dropped =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+
+    try db.applyTableSchemaJson(alloc, schema_enforced, .{});
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "customer:drop", .value = "{\"id\":\"customer:drop\"}" },
+            .{ .key = "order:drop", .value = "{\"id\":\"order:drop\",\"customer_id\":\"customer:drop\"}" },
+        },
+    });
+
+    const fk_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "orders_customer_id_fkey", "customers", "customer:drop", "row", "order:drop");
+    defer alloc.free(fk_ref);
+    const ref_value = try db.core.store.get(alloc, fk_ref);
+    defer alloc.free(ref_value);
+    try std.testing.expectEqualStrings("", ref_value);
+
+    try db.applyTableSchemaJson(alloc, schema_dropped, .{});
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, fk_ref));
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "order:orphan-after-drop", .value = "{\"id\":\"order:orphan-after-drop\",\"customer_id\":\"customer:missing-after-drop\"}" }},
+    });
+    try db.batch(.{
+        .deletes = &.{"customer:drop"},
+    });
+    try std.testing.expect((try db.get(alloc, "customer:drop")) == null);
+
+    const durable_schema = (try schema_mod.loadSchema(db.core.store, alloc)) orelse return error.TestUnexpectedResult;
+    defer schema_mod.freeSchema(alloc, durable_schema);
+    try std.testing.expectEqual(@as(usize, 0), durable_schema.foreign_keys.len);
+}
+
+test "db direct schema apply validates and builds added foreign keys" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict"}]}
+    ;
+
+    try db.applyTableSchemaJson(alloc, schema_v1, .{});
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "customer:a", .value = "{\"id\":\"customer:a\"}" },
+            .{ .key = "order:1", .value = "{\"id\":\"order:1\",\"customer_id\":\"customer:a\"}" },
+        },
+    });
+
+    try db.applyTableSchemaJson(alloc, schema_v2, .{});
+
+    const fk_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "orders_customer_id_fkey", "customers", "customer:a", "row", "order:1");
+    defer alloc.free(fk_ref);
+    const ref_value = try db.core.store.get(alloc, fk_ref);
+    defer alloc.free(ref_value);
+    try std.testing.expectEqualStrings("", ref_value);
+
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .deletes = &.{"customer:a"},
+    }));
+}
+
+test "db direct schema apply builds added unique constraints before foreign keys to unique tuples" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"ref_email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"ref_email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]}],"foreign_keys":[{"name":"users_ref_email_fkey","columns":["ref_email"],"references":{"table":"row","columns":["email"]},"on_delete":"restrict"}]}
+    ;
+
+    try db.applyTableSchemaJson(alloc, schema_v1, .{});
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:a", .value = "{\"id\":\"user:a\",\"email\":\"a@example.com\"}" },
+            .{ .key = "user:b", .value = "{\"id\":\"user:b\",\"email\":\"b@example.com\",\"ref_email\":\"a@example.com\"}" },
+        },
+    });
+
+    try db.applyTableSchemaJson(alloc, schema_v2, .{});
+
+    const parent_tuple = try relational_store_mod.bytesTupleValueAlloc(alloc, &.{"a@example.com"});
+    defer alloc.free(parent_tuple);
+    const unique_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_email_key", parent_tuple);
+    defer alloc.free(unique_key);
+    const unique_owner = try db.core.store.get(alloc, unique_key);
+    defer alloc.free(unique_owner);
+    try std.testing.expectEqualStrings("user:a", unique_owner);
+
+    const fk_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "users_ref_email_fkey", "row", parent_tuple, "row", "user:b");
+    defer alloc.free(fk_ref);
+    const ref_value = try db.core.store.get(alloc, fk_ref);
+    defer alloc.free(ref_value);
+    try std.testing.expectEqualStrings("", ref_value);
+}
+
+test "db direct schema apply rejects added foreign keys with orphaned existing rows" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict"}]}
+    ;
+
+    try db.applyTableSchemaJson(alloc, schema_v1, .{});
+    try db.batch(.{
+        .writes = &.{.{ .key = "order:orphan", .value = "{\"id\":\"order:orphan\",\"customer_id\":\"customer:missing\"}" }},
+    });
+
+    try std.testing.expectError(error.ForeignKeyViolation, db.applyTableSchemaJson(alloc, schema_v2, .{}));
+    const durable_schema = (try schema_mod.loadSchema(db.core.store, alloc)) orelse return error.TestUnexpectedResult;
+    defer schema_mod.freeSchema(alloc, durable_schema);
+    try std.testing.expectEqual(@as(usize, 0), durable_schema.foreign_keys.len);
+}
+
+test "db foreign key integrity progress is durable per range" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "a:customer", .value = "{\"id\":\"a:customer\"}" },
+            .{ .key = "a:order", .value = "{\"id\":\"a:order\",\"customer_id\":\"a:customer\"}" },
+            .{ .key = "z:customer", .value = "{\"id\":\"z:customer\"}" },
+            .{ .key = "z:order", .value = "{\"id\":\"z:order\",\"customer_id\":\"z:customer\"}" },
+        },
+    });
+
+    const low_report = try db.validateForeignKeyRefsInRange("a:", "m:");
+    try std.testing.expect(low_report.valid());
+    try std.testing.expectEqual(@as(u64, 1), low_report.referenced_child_rows);
+    const high_report = try db.validateForeignKeyRefsInRange("m:", "");
+    try std.testing.expect(high_report.valid());
+    try std.testing.expectEqual(@as(u64, 1), high_report.referenced_child_rows);
+
+    const low_progress = (try db.loadForeignKeyIntegrityProgressRecord(.validate, null, "a:", "m:")) orelse return error.TestUnexpectedResult;
+    defer db.freeForeignKeyIntegrityProgressRecord(low_progress);
+    try std.testing.expectEqualStrings("validate", low_progress.mode);
+    try std.testing.expectEqualStrings("a:", low_progress.lower_doc_key);
+    try std.testing.expectEqualStrings("m:", low_progress.upper_doc_key);
+    try std.testing.expect(low_progress.valid);
+    try std.testing.expectEqual(@as(u64, 1), low_progress.report.referenced_child_rows);
+
+    const high_progress = (try db.loadForeignKeyIntegrityProgressRecord(.validate, null, "m:", "")) orelse return error.TestUnexpectedResult;
+    defer db.freeForeignKeyIntegrityProgressRecord(high_progress);
+    try std.testing.expectEqualStrings("validate", high_progress.mode);
+    try std.testing.expectEqualStrings("m:", high_progress.lower_doc_key);
+    try std.testing.expectEqualStrings("", high_progress.upper_doc_key);
+    try std.testing.expect(high_progress.valid);
+    try std.testing.expectEqual(@as(u64, 1), high_progress.report.referenced_child_rows);
+    try std.testing.expect((try db.loadForeignKeyIntegrityProgressRecord(.validate, null, "", "")) == null);
+
+    const all_progress = try db.listForeignKeyIntegrityProgressRecords();
+    defer db.freeForeignKeyIntegrityProgressRecords(all_progress);
+    try std.testing.expectEqual(@as(usize, 2), all_progress.len);
+    var saw_low = false;
+    var saw_high = false;
+    for (all_progress) |entry| {
+        try std.testing.expectEqualStrings("validate", entry.mode);
+        if (std.mem.eql(u8, entry.lower_doc_key, "a:") and std.mem.eql(u8, entry.upper_doc_key, "m:")) saw_low = true;
+        if (std.mem.eql(u8, entry.lower_doc_key, "m:") and std.mem.eql(u8, entry.upper_doc_key, "")) saw_high = true;
+    }
+    try std.testing.expect(saw_low);
+    try std.testing.expect(saw_high);
+
+    const worker_report = try db.claimAndRunForeignKeyIntegrityWorkUnitAt(
+        "claim:validate-all",
+        "worker:validate",
+        19,
+        "child_range",
+        .validate,
+        null,
+        "",
+        "",
+        60_000,
+        100_000,
+    );
+    try std.testing.expect(worker_report.valid());
+    try std.testing.expectEqual(@as(u64, 2), worker_report.referenced_child_rows);
+
+    const worker_claim = (try db.loadForeignKeyIntegrityClaimRecord("claim:validate-all")) orelse return error.TestUnexpectedResult;
+    defer db.freeForeignKeyIntegrityClaimRecord(worker_claim);
+    try std.testing.expectEqualStrings("worker:validate", worker_claim.worker_id);
+    try std.testing.expectEqualStrings("validate", worker_claim.planned_action);
+    try std.testing.expectEqualStrings("", worker_claim.lower_doc_key);
+    try std.testing.expectEqualStrings("", worker_claim.upper_doc_key);
+
+    const worker_progress = (try db.loadForeignKeyIntegrityProgressRecord(.validate, null, "", "")) orelse return error.TestUnexpectedResult;
+    defer db.freeForeignKeyIntegrityProgressRecord(worker_progress);
+    try std.testing.expect(worker_progress.valid);
+    try std.testing.expectEqual(@as(u64, 2), worker_progress.report.referenced_child_rows);
+}
+
+test "db foreign key integrity work claims are leased and durable" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const first = try db.claimForeignKeyIntegrityWorkUnitAt(
+            "claim:a",
+            "worker:a",
+            17,
+            "child_range",
+            "validate",
+            "orders_customer_id_fkey",
+            "a:",
+            "m:",
+            1_000,
+            10_000,
+        );
+        defer db.freeForeignKeyIntegrityClaimRecord(first);
+        try std.testing.expectEqualStrings("claim:a", first.claim_key);
+        try std.testing.expectEqualStrings("worker:a", first.worker_id);
+        try std.testing.expectEqual(@as(u64, 17), first.group_id);
+        try std.testing.expectEqualStrings("validate", first.planned_action);
+        try std.testing.expectEqualStrings("orders_customer_id_fkey", first.constraint_name.?);
+        try std.testing.expectEqual(@as(u32, 1), first.attempts);
+        try std.testing.expect(first.lease_until_ns > first.claimed_at_ns);
+
+        try std.testing.expectError(error.ForeignKeyIntegrityClaimBusy, db.claimForeignKeyIntegrityWorkUnitAt(
+            "claim:a",
+            "worker:b",
+            17,
+            "child_range",
+            "validate",
+            "orders_customer_id_fkey",
+            "a:",
+            "m:",
+            1_000,
+            20_000,
+        ));
+
+        const renewed = try db.claimForeignKeyIntegrityWorkUnitAt(
+            "claim:a",
+            "worker:a",
+            17,
+            "child_range",
+            "validate",
+            "orders_customer_id_fkey",
+            "a:",
+            "m:",
+            1_000,
+            30_000,
+        );
+        defer db.freeForeignKeyIntegrityClaimRecord(renewed);
+        try std.testing.expectEqualStrings("worker:a", renewed.worker_id);
+        try std.testing.expectEqual(@as(u32, 2), renewed.attempts);
+        try std.testing.expect(renewed.claimed_at_ns > first.claimed_at_ns);
+
+        const taken = try db.claimForeignKeyIntegrityWorkUnitAt(
+            "claim:a",
+            "worker:b",
+            17,
+            "child_range",
+            "repair",
+            null,
+            "a:",
+            "m:",
+            1_000,
+            renewed.lease_until_ns + 1,
+        );
+        defer db.freeForeignKeyIntegrityClaimRecord(taken);
+        try std.testing.expectEqualStrings("worker:b", taken.worker_id);
+        try std.testing.expectEqualStrings("repair", taken.planned_action);
+        try std.testing.expect(taken.constraint_name == null);
+        try std.testing.expectEqual(@as(u32, 3), taken.attempts);
+
+        const loaded = (try db.loadForeignKeyIntegrityClaimRecord("claim:a")) orelse return error.TestUnexpectedResult;
+        defer db.freeForeignKeyIntegrityClaimRecord(loaded);
+        try std.testing.expectEqualStrings("worker:b", loaded.worker_id);
+        try std.testing.expectEqualStrings("repair", loaded.planned_action);
+
+        const all = try db.listForeignKeyIntegrityClaimRecords();
+        defer db.freeForeignKeyIntegrityClaimRecords(all);
+        try std.testing.expectEqual(@as(usize, 1), all.len);
+        try std.testing.expectEqualStrings("claim:a", all[0].claim_key);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+    const persisted = (try reopened.loadForeignKeyIntegrityClaimRecord("claim:a")) orelse return error.TestUnexpectedResult;
+    defer reopened.freeForeignKeyIntegrityClaimRecord(persisted);
+    try std.testing.expectEqualStrings("worker:b", persisted.worker_id);
+    try std.testing.expectEqualStrings("repair", persisted.planned_action);
+    try std.testing.expectEqual(@as(u32, 3), persisted.attempts);
+}
+
+test "db foreign key maintenance leases use durable realtime clock" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const before_claim_ns = currentTimeNs();
+    const claim = try db.claimForeignKeyIntegrityWorkUnit(
+        "claim:realtime",
+        "worker:realtime",
+        17,
+        "child_range",
+        "validate",
+        "orders_customer_id_fkey",
+        "",
+        "",
+        60_000,
+    );
+    defer db.freeForeignKeyIntegrityClaimRecord(claim);
+    try std.testing.expect(claim.claimed_at_ns >= before_claim_ns);
+    try std.testing.expect(claim.lease_until_ns > currentTimeNs());
+
+    const before_action_ns = currentTimeNs();
+    const action = try db.scheduleForeignKeyActionJob(
+        "fk-action:realtime",
+        "set_null",
+        "worker:realtime",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:realtime",
+        16,
+    );
+    defer db.freeForeignKeyActionJobRecord(action);
+    try std.testing.expect(action.created_at_ns >= before_action_ns);
+    try std.testing.expectEqual(@as(u64, 0), action.lease_until_ns);
+
+    const before_action_claim_ns = currentTimeNs();
+    const claimed_action = try db.claimForeignKeyActionJobPage(
+        "fk-action:realtime:claim",
+        "set_null",
+        "worker:realtime",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:realtime",
+        16,
+        60_000,
+    );
+    defer db.freeForeignKeyActionJobRecord(claimed_action);
+    try std.testing.expect(claimed_action.claimed_at_ns >= before_action_claim_ns);
+    try std.testing.expect(claimed_action.lease_until_ns > currentTimeNs());
+}
+
+test "db foreign key action jobs canonicalize SQL action aliases" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const scheduled = try db.scheduleForeignKeyActionJobAt(
+        "fk-action:sql-set-null",
+        "ON DELETE SET NULL",
+        "worker:fk-action:scheduler",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:sql",
+        16,
+        100_000,
+    );
+    defer db.freeForeignKeyActionJobRecord(scheduled);
+    try std.testing.expectEqualStrings("set_null", scheduled.action);
+
+    const scheduled_again = try db.scheduleForeignKeyActionJobAt(
+        "fk-action:sql-set-null",
+        "set-null",
+        "worker:fk-action:scheduler",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:sql",
+        16,
+        100_001,
+    );
+    defer db.freeForeignKeyActionJobRecord(scheduled_again);
+    try std.testing.expectEqualStrings("set_null", scheduled_again.action);
+    try std.testing.expectEqual(@as(u64, scheduled.created_at_ns), scheduled_again.created_at_ns);
+
+    const claimed = try db.claimForeignKeyActionJobPageAt(
+        "fk-action:sql-set-null",
+        "ON DELETE SET NULL",
+        "worker:fk-action:claimer",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:sql",
+        16,
+        60_000,
+        100_010,
+    );
+    defer db.freeForeignKeyActionJobRecord(claimed);
+    try std.testing.expectEqualStrings("set_null", claimed.action);
+    try std.testing.expectEqualStrings("claimed", claimed.status);
+
+    const update_scheduled = try db.scheduleForeignKeyActionJobWithUpdatedParentKeyAt(
+        "fk-action:sql-update-cascade",
+        "ON UPDATE CASCADE",
+        "worker:fk-action:scheduler",
+        "users_ref_email_fkey",
+        "users",
+        "email:old",
+        "email:new",
+        8,
+        100_020,
+    );
+    defer db.freeForeignKeyActionJobRecord(update_scheduled);
+    try std.testing.expectEqualStrings("update_cascade", update_scheduled.action);
+    try std.testing.expectEqualStrings("email:new", update_scheduled.updated_parent_key.?);
+
+    const schedule = try db.scheduleForeignKeyActionScheduleAt(
+        "fk-action-schedule:sql-set-null",
+        "fk-action:sql-set-null-scheduled",
+        "SET NULL",
+        "worker:fk-action:scheduler",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:scheduled",
+        32,
+        100_030,
+    );
+    defer db.freeForeignKeyActionScheduleRecord(schedule);
+    try std.testing.expectEqualStrings("set_null", schedule.action);
+
+    const schedule_again = try db.scheduleForeignKeyActionScheduleAt(
+        "fk-action-schedule:sql-set-null",
+        "fk-action:sql-set-null-scheduled",
+        "set-null",
+        "worker:fk-action:scheduler",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:scheduled",
+        32,
+        100_031,
+    );
+    defer db.freeForeignKeyActionScheduleRecord(schedule_again);
+    try std.testing.expectEqualStrings("set_null", schedule_again.action);
+    try std.testing.expectEqual(@as(u64, schedule.created_at_ns), schedule_again.created_at_ns);
+}
+
+test "db foreign key action schedule records zero-owner seed failures durably" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const scheduled = try db.scheduleForeignKeyActionSchedule(
+        "fk-action-schedule:set-null:no-owners",
+        "fk-action:set-null:no-owners",
+        "set_null",
+        "worker:scheduler",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:no-owners",
+        128,
+    );
+    defer db.freeForeignKeyActionScheduleRecord(scheduled);
+
+    try std.testing.expectError(error.InvalidForeignKeyActionJob, db.requeueForeignKeyActionScheduleAt(
+        "fk-action-schedule:set-null:no-owners",
+        "fk-action:set-null:no-owners",
+        "set_null",
+        "worker:retry",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:no-owners",
+        64,
+        31_999,
+    ));
+
+    const failed = try db.markForeignKeyActionScheduleSeededAt(
+        "fk-action-schedule:set-null:no-owners",
+        0,
+        32_000,
+    );
+    defer db.freeForeignKeyActionScheduleRecord(failed);
+    try std.testing.expectEqualStrings("invalid", failed.status);
+    try std.testing.expect(!failed.completed);
+    try std.testing.expectEqual(@as(u64, 0), failed.scheduled_groups);
+    try std.testing.expect(failed.last_error != null);
+    try std.testing.expectEqualStrings("NoForeignKeyActionOwnerGroups", failed.last_error.?);
+    try std.testing.expectEqual(@as(u64, 0), failed.requeue_count);
+    try std.testing.expect(failed.last_requeued_at_ns == null);
+
+    try std.testing.expectError(error.InvalidForeignKeyActionJob, db.markForeignKeyActionScheduleSeededAt(
+        "fk-action-schedule:set-null:no-owners",
+        2,
+        32_000,
+    ));
+
+    try std.testing.expectError(error.InvalidForeignKeyActionJob, db.requeueForeignKeyActionScheduleAt(
+        "fk-action-schedule:set-null:no-owners",
+        "fk-action:set-null:no-owners",
+        "cascade",
+        "worker:scheduler",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:no-owners",
+        64,
+        32_000,
+    ));
+
+    const requeued = try db.requeueForeignKeyActionScheduleAt(
+        "fk-action-schedule:set-null:no-owners",
+        "fk-action:set-null:no-owners",
+        "ON DELETE SET NULL",
+        "worker:retry",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:no-owners",
+        64,
+        32_001,
+    );
+    defer db.freeForeignKeyActionScheduleRecord(requeued);
+    try std.testing.expectEqualStrings("pending", requeued.status);
+    try std.testing.expect(!requeued.completed);
+    try std.testing.expectEqualStrings("worker:retry", requeued.worker_id);
+    try std.testing.expectEqual(@as(usize, 64), requeued.page_limit);
+    try std.testing.expectEqual(@as(u64, 0), requeued.scheduled_groups);
+    try std.testing.expect(requeued.last_error == null);
+    try std.testing.expectEqual(@as(u64, 1), requeued.requeue_count);
+    try std.testing.expectEqual(@as(u64, 32_001), requeued.last_requeued_at_ns.?);
+
+    const retried = try db.markForeignKeyActionScheduleSeededAt(
+        "fk-action-schedule:set-null:no-owners",
+        2,
+        32_002,
+    );
+    defer db.freeForeignKeyActionScheduleRecord(retried);
+    try std.testing.expectEqualStrings("seeded", retried.status);
+    try std.testing.expect(retried.completed);
+    try std.testing.expectEqual(@as(u64, 2), retried.scheduled_groups);
+    try std.testing.expect(retried.last_error == null);
+    try std.testing.expectEqual(@as(u64, 1), retried.requeue_count);
+    try std.testing.expectEqual(@as(u64, 32_001), retried.last_requeued_at_ns.?);
+
+    try std.testing.expectError(error.InvalidForeignKeyActionJob, db.requeueForeignKeyActionScheduleAt(
+        "fk-action-schedule:set-null:no-owners",
+        "fk-action:set-null:no-owners",
+        "set_null",
+        "worker:retry",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:no-owners",
+        64,
+        32_003,
+    ));
+}
+
+test "db foreign key action job records page execution failures" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"set_null"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "customer:bad-action", .value = "{\"id\":\"customer:bad-action\"}" },
+            .{ .key = "order:bad-action", .value = "{\"id\":\"order:bad-action\",\"customer_id\":\"customer:bad-action\",\"status\":\"open\"}" },
+        },
+    });
+
+    try std.testing.expectError(error.ForeignKeyViolation, db.claimAndRunForeignKeyActionJobPageAt(
+        "fk-action:cascade:set-null-schema",
+        "cascade",
+        "worker:fk-action:bad",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:bad-action",
+        8,
+        60_000,
+        300_000,
+    ));
+
+    const failed = (try db.loadForeignKeyActionJobRecord("fk-action:cascade:set-null-schema")) orelse return error.TestUnexpectedResult;
+    defer db.freeForeignKeyActionJobRecord(failed);
+    try std.testing.expectEqualStrings("invalid", failed.status);
+    try std.testing.expect(!failed.completed);
+    try std.testing.expectEqual(@as(u64, 0), failed.applied_children);
+    try std.testing.expect(failed.last_error != null);
+    try std.testing.expectEqualStrings("ForeignKeyViolation", failed.last_error.?);
+}
+
+test "db foreign key integrity job records persist intent and completion" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const created = try db.upsertForeignKeyIntegrityJobRecordAt(
+            "job:fk:orders:validate",
+            "orders",
+            "validate",
+            "worker:fk-job",
+            "orders_customer_id_fkey",
+            "a:",
+            "z:",
+            60_000,
+            4,
+            "running",
+            10_000,
+        );
+        defer db.freeForeignKeyIntegrityJobRecord(created);
+        try std.testing.expectEqualStrings("job:fk:orders:validate", created.job_id);
+        try std.testing.expectEqualStrings("orders", created.table_name);
+        try std.testing.expectEqualStrings("validate", created.action);
+        try std.testing.expectEqualStrings("worker:fk-job", created.worker_id);
+        try std.testing.expectEqualStrings("orders_customer_id_fkey", created.constraint_name.?);
+        try std.testing.expectEqualStrings("a:", created.lower_doc_key);
+        try std.testing.expectEqualStrings("z:", created.upper_doc_key);
+        try std.testing.expectEqual(@as(u64, 60_000), created.lease_ms);
+        try std.testing.expectEqual(@as(usize, 4), created.max_work_units);
+        try std.testing.expectEqualStrings("running", created.status);
+        try std.testing.expectEqual(@as(u64, 10_000), created.created_at_ns);
+        try std.testing.expectEqual(@as(u64, 10_000), created.updated_at_ns);
+        try std.testing.expectEqual(@as(u32, 1), created.attempts);
+        try std.testing.expect(!created.completed);
+        try std.testing.expect(created.valid == null);
+        try std.testing.expectEqualStrings("[]", created.violation_samples_json);
+        try std.testing.expectEqual(@as(usize, 0), created.violation_sample_count);
+        try std.testing.expect(!created.violations_truncated);
+        try std.testing.expectEqual(@as(u64, 0), created.aggregate_report.missing_parent_rows);
+        try std.testing.expectEqual(@as(u64, 0), created.aggregate_report.missing_ref_rows);
+        try std.testing.expectEqual(@as(u64, 0), created.aggregate_report.stale_ref_rows);
+        try std.testing.expectEqual(@as(u64, 0), created.diagnostic_passes);
+        try std.testing.expectEqual(@as(u64, 0), created.violating_passes);
+        try std.testing.expect(created.first_violation_at_ns == null);
+        try std.testing.expect(created.last_violation_at_ns == null);
+
+        const resumed = try db.upsertForeignKeyIntegrityJobRecordAt(
+            "job:fk:orders:validate",
+            "orders",
+            "validate",
+            "worker:fk-job-2",
+            "orders_customer_id_fkey",
+            "a:",
+            "z:",
+            120_000,
+            8,
+            "running",
+            20_000,
+        );
+        defer db.freeForeignKeyIntegrityJobRecord(resumed);
+        try std.testing.expectEqual(@as(u64, 10_000), resumed.created_at_ns);
+        try std.testing.expectEqual(@as(u64, 20_000), resumed.updated_at_ns);
+        try std.testing.expectEqual(@as(u32, 2), resumed.attempts);
+        try std.testing.expectEqualStrings("worker:fk-job-2", resumed.worker_id);
+        try std.testing.expectEqual(@as(u64, 120_000), resumed.lease_ms);
+        try std.testing.expectEqual(@as(usize, 8), resumed.max_work_units);
+
+        const diagnosed = try db.updateForeignKeyIntegrityJobDiagnosticsWithReportAt(
+            "job:fk:orders:validate",
+            .{ .missing_parent_rows = 1 },
+            "[{\"kind\":\"missing_parent\",\"child_key\":\"order:1\"}]",
+            1,
+            true,
+            25_000,
+        );
+        defer db.freeForeignKeyIntegrityJobRecord(diagnosed);
+        try std.testing.expectEqualStrings("[{\"kind\":\"missing_parent\",\"child_key\":\"order:1\"}]", diagnosed.violation_samples_json);
+        try std.testing.expectEqual(@as(usize, 1), diagnosed.violation_sample_count);
+        try std.testing.expect(diagnosed.violations_truncated);
+        try std.testing.expectEqual(@as(u64, 1), diagnosed.diagnostic_passes);
+        try std.testing.expectEqual(@as(u64, 1), diagnosed.violating_passes);
+        try std.testing.expectEqual(@as(u64, 25_000), diagnosed.first_violation_at_ns.?);
+        try std.testing.expectEqual(@as(u64, 25_000), diagnosed.last_violation_at_ns.?);
+        try std.testing.expectEqual(@as(u64, 1), diagnosed.last_report.missing_parent_rows);
+        try std.testing.expectEqual(@as(u64, 1), diagnosed.aggregate_report.missing_parent_rows);
+
+        const completed = try db.completeForeignKeyIntegrityJobRecordAt(
+            "job:fk:orders:validate",
+            "complete",
+            true,
+            .{ .referenced_child_rows = 12 },
+            30_000,
+        );
+        defer db.freeForeignKeyIntegrityJobRecord(completed);
+        try std.testing.expect(completed.completed);
+        try std.testing.expect(completed.valid.?);
+        try std.testing.expectEqualStrings("complete", completed.status);
+        try std.testing.expectEqual(@as(u64, 12), completed.last_report.referenced_child_rows);
+        try std.testing.expectEqual(@as(u64, 12), completed.aggregate_report.referenced_child_rows);
+        try std.testing.expectEqual(@as(u64, 1), completed.aggregate_report.missing_parent_rows);
+        try std.testing.expectEqualStrings("[{\"kind\":\"missing_parent\",\"child_key\":\"order:1\"}]", completed.violation_samples_json);
+        try std.testing.expectEqual(@as(usize, 1), completed.violation_sample_count);
+        try std.testing.expect(completed.violations_truncated);
+        try std.testing.expectEqual(@as(u64, 1), completed.diagnostic_passes);
+        try std.testing.expectEqual(@as(u64, 1), completed.violating_passes);
+        try std.testing.expectEqual(@as(u64, 25_000), completed.first_violation_at_ns.?);
+        try std.testing.expectEqual(@as(u64, 25_000), completed.last_violation_at_ns.?);
+
+        const all = try db.listForeignKeyIntegrityJobRecords();
+        defer db.freeForeignKeyIntegrityJobRecords(all);
+        try std.testing.expectEqual(@as(usize, 1), all.len);
+        try std.testing.expectEqualStrings("job:fk:orders:validate", all[0].job_id);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+    const persisted = (try reopened.loadForeignKeyIntegrityJobRecord("job:fk:orders:validate")) orelse return error.TestUnexpectedResult;
+    defer reopened.freeForeignKeyIntegrityJobRecord(persisted);
+    try std.testing.expect(persisted.completed);
+    try std.testing.expect(persisted.valid.?);
+    try std.testing.expectEqualStrings("complete", persisted.status);
+    try std.testing.expectEqual(@as(u32, 2), persisted.attempts);
+    try std.testing.expectEqual(@as(u64, 12), persisted.last_report.referenced_child_rows);
+    try std.testing.expectEqual(@as(u64, 12), persisted.aggregate_report.referenced_child_rows);
+    try std.testing.expectEqual(@as(u64, 1), persisted.aggregate_report.missing_parent_rows);
+    try std.testing.expectEqualStrings("[{\"kind\":\"missing_parent\",\"child_key\":\"order:1\"}]", persisted.violation_samples_json);
+    try std.testing.expectEqual(@as(usize, 1), persisted.violation_sample_count);
+    try std.testing.expect(persisted.violations_truncated);
+    try std.testing.expectEqual(@as(u64, 1), persisted.diagnostic_passes);
+    try std.testing.expectEqual(@as(u64, 1), persisted.violating_passes);
+    try std.testing.expectEqual(@as(u64, 25_000), persisted.first_violation_at_ns.?);
+    try std.testing.expectEqual(@as(u64, 25_000), persisted.last_violation_at_ns.?);
+}

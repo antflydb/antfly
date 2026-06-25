@@ -60,6 +60,11 @@ forms using the same parser options as the existing lowerer. Generated
 `UNIQUE`, method, element-list, covering-index `INCLUDE (...)`, options, and
 partial-index `WHERE ...` token ranges and generated-first create-index
 planning validates those ranges before lowering through the typed DDL planner.
+Incomplete covered DDL clause-boundary shapes for `CREATE TABLE`,
+`CREATE INDEX`, `ALTER TABLE`, and `DROP TABLE` now fail closed through the
+generated parser instead of falling back to the legacy DDL classifier, while
+rich DDL syntax that is not yet generated-covered still falls back to the
+existing typed DDL parser.
 Simple DML now has generated-parser corpus
 coverage, retained generated raw and AST nodes for covered write statements,
 structured generated DML ranges for target tables, sources, assignments,
@@ -110,12 +115,11 @@ fail closed through the generated parser instead of falling back to the legacy
 write classifier. Other DML shapes still use an initial generated
 AST-to-plan wrapper that fails closed if the generated DML family does not
 match the existing write classifier before delegating to the current typed DML
-lowerer. DML statement heads now require generated parser success instead of
-falling back to the legacy write classifier; unsupported DML syntax fails at
-the generated grammar boundary, and deeper DML cutover still requires replacing
-token-based command-body parsing with complete generated AST payloads for
-recursive CTE DML command bodies beyond retained generated CTE body metadata
-and broader unsupported-shape diagnostics.
+lowerer. Deeper DML cutover still requires replacing token-based command-body
+parsing with complete generated AST payloads for recursive CTE DML command
+bodies beyond retained generated CTE body metadata, broader unsupported-shape
+diagnostics, and a later full statement-head promotion once generated coverage
+matches the currently supported typed DML surface.
 Representative
 read queries now have generated-parser corpus coverage, retained generated raw
 and AST nodes for covered read statements, top-level generated AST ranges for
@@ -340,6 +344,9 @@ clauses with generated-first AST-to-plan parity validation. Generated
 `ALTER TABLE` ASTs now retain target-table and operation-tail ranges and
 generated-first ALTER TABLE planning validates those ranges before lowering
 through the typed DDL planner for covered add/drop/rename/validate operations.
+Incomplete covered DDL clause-boundary shapes for create-table, create-index,
+alter-table, and drop-table now use generated fail-closed diagnostics instead
+of classifier fallback.
 Unsupported DDL remains on the existing parser until
    each shape has raw AST parity.
 3. Simple DML: `INSERT ... VALUES`, primary-key `UPDATE`, primary-key
@@ -387,14 +394,13 @@ Unsupported DDL remains on the existing parser until
    closed if their AST-to-plan contract regresses.
    Incomplete migrated DML clause-boundary shapes for insert, update, delete,
    truncate, and merge now use generated fail-closed diagnostics instead of
-   classifier fallback, and DML statement heads now require generated parser
-   success instead of falling back to the legacy write classifier on unsupported
-   DML syntax.
+   classifier fallback.
    Switching the full DML family from generated-parser gating plus typed
    lowerer delegation to complete generated AST-driven lowering still requires
    generated command-body ASTs for recursive CTE DML beyond retained generated
-   CTE body metadata and direct recursive write-plan dispatch, plus broader
-   unsupported-shape diagnostics.
+   CTE body metadata and direct recursive write-plan dispatch, broader
+   unsupported-shape diagnostics, and full generated statement-head promotion
+   once generated coverage matches the current typed DML lowerer surface.
 4. Read queries: projections, predicates, joins, CTEs, aggregates, windows,
    set operations, lateral, ordering, limits, and document-table sources.
    Initial generated-parser coverage now retains raw and AST read nodes for

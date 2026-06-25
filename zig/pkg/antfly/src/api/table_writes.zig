@@ -61,6 +61,7 @@ const table_write_integrity_types = @import("table_writes/integrity_types.zig");
 const table_write_managed_db = @import("table_writes/managed_db.zig");
 const table_write_schema_jobs = @import("table_writes/schema_jobs.zig");
 const table_write_backup_restore = @import("table_writes/backup_restore.zig");
+const table_write_relational_mutation = @import("table_writes/relational_mutation.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const distributed_txn = @import("distributed_txn.zig");
 const build_options = @import("build_options");
@@ -244,6 +245,13 @@ const autoBulkIngestGroupBatchOps = table_write_bulk_ingest.autoBulkIngestGroupB
 
 const moveDroppedGroupPathToTrash = table_write_backup_restore.moveDroppedGroupPathToTrash;
 const deleteGroupPathIfPresent = table_write_backup_restore.deleteGroupPathIfPresent;
+
+pub const mutateRowsJoinedFromRecursiveCtePlanAlloc = table_write_relational_mutation.mutateRowsJoinedFromRecursiveCtePlanAlloc;
+pub const mutateRowsJoinedFromRecursiveCtePlanWithSessionAlloc = table_write_relational_mutation.mutateRowsJoinedFromRecursiveCtePlanWithSessionAlloc;
+pub const mutateRowsJoinedFromRecursiveCtePlanAutocommitAlloc = table_write_relational_mutation.mutateRowsJoinedFromRecursiveCtePlanAutocommitAlloc;
+pub const mutateRowsJoinedFromRecursiveCtePlanAutocommitWithSessionAlloc = table_write_relational_mutation.mutateRowsJoinedFromRecursiveCtePlanAutocommitWithSessionAlloc;
+pub const mergeRowsFromRecursiveCtePlanAlloc = table_write_relational_mutation.mergeRowsFromRecursiveCtePlanAlloc;
+pub const mergeRowsFromRecursiveCtePlanWithSessionAlloc = table_write_relational_mutation.mergeRowsFromRecursiveCtePlanWithSessionAlloc;
 const ManagedDbOpenMode = table_write_managed_db.ManagedDbOpenMode;
 const ManagedDbOpenOptions = table_write_managed_db.ManagedDbOpenOptions;
 const haMirrorForManagedDbOpenMode = table_write_managed_db.haMirrorForManagedDbOpenMode;
@@ -737,241 +745,6 @@ const TestEmbeddingRequest = struct {
     model: std.json.Value,
     input: std.json.Value,
 };
-
-pub fn mutateRowsJoinedFromRecursiveCtePlanAlloc(
-    alloc: std.mem.Allocator,
-    read_source: table_reads.TableReadSource,
-    write_source: TableWriteSource,
-    catalog: table_catalog.CatalogSource,
-    default_table_name: []const u8,
-    recursive_source_schema: storage_schema.TableSchema,
-    target_schema: storage_schema.TableSchema,
-    lowered: sql_adapter.LoweredRecursiveJoinedMutationSource,
-    consistency: raft_mod.ReadConsistency,
-) !?db_mod.types.RelationalRowsMutationSourceResult {
-    return try mutateRowsJoinedFromRecursiveCtePlanWithSessionAlloc(
-        alloc,
-        read_source,
-        write_source,
-        catalog,
-        catalog_resources.SqlCatalogSession.default(),
-        default_table_name,
-        recursive_source_schema,
-        target_schema,
-        lowered,
-        consistency,
-    );
-}
-
-pub fn mutateRowsJoinedFromRecursiveCtePlanWithSessionAlloc(
-    alloc: std.mem.Allocator,
-    read_source: table_reads.TableReadSource,
-    write_source: TableWriteSource,
-    catalog: table_catalog.CatalogSource,
-    session: catalog_resources.SqlCatalogSession,
-    default_table_name: []const u8,
-    recursive_source_schema: storage_schema.TableSchema,
-    target_schema: storage_schema.TableSchema,
-    lowered: sql_adapter.LoweredRecursiveJoinedMutationSource,
-    consistency: raft_mod.ReadConsistency,
-) !?db_mod.types.RelationalRowsMutationSourceResult {
-    const source_query = recursiveJoinedMutationSourceQuery(lowered.mutation.mutation.req);
-    if (!std.mem.eql(u8, source_query.source_cte, lowered.recursive.cte_name)) return error.InvalidRowsRequest;
-
-    var materialized = (try table_reads.materializeLoweredSqlRecursiveCteRowsWithSessionAlloc(
-        alloc,
-        read_source,
-        catalog,
-        session,
-        default_table_name,
-        recursive_source_schema,
-        lowered.recursive,
-        consistency,
-    )) orelse return null;
-    defer materialized.deinit(alloc);
-
-    var cte_schema = recursive_source_schema;
-    cte_schema.relational_columns = lowered.recursive.output_columns;
-    const synthetic_primary_key_columns = [_][]const u8{lowered.recursive.output_columns[0].name};
-    cte_schema.primary_key = .{ .columns = synthetic_primary_key_columns[0..] };
-
-    var filtered_source_query = source_query;
-    filtered_source_query.source_cte = "";
-    filtered_source_query.select = &.{};
-    filtered_source_query.select_all = true;
-    filtered_source_query.row_claim = null;
-    var source_rows = try relational_rows_api.executeRowsQueryOnJsonRowsAlloc(alloc, cte_schema, filtered_source_query, materialized.rows);
-    defer source_rows.deinit(alloc);
-
-    return try write_source.mutateRowsJoinedFromSourceRows(
-        alloc,
-        lowered.mutation.target_table_name,
-        target_schema,
-        recursive_source_schema,
-        lowered.mutation.mutation.req,
-        source_rows.rows,
-    );
-}
-
-pub fn mutateRowsJoinedFromRecursiveCtePlanAutocommitAlloc(
-    alloc: std.mem.Allocator,
-    read_source: table_reads.TableReadSource,
-    write_source: TableWriteSource,
-    catalog: table_catalog.CatalogSource,
-    default_table_name: []const u8,
-    recursive_source_schema: storage_schema.TableSchema,
-    target_schema: storage_schema.TableSchema,
-    lowered: sql_adapter.LoweredRecursiveJoinedMutationSource,
-    consistency: raft_mod.ReadConsistency,
-) !?db_mod.types.RelationalRowsMutationSourceResult {
-    return try mutateRowsJoinedFromRecursiveCtePlanAutocommitWithSessionAlloc(
-        alloc,
-        read_source,
-        write_source,
-        catalog,
-        catalog_resources.SqlCatalogSession.default(),
-        default_table_name,
-        recursive_source_schema,
-        target_schema,
-        lowered,
-        consistency,
-    );
-}
-
-pub fn mutateRowsJoinedFromRecursiveCtePlanAutocommitWithSessionAlloc(
-    alloc: std.mem.Allocator,
-    read_source: table_reads.TableReadSource,
-    write_source: TableWriteSource,
-    catalog: table_catalog.CatalogSource,
-    session: catalog_resources.SqlCatalogSession,
-    default_table_name: []const u8,
-    recursive_source_schema: storage_schema.TableSchema,
-    target_schema: storage_schema.TableSchema,
-    lowered: sql_adapter.LoweredRecursiveJoinedMutationSource,
-    consistency: raft_mod.ReadConsistency,
-) !?db_mod.types.RelationalRowsMutationSourceResult {
-    const source_query = recursiveJoinedMutationSourceQuery(lowered.mutation.mutation.req);
-    if (!std.mem.eql(u8, source_query.source_cte, lowered.recursive.cte_name)) return error.InvalidRowsRequest;
-
-    var materialized = (try table_reads.materializeLoweredSqlRecursiveCteRowsWithSessionAlloc(
-        alloc,
-        read_source,
-        catalog,
-        session,
-        default_table_name,
-        recursive_source_schema,
-        lowered.recursive,
-        consistency,
-    )) orelse return null;
-    defer materialized.deinit(alloc);
-
-    var cte_schema = recursive_source_schema;
-    cte_schema.relational_columns = lowered.recursive.output_columns;
-    const synthetic_primary_key_columns = [_][]const u8{lowered.recursive.output_columns[0].name};
-    cte_schema.primary_key = .{ .columns = synthetic_primary_key_columns[0..] };
-
-    var filtered_source_query = source_query;
-    filtered_source_query.source_cte = "";
-    filtered_source_query.select = &.{};
-    filtered_source_query.select_all = true;
-    filtered_source_query.row_claim = null;
-    var source_rows = try relational_rows_api.executeRowsQueryOnJsonRowsAlloc(alloc, cte_schema, filtered_source_query, materialized.rows);
-    defer source_rows.deinit(alloc);
-
-    return try write_source.mutateRowsJoinedFromSourceRowsAutocommit(
-        alloc,
-        lowered.mutation.target_table_name,
-        target_schema,
-        recursive_source_schema,
-        lowered.mutation.mutation.req,
-        source_rows.rows,
-        lowered.mutation.sync_level,
-    );
-}
-
-pub fn mergeRowsFromRecursiveCtePlanAlloc(
-    alloc: std.mem.Allocator,
-    read_source: table_reads.TableReadSource,
-    write_source: TableWriteSource,
-    catalog: table_catalog.CatalogSource,
-    default_table_name: []const u8,
-    recursive_source_schema: storage_schema.TableSchema,
-    target_schema: storage_schema.TableSchema,
-    lowered: sql_adapter.LoweredRecursiveMergeMutation,
-    consistency: raft_mod.ReadConsistency,
-) !?relational_rows_api.OwnedRowsBatchRequest {
-    return try mergeRowsFromRecursiveCtePlanWithSessionAlloc(
-        alloc,
-        read_source,
-        write_source,
-        catalog,
-        catalog_resources.SqlCatalogSession.default(),
-        default_table_name,
-        recursive_source_schema,
-        target_schema,
-        lowered,
-        consistency,
-    );
-}
-
-pub fn mergeRowsFromRecursiveCtePlanWithSessionAlloc(
-    alloc: std.mem.Allocator,
-    read_source: table_reads.TableReadSource,
-    write_source: TableWriteSource,
-    catalog: table_catalog.CatalogSource,
-    session: catalog_resources.SqlCatalogSession,
-    default_table_name: []const u8,
-    recursive_source_schema: storage_schema.TableSchema,
-    target_schema: storage_schema.TableSchema,
-    lowered: sql_adapter.LoweredRecursiveMergeMutation,
-    consistency: raft_mod.ReadConsistency,
-) !?relational_rows_api.OwnedRowsBatchRequest {
-    if (!std.mem.eql(u8, lowered.merge.source.source_cte, lowered.recursive.cte_name)) return error.InvalidRowsRequest;
-
-    var materialized = (try table_reads.materializeLoweredSqlRecursiveCteRowsWithSessionAlloc(
-        alloc,
-        read_source,
-        catalog,
-        session,
-        default_table_name,
-        recursive_source_schema,
-        lowered.recursive,
-        consistency,
-    )) orelse return null;
-    defer materialized.deinit(alloc);
-
-    var cte_schema = recursive_source_schema;
-    cte_schema.relational_columns = lowered.recursive.output_columns;
-    const synthetic_primary_key_columns = [_][]const u8{lowered.recursive.output_columns[0].name};
-    cte_schema.primary_key = .{ .columns = synthetic_primary_key_columns[0..] };
-
-    var source_query = lowered.merge.source;
-    source_query.source_cte = "";
-    source_query.select = &.{};
-    source_query.select_all = true;
-    source_query.row_claim = null;
-    var source_rows = try relational_rows_api.executeRowsQueryOnJsonRowsAlloc(alloc, cte_schema, source_query, materialized.rows);
-    defer source_rows.deinit(alloc);
-
-    var merge_plan = lowered.merge;
-    merge_plan.source.source_cte = "";
-    merge_plan.ctes = &.{};
-    return try write_source.mergeRowsFromSourceRows(
-        alloc,
-        lowered.merge.target_table_name,
-        target_schema,
-        cte_schema,
-        merge_plan,
-        source_rows.rows,
-    );
-}
-
-fn recursiveJoinedMutationSourceQuery(req: db_mod.types.RelationalRowsJoinedMutationSourceRequest) db_mod.types.RelationalRowsQueryRequest {
-    return switch (req.target_side) {
-        .left => req.join.right,
-        .right => req.join.left,
-    };
-}
 
 fn runUniqueConstraintIntegritySchemaControllerMaintenanceForTable(
     alloc: std.mem.Allocator,
@@ -15470,10 +15243,16 @@ test "bound table write source enforces string length and object cardinality" {
     }));
 }
 
+fn uniqueTestTmpPathAlloc(alloc: std.mem.Allocator, prefix: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "/tmp/{s}-{d}", .{ prefix, platform_time.monotonicNs() });
+}
+
 test "bound table write source backs up and restores a local table" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-backup-restore";
-    const backup_root = "/tmp/antfly-api-table-backup-restore-out";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-backup-restore");
+    defer alloc.free(path);
+    const backup_root = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-backup-restore-out");
+    defer alloc.free(backup_root);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -15530,8 +15309,10 @@ test "bound table write source backs up and restores a local table" {
 
 test "bound table write source backs up and restores a portable local table" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-portable-backup-restore";
-    const backup_root = "/tmp/antfly-api-table-portable-backup-restore-out";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-portable-backup-restore");
+    defer alloc.free(path);
+    const backup_root = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-portable-backup-restore-out");
+    defer alloc.free(backup_root);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -15594,8 +15375,10 @@ test "bound table write source backs up and restores a portable local table" {
 
 test "provisioned table write source backs up and restores a local table" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-table-backup-restore";
-    const backup_root = "/tmp/antfly-api-provisioned-table-backup-restore-out";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-table-backup-restore");
+    defer alloc.free(path);
+    const backup_root = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-table-backup-restore-out");
+    defer alloc.free(backup_root);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -15696,9 +15479,12 @@ test "provisioned table write source backs up and restores a local table" {
 
 test "provisioned table write source backs up a portable local table" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-table-portable-backup";
-    const backup_root = "/tmp/antfly-api-provisioned-table-portable-backup-out";
-    const restore_path = "/tmp/antfly-api-provisioned-table-portable-backup-restore";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-table-portable-backup");
+    defer alloc.free(path);
+    const backup_root = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-table-portable-backup-out");
+    defer alloc.free(backup_root);
+    const restore_path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-table-portable-backup-restore");
+    defer alloc.free(restore_path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -15787,8 +15573,10 @@ test "provisioned table write source backs up a portable local table" {
 
 test "provisioned table restore rejects mismatched doc identity namespace" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-table-backup-restore-docid-mismatch";
-    const backup_root = "/tmp/antfly-api-provisioned-table-backup-restore-docid-mismatch-out";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-table-backup-restore-docid-mismatch");
+    defer alloc.free(path);
+    const backup_root = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-table-backup-restore-docid-mismatch-out");
+    defer alloc.free(backup_root);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -15890,8 +15678,10 @@ test "provisioned table restore rejects mismatched doc identity namespace" {
 
 test "provisioned table write source backs up and restores full_text writes from the write cache" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-write-cache-backup-restore";
-    const backup_root = "/tmp/antfly-api-provisioned-write-cache-backup-restore-out";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-write-cache-backup-restore");
+    defer alloc.free(path);
+    const backup_root = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-write-cache-backup-restore-out");
+    defer alloc.free(backup_root);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -18510,7 +18300,8 @@ const ProvisionedWriteCoalesceBatchWorker = struct {
 
 test "provisioned table write source coalesces same-group waiters" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-batch-coalesce-waiters";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-batch-coalesce-waiters");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -18566,7 +18357,8 @@ test "provisioned table write source coalesces same-group waiters" {
 
 test "provisioned table write coalescer isolates failed waiters" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-batch-coalesce-failure-isolation";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-batch-coalesce-failure-isolation");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
