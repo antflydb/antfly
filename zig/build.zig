@@ -5973,22 +5973,18 @@ pub fn build(b: *std.Build) void {
     const db_test_step = b.step("db-test", "Run storage/db unit tests");
     db_test_step.dependOn(&run_db_unit_tests.step);
 
+    // DB refactor targets should stay module/category scoped. If a focused
+    // target needs a new test, move that test into the owning module or give it
+    // a stable category prefix instead of adding individual test titles here.
+    const db_schema_default_filters = [_][]const u8{
+        "storage.db.schema_runtime.test.",
+        "storage.db.relational_integrity.test.",
+        "partial predicates maintain indexes and unique owners",
+        "db system-versioned relational tables",
+    };
     const db_schema_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{
-            "db schema checks",
-            "db schema apply validates",
-            "db table schema apply",
-            "db staged algebraic pending",
-            "db direct schema apply",
-            "db executes claimed schema rewrite",
-            "db executes claimed full schema rewrite",
-            "db drains metadata schema rewrite",
-            "db schema rewrite drain",
-            "partial predicates maintain indexes and unique owners",
-            "db executes claimed schema validation jobs",
-            "db system-versioned relational tables",
-        },
+        .filters = selectTestFilters(b, &db_schema_default_filters),
     });
     const run_db_schema_tests = b.addRunArtifact(db_schema_tests);
     const db_schema_test_step = b.step("db-schema-test", "Run focused storage/db schema validation tests");
@@ -5996,7 +5992,7 @@ pub fn build(b: *std.Build) void {
 
     const db_foreign_key_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{"foreign key"},
+        .filters = selectTestFilters(b, &.{"foreign key"}),
     });
     const run_db_foreign_key_tests = b.addRunArtifact(db_foreign_key_tests);
     const db_foreign_key_test_step = b.step("db-foreign-key-test", "Run focused storage/db foreign-key unit tests");
@@ -6004,11 +6000,24 @@ pub fn build(b: *std.Build) void {
 
     const db_temporal_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{"db relational temporal"},
+        .filters = selectTestFilters(b, &.{"db relational temporal"}),
     });
     const run_db_temporal_tests = b.addRunArtifact(db_temporal_tests);
     const db_temporal_test_step = b.step("db-temporal-test", "Run focused storage/db application-time temporal unit tests");
     db_temporal_test_step.dependOn(&run_db_temporal_tests.step);
+
+    const db_relational_rows_default_filters = [_][]const u8{
+        "storage.db.relational_rows.test.",
+        "storage.db.db.test.relational rows query ",
+        "storage.db.db.test.relational rows set operation",
+    };
+    const db_relational_rows_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = selectTestFilters(b, &db_relational_rows_default_filters),
+    });
+    const run_db_relational_rows_tests = b.addRunArtifact(db_relational_rows_tests);
+    const db_relational_rows_test_step = b.step("db-relational-rows-test", "Run focused storage/db relational row query and set-operation tests");
+    db_relational_rows_test_step.dependOn(&run_db_relational_rows_tests.step);
 
     const db_enrichment_tests = b.addTest(.{
         .root_module = db_test_mod,
@@ -6017,22 +6026,6 @@ pub fn build(b: *std.Build) void {
     const run_db_enrichment_tests = b.addRunArtifact(db_enrichment_tests);
     const db_enrichment_test_step = b.step("db-enrichment-test", "Run storage/db enrichment-related unit tests");
     db_enrichment_test_step.dependOn(&run_db_enrichment_tests.step);
-
-    const db_enrichment_single_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = &.{"db dense index can reference existing whole-doc embedding enrichment"},
-    });
-    const run_db_enrichment_single_tests = b.addRunArtifact(db_enrichment_single_tests);
-    const db_enrichment_single_step = b.step("db-enrichment-single-test", "Run the focused whole-doc enrichment DB test");
-    db_enrichment_single_step.dependOn(&run_db_enrichment_single_tests.step);
-
-    const db_restore_managed_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = &.{"db restore snapshot replays managed chunked dense embeddings"},
-    });
-    const run_db_restore_managed_tests = b.addRunArtifact(db_restore_managed_tests);
-    const db_restore_managed_step = b.step("db-restore-managed-test", "Run the focused managed chunked dense restore DB test");
-    db_restore_managed_step.dependOn(&run_db_restore_managed_tests.step);
 
     const provisioned_write_cache_failed_close_tests = b.addTest(.{
         .root_module = db_test_mod,
@@ -6071,38 +6064,6 @@ pub fn build(b: *std.Build) void {
     );
     provisioned_query_visibility_step.dependOn(&run_provisioned_query_visibility_tests.step);
     unit_test_step.dependOn(&run_provisioned_query_visibility_tests.step);
-
-    const db_embeddings_update_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = &.{"db document _embeddings update vector index and strip stored special fields"},
-    });
-    const run_db_embeddings_update_tests = b.addRunArtifact(db_embeddings_update_tests);
-    const db_embeddings_update_step = b.step("db-embeddings-update-test", "Run the explicit _embeddings update DB test");
-    db_embeddings_update_step.dependOn(&run_db_embeddings_update_tests.step);
-
-    const db_merge_cutover_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = &.{"db merge-style cutover preserves enrichment resume and fencing across reopen"},
-    });
-    const run_db_merge_cutover_tests = b.addRunArtifact(db_merge_cutover_tests);
-    const db_merge_cutover_step = b.step("db-merge-cutover-test", "Run the merge cutover enrichment reopen DB test");
-    db_merge_cutover_step.dependOn(&run_db_merge_cutover_tests.step);
-
-    const db_shared_embedding_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = &.{"db shared embedding enrichment feeds multiple dense indexes"},
-    });
-    const run_db_shared_embedding_tests = b.addRunArtifact(db_shared_embedding_tests);
-    const db_shared_embedding_step = b.step("db-shared-embedding-test", "Run the shared embedding enrichment DB test");
-    db_shared_embedding_step.dependOn(&run_db_shared_embedding_tests.step);
-
-    const db_dense_parent_paging_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = &.{"db dense parent paging fetches enough chunk hits before grouping"},
-    });
-    const run_db_dense_parent_paging_tests = b.addRunArtifact(db_dense_parent_paging_tests);
-    const db_dense_parent_paging_step = b.step("db-dense-parent-paging-test", "Run the dense parent paging enrichment DB test");
-    db_dense_parent_paging_step.dependOn(&run_db_dense_parent_paging_tests.step);
 
     const sparse_test_mod = makeLmdbModule(b, "pkg/antfly/src/sparse_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     sparse_test_mod.addImport("bloom", bloom_mod);

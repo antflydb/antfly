@@ -579,14 +579,18 @@ pub const Server = struct {
         try self.server.runRound();
         self.refreshMetadataRaftStorageDiagnostics();
         try self.server.campaignMetadataGroup();
-        try self.server.svc.upsertReplicaIntent(.{
-            .record = .{
-                .group_id = metadata_group_id,
-                .replica_id = 1,
-                .local_node_id = local_node_id,
-                .bootstrap_mode = .persisted,
+        try self.server.svc.raft.submit(.{
+            .replica_intent = .{
+                .upsert = .{
+                    .record = .{
+                        .group_id = metadata_group_id,
+                        .replica_id = 1,
+                        .local_node_id = local_node_id,
+                        .bootstrap_mode = .persisted,
+                    },
+                    .peer_node_ids = &.{},
+                },
             },
-            .peer_node_ids = &.{},
         });
         try self.bootstrapPublicApiPrerequisites(local_node_id);
     }
