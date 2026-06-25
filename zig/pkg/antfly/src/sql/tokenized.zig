@@ -462,6 +462,10 @@ fn isIncompleteGeneratedDdlBoundary(tokens: []const Token, raw_statement: RawSql
             if (end <= start + 3) return true;
             return isGeneratedDdlTrailingBoundary(last);
         }
+        if (tokenMatchesKeyword(tokens[start + 1], .tablespace)) {
+            if (end <= start + 3) return true;
+            return isGeneratedDdlTrailingBoundary(last);
+        }
         if (tokenMatchesKeyword(tokens[start + 1], .index)) {
             if (end <= start + 3) return true;
             return isGeneratedDdlTrailingBoundary(last);
@@ -479,6 +483,10 @@ fn isIncompleteGeneratedDdlBoundary(tokens: []const Token, raw_statement: RawSql
         return isGeneratedDdlTrailingBoundary(last);
     }
     if (tokenMatchesKeyword(first, .alter) and tokenMatchesKeyword(tokens[start + 1], .schema)) {
+        if (end <= start + 3) return true;
+        return isGeneratedDdlTrailingBoundary(last);
+    }
+    if (tokenMatchesKeyword(first, .alter) and tokenMatchesKeyword(tokens[start + 1], .tablespace)) {
         if (end <= start + 3) return true;
         return isGeneratedDdlTrailingBoundary(last);
     }
@@ -504,6 +512,7 @@ fn isIncompleteGeneratedDdlBoundary(tokens: []const Token, raw_statement: RawSql
             tokenMatchesKeyword(tokens[start + 1], .domain) or
             tokenMatchesKeyword(tokens[start + 1], .sequence) or
             tokenMatchesKeyword(tokens[start + 1], .type) or
+            tokenMatchesKeyword(tokens[start + 1], .tablespace) or
             tokenMatchesKeyword(tokens[start + 1], .index) or
             tokenMatchesKeyword(tokens[start + 1], .database) or
             tokenMatchesKeyword(tokens[start + 1], .schema) or
@@ -1384,6 +1393,9 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE TYPE usage_status AS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER TYPE usage_status ADD"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP TYPE IF EXISTS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE TABLESPACE"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER TABLESPACE fastspace RENAME TO"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP TABLESPACE IF EXISTS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT DISTINCT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT DISTINCT ON ("));
@@ -2141,6 +2153,54 @@ test "sql adapter parsed sql owns typed statement variants" {
         else => return error.TestUnexpectedResult,
     }
     switch (alter_schema.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var create_tablespace = try ParsedSql.initAlloc(alloc, "CREATE TABLESPACE fastspace LOCATION '/var/lib/antfly/fastspace'");
+    defer create_tablespace.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, create_tablespace.generatedStatementKind().?);
+    switch (create_tablespace.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_tablespace, ddl_ast.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 5 }, ddl_ast.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (create_tablespace.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var alter_tablespace = try ParsedSql.initAlloc(alloc, "ALTER TABLESPACE fastspace RENAME TO fastspace_archive");
+    defer alter_tablespace.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, alter_tablespace.generatedStatementKind().?);
+    switch (alter_tablespace.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_tablespace, ddl_ast.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 6 }, ddl_ast.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (alter_tablespace.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_tablespace = try ParsedSql.initAlloc(alloc, "DROP TABLESPACE IF EXISTS fastspace_archive");
+    defer drop_tablespace.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, drop_tablespace.generatedStatementKind().?);
+    switch (drop_tablespace.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.drop_tablespace, ddl_ast.kind);
+            try std.testing.expect(ddl_ast.if_exists);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl_ast.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (drop_tablespace.statement) {
         .ddl => {},
         else => return error.TestUnexpectedResult,
     }

@@ -3283,6 +3283,10 @@ pub fn ddlPlanFromGeneratedAstAlloc(
         .alter_enum_type,
         .drop_enum_type,
         => try enumTypeCatalogPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options),
+        .create_tablespace,
+        .alter_tablespace,
+        .drop_tablespace,
+        => try tablespaceCatalogPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options),
         .create_index => .{ .create_index = try createIndexPlanFromGeneratedAstAlloc(alloc, tokens, ast, options.create_index_options) },
         .alter_table => if (generatedAlterTableUsesRowSecurityRuntimeBoundary(tokens, ast))
             .{ .row_security_catalog = .{ .alter_table = try rowSecurityAlterTablePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } }
@@ -3302,8 +3306,10 @@ fn generatedDdlUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated
         .create_domain,
         .create_sequence,
         .create_enum_type,
+        .create_tablespace,
         .create_extension,
         .alter_schema,
+        .alter_tablespace,
         .alter_view,
         .alter_domain,
         .alter_sequence,
@@ -3313,6 +3319,7 @@ fn generatedDdlUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated
         .drop_domain,
         .drop_sequence,
         .drop_enum_type,
+        .drop_tablespace,
         .drop_index,
         .drop_schema,
         .drop_database,
@@ -3650,6 +3657,74 @@ fn validateGeneratedEnumTypeDdlAst(tokens: []const grammar.Token, ast: generated
             if (object_name.start != name_index) return error.UnsupportedSqlShape;
             const has_cascade = generatedRangeHasKeyword(tokens, .{ .start = object_name.end, .end = end }, "cascade");
             if (has_cascade != ast.cascade) return error.UnsupportedSqlShape;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
+fn tablespaceCatalogPlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+    options: DdlPlanParserOptions,
+) !LoweredDdlPlan {
+    try validateGeneratedTablespaceDdlAst(tokens, ast);
+    var pos: usize = 0;
+    var plan = try parseDdlPlanAlloc(alloc, tokens, &pos, options);
+    errdefer plan.deinit(alloc);
+    if (pos != tokens.len) return error.UnsupportedSqlShape;
+    switch (ast.kind) {
+        .create_tablespace => switch (plan) {
+            .tablespace_catalog => |catalog| switch (catalog) {
+                .create => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .alter_tablespace => switch (plan) {
+            .tablespace_catalog => |catalog| switch (catalog) {
+                .rename => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .drop_tablespace => switch (plan) {
+            .tablespace_catalog => |catalog| switch (catalog) {
+                .drop => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+    return plan;
+}
+
+fn validateGeneratedTablespaceDdlAst(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) !void {
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    const object_name = ast.object_name_tokens orelse return error.UnsupportedSqlShape;
+    if (object_name.start >= object_name.end or object_name.end > end) return error.UnsupportedSqlShape;
+    switch (ast.kind) {
+        .create_tablespace => {
+            if (end < 4 or !tokens[0].matchesKeyword("create") or !tokens[1].matchesKeyword("tablespace")) return error.UnsupportedSqlShape;
+            if (object_name.start != 2) return error.UnsupportedSqlShape;
+            const operation = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+            if (operation.start != object_name.end or operation.end != end or operation.start >= end) return error.UnsupportedSqlShape;
+        },
+        .alter_tablespace => {
+            if (end < 6 or !tokens[0].matchesKeyword("alter") or !tokens[1].matchesKeyword("tablespace")) return error.UnsupportedSqlShape;
+            if (object_name.start != 2) return error.UnsupportedSqlShape;
+            const operation = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+            if (operation.start != object_name.end or operation.end != end or operation.start >= end) return error.UnsupportedSqlShape;
+            if (!tokens[operation.start].matchesKeyword("rename")) return error.UnsupportedSqlShape;
+        },
+        .drop_tablespace => {
+            if (end < 3 or !tokens[0].matchesKeyword("drop") or !tokens[1].matchesKeyword("tablespace")) return error.UnsupportedSqlShape;
+            var name_index: usize = 2;
+            const if_exists = consumeGeneratedPlanIfExists(tokens, &name_index, end);
+            if (if_exists != ast.if_exists) return error.UnsupportedSqlShape;
+            if (object_name.start != name_index) return error.UnsupportedSqlShape;
+            if (object_name.end != end) return error.UnsupportedSqlShape;
         },
         else => return error.UnsupportedSqlShape,
     }
@@ -4305,6 +4380,7 @@ fn validateGeneratedDdlAstSpans(
         .create_domain,
         .create_sequence,
         .create_enum_type,
+        .create_tablespace,
         .create_index,
         .create_extension,
         .create_graph_index,
@@ -4313,6 +4389,7 @@ fn validateGeneratedDdlAstSpans(
         .relation_population => unreachable,
         .alter_table,
         .alter_schema,
+        .alter_tablespace,
         .alter_view,
         .alter_domain,
         .alter_sequence,
@@ -4323,6 +4400,7 @@ fn validateGeneratedDdlAstSpans(
         .drop_domain,
         .drop_sequence,
         .drop_enum_type,
+        .drop_tablespace,
         .drop_index,
         .drop_schema,
         .drop_database,
@@ -13172,6 +13250,18 @@ test "sql adapter ddl plan lowers namespace database and tablespace catalog ddl 
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var malformed_generated_tablespace = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLESPACE fastspace RENAME TO fastspace_archive;");
+    defer malformed_generated_tablespace.deinit(alloc);
+    if (malformed_generated_tablespace.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.alter_table_operation_tokens = .{ .start = 2, .end = malformed_generated_tablespace.items().len },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_generated_tablespace));
 }
 
 test "sql adapter ddl plan lowers notification and logical replication catalog ddl plans" {

@@ -87,6 +87,10 @@ Schema namespace rename DDL, `ALTER SCHEMA ... RENAME TO ...`, now shares the
 generated schema namespace boundary with generated `CREATE SCHEMA` and
 `DROP SCHEMA`, retaining old/new schema-name metadata before lowering to the
 typed namespace catalog plan.
+Tablespace catalog DDL heads, including `CREATE TABLESPACE`,
+`ALTER TABLESPACE ... RENAME TO ...`, and `DROP TABLESPACE`, now use the
+generated DDL boundary with retained tablespace-name and option/rename-tail
+metadata before delegating to the existing typed tablespace catalog planner.
 Generated
 `CREATE INDEX` ASTs also retain
 `UNIQUE`, method, element-list, covering-index `INCLUDE (...)`, options, and
@@ -98,12 +102,13 @@ now parse and classify through the generated DDL family with retained target
 name spans before delegating to the existing relation-population planner.
 Incomplete covered DDL clause-boundary shapes for `CREATE TABLE`, lifetime
 prefixed `CREATE [TEMP|TEMPORARY|UNLOGGED] TABLE`, `CREATE VIEW`,
-`CREATE DOMAIN`, `CREATE SEQUENCE`, `CREATE TYPE`, `CREATE INDEX`,
-`ALTER TABLE`, `ALTER SCHEMA`, `ALTER VIEW`, `ALTER DOMAIN`, `ALTER SEQUENCE`,
-`ALTER TYPE`, `DROP TABLE`, `DROP VIEW`, `DROP DOMAIN`, `DROP SEQUENCE`, and
-`DROP TYPE` now fail closed through the generated parser instead of falling
-back to the legacy DDL classifier, while rich DDL syntax that is not yet
-generated-covered still falls back to the existing typed DDL parser.
+`CREATE DOMAIN`, `CREATE SEQUENCE`, `CREATE TYPE`, `CREATE TABLESPACE`,
+`CREATE INDEX`, `ALTER TABLE`, `ALTER SCHEMA`, `ALTER TABLESPACE`,
+`ALTER VIEW`, `ALTER DOMAIN`, `ALTER SEQUENCE`, `ALTER TYPE`, `DROP TABLE`,
+`DROP VIEW`, `DROP DOMAIN`, `DROP SEQUENCE`, `DROP TYPE`, and
+`DROP TABLESPACE` now fail closed through the generated parser instead of
+falling back to the legacy DDL classifier, while rich DDL syntax that is not
+yet generated-covered still falls back to the existing typed DDL parser.
 Simple DML now has generated-parser corpus
 coverage, retained generated raw and AST nodes for covered write statements,
 structured generated DML ranges for target tables, sources, assignments,
@@ -1028,6 +1033,8 @@ Generated grammar work needs evidence at multiple levels:
   statements, graph DDL, database/schema/extension catalog DDL, generated
   `CREATE TABLE` including serial identity-allocation tables, `DROP TABLE`,
   generated schema namespace rename DDL for `ALTER SCHEMA ... RENAME TO ...`,
+  generated tablespace catalog DDL for `CREATE TABLESPACE`, `ALTER TABLESPACE`,
+  and `DROP TABLESPACE`,
   `DROP INDEX`, generated domain catalog DDL for `CREATE DOMAIN`,
   `ALTER DOMAIN`, and `DROP DOMAIN`, generated sequence catalog DDL for
   `CREATE SEQUENCE`, `ALTER SEQUENCE`, and `DROP SEQUENCE`, generated

@@ -58,10 +58,12 @@ pub const GeneratedSqlDdlKind = enum {
     create_domain,
     create_sequence,
     create_enum_type,
+    create_tablespace,
     create_index,
     create_extension,
     alter_table,
     alter_schema,
+    alter_tablespace,
     alter_view,
     alter_domain,
     alter_sequence,
@@ -71,6 +73,7 @@ pub const GeneratedSqlDdlKind = enum {
     drop_domain,
     drop_sequence,
     drop_enum_type,
+    drop_tablespace,
     drop_index,
     drop_schema,
     drop_database,
@@ -1947,6 +1950,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.domain)) return .{ .ddl = .create_domain };
         if (second.matchesKeywordTag(.sequence)) return .{ .ddl = .create_sequence };
         if (second.matchesKeywordTag(.type)) return .{ .ddl = .create_enum_type };
+        if (second.matchesKeywordTag(.tablespace)) return .{ .ddl = .create_tablespace };
         if (second.matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
         if (second.matchesKeywordTag(.unique) and tokens.len > 2 and tokens[2].matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
         if (second.matchesKeywordTag(.foreign) and tokens.len > 2 and tokens[2].matchesKeywordTag(.table)) return .{ .unsupported = .create_foreign_table };
@@ -1974,6 +1978,9 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     }
     if (first.matchesKeywordTag(.alter) and tokens.len > 1 and tokens[1].matchesKeywordTag(.schema)) {
         return .{ .ddl = .alter_schema };
+    }
+    if (first.matchesKeywordTag(.alter) and tokens.len > 1 and tokens[1].matchesKeywordTag(.tablespace)) {
+        return .{ .ddl = .alter_tablespace };
     }
     if (first.matchesKeywordTag(.alter) and tokens.len > 1 and tokens[1].matchesKeywordTag(.view)) {
         return .{ .ddl = .alter_view };
@@ -2004,6 +2011,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.domain)) return .{ .ddl = .drop_domain };
         if (second.matchesKeywordTag(.sequence)) return .{ .ddl = .drop_sequence };
         if (second.matchesKeywordTag(.type)) return .{ .ddl = .drop_enum_type };
+        if (second.matchesKeywordTag(.tablespace)) return .{ .ddl = .drop_tablespace };
         if (second.matchesKeywordTag(.index)) return .{ .extension_index = .drop_index };
         if (second.matchesKeywordTag(.schema)) return .{ .ddl = .drop_schema };
         if (second.matchesKeywordTag(.database)) return .{ .ddl = .drop_database };
@@ -2478,6 +2486,14 @@ fn buildDdlAst(
                 }
             }
         },
+        .create_tablespace => {
+            if (end > 2 and tokens[1].matchesKeywordTag(.tablespace)) {
+                ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 2, end);
+                if (ast.object_name_tokens) |tablespace_range| {
+                    if (tablespace_range.end < end) ast.alter_table_operation_tokens = .{ .start = tablespace_range.end, .end = end };
+                }
+            }
+        },
         .create_index => {
             if (tokens.len > 2 and tokens[1].matchesKeywordTag(.unique) and tokens[2].matchesKeywordTag(.index)) {
                 ast.unique = true;
@@ -2542,6 +2558,14 @@ fn buildDdlAst(
                 ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 2, end);
                 if (ast.object_name_tokens) |schema_range| {
                     if (schema_range.end < end) ast.alter_table_operation_tokens = .{ .start = schema_range.end, .end = end };
+                }
+            }
+        },
+        .alter_tablespace => {
+            if (end > 2 and tokens[1].matchesKeywordTag(.tablespace)) {
+                ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 2, end);
+                if (ast.object_name_tokens) |tablespace_range| {
+                    if (tablespace_range.end < end) ast.alter_table_operation_tokens = .{ .start = tablespace_range.end, .end = end };
                 }
             }
         },
@@ -2610,6 +2634,10 @@ fn buildDdlAst(
             ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
             ast.object_name_tokens = generatedQualifiedNameRange(tokens, index, end);
             ast.cascade = findKeyword(tokens, index + 1, end, .cascade) != null;
+        },
+        .drop_tablespace => {
+            ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
+            ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
         },
         .drop_index => {
             ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
@@ -5860,6 +5888,9 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_enum_type }, (try parseSqlAlloc(alloc, "CREATE TYPE usage_status AS ENUM ('open', 'done')")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_enum_type }, (try parseSqlAlloc(alloc, "ALTER TYPE usage_status ADD VALUE IF NOT EXISTS 'archived' AFTER 'done'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_enum_type }, (try parseSqlAlloc(alloc, "DROP TYPE IF EXISTS usage_status CASCADE")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_tablespace }, (try parseSqlAlloc(alloc, "CREATE TABLESPACE fastspace LOCATION '/var/lib/antfly/fastspace'")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_tablespace }, (try parseSqlAlloc(alloc, "ALTER TABLESPACE fastspace RENAME TO fastspace_archive")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_tablespace }, (try parseSqlAlloc(alloc, "DROP TABLESPACE IF EXISTS fastspace_archive")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .relation_population }, (try parseSqlAlloc(alloc, "SELECT account_id, total INTO usage_archive FROM usage_records WHERE total > 10")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .relation_population }, (try parseSqlAlloc(alloc, "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT account_id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_schema }, (try parseSqlAlloc(alloc, "ALTER SCHEMA analytics RENAME TO reporting")).statement);
@@ -6031,6 +6062,17 @@ test "generated SQL parser facade builds control AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const create_tablespace_sql = "CREATE TABLESPACE fastspace LOCATION '/var/lib/antfly/fastspace'";
+    const create_tablespace_result = try parseSqlAlloc(alloc, create_tablespace_sql);
+    switch (create_tablespace_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.create_tablespace, ddl.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 5 }, ddl.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const extension_sql = "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public VERSION '1.3'";
     const extension_result = try parseSqlAlloc(alloc, extension_sql);
     switch (extension_result.ast.?) {
@@ -6120,6 +6162,17 @@ test "generated SQL parser facade builds control AST spans" {
     switch (alter_schema_result.ast.?) {
         .ddl => |ddl| {
             try std.testing.expectEqual(GeneratedSqlDdlKind.alter_schema, ddl.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 6 }, ddl.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const alter_tablespace_sql = "ALTER TABLESPACE fastspace RENAME TO fastspace_archive";
+    const alter_tablespace_result = try parseSqlAlloc(alloc, alter_tablespace_sql);
+    switch (alter_tablespace_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.alter_tablespace, ddl.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 6 }, ddl.alter_table_operation_tokens.?);
         },
@@ -6237,6 +6290,17 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlDdlKind.drop_enum_type, ddl.kind);
             try std.testing.expect(ddl.if_exists);
             try std.testing.expect(ddl.cascade);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const drop_tablespace_sql = "DROP TABLESPACE IF EXISTS fastspace_archive";
+    const drop_tablespace_result = try parseSqlAlloc(alloc, drop_tablespace_sql);
+    switch (drop_tablespace_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.drop_tablespace, ddl.kind);
+            try std.testing.expect(ddl.if_exists);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl.object_name_tokens.?);
         },
         else => return error.TestUnexpectedResult,

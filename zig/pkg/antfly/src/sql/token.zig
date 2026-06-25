@@ -323,6 +323,7 @@ pub const TokenKeyword = enum {
     symmetric,
     system,
     table,
+    tablespace,
     temp,
     temporary,
     then,
@@ -567,6 +568,7 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.rule, keywordFromIdentifier("RULE").?);
     try std.testing.expectEqual(TokenKeyword.server, keywordFromIdentifier("SERVER").?);
     try std.testing.expectEqual(TokenKeyword.subscription, keywordFromIdentifier("SUBSCRIPTION").?);
+    try std.testing.expectEqual(TokenKeyword.tablespace, keywordFromIdentifier("TABLESPACE").?);
     try std.testing.expectEqual(TokenKeyword.unbounded, keywordFromIdentifier("UNBOUNDED").?);
     try std.testing.expectEqual(TokenKeyword.window, keywordFromIdentifier("WINDOW").?);
     try std.testing.expectEqual(TokenKeyword.yes, keywordFromIdentifier("YES").?);

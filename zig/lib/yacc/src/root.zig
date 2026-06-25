@@ -624,7 +624,7 @@ fn emitZigMetadata(
     }
     try out.appendSlice(allocator,
         \\};
-        \\pub const State = struct { item_start: u16, item_len: u16 };
+        \\pub const State = struct { item_start: u32, item_len: u16 };
         \\pub const states = [_]State{
         \\
     );
@@ -638,7 +638,7 @@ fn emitZigMetadata(
         \\
         \\pub const ActionKind = enum { shift, reduce, accept };
         \\pub const Action = struct { state: u16, terminal: u16, kind: ActionKind, target: u16 };
-        \\pub const TableRange = struct { start: u16, len: u16 };
+        \\pub const TableRange = struct { start: u32, len: u16 };
         \\pub const actions = [_]Action{
         \\
     );
@@ -778,7 +778,8 @@ fn emitZigMetadata(
         \\pub fn actionsForState(state: u16) []const Action {
         \\    if (state >= action_ranges.len) return &.{};
         \\    const range = action_ranges[state];
-        \\    return actions[range.start .. range.start + range.len];
+        \\    const start: usize = @intCast(range.start);
+        \\    return actions[start .. start + range.len];
         \\}
         \\
         \\pub fn symbolName(id: u16) []const u8 {
@@ -789,8 +790,8 @@ fn emitZigMetadata(
         \\fn findAction(state: u16, terminal: u16) ?Action {
         \\    if (state >= action_ranges.len) return null;
         \\    const range = action_ranges[state];
-        \\    var lo: usize = range.start;
-        \\    var hi: usize = range.start + range.len;
+        \\    var lo: usize = @intCast(range.start);
+        \\    var hi: usize = lo + range.len;
         \\    while (lo < hi) {
         \\        const mid = lo + (hi - lo) / 2;
         \\        const action = actions[mid];
@@ -807,8 +808,8 @@ fn emitZigMetadata(
         \\fn findGoto(state: u16, nonterminal: u16) ?Goto {
         \\    if (state >= goto_ranges.len) return null;
         \\    const range = goto_ranges[state];
-        \\    var lo: usize = range.start;
-        \\    var hi: usize = range.start + range.len;
+        \\    var lo: usize = @intCast(range.start);
+        \\    var hi: usize = lo + range.len;
         \\    while (lo < hi) {
         \\        const mid = lo + (hi - lo) / 2;
         \\        const goto_entry = gotos[mid];

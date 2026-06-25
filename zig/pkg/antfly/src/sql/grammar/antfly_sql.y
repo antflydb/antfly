@@ -37,7 +37,7 @@
 %token ELSE END ESCAPE EXPLAIN EXISTS EXTENSION EXTRACT FALSE FETCH FILTER FIRST FOLLOWING FOR FOREIGN FROM FULL GRANT GRAPH GROUP HAVING IDENTITY IF ILIKE INCLUDE IN INDEX INNER INSERT INTERVAL INTO IS
 %token ISNULL JOIN KEY LABEL LAST LATERAL LEFT LIKE LIMIT LISTEN LOAD LOCK LOCKED MATCHED MATERIALIZED MERGE METRIC MOVE NO NOT NULL NOTIFY NOTNULL NOWAIT NULLS OF ON OR ORDER OUTER OVER PARTITION POLICY PRECEDING PREPARE PRIMARY PUBLIC PUBLICATION
 %token NEXT NOTHING OFFSET ONLY QUERY RANGE RECURSIVE REFRESH REINDEX RELEASE RENAME REPLACE RESET RESTART RESTRICT RETURNING REVOKE RIGHT ROLLBACK ROW ROWS RULE SAVEPOINT SCHEMA SECURITY SELECT SERVER SET SHARE SHOW SKIP SOME SUBSCRIPTION TABLE TEMP TEMPORARY TIMESTAMP TIMESTAMPTZ TO TRUNCATE
-%token SEQUENCE SYMMETRIC THEN TRUE TRIGGER UNION UNIQUE UNKNOWN UNLISTEN UNLOGGED UPDATE USING VACUUM VALUES VIEW WHEN WHERE WINDOW WITH WITHIN
+%token SEQUENCE SYMMETRIC TABLESPACE THEN TRUE TRIGGER UNION UNIQUE UNKNOWN UNLISTEN UNLOGGED UPDATE USING VACUUM VALUES VIEW WHEN WHERE WINDOW WITH WITHIN
 %token EXCEPT INTERSECT UNBOUNDED
 %token BASE_WEIGHT FIELD FRESHNESS GRAPH_METRIC KEY KIND METRIC METRIC_FRESHNESS MISSING_SCORE NAME SOURCE SOURCES TYPE WEIGHT
 
@@ -91,6 +91,7 @@ ddl_statement:
   | create_domain_statement
   | create_sequence_statement
   | create_type_statement
+  | create_tablespace_statement
   | create_index_statement
   | create_extension_statement
   | alter_table_statement
@@ -99,6 +100,7 @@ ddl_statement:
   | alter_sequence_statement
   | alter_type_statement
   | alter_schema_statement
+  | alter_tablespace_statement
   | drop_statement
   | relation_population_statement
   ;
@@ -144,6 +146,10 @@ create_sequence_statement:
 
 create_type_statement:
     CREATE TYPE qualified_name AS diagnostic_tail
+  ;
+
+create_tablespace_statement:
+    CREATE TABLESPACE qualified_name diagnostic_tail
   ;
 
 relation_population_statement:
@@ -211,6 +217,10 @@ alter_schema_statement:
     ALTER SCHEMA qualified_name RENAME TO qualified_name
   ;
 
+alter_tablespace_statement:
+    ALTER TABLESPACE qualified_name RENAME TO qualified_name
+  ;
+
 alter_table_relation_prefix_opt:
     /* empty */
   | IF EXISTS
@@ -228,6 +238,7 @@ drop_statement:
   | DROP DOMAIN if_exists_opt qualified_name drop_behavior_opt
   | DROP SEQUENCE if_exists_opt qualified_name drop_behavior_opt
   | DROP TYPE if_exists_opt qualified_name drop_behavior_opt
+  | DROP TABLESPACE if_exists_opt qualified_name
   ;
 
 drop_database_force_opt:
@@ -1125,6 +1136,7 @@ identifier_name:
   | SAVEPOINT
   | SECURITY
   | SEQUENCE
+  | TABLESPACE
   | SOURCE
   | SOURCES
   | TYPE
@@ -1275,6 +1287,7 @@ diagnostic_token:
   | SOURCE
   | SUBSCRIPTION
   | TABLE
+  | TABLESPACE
   | TEMP
   | TEMPORARY
   | TO
