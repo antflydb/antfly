@@ -12705,7 +12705,7 @@ fn lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(
                 .update_joined_source => {
                     if (ast.source_tokens != null) {
                         try validateGeneratedUpdateJoinedRanges(tokens, ast, end);
-                        try validateGeneratedDmlRelationSourceBodyAlloc(alloc, parsed_sql, ast);
+                        try validateGeneratedDmlRelationSourceBody(parsed_sql, ast);
                     } else {
                         try validateGeneratedUpdateSourceRanges(tokens, ast, end);
                     }
@@ -12738,7 +12738,7 @@ fn lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(
                 .delete_joined_source => {
                     if (ast.source_tokens != null) {
                         try validateGeneratedDeleteJoinedRanges(tokens, ast, end);
-                        try validateGeneratedDmlRelationSourceBodyAlloc(alloc, parsed_sql, ast);
+                        try validateGeneratedDmlRelationSourceBody(parsed_sql, ast);
                     } else {
                         try validateGeneratedDeleteSourceRanges(tokens, ast, end);
                     }
@@ -12768,7 +12768,7 @@ fn lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(
         .merge => {
             if (write_kind != .merge) return error.UnsupportedSqlShape;
             try validateGeneratedMergeRanges(tokens, ast, end);
-            try validateGeneratedDmlRelationSourceBodyAlloc(alloc, parsed_sql, ast);
+            try validateGeneratedDmlRelationSourceBody(parsed_sql, ast);
             if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
             const source_schema = options.joined_source_schema orelse schema;
             if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
@@ -13119,12 +13119,10 @@ fn generatedDeleteTargetTableStart(tokens: []const Token, start: usize, end: usi
     return start + 2;
 }
 
-fn validateGeneratedDmlRelationSourceBodyAlloc(
-    alloc: std.mem.Allocator,
+fn validateGeneratedDmlRelationSourceBody(
     parsed_sql: *const tokenized.ParsedSql,
     ast: generated_parser.GeneratedSqlDmlAst,
 ) !void {
-    _ = alloc;
     try validateGeneratedDmlRelationSourceBodyAst(parsed_sql.items(), ast);
 }
 
@@ -13290,7 +13288,7 @@ fn updateJoinedSourceFromGeneratedDmlAstAlloc(
     const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     try validateGeneratedUpdateJoinedRanges(tokens, ast, end);
     if (ast.source_tokens != null) {
-        try validateGeneratedDmlRelationSourceBodyAlloc(alloc, parsed_sql, ast);
+        try validateGeneratedDmlRelationSourceBody(parsed_sql, ast);
     }
 
     const parser_context = @import("parser_context.zig");
@@ -13336,7 +13334,7 @@ fn deleteJoinedSourceFromGeneratedDmlAstAlloc(
     const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     try validateGeneratedDeleteJoinedRanges(tokens, ast, end);
     if (ast.source_tokens != null) {
-        try validateGeneratedDmlRelationSourceBodyAlloc(alloc, parsed_sql, ast);
+        try validateGeneratedDmlRelationSourceBody(parsed_sql, ast);
     }
 
     const parser_context = @import("parser_context.zig");
@@ -13440,7 +13438,7 @@ fn mergeMutationFromGeneratedDmlAstAlloc(
     const tokens = parsed_sql.items();
     const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     try validateGeneratedMergeRanges(tokens, ast, end);
-    try validateGeneratedDmlRelationSourceBodyAlloc(alloc, parsed_sql, ast);
+    try validateGeneratedDmlRelationSourceBody(parsed_sql, ast);
 
     const parser_context = @import("parser_context.zig");
     var parser_state = parser_context.ParserState{
@@ -14155,7 +14153,7 @@ test "sql adapter lower dml validates generated child read payloads" {
     );
     defer relation_source.deinit(alloc);
     switch (relation_source.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
-        .dml => |dml| try validateGeneratedDmlRelationSourceBodyAlloc(alloc, &relation_source, dml),
+        .dml => |dml| try validateGeneratedDmlRelationSourceBody(&relation_source, dml),
         else => return error.TestUnexpectedResult,
     }
     if (relation_source.generated_statement) |*generated_statement| {
@@ -14167,7 +14165,7 @@ test "sql adapter lower dml validates generated child read payloads" {
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
     switch (relation_source.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
-        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedDmlRelationSourceBodyAlloc(alloc, &relation_source, dml)),
+        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedDmlRelationSourceBody(&relation_source, dml)),
         else => return error.TestUnexpectedResult,
     }
 }
