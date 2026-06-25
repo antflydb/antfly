@@ -85,7 +85,8 @@ single-table source `UPDATE` and `DELETE` statements without joined
 mutation-source lowering. Explicit `UPDATE ... FROM` and `DELETE ... USING`
 joined mutation-source statements now validate generated target, source,
 predicate, and returning ranges before direct joined mutation-source lowering,
-and generated-direct parity now covers explicit joined
+parse generated child-read wrappers for relation source bodies, and
+generated-direct parity now covers explicit joined
 `UPDATE ... FROM` and `DELETE ... USING` bodies with separate source schemas,
 computed source assignments, expression predicates, source-qualified returning
 expressions, and lock options, plus simple, correlated, filtered, computed,
@@ -109,8 +110,9 @@ lowerer. Unsupported DML still falls back, and deeper DML cutover still
 requires replacing token-based command-body parsing with complete generated AST
 payloads for recursive CTE DML beyond generated range validation,
 retained generated read-body AST payloads for insert-select source bodies
-beyond generated child-read parse validation, and joined mutation source bodies
-that need generated read-body ASTs beyond statement ranges.
+beyond generated child-read parse validation, and retained generated read-body
+AST payloads for joined mutation and merge relation source bodies beyond
+generated child-read wrapper validation.
 Representative
 read queries now have generated-parser corpus coverage, retained generated raw
 and AST nodes for covered read statements, top-level generated AST ranges for
@@ -383,9 +385,10 @@ Unsupported DDL remains on the existing parser until
    still requires generated command-body ASTs for recursive CTE DML beyond
    generated range validation and direct recursive write-plan dispatch,
    retained generated read-body AST payloads for insert-select source bodies
-   beyond generated child-read parse validation, joined mutation source bodies
-   that need generated read-body ASTs beyond statement ranges, and broader
-   unsupported-shape diagnostics.
+   beyond generated child-read parse validation, retained generated read-body
+   AST payloads for joined mutation and merge relation source bodies beyond
+   generated child-read wrapper validation, and broader unsupported-shape
+   diagnostics.
 4. Read queries: projections, predicates, joins, CTEs, aggregates, windows,
    set operations, lateral, ordering, limits, and document-table sources.
    Initial generated-parser coverage now retains raw and AST read nodes for
@@ -792,7 +795,8 @@ Generated grammar work needs evidence at multiple levels:
   returning lists, direct generated AST-to-plan coverage for table-wide and
   single-table source update/delete mutation-source requests without joined
   sources, direct generated AST-to-plan coverage for explicit update-from and
-  delete-using joined mutation-source requests, direct generated AST-to-plan
+  delete-using joined mutation-source requests with generated child-read
+  wrapper validation for relation source bodies, direct generated AST-to-plan
   coverage for merge plans and non-recursive CTE write prefixes across
   insert-source, point update/delete, joined update/delete, and merge,
   generated-direct validation and dispatch for recursive CTE insert-source,
