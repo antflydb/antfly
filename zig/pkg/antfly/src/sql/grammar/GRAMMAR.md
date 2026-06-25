@@ -494,11 +494,17 @@ Unsupported DDL remains on the existing parser until
    body projection/group/order, named-window partition/order, set-operation
    right-projection, and join `USING` column ranges, and that clause-owned
    first/last expression summary payloads match the first/last expression item
-   spans in their generated lists.
+   spans in their generated lists. Generated expression and set-operation AST
+   builders now construct recursive child/list payloads in place instead of
+   relying on large recursive value returns, keeping expanded generated read
+   coverage stable as more expression metadata is retained.
    Simple query reads now have
    a direct generated AST-to-query-plan lowering boundary after clause-range
    validation, and aggregate, join, and lateral reads now have direct generated
-   AST-to-read-family dispatch boundaries after clause-range validation.
+   AST-to-read-family dispatch boundaries after clause-range validation;
+   generated read classification now recognizes aggregate-function projections
+   such as global `COUNT(*)` reads and aggregate CTE bodies without requiring
+   `GROUP BY` or `HAVING` side effects.
    Single binary join reads now validate generated join-tree metadata against
    the typed join lowerer before producing a join plan, and generated join
    reads reject malformed left-associative tree root/depth/index/child
