@@ -11469,7 +11469,7 @@ pub const ApiHttpServer = struct {
                     .read_index,
                 )) orelse return try textResponse(self.alloc, 404, "not found");
                 defer result.deinit(self.alloc);
-                const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
+                const row_filter_json = try self.resolveEffectiveRowFilterJsonForDatabase(self.alloc, authenticated_identity, tables_api.default_database_name, table_name);
                 defer if (row_filter_json) |value| self.alloc.free(value);
                 if (row_filter_json) |value| {
                     const filtered = try self.filterScanResultByRowFilter(source, table_name, result.ndjson, value);
