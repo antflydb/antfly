@@ -499,7 +499,14 @@ fn parseStatement(
             .ddl => return .{ .ddl = .{ .raw = raw_statement } },
             .extension_index => return .{ .ddl = .{ .raw = raw_statement } },
             .dml => if (tokenized_sql.write_statement_kind) |kind| return .{ .write = .{ .kind = kind, .raw = raw_statement } },
-            .read => if (tokenized_sql.read_statement_kind) |kind| return .{ .read = .{ .kind = kind, .raw = raw_statement } },
+            .read => if (generatedReadStatementKind(tokenized_sql.items(), generated_raw)) |kind| {
+                if (tokenized_sql.read_statement_kind) |classified_kind| {
+                    if (classified_kind != kind) return .{ .unknown = raw_statement };
+                }
+                return .{ .read = .{ .kind = kind, .raw = raw_statement } };
+            } else if (tokenized_sql.read_statement_kind) |kind| {
+                return .{ .read = .{ .kind = kind, .raw = raw_statement } };
+            },
             .graph => return .{ .ddl = .{ .raw = raw_statement } },
             .unsupported => |kind| if (!generatedUnsupportedUsesLegacyPlanner(kind)) return .{ .unsupported = .{ .kind = kind, .raw = raw_statement } },
             .other => {},
@@ -518,6 +525,104 @@ fn parseStatement(
         .ddl => classifyDdlLikeStatement(raw_statement, tokenized_sql.items()),
         else => .{ .unknown = raw_statement },
     };
+}
+
+fn generatedReadStatementKind(
+    tokens: []const Token,
+    generated_raw: GeneratedRawSqlStatement,
+) ?classifier.SqlReadStatementKind {
+    const ast_value = generated_raw.ast orelse return null;
+    const read_ast = switch (ast_value) {
+        .read => |read| read,
+        else => return null,
+    };
+    return switch (read_ast.kind) {
+        .query => .query,
+        .aggregate => .aggregate,
+        .join => .join,
+        .lateral => .lateral,
+        .window => .window,
+        .set_operation => .set_operation,
+        .cte => generatedCteReadStatementKind(tokens, read_ast),
+    };
+}
+
+fn generatedCteReadStatementKind(
+    tokens: []const Token,
+    read_ast: generated_parser.GeneratedSqlReadAst,
+) ?classifier.SqlReadStatementKind {
+    if (read_ast.cte_recursive) return .recursive_cte;
+    if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return null;
+    if (read_ast.set_operation_tokens != null) return .set_operation;
+    if (read_ast.source_tokens) |source| {
+        if (generatedReadRangeContainsKeyword(tokens, source, .lateral)) return .lateral;
+    }
+    if (read_ast.projection_tokens) |projection| {
+        if (generatedReadRangeContainsKeyword(tokens, projection, .over)) return .window;
+    }
+    const aggregate_projection = if (read_ast.projection_tokens) |projection|
+        generatedReadRangeHasAggregateFunction(tokens, projection)
+    else
+        false;
+    if ((read_ast.distinct_tokens != null and read_ast.distinct_on_items.count == 0) or
+        read_ast.group_tokens != null or
+        read_ast.having_tokens != null or
+        aggregate_projection)
+    {
+        return .aggregate;
+    }
+    if (read_ast.source_tokens) |source| {
+        if (generatedReadRangeContainsKeyword(tokens, source, .join)) return .join;
+    }
+    return .query;
+}
+
+fn generatedReadRangeContainsKeyword(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    keyword: TokenKeyword,
+) bool {
+    if (range.end > tokens.len or range.start > range.end) return false;
+    var index = range.start;
+    while (index < range.end) : (index += 1) {
+        if (tokens[index].matchesKeywordTag(keyword)) return true;
+    }
+    return false;
+}
+
+fn generatedReadRangeHasAggregateFunction(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (range.end > tokens.len or range.start > range.end) return false;
+    var depth: usize = 0;
+    var index = range.start;
+    while (index < range.end) : (index += 1) {
+        const token = tokens[index];
+        switch (token.kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth > 0) depth -= 1;
+            },
+            .identifier => if (depth == 0 and index + 1 < range.end and tokens[index + 1].kind == .lparen and generatedSqlAggregateFunctionName(token)) {
+                return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn generatedSqlAggregateFunctionName(token: Token) bool {
+    return token.matchesKeywordTag(.count) or
+        token.matchesKeywordTag(.sum) or
+        token.matchesKeywordTag(.avg) or
+        token.matchesKeywordTag(.min) or
+        token.matchesKeywordTag(.max) or
+        token.matchesKeywordTag(.bool_or) or
+        token.matchesKeywordTag(.bool_and) or
+        token.matchesKeywordTag(.array_agg) or
+        token.matchesKeywordTag(.string_agg);
 }
 
 fn generatedUnsupportedUsesLegacyPlanner(kind: generated_parser.GeneratedSqlUnsupportedKind) bool {
@@ -2446,6 +2551,39 @@ test "sql adapter parsed sql retains generated read nodes for covered query corp
     defer generated_distinct_on.deinit(alloc);
     try std.testing.expect(generated_distinct_on.generated_statement != null);
     try std.testing.expectEqual(classifier.SqlReadStatementKind.query, generated_distinct_on.readStatementKind().?);
+}
+
+test "sql adapter parsed sql read statement kind can come from generated AST" {
+    const alloc = std.testing.allocator;
+
+    var generated_query = try ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE status = 'open'");
+    defer generated_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_query.generatedStatementKind().?);
+
+    generated_query.tokenized_sql.read_statement_kind = null;
+    generated_query.statement = parseStatement(generated_query.raw_statement, generated_query.generated_statement, &generated_query.tokenized_sql);
+    try std.testing.expectEqual(classifier.SqlReadStatementKind.query, generated_query.readStatementKind().?);
+
+    var generated_cte_aggregate = try ParsedSql.initAlloc(alloc, "WITH source_rows AS (SELECT status FROM usage_records) SELECT count(*) FROM source_rows");
+    defer generated_cte_aggregate.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_cte_aggregate.generatedStatementKind().?);
+
+    generated_cte_aggregate.tokenized_sql.read_statement_kind = null;
+    generated_cte_aggregate.statement = parseStatement(generated_cte_aggregate.raw_statement, generated_cte_aggregate.generated_statement, &generated_cte_aggregate.tokenized_sql);
+    try std.testing.expectEqual(classifier.SqlReadStatementKind.aggregate, generated_cte_aggregate.readStatementKind().?);
+}
+
+test "sql adapter parsed sql read statement kind fails closed on classifier disagreement" {
+    const alloc = std.testing.allocator;
+
+    var generated_query = try ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE status = 'open'");
+    defer generated_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_query.generatedStatementKind().?);
+
+    generated_query.tokenized_sql.read_statement_kind = .aggregate;
+    generated_query.statement = parseStatement(generated_query.raw_statement, generated_query.generated_statement, &generated_query.tokenized_sql);
+    try std.testing.expect(generated_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_query.statement));
 }
 
 test "sql adapter parsed sql retains generated graph nodes as DDL" {

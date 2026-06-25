@@ -947,8 +947,11 @@ Generated grammar work needs evidence at multiple levels:
   metadata is malformed, and generated-family validation over other
   representative write plans. Read plans have initial
   generated AST-to-plan parity through generated-first read lowering context
-  dispatch and generated-family validation wrappers over representative query,
-  aggregate, join, lateral, and non-recursive CTE plans, AST-shape coverage for
+  dispatch, generated read AST kind now drives parsed-statement read-family
+  classification for generated-covered reads with fail-closed classifier
+  disagreement checks, and generated-family validation wrappers over
+  representative query, aggregate, join, lateral, and non-recursive CTE plans,
+  AST-shape coverage for
   generated-ranged multi-CTE and recursive CTE
   prefixes, single- and multi-join component range/tree coverage with
   fail-closed executable-contract validation for unsupported generated
