@@ -3307,6 +3307,10 @@ pub fn ddlPlanFromGeneratedAstAlloc(
         .drop_function,
         .drop_procedure,
         => try routineCatalogPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options),
+        .create_role,
+        .alter_role,
+        .drop_role,
+        => try authorizationCatalogPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options),
         .create_index => .{ .create_index = try createIndexPlanFromGeneratedAstAlloc(alloc, tokens, ast, options.create_index_options) },
         .alter_table => if (generatedAlterTableUsesRowSecurityRuntimeBoundary(tokens, ast))
             .{ .row_security_catalog = .{ .alter_table = try rowSecurityAlterTablePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } }
@@ -3352,6 +3356,9 @@ fn generatedDdlUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated
         .create_procedure,
         .drop_function,
         .drop_procedure,
+        .create_role,
+        .alter_role,
+        .drop_role,
         .create_policy,
         .alter_policy,
         .drop_policy,
@@ -3417,6 +3424,47 @@ fn validateGeneratedRoutineDdlAst(tokens: []const grammar.Token, ast: generated_
                 else => unreachable,
             };
             if (!tokens[1].matchesKeywordTag(expected)) return error.UnsupportedSqlShape;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
+fn authorizationCatalogPlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+    options: DdlPlanParserOptions,
+) !LoweredDdlPlan {
+    try validateGeneratedRoleDdlAst(tokens, ast);
+    var pos: usize = 0;
+    var plan = try parseDdlPlanAlloc(alloc, tokens, &pos, options);
+    errdefer plan.deinit(alloc);
+    if (pos != tokens.len) return error.UnsupportedSqlShape;
+    switch (plan) {
+        .authorization_catalog => |authorization| switch (authorization) {
+            .create_role, .alter_role, .drop_role => {},
+            else => return error.UnsupportedSqlShape,
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+    return plan;
+}
+
+fn validateGeneratedRoleDdlAst(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) !void {
+    try validateGeneratedDdlAstSpans(tokens, ast);
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    const object_name_tokens = ast.object_name_tokens orelse return error.UnsupportedSqlShape;
+    if (object_name_tokens.start >= object_name_tokens.end or object_name_tokens.end > end) return error.UnsupportedSqlShape;
+    switch (ast.kind) {
+        .create_role => {
+            if (end < 3 or !tokens[0].matchesKeyword("create") or !tokens[1].matchesKeywordTag(.role)) return error.UnsupportedSqlShape;
+        },
+        .alter_role => {
+            if (end < 5 or !tokens[0].matchesKeyword("alter") or !tokens[1].matchesKeywordTag(.role)) return error.UnsupportedSqlShape;
+            if (ast.alter_table_operation_tokens == null) return error.UnsupportedSqlShape;
+        },
+        .drop_role => {
+            if (end < 3 or !tokens[0].matchesKeyword("drop") or !tokens[1].matchesKeywordTag(.role)) return error.UnsupportedSqlShape;
         },
         else => return error.UnsupportedSqlShape,
     }
@@ -4790,6 +4838,7 @@ fn validateGeneratedDdlAstSpans(
         .create_policy,
         .create_function,
         .create_procedure,
+        .create_role,
         .create_index,
         .create_extension,
         .create_graph_index,
@@ -4806,6 +4855,7 @@ fn validateGeneratedDdlAstSpans(
         .alter_publication,
         .alter_subscription,
         .alter_policy,
+        .alter_role,
         => .alter,
         .drop_table,
         .drop_view,
@@ -4819,6 +4869,7 @@ fn validateGeneratedDdlAstSpans(
         .drop_policy,
         .drop_function,
         .drop_procedure,
+        .drop_role,
         .drop_index,
         .drop_schema,
         .drop_database,
@@ -14848,6 +14899,50 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
             .create => |create| {
                 try std.testing.expectEqual(RoutineKind.procedure, create.kind);
                 try std.testing.expectEqualStrings("rotate_generated_usage", create.routine_name);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var runtime_create_role = try tokenized.ParsedSql.initAlloc(alloc, "CREATE ROLE generated_app_writer;");
+    defer runtime_create_role.deinit(alloc);
+    var runtime_create_role_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_create_role);
+    defer runtime_create_role_plan.deinit(alloc);
+    switch (runtime_create_role_plan) {
+        .authorization_catalog => |plan| switch (plan) {
+            .create_role => |create| try std.testing.expectEqualStrings("generated_app_writer", create.role_name),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var runtime_alter_role = try tokenized.ParsedSql.initAlloc(alloc, "ALTER ROLE generated_app_writer IN DATABASE appdb SET app.tenant_id = current_setting('app.tenant_id');");
+    defer runtime_alter_role.deinit(alloc);
+    var runtime_alter_role_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_alter_role);
+    defer runtime_alter_role_plan.deinit(alloc);
+    switch (runtime_alter_role_plan) {
+        .authorization_catalog => |plan| switch (plan) {
+            .alter_role => |alter| {
+                try std.testing.expectEqualStrings("generated_app_writer", alter.role_name);
+                try std.testing.expectEqualStrings("appdb", alter.database_name.?);
+                try std.testing.expectEqual(AlterRolePlan.Operation.set, alter.operation);
+                try std.testing.expectEqualStrings("app.tenant_id", alter.setting_name);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var runtime_drop_role = try tokenized.ParsedSql.initAlloc(alloc, "DROP ROLE IF EXISTS generated_app_writer;");
+    defer runtime_drop_role.deinit(alloc);
+    var runtime_drop_role_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_drop_role);
+    defer runtime_drop_role_plan.deinit(alloc);
+    switch (runtime_drop_role_plan) {
+        .authorization_catalog => |plan| switch (plan) {
+            .drop_role => |drop| {
+                try std.testing.expectEqualStrings("generated_app_writer", drop.role_name);
+                try std.testing.expect(drop.if_exists);
             },
             else => return error.TestUnexpectedResult,
         },

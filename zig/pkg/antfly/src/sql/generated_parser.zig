@@ -65,6 +65,7 @@ pub const GeneratedSqlDdlKind = enum {
     create_policy,
     create_function,
     create_procedure,
+    create_role,
     create_index,
     create_extension,
     alter_table,
@@ -77,6 +78,7 @@ pub const GeneratedSqlDdlKind = enum {
     alter_publication,
     alter_subscription,
     alter_policy,
+    alter_role,
     drop_table,
     drop_view,
     drop_materialized_view,
@@ -89,6 +91,7 @@ pub const GeneratedSqlDdlKind = enum {
     drop_policy,
     drop_function,
     drop_procedure,
+    drop_role,
     drop_index,
     drop_schema,
     drop_database,
@@ -1593,6 +1596,7 @@ pub const simple_ddl_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CREATE FUNCTION audit_changes() RETURNS trigger LANGUAGE plpgsql", .kind = .ddl },
     .{ .sql = "CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger LANGUAGE plpgsql", .kind = .ddl },
     .{ .sql = "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql", .kind = .ddl },
+    .{ .sql = "CREATE ROLE app_writer", .kind = .ddl },
     .{ .sql = "ALTER TABLE usage_records ADD COLUMN status text", .kind = .ddl },
     .{ .sql = "ALTER TABLE IF EXISTS ONLY usage_records DROP COLUMN IF EXISTS status RESTRICT", .kind = .ddl },
     .{ .sql = "ALTER VIEW active_usage RENAME TO active_usage_v2", .kind = .ddl },
@@ -1600,6 +1604,7 @@ pub const simple_ddl_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "ALTER PUBLICATION usage_pub ADD TABLE usage_records", .kind = .ddl },
     .{ .sql = "ALTER SUBSCRIPTION usage_sub DISABLE", .kind = .ddl },
     .{ .sql = "ALTER POLICY usage_policy ON usage_records RENAME TO usage_policy_v2", .kind = .ddl },
+    .{ .sql = "ALTER ROLE app_writer IN DATABASE appdb SET app.tenant_id = current_setting('app.tenant_id')", .kind = .ddl },
     .{ .sql = "CREATE INDEX usage_records_status_idx ON usage_records (status)", .kind = .extension_index },
     .{ .sql = "CREATE INDEX IF NOT EXISTS usage_records_status_idx ON usage_records (status)", .kind = .extension_index },
     .{ .sql = "CREATE UNIQUE INDEX usage_records_status_active_idx ON usage_records (status) INCLUDE (tenant_id, amount) WHERE deleted_at IS NULL", .kind = .extension_index },
@@ -1614,6 +1619,7 @@ pub const simple_ddl_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "DROP POLICY IF EXISTS usage_policy ON usage_records", .kind = .ddl },
     .{ .sql = "DROP FUNCTION IF EXISTS audit_changes(text) CASCADE", .kind = .ddl },
     .{ .sql = "DROP PROCEDURE rotate_usage()", .kind = .ddl },
+    .{ .sql = "DROP ROLE IF EXISTS app_writer", .kind = .ddl },
     .{ .sql = "REFRESH MATERIALIZED VIEW usage_summary", .kind = .ddl },
     .{ .sql = "DROP INDEX usage_records_status_idx", .kind = .extension_index },
     .{ .sql = "DROP EXTENSION vector", .kind = .extension_index },
@@ -2022,6 +2028,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.policy)) return .{ .ddl = .create_policy };
         if (second.matchesKeywordTag(.function)) return .{ .ddl = .create_function };
         if (second.matchesKeywordTag(.procedure)) return .{ .ddl = .create_procedure };
+        if (second.matchesKeywordTag(.role)) return .{ .ddl = .create_role };
         if (second.matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
         if (second.matchesKeywordTag(.unique) and tokens.len > 2 and tokens[2].matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
         if (second.matchesKeywordTag(.foreign) and tokens.len > 2 and tokens[2].matchesKeywordTag(.table)) return .{ .unsupported = .create_foreign_table };
@@ -2077,6 +2084,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.subscription)) return .{ .ddl = .alter_subscription };
         if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .alter_trigger };
         if (second.matchesKeyword("user") and tokens.len > 2 and tokens[2].matchesKeyword("mapping")) return .{ .unsupported = .alter_user_mapping };
+        if (second.matchesKeywordTag(.role)) return .{ .ddl = .alter_role };
     }
     if (first.matchesKeywordTag(.drop) and tokens.len > 1) {
         const second = tokens[1];
@@ -2100,6 +2108,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .ddl = .drop_materialized_view };
         if (second.matchesKeywordTag(.policy)) return .{ .ddl = .drop_policy };
         if (second.matchesKeywordTag(.rule)) return .{ .unsupported = .drop_rule };
+        if (second.matchesKeywordTag(.role)) return .{ .ddl = .drop_role };
         if (second.matchesKeywordTag(.server)) return .{ .unsupported = .drop_server };
         if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .drop_trigger };
         if (second.matchesKeyword("user") and tokens.len > 2 and tokens[2].matchesKeyword("mapping")) return .{ .unsupported = .drop_user_mapping };
@@ -2637,6 +2646,14 @@ fn buildDdlAst(
                 if (routine_range.end < end) ast.alter_table_operation_tokens = .{ .start = routine_range.end, .end = end };
             }
         },
+        .create_role => {
+            if (end > 2 and tokens[1].matchesKeywordTag(.role)) {
+                ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 2, end);
+                if (ast.object_name_tokens) |role_range| {
+                    if (role_range.end < end) ast.alter_table_operation_tokens = .{ .start = role_range.end, .end = end };
+                }
+            }
+        },
         .create_index => {
             if (tokens.len > 2 and tokens[1].matchesKeywordTag(.unique) and tokens[2].matchesKeywordTag(.index)) {
                 ast.unique = true;
@@ -2778,6 +2795,14 @@ fn buildDdlAst(
                 }
             }
         },
+        .alter_role => {
+            if (end > 2 and tokens[1].matchesKeywordTag(.role)) {
+                ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 2, end);
+                if (ast.object_name_tokens) |role_range| {
+                    if (role_range.end < end) ast.alter_table_operation_tokens = .{ .start = role_range.end, .end = end };
+                }
+            }
+        },
         .drop_database => {
             ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
             ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
@@ -2846,6 +2871,13 @@ fn buildDdlAst(
                 if (routine_range.end < end) ast.alter_table_operation_tokens = .{ .start = routine_range.end, .end = end };
             }
             ast.cascade = findKeyword(tokens, index + 1, end, .cascade) != null;
+        },
+        .drop_role => {
+            ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
+            ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
+            if (ast.object_name_tokens) |role_range| {
+                if (role_range.end < end) ast.alter_table_operation_tokens = .{ .start = role_range.end, .end = end };
+            }
         },
         .drop_index => {
             ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
@@ -6139,6 +6171,9 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_procedure }, (try parseSqlAlloc(alloc, "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_function }, (try parseSqlAlloc(alloc, "DROP FUNCTION IF EXISTS audit_changes(text) CASCADE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_procedure }, (try parseSqlAlloc(alloc, "DROP PROCEDURE rotate_usage()")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_role }, (try parseSqlAlloc(alloc, "CREATE ROLE app_writer")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_role }, (try parseSqlAlloc(alloc, "ALTER ROLE app_writer RESET statement_timeout")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_role }, (try parseSqlAlloc(alloc, "DROP ROLE IF EXISTS app_writer")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .relation_population }, (try parseSqlAlloc(alloc, "SELECT account_id, total INTO usage_archive FROM usage_records WHERE total > 10")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .relation_population }, (try parseSqlAlloc(alloc, "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT account_id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_schema }, (try parseSqlAlloc(alloc, "ALTER SCHEMA analytics RENAME TO reporting")).statement);

@@ -49,6 +49,30 @@ func main() {
 		exitf("unexpected selected status: %q", status)
 	}
 
+	var version string
+	if err := conn.QueryRow(ctx, "SELECT version();").Scan(&version); err != nil {
+		exitf("select version: %v", err)
+	}
+	if version == "" {
+		exitf("empty version")
+	}
+
+	var serverVersion string
+	if err := conn.QueryRow(ctx, "SHOW server_version;").Scan(&serverVersion); err != nil {
+		exitf("show server_version: %v", err)
+	}
+	if serverVersion != "16.0-antfly" {
+		exitf("unexpected server_version: %q", serverVersion)
+	}
+
+	var searchPath string
+	if err := conn.QueryRow(ctx, "SHOW search_path;").Scan(&searchPath); err != nil {
+		exitf("show search_path: %v", err)
+	}
+	if searchPath != "public" {
+		exitf("unexpected search_path: %q", searchPath)
+	}
+
 	if _, err := conn.Exec(ctx, "BEGIN;"); err != nil {
 		exitf("begin: %v", err)
 	}

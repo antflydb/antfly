@@ -62,6 +62,7 @@ const transaction_runtime_mod = @import("maintenance/transaction_runtime.zig");
 const transactions_mod = @import("../transactions.zig");
 const ttl_runtime_mod = @import("maintenance/ttl_runtime.zig");
 const types = @import("types.zig");
+const vectorindex_mod = @import("antfly_vectorindex");
 
 const Allocator = std.mem.Allocator;
 const ManagedSyncTargets = db_internal.ManagedSyncTargets;
@@ -4572,6 +4573,329 @@ test "db lifecycle open query_readonly lmdb primary rejects writes after readonl
         .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }},
         .sync_level = .write,
     }));
+}
+
+test "db lifecycle open quarantines dense index with unsupported artifact version" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const waitForSearchResult = db_test_support.waitForSearchResult;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const dense_cfg: types.IndexConfig = .{
+        .name = "dv_quarantine",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"dv_quarantine\"}}",
+    };
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    const open_options: OpenOptions = .{
+        .enrichment = .{
+            .owner_id = "quarantine-worker",
+            .dense_embedder = deterministic.interface(),
+        },
+    };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), open_options);
+        defer db.close();
+
+        try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+        try db.addIndex(dense_cfg);
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"alpha concept overview\"}" },
+            },
+            .sync_level = .write,
+        });
+        try db.runUntilIdle();
+
+        // Persist an HBC metadata record with a version this build does not
+        // support, simulating an artifact written by an incompatible build.
+        const entry = db.core.denseIndex("dv_quarantine") orelse return error.TestUnexpectedResult;
+        var bad_meta = entry.index.metadata;
+        bad_meta.version = 99;
+        var meta_buf: [vectorindex_mod.hbc.IndexMetadata.encoded_size]u8 = undefined;
+        const encoded = bad_meta.encode(&meta_buf);
+        var txn = try entry.index.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(.meta, vectorindex_mod.hbc.meta_key, encoded);
+        try txn.commit();
+    }
+
+    var db = try DB.open(alloc, std.mem.span(path), open_options);
+    defer db.close();
+
+    // The broken dense index is quarantined: absent from the runtime, its
+    // load error recorded, and the rest of the table fully usable.
+    try std.testing.expect(db.core.denseIndex("dv_quarantine") == null);
+    const recorded = db.core.index_manager.loadFailure("dv_quarantine") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("UnsupportedVersion", recorded);
+
+    var ft_result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match = .{ .field = "title", .text = "alpha" } },
+    });
+    defer ft_result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), ft_result.total_hits);
+
+    {
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        var found = false;
+        for (stats.indexes) |item| {
+            if (!std.mem.eql(u8, item.name, "dv_quarantine")) continue;
+            found = true;
+            const load_error = item.load_error orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("UnsupportedVersion", load_error);
+            try std.testing.expect(!item.backfill_active);
+        }
+        try std.testing.expect(found);
+    }
+
+    // Queries that explicitly reference the quarantined index get a distinct
+    // error instead of IndexNotFound or a stall.
+    const query_vec = [_]f32{ 0.1, 0.2, 0.3 };
+    try std.testing.expectError(error.IndexUnavailable, db.search(alloc, .{
+        .index_name = "dv_quarantine",
+        .dense = .{
+            .vector = &query_vec,
+            .k = 1,
+        },
+        .limit = 1,
+    }));
+
+    // Drop + recreate recovers and clears the recorded failure.
+    try std.testing.expect(try db.deleteIndex("dv_quarantine"));
+    try std.testing.expect(db.core.index_manager.loadFailure("dv_quarantine") == null);
+    try db.addIndex(dense_cfg);
+    try db.runUntilIdle();
+    try std.testing.expect(db.core.denseIndex("dv_quarantine") != null);
+
+    const recovered_vec = try deterministic.interface().embedDense(alloc, "dv_quarantine", "alpha concept overview", 3);
+    defer alloc.free(recovered_vec);
+    var recovered = try waitForSearchResult(alloc, &db, .{
+        .index_name = "dv_quarantine",
+        .dense = .{
+            .vector = recovered_vec,
+            .k = 1,
+        },
+        .limit = 1,
+    }, 1);
+    defer recovered.deinit();
+    try std.testing.expect(recovered.total_hits >= 1);
+}
+
+test "db lifecycle quarantine drops dense index after persisted index directory corruption" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const corruptNonEmptyFilesUnderDir = db_test_support.corruptNonEmptyFilesUnderDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    const path_slice = std.mem.span(path);
+
+    const dense_cfg: types.IndexConfig = .{
+        .name = "dv_corrupt",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"cosine\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"dv_corrupt\"}}",
+    };
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    const open_options: OpenOptions = .{
+        .enrichment = .{
+            .owner_id = "corrupt-worker",
+            .dense_embedder = deterministic.interface(),
+        },
+    };
+
+    {
+        var db = try DB.open(alloc, path_slice, open_options);
+        defer db.close();
+
+        try db.addIndex(dense_cfg);
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"body\":\"alpha concept overview\"}" },
+            },
+            .sync_level = .write,
+        });
+        try db.runUntilIdle();
+        try std.testing.expect(db.core.denseIndex("dv_corrupt") != null);
+    }
+
+    const index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dv_corrupt", .{path_slice});
+    defer alloc.free(index_path);
+    try std.testing.expect((try corruptNonEmptyFilesUnderDir(alloc, index_path)) > 0);
+
+    var db = try DB.open(alloc, path_slice, open_options);
+    defer db.close();
+
+    try std.testing.expect(db.core.denseIndex("dv_corrupt") == null);
+    _ = db.core.index_manager.loadFailure("dv_corrupt") orelse return error.TestUnexpectedResult;
+
+    try std.testing.expect(try db.deleteIndex("dv_corrupt"));
+    try std.testing.expect(db.core.index_manager.loadFailure("dv_corrupt") == null);
+    try std.testing.expect(db.core.index_manager.get("dv_corrupt") == null);
+
+    var io_impl = db_internal.threadedIo();
+    defer io_impl.deinit();
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io_impl.io(), index_path, .{}));
+}
+
+test "db lifecycle quarantine self-heals via retryQuarantinedIndexLoads" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        defer {
+            for (writes.items) |item| {
+                alloc.free(@constCast(item.key));
+                alloc.free(@constCast(item.value));
+            }
+            writes.deinit(alloc);
+        }
+        for (0..300) |i| {
+            try writes.append(alloc, .{
+                .key = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i}),
+                .value = try std.fmt.allocPrint(alloc, "{{\"title\":\"alpha\",\"n\":{d}}}", .{i}),
+            });
+        }
+        try db.batch(.{ .writes = writes.items });
+        try db.core.index_manager.addAllNoBackfill(db.core.store, &.{.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        }});
+    }
+
+    index_manager_mod.test_abort_text_backfill_after_batches = 1;
+    defer index_manager_mod.test_abort_text_backfill_after_batches = null;
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try std.testing.expect(db.core.index_manager.loadFailure("ft_v1") != null);
+    try std.testing.expect(db.core.textIndexEntry("ft_v1") == null);
+
+    // Writes keep flowing while the index is quarantined; the heal's resumed
+    // backfill must pick them up. They also guarantee the next backfill
+    // attempt flushes at least once, so the still-set abort knob fires.
+    {
+        var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        defer {
+            for (writes.items) |item| {
+                alloc.free(@constCast(item.key));
+                alloc.free(@constCast(item.value));
+            }
+            writes.deinit(alloc);
+        }
+        for (300..400) |i| {
+            try writes.append(alloc, .{
+                .key = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i}),
+                .value = try std.fmt.allocPrint(alloc, "{{\"title\":\"alpha\",\"n\":{d}}}", .{i}),
+            });
+        }
+        try db.batch(.{ .writes = writes.items });
+    }
+
+    // While the cause persists, a forced retry fails and applies backoff.
+    {
+        const result = try db.retryQuarantinedIndexLoads(true);
+        try std.testing.expectEqual(@as(usize, 0), result.recovered);
+        try std.testing.expectEqual(@as(usize, 1), result.remaining);
+    }
+    // Cause fixed — but the failed attempt set a backoff deadline, so a
+    // non-forced retry is skipped without re-attempting the open (it would
+    // recover if it attempted).
+    index_manager_mod.test_abort_text_backfill_after_batches = null;
+    {
+        const result = try db.retryQuarantinedIndexLoads(false);
+        try std.testing.expectEqual(@as(usize, 0), result.recovered);
+        try std.testing.expectEqual(@as(usize, 1), result.remaining);
+    }
+
+    // Forced retry recovers the index in-process — no reopen, no
+    // drop+recreate — resuming the persisted rebuild state.
+    const result = try db.retryQuarantinedIndexLoads(true);
+    try std.testing.expectEqual(@as(usize, 1), result.recovered);
+    try std.testing.expectEqual(@as(usize, 0), result.remaining);
+    try std.testing.expect(db.core.index_manager.loadFailure("ft_v1") == null);
+    try std.testing.expect(db.core.textIndexEntry("ft_v1") != null);
+
+    try db.runUntilIdle();
+    var search_result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+        .limit = 500,
+    });
+    defer search_result.deinit();
+    try std.testing.expectEqual(@as(u32, 400), search_result.total_hits);
+}
+
+test "db lifecycle open read-only propagates transient index load errors instead of quarantining" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+        try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    }
+
+    index_manager_mod.test_inject_index_open_error = error.FileNotFound;
+    defer index_manager_mod.test_inject_index_open_error = null;
+
+    // A read-only (replica) open must NOT quarantine a transient read race
+    // (e.g. the writer reclaiming obsolete LSM runs mid-open): the error
+    // propagates so the query layer reopens against a fresh manifest and
+    // retries. A quarantined replica would instead serve IndexUnavailable
+    // until the read cache next invalidates it — the quarantine retry
+    // worker only runs on the writer.
+    try std.testing.expectError(error.FileNotFound, DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .query_readonly,
+    }));
+
+    // The writer open quarantines the same error: the writer cannot race
+    // its own (not yet started) reclaim, so a missing artifact there is
+    // persistent damage — and the in-process retry recovers it once the
+    // cause clears.
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    const recorded = db.core.index_manager.loadFailure("ft_v1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("FileNotFound", recorded);
+
+    index_manager_mod.test_inject_index_open_error = null;
+    const result = try db.retryQuarantinedIndexLoads(true);
+    try std.testing.expectEqual(@as(usize, 1), result.recovered);
+    try std.testing.expectEqual(@as(usize, 0), result.remaining);
+    try std.testing.expect(db.core.index_manager.loadFailure("ft_v1") == null);
 }
 
 test "db lifecycle open writer_no_replay defers pending derived replay until runUntilIdle" {

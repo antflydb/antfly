@@ -36,7 +36,7 @@
 %token CREATE COPY DATA DATABASE DEALLOCATE DECLARE DEFAULT DELETE DESC DISCARD DISTINCT DO DOMAIN DROP EXECUTE
 %token ELSE END ESCAPE EXPLAIN EXISTS EXTENSION EXTRACT FALSE FETCH FILTER FIRST FOLLOWING FOR FOREIGN FROM FULL FUNCTION GRANT GRAPH GROUP HAVING IDENTITY IF ILIKE INCLUDE IN INDEX INNER INSERT INTERVAL INTO IS
 %token ISNULL JOIN KEY LABEL LAST LATERAL LEFT LIKE LIMIT LISTEN LOAD LOCK LOCKED MATCHED MATERIALIZED MERGE METRIC MOVE NO NOT NULL NOTIFY NOTNULL NOWAIT NULLS OF ON OR ORDER OUTER OVER PARTITION POLICY PRECEDING PREPARE PRIMARY PUBLIC PUBLICATION
-%token NEXT NOTHING OFFSET ONLY PROCEDURE QUERY RANGE RECURSIVE REFRESH REINDEX RELEASE RENAME REPLACE RESET RESTART RESTRICT RETURNING REVOKE RIGHT ROLLBACK ROW ROWS RULE SAVEPOINT SCHEMA SECURITY SELECT SERVER SET SHARE SHOW SKIP SOME SUBSCRIPTION TABLE TEMP TEMPORARY TIMESTAMP TIMESTAMPTZ TO TRUNCATE
+%token NEXT NOTHING OFFSET ONLY PROCEDURE QUERY RANGE RECURSIVE REFRESH REINDEX RELEASE RENAME REPLACE RESET RESTART RESTRICT RETURNING REVOKE RIGHT ROLLBACK ROLE ROW ROWS RULE SAVEPOINT SCHEMA SECURITY SELECT SERVER SET SHARE SHOW SKIP SOME SUBSCRIPTION TABLE TEMP TEMPORARY TIMESTAMP TIMESTAMPTZ TO TRUNCATE
 %token SEQUENCE SYMMETRIC TABLESPACE THEN TRUE TRIGGER UNION UNIQUE UNKNOWN UNLISTEN UNLOGGED UPDATE USING VACUUM VALUES VIEW WHEN WHERE WINDOW WITH WITHIN
 %token EXCEPT INTERSECT UNBOUNDED
 %token BASE_WEIGHT FIELD FRESHNESS GRAPH_METRIC KEY KIND METRIC METRIC_FRESHNESS MISSING_SCORE NAME SOURCE SOURCES TYPE WEIGHT
@@ -97,6 +97,7 @@ ddl_statement:
   | create_subscription_statement
   | create_policy_statement
   | create_routine_statement
+  | create_role_statement
   | create_index_statement
   | create_extension_statement
   | alter_table_statement
@@ -109,6 +110,7 @@ ddl_statement:
   | alter_publication_statement
   | alter_subscription_statement
   | alter_policy_statement
+  | alter_role_statement
   | drop_statement
   | refresh_materialized_view_statement
   | relation_population_statement
@@ -179,6 +181,10 @@ create_policy_statement:
 
 create_routine_statement:
     CREATE create_routine_replace_opt routine_kind qualified_name LPAREN routine_parameter_list_opt RPAREN diagnostic_tail_opt
+  ;
+
+create_role_statement:
+    CREATE ROLE identifier_name diagnostic_tail_opt
   ;
 
 create_routine_replace_opt:
@@ -287,6 +293,15 @@ alter_policy_statement:
     ALTER POLICY identifier_name ON qualified_name diagnostic_tail_opt
   ;
 
+alter_role_statement:
+    ALTER ROLE identifier_name alter_role_database_opt diagnostic_tail
+  ;
+
+alter_role_database_opt:
+    /* empty */
+  | IN DATABASE identifier_name
+  ;
+
 alter_table_relation_prefix_opt:
     /* empty */
   | IF EXISTS
@@ -310,6 +325,7 @@ drop_statement:
   | DROP SUBSCRIPTION if_exists_opt qualified_name
   | DROP POLICY if_exists_opt identifier_name ON qualified_name drop_behavior_opt
   | DROP routine_kind if_exists_opt qualified_name LPAREN routine_type_list_opt RPAREN drop_behavior_opt
+  | DROP ROLE if_exists_opt identifier_name drop_behavior_opt
   ;
 
 refresh_materialized_view_statement:
@@ -1209,8 +1225,10 @@ identifier_name:
   | RELEASE
   | RENAME
   | REPLACE
+  | RESET
   | RESTART
   | REVOKE
+  | ROLE
   | SAVEPOINT
   | SECURITY
   | SEQUENCE
@@ -1350,9 +1368,11 @@ diagnostic_token:
   | RELEASE
   | RENAME
   | REPLACE
+  | RESET
   | RESTRICT
   | RESTART
   | REVOKE
+  | ROLE
   | ROW
   | RULE
   | SAVEPOINT

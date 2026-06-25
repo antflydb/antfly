@@ -6403,6 +6403,345 @@ pub const ApiHttpServer = struct {
         }
     }
 
+    const PostgresCompatibilityScalar = struct {
+        column_name: []const u8,
+        value: []u8,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.value);
+            self.* = undefined;
+        }
+    };
+
+    const PostgresCompatibilitySetting = struct {
+        name: []const u8,
+        value: []u8,
+        description: []const u8,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.value);
+            self.* = undefined;
+        }
+    };
+
+    fn handlePublicSqlPostgresCompatibilityRead(
+        self: *ApiHttpServer,
+        parsed_sql: *const sql_adapter.ParsedSql,
+        session: *sql_adapter.OwnedSqlCatalogSession,
+    ) !?PublicSqlResultOrResponse {
+        if (try self.postgresCompatibilityScalarAlloc(parsed_sql, session.session())) |scalar_value| {
+            var scalar = scalar_value;
+            defer scalar.deinit(self.alloc);
+            return .{ .result = .{
+                .session_id = self.ensureSqlProtocolSessionId(session),
+                .statement_kind = "query",
+                .result = .{ .read = try self.publicSqlPostgresCompatibilityScalarReadAlloc(scalar.column_name, scalar.value) },
+            } };
+        }
+
+        if (self.postgresCompatibilityShowAll(parsed_sql)) {
+            return .{ .result = .{
+                .session_id = self.ensureSqlProtocolSessionId(session),
+                .statement_kind = "query",
+                .result = .{ .read = try self.publicSqlPostgresCompatibilityShowAllReadAlloc(session.session()) },
+            } };
+        }
+
+        return null;
+    }
+
+    fn describePublicSqlPostgresCompatibilityReadAlloc(
+        self: *ApiHttpServer,
+        parsed_sql: *const sql_adapter.ParsedSql,
+        session: *sql_adapter.OwnedSqlCatalogSession,
+    ) !?PublicSqlDescribeResult {
+        if (try self.postgresCompatibilityScalarAlloc(parsed_sql, session.session())) |scalar_value| {
+            var scalar = scalar_value;
+            defer scalar.deinit(self.alloc);
+            return .{
+                .session_id = self.ensureSqlProtocolSessionId(session),
+                .statement_kind = "query",
+                .has_row_description = true,
+                .columns = try self.publicSqlPostgresCompatibilityColumnsAlloc(&.{scalar.column_name}),
+            };
+        }
+        if (self.postgresCompatibilityShowAll(parsed_sql)) {
+            return .{
+                .session_id = self.ensureSqlProtocolSessionId(session),
+                .statement_kind = "query",
+                .has_row_description = true,
+                .columns = try self.publicSqlPostgresCompatibilityColumnsAlloc(&.{ "name", "setting", "description" }),
+            };
+        }
+        return null;
+    }
+
+    fn postgresCompatibilityScalarAlloc(
+        self: *ApiHttpServer,
+        parsed_sql: *const sql_adapter.ParsedSql,
+        session: catalog_resources.SqlCatalogSession,
+    ) !?PostgresCompatibilityScalar {
+        if (self.postgresCompatibilitySelectFunction(parsed_sql, "version")) {
+            return .{
+                .column_name = "version",
+                .value = try std.fmt.allocPrint(self.alloc, "Antfly {s} PostgreSQL wire compatibility 16.0", .{build_options.antfly_version}),
+            };
+        }
+        if (self.postgresCompatibilitySelectFunction(parsed_sql, "current_database")) {
+            return .{
+                .column_name = "current_database",
+                .value = try self.alloc.dupe(u8, session.currentDatabase()),
+            };
+        }
+        if (self.postgresCompatibilitySelectFunction(parsed_sql, "current_schema")) {
+            return .{
+                .column_name = "current_schema",
+                .value = try self.alloc.dupe(u8, session.primarySearchPathNamespace()),
+            };
+        }
+        if (self.postgresCompatibilityShowSettingName(parsed_sql)) |setting_name| {
+            return .{
+                .column_name = setting_name,
+                .value = try self.postgresCompatibilitySettingValueAlloc(setting_name, session),
+            };
+        }
+        return null;
+    }
+
+    fn postgresCompatibilitySelectFunction(self: *ApiHttpServer, parsed_sql: *const sql_adapter.ParsedSql, function_name: []const u8) bool {
+        _ = self;
+        const raw = parsed_sql.statement.raw();
+        const all_tokens = parsed_sql.items();
+        if (raw.token_end > all_tokens.len or raw.token_start >= raw.token_end) return false;
+        const tokens = all_tokens[raw.token_start..raw.token_end];
+        if (tokens.len < 4) return false;
+        if (!tokens[0].matchesKeywordTag(.select)) return false;
+        if (!postgresCompatibilityTokenTextMatches(tokens[1], function_name)) return false;
+        if (tokens[2].kind != .lparen or tokens[3].kind != .rparen) return false;
+        return postgresCompatibilityOptionalAliasOnly(tokens[4..]);
+    }
+
+    fn postgresCompatibilityShowSettingName(self: *ApiHttpServer, parsed_sql: *const sql_adapter.ParsedSql) ?[]const u8 {
+        _ = self;
+        const raw = parsed_sql.statement.raw();
+        const all_tokens = parsed_sql.items();
+        if (raw.token_end > all_tokens.len or raw.token_start >= raw.token_end) return null;
+        const tokens = all_tokens[raw.token_start..raw.token_end];
+        if (tokens.len != 2) return null;
+        if (!tokens[0].matchesKeywordTag(.show)) return null;
+        if (tokens[1].matchesKeywordTag(.all)) return null;
+        return postgresCompatibilityCanonicalSettingName(tokens[1].text);
+    }
+
+    fn postgresCompatibilityShowAll(self: *ApiHttpServer, parsed_sql: *const sql_adapter.ParsedSql) bool {
+        _ = self;
+        const raw = parsed_sql.statement.raw();
+        const all_tokens = parsed_sql.items();
+        if (raw.token_end > all_tokens.len or raw.token_start >= raw.token_end) return false;
+        const tokens = all_tokens[raw.token_start..raw.token_end];
+        return tokens.len == 2 and tokens[0].matchesKeywordTag(.show) and tokens[1].matchesKeywordTag(.all);
+    }
+
+    fn postgresCompatibilityTokenTextMatches(token: anytype, expected: []const u8) bool {
+        return token.kind == .identifier and std.ascii.eqlIgnoreCase(token.text, expected);
+    }
+
+    fn postgresCompatibilityOptionalAliasOnly(tokens: anytype) bool {
+        if (tokens.len == 0) return true;
+        if (tokens.len == 2 and tokens[0].matchesKeywordTag(.as) and tokens[1].kind == .identifier) return true;
+        if (tokens.len == 1 and tokens[0].kind == .identifier) return true;
+        return false;
+    }
+
+    fn postgresCompatibilityCanonicalSettingName(name: []const u8) ?[]const u8 {
+        const settings = [_][]const u8{
+            "server_version",
+            "server_version_num",
+            "server_encoding",
+            "client_encoding",
+            "DateStyle",
+            "integer_datetimes",
+            "standard_conforming_strings",
+            "TimeZone",
+            "application_name",
+            "search_path",
+            "transaction_isolation",
+            "default_transaction_read_only",
+            "transaction_read_only",
+            "statement_timeout",
+        };
+        for (settings) |setting| {
+            if (std.ascii.eqlIgnoreCase(name, setting)) return setting;
+        }
+        return null;
+    }
+
+    fn postgresCompatibilitySettingValueAlloc(
+        self: *ApiHttpServer,
+        name: []const u8,
+        session: catalog_resources.SqlCatalogSession,
+    ) ![]u8 {
+        if (std.ascii.eqlIgnoreCase(name, "server_version")) return try self.alloc.dupe(u8, "16.0-antfly");
+        if (std.ascii.eqlIgnoreCase(name, "server_version_num")) return try self.alloc.dupe(u8, "160000");
+        if (std.ascii.eqlIgnoreCase(name, "server_encoding")) return try self.alloc.dupe(u8, "UTF8");
+        if (std.ascii.eqlIgnoreCase(name, "client_encoding")) return try self.alloc.dupe(u8, "UTF8");
+        if (std.ascii.eqlIgnoreCase(name, "DateStyle")) return try self.alloc.dupe(u8, "ISO, MDY");
+        if (std.ascii.eqlIgnoreCase(name, "integer_datetimes")) return try self.alloc.dupe(u8, "on");
+        if (std.ascii.eqlIgnoreCase(name, "standard_conforming_strings")) return try self.alloc.dupe(u8, "on");
+        if (std.ascii.eqlIgnoreCase(name, "TimeZone")) return try self.alloc.dupe(u8, "UTC");
+        if (std.ascii.eqlIgnoreCase(name, "application_name")) return try self.alloc.dupe(u8, "");
+        if (std.ascii.eqlIgnoreCase(name, "search_path")) return try self.postgresCompatibilitySearchPathAlloc(session);
+        if (std.ascii.eqlIgnoreCase(name, "transaction_isolation")) return try self.alloc.dupe(u8, "read committed");
+        if (std.ascii.eqlIgnoreCase(name, "default_transaction_read_only")) return try self.alloc.dupe(u8, if (try sql_adapter.sqlDefaultTransactionReadOnlyFromSession(session)) "on" else "off");
+        if (std.ascii.eqlIgnoreCase(name, "transaction_read_only")) {
+            const read_only = (try sql_adapter.sqlTransactionReadOnlyFromSession(session)) orelse try sql_adapter.sqlDefaultTransactionReadOnlyFromSession(session);
+            return try self.alloc.dupe(u8, if (read_only) "on" else "off");
+        }
+        if (std.ascii.eqlIgnoreCase(name, "statement_timeout")) return try self.alloc.dupe(u8, session.settingValue("statement_timeout") orelse "0");
+        return error.InvalidSqlRequest;
+    }
+
+    fn postgresCompatibilitySearchPathAlloc(self: *ApiHttpServer, session: catalog_resources.SqlCatalogSession) ![]u8 {
+        const default_search_path: []const []const u8 = &.{catalog_resources.default_namespace_name};
+        const source = if (session.search_path.len == 0) default_search_path else session.search_path;
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        errdefer out.deinit();
+        for (source, 0..) |namespace, i| {
+            if (i != 0) try out.writer.writeAll(", ");
+            try out.writer.writeAll(namespace);
+        }
+        return try out.toOwnedSlice();
+    }
+
+    fn publicSqlPostgresCompatibilityScalarReadAlloc(
+        self: *ApiHttpServer,
+        column_name: []const u8,
+        value: []const u8,
+    ) !PublicSqlResult.Read {
+        const columns = try self.publicSqlPostgresCompatibilityColumnsAlloc(&.{column_name});
+        errdefer relational_rows_api.freeRowsOutputColumns(self.alloc, columns);
+        const rows = try self.alloc.alloc([]const u8, 1);
+        errdefer self.alloc.free(rows);
+        rows[0] = try self.publicSqlPostgresCompatibilityRowAlloc(&.{column_name}, &.{value});
+        return .{
+            .result = .{ .query = .{ .rows = rows, .total = 1 } },
+            .columns = columns,
+        };
+    }
+
+    fn publicSqlPostgresCompatibilityShowAllReadAlloc(
+        self: *ApiHttpServer,
+        session: catalog_resources.SqlCatalogSession,
+    ) !PublicSqlResult.Read {
+        const settings = try self.postgresCompatibilityShowAllSettingsAlloc(session);
+        defer {
+            for (settings) |*setting| setting.deinit(self.alloc);
+            self.alloc.free(settings);
+        }
+        const columns = try self.publicSqlPostgresCompatibilityColumnsAlloc(&.{ "name", "setting", "description" });
+        errdefer relational_rows_api.freeRowsOutputColumns(self.alloc, columns);
+        const rows = try self.alloc.alloc([]const u8, settings.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (rows[0..initialized]) |row| self.alloc.free(@constCast(row));
+            self.alloc.free(rows);
+        }
+        for (settings, 0..) |setting, i| {
+            rows[i] = try self.publicSqlPostgresCompatibilityRowAlloc(
+                &.{ "name", "setting", "description" },
+                &.{ setting.name, setting.value, setting.description },
+            );
+            initialized += 1;
+        }
+        return .{
+            .result = .{ .query = .{ .rows = rows, .total = @intCast(rows.len) } },
+            .columns = columns,
+        };
+    }
+
+    fn postgresCompatibilityShowAllSettingsAlloc(
+        self: *ApiHttpServer,
+        session: catalog_resources.SqlCatalogSession,
+    ) ![]PostgresCompatibilitySetting {
+        const source = [_]struct { name: []const u8, description: []const u8 }{
+            .{ .name = "server_version", .description = "Shows the server version." },
+            .{ .name = "server_version_num", .description = "Shows the server version as an integer." },
+            .{ .name = "server_encoding", .description = "Shows the server encoding." },
+            .{ .name = "client_encoding", .description = "Shows the client encoding." },
+            .{ .name = "DateStyle", .description = "Sets the display format for date and time values." },
+            .{ .name = "integer_datetimes", .description = "Shows whether datetimes are stored as integers." },
+            .{ .name = "standard_conforming_strings", .description = "Shows whether ordinary string literals treat backslashes literally." },
+            .{ .name = "TimeZone", .description = "Sets the time zone for displaying and interpreting time stamps." },
+            .{ .name = "application_name", .description = "Sets the application name." },
+            .{ .name = "search_path", .description = "Sets the schema search order." },
+            .{ .name = "transaction_isolation", .description = "Sets the current transaction isolation level." },
+            .{ .name = "default_transaction_read_only", .description = "Sets the default read-only status of new transactions." },
+            .{ .name = "transaction_read_only", .description = "Shows whether the current transaction is read-only." },
+            .{ .name = "statement_timeout", .description = "Sets the maximum allowed duration of any statement." },
+        };
+        const out = try self.alloc.alloc(PostgresCompatibilitySetting, source.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*setting| setting.deinit(self.alloc);
+            self.alloc.free(out);
+        }
+        for (source, 0..) |row, i| {
+            out[i] = .{
+                .name = row.name,
+                .value = try self.postgresCompatibilitySettingValueAlloc(row.name, session),
+                .description = row.description,
+            };
+            initialized += 1;
+        }
+        return out;
+    }
+
+    fn publicSqlPostgresCompatibilityColumnsAlloc(
+        self: *ApiHttpServer,
+        names: []const []const u8,
+    ) ![]const runtime_schema_mod.RelationalColumn {
+        const columns = try self.alloc.alloc(runtime_schema_mod.RelationalColumn, names.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (columns[0..initialized]) |column| {
+                self.alloc.free(column.name);
+                self.alloc.free(column.path);
+            }
+            self.alloc.free(columns);
+        }
+        for (names, 0..) |name, i| {
+            const owned_name = try self.alloc.dupe(u8, name);
+            errdefer self.alloc.free(owned_name);
+            const owned_path = try self.alloc.dupe(u8, name);
+            errdefer self.alloc.free(owned_path);
+            columns[i] = .{
+                .name = owned_name,
+                .path = owned_path,
+                .field_type = .text,
+                .nullable = false,
+            };
+            initialized += 1;
+        }
+        return columns;
+    }
+
+    fn publicSqlPostgresCompatibilityRowAlloc(
+        self: *ApiHttpServer,
+        columns: []const []const u8,
+        values: []const []const u8,
+    ) ![]const u8 {
+        std.debug.assert(columns.len == values.len);
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        errdefer out.deinit();
+        try out.writer.writeByte('{');
+        for (columns, values, 0..) |column, value, i| {
+            if (i != 0) try out.writer.writeByte(',');
+            try out.writer.print("{f}:{f}", .{ std.json.fmt(column, .{}), std.json.fmt(value, .{}) });
+        }
+        try out.writer.writeByte('}');
+        return try out.toOwnedSlice();
+    }
+
     pub fn handlePublicSqlRequestResult(self: *ApiHttpServer, request: PublicSqlRequest, authenticated_identity: ?AuthenticatedIdentity) !PublicSqlResultOrResponse {
         if (std.mem.trim(u8, request.sql, " \t\r\n").len == 0) return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") };
 
@@ -6424,6 +6763,16 @@ pub const ApiHttpServer = struct {
         if (session.sql_transaction_failed and !parsedSqlTransactionBoundaryClearsLocalSession(&parsed_sql)) {
             try self.savePublicSqlSession(session);
             return .{ .response = try textResponse(self.alloc, 400, "current transaction is aborted") };
+        }
+        if (try self.handlePublicSqlPostgresCompatibilityRead(&parsed_sql, &session)) |outcome_value| {
+            var outcome = outcome_value;
+            errdefer outcome.deinit(self.alloc);
+            try self.savePublicSqlSession(session);
+            switch (outcome) {
+                .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(&session),
+                .response => {},
+            }
+            return outcome;
         }
         if (parsed_sql.writeStatementKind() != null) {
             var outcome = try self.handlePublicSqlWrite(&parsed_sql, &session, authenticated_identity);
@@ -6514,6 +6863,13 @@ pub const ApiHttpServer = struct {
             else => return err,
         };
         defer parsed_sql.deinit(self.alloc);
+        if (try self.describePublicSqlPostgresCompatibilityReadAlloc(&parsed_sql, &session)) |result_value| {
+            var result = result_value;
+            errdefer result.deinit(self.alloc);
+            try self.savePublicSqlSession(session);
+            result.transaction_status = self.publicSqlTransactionStatus(&session);
+            return .{ .result = result };
+        }
         if (parsed_sql.readStatementKind() != null) {
             var outcome = try self.describePublicSqlReadColumnsAlloc(&parsed_sql, &session, authenticated_identity);
             errdefer outcome.deinit(self.alloc);

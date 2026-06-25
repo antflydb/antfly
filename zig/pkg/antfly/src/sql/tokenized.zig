@@ -2538,6 +2538,53 @@ test "sql adapter parsed sql owns typed statement variants" {
         else => return error.TestUnexpectedResult,
     }
 
+    var create_role = try ParsedSql.initAlloc(alloc, "CREATE ROLE app_writer");
+    defer create_role.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, create_role.generatedStatementKind().?);
+    switch (create_role.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_role, ddl_ast.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl_ast.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (create_role.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var alter_role = try ParsedSql.initAlloc(alloc, "ALTER ROLE app_writer IN DATABASE appdb SET app.tenant_id = current_setting('app.tenant_id')");
+    defer alter_role.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, alter_role.generatedStatementKind().?);
+    switch (alter_role.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_role, ddl_ast.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 13 }, ddl_ast.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (alter_role.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_role = try ParsedSql.initAlloc(alloc, "DROP ROLE IF EXISTS app_writer");
+    defer drop_role.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, drop_role.generatedStatementKind().?);
+    switch (drop_role.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.drop_role, ddl_ast.kind);
+            try std.testing.expect(ddl_ast.if_exists);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl_ast.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (drop_role.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
     var create_materialized_view = try ParsedSql.initAlloc(alloc, "CREATE MATERIALIZED VIEW IF NOT EXISTS usage_summary AS SELECT status FROM usage_records WITH NO DATA");
     defer create_materialized_view.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, create_materialized_view.generatedStatementKind().?);

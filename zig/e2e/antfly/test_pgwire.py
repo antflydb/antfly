@@ -263,6 +263,41 @@ def test_pgwire_simple_query_accepts_multiple_statements(pgwire_server):
     assert rows == [["row:b", "closed"]]
 
 
+def test_pgwire_postgres_compatibility_probes_return_rows(pgwire_server):
+    with socket.create_connection((pgwire_server.host, pgwire_server.pgwire_port), timeout=5) as sock:
+        _pgwire_startup(sock)
+        version_messages = _pgwire_simple_query(sock, "SELECT version();")
+        server_version_messages = _pgwire_simple_query(sock, "SHOW server_version;")
+        search_path_messages = _pgwire_simple_query(sock, "SHOW search_path;")
+        show_all_messages = _pgwire_simple_query(sock, "SHOW ALL;")
+
+    assert [message for message in version_messages if message["type"] == "columns"] == [
+        {"type": "columns", "columns": ["version"], "oids": [PG_TEXT_OID]}
+    ]
+    version_rows = [message["values"] for message in version_messages if message["type"] == "row"]
+    assert len(version_rows) == 1
+    assert "Antfly" in version_rows[0][0]
+    assert [message["tag"] for message in version_messages if message["type"] == "command"] == ["SELECT 1"]
+
+    assert [message for message in server_version_messages if message["type"] == "columns"] == [
+        {"type": "columns", "columns": ["server_version"], "oids": [PG_TEXT_OID]}
+    ]
+    assert [message["values"] for message in server_version_messages if message["type"] == "row"] == [["16.0-antfly"]]
+    assert [message["tag"] for message in server_version_messages if message["type"] == "command"] == ["SELECT 1"]
+
+    assert [message["values"] for message in search_path_messages if message["type"] == "row"] == [["public"]]
+
+    show_all_columns = [message for message in show_all_messages if message["type"] == "columns"]
+    assert show_all_columns == [
+        {"type": "columns", "columns": ["name", "setting", "description"], "oids": [PG_TEXT_OID, PG_TEXT_OID, PG_TEXT_OID]}
+    ]
+    show_all_rows = [message["values"] for message in show_all_messages if message["type"] == "row"]
+    show_all_settings = {row[0]: row[1] for row in show_all_rows}
+    assert show_all_settings["server_version"] == "16.0-antfly"
+    assert show_all_settings["client_encoding"] == "UTF8"
+    assert show_all_settings["search_path"] == "public"
+
+
 def test_pgwire_ready_for_query_tracks_transaction_status(pgwire_server):
     with socket.create_connection((pgwire_server.host, pgwire_server.pgwire_port), timeout=5) as sock:
         _pgwire_startup(sock)

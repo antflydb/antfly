@@ -3922,6 +3922,128 @@ test "db write path bulk ingest finish publishes primary store before external d
     try std.testing.expect(result.total_hits > 0);
 }
 
+test "db write path extract enrichments exposes cleaned writes and special fields" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    var result = try db.extractEnrichments(alloc, &.{
+        .{
+            .key = "doc:a",
+            .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,2,3],\"sparse_idx\":{\"indices\":[1,5],\"values\":[0.5,0.75]}},\"_edges\":{\"graph_v1\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":2.0}]}}}",
+        },
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.cleaned_writes.len);
+    try std.testing.expectEqualStrings("doc:a", result.cleaned_writes[0].key);
+    try std.testing.expect(std.mem.indexOf(u8, result.cleaned_writes[0].value, "\"title\":\"alpha\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.cleaned_writes[0].value, "_embeddings") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.cleaned_writes[0].value, "_summaries") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.cleaned_writes[0].value, "_edges") == null);
+
+    try std.testing.expectEqual(@as(usize, 1), result.dense_embeddings.len);
+    try std.testing.expectEqualStrings("dense_idx", result.dense_embeddings[0].index_name);
+    try std.testing.expectEqual(@as(usize, 3), result.dense_embeddings[0].vector.len);
+
+    try std.testing.expectEqual(@as(usize, 1), result.sparse_embeddings.len);
+    try std.testing.expectEqualStrings("sparse_idx", result.sparse_embeddings[0].index_name);
+    try std.testing.expectEqual(@as(usize, 2), result.sparse_embeddings[0].indices.len);
+
+    try std.testing.expectEqual(@as(usize, 1), result.graph_writes.len);
+    try std.testing.expectEqualStrings("graph_v1", result.graph_writes[0].index_name);
+    try std.testing.expectEqualStrings("doc:b", result.graph_writes[0].target);
+}
+
+test "db write path extract enrichments projects configured embedded json vector and graph fields" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "attrs_dense",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"attrs.embedding\",\"dims\":3,\"metric\":\"cosine\"}",
+    });
+    try db.addIndex(.{
+        .name = "attrs_sparse",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"attrs.sparse\"}",
+    });
+    try db.addIndex(.{
+        .name = "attrs_graph",
+        .kind = .graph,
+        .config_json = "{\"edge_types\":[{\"name\":\"cites\",\"field\":\"attrs.links\"}]}",
+    });
+
+    var result = try db.extractEnrichments(alloc, &.{
+        .{
+            .key = "doc:a",
+            .value =
+            \\{"title":"alpha","attrs":{"embedding":[1,0,0],"sparse":{"indices":[7,42],"values":[1.5,0.5]},"links":["doc:b","doc:c"]}}
+            ,
+        },
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.cleaned_writes.len);
+    try std.testing.expectEqual(@as(usize, 1), result.dense_embeddings.len);
+    try std.testing.expectEqualStrings("attrs_dense", result.dense_embeddings[0].index_name);
+    try std.testing.expectEqual(@as(usize, 3), result.dense_embeddings[0].vector.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), result.dense_embeddings[0].vector[0], 0.0001);
+
+    try std.testing.expectEqual(@as(usize, 1), result.sparse_embeddings.len);
+    try std.testing.expectEqualStrings("attrs_sparse", result.sparse_embeddings[0].index_name);
+    try std.testing.expectEqual(@as(usize, 2), result.sparse_embeddings[0].indices.len);
+    try std.testing.expectEqual(@as(u32, 7), result.sparse_embeddings[0].indices[0]);
+
+    try std.testing.expectEqual(@as(usize, 2), result.graph_writes.len);
+    try std.testing.expectEqualStrings("attrs_graph", result.graph_writes[0].index_name);
+    try std.testing.expectEqualStrings("cites", result.graph_writes[0].edge_type);
+    try std.testing.expectEqualStrings("doc:b", result.graph_writes[0].target);
+    try std.testing.expectEqualStrings("doc:c", result.graph_writes[1].target);
+}
+
+test "db write path extract enrichments rejects unsupported legacy summaries field" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try std.testing.expectError(error.UnsupportedReservedField, db.extractEnrichments(alloc, &.{
+        .{
+            .key = "doc:a",
+            .value = "{\"title\":\"alpha\",\"_summaries\":{\"sum_idx\":\"brief\"}}",
+        },
+    }));
+}
+
 test "db write path document artifact child range applies batch without source row write" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
