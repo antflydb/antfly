@@ -6568,6 +6568,12 @@ pub const ApiHttpServer = struct {
                 .value = try self.alloc.dupe(u8, session.primarySearchPathNamespace()),
             };
         }
+        if (self.postgresCompatibilitySelectCurrentSetting(parsed_sql)) |setting_name| {
+            return .{
+                .column_name = "current_setting",
+                .value = try self.postgresCompatibilitySettingValueAlloc(setting_name, session),
+            };
+        }
         if (self.postgresCompatibilityShowSettingName(parsed_sql)) |setting_name| {
             return .{
                 .column_name = setting_name,
@@ -6588,6 +6594,20 @@ pub const ApiHttpServer = struct {
         if (!postgresCompatibilityTokenTextMatches(tokens[1], function_name)) return false;
         if (tokens[2].kind != .lparen or tokens[3].kind != .rparen) return false;
         return postgresCompatibilityOptionalAliasOnly(tokens[4..]);
+    }
+
+    fn postgresCompatibilitySelectCurrentSetting(self: *ApiHttpServer, parsed_sql: *const sql_adapter.ParsedSql) ?[]const u8 {
+        _ = self;
+        const raw = parsed_sql.statement.raw();
+        const all_tokens = parsed_sql.items();
+        if (raw.token_end > all_tokens.len or raw.token_start >= raw.token_end) return null;
+        const tokens = all_tokens[raw.token_start..raw.token_end];
+        if (tokens.len < 5) return null;
+        if (!tokens[0].matchesKeywordTag(.select)) return null;
+        if (!postgresCompatibilityTokenTextMatches(tokens[1], "current_setting")) return null;
+        if (tokens[2].kind != .lparen or tokens[3].kind != .string or tokens[4].kind != .rparen) return null;
+        if (!postgresCompatibilityOptionalAliasOnly(tokens[5..])) return null;
+        return postgresCompatibilityCanonicalSettingName(tokens[3].text);
     }
 
     fn postgresCompatibilityShowSettingName(self: *ApiHttpServer, parsed_sql: *const sql_adapter.ParsedSql) ?[]const u8 {

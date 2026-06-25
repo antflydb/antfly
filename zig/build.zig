@@ -4524,7 +4524,6 @@ pub fn build(b: *std.Build) void {
             "algebraic derived join tensor reads subtract identity tombstones at generation",
             "planner rejects rebuild-required schema lifecycle state",
             "algebraic adaptive progress marks rebuild required on schema drift",
-            "db vector symbolic filters fail closed when algebraic lifecycle is stale",
             "remote simple vector query uses vector worker route",
             "encode query request serializes internal resolved doc filters with wire context",
             "simple vector shard request carries serializable resolved doc filter",

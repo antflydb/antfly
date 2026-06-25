@@ -1981,19 +1981,21 @@ pub fn tokenIdsAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token) 
     errdefer ids.deinit(alloc);
     for (tokens, 0..) |tok, index| {
         if (tok.kind == .semicolon and trailingSemicolonOnly(tokens, index)) break;
-        try appendTokenIds(alloc, &ids, tok);
+        const next = if (index + 1 < tokens.len) tokens[index + 1] else null;
+        try appendTokenIds(alloc, &ids, tok, next);
     }
     return try ids.toOwnedSlice(alloc);
 }
 
-fn appendTokenIds(alloc: std.mem.Allocator, ids: *std.ArrayListUnmanaged(u16), tok: token_mod.Token) !void {
+fn appendTokenIds(alloc: std.mem.Allocator, ids: *std.ArrayListUnmanaged(u16), tok: token_mod.Token, next: ?token_mod.Token) !void {
     switch (tok.kind) {
         .identifier => {
             if (try keywordSymbolIdAlloc(alloc, tok)) |id| {
                 try ids.append(alloc, id);
                 return;
             }
-            try appendIdentifierIds(alloc, ids, tok.text);
+            const allow_trailing_dot = next != null and next.?.kind == .star;
+            try appendIdentifierIds(alloc, ids, tok.text, allow_trailing_dot);
         },
         .string => try appendSymbol(ids, alloc, "STRING"),
         .number => try appendSymbol(ids, alloc, "NUMBER"),
@@ -2032,8 +2034,14 @@ fn appendTokenIds(alloc: std.mem.Allocator, ids: *std.ArrayListUnmanaged(u16), t
     }
 }
 
-fn appendIdentifierIds(alloc: std.mem.Allocator, ids: *std.ArrayListUnmanaged(u16), text: []const u8) !void {
-    var parts = std.mem.splitScalar(u8, text, '.');
+fn appendIdentifierIds(alloc: std.mem.Allocator, ids: *std.ArrayListUnmanaged(u16), text: []const u8, allow_trailing_dot: bool) !void {
+    if (text.len == 0) return error.UnsupportedSqlShape;
+    const has_trailing_dot = text[text.len - 1] == '.';
+    if (has_trailing_dot and !allow_trailing_dot) return error.UnsupportedSqlShape;
+    const body = if (has_trailing_dot) text[0 .. text.len - 1] else text;
+    if (body.len == 0) return error.UnsupportedSqlShape;
+
+    var parts = std.mem.splitScalar(u8, body, '.');
     var emitted = false;
     while (parts.next()) |part| {
         if (part.len == 0) return error.UnsupportedSqlShape;
@@ -2041,6 +2049,7 @@ fn appendIdentifierIds(alloc: std.mem.Allocator, ids: *std.ArrayListUnmanaged(u1
         try appendSymbol(ids, alloc, "IDENT");
         emitted = true;
     }
+    if (has_trailing_dot) try appendSymbol(ids, alloc, "DOT");
 }
 
 fn appendSymbol(ids: *std.ArrayListUnmanaged(u16), alloc: std.mem.Allocator, name: []const u8) !void {
@@ -7302,6 +7311,24 @@ test "generated SQL parser facade builds read AST spans" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    const table_qualified_star_projection_read_sql = "SELECT docs.* FROM docs WHERE _id = 'doc:a'";
+    const table_qualified_star_projection_read_result = try parseSqlAlloc(alloc, table_qualified_star_projection_read_sql);
+    switch (table_qualified_star_projection_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 4 }, read.projection_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), read.projection_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 4 }, read.projection_items.items[0]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 4 }, read.projection_items.expression_items[0]);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.projection_items.expressions[0].kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 4 }, read.projection_items.expressions[0].tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 10 }, read.where_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, parseSqlAlloc(alloc, "SELECT docs. FROM docs"));
 
     const graph_source_read_sql = "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b') AS gm";
     var graph_source_tokens = try lexer.tokenizeAlloc(alloc, graph_source_read_sql);
