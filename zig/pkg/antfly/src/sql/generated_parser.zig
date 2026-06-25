@@ -2901,6 +2901,9 @@ fn buildDdlAst(
         .create_domain => {
             if (end > 2 and tokens[1].matchesKeywordTag(.domain)) {
                 ast.object_name_tokens = generatedQualifiedNameRange(tokens, 2, end);
+                if (ast.object_name_tokens) |domain_range| {
+                    if (domain_range.end < end) ast.alter_table_operation_tokens = .{ .start = domain_range.end, .end = end };
+                }
             }
         },
         .create_sequence => {
@@ -6916,6 +6919,7 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlDdlKind.create_domain, ddl.kind);
             try std.testing.expectEqualStrings("CREATE", spanText(create_domain_sql, ddl.command_span));
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 11 }, ddl.alter_table_operation_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

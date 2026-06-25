@@ -74,7 +74,9 @@ typed view catalog planner.
 Domain catalog DDL heads, including `CREATE DOMAIN`, `ALTER DOMAIN`, and
 `DROP DOMAIN`, now use the same generated DDL boundary with retained object
 spans and validated command/tail metadata before delegating to the existing
-typed domain catalog planner.
+typed domain catalog planner. Generated `CREATE DOMAIN` ASTs retain the
+definition tail starting at `AS`, and domain planning fails closed if that
+tail no longer begins at the recorded domain-name boundary.
 Sequence catalog DDL heads, including `CREATE SEQUENCE`, `ALTER SEQUENCE`, and
 `DROP SEQUENCE`, now use the generated DDL boundary with retained object,
 option-tail, and drop-behavior metadata before delegating sequence option

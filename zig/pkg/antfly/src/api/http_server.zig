@@ -6583,6 +6583,70 @@ pub const ApiHttpServer = struct {
         }
     };
 
+    const PostgresCompatibilityInformationSchemaView = enum {
+        tables,
+        columns,
+    };
+
+    const PostgresCompatibilityInformationSchemaFilters = struct {
+        table_catalog: ?[]const u8 = null,
+        table_schema: ?[]const u8 = null,
+        table_name: ?[]const u8 = null,
+    };
+
+    const PostgresCompatibilityInformationSchemaOrderKey = struct {
+        column: []const u8,
+        descending: bool = false,
+    };
+
+    const PostgresCompatibilityInformationSchemaTail = struct {
+        filters: PostgresCompatibilityInformationSchemaFilters = .{},
+        order_by: []const PostgresCompatibilityInformationSchemaOrderKey = &.{},
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.order_by);
+            self.* = undefined;
+        }
+    };
+
+    const PostgresCompatibilityInformationSchemaQuery = struct {
+        view: PostgresCompatibilityInformationSchemaView,
+        columns: []const []const u8,
+        filters: PostgresCompatibilityInformationSchemaFilters = .{},
+        order_by: []const PostgresCompatibilityInformationSchemaOrderKey = &.{},
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.columns);
+            alloc.free(self.order_by);
+            self.* = undefined;
+        }
+    };
+
+    const PostgresCompatibilityInformationSchemaSortValue = union(enum) {
+        text: []const u8,
+        number: usize,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            switch (self.*) {
+                .text => |value| alloc.free(@constCast(value)),
+                .number => {},
+            }
+            self.* = undefined;
+        }
+    };
+
+    const PostgresCompatibilityRenderedInformationSchemaRow = struct {
+        row: []const u8,
+        sort_values: []PostgresCompatibilityInformationSchemaSortValue = &.{},
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            if (self.row.len != 0) alloc.free(@constCast(self.row));
+            for (self.sort_values) |*value| value.deinit(alloc);
+            alloc.free(self.sort_values);
+            self.* = undefined;
+        }
+    };
+
     fn handlePublicSqlPostgresCompatibilityRead(
         self: *ApiHttpServer,
         parsed_sql: *const sql_adapter.ParsedSql,
@@ -6595,6 +6659,16 @@ pub const ApiHttpServer = struct {
                 .session_id = self.ensureSqlProtocolSessionId(session),
                 .statement_kind = "query",
                 .result = .{ .read = try self.publicSqlPostgresCompatibilityScalarReadAlloc(scalar.column_name, scalar.value) },
+            } };
+        }
+
+        if (try self.postgresCompatibilityInformationSchemaQueryAlloc(parsed_sql)) |query_value| {
+            var query = query_value;
+            defer query.deinit(self.alloc);
+            return .{ .result = .{
+                .session_id = self.ensureSqlProtocolSessionId(session),
+                .statement_kind = "query",
+                .result = .{ .read = try self.publicSqlPostgresCompatibilityInformationSchemaReadAlloc(query, session.session()) },
             } };
         }
 
@@ -6624,6 +6698,16 @@ pub const ApiHttpServer = struct {
                 .columns = try self.publicSqlPostgresCompatibilityColumnsAlloc(&.{scalar.column_name}),
             };
         }
+        if (try self.postgresCompatibilityInformationSchemaQueryAlloc(parsed_sql)) |query_value| {
+            var query = query_value;
+            defer query.deinit(self.alloc);
+            return .{
+                .session_id = self.ensureSqlProtocolSessionId(session),
+                .statement_kind = "query",
+                .has_row_description = true,
+                .columns = try self.publicSqlPostgresCompatibilityColumnsAlloc(query.columns),
+            };
+        }
         if (self.postgresCompatibilityShowAll(parsed_sql)) {
             return .{
                 .session_id = self.ensureSqlProtocolSessionId(session),
@@ -6633,6 +6717,286 @@ pub const ApiHttpServer = struct {
             };
         }
         return null;
+    }
+
+    fn postgresCompatibilityInformationSchemaQueryAlloc(
+        self: *ApiHttpServer,
+        parsed_sql: *const sql_adapter.ParsedSql,
+    ) !?PostgresCompatibilityInformationSchemaQuery {
+        const raw = parsed_sql.statement.raw();
+        const all_tokens = parsed_sql.items();
+        if (raw.token_end > all_tokens.len or raw.token_start >= raw.token_end) return null;
+        const tokens = all_tokens[raw.token_start..raw.token_end];
+        if (tokens.len < 4 or !tokens[0].matchesKeywordTag(.select)) return null;
+
+        var from_index: ?usize = null;
+        for (tokens, 0..) |token, i| {
+            if (i <= 1) continue;
+            if (token.matchesKeywordTag(.from)) {
+                from_index = i;
+                break;
+            }
+        }
+        const from_pos = from_index orelse return null;
+        if (from_pos + 1 >= tokens.len) return null;
+        const view: PostgresCompatibilityInformationSchemaView = if (postgresCompatibilityQualifiedNameMatches(tokens[from_pos + 1], "information_schema", "tables"))
+            .tables
+        else if (postgresCompatibilityQualifiedNameMatches(tokens[from_pos + 1], "information_schema", "columns"))
+            .columns
+        else
+            return null;
+
+        const selected_columns = (try self.postgresCompatibilityInformationSchemaSelectListAlloc(view, tokens[1..from_pos])) orelse return null;
+        errdefer self.alloc.free(selected_columns);
+        var tail = (try self.postgresCompatibilityInformationSchemaTailAlloc(view, selected_columns, tokens[from_pos + 2 ..])) orelse {
+            self.alloc.free(selected_columns);
+            return null;
+        };
+        errdefer tail.deinit(self.alloc);
+        return .{
+            .view = view,
+            .columns = selected_columns,
+            .filters = tail.filters,
+            .order_by = tail.order_by,
+        };
+    }
+
+    fn postgresCompatibilityInformationSchemaSelectListAlloc(
+        self: *ApiHttpServer,
+        view: PostgresCompatibilityInformationSchemaView,
+        tokens: anytype,
+    ) !?[]const []const u8 {
+        if (tokens.len == 1 and tokens[0].kind == .star) {
+            const defaults = switch (view) {
+                .tables => &[_][]const u8{ "table_catalog", "table_schema", "table_name", "table_type" },
+                .columns => &[_][]const u8{ "table_catalog", "table_schema", "table_name", "column_name", "ordinal_position", "data_type", "is_nullable" },
+            };
+            const out = try self.alloc.alloc([]const u8, defaults.len);
+            @memcpy(out, defaults);
+            return out;
+        }
+
+        var count: usize = 0;
+        var expect_column = true;
+        for (tokens) |token| {
+            if (expect_column) {
+                if (token.kind != .identifier) return null;
+                const column = postgresCompatibilityIdentifierTail(token.text);
+                if (!postgresCompatibilityInformationSchemaColumnAllowed(view, column)) return null;
+                count += 1;
+                expect_column = false;
+            } else {
+                if (token.kind != .comma) return null;
+                expect_column = true;
+            }
+        }
+        if (count == 0 or expect_column) return null;
+
+        const out = try self.alloc.alloc([]const u8, count);
+        var out_index: usize = 0;
+        expect_column = true;
+        for (tokens) |token| {
+            if (expect_column) {
+                out[out_index] = postgresCompatibilityIdentifierTail(token.text);
+                out_index += 1;
+                expect_column = false;
+            } else {
+                expect_column = true;
+            }
+        }
+        return out;
+    }
+
+    fn postgresCompatibilityInformationSchemaColumnAllowed(view: PostgresCompatibilityInformationSchemaView, column: []const u8) bool {
+        const allowed = switch (view) {
+            .tables => &[_][]const u8{
+                "table_catalog",
+                "table_schema",
+                "table_name",
+                "table_type",
+                "self_referencing_column_name",
+                "reference_generation",
+                "user_defined_type_catalog",
+                "user_defined_type_schema",
+                "user_defined_type_name",
+                "is_insertable_into",
+                "is_typed",
+                "commit_action",
+            },
+            .columns => &[_][]const u8{
+                "table_catalog",
+                "table_schema",
+                "table_name",
+                "column_name",
+                "ordinal_position",
+                "column_default",
+                "is_nullable",
+                "data_type",
+                "character_maximum_length",
+                "character_octet_length",
+                "numeric_precision",
+                "numeric_precision_radix",
+                "numeric_scale",
+                "datetime_precision",
+                "interval_type",
+                "interval_precision",
+                "character_set_catalog",
+                "character_set_schema",
+                "character_set_name",
+                "collation_catalog",
+                "collation_schema",
+                "collation_name",
+                "domain_catalog",
+                "domain_schema",
+                "domain_name",
+                "udt_catalog",
+                "udt_schema",
+                "udt_name",
+                "scope_catalog",
+                "scope_schema",
+                "scope_name",
+                "maximum_cardinality",
+                "dtd_identifier",
+                "is_self_referencing",
+                "is_identity",
+                "identity_generation",
+                "identity_start",
+                "identity_increment",
+                "identity_maximum",
+                "identity_minimum",
+                "identity_cycle",
+                "is_generated",
+                "generation_expression",
+                "is_updatable",
+            },
+        };
+        for (allowed) |allowed_column| {
+            if (std.ascii.eqlIgnoreCase(column, allowed_column)) return true;
+        }
+        return false;
+    }
+
+    fn postgresCompatibilityInformationSchemaTailAlloc(
+        self: *ApiHttpServer,
+        view: PostgresCompatibilityInformationSchemaView,
+        selected_columns: []const []const u8,
+        tokens: anytype,
+    ) !?PostgresCompatibilityInformationSchemaTail {
+        if (tokens.len == 0) return .{};
+        if (tokens[0].matchesKeywordTag(.order)) {
+            const order_by = (try self.postgresCompatibilityInformationSchemaOrderByAlloc(view, selected_columns, tokens)) orelse return null;
+            return .{ .order_by = order_by };
+        }
+        if (!tokens[0].matchesKeywordTag(.where)) return null;
+        var filters = PostgresCompatibilityInformationSchemaFilters{};
+        var i: usize = 1;
+        while (i < tokens.len) {
+            if (tokens[i].matchesKeywordTag(.order)) {
+                const order_by = (try self.postgresCompatibilityInformationSchemaOrderByAlloc(view, selected_columns, tokens[i..])) orelse return null;
+                return .{ .filters = filters, .order_by = order_by };
+            }
+            if (i + 2 >= tokens.len) return null;
+            if (tokens[i].kind != .identifier or tokens[i + 1].kind != .eq or tokens[i + 2].kind != .string) return null;
+            const field = postgresCompatibilityIdentifierTail(tokens[i].text);
+            if (std.ascii.eqlIgnoreCase(field, "table_catalog")) {
+                filters.table_catalog = tokens[i + 2].text;
+            } else if (std.ascii.eqlIgnoreCase(field, "table_schema")) {
+                filters.table_schema = tokens[i + 2].text;
+            } else if (std.ascii.eqlIgnoreCase(field, "table_name")) {
+                filters.table_name = tokens[i + 2].text;
+            } else {
+                return null;
+            }
+            i += 3;
+            if (i == tokens.len) break;
+            if (tokens[i].matchesKeywordTag(.order)) {
+                const order_by = (try self.postgresCompatibilityInformationSchemaOrderByAlloc(view, selected_columns, tokens[i..])) orelse return null;
+                return .{ .filters = filters, .order_by = order_by };
+            }
+            if (!tokens[i].matchesKeywordTag(.@"and")) return null;
+            i += 1;
+        }
+        return .{ .filters = filters };
+    }
+
+    fn postgresCompatibilityInformationSchemaOrderByAlloc(
+        self: *ApiHttpServer,
+        view: PostgresCompatibilityInformationSchemaView,
+        selected_columns: []const []const u8,
+        tokens: anytype,
+    ) !?[]const PostgresCompatibilityInformationSchemaOrderKey {
+        if (tokens.len < 3) return null;
+        if (!tokens[0].matchesKeywordTag(.order) or !tokens[1].matchesKeywordTag(.by)) return null;
+        var count: usize = 0;
+        var i: usize = 2;
+        var expect_column = true;
+        while (i < tokens.len) {
+            if (expect_column) {
+                if (tokens[i].kind != .identifier and tokens[i].kind != .number) return null;
+                if (tokens[i].kind == .identifier) {
+                    const column = postgresCompatibilityIdentifierTail(tokens[i].text);
+                    if (!postgresCompatibilityInformationSchemaColumnAllowed(view, column)) return null;
+                } else {
+                    const ordinal = std.fmt.parseUnsigned(usize, tokens[i].text, 10) catch return null;
+                    if (ordinal == 0 or ordinal > selected_columns.len) return null;
+                }
+                count += 1;
+                i += 1;
+                if (i < tokens.len and (tokens[i].matchesKeywordTag(.asc) or tokens[i].matchesKeywordTag(.desc))) i += 1;
+                if (i < tokens.len and tokens[i].matchesKeywordTag(.nulls)) {
+                    i += 1;
+                    if (i >= tokens.len or (!tokens[i].matchesKeywordTag(.first) and !tokens[i].matchesKeywordTag(.last))) return null;
+                    i += 1;
+                }
+                expect_column = false;
+            } else {
+                if (tokens[i].kind != .comma) return null;
+                i += 1;
+                expect_column = true;
+            }
+        }
+        if (expect_column or count == 0) return null;
+
+        const out = try self.alloc.alloc(PostgresCompatibilityInformationSchemaOrderKey, count);
+        var out_index: usize = 0;
+        errdefer self.alloc.free(out);
+        i = 2;
+        expect_column = true;
+        while (i < tokens.len) {
+            if (expect_column) {
+                const column = if (tokens[i].kind == .number) blk: {
+                    const ordinal = std.fmt.parseUnsigned(usize, tokens[i].text, 10) catch unreachable;
+                    break :blk selected_columns[ordinal - 1];
+                } else postgresCompatibilityIdentifierTail(tokens[i].text);
+                i += 1;
+                var descending = false;
+                if (i < tokens.len and (tokens[i].matchesKeywordTag(.asc) or tokens[i].matchesKeywordTag(.desc))) {
+                    descending = tokens[i].matchesKeywordTag(.desc);
+                    i += 1;
+                }
+                if (i < tokens.len and tokens[i].matchesKeywordTag(.nulls)) i += 2;
+                out[out_index] = .{ .column = column, .descending = descending };
+                out_index += 1;
+                expect_column = false;
+            } else {
+                i += 1;
+                expect_column = true;
+            }
+        }
+        return out;
+    }
+
+    fn postgresCompatibilityQualifiedNameMatches(token: anytype, expected_schema: []const u8, expected_name: []const u8) bool {
+        if (token.kind != .identifier) return false;
+        const dot = std.mem.indexOfScalar(u8, token.text, '.') orelse return false;
+        if (std.mem.indexOfScalar(u8, token.text[dot + 1 ..], '.') != null) return false;
+        return std.ascii.eqlIgnoreCase(token.text[0..dot], expected_schema) and
+            std.ascii.eqlIgnoreCase(token.text[dot + 1 ..], expected_name);
+    }
+
+    fn postgresCompatibilityIdentifierTail(identifier: []const u8) []const u8 {
+        if (std.mem.lastIndexOfScalar(u8, identifier, '.')) |dot| return identifier[dot + 1 ..];
+        return identifier;
     }
 
     fn postgresCompatibilityScalarAlloc(
@@ -6810,6 +7174,258 @@ pub const ApiHttpServer = struct {
         return .{
             .result = .{ .query = .{ .rows = rows, .total = 1 } },
             .columns = columns,
+        };
+    }
+
+    fn publicSqlPostgresCompatibilityInformationSchemaReadAlloc(
+        self: *ApiHttpServer,
+        query: PostgresCompatibilityInformationSchemaQuery,
+        session: catalog_resources.SqlCatalogSession,
+    ) !PublicSqlResult.Read {
+        var snapshot = try self.catalogSource().adminSnapshot();
+        defer self.catalogSource().freeAdminSnapshot(&snapshot);
+        const columns = try self.publicSqlPostgresCompatibilityColumnsAlloc(query.columns);
+        errdefer relational_rows_api.freeRowsOutputColumns(self.alloc, columns);
+        var rows_list = std.ArrayList(PostgresCompatibilityRenderedInformationSchemaRow).empty;
+        errdefer {
+            for (rows_list.items) |*row| row.deinit(self.alloc);
+            rows_list.deinit(self.alloc);
+        }
+
+        for (snapshot.tables) |table| {
+            if (!std.mem.eql(u8, table.database_name, session.currentDatabase())) continue;
+            if (query.filters.table_catalog) |database_name| {
+                if (!std.mem.eql(u8, table.database_name, database_name)) continue;
+            }
+            if (query.filters.table_schema) |schema_name| {
+                if (!std.mem.eql(u8, table.namespace_name, schema_name)) continue;
+            }
+            if (query.filters.table_name) |table_name| {
+                if (!std.mem.eql(u8, table.name, table_name)) continue;
+            }
+            switch (query.view) {
+                .tables => try rows_list.append(self.alloc, try self.publicSqlPostgresCompatibilityInformationSchemaTableRowAlloc(query.columns, query.order_by, table)),
+                .columns => try self.appendPostgresCompatibilityInformationSchemaColumnRows(&rows_list, query.columns, query.order_by, table),
+            }
+        }
+
+        if (query.order_by.len != 0) {
+            std.mem.sort(
+                PostgresCompatibilityRenderedInformationSchemaRow,
+                rows_list.items,
+                query.order_by,
+                ApiHttpServer.postgresCompatibilityInformationSchemaRowLessThan,
+            );
+        }
+
+        const rows = try self.alloc.alloc([]const u8, rows_list.items.len);
+        var rows_initialized: usize = 0;
+        errdefer {
+            for (rows[0..rows_initialized]) |row| self.alloc.free(@constCast(row));
+            self.alloc.free(rows);
+        }
+        for (rows_list.items, 0..) |*row, i| {
+            rows[i] = row.row;
+            rows_initialized += 1;
+            row.row = "";
+            row.deinit(self.alloc);
+        }
+        rows_list.deinit(self.alloc);
+        return .{
+            .result = .{ .query = .{ .rows = rows, .total = @intCast(rows.len) } },
+            .columns = columns,
+        };
+    }
+
+    fn appendPostgresCompatibilityInformationSchemaColumnRows(
+        self: *ApiHttpServer,
+        rows: *std.ArrayList(PostgresCompatibilityRenderedInformationSchemaRow),
+        selected_columns: []const []const u8,
+        order_by: []const PostgresCompatibilityInformationSchemaOrderKey,
+        table: metadata_table_manager.TableRecord,
+    ) !void {
+        if (table.schema_json.len == 0) return;
+        var parsed_schema = schema_mod.parseValidatedTableSchema(self.alloc, table.schema_json) catch return;
+        defer parsed_schema.deinit(self.alloc);
+        const schema = schema_mod.deriveRuntimeTableSchema(self.alloc, parsed_schema) catch return;
+        defer runtime_schema_mod.freeSchema(self.alloc, schema);
+
+        for (schema.relational_columns, 0..) |column, i| {
+            try rows.append(
+                self.alloc,
+                try self.publicSqlPostgresCompatibilityInformationSchemaColumnRowAlloc(selected_columns, order_by, table, column, i + 1),
+            );
+        }
+    }
+
+    fn publicSqlPostgresCompatibilityInformationSchemaTableRowAlloc(
+        self: *ApiHttpServer,
+        selected_columns: []const []const u8,
+        order_by: []const PostgresCompatibilityInformationSchemaOrderKey,
+        table: metadata_table_manager.TableRecord,
+    ) !PostgresCompatibilityRenderedInformationSchemaRow {
+        var values = try self.alloc.alloc([]const u8, selected_columns.len);
+        defer self.alloc.free(values);
+        for (selected_columns, 0..) |column, i| {
+            values[i] = postgresCompatibilityInformationSchemaTableValue(column, table);
+        }
+        const row = try self.publicSqlPostgresCompatibilityRowAlloc(selected_columns, values);
+        errdefer self.alloc.free(@constCast(row));
+        return .{
+            .row = row,
+            .sort_values = try self.postgresCompatibilityInformationSchemaTableSortValuesAlloc(order_by, table),
+        };
+    }
+
+    fn postgresCompatibilityInformationSchemaTableValue(column: []const u8, table: metadata_table_manager.TableRecord) []const u8 {
+        if (std.ascii.eqlIgnoreCase(column, "table_catalog")) return table.database_name;
+        if (std.ascii.eqlIgnoreCase(column, "table_schema")) return table.namespace_name;
+        if (std.ascii.eqlIgnoreCase(column, "table_name")) return table.name;
+        if (std.ascii.eqlIgnoreCase(column, "table_type")) return "BASE TABLE";
+        if (std.ascii.eqlIgnoreCase(column, "is_insertable_into")) return "YES";
+        if (std.ascii.eqlIgnoreCase(column, "is_typed")) return "NO";
+        return "";
+    }
+
+    fn postgresCompatibilityInformationSchemaTableSortValuesAlloc(
+        self: *ApiHttpServer,
+        order_by: []const PostgresCompatibilityInformationSchemaOrderKey,
+        table: metadata_table_manager.TableRecord,
+    ) ![]PostgresCompatibilityInformationSchemaSortValue {
+        const out = try self.alloc.alloc(PostgresCompatibilityInformationSchemaSortValue, order_by.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*value| value.deinit(self.alloc);
+            self.alloc.free(out);
+        }
+        for (order_by, 0..) |order_key, i| {
+            out[i] = .{ .text = try self.alloc.dupe(u8, postgresCompatibilityInformationSchemaTableValue(order_key.column, table)) };
+            initialized += 1;
+        }
+        return out;
+    }
+
+    fn publicSqlPostgresCompatibilityInformationSchemaColumnRowAlloc(
+        self: *ApiHttpServer,
+        selected_columns: []const []const u8,
+        order_by: []const PostgresCompatibilityInformationSchemaOrderKey,
+        table: metadata_table_manager.TableRecord,
+        column: runtime_schema_mod.RelationalColumn,
+        ordinal_position: usize,
+    ) !PostgresCompatibilityRenderedInformationSchemaRow {
+        var values = try self.alloc.alloc([]const u8, selected_columns.len);
+        defer {
+            for (selected_columns, values) |selected_column, value| {
+                if (std.ascii.eqlIgnoreCase(selected_column, "ordinal_position")) self.alloc.free(@constCast(value));
+            }
+            self.alloc.free(values);
+        }
+        for (selected_columns, 0..) |selected_column, i| {
+            values[i] = if (std.ascii.eqlIgnoreCase(selected_column, "ordinal_position"))
+                try std.fmt.allocPrint(self.alloc, "{d}", .{ordinal_position})
+            else
+                postgresCompatibilityInformationSchemaColumnValue(selected_column, table, column);
+        }
+        const row = try self.publicSqlPostgresCompatibilityRowAlloc(selected_columns, values);
+        errdefer self.alloc.free(@constCast(row));
+        return .{
+            .row = row,
+            .sort_values = try self.postgresCompatibilityInformationSchemaColumnSortValuesAlloc(order_by, table, column, ordinal_position),
+        };
+    }
+
+    fn postgresCompatibilityInformationSchemaColumnValue(
+        selected_column: []const u8,
+        table: metadata_table_manager.TableRecord,
+        column: runtime_schema_mod.RelationalColumn,
+    ) []const u8 {
+        if (std.ascii.eqlIgnoreCase(selected_column, "table_catalog")) return table.database_name;
+        if (std.ascii.eqlIgnoreCase(selected_column, "table_schema")) return table.namespace_name;
+        if (std.ascii.eqlIgnoreCase(selected_column, "table_name")) return table.name;
+        if (std.ascii.eqlIgnoreCase(selected_column, "column_name")) return column.name;
+        if (std.ascii.eqlIgnoreCase(selected_column, "is_nullable")) return if (column.nullable) "YES" else "NO";
+        if (std.ascii.eqlIgnoreCase(selected_column, "data_type")) return postgresCompatibilityInformationSchemaDataType(column);
+        if (std.ascii.eqlIgnoreCase(selected_column, "udt_catalog")) return table.database_name;
+        if (std.ascii.eqlIgnoreCase(selected_column, "udt_schema")) return "pg_catalog";
+        if (std.ascii.eqlIgnoreCase(selected_column, "udt_name")) return postgresCompatibilityInformationSchemaUdtName(column);
+        if (std.ascii.eqlIgnoreCase(selected_column, "numeric_precision_radix")) return if (column.field_type == .numeric) "10" else "";
+        if (std.ascii.eqlIgnoreCase(selected_column, "is_identity")) return "NO";
+        if (std.ascii.eqlIgnoreCase(selected_column, "is_generated")) return if (column.generated != null) "ALWAYS" else "NEVER";
+        if (std.ascii.eqlIgnoreCase(selected_column, "is_self_referencing")) return "NO";
+        if (std.ascii.eqlIgnoreCase(selected_column, "is_updatable")) return if (column.generated != null) "NO" else "YES";
+        return "";
+    }
+
+    fn postgresCompatibilityInformationSchemaColumnSortValuesAlloc(
+        self: *ApiHttpServer,
+        order_by: []const PostgresCompatibilityInformationSchemaOrderKey,
+        table: metadata_table_manager.TableRecord,
+        column: runtime_schema_mod.RelationalColumn,
+        ordinal_position: usize,
+    ) ![]PostgresCompatibilityInformationSchemaSortValue {
+        const out = try self.alloc.alloc(PostgresCompatibilityInformationSchemaSortValue, order_by.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*value| value.deinit(self.alloc);
+            self.alloc.free(out);
+        }
+        for (order_by, 0..) |order_key, i| {
+            out[i] = if (std.ascii.eqlIgnoreCase(order_key.column, "ordinal_position"))
+                .{ .number = ordinal_position }
+            else
+                .{ .text = try self.alloc.dupe(u8, postgresCompatibilityInformationSchemaColumnValue(order_key.column, table, column)) };
+            initialized += 1;
+        }
+        return out;
+    }
+
+    fn postgresCompatibilityInformationSchemaRowLessThan(
+        order_by: []const PostgresCompatibilityInformationSchemaOrderKey,
+        lhs: PostgresCompatibilityRenderedInformationSchemaRow,
+        rhs: PostgresCompatibilityRenderedInformationSchemaRow,
+    ) bool {
+        for (order_by, 0..) |order_key, i| {
+            if (i >= lhs.sort_values.len or i >= rhs.sort_values.len) return false;
+            const cmp = switch (lhs.sort_values[i]) {
+                .text => |lhs_text| switch (rhs.sort_values[i]) {
+                    .text => |rhs_text| std.mem.order(u8, lhs_text, rhs_text),
+                    .number => .lt,
+                },
+                .number => |lhs_number| switch (rhs.sort_values[i]) {
+                    .text => .gt,
+                    .number => |rhs_number| std.math.order(lhs_number, rhs_number),
+                },
+            };
+            switch (cmp) {
+                .lt => return !order_key.descending,
+                .gt => return order_key.descending,
+                .eq => {},
+            }
+        }
+        return false;
+    }
+
+    fn postgresCompatibilityInformationSchemaDataType(column: runtime_schema_mod.RelationalColumn) []const u8 {
+        return switch (column.field_type) {
+            .keyword, .text, .html, .search_as_you_type, .link, .blob => "text",
+            .numeric => "numeric",
+            .boolean => "boolean",
+            .datetime => "timestamp with time zone",
+            .json => "jsonb",
+            .array => "ARRAY",
+            .embedding, .geopoint, .geoshape => "USER-DEFINED",
+        };
+    }
+
+    fn postgresCompatibilityInformationSchemaUdtName(column: runtime_schema_mod.RelationalColumn) []const u8 {
+        return switch (column.field_type) {
+            .keyword, .text, .html, .search_as_you_type, .link, .blob => "text",
+            .numeric => "numeric",
+            .boolean => "bool",
+            .datetime => "timestamptz",
+            .json => "jsonb",
+            .array => "_text",
+            .embedding, .geopoint, .geoshape => "jsonb",
         };
     }
 

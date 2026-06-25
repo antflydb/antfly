@@ -64,17 +64,42 @@ const scraping = if (builtin.os.tag == .freestanding or build_options.bench_mini
 else
     @import("antfly_scraping");
 const mapper = @import("../document_mapper.zig");
-const db_test_support = @import("../test_support.zig");
-const tempPath = db_test_support.tempPath;
-const cleanupTempDir = db_test_support.cleanupTempDir;
-const waitForSearchResult = db_test_support.waitForSearchResult;
-const waitForDenseSearchResult = db_test_support.waitForDenseSearchResult;
-const waitForAppliedSequenceAdvance = db_test_support.waitForAppliedSequenceAdvance;
-const waitForDenseIndexResultsWithAttempts = db_test_support.waitForDenseIndexResultsWithAttempts;
-const slow_test_wait_attempts = db_test_support.slow_test_wait_attempts;
-const CountingDenseEmbedder = db_test_support.CountingDenseEmbedder;
-const CountingSparseEmbedder = db_test_support.CountingSparseEmbedder;
-const TestAssetProducer = db_test_support.TestAssetProducer;
+
+const TestHelpers = if (builtin.is_test) struct {
+    pub fn tempPath(buf: []u8) [*:0]const u8 {
+        return @import("../test_support.zig").tempPath(buf);
+    }
+
+    pub fn cleanupTempDir(path: [*:0]const u8) void {
+        @import("../test_support.zig").cleanupTempDir(path);
+    }
+
+    pub fn waitForSearchResult(alloc: Allocator, db: anytype, req: types.SearchRequest, min_hits: u32) !types.SearchResult {
+        return @import("../test_support.zig").waitForSearchResult(alloc, db, req, min_hits);
+    }
+
+    pub fn waitForDenseSearchResult(alloc: Allocator, db: anytype, req: types.SearchRequest, min_hits: u32) !types.SearchResult {
+        return @import("../test_support.zig").waitForDenseSearchResult(alloc, db, req, min_hits);
+    }
+
+    pub fn waitForAppliedSequenceAdvance(alloc: Allocator, db: anytype, index_name: []const u8, previous: u64) !u64 {
+        return @import("../test_support.zig").waitForAppliedSequenceAdvance(alloc, db, index_name, previous);
+    }
+
+    pub fn waitForDenseIndexResultsWithAttempts(
+        index: *@import("../../hbc_adapter.zig").HBCIndex,
+        query: []const f32,
+        k: usize,
+        min_hits: usize,
+        max_attempts: usize,
+    ) !@import("../../hbc_adapter.zig").SearchResults {
+        return @import("../test_support.zig").waitForDenseIndexResultsWithAttempts(index, query, k, min_hits, max_attempts);
+    }
+
+    pub fn slowWaitAttempts() usize {
+        return @import("../test_support.zig").slow_test_wait_attempts;
+    }
+} else struct {};
 
 fn getenv(name: [*:0]const u8) ?[]const u8 {
     return platform.env.getenv(name);
@@ -6829,10 +6854,10 @@ test "db enrichment runtime document extraction asset materializes unit artifact
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
-    var fake = TestAssetProducer{};
+    var fake = @import("../test_support.zig").TestAssetProducer{};
     var db = try DB.open(alloc, std.mem.span(path), .{
         .enrichment = .{
             .owner_id = "worker-a",
@@ -6905,8 +6930,8 @@ test "db enrichment runtime document extraction async accounts resource manager 
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var resource_manager = resource_manager_mod.ResourceManager.init(.{});
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -6951,8 +6976,8 @@ test "db enrichment runtime document extraction routes mixed files using source 
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .enrichment = .{
@@ -7002,8 +7027,8 @@ test "db enrichment runtime document extraction stores docx section units" {
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
@@ -7055,8 +7080,8 @@ test "db enrichment runtime document extraction stores zip archive entry units" 
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
@@ -7109,8 +7134,8 @@ test "db enrichment runtime document extraction stores image pending OCR unit" {
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
@@ -7166,10 +7191,10 @@ test "db enrichment runtime document extraction completes image OCR with reader 
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
-    var fake = TestAssetProducer{};
+    var fake = @import("../test_support.zig").TestAssetProducer{};
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
@@ -7215,10 +7240,10 @@ test "db enrichment runtime document extraction async reuses generated OCR text 
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
-    var fake = TestAssetProducer{};
+    var fake = @import("../test_support.zig").TestAssetProducer{};
     var db = try DB.open(alloc, std.mem.span(path), .{
         .ttl_cleanup = .{ .enabled = false },
         .enrichment = .{
@@ -7262,10 +7287,10 @@ test "db enrichment runtime document extraction stores structured OCR confidence
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
-    var fake = TestAssetProducer{
+    var fake = @import("../test_support.zig").TestAssetProducer{
         .reader_output = "{\"text\":\"invoice total\",\"confidence\":0.92,\"bbox\":[1,2,101,42],\"warning\":\"low contrast\"}",
     };
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -7330,10 +7355,10 @@ test "db enrichment runtime document extraction completes audio transcription wi
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
-    var fake = TestAssetProducer{
+    var fake = @import("../test_support.zig").TestAssetProducer{
         .transcriber_output = "{\"text\":\"spoken words\",\"confidence\":0.81}",
     };
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -7388,8 +7413,8 @@ test "db enrichment runtime document extraction stores rfc822 email units" {
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
@@ -7448,8 +7473,8 @@ test "db enrichment runtime document extraction stores multipart rfc822 text par
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
@@ -7507,8 +7532,8 @@ test "db enrichment runtime document extraction stores unsupported file manifest
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .enrichment = .{
@@ -7646,11 +7671,11 @@ test "db enrichment runtime document extraction skips stable unit local rewrites
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
-    var counting = CountingDenseEmbedder{};
-    var fake = TestAssetProducer{};
+    var counting = @import("../test_support.zig").CountingDenseEmbedder{};
+    var fake = @import("../test_support.zig").TestAssetProducer{};
     var db = try DB.open(alloc, std.mem.span(path), .{
         .enrichment = .{
             .owner_id = "worker-a",
@@ -7722,8 +7747,8 @@ test "db enrichment runtime document extraction manifest inspection and reproces
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .enrichment = .{
@@ -7925,8 +7950,8 @@ test "db enrichment runtime document extraction failure records last error and c
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -7993,10 +8018,10 @@ test "db enrichment runtime document extraction skips stable unit local rewrites
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
-    var counting = CountingDenseEmbedder{};
+    var counting = @import("../test_support.zig").CountingDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
         .enrichment = .{
             .owner_id = "worker-a",
@@ -8104,8 +8129,8 @@ test "db enrichment runtime document extraction chunks units through source arti
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
     var deterministic_sparse = embedder_mod.DeterministicSparseEmbedder{};
@@ -8306,7 +8331,7 @@ test "db enrichment runtime document extraction chunks units through source arti
     const query_vec = try deterministic_dense.interface().embedDense(alloc, "document_chunk_dense_v1", "alpha beta gamma", 3);
     defer alloc.free(query_vec);
     const dense_index = db.core.index_manager.denseIndex("dv_document_chunks") orelse return error.IndexNotFound;
-    var direct = try waitForDenseIndexResultsWithAttempts(&dense_index.index, query_vec, 3, 1, slow_test_wait_attempts);
+    var direct = try TestHelpers.waitForDenseIndexResultsWithAttempts(&dense_index.index, query_vec, 3, 1, TestHelpers.slowWaitAttempts());
     defer direct.deinit();
     const dense_internal_id = if (direct.takeMetadata(0)) |metadata|
         metadata
@@ -8736,8 +8761,8 @@ test "db enrichment runtime batch marks generated enrichment replay for generato
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -8778,8 +8803,8 @@ test "db enrichment runtime status changes notify query visibility hook" {
     const QueryVisibilityChange = db_mod.QueryVisibilityChange;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -8826,8 +8851,8 @@ test "db enrichment runtime full_index sync precomputes generated enrichments in
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
     var deterministic_sparse = embedder_mod.DeterministicSparseEmbedder{};
@@ -8886,8 +8911,8 @@ test "db enrichment runtime enrichments sync precomputes generated enrichments i
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
     var deterministic_sparse = embedder_mod.DeterministicSparseEmbedder{};
@@ -8948,8 +8973,8 @@ test "db enrichment runtime replicated apply decouples client sync from raft app
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -8994,8 +9019,8 @@ test "db enrichment runtime precomputed watermark advances across replay entries
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -9037,10 +9062,10 @@ test "db enrichment runtime asset producer executes fake providers and skips unc
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
-    var fake = TestAssetProducer{};
+    var fake = @import("../test_support.zig").TestAssetProducer{};
     var db = try DB.open(alloc, std.mem.span(path), .{
         .enrichment = .{
             .owner_id = "worker-a",
@@ -9145,8 +9170,8 @@ test "db enrichment runtime runUntilIdle drains enrichment and derived indexing"
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -9202,8 +9227,8 @@ test "db enrichment runtime relational sources read committed base rows" {
     const relational_store_mod = @import("../relational_store.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -9274,11 +9299,11 @@ test "db enrichment runtime relational sources read committed base rows" {
 test "db enrichment runtime managed dense remains searchable after transient rate limits" {
     const alloc = std.testing.allocator;
     const DB = @import("../mod.zig").DB;
-    const GateDenseEmbedder = db_test_support.GateDenseEmbedder;
+    const GateDenseEmbedder = @import("../test_support.zig").GateDenseEmbedder;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var gated = GateDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -9354,10 +9379,10 @@ test "db enrichment runtime managed dense delete recreate recovers after corrupt
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
-    var counting = CountingDenseEmbedder{};
+    var counting = @import("../test_support.zig").CountingDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
         .enrichment = .{
             .owner_id = "worker-a",
@@ -9424,10 +9449,10 @@ test "db enrichment runtime managed dense delete recreate recovers after corrupt
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
-    var counting = CountingDenseEmbedder{};
+    var counting = @import("../test_support.zig").CountingDenseEmbedder{};
     const cfg: types.IndexConfig = .{
         .name = "semantic_idx",
         .kind = .dense_vector,
@@ -9498,10 +9523,10 @@ test "db enrichment runtime dense skips unchanged source hash" {
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
-    var counting = CountingDenseEmbedder{};
+    var counting = @import("../test_support.zig").CountingDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
         .enrichment = .{
             .owner_id = "worker-a",
@@ -9557,10 +9582,10 @@ test "db enrichment runtime dense republishes unchanged source hash from cached 
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
-    var counting = CountingDenseEmbedder{};
+    var counting = @import("../test_support.zig").CountingDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
         .enrichment = .{
             .owner_id = "worker-a",
@@ -9615,10 +9640,10 @@ test "db enrichment runtime chunked dense skips unchanged chunks and deletes sta
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
-    var counting = CountingDenseEmbedder{};
+    var counting = @import("../test_support.zig").CountingDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
         .enrichment = .{
             .owner_id = "worker-a",
@@ -9705,10 +9730,10 @@ test "db enrichment runtime chunked dense replays cached artifacts after dense r
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
-    var counting = CountingDenseEmbedder{};
+    var counting = @import("../test_support.zig").CountingDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
         .enrichment = .{
             .owner_id = "worker-a",
@@ -9766,10 +9791,10 @@ test "db enrichment runtime reopened chunked dense HBC deletes stale vectors thr
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
-    var counting = CountingDenseEmbedder{};
+    var counting = @import("../test_support.zig").CountingDenseEmbedder{};
     {
         var db = try DB.open(alloc, std.mem.span(path), .{
             .enrichment = .{
@@ -9825,8 +9850,8 @@ test "db enrichment runtime chunked generated dense and sparse embeddings search
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
     var deterministic_sparse = embedder_mod.DeterministicSparseEmbedder{};
@@ -9924,10 +9949,10 @@ test "db enrichment runtime sparse skips unchanged source hash" {
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
-    var counting = CountingSparseEmbedder{};
+    var counting = @import("../test_support.zig").CountingSparseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
         .enrichment = .{
@@ -9984,10 +10009,10 @@ test "db enrichment runtime chunked sparse skips unchanged chunks and deletes st
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
-    var counting = CountingSparseEmbedder{};
+    var counting = @import("../test_support.zig").CountingSparseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
         .enrichment = .{
@@ -10069,8 +10094,8 @@ test "db enrichment runtime computeEnrichments synchronously builds chunk and em
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -10124,8 +10149,8 @@ test "db enrichment runtime leased enrichment worker generates dense embeddings"
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -10185,8 +10210,8 @@ test "db enrichment runtime leased enrichment worker generates dense embeddings 
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -10250,8 +10275,8 @@ test "db enrichment runtime leased enrichment worker materializes chunk artifact
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -10310,8 +10335,8 @@ test "db enrichment runtime leased enrichment worker keeps chunk storage ephemer
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -10358,8 +10383,8 @@ test "db enrichment runtime leased enrichment worker persists chunk storage when
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -10409,8 +10434,8 @@ test "db enrichment runtime leased enrichment worker persists chunk storage when
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -10455,8 +10480,8 @@ test "db enrichment runtime leased enrichment worker materializes chunk artifact
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -10516,8 +10541,8 @@ test "db enrichment runtime shared embedding enrichment feeds multiple dense ind
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -10581,8 +10606,8 @@ test "db enrichment runtime shared embedding enrichment feeds multiple dense ind
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -10647,8 +10672,8 @@ test "db enrichment runtime dense index can reference existing whole-doc embeddi
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -10697,8 +10722,8 @@ test "db enrichment runtime dense index can reference existing chunk embedding e
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -10729,12 +10754,12 @@ test "db enrichment runtime dense index can reference existing chunk embedding e
 
     try db.enrichment_runtime.?.waitForApplied(1);
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    _ = try waitForAppliedSequenceAdvance(alloc, &db, "dv_ref", 0);
+    _ = try TestHelpers.waitForAppliedSequenceAdvance(alloc, &db, "dv_ref", 0);
 
     const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
     defer alloc.free(query_vec);
     const dv_ref = db.core.index_manager.denseIndex("dv_ref") orelse return error.IndexNotFound;
-    var direct = try waitForDenseIndexResultsWithAttempts(&dv_ref.index, query_vec, 3, 1, slow_test_wait_attempts);
+    var direct = try TestHelpers.waitForDenseIndexResultsWithAttempts(&dv_ref.index, query_vec, 3, 1, TestHelpers.slowWaitAttempts());
     defer direct.deinit();
 
     const internal_id = if (direct.takeMetadata(0)) |metadata|
@@ -10758,8 +10783,8 @@ test "db enrichment runtime persists shorthand chunk enrichment catalog across r
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -10817,8 +10842,8 @@ test "db enrichment runtime persists shorthand chunk enrichment catalog across r
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const primary_backend: db_config.PrimaryBackend = .{ .lsm = db_config.primary_lsm_options_default };
 
@@ -10882,8 +10907,8 @@ test "db enrichment runtime listEnrichments returns explicit definitions across 
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -10922,8 +10947,8 @@ test "db enrichment runtime addEnrichment supports explicit shared definitions" 
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -10973,10 +10998,10 @@ test "db enrichment runtime addEnrichment supports explicit shared definitions" 
         .dense = .{ .vector = query_vec, .k = 3 },
         .return_mode = .chunk,
     };
-    var dense_result = try waitForDenseSearchResult(alloc, &db, req, 1);
+    var dense_result = try TestHelpers.waitForDenseSearchResult(alloc, &db, req, 1);
     dense_result.deinit();
 
-    var result = try waitForSearchResult(alloc, &db, req, 1);
+    var result = try TestHelpers.waitForSearchResult(alloc, &db, req, 1);
     defer result.deinit();
     const chunk_zero = try artifact_ids.chunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
     defer alloc.free(chunk_zero);
@@ -11009,8 +11034,8 @@ test "db enrichment runtime listEnrichments returns explicit definitions across 
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const primary_backend: db_config.PrimaryBackend = .{ .lsm = db_config.primary_lsm_options_default };
 
@@ -11055,8 +11080,8 @@ test "db enrichment runtime dense parent paging fetches enough chunk hits before
     const DB = @import("../mod.zig").DB;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -11084,7 +11109,7 @@ test "db enrichment runtime dense parent paging fetches enough chunk hits before
     const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
     defer alloc.free(query_vec);
 
-    var first_parent = try waitForSearchResult(alloc, &db, .{
+    var first_parent = try TestHelpers.waitForSearchResult(alloc, &db, .{
         .index_name = "dv_v1",
         .dense = .{ .vector = query_vec, .k = 1 },
         .return_mode = .parent,
@@ -11095,7 +11120,7 @@ test "db enrichment runtime dense parent paging fetches enough chunk hits before
     try std.testing.expectEqual(@as(usize, 1), first_parent.hits.len);
     try std.testing.expectEqualStrings("doc:a", first_parent.hits[0].id);
 
-    var second_parent = try waitForSearchResult(alloc, &db, .{
+    var second_parent = try TestHelpers.waitForSearchResult(alloc, &db, .{
         .index_name = "dv_v1",
         .dense = .{ .vector = query_vec, .k = 1 },
         .return_mode = .parent,

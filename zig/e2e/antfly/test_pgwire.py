@@ -310,8 +310,10 @@ def test_pgwire_auth_uses_public_api_user_manager(auth_pgwire_server, antfly_bin
 
 
 def test_pgwire_postgres_compatibility_probes_return_rows(pgwire_server):
+    table = _table_name("pgwire_info_schema")
     with socket.create_connection((pgwire_server.host, pgwire_server.pgwire_port), timeout=5) as sock:
         _pgwire_startup(sock)
+        _pgwire_simple_query(sock, f"CREATE TABLE {table} (id text PRIMARY KEY, amount numeric, active boolean);")
         version_messages = _pgwire_simple_query(sock, "SELECT version();")
         catalog_version_messages = _pgwire_simple_query(sock, "SELECT pg_catalog.version();")
         server_version_messages = _pgwire_simple_query(sock, "SHOW server_version;")
@@ -319,6 +321,16 @@ def test_pgwire_postgres_compatibility_probes_return_rows(pgwire_server):
         catalog_current_setting_messages = _pgwire_simple_query(sock, "SELECT pg_catalog.current_setting('server_version_num');")
         search_path_messages = _pgwire_simple_query(sock, "SHOW search_path;")
         show_all_messages = _pgwire_simple_query(sock, "SHOW ALL;")
+        information_schema_tables_messages = _pgwire_simple_query(
+            sock,
+            "SELECT table_schema, table_name, table_type FROM information_schema.tables "
+            f"WHERE table_schema = 'public' AND table_name = '{table}';",
+        )
+        information_schema_columns_messages = _pgwire_simple_query(
+            sock,
+            "SELECT column_name, ordinal_position, data_type, is_nullable FROM information_schema.columns "
+            f"WHERE table_catalog = 'default' AND table_name = '{table}' ORDER BY ordinal_position;",
+        )
 
     assert [message for message in version_messages if message["type"] == "columns"] == [
         {"type": "columns", "columns": ["version"], "oids": [PG_TEXT_OID]}
@@ -365,6 +377,27 @@ def test_pgwire_postgres_compatibility_probes_return_rows(pgwire_server):
     assert show_all_settings["server_version"] == "16.0-antfly"
     assert show_all_settings["client_encoding"] == "UTF8"
     assert show_all_settings["search_path"] == "public"
+
+    assert [message for message in information_schema_tables_messages if message["type"] == "columns"] == [
+        {"type": "columns", "columns": ["table_schema", "table_name", "table_type"], "oids": [PG_TEXT_OID, PG_TEXT_OID, PG_TEXT_OID]}
+    ]
+    assert [message["values"] for message in information_schema_tables_messages if message["type"] == "row"] == [
+        ["public", table, "BASE TABLE"]
+    ]
+
+    assert [message for message in information_schema_columns_messages if message["type"] == "columns"] == [
+        {
+            "type": "columns",
+            "columns": ["column_name", "ordinal_position", "data_type", "is_nullable"],
+            "oids": [PG_TEXT_OID, PG_TEXT_OID, PG_TEXT_OID, PG_TEXT_OID],
+        }
+    ]
+    info_schema_columns = [message["values"] for message in information_schema_columns_messages if message["type"] == "row"]
+    assert info_schema_columns == [
+        ["id", "1", "text", "NO"],
+        ["amount", "2", "numeric", "YES"],
+        ["active", "3", "boolean", "YES"],
+    ]
 
 
 def test_pgwire_cancel_request_uses_backend_key_side_channel(pgwire_server):

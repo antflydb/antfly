@@ -28,8 +28,6 @@ const platform_clock = @import("../../platform/clock.zig");
 const temporal_typed_dv = @import("../../section/typed_doc_values.zig");
 
 const Allocator = std.mem.Allocator;
-const expectRelationalTemporalPriceRow = @import("test_support.zig").expectRelationalTemporalPriceRow;
-const expectRelationalTemporalPrimarySelectorPriceRow = @import("test_support.zig").expectRelationalTemporalPrimarySelectorPriceRow;
 
 const temporal_bound_neg_infinity_tag: u8 = 0xf0;
 const temporal_bound_pos_infinity_tag: u8 = 0xf1;
@@ -10552,6 +10550,8 @@ test "db relational temporal mutation source splits portions transactionally" {
     const db_test_support = @import("test_support.zig");
     const tempPath = db_test_support.tempPath;
     const cleanupTempDir = db_test_support.cleanupTempDir;
+    const expectRelationalTemporalPriceRow = db_test_support.expectRelationalTemporalPriceRow;
+    const expectRelationalTemporalPrimarySelectorPriceRow = db_test_support.expectRelationalTemporalPrimarySelectorPriceRow;
 
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
@@ -10814,6 +10814,7 @@ test "db relational temporal mutation source preserves foreign key coverage" {
     const db_test_support = @import("test_support.zig");
     const tempPath = db_test_support.tempPath;
     const cleanupTempDir = db_test_support.cleanupTempDir;
+    const expectRelationalTemporalPriceRow = db_test_support.expectRelationalTemporalPriceRow;
 
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
@@ -10906,6 +10907,7 @@ test "db relational temporal workload combines portion splits foreign key repair
     const db_test_support = @import("test_support.zig");
     const tempPath = db_test_support.tempPath;
     const cleanupTempDir = db_test_support.cleanupTempDir;
+    const expectRelationalTemporalPriceRow = db_test_support.expectRelationalTemporalPriceRow;
 
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);

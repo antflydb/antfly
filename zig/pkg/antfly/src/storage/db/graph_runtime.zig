@@ -14,25 +14,18 @@
 
 const std = @import("std");
 
-const db_mod = @import("mod.zig");
 const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
 const graph_mod = @import("../../graph/graph.zig");
 const internal_keys = @import("../internal_keys.zig");
-const db_test_support = @import("test_support.zig");
-
-const DB = db_mod.DB;
-const tempPath = db_test_support.tempPath;
-const cleanupTempDir = db_test_support.cleanupTempDir;
-const TestAssetProducer = db_test_support.TestAssetProducer;
 
 test "db graph runtime index materializes relation asset artifacts into graph edge artifacts" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
     try db.addIndex(.{
@@ -75,10 +68,10 @@ test "db graph runtime relation artifact materializer uses mapping templates" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
     try db.addIndex(.{
@@ -122,10 +115,10 @@ test "db graph runtime relation artifact materializer resolves entity refs and a
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
     try db.addIndex(.{
@@ -168,10 +161,10 @@ test "db graph runtime relation artifact materializer replaces stale document ed
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
     try db.addIndex(.{
@@ -214,10 +207,10 @@ test "db graph runtime relation artifact materializer deletes edges when asset s
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
     try db.addIndex(.{
@@ -264,10 +257,10 @@ test "db graph runtime artifact source lifecycle reuses and protects asset enric
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
     try db.addIndex(.{
@@ -316,10 +309,10 @@ test "db graph runtime artifact source reuses user enrichment and rejects incomp
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
     try db.addEnrichment(.{
@@ -355,10 +348,10 @@ test "db graph runtime source artifact deletion clears materialized graph edges"
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
     try db.addIndex(.{
@@ -405,10 +398,10 @@ test "db graph runtime artifact edges are visible to graph search queries" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
     try db.addIndex(.{
@@ -458,10 +451,10 @@ test "db graph runtime artifact external node targets return ids without documen
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
     try db.addIndex(.{
@@ -512,11 +505,11 @@ test "db graph runtime async asset producer source materializes through replay" 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var fake = TestAssetProducer{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    var fake = @import("test_support.zig").TestAssetProducer{};
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{
         .enrichment = .{
             .owner_id = "worker-a",
             .asset_producer = fake.producer(),
@@ -558,11 +551,11 @@ test "db graph runtime artifact source replay catches up after reopen" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
         defer db.close();
 
         try db.addIndex(.{
@@ -582,7 +575,7 @@ test "db graph runtime artifact source replay catches up after reopen" {
         defer alloc.free(artifact_key);
         var ctx = db.batchContext();
         const sequence = db.core.store.reserveNextReplaySequence(1);
-        const replay_payload = try DB.derivedAsyncEncodeChangeRecordPayloadForContext(&ctx, .{
+        const replay_payload = try @import("mod.zig").DB.derivedAsyncEncodeChangeRecordPayloadForContext(&ctx, .{
             .changed_artifact_keys = &.{artifact_key},
         }, sequence);
         defer alloc.free(replay_payload);
@@ -596,7 +589,7 @@ test "db graph runtime artifact source replay catches up after reopen" {
         });
     }
 
-    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    var reopened = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer reopened.close();
     try reopened.runUntilIdle();
 
@@ -610,11 +603,11 @@ test "db graph runtime edge artifact replay catches up after reopen" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+        var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
         defer db.close();
 
         try db.addIndex(.{
@@ -629,7 +622,7 @@ test "db graph runtime edge artifact replay catches up after reopen" {
         defer alloc.free(graph_value);
         var ctx = db.batchContext();
         const sequence = db.core.store.reserveNextReplaySequence(1);
-        const replay_payload = try DB.derivedAsyncEncodeChangeRecordPayloadForContext(&ctx, .{
+        const replay_payload = try @import("mod.zig").DB.derivedAsyncEncodeChangeRecordPayloadForContext(&ctx, .{
             .changed_artifact_keys = &.{graph_key},
         }, sequence);
         defer alloc.free(replay_payload);
@@ -642,7 +635,7 @@ test "db graph runtime edge artifact replay catches up after reopen" {
         });
     }
 
-    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    var reopened = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer reopened.close();
     try reopened.runUntilIdle();
 

@@ -41,13 +41,6 @@ const backend_erased = @import("../backend_erased.zig");
 const background_runtime_mod = @import("../background_runtime.zig");
 const types = @import("types.zig");
 
-const db_mod = @import("mod.zig");
-const derived_async = @import("derived_async.zig");
-const db_internal = @import("internal.zig");
-const graph_mod = @import("../../graph/graph.zig");
-const graph_query_mod = @import("../../graph/query.zig");
-const db_test_support = @import("test_support.zig");
-
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -1798,16 +1791,6 @@ fn lockMutex(mutex: *std.atomic.Mutex) void {
 
 const testing = std.testing;
 
-const DB = db_mod.DB;
-const graphAssetStateKeyAlloc = db_internal.graphAssetStateKeyAlloc;
-const freeOwnedKeySlice = derived_async.freeOwnedKeySlice;
-const lockApply = db_test_support.lockApply;
-const tempPath = db_test_support.tempPath;
-const cleanupTempDir = db_test_support.cleanupTempDir;
-const FixedVectorEmbedder = db_test_support.FixedVectorEmbedder;
-const FakePromotionSink = db_test_support.FakePromotionSink;
-const TestAssetProducer = db_test_support.TestAssetProducer;
-
 /// Adapts any shard store (the erased backend store: `beginRead/get`,
 /// `beginWrite/put/delete/commit/abort`) to the resolver's `ArtifactStore`
 /// seam. Generic over the store type so it works with the production erased
@@ -3449,10 +3432,10 @@ test "db resolution runtime starts resolver replay workers only while resolver c
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
     try std.testing.expect(db.resolution_runtime != null);
@@ -3512,11 +3495,11 @@ test "db resolution runtime backfills a mention name embedding so ann/cosine res
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var embedder = FixedVectorEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{ .resolution_embedder = embedder.interface() });
+    var embedder = @import("test_support.zig").FixedVectorEmbedder{};
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{ .resolution_embedder = embedder.interface() });
     defer db.close();
 
     try db.addIndex(.{
@@ -3580,7 +3563,7 @@ test "db resolution runtime backfills a mention name embedding so ann/cosine res
     try std.testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
 
     const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
-    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, edges);
     try std.testing.expectEqual(@as(usize, 1), edges.len);
     try std.testing.expectEqualStrings("person/ada_lovelace", edges[0].target);
 }
@@ -3589,10 +3572,10 @@ test "db resolution runtime resolves extracted entities into a resolution artifa
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
     // A graph index drives production of the relations_v1 asset (extraction)
@@ -3647,10 +3630,10 @@ test "db resolution runtime re-resolves the corpus when upsertResolver bumps the
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
     try db.addIndex(.{
@@ -3711,10 +3694,10 @@ test "db resolution runtime re-resolves existing corpus when upsertResolver inse
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
     try db.addIndex(.{
@@ -3777,10 +3760,10 @@ test "db resolution runtime drains pending resolver backfill when retrying a no-
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
     try db.addIndex(.{
@@ -3819,7 +3802,7 @@ test "db resolution runtime drains pending resolver backfill when retrying a no-
     };
 
     {
-        lockApply(&db);
+        @import("test_support.zig").lockApply(&db);
         defer db.core.unlockApply();
         try std.testing.expectEqual(index_manager_mod.IndexManager.ResolverUpsertResult.inserted, try db.core.upsertResolver(cfg));
     }
@@ -3841,10 +3824,10 @@ test "db resolution runtime refuses resolver removal while resolution or promoti
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
     try db.addIndex(.{
@@ -3887,13 +3870,13 @@ test "db resolution runtime promotes resolved entities into entity-document upse
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var sink = FakePromotionSink{ .alloc = alloc };
+    var sink = @import("test_support.zig").FakePromotionSink{ .alloc = alloc };
     defer sink.deinit();
 
-    var db = try DB.open(alloc, std.mem.span(path), .{ .entity_sink = sink.sink() });
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{ .entity_sink = sink.sink() });
     defer db.close();
 
     try db.addIndex(.{
@@ -3954,10 +3937,10 @@ test "db resolution runtime graph replay blocks resolution artifact without reso
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
 
     try db.addIndex(.{
@@ -3990,7 +3973,7 @@ test "db resolution runtime graph replay blocks resolution artifact without reso
     try std.testing.expect(try db.derivedAsyncBatchAdvancesManagedIndexApplyStateForReplay(batch, index_ref));
     try std.testing.expectError(
         error.MissingResolverArtifactContract,
-        derived_async.materializeGraphSourceArtifactsForIndex(
+        @import("derived_async.zig").materializeGraphSourceArtifactsForIndex(
             alloc,
             db.core.store,
             db.core.index_manager,
@@ -4003,7 +3986,7 @@ test "db resolution runtime graph replay blocks resolution artifact without reso
     try db.core.store.delete(resolution_key);
     try std.testing.expectError(
         error.MissingResolverArtifactContract,
-        derived_async.materializeGraphSourceArtifactsForIndex(
+        @import("derived_async.zig").materializeGraphSourceArtifactsForIndex(
             alloc,
             db.core.store,
             db.core.index_manager,
@@ -4030,10 +4013,10 @@ test "db resolution runtime graph replay ignores resolution artifacts bound to a
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
 
     try db.addIndex(.{
@@ -4089,10 +4072,10 @@ test "db resolution runtime materializes doc->entity mention edges as provenance
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
     // The graph index materializes the relations_v1 extraction asset and, with
@@ -4150,7 +4133,7 @@ test "db resolution runtime materializes doc->entity mention edges as provenance
     // Outbound: doc:a mentions both canonical entities.
     {
         const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
-        defer graph_mod.GraphIndex.freeEdges(alloc, out);
+        defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, out);
         try std.testing.expectEqual(@as(usize, 2), out.len);
         // Each mention edge records the resolved DocRef target table so the
         // endpoint can be hydrated cross-table.
@@ -4161,7 +4144,7 @@ test "db resolution runtime materializes doc->entity mention edges as provenance
     // Inbound provenance: "which documents mention this entity" == inbound edges.
     {
         const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
-        defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
+        defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, inbound);
         try std.testing.expectEqual(@as(usize, 1), inbound.len);
         try std.testing.expectEqualStrings("doc:a", inbound[0].source);
         try std.testing.expectEqualStrings("person/ada_lovelace", inbound[0].target);
@@ -4172,10 +4155,10 @@ test "db resolution runtime materializes doc->entity mention edges as provenance
     try db.runUntilIdle();
     {
         const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
-        defer graph_mod.GraphIndex.freeEdges(alloc, out);
+        defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, out);
         try std.testing.expectEqual(@as(usize, 0), out.len);
         const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
-        defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
+        defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, inbound);
         try std.testing.expectEqual(@as(usize, 0), inbound.len);
     }
 }
@@ -4184,13 +4167,13 @@ test "db resolution runtime resolver removal retires resolution artifacts and me
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var sink = FakePromotionSink{ .alloc = alloc };
+    var sink = @import("test_support.zig").FakePromotionSink{ .alloc = alloc };
     defer sink.deinit();
 
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{
         .executor = .{ .backend = .manual },
         .start_index_workers = false,
         .entity_sink = sink.sink(),
@@ -4253,7 +4236,7 @@ test "db resolution runtime resolver removal retires resolution artifacts and me
     }
     {
         const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
-        defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
+        defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, inbound);
         try std.testing.expectEqual(@as(usize, 1), inbound.len);
     }
 
@@ -4275,10 +4258,10 @@ test "db resolution runtime resolver removal retires resolution artifacts and me
     }
     {
         const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
-        defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
+        defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, inbound);
         try std.testing.expectEqual(@as(usize, 0), inbound.len);
         const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
-        defer graph_mod.GraphIndex.freeEdges(alloc, out);
+        defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, out);
         try std.testing.expectEqual(@as(usize, 0), out.len);
     }
 }
@@ -4287,10 +4270,10 @@ test "db resolution runtime does not materialize review-band resolution as canon
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{
         .executor = .{ .backend = .manual },
     });
     defer db.close();
@@ -4354,7 +4337,7 @@ test "db resolution runtime does not materialize review-band resolution as canon
     try std.testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
 
     const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
-    defer graph_mod.GraphIndex.freeEdges(alloc, out);
+    defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, out);
     try std.testing.expectEqual(@as(usize, 0), out.len);
 
     _ = try db.recordReviewDecision("doc:a", "relations_v1", "resolution_v1", "e0", .match, "entities", "person/ada_lovelace");
@@ -4369,7 +4352,7 @@ test "db resolution runtime does not materialize review-band resolution as canon
     try std.testing.expectEqualStrings("person/ada_lovelace", curated_ent.get("doc_ref").?.object.get("key").?.string);
 
     const curated_edges = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
-    defer graph_mod.GraphIndex.freeEdges(alloc, curated_edges);
+    defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, curated_edges);
     try std.testing.expectEqual(@as(usize, 1), curated_edges.len);
     try std.testing.expectEqualStrings("person/ada_lovelace", curated_edges[0].target);
 }
@@ -4378,10 +4361,10 @@ test "db resolution runtime mention edge weight is fused from extractor trust an
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
     try db.addIndex(.{
@@ -4421,7 +4404,7 @@ test "db resolution runtime mention edge weight is fused from extractor trust an
     try db.runUntilIdle();
 
     const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
-    defer graph_mod.GraphIndex.freeEdges(alloc, out);
+    defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, out);
     try std.testing.expectEqual(@as(usize, 1), out.len);
     try std.testing.expectEqualStrings("person/ada_lovelace", out[0].target);
     // Calibrated weight, not the legacy 1.0.
@@ -4432,10 +4415,10 @@ test "db resolution runtime rewriteEntityEdges repoints provenance edges to a me
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
     try db.addIndex(.{
@@ -4471,7 +4454,7 @@ test "db resolution runtime rewriteEntityEdges repoints provenance edges to a me
     // The mention edge points at the resolved DocRef from the resolution artifact.
     {
         const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
-        defer graph_mod.GraphIndex.freeEdges(alloc, inbound);
+        defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, inbound);
         try std.testing.expectEqual(@as(usize, 1), inbound.len);
     }
 
@@ -4483,11 +4466,11 @@ test "db resolution runtime rewriteEntityEdges repoints provenance edges to a me
     // Inbound edges moved from the merged-away key to the survivor.
     {
         const old_inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
-        defer graph_mod.GraphIndex.freeEdges(alloc, old_inbound);
+        defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, old_inbound);
         try std.testing.expectEqual(@as(usize, 0), old_inbound.len);
 
         const new_inbound = try db.getEdges(alloc, "prov_graph", "person/ada_canonical", "mentions", .in);
-        defer graph_mod.GraphIndex.freeEdges(alloc, new_inbound);
+        defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, new_inbound);
         try std.testing.expectEqual(@as(usize, 1), new_inbound.len);
         try std.testing.expectEqualStrings("doc:a", new_inbound[0].source);
         try std.testing.expectEqualStrings("person/ada_canonical", new_inbound[0].target);
@@ -4498,10 +4481,10 @@ test "db resolution runtime graph hydration fails closed for a not-yet-promoted 
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
     try db.addIndex(.{
@@ -4534,7 +4517,7 @@ test "db resolution runtime graph hydration fails closed for a not-yet-promoted 
     });
     try db.runUntilIdle();
 
-    const mention_query = graph_query_mod.GraphQuery{
+    const mention_query = @import("../../graph/query.zig").GraphQuery{
         .query_type = .neighbors,
         .index_name = "prov_graph",
         .start_nodes = .{ .keys = &.{"doc:a"} },
@@ -4588,11 +4571,11 @@ test "db resolution runtime resolver catalog persists across reopen" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
     {
-        var db = try DB.open(alloc, std.mem.span(path), .{});
+        var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
         defer db.close();
         try db.addResolver(.{
             .name = "knowledge_graph",
@@ -4632,7 +4615,7 @@ test "db resolution runtime resolver catalog persists across reopen" {
         }));
     }
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
     const resolvers = try db.listResolvers(alloc);
@@ -4655,16 +4638,16 @@ test "db resolution runtime async asset producer mention edges come from resolut
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = @import("test_support.zig").tempPath(&path_buf);
+    defer @import("test_support.zig").cleanupTempDir(path);
 
-    var fake = TestAssetProducer{
+    var fake = @import("test_support.zig").TestAssetProducer{
         .extractor_output =
         \\{"entities":[{"id":"e0","label":"person","text":"A. Lovelace"}],"relations":[]}
         ,
     };
-    var embedder = FixedVectorEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
+    var embedder = @import("test_support.zig").FixedVectorEmbedder{};
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{
         .enrichment = .{
             .owner_id = "worker-a",
             .asset_producer = fake.producer(),
@@ -4730,23 +4713,23 @@ test "db resolution runtime async asset producer mention edges come from resolut
     try std.testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
 
     const edges = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
-    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, edges);
     try std.testing.expectEqual(@as(usize, 1), edges.len);
     try std.testing.expectEqualStrings("person/ada_lovelace", edges[0].target);
     try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"target_table\":\"entities\"") != null);
 
     const deterministic_edges = try db.getEdges(alloc, "prov_graph", "person/a_lovelace", "mentions", .in);
-    defer graph_mod.GraphIndex.freeEdges(alloc, deterministic_edges);
+    defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, deterministic_edges);
     try std.testing.expectEqual(@as(usize, 0), deterministic_edges.len);
 
-    const relation_state_key = try graphAssetStateKeyAlloc(alloc, "doc:a", "prov_graph", "relations_v1");
+    const relation_state_key = try @import("internal.zig").graphAssetStateKeyAlloc(alloc, "doc:a", "prov_graph", "relations_v1");
     defer alloc.free(relation_state_key);
     try db.core.store.delete(relation_state_key);
 
     const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
     defer alloc.free(asset_key);
-    const changed = try derived_async.materializeGraphSourceArtifactsForIndex(alloc, db.core.store, db.core.index_manager, &.{asset_key}, "prov_graph", .{});
-    defer freeOwnedKeySlice(alloc, changed);
+    const changed = try @import("derived_async.zig").materializeGraphSourceArtifactsForIndex(alloc, db.core.store, db.core.index_manager, &.{asset_key}, "prov_graph", .{});
+    defer @import("derived_async.zig").freeOwnedKeySlice(alloc, changed);
 
     const graph_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "prov_graph", "mentions", "person/ada_lovelace");
     defer alloc.free(graph_edge_key);

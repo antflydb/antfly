@@ -3872,7 +3872,9 @@ fn validateGeneratedDomainDdlAst(tokens: []const grammar.Token, ast: generated_p
         .create_domain => {
             if (end < 5 or !tokens[0].matchesKeyword("create") or !tokens[1].matchesKeyword("domain")) return error.UnsupportedSqlShape;
             if (object_name.start != 2) return error.UnsupportedSqlShape;
-            if (object_name.end >= end or !tokens[object_name.end].matchesKeyword("as")) return error.UnsupportedSqlShape;
+            const operation = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+            if (operation.start != object_name.end or operation.end != end or operation.start >= end) return error.UnsupportedSqlShape;
+            if (!tokens[operation.start].matchesKeyword("as")) return error.UnsupportedSqlShape;
         },
         .alter_domain => {
             if (end < 5 or !tokens[0].matchesKeyword("alter") or !tokens[1].matchesKeyword("domain")) return error.UnsupportedSqlShape;
@@ -13358,6 +13360,38 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var malformed_generated_create_domain_name = try tokenized.ParsedSql.initAlloc(alloc, "CREATE DOMAIN generated_amount AS numeric;");
+    defer malformed_generated_create_domain_name.deinit(alloc);
+    if (malformed_generated_create_domain_name.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_domain, ddl.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
+                    ddl.object_name_tokens = .{ .start = 1, .end = 2 };
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_domain_name));
+
+    var malformed_generated_create_domain_tail = try tokenized.ParsedSql.initAlloc(alloc, "CREATE DOMAIN generated_amount AS numeric;");
+    defer malformed_generated_create_domain_tail.deinit(alloc);
+    if (malformed_generated_create_domain_tail.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_domain, ddl.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = malformed_generated_create_domain_tail.items().len - 1 }, ddl.alter_table_operation_tokens.?);
+                    ddl.alter_table_operation_tokens = .{ .start = 2, .end = malformed_generated_create_domain_tail.items().len - 1 };
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_domain_tail));
 
     var create_sequence = try lowerDdlPlanForTestAlloc(alloc, "CREATE SEQUENCE public.users_owned_id_seq AS bigint START WITH 10 OWNED BY public.users.id;");
     defer create_sequence.deinit(alloc);

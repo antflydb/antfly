@@ -20,9 +20,8 @@ const antfly_storage_build = @import("pkg/antfly/build/storage.zig");
 const antfly_tests_build = @import("pkg/antfly/build/tests.zig");
 const inference_runtime_build = @import("pkg/inference/build/runtime.zig");
 
+const APITestFilters = antfly_tests_build.APITestFilters;
 const LmdbBackend = antfly_storage_build.LmdbBackend;
-const DBTestFilters = antfly_tests_build.DBTestFilters;
-const DBTestStep = antfly_tests_build.DBTestStep;
 const chainLabeledFilteredTests = antfly_tests_build.chainLabeledFilteredTests;
 const chainLabeledRun = antfly_tests_build.chainLabeledRun;
 const configureEmbeddedModule = antfly_embedded_build.configureModule;
@@ -190,21 +189,6 @@ fn addFilteredTestStep(
     const step = b.step(step_name, description);
     step.dependOn(&run.step);
     return run;
-}
-
-fn addDBFilteredTestStep(
-    b: *std.Build,
-    root_module: *std.Build.Module,
-    db_step: DBTestStep,
-) *std.Build.Step.Run {
-    return addFilteredTestStep(
-        b,
-        root_module,
-        db_step.name,
-        db_step.description,
-        db_step.filters,
-        .{ .simple_runner = db_step.simple_runner },
-    );
 }
 
 fn addDelegatedPackageStep(
@@ -3487,17 +3471,7 @@ pub fn build(b: *std.Build) void {
     const unit_test_step = b.step("unit-test", "Run hermetic unit and focused integration test buckets without metadata chaos simulations");
     const unit_test_progress_step = b.step("unit-test-progress", "Run labeled major unit test suites to expose slow or stuck phases");
 
-    const lib_db_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &DBTestFilters.root),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_db_tests = b.addRunArtifact(lib_db_tests);
-    const lib_db_test_step = b.step("lib-db-test", "Run root-module DB tests only");
-    lib_db_test_step.dependOn(&run_lib_db_tests.step);
+    const lib_db_test = antfly_tests_build.addDBRootTestStep(b, lib_test_mod);
 
     const serverless_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -3556,8 +3530,8 @@ pub fn build(b: *std.Build) void {
 
     var run_lib_db_result_shape_tests: ?*std.Build.Step.Run = null;
     for (antfly_tests_build.db_root_module_steps) |db_step| {
-        const run_db_step = addDBFilteredTestStep(b, lib_test_mod, db_step);
-        if (std.mem.eql(u8, db_step.name, "lib-db-result-shape-test")) {
+        const run_db_step = antfly_tests_build.addDBFilteredTestStep(b, lib_test_mod, db_step);
+        if (antfly_tests_build.isDBResultShapeStep(db_step)) {
             run_lib_db_result_shape_tests = run_db_step;
         }
     }
@@ -4427,134 +4401,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_api_docid_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{
-            "api table reads reject stale doc identity before multigroup fanout",
-            "distributed table reads reject stale doc identity before multigroup fanout",
-            "api public table query rejects only top-level internal fields",
-            "single embeddings index encoder scopes isolated enrichment failure to one index",
-            "api query contract rejects doc identity control fields when with relaxes schema",
-            "api query contract public parser rejects internal shard doc identity controls",
-            "api distributed graph hydrate carries identity generation and clears cross-range ordinals",
-            "distributed graph metric status merge validates metadata compatibility",
-            "distributed graph rejects doc identity rebuild before cross-range fanout",
-            "distributed graph rejects unstamped result refs before cross-range fanout",
-            "distributed graph edge reader carries identity generation",
-            "query merge preserves common identity read generation",
-            "query encoder does not expose internal doc ordinals",
-            "graph edge local read rejects stale identity generation",
-            "catalog doc identity readiness checks table range health",
-            "catalog resolved filter validation accepts preserved split identity domains",
-            "metadata merge request validation rejects incompatible doc identity namespaces",
-            "metadata merge validation handles rolling mixed-version doc identity status fixtures",
-            "metadata split request validation rejects stale doc identity namespace",
-            "metadata reconciler does not automatically split ordinal exhausted doc identity",
-            "metadata state classifies mixed-version doc identity lifecycle reports",
-            "metadata state marks doc identity rebuild required on range namespace mismatch",
-            "metadata http server rejects split and merge during active doc identity reassignment before source mutation",
-            "metadata http server serves status and filtered admin routes",
-            "metadata http server maps source split merge doc identity conflicts",
-            "metadata http client preserves split merge doc identity conflicts",
-            "metadata http client parses legacy range records without doc identity fields",
-            "metadata http client round-trips range doc identity fields",
-            "metadata http client round-trips server endpoints",
-            "table workflow doc identity guards reject active transition intents",
-            "table workflow doc identity lifecycle handles mixed-version transition status",
-            "metadata reconciler doc identity guards block new planning during active reassignment",
-            "metadata reconciler does not upsert desired split with stale doc identity namespace",
-            "metadata reconciler allows explicit merge with doc identity reassignment opt-in",
-            "replay batcher tuple map keys preserve embedded delimiters",
-            "db chunk cache keys preserve embedded separators",
-            "enrichment worker chunk cache keys preserve embedded separators",
-            "search request text stats keys preserve embedded separators",
-            "merge distributed background text stats keys preserve embedded separators",
-            "graph edge local read rejects stale identity namespace",
-            "dense metadata keys preserve embedded index separators",
-            "dense metadata lookups read legacy textual rows",
-            "distributed txn participant ids preserve embedded group markers",
-            "distributed join unmatched worker pages group-local right hits",
-            "distributed join follow-up pagination requires stamped identity request",
-            "distributed join group-local hit pagination reuses structured search generation",
-            "distributed right join unmatched tracking uses ordinal identity keys",
-            "distributed join unmatched worker prefers local search results over query envelopes",
-            "distributed join rejects doc identity rebuild before right-table fanout",
-            "distributed join stateful shuffle rejects doc identity rebuild before worker dispatch",
-            "internal worker doc identity exchange audit covers every boundary",
-            "internal group write routes map shard doc identity mismatch to conflict",
-            "internal group join routes map doc identity mismatch to conflict",
-            "internal group read routes map doc identity mismatch to conflict",
-            "api http client preserves group doc identity conflicts",
-            "aggregation context rejects non-current identity generation",
-            "aggregation full-result rerun can reuse snapped result identity generation",
-            "explicit text stats requests preserve identity generation",
-            "explicit text stats requests carry resolved doc filters and apply exact projection",
-            "explicit text stats requests reject stale identity generation",
-            "algebraic partial request fails closed when lifecycle is stale",
-            "algebraic partial request accepts current identity generation and rejects stale",
-            "provisioned distributed aggregations collect path terms nested cardinality",
-            "algebraic distributed planner selects identity-stamped derived join tensor program",
-            "algebraic derived join tensor reads subtract identity tombstones at generation",
-            "planner rejects rebuild-required schema lifecycle state",
-            "algebraic adaptive progress marks rebuild required on schema drift",
-            "remote simple vector query uses vector worker route",
-            "encode query request serializes internal resolved doc filters with wire context",
-            "simple vector shard request carries serializable resolved doc filter",
-            "api http server maps public query doc identity mismatch to unavailable",
-            "api http server maps retrieval agent doc identity mismatch to unavailable",
-            "api http server query builder maps doc identity mismatch to unavailable",
-            "api http server surfaces structured doc identity conflicts for transaction commits",
-            "internal group vector worker rejects unsupported identity generation",
-            "internal group graph expand rejects unsupported identity generation",
-            "distributed graph expand request preserves algebraic semiring planning flag",
-            "batch identity metadata delete observes buffered resurrection state",
-            "identity validation accepts missing canonical rows but rejects conflicts",
-            "identity allocation rejects canonical row conflicts before reserving ordinal",
-            "batch identity metadata fails closed at ordinal capacity",
-            "identity namespace reassignment preserves snapshot generations and rejects stale writers",
-            "near-u32 ordinal pressure preserves sparse high ordinal state through reassignment",
-            "storage.db.lifecycle.test.db lifecycle doc identity ",
-            "storage.db.write_path.test.db write path doc identity ",
-            "storage.db.transactions.test.db transactions doc identity ",
-            "storage.db.split_restore_test.test.db split restore doc identity ",
-            "export and import preserves doc identity metadata",
-            "import rejects doc identity metadata with invalid canonical ids",
-            "import rejects doc identity namespace mismatch unless preserving existing namespace",
-            "storage.db.search_runtime.test.db search runtime identity ",
-            "doc filter wire round-trips ordinal and doc-key filters",
-            "doc filter wire rejects old required-field fixtures but tolerates additive fields",
-            "doc filter wire rejects invalid ordinal fixtures from mixed-version senders",
-            "dense vector id ignores ordinal metadata for a different doc",
-            "dense metadata prefetch includes legacy ordinal vector ids",
-            "db dense artifact rebuild preserves stable vector ids distinct from ordinals",
-            "db sparse index keeps physical doc nums distinct from doc identity ordinals",
-            "native dense constraints fail closed without ordinal vector mapping",
-            "native constraints fail closed when resolved ordinals cannot be represented",
-            "native sparse constraints fail closed without ordinal doc num mapper",
-            "native sparse constraints map resolved ordinals to physical doc nums",
-            "match_all candidate ordinal lookup uses identity read generation",
-            "match_all consumes resolved ordinal filters without doc id projection",
-            "native constraints pass identity generation to doc-set id projection",
-            "native constraints pass identity read generation to live doc filtering",
-            "native constraints treat resolved all-doc exclusion as empty candidates",
-            "native sparse constraints keep explicit doc ids when identity coverage is incomplete",
-            "text resolved doc filter projection passes identity generation to live filtering",
-            "text native constraints fall back for mixed ordinal sidecar coverage",
-            "text native constraints fail closed when resolved ordinals cannot be projected",
-            "text native constraints treat resolved all-doc exclusion as empty candidates",
-            "segment doc ordinal sidecar roundtrip and merge preserve live order",
-            "db text compaction preserves ordinal filters across reopen",
-            "structured filter doc set cache returns owned clones",
-            "structured filter doc set cache separates shared namespace generation keys",
-            "cache invalidates ownership move prefix without reviving pinned generations",
-            "applyGraphUnion deduplicates by ordinals when hit pages are complete",
-            "applyGraphIntersection uses ordinals when hit pages are complete",
-            "query merge preserves single-result doc ordinals",
-            "fuseNamedSets deduplicates aliases by ordinal when complete",
-            "graph result_ref fails closed when unbounded resolved doc-set cannot project",
-            "graph result_ref uses complete node doc-set when hits are paged",
-            "graph query result doc-set resolution receives identity generation",
-            "provisioned direct read db opens reject stale identity namespace",
-            "provisioned query runtime db rejects stale identity namespace",
-        },
+        .filters = &APITestFilters.docid,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4604,58 +4451,7 @@ pub fn build(b: *std.Build) void {
     antfly_imports.configure(b, raft_transition_runtime_docid_test_mod, true, true);
     const api_transactions_docid_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
-        .filters = &.{
-            "transaction read snapshot map keys preserve embedded delimiters",
-            "transaction session commit response includes retry hints for doc identity availability conflicts",
-            "transaction session registry persists SQL catalog session state and savepoints restore it",
-            "catalog source resolves foreign key ref owner groups",
-            "catalog source resolves unique constraint owner groups",
-            "catalog source promotes unique constraint with table schema compare and swap",
-            "txn prepare parser round-trips constraint participant intents",
-            "foreign key ref children request and response round-trip cursors",
-            "foreign key action schedule ids include the mutating action",
-            "distributed txn coordinator registers foreign key parent participants",
-            "distributed txn coordinator externalizes deferred foreign key parent checks exactly",
-            "single-table distributed txn coordinator registers foreign key parent groups",
-            "distributed txn coordinator routes foreign key child writes through ref owners when configured",
-            "distributed txn coordinator fails closed for transitional foreign key ref owner ranges",
-            "distributed txn coordinator routes old and new foreign key refs with versioned child rows",
-            "distributed txn coordinator routes unique-touching transforms with row proofs",
-            "distributed txn coordinator routes unique constraint writes through owner ranges",
-            "distributed txn coordinator routes unique owner handoff with row version proofs",
-            "distributed txn coordinator allows non-unique transforms on multi-range unique tables",
-            "distributed txn coordinator allows single-range unique writes to use local enforcement",
-            "distributed txn coordinator rejects non-primary foreign key parent writes without unique owner topology",
-            "distributed txn coordinator rejects partial match full composite foreign key writes before prepare",
-            "distributed txn coordinator routes foreign key checks through unique owner ranges",
-            "distributed txn coordinator routes cross-table foreign key checks through parent unique owner ranges",
-            "distributed txn coordinator routes unique foreign key parent updates through ref owners",
-            "distributed txn coordinator schedules mutating unique foreign key parent updates through ref owners",
-            "distributed txn coordinator routes cross-table composite foreign key checks through parent unique owner ranges",
-            "distributed txn coordinator routes cross-table composite foreign key checks through parent primary key owner ranges",
-            "distributed txn coordinator routes unique foreign key parent deletes through ref owners",
-            "distributed txn coordinator routes cross-table unique foreign key parent deletes through ref owners",
-            "distributed txn coordinator routes unique foreign key set-null parent deletes through ref owners",
-            "distributed txn coordinator routes unique foreign key cascade parent deletes through ref owners",
-            "distributed txn explain routes restrict parent deletes through ref owners",
-            "distributed txn explain fails closed on incomplete routed ref owner scans",
-            "distributed txn coordinator routes foreign key reference transforms with final-value planning",
-            "distributed txn coordinator allows non-reference transforms on foreign key tables",
-            "distributed txn coordinator fails closed without foreign key ref owner parent delete ranges",
-            "distributed txn coordinator routes foreign key parent deletes through ref owners when configured",
-            "distributed txn coordinator routes deferred foreign key parent deletes through ref owners when configured",
-            "distributed txn coordinator fails closed for transitional foreign key ref owner parent deletes",
-            "distributed txn coordinator ignores unrelated foreign key child tables for parent delete planning",
-            "distributed txn coordinator routes distributed foreign key set-null actions across child ranges",
-            "foreign key action page executes owner ref cleanup and child mutation through routed participants",
-            "foreign key action page fails closed for transitional ref owner topology",
-            "foreign key action page routes update cascade child mutations with replacement parent key",
-            "foreign key action page schedules recursive cascade work for deleted children",
-            "foreign key action page accepts same table runtime parent identity for durable schedules",
-            "distributed txn relational identity workload mixes owner topology churn and actions",
-            "distributed txn coordinator routes distributed foreign key cascade actions across child ranges",
-            "distributed txn coordinator rejects distributed foreign key cascade actions without ref owner topology",
-        },
+        .filters = &APITestFilters.transactions_docid,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4663,49 +4459,7 @@ pub fn build(b: *std.Build) void {
     });
     const api_table_writes_docid_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
-        .filters = selectTestFilters(b, &.{
-            "table write index parser keeps full text field metadata out of storage config",
-            "api auto bulk ingest does not open sessions for normal online writes",
-            "weak sync levels do not drain managed db after batch",
-            "provisioning detects model backed graph shorthand assets inside config_json strings",
-            "provisioning does not require asset producer for copy graph shorthand assets inside config_json strings",
-            "provisioned table write source rejects stale doc identity namespace before write",
-            "bound table write source backs up and restores a local table",
-            "bound table write source backs up and restores a portable local table",
-            "provisioned table write source backs up a portable local table",
-            "provisioned table restore rejects mismatched doc identity namespace",
-            "provisioned restore repair open rejects stale doc identity namespace",
-            "write cache reserves retirement slots when pruning multiple leased generations",
-            "table write source core forwards required batch and defaults optional capabilities",
-            "primary lookup adopts seeded write cache across visible generation bump",
-            "provisioned table write source coalesces same-group waiters",
-            "provisioned table write coalescer isolates failed waiters",
-            "unique integrity owner topology inspection reports active and transitional ranges",
-            "foreign key integrity plan clips requested span to table ranges",
-            "foreign key integrity worker plan includes active owner ranges",
-            "foreign key integrity stable job id uses planned action and bounds",
-            "foreign key integrity diagnostics deduplicates violation samples",
-            "secondary index rebuild worker helper claims repairs and finishes range",
-            "provisioned secondary index rebuild worker pass repairs projected catalog range",
-            "provisioned schema rewrite worker pass drains projected catalog range job",
-            "schema rewrite worker pass treats unclaimed terminal jobs as terminal",
-            "secondary index promotion ignores stale ready rebuild generation",
-            "foreign key integrity job diagnostics merge samples across passes",
-            "foreign key integrity job records diagnostics across incomplete passes",
-            "unique schema controller maintenance",
-            "foreign key schema controller maintenance",
-            "foreign key schema controller maintenance resumes durable action job",
-            "provisioned foreign key action job drains owner range page",
-            "provisioned same-table foreign key action job routes runtime parent through catalog owner range",
-            "provisioned table write source routes same-owner identity rewrites and rejects cross-owner rewrites",
-            "provisioned table write source routes cross-table rows insert source through catalog owners",
-            "recursive cte joined mutation source executes through typed read materialization and write staging",
-            "provisioned table write source stages relational mutation source on single owner range",
-            "provisioned table write source globally plans relational mutation source across ranges",
-            "hosted provisioned table write source globally plans relational mutation source across local owner ranges",
-            "provisioned table write source consistent visibility hook does not block on busy apply lock",
-            "provisioned table write source consistent visibility refreshes stale dense status",
-        }),
+        .filters = selectTestFilters(b, &APITestFilters.table_writes_docid),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4713,7 +4467,7 @@ pub fn build(b: *std.Build) void {
     });
     const provisioned_query_visibility_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
-        .filters = selectTestFilters(b, &.{"provisioned query visibility "}),
+        .filters = selectTestFilters(b, &APITestFilters.provisioned_query_visibility),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4721,46 +4475,7 @@ pub fn build(b: *std.Build) void {
     });
     const api_table_reads_docid_tests = b.addTest(.{
         .root_module = api_table_reads_docid_test_mod,
-        .filters = &.{
-            "provisioned read cache keys entries by lsm root generation",
-            "provisioned read cache keys entries by identity namespace",
-            "provisioned read cache invalidates repeated ownership moves with pinned leases",
-            "provisioned read cache clear preserves in-flight pending opens and bumps epoch",
-            "provisioned read cache invalidate removes entries without dropping pending opens",
-            "provisioned read cache retires invalidated entries until the last lease is released",
-            "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
-            "provisioned query runtime db opens with catalog identity namespace",
-            "provisioned query runtime db rejects stale identity namespace",
-            "fanout planner uses io cap and request shape",
-            "graph hydrate resolved doc filter applies include and exclude sets",
-            "provisioned table read source executes relational row query plans across ranges",
-            "routed rows query plan executes over scanned owner rows with ctes",
-            "external lake rows query and aggregate plans route through lake scan hook",
-            "pinned external lake rows scanner validates schema binding against inventory",
-            "object storage pinned external lake source routes row plans through scanner",
-            "owned object storage lake source discovers and pins parquet prefix inventory",
-            "opened object storage lake source owns store and pins parquet prefix inventory",
-            "external lake routing source resolves object store for external row plans",
-            "configured external lake resolver opens credentialed filesystem connection",
-            "lowered sql cross-table read plans execute through routed scans",
-            "lowered sql set operation plans preserve overlapping union all rows",
-            "lowered sql set operation materialization admission distinguishes spill from hard caps",
-            "lowered sql recursive cte materialization admission uses stream spill policy",
-            "lowered sql insert source plans build batches from routed scans",
-            "lowered sql merge mutation plans build batches from routed scans",
-            "lowered relation population plans execute routed typed read sources",
-            "lowered document sql read plans execute native lookup and bounded scan",
-            "document sql catalog read producers treat catalog misses as terminal",
-            "lowered document sql aggregate executes native grouped avg materialization",
-            "lowered document sql aggregate uses catalog target for non-default namespace materialization",
-            "remote document algebraic aggregate preserves typed unavailable and not found errors",
-            "internal group document algebraic aggregate route preserves typed errors",
-            "document algebraic aggregate fan-in merges raw grouped averages before applying limit",
-            "document algebraic aggregate fan-in preserves empty scalar aggregate semantics",
-            "parseRemoteSearchResult preserves fused index scores",
-            "hosted remote temporal unique owner lookup resolves point interval",
-            "provisioned standby read gate permits stale reads and routes non-stale reads to primary",
-        },
+        .filters = &APITestFilters.table_reads_docid,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4768,17 +4483,7 @@ pub fn build(b: *std.Build) void {
     });
     const api_table_reads_graph_metric_tests = b.addTest(.{
         .root_module = api_table_reads_docid_test_mod,
-        .filters = &.{
-            "hosted cross-range graph metric fan-in merges compatible hits pair",
-            "hosted cross-range graph metric fan-in rejects unpublished or incompatible shard generations",
-            "hosted cross-range graph metric fan-in rejects incompatible remote hits pair",
-            "hosted cross-range graph metric fan-in rejects missing remote hits status",
-            "hosted cross-range graph metric fan-in merges compatible published shard generations",
-            "hosted cross-range graph metric fan-in merges active stale shard for published",
-            "hosted cross-range graph metric fan-in merges nonuniform promotion shard layout",
-            "encode query request includes graph metric read and rerank",
-            "graph metric fan-in shard request carries internal status without mutating public request",
-        },
+        .filters = &APITestFilters.table_reads_graph_metric,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4786,19 +4491,7 @@ pub fn build(b: *std.Build) void {
     });
     const api_public_table_http_docid_tests = b.addTest(.{
         .root_module = api_public_table_http_docid_test_mod,
-        .filters = &.{
-            "public table batch handler maps doc identity unavailable errors",
-            "public table batch handler maps HA write gate errors",
-            "public table query handler maps doc identity unavailable errors",
-            "public table query handler maps HA read gate errors",
-            "public table query view handler maps doc identity unavailable errors",
-            "public table backup handler accepts portable format",
-            "public table query view handler maps HA read gate errors",
-            "public document artifact manifest handlers map HA read gate errors",
-            "public table graph metric action handler returns status response",
-            "public document artifact manifest handler returns summary and raw state",
-            "public document artifact reprocess handler returns accepted",
-        },
+        .filters = &APITestFilters.public_table_http_docid,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4806,53 +4499,7 @@ pub fn build(b: *std.Build) void {
     });
     const api_rows_tests = b.addTest(.{
         .root_module = api_rows_test_mod,
-        .filters = selectTestFilters(b, &.{
-            "relational rows unique selector",
-            "relational rows conflict target upsert",
-            "relational rows batch returning",
-            "relational rows materializes server defaults",
-            "relational rows json_set",
-            "relational rows window contract",
-            "relational rows join contract",
-            "relational rows lateral contract",
-            "relational rows cte plan contract",
-            "relational rows read plan output metadata",
-            "relational rows cross-table join and lateral plans execute with side schemas",
-            "relational rows query contract projects coalesce",
-            "relational rows query contract projects generic expression",
-            "relational rows query contract parses public expression operator surface",
-            "relational rows query contract projects date_trunc",
-            "relational rows query contract projects string_to_array",
-            "relational rows query contract supports scalar or",
-            "relational rows lake bridge",
-            "postgres sql adapter",
-            "api http server resolves relational rows by unique selector",
-            "api http server executes public relational row plan endpoints",
-            "api http server exposes psql-style SQL session endpoint",
-            "api http server applies SQL routine catalog plans through native runtime",
-            "api http server exposes SQL routine bindings to catalog read planning",
-            "api http server passes SQL routine bindings to source-backed schema DDL",
-            "api http server refreshes SQL routine hooks from ready extension query functions",
-            "api http server persists prepared transaction SQL DDL through durable session store fallback",
-            "api http server routes public external lake row queries through configured resolver",
-            "api http server resolves credentialed external lake rows from node config",
-            "relational rows query projects typed expression outputs",
-            "provisioned relational row plans fail closed when range topology moves during collection",
-            "hosted table read source executes relational row query plans across local and remote owners",
-            "hosted table read source coordinates relational row plans without local owner ranges",
-            "hosted relational row plans fail closed when remote range topology moves during collection",
-            "hosted relational lateral plans fail closed when remote range topology moves during right collection",
-            "relational unique owner lookup requires one active owner range",
-            "bound table read source executes SQL system-time as-of by commit sequence",
-            "relational rows mutation source updates claimed base rows transactionally",
-            "relational rows mutation source plans across injected owner ranges",
-            "relational joined mutation source stages target-side updates from source rows",
-            "relational joined mutation source plans across injected owner ranges",
-            "relational joined mutation source stages target updates with separate source schema",
-            "db row claim lease expiry aborts stale owner and lets next claimer proceed",
-            "db row claim lease expiry lets direct mutation reclaim stale owner",
-            "catalog source resolves groups by key and span",
-        }),
+        .filters = selectTestFilters(b, &APITestFilters.rows),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4860,19 +4507,7 @@ pub fn build(b: *std.Build) void {
     });
     const sql_api_parity_tests = b.addTest(.{
         .root_module = api_rows_test_mod,
-        .filters = &.{
-            "postgres sql adapter classifies application parity corpus",
-            "postgres sql adapter rejects data-driven application edge cases explicitly",
-            "catalog apply applies incremental ddl plans to public schema json",
-            "api http server executes public relational row plan endpoints",
-            "api http server routes public external lake row queries through configured resolver",
-            "api http server resolves credentialed external lake rows from node config",
-            "relational rows joined mutation source contract parses lockable join plans",
-            "relational rows joined mutation source validates target and source schemas independently",
-            "relational rows cross-table join and lateral plans execute with side schemas",
-            "postgres sql adapter typed read plans execute through relational storage",
-            "postgres sql adapter typed write plans execute through relational storage",
-        },
+        .filters = &APITestFilters.sql_api_parity,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4880,9 +4515,7 @@ pub fn build(b: *std.Build) void {
     });
     const sql_api_parity_fixture_promote_tests = b.addTest(.{
         .root_module = api_rows_test_mod,
-        .filters = &.{
-            "postgres sql adapter checks application parity fixture freshness",
-        },
+        .filters = &APITestFilters.sql_api_parity_fixture,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4890,9 +4523,7 @@ pub fn build(b: *std.Build) void {
     });
     const sql_api_parity_fixture_check_tests = b.addTest(.{
         .root_module = api_rows_test_mod,
-        .filters = &.{
-            "postgres sql adapter checks application parity fixture freshness",
-        },
+        .filters = &APITestFilters.sql_api_parity_fixture,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4900,9 +4531,7 @@ pub fn build(b: *std.Build) void {
     });
     const api_internal_group_write_routes_tests = b.addTest(.{
         .root_module = api_internal_group_write_routes_test_mod,
-        .filters = &.{
-            "internal group write routes",
-        },
+        .filters = &APITestFilters.internal_group_write_routes,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4910,9 +4539,7 @@ pub fn build(b: *std.Build) void {
     });
     const raft_transition_runtime_docid_tests = b.addTest(.{
         .root_module = raft_transition_runtime_docid_test_mod,
-        .filters = &.{
-            "transition runtime fails closed when doc identity reassignment callback is missing",
-        },
+        .filters = &APITestFilters.raft_transition_runtime_docid,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4920,11 +4547,7 @@ pub fn build(b: *std.Build) void {
     });
     const lib_serverless_docid_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{
-            "serverless query module compiles",
-            "search plan rejects internal doc identity controls",
-            "serverless graph plans reject internal doc identity controls",
-        },
+        .filters = &APITestFilters.serverless_docid,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4979,43 +4602,7 @@ pub fn build(b: *std.Build) void {
     api_public_table_http_docid_test_step.dependOn(&run_api_public_table_http_docid_tests.step);
     const lib_docid_lifecycle_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{
-            "metadata reconciler does not automatically split ordinal exhausted doc identity",
-            "metadata state classifies mixed-version doc identity lifecycle reports",
-            "metadata state marks doc identity rebuild required on range namespace mismatch",
-            "metadata merge validation handles rolling mixed-version doc identity status fixtures",
-            "metadata split request validation rejects stale doc identity namespace",
-            "metadata http server rejects split and merge during active doc identity reassignment before source mutation",
-            "table workflow doc identity guards reject active transition intents",
-            "metadata reconciler doc identity guards block new planning during active reassignment",
-            "metadata reconciler does not upsert desired split with stale doc identity namespace",
-            "metadata reconciler allows explicit merge with doc identity reassignment opt-in",
-            "distributed join follow-up pagination requires stamped identity request",
-            "distributed join group-local hit pagination reuses structured search generation",
-            "distributed join rejects doc identity rebuild before right-table fanout",
-            "distributed join stateful shuffle rejects doc identity rebuild before worker dispatch",
-            "distributed graph rejects doc identity rebuild before cross-range fanout",
-            "distributed graph rejects unstamped result refs before cross-range fanout",
-            "api distributed graph hydrate carries identity generation and clears cross-range ordinals",
-            "internal worker doc identity exchange audit covers every boundary",
-            "aggregation context rejects non-current identity generation",
-            "aggregation full-result rerun can reuse snapped result identity generation",
-            "explicit text stats requests preserve identity generation",
-            "explicit text stats requests reject stale identity generation",
-            "structured filter doc set cache separates shared namespace generation keys",
-            "cache invalidates ownership move prefix without reviving pinned generations",
-            "db text compaction preserves ordinal filters across reopen",
-            "storage.db.lifecycle.test.db lifecycle doc identity ",
-            "storage.db.write_path.test.db write path doc identity ",
-            "identity namespace reassignment preserves snapshot generations and rejects stale writers",
-            "near-u32 ordinal pressure preserves sparse high ordinal state through reassignment",
-            "index manager split handoff preserves interleaved write and query summaries",
-            "storage.db.transactions.test.db transactions doc identity ",
-            "storage.db.split_restore_test.test.db split restore doc identity ",
-            "storage.db.search_runtime.test.db search runtime identity ",
-            "doc filter wire rejects old required-field fixtures but tolerates additive fields",
-            "doc filter wire rejects invalid ordinal fixtures from mixed-version senders",
-        },
+        .filters = &APITestFilters.docid_lifecycle,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -5454,7 +5041,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_capi_tests.step);
     unit_test_step.dependOn(&run_lite_native_tests.step);
     unit_test_step.dependOn(&run_lite_cli_tests.step);
-    unit_test_step.dependOn(&run_lib_db_tests.step);
+    unit_test_step.dependOn(&lib_db_test.run.step);
     unit_test_step.dependOn(&run_lib_db_result_shape_tests.?.step);
     unit_test_step.dependOn(&run_serverless_tests.step);
     unit_test_step.dependOn(&run_lib_data_runtime_tests.step);
@@ -5484,7 +5071,7 @@ pub fn build(b: *std.Build) void {
 
     var unit_progress_tail: ?*std.Build.Step = null;
     unit_progress_tail = chainLabeledRun(b, lib_storage_progress_tests, "lib-storage-test", unit_progress_tail);
-    unit_progress_tail = chainLabeledRun(b, lib_db_tests, "lib-db-test", unit_progress_tail);
+    unit_progress_tail = chainLabeledRun(b, lib_db_test.tests, antfly_tests_build.db_root_step_name, unit_progress_tail);
     unit_progress_tail = chainLabeledRun(b, lib_metadata_tests, "lib-metadata-test", unit_progress_tail);
     unit_progress_tail = chainLabeledRun(b, raft_unit_tests, "raft-test", unit_progress_tail);
     unit_progress_tail = chainLabeledRun(b, raft_transport_tests, "raft-transport-test", unit_progress_tail);
@@ -5784,21 +5371,12 @@ pub fn build(b: *std.Build) void {
     storage_vopr_step.dependOn(&run_index_manager_vopr_tests.step);
     sim_test_step.dependOn(storage_vopr_step);
 
-    const db_unit_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_db_unit_tests = b.addRunArtifact(db_unit_tests);
-    const db_test_step = b.step("db-test", "Run storage/db unit tests");
-    db_test_step.dependOn(&run_db_unit_tests.step);
+    const run_db_unit_tests = antfly_tests_build.addDBStorageTestStep(b, db_test_mod);
 
     var run_db_sim_tests: ?*std.Build.Step.Run = null;
     for (antfly_tests_build.db_storage_module_steps) |db_step| {
-        const run_db_step = addDBFilteredTestStep(b, db_test_mod, db_step);
-        if (std.mem.eql(u8, db_step.name, "db-sim-test")) {
+        const run_db_step = antfly_tests_build.addDBFilteredTestStep(b, db_test_mod, db_step);
+        if (antfly_tests_build.isDBSimStep(db_step)) {
             run_db_sim_tests = run_db_step;
         }
     }

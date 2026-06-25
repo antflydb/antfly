@@ -31,7 +31,6 @@ const transactions_mod = @import("../transactions.zig");
 const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
-const TxnResolverRecorder = @import("test_support.zig").TxnResolverRecorder;
 const row_claim_intent_key_prefix = relational_rows.row_claim_intent_key_prefix;
 
 pub fn Impl(comptime DB: type) type {
@@ -2160,6 +2159,7 @@ test "db transactions recovery runtime resolves participants and unblocks cleanu
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
+    const TxnResolverRecorder = db_test_support.TxnResolverRecorder;
     var recorder = TxnResolverRecorder{};
     const txn_id = blk: {
         var setup_db = try DB.open(alloc, std.mem.span(path), .{});
@@ -2269,6 +2269,7 @@ test "db transactions recovery runtime appends identity rows for committed orpha
         break :blk txn_id;
     };
 
+    const TxnResolverRecorder = db_test_support.TxnResolverRecorder;
     var recorder = TxnResolverRecorder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
         .transaction_recovery = .{
@@ -2356,6 +2357,7 @@ test "db transactions relational recovery resolves orphaned intents into base ro
         break :blk txn_id;
     };
 
+    const TxnResolverRecorder = db_test_support.TxnResolverRecorder;
     var recorder = TxnResolverRecorder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
         .transaction_recovery = .{
@@ -2452,6 +2454,7 @@ test "db transactions one-shot relational recovery resolves orphaned intents int
     std.mem.writeInt(u64, record_value[25..33], commit_ts, .little);
     try db.core.store.put(record_key[0..], record_value[0..]);
 
+    const TxnResolverRecorder = db_test_support.TxnResolverRecorder;
     var recorder = TxnResolverRecorder{};
     const stats = try db.runTransactionRecoveryOnce(.{
         .enabled = true,
