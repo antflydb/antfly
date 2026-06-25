@@ -3212,8 +3212,23 @@ fn generatedCreateIndexUsesRuntimeBoundary(tokens: []const grammar.Token, ast: g
     const end = generatedStatementEnd(tokens, ast.statement_span) orelse return false;
     const elements_range = ast.index_elements_tokens orelse return false;
     if (!generatedRangeWithinStatement(elements_range, end)) return false;
-    if (ast.index_where_tokens != null) return false;
+    if (ast.index_where_tokens) |where_range| {
+        if (!generatedRangeWithinStatement(where_range, end) or where_range.start >= where_range.end) return false;
+        if (!generatedCreateIndexWhereUsesRuntimeBoundary(tokens, where_range)) return false;
+    } else if (generatedRangeHasKeyword(tokens, .{ .start = 0, .end = end }, "where")) {
+        return false;
+    }
     return true;
+}
+
+fn generatedCreateIndexWhereUsesRuntimeBoundary(tokens: []const grammar.Token, range: generated_parser.GeneratedSqlTokenRange) bool {
+    if (range.end > tokens.len or range.start > range.end) return false;
+    if (range.end - range.start != 3) return false;
+    if (tokens[range.start].kind != .identifier) return false;
+    const op = tokens[range.start + 1];
+    if (op.kind == .eq or op.kind == .neq) return true;
+    if (op.matchesKeywordTag(.is) and tokens[range.start + 2].matchesKeywordTag(.null)) return true;
+    return false;
 }
 
 fn generatedAlterTableUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) bool {
@@ -3270,6 +3285,14 @@ fn generatedRangeMatchesKeywords(tokens: []const grammar.Token, range: generated
         if (!tokens[range.start + offset].matchesKeyword(keyword)) return false;
     }
     return true;
+}
+
+fn generatedRangeHasKeyword(tokens: []const grammar.Token, range: generated_parser.GeneratedSqlTokenRange, keyword: []const u8) bool {
+    if (range.end > tokens.len or range.start > range.end) return false;
+    for (tokens[range.start..range.end]) |token| {
+        if (token.matchesKeyword(keyword)) return true;
+    }
+    return false;
 }
 
 fn generatedRangeContainsText(tokens: []const grammar.Token, range: generated_parser.GeneratedSqlTokenRange, text: []const u8) bool {
@@ -12943,6 +12966,24 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
             try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
             try std.testing.expectEqual(@as(usize, 1), plan.include_columns.len);
             try std.testing.expectEqual(@as(usize, 0), plan.where.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var runtime_partial_index = try tokenized.ParsedSql.initAlloc(alloc, "CREATE UNIQUE INDEX generated_usage_active_status_idx ON generated_usage_records (status) WHERE status = 'active';");
+    defer runtime_partial_index.deinit(alloc);
+    var runtime_partial_index_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_partial_index);
+    defer runtime_partial_index_plan.deinit(alloc);
+    switch (runtime_partial_index_plan) {
+        .create_index => |plan| {
+            try std.testing.expectEqualStrings("generated_usage_active_status_idx", plan.index_name);
+            try std.testing.expectEqualStrings("generated_usage_records", plan.table_name);
+            try std.testing.expect(plan.unique);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqual(@as(usize, 0), plan.expressions.len);
+            try std.testing.expectEqual(@as(usize, 1), plan.where.len);
+            try std.testing.expectEqualStrings("status", plan.where[0].field);
+            try std.testing.expectEqual(@as(usize, 0), plan.where_expressions.len);
         },
         else => return error.TestUnexpectedResult,
     }
