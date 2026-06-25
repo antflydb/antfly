@@ -95,6 +95,7 @@ ddl_statement:
   | create_tablespace_statement
   | create_publication_statement
   | create_subscription_statement
+  | create_policy_statement
   | create_index_statement
   | create_extension_statement
   | alter_table_statement
@@ -106,6 +107,7 @@ ddl_statement:
   | alter_tablespace_statement
   | alter_publication_statement
   | alter_subscription_statement
+  | alter_policy_statement
   | drop_statement
   | refresh_materialized_view_statement
   | relation_population_statement
@@ -168,6 +170,10 @@ create_publication_statement:
 
 create_subscription_statement:
     CREATE SUBSCRIPTION qualified_name diagnostic_tail
+  ;
+
+create_policy_statement:
+    CREATE POLICY identifier_name ON qualified_name diagnostic_tail_opt
   ;
 
 relation_population_statement:
@@ -247,6 +253,10 @@ alter_subscription_statement:
     ALTER SUBSCRIPTION qualified_name diagnostic_tail
   ;
 
+alter_policy_statement:
+    ALTER POLICY identifier_name ON qualified_name diagnostic_tail_opt
+  ;
+
 alter_table_relation_prefix_opt:
     /* empty */
   | IF EXISTS
@@ -268,6 +278,7 @@ drop_statement:
   | DROP TABLESPACE if_exists_opt qualified_name
   | DROP PUBLICATION if_exists_opt qualified_name
   | DROP SUBSCRIPTION if_exists_opt qualified_name
+  | DROP POLICY if_exists_opt identifier_name ON qualified_name drop_behavior_opt
   ;
 
 refresh_materialized_view_statement:
@@ -399,18 +410,15 @@ unsupported_statement:
   | EXPLAIN explain_options_opt explain_subject_opt
   | DO diagnostic_tail_opt
   | CREATE FOREIGN TABLE diagnostic_tail_opt
-  | CREATE POLICY diagnostic_tail_opt
   | CREATE RULE diagnostic_tail_opt
   | CREATE SERVER diagnostic_tail_opt
   | CREATE TRIGGER diagnostic_tail_opt
   | ALTER FOREIGN TABLE diagnostic_tail_opt
   | ALTER MATERIALIZED VIEW diagnostic_tail_opt
-  | ALTER POLICY diagnostic_tail_opt
   | ALTER RULE diagnostic_tail_opt
   | ALTER SERVER diagnostic_tail_opt
   | ALTER TRIGGER diagnostic_tail_opt
   | DROP FOREIGN TABLE diagnostic_tail_opt
-  | DROP POLICY diagnostic_tail_opt
   | DROP RULE diagnostic_tail_opt
   | DROP SERVER diagnostic_tail_opt
   | DROP TRIGGER diagnostic_tail_opt

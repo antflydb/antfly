@@ -536,7 +536,7 @@ fn validateGeneratedCteListMetadata(tokens: []const tokenized.Token, read_ast: g
         }
         if (cte.column_tokens) |column_tokens| {
             const column_name_tokens = cte.column_name_tokens orelse return error.UnsupportedSqlShape;
-            if (column_tokens.start <= cte.name_tokens.end or column_tokens.end > body.start) return error.UnsupportedSqlShape;
+            if (column_tokens.start < cte.name_tokens.end or column_tokens.end > body.start) return error.UnsupportedSqlShape;
             if (column_name_tokens.start <= column_tokens.start or column_name_tokens.end >= column_tokens.end) {
                 return error.UnsupportedSqlShape;
             }
@@ -5978,6 +5978,20 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &recursive_cte_parsed_sql, recursive_cte_read_ast),
     );
+
+    var recursive_cte_alias_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH RECURSIVE walk(id, depth) AS (SELECT id, depth FROM usage_records WHERE kind = 'order' UNION ALL SELECT child.id, walk.depth + 1 FROM usage_records AS child JOIN walk ON child.customer_id = walk.id) SELECT id FROM walk WHERE depth > 1 ORDER BY id",
+    );
+    defer recursive_cte_alias_parsed_sql.deinit(alloc);
+    const recursive_cte_alias_generated_raw = recursive_cte_alias_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    const recursive_cte_alias_read_ast = switch (recursive_cte_alias_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    var recursive_cte_alias_lowered = try lowerReadPlanFromGeneratedReadAstAlloc(&context, &recursive_cte_alias_parsed_sql, recursive_cte_alias_read_ast);
+    defer recursive_cte_alias_lowered.deinit(alloc);
+    try std.testing.expectEqual(@as(std.meta.Tag(plan.LoweredReadPlan), .recursive_cte), std.meta.activeTag(recursive_cte_alias_lowered));
 }
 
 test "sql adapter lowering context classifies read sql into typed plan families" {

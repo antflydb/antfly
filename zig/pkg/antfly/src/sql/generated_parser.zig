@@ -62,6 +62,7 @@ pub const GeneratedSqlDdlKind = enum {
     create_tablespace,
     create_publication,
     create_subscription,
+    create_policy,
     create_index,
     create_extension,
     alter_table,
@@ -73,6 +74,7 @@ pub const GeneratedSqlDdlKind = enum {
     alter_enum_type,
     alter_publication,
     alter_subscription,
+    alter_policy,
     drop_table,
     drop_view,
     drop_materialized_view,
@@ -82,6 +84,7 @@ pub const GeneratedSqlDdlKind = enum {
     drop_tablespace,
     drop_publication,
     drop_subscription,
+    drop_policy,
     drop_index,
     drop_schema,
     drop_database,
@@ -1548,12 +1551,14 @@ pub const simple_ddl_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CREATE DOMAIN positive_amount AS numeric CHECK (VALUE > 0)", .kind = .ddl },
     .{ .sql = "CREATE PUBLICATION usage_pub FOR TABLE usage_records", .kind = .ddl },
     .{ .sql = "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=example dbname=usage' PUBLICATION usage_pub", .kind = .ddl },
+    .{ .sql = "CREATE POLICY usage_policy ON usage_records USING (tenant_id = current_user)", .kind = .ddl },
     .{ .sql = "ALTER TABLE usage_records ADD COLUMN status text", .kind = .ddl },
     .{ .sql = "ALTER TABLE IF EXISTS ONLY usage_records DROP COLUMN IF EXISTS status RESTRICT", .kind = .ddl },
     .{ .sql = "ALTER VIEW active_usage RENAME TO active_usage_v2", .kind = .ddl },
     .{ .sql = "ALTER DOMAIN positive_amount SET NOT NULL", .kind = .ddl },
     .{ .sql = "ALTER PUBLICATION usage_pub ADD TABLE usage_records", .kind = .ddl },
     .{ .sql = "ALTER SUBSCRIPTION usage_sub DISABLE", .kind = .ddl },
+    .{ .sql = "ALTER POLICY usage_policy ON usage_records RENAME TO usage_policy_v2", .kind = .ddl },
     .{ .sql = "CREATE INDEX usage_records_status_idx ON usage_records (status)", .kind = .extension_index },
     .{ .sql = "CREATE INDEX IF NOT EXISTS usage_records_status_idx ON usage_records (status)", .kind = .extension_index },
     .{ .sql = "CREATE UNIQUE INDEX usage_records_status_active_idx ON usage_records (status) INCLUDE (tenant_id, amount) WHERE deleted_at IS NULL", .kind = .extension_index },
@@ -1565,6 +1570,7 @@ pub const simple_ddl_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "DROP DOMAIN IF EXISTS positive_amount CASCADE", .kind = .ddl },
     .{ .sql = "DROP PUBLICATION IF EXISTS usage_pub", .kind = .ddl },
     .{ .sql = "DROP SUBSCRIPTION IF EXISTS usage_sub", .kind = .ddl },
+    .{ .sql = "DROP POLICY IF EXISTS usage_policy ON usage_records", .kind = .ddl },
     .{ .sql = "REFRESH MATERIALIZED VIEW usage_summary", .kind = .ddl },
     .{ .sql = "DROP INDEX usage_records_status_idx", .kind = .extension_index },
     .{ .sql = "DROP EXTENSION vector", .kind = .extension_index },
@@ -1718,7 +1724,6 @@ pub const simple_graph_corpus = [_]GeneratedSqlCorpusCase{
 pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "ALTER FOREIGN TABLE foreign_usage_records RENAME TO foreign_usage_archive", .kind = .unsupported },
     .{ .sql = "ALTER MATERIALIZED VIEW usage_summary RENAME TO usage_summary_v2", .kind = .unsupported },
-    .{ .sql = "ALTER POLICY usage_policy ON usage_records RENAME TO usage_policy_v2", .kind = .unsupported },
     .{ .sql = "ALTER RULE usage_insert ON usage_records RENAME TO usage_insert_v2", .kind = .unsupported },
     .{ .sql = "ALTER SERVER usage_server VERSION '15'", .kind = .unsupported },
     .{ .sql = "ALTER TRIGGER usage_audit ON usage_records RENAME TO usage_audit_v2", .kind = .unsupported },
@@ -1730,7 +1735,6 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "COMMENT ON TABLE usage_records IS 'billing rows'", .kind = .unsupported },
     .{ .sql = "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)", .kind = .unsupported },
     .{ .sql = "CREATE FOREIGN TABLE foreign_usage_records (id text) SERVER usage_fdw", .kind = .unsupported },
-    .{ .sql = "CREATE POLICY usage_policy ON usage_records USING (tenant_id = current_user)", .kind = .unsupported },
     .{ .sql = "CREATE RULE usage_insert AS ON INSERT TO usage_records DO ALSO NOTIFY usage_events", .kind = .unsupported },
     .{ .sql = "CREATE SERVER usage_server FOREIGN DATA WRAPPER postgres_fdw", .kind = .unsupported },
     .{ .sql = "CREATE TRIGGER usage_audit BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage()", .kind = .unsupported },
@@ -1758,7 +1762,6 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "REVOKE SELECT ON TABLE usage_records FROM readonly", .kind = .unsupported },
     .{ .sql = "SAVEPOINT usage_batch", .kind = .unsupported },
     .{ .sql = "SECURITY LABEL ON TABLE usage_records IS 'internal'", .kind = .unsupported },
-    .{ .sql = "DROP POLICY IF EXISTS usage_policy ON usage_records", .kind = .unsupported },
     .{ .sql = "DROP RULE IF EXISTS usage_insert ON usage_records", .kind = .unsupported },
     .{ .sql = "DROP SERVER IF EXISTS usage_server CASCADE", .kind = .unsupported },
     .{ .sql = "DROP TRIGGER IF EXISTS usage_audit ON usage_records", .kind = .unsupported },
@@ -1963,6 +1966,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.tablespace)) return .{ .ddl = .create_tablespace };
         if (second.matchesKeywordTag(.publication)) return .{ .ddl = .create_publication };
         if (second.matchesKeywordTag(.subscription)) return .{ .ddl = .create_subscription };
+        if (second.matchesKeywordTag(.policy)) return .{ .ddl = .create_policy };
         if (second.matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
         if (second.matchesKeywordTag(.unique) and tokens.len > 2 and tokens[2].matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
         if (second.matchesKeywordTag(.foreign) and tokens.len > 2 and tokens[2].matchesKeywordTag(.table)) return .{ .unsupported = .create_foreign_table };
@@ -1970,7 +1974,6 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
             if (tokens[2].matchesKeywordTag(.index)) return .{ .graph = .create_index };
             if (tokens[2].matchesKeywordTag(.metric)) return .{ .graph = .create_metric };
         }
-        if (second.matchesKeywordTag(.policy)) return .{ .unsupported = .create_policy };
         if (second.matchesKeywordTag(.rule)) return .{ .unsupported = .create_rule };
         if (second.matchesKeywordTag(.server)) return .{ .unsupported = .create_server };
         if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .create_trigger };
@@ -2006,7 +2009,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.alter) and tokens.len > 1) {
         const second = tokens[1];
         if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .unsupported = .alter_materialized_view };
-        if (second.matchesKeywordTag(.policy)) return .{ .unsupported = .alter_policy };
+        if (second.matchesKeywordTag(.policy)) return .{ .ddl = .alter_policy };
         if (second.matchesKeywordTag(.publication)) return .{ .ddl = .alter_publication };
         if (second.matchesKeywordTag(.rule)) return .{ .unsupported = .alter_rule };
         if (second.matchesKeywordTag(.server)) return .{ .unsupported = .alter_server };
@@ -2029,7 +2032,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.extension)) return .{ .extension_index = .drop_extension };
         if (second.matchesKeywordTag(.foreign) and tokens.len > 2 and tokens[2].matchesKeywordTag(.table)) return .{ .unsupported = .drop_foreign_table };
         if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .ddl = .drop_materialized_view };
-        if (second.matchesKeywordTag(.policy)) return .{ .unsupported = .drop_policy };
+        if (second.matchesKeywordTag(.policy)) return .{ .ddl = .drop_policy };
         if (second.matchesKeywordTag(.rule)) return .{ .unsupported = .drop_rule };
         if (second.matchesKeywordTag(.server)) return .{ .unsupported = .drop_server };
         if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .drop_trigger };
@@ -2531,6 +2534,20 @@ fn buildDdlAst(
                 }
             }
         },
+        .create_policy => {
+            if (end > 4 and tokens[1].matchesKeywordTag(.policy)) {
+                ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 2, end);
+                if (ast.object_name_tokens) |policy_range| {
+                    index = policy_range.end;
+                    if (index < end and tokens[index].matchesKeywordTag(.on)) {
+                        ast.index_table_tokens = generatedQualifiedNameRange(tokens, index + 1, end);
+                        if (ast.index_table_tokens) |table_range| {
+                            if (table_range.end < end) ast.alter_table_operation_tokens = .{ .start = table_range.end, .end = end };
+                        }
+                    }
+                }
+            }
+        },
         .create_index => {
             if (tokens.len > 2 and tokens[1].matchesKeywordTag(.unique) and tokens[2].matchesKeywordTag(.index)) {
                 ast.unique = true;
@@ -2658,6 +2675,20 @@ fn buildDdlAst(
                 }
             }
         },
+        .alter_policy => {
+            if (end > 4 and tokens[1].matchesKeywordTag(.policy)) {
+                ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 2, end);
+                if (ast.object_name_tokens) |policy_range| {
+                    index = policy_range.end;
+                    if (index < end and tokens[index].matchesKeywordTag(.on)) {
+                        ast.index_table_tokens = generatedQualifiedNameRange(tokens, index + 1, end);
+                        if (ast.index_table_tokens) |table_range| {
+                            if (table_range.end < end) ast.alter_table_operation_tokens = .{ .start = table_range.end, .end = end };
+                        }
+                    }
+                }
+            }
+        },
         .drop_database => {
             ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
             ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
@@ -2705,6 +2736,19 @@ fn buildDdlAst(
         .drop_subscription => {
             ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
             ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
+        },
+        .drop_policy => {
+            ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
+            ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
+            if (ast.object_name_tokens) |policy_range| {
+                index = policy_range.end;
+                if (index < end and tokens[index].matchesKeywordTag(.on)) {
+                    ast.index_table_tokens = generatedQualifiedNameRange(tokens, index + 1, end);
+                    if (ast.index_table_tokens) |table_range| {
+                        ast.cascade = findKeyword(tokens, table_range.end, end, .cascade) != null;
+                    }
+                }
+            }
         },
         .drop_index => {
             ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
