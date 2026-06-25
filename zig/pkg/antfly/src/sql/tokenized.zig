@@ -1574,6 +1574,7 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .create_server,
         .create_statistics,
         .create_text_search_configuration,
+        .create_transform,
         .create_user_mapping,
         .do_block,
         .drop_access_method,
@@ -1589,6 +1590,7 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .drop_server,
         .drop_statistics,
         .drop_text_search_configuration,
+        .drop_transform,
         .drop_user_mapping,
         .load,
         .move,
@@ -2344,6 +2346,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .create_text_search_configuration_not_planned_by_generated_parser,
         },
         .{
+            .sql = "CREATE TRANSFORM FOR jsonb LANGUAGE plpgsql FROM SQL WITH FUNCTION jsonb_to_plpgsql(internal)",
+            .kind = .create_transform,
+            .reason = .create_transform_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "CREATE TRIGGER usage_audit BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage()",
             .kind = .create_trigger,
             .reason = .create_trigger_not_planned_by_generated_parser,
@@ -2407,6 +2414,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "DROP TEXT SEARCH CONFIGURATION IF EXISTS usage_search",
             .kind = .drop_text_search_configuration,
             .reason = .drop_text_search_configuration_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "DROP TRANSFORM FOR jsonb LANGUAGE plpgsql",
+            .kind = .drop_transform,
+            .reason = .drop_transform_not_planned_by_generated_parser,
         },
         .{
             .sql = "FETCH FROM usage_cursor",

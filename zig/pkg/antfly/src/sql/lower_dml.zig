@@ -12642,13 +12642,7 @@ fn validateGeneratedChildReadRangeAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     range: generated_parser.GeneratedSqlTokenRange,
 ) !void {
-    const tokens = parsed_sql.items();
-    if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
-    const source_start = tokens[range.start].source_start;
-    const source_end = tokens[range.end - 1].source_end;
-    const sql = parsed_sql.sql();
-    if (source_start >= source_end or source_end > sql.len) return error.UnsupportedSqlShape;
-    var child = tokenized.ParsedSql.initAlloc(alloc, sql[source_start..source_end]) catch |err| switch (err) {
+    var child = tokenized.ParsedSql.initChildStatementAlloc(alloc, parsed_sql, range.start, range.end) catch |err| switch (err) {
         error.UnsupportedSqlShape, error.UnexpectedToken => return error.UnsupportedSqlShape,
         else => return err,
     };
@@ -13130,23 +13124,8 @@ fn validateGeneratedDmlRelationSourceBodyAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     ast: generated_parser.GeneratedSqlDmlAst,
 ) !void {
+    _ = alloc;
     try validateGeneratedDmlRelationSourceBodyAst(parsed_sql.items(), ast);
-    const source_range = ast.source_tokens orelse return error.UnsupportedSqlShape;
-    const tokens = parsed_sql.items();
-    if (source_range.start >= source_range.end or source_range.end > tokens.len) return error.UnsupportedSqlShape;
-    const source_start = tokens[source_range.start].source_start;
-    const source_end = tokens[source_range.end - 1].source_end;
-    const sql = parsed_sql.sql();
-    if (source_start >= source_end or source_end > sql.len) return error.UnsupportedSqlShape;
-
-    const wrapped_source = try std.fmt.allocPrint(alloc, "SELECT * FROM {s}", .{sql[source_start..source_end]});
-    defer alloc.free(wrapped_source);
-    var child = tokenized.ParsedSql.initAlloc(alloc, wrapped_source) catch |err| switch (err) {
-        error.UnsupportedSqlShape, error.UnexpectedToken => return error.UnsupportedSqlShape,
-        else => return err,
-    };
-    defer child.deinit(alloc);
-    try validateGeneratedChildReadParsedSql(&child);
 }
 
 fn validateGeneratedDmlRelationSourceBodyAst(

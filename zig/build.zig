@@ -3033,6 +3033,7 @@ pub fn build(b: *std.Build) void {
         "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime planned ",
         "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime query ",
         "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime role ",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime operations ",
         "graph metric order and filter dependencies attach status without projection",
         "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime lease ",
         "graph metric failed planned build cleans abandoned scores and job namespace",
@@ -3203,6 +3204,8 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_graph_metric_operations_tests = b.addRunArtifact(graph_metric_operations_tests);
+    const graph_metric_operations_step = b.step("graph-metric-operations-test", "Run focused graph metric operation tests");
+    graph_metric_operations_step.dependOn(&run_graph_metric_operations_tests.step);
     for (root_test_skip_filters) |filter| {
         run_graph_metric_lifecycle_tests.addArgs(&.{ "--skip-test-filter", filter });
         run_graph_metric_operations_tests.addArgs(&.{ "--skip-test-filter", filter });

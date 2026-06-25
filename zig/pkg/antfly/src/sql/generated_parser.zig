@@ -206,6 +206,7 @@ pub const GeneratedSqlUnsupportedKind = enum {
     create_subscription,
     create_statistics,
     create_text_search_configuration,
+    create_transform,
     create_trigger,
     create_user_mapping,
     declare,
@@ -219,6 +220,7 @@ pub const GeneratedSqlUnsupportedKind = enum {
     drop_owned,
     drop_statistics,
     drop_text_search_configuration,
+    drop_transform,
     drop_user_mapping,
     explain,
     fetch,
@@ -286,6 +288,7 @@ pub const GeneratedSqlUnsupportedReason = enum {
     create_subscription_not_planned_by_generated_parser,
     create_statistics_not_planned_by_generated_parser,
     create_text_search_configuration_not_planned_by_generated_parser,
+    create_transform_not_planned_by_generated_parser,
     create_trigger_not_planned_by_generated_parser,
     create_user_mapping_not_planned_by_generated_parser,
     declare_not_planned_by_generated_parser,
@@ -299,6 +302,7 @@ pub const GeneratedSqlUnsupportedReason = enum {
     drop_owned_not_planned_by_generated_parser,
     drop_statistics_not_planned_by_generated_parser,
     drop_text_search_configuration_not_planned_by_generated_parser,
+    drop_transform_not_planned_by_generated_parser,
     drop_user_mapping_not_planned_by_generated_parser,
     explain_not_planned_by_generated_parser,
     fetch_not_planned_by_generated_parser,
@@ -1871,6 +1875,7 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CREATE STATISTICS usage_stats ON tenant_id, status FROM usage_records", .kind = .unsupported },
     .{ .sql = "CREATE TRIGGER usage_audit BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage()", .kind = .unsupported },
     .{ .sql = "CREATE TEXT SEARCH CONFIGURATION usage_search (COPY = pg_catalog.english)", .kind = .unsupported },
+    .{ .sql = "CREATE TRANSFORM FOR jsonb LANGUAGE plpgsql FROM SQL WITH FUNCTION jsonb_to_plpgsql(internal)", .kind = .unsupported },
     .{ .sql = "CREATE USER MAPPING FOR usage_user SERVER usage_server OPTIONS (user 'remote')", .kind = .unsupported },
     .{ .sql = "DECLARE usage_cursor NO SCROLL CURSOR FOR SELECT id FROM usage_records", .kind = .unsupported },
     .{ .sql = "DO 'BEGIN NULL; END'", .kind = .unsupported },
@@ -1883,6 +1888,7 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "DROP OWNED BY usage_role CASCADE", .kind = .unsupported },
     .{ .sql = "DROP STATISTICS IF EXISTS usage_stats", .kind = .unsupported },
     .{ .sql = "DROP TEXT SEARCH CONFIGURATION IF EXISTS usage_search", .kind = .unsupported },
+    .{ .sql = "DROP TRANSFORM FOR jsonb LANGUAGE plpgsql", .kind = .unsupported },
     .{ .sql = "EXPLAIN", .kind = .unsupported },
     .{ .sql = "EXPLAIN SELECT id FROM usage_records", .kind = .unsupported },
     .{ .sql = "EXPLAIN ANALYZE INSERT INTO usage_records (id) VALUES ('u1')", .kind = .unsupported },
@@ -2156,6 +2162,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.server)) return .{ .unsupported = .create_server };
         if (second.matchesKeyword("statistics")) return .{ .unsupported = .create_statistics };
         if (second.matchesKeywordTag(.text) and tokens.len > 3 and tokens[2].matchesKeyword("search") and tokens[3].matchesKeyword("configuration")) return .{ .unsupported = .create_text_search_configuration };
+        if (second.matchesKeyword("transform")) return .{ .unsupported = .create_transform };
         if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .create_trigger };
         if (second.matchesKeyword("user") and tokens.len > 2 and tokens[2].matchesKeyword("mapping")) return .{ .unsupported = .create_user_mapping };
         if (second.matchesKeywordTag(.extension)) return .{ .extension_index = .create_extension };
@@ -2244,6 +2251,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.server)) return .{ .unsupported = .drop_server };
         if (second.matchesKeyword("statistics")) return .{ .unsupported = .drop_statistics };
         if (second.matchesKeywordTag(.text) and tokens.len > 3 and tokens[2].matchesKeyword("search") and tokens[3].matchesKeyword("configuration")) return .{ .unsupported = .drop_text_search_configuration };
+        if (second.matchesKeyword("transform")) return .{ .unsupported = .drop_transform };
         if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .drop_trigger };
         if (second.matchesKeyword("user") and tokens.len > 2 and tokens[2].matchesKeyword("mapping")) return .{ .unsupported = .drop_user_mapping };
     }
@@ -2445,6 +2453,7 @@ fn buildUnsupportedAst(
             .create_subscription => .create_subscription_not_planned_by_generated_parser,
             .create_statistics => .create_statistics_not_planned_by_generated_parser,
             .create_text_search_configuration => .create_text_search_configuration_not_planned_by_generated_parser,
+            .create_transform => .create_transform_not_planned_by_generated_parser,
             .create_trigger => .create_trigger_not_planned_by_generated_parser,
             .create_user_mapping => .create_user_mapping_not_planned_by_generated_parser,
             .declare => .declare_not_planned_by_generated_parser,
@@ -2458,6 +2467,7 @@ fn buildUnsupportedAst(
             .drop_owned => .drop_owned_not_planned_by_generated_parser,
             .drop_statistics => .drop_statistics_not_planned_by_generated_parser,
             .drop_text_search_configuration => .drop_text_search_configuration_not_planned_by_generated_parser,
+            .drop_transform => .drop_transform_not_planned_by_generated_parser,
             .drop_user_mapping => .drop_user_mapping_not_planned_by_generated_parser,
             .explain => .explain_not_planned_by_generated_parser,
             .fetch => .fetch_not_planned_by_generated_parser,
@@ -6538,6 +6548,8 @@ test "generated SQL parser facade exposes typed read and unsupported statement n
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .notify }, (try parseSqlAlloc(alloc, "NOTIFY usage_events, 'changed'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_statistics }, (try parseSqlAlloc(alloc, "CREATE STATISTICS usage_stats ON tenant_id, status FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_text_search_configuration }, (try parseSqlAlloc(alloc, "CREATE TEXT SEARCH CONFIGURATION usage_search (COPY = pg_catalog.english)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_transform }, (try parseSqlAlloc(alloc, "CREATE TRANSFORM FOR jsonb LANGUAGE plpgsql FROM SQL WITH FUNCTION jsonb_to_plpgsql(internal)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_transform }, (try parseSqlAlloc(alloc, "DROP TRANSFORM FOR jsonb LANGUAGE plpgsql")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .vacuum }, (try parseSqlAlloc(alloc, "VACUUM FULL usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .reindex }, (try parseSqlAlloc(alloc, "REINDEX INDEX usage_records_status_idx")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .release }, (try parseSqlAlloc(alloc, "RELEASE SAVEPOINT usage_batch")).statement);
@@ -10209,6 +10221,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 10 },
         },
         .{
+            .sql = "CREATE TRANSFORM FOR jsonb LANGUAGE plpgsql FROM SQL WITH FUNCTION jsonb_to_plpgsql(internal)",
+            .kind = .create_transform,
+            .reason = .create_transform_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 14 },
+        },
+        .{
             .sql = "CREATE TRIGGER usage_audit BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage()",
             .kind = .create_trigger,
             .reason = .create_trigger_not_planned_by_generated_parser,
@@ -10285,6 +10303,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .kind = .drop_text_search_configuration,
             .reason = .drop_text_search_configuration_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 7 },
+        },
+        .{
+            .sql = "DROP TRANSFORM FOR jsonb LANGUAGE plpgsql",
+            .kind = .drop_transform,
+            .reason = .drop_transform_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 6 },
         },
         .{
             .sql = "GRANT SELECT ON TABLE usage_records TO readonly",
