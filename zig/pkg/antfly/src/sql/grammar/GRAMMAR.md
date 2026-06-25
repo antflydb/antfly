@@ -71,7 +71,10 @@ plans, including `ON CONFLICT` actions and field/all-field/expression
 AST ranges into relational row batches. Supported explicit-column
 `INSERT ... SELECT` plans, including `ON CONFLICT` actions and returning lists,
 now validate generated source, conflict, and returning ranges before direct
-insert-source lowering. Single-table point `UPDATE` and `DELETE` statements with generated
+insert-source lowering, with generated-direct coverage for non-CTE computed
+source projections, expression predicates, ordering, pagination, `RETURNING *`
+plus expressions, cross-table sources, and conflict-update predicates and
+expressions. Single-table point `UPDATE` and `DELETE` statements with generated
 `WHERE` ranges and field/all-field/expression `RETURNING` lists now also lower
 directly from generated AST ranges into relational row batches. Table-wide and
 single-table source `UPDATE` and `DELETE` statements without joined
@@ -94,9 +97,9 @@ AST-to-plan wrapper that fails closed if the generated DML family does not
 match the existing write classifier before delegating to the current typed DML
 lowerer. Unsupported DML still falls back, and deeper DML cutover still
 requires replacing token-based command-body parsing with complete generated AST
-payloads for broader `INSERT ... SELECT` source bodies, richer joined mutation
-source bodies beyond the promoted semijoin surface, and CTE/recursive
-`MERGE` forms.
+payloads for CTE/recursive DML, insert-select source bodies that need generated
+read-body ASTs beyond statement ranges, richer joined mutation source bodies
+beyond the promoted semijoin surface, and CTE/recursive `MERGE` forms.
 Representative
 read queries now have generated-parser corpus coverage, retained generated raw
 and AST nodes for covered read statements, top-level generated AST ranges for
@@ -331,7 +334,10 @@ Unsupported DDL remains on the existing parser until
    generated AST-to-plan lowerer for default row batches with conflict actions
    and returning lists; supported explicit-column `INSERT ... SELECT` has a
    generated range-validated direct insert-source lowerer for same-table and
-   configured cross-table sources, conflict actions, and returning lists;
+   configured cross-table sources, conflict actions, conflict-update
+   predicates and expressions, computed source projections, expression
+   predicates, ordering, pagination, and returning lists including
+   `RETURNING *` plus expressions;
    single-table point `UPDATE` and `DELETE` have direct
    generated AST-to-plan lowerers for generated primary/unique selector ranges
    with field, all-field, and expression returning lists; table-wide and
@@ -358,9 +364,11 @@ Unsupported DDL remains on the existing parser until
    truncate, and merge now use generated fail-closed diagnostics instead of
    classifier fallback.
    Switching the full DML family from fallback to required generated parsing
-   still requires generated command-body ASTs for broader insert-select source bodies,
-   richer joined mutation source bodies beyond the promoted semijoin surface,
-   CTE/recursive merge forms, and broader unsupported-shape diagnostics.
+   still requires generated command-body ASTs for CTE/recursive DML,
+   insert-select source bodies that need generated read-body ASTs beyond
+   statement ranges, richer joined mutation source bodies beyond the promoted
+   semijoin surface, CTE/recursive merge forms, and broader unsupported-shape
+   diagnostics.
 4. Read queries: projections, predicates, joins, CTEs, aggregates, windows,
    set operations, lateral, ordering, limits, and document-table sources.
    Initial generated-parser coverage now retains raw and AST read nodes for

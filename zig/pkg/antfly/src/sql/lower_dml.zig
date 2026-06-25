@@ -12344,6 +12344,23 @@ fn lowerGeneratedDmlWritePlanForDmlTestAlloc(
     return try lowerWritePlanFromGeneratedDmlAstDirectAlloc(alloc, &parsed_sql, dml_ast, schema, params, options);
 }
 
+fn lowerGeneratedInsertSourceForDmlTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+) !plan_mod.LoweredInsertSource {
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    const generated_raw = parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    const dml_ast = switch (generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .dml => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    return try insertSourceFromGeneratedDmlAstAlloc(alloc, &parsed_sql, dml_ast, schema, params, options);
+}
+
 fn lowerGeneratedMergeForDmlTestAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
@@ -13765,6 +13782,69 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
     try std.testing.expectEqualStrings("archive_id", generated_cross_insert_source.insert_source.req.assignments[0].expression.field);
     try std.testing.expectEqual(@as(usize, 1), generated_cross_insert_source.insert_source.req.source.predicates.len);
     try std.testing.expectEqualStrings("archive_status", generated_cross_insert_source.insert_source.req.source.predicates[0].field);
+
+    var generated_rich_insert_source = try lowerGeneratedInsertSourceForDmlTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, quantity) SELECT id, lower(status) AS status, quantity + 1 AS quantity FROM usage_records WHERE lower(status) LIKE ANY(ARRAY['ready%', 'queued%']) ORDER BY quantity DESC LIMIT 5 OFFSET 2 RETURNING *, lower(status) AS status_key",
+        schema,
+        &.{},
+        options,
+    );
+    defer generated_rich_insert_source.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", generated_rich_insert_source.table_name);
+    try std.testing.expectEqualStrings("usage_records", generated_rich_insert_source.insert_source.req.source_table);
+    try std.testing.expectEqual(@as(usize, 3), generated_rich_insert_source.insert_source.req.assignments.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, generated_rich_insert_source.insert_source.req.assignments[1].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, generated_rich_insert_source.insert_source.req.assignments[2].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), generated_rich_insert_source.insert_source.req.source.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_or, generated_rich_insert_source.insert_source.req.source.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), generated_rich_insert_source.insert_source.req.source.order_by.len);
+    try std.testing.expectEqual(@as(?u32, 5), generated_rich_insert_source.insert_source.req.source.limit);
+    try std.testing.expectEqual(@as(u32, 2), generated_rich_insert_source.insert_source.req.source.offset);
+    try std.testing.expect(generated_rich_insert_source.insert_source.req.returning_all);
+    try std.testing.expectEqual(@as(usize, 1), generated_rich_insert_source.insert_source.req.returning_expressions.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_rich_insert_source.returning_expression_count);
+    try std.testing.expect(generated_rich_insert_source.returning_all);
+
+    var generated_conflict_insert_source = try lowerGeneratedInsertSourceForDmlTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, quantity) SELECT id, status, quantity FROM usage_records WHERE status = 'ready' ON CONFLICT (id) DO UPDATE SET quantity = excluded.quantity WHERE excluded.quantity > quantity RETURNING id, quantity",
+        schema,
+        &.{},
+        options,
+    );
+    defer generated_conflict_insert_source.deinit(alloc);
+    const generated_insert_source_conflict = generated_conflict_insert_source.insert_source.req.on_conflict orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsConflictAction.update, generated_insert_source_conflict.action);
+    try std.testing.expectEqual(@as(usize, 0), generated_insert_source_conflict.operations.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_insert_source_conflict.patch_expressions.len);
+    try std.testing.expectEqualStrings("quantity", generated_insert_source_conflict.patch_expressions[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, generated_insert_source_conflict.patch_expressions[0].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.proposed, generated_insert_source_conflict.patch_expressions[0].expression.field_source);
+    const generated_insert_source_conflict_where = generated_insert_source_conflict.where_expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, generated_insert_source_conflict_where.op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.proposed, generated_insert_source_conflict_where.lhs.field_source);
+    try std.testing.expectEqual(@as(usize, 1), generated_insert_source_conflict_where.rhs.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.existing, generated_insert_source_conflict_where.rhs[0].field_source);
+
+    var generated_rich_cross_insert_source = try lowerGeneratedInsertSourceForDmlTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, quantity) SELECT archive_id, lower(archive_status) AS status, archive_quantity + 1 AS quantity FROM archived_records WHERE lower(archive_status) = 'ready' ORDER BY archive_quantity DESC LIMIT 2 RETURNING id, status",
+        schema,
+        &.{},
+        cross_source_options,
+    );
+    defer generated_rich_cross_insert_source.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", generated_rich_cross_insert_source.table_name);
+    try std.testing.expectEqualStrings("archived_records", generated_rich_cross_insert_source.insert_source.req.source_table);
+    try std.testing.expectEqual(@as(usize, 3), generated_rich_cross_insert_source.insert_source.req.assignments.len);
+    try std.testing.expectEqualStrings("archive_id", generated_rich_cross_insert_source.insert_source.req.assignments[0].expression.field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, generated_rich_cross_insert_source.insert_source.req.assignments[1].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, generated_rich_cross_insert_source.insert_source.req.assignments[2].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), generated_rich_cross_insert_source.insert_source.req.source.expression_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_rich_cross_insert_source.insert_source.req.source.order_by.len);
+    try std.testing.expectEqual(@as(?u32, 2), generated_rich_cross_insert_source.insert_source.req.source.limit);
+    try std.testing.expectEqual(@as(usize, 2), generated_rich_cross_insert_source.insert_source.req.returning.len);
 
     var parsed_generated_update = try tokenized.ParsedSql.initAlloc(
         alloc,
