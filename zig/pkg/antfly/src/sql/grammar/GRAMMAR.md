@@ -91,6 +91,11 @@ Tablespace catalog DDL heads, including `CREATE TABLESPACE`,
 `ALTER TABLESPACE ... RENAME TO ...`, and `DROP TABLESPACE`, now use the
 generated DDL boundary with retained tablespace-name and option/rename-tail
 metadata before delegating to the existing typed tablespace catalog planner.
+Logical-replication catalog DDL heads, including
+`CREATE`/`ALTER`/`DROP PUBLICATION` and
+`CREATE`/`ALTER`/`DROP SUBSCRIPTION`, now use the generated DDL boundary with
+retained object-name and operation-tail metadata before delegating to the
+existing typed logical-replication catalog planner.
 Generated
 `CREATE INDEX` ASTs also retain
 `UNIQUE`, method, element-list, covering-index `INCLUDE (...)`, options, and
@@ -103,10 +108,12 @@ name spans before delegating to the existing relation-population planner.
 Incomplete covered DDL clause-boundary shapes for `CREATE TABLE`, lifetime
 prefixed `CREATE [TEMP|TEMPORARY|UNLOGGED] TABLE`, `CREATE VIEW`,
 `CREATE DOMAIN`, `CREATE SEQUENCE`, `CREATE TYPE`, `CREATE TABLESPACE`,
+`CREATE PUBLICATION`, `CREATE SUBSCRIPTION`,
 `CREATE INDEX`, `ALTER TABLE`, `ALTER SCHEMA`, `ALTER TABLESPACE`,
-`ALTER VIEW`, `ALTER DOMAIN`, `ALTER SEQUENCE`, `ALTER TYPE`, `DROP TABLE`,
-`DROP VIEW`, `DROP DOMAIN`, `DROP SEQUENCE`, `DROP TYPE`, and
-`DROP TABLESPACE` now fail closed through the generated parser instead of
+`ALTER PUBLICATION`, `ALTER SUBSCRIPTION`, `ALTER VIEW`, `ALTER DOMAIN`,
+`ALTER SEQUENCE`, `ALTER TYPE`, `DROP TABLE`, `DROP VIEW`, `DROP DOMAIN`,
+`DROP SEQUENCE`, `DROP TYPE`, `DROP TABLESPACE`, `DROP PUBLICATION`, and
+`DROP SUBSCRIPTION` now fail closed through the generated parser instead of
 falling back to the legacy DDL classifier, while rich DDL syntax that is not
 yet generated-covered still falls back to the existing typed DDL parser.
 Simple DML now has generated-parser corpus
@@ -346,8 +353,8 @@ Unsupported generated diagnostics also cover PostgreSQL materialized-view DDL
 entry points, including `CREATE MATERIALIZED VIEW`, `ALTER MATERIALIZED VIEW`,
 `DROP MATERIALIZED VIEW`, and `REFRESH MATERIALIZED VIEW`; procedural blocks
 with `DO`; foreign-table DDL; trigger and rewrite-rule DDL, including
-`ALTER TRIGGER` and `ALTER RULE`; row-security policy DDL; logical-replication
-publication and subscription DDL; and foreign-server DDL. These common
+`ALTER TRIGGER` and `ALTER RULE`; row-security policy DDL; and foreign-server
+DDL. These common
 unsupported PostgreSQL dump/admin shapes now have stable unsupported AST
 reasons instead of generic parser fallback. Legacy-supported materialized-view
 catalog operations now use those generated unsupported AST nodes as a validated
@@ -361,9 +368,7 @@ policy predicates that require parser-context function bindings, before
 delegating to the typed row-security catalog planner. Notification channel
 commands also use the validated unsupported boundary for `LISTEN`, `NOTIFY`,
 and `UNLISTEN` before delegating to typed notification catalog planning.
-Logical-replication catalog commands use the same boundary for
-`CREATE`/`ALTER`/`DROP PUBLICATION` and `CREATE`/`ALTER`/`DROP SUBSCRIPTION`;
-authorization and utility commands use it for `GRANT`, `REVOKE`, `COMMENT`,
+Authorization and utility commands use it for `GRANT`, `REVOKE`, `COMMENT`,
 `CALL`, and `LOCK`; and update-policy trigger commands use it for
 `CREATE TRIGGER` and `DROP TRIGGER`. Maintenance commands use the same
 validated generated unsupported boundary for `VACUUM`, `ANALYZE`, `REINDEX`,
@@ -1035,6 +1040,9 @@ Generated grammar work needs evidence at multiple levels:
   generated schema namespace rename DDL for `ALTER SCHEMA ... RENAME TO ...`,
   generated tablespace catalog DDL for `CREATE TABLESPACE`, `ALTER TABLESPACE`,
   and `DROP TABLESPACE`,
+  generated logical-replication catalog DDL for
+  `CREATE`/`ALTER`/`DROP PUBLICATION` and
+  `CREATE`/`ALTER`/`DROP SUBSCRIPTION`,
   `DROP INDEX`, generated domain catalog DDL for `CREATE DOMAIN`,
   `ALTER DOMAIN`, and `DROP DOMAIN`, generated sequence catalog DDL for
   `CREATE SEQUENCE`, `ALTER SEQUENCE`, and `DROP SEQUENCE`, generated

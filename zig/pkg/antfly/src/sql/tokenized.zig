@@ -466,6 +466,12 @@ fn isIncompleteGeneratedDdlBoundary(tokens: []const Token, raw_statement: RawSql
             if (end <= start + 3) return true;
             return isGeneratedDdlTrailingBoundary(last);
         }
+        if (tokenMatchesKeyword(tokens[start + 1], .publication) or
+            tokenMatchesKeyword(tokens[start + 1], .subscription))
+        {
+            if (end <= start + 3) return true;
+            return isGeneratedDdlTrailingBoundary(last);
+        }
         if (tokenMatchesKeyword(tokens[start + 1], .index)) {
             if (end <= start + 3) return true;
             return isGeneratedDdlTrailingBoundary(last);
@@ -506,6 +512,12 @@ fn isIncompleteGeneratedDdlBoundary(tokens: []const Token, raw_statement: RawSql
         if (end <= start + 3) return true;
         return isGeneratedDdlTrailingBoundary(last);
     }
+    if (tokenMatchesKeyword(first, .alter) and
+        (tokenMatchesKeyword(tokens[start + 1], .publication) or tokenMatchesKeyword(tokens[start + 1], .subscription)))
+    {
+        if (end <= start + 3) return true;
+        return isGeneratedDdlTrailingBoundary(last);
+    }
     if (tokenMatchesKeyword(first, .drop)) {
         if (tokenMatchesKeyword(tokens[start + 1], .table) or
             tokenMatchesKeyword(tokens[start + 1], .view) or
@@ -513,6 +525,8 @@ fn isIncompleteGeneratedDdlBoundary(tokens: []const Token, raw_statement: RawSql
             tokenMatchesKeyword(tokens[start + 1], .sequence) or
             tokenMatchesKeyword(tokens[start + 1], .type) or
             tokenMatchesKeyword(tokens[start + 1], .tablespace) or
+            tokenMatchesKeyword(tokens[start + 1], .publication) or
+            tokenMatchesKeyword(tokens[start + 1], .subscription) or
             tokenMatchesKeyword(tokens[start + 1], .index) or
             tokenMatchesKeyword(tokens[start + 1], .database) or
             tokenMatchesKeyword(tokens[start + 1], .schema) or
@@ -533,6 +547,7 @@ fn isGeneratedDdlTrailingBoundary(token: Token) bool {
         tokenMatchesKeyword(token, .only) or
         tokenMatchesKeyword(token, .on) or
         tokenMatchesKeyword(token, .using) or
+        tokenMatchesKeyword(token, .@"for") or
         tokenMatchesKeyword(token, .with) or
         tokenMatchesKeyword(token, .where) or
         tokenMatchesKeyword(token, .include) or
@@ -547,10 +562,15 @@ fn isGeneratedDdlTrailingBoundary(token: Token) bool {
         tokenMatchesKeyword(token, .default) or
         tokenMatchesKeyword(token, .null) or
         tokenMatchesKeyword(token, .to) or
+        tokenMatchesKeyword(token, .table) or
+        tokenMatchesKeyword(token, .publication) or
         tokenMatchesKeyword(token, .as) or
         tokenMatchesKeyword(token, .restart) or
         tokenMatchesKeyword(token, .by) or
-        tokenMatchesKeyword(token, .no);
+        tokenMatchesKeyword(token, .no) or
+        tokenMatchesText(token, "connection") or
+        tokenMatchesText(token, "enable") or
+        tokenMatchesText(token, "disable");
 }
 
 fn isIncompleteGeneratedReadBoundary(tokens: []const Token, raw_statement: RawSqlStatement) bool {
@@ -1396,6 +1416,14 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE TABLESPACE"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER TABLESPACE fastspace RENAME TO"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP TABLESPACE IF EXISTS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE PUBLICATION"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE PUBLICATION usage_pub FOR"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER PUBLICATION usage_pub ADD"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP PUBLICATION IF EXISTS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE SUBSCRIPTION"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE SUBSCRIPTION usage_sub CONNECTION"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER SUBSCRIPTION usage_sub"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP SUBSCRIPTION IF EXISTS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT DISTINCT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT DISTINCT ON ("));
@@ -1672,11 +1700,6 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .alter_policy_not_planned_by_generated_parser,
         },
         .{
-            .sql = "ALTER PUBLICATION usage_pub ADD TABLE usage_records",
-            .kind = .alter_publication,
-            .reason = .alter_publication_not_planned_by_generated_parser,
-        },
-        .{
             .sql = "ALTER RULE usage_insert ON usage_records RENAME TO usage_insert_v2",
             .kind = .alter_rule,
             .reason = .alter_rule_not_planned_by_generated_parser,
@@ -1685,11 +1708,6 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "ALTER SERVER usage_server VERSION '15'",
             .kind = .alter_server,
             .reason = .alter_server_not_planned_by_generated_parser,
-        },
-        .{
-            .sql = "ALTER SUBSCRIPTION usage_sub DISABLE",
-            .kind = .alter_subscription,
-            .reason = .alter_subscription_not_planned_by_generated_parser,
         },
         .{
             .sql = "ALTER TRIGGER usage_audit ON usage_records RENAME TO usage_audit_v2",
@@ -1742,11 +1760,6 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .create_policy_not_planned_by_generated_parser,
         },
         .{
-            .sql = "CREATE PUBLICATION usage_pub FOR TABLE usage_records",
-            .kind = .create_publication,
-            .reason = .create_publication_not_planned_by_generated_parser,
-        },
-        .{
             .sql = "CREATE RULE usage_insert AS ON INSERT TO usage_records DO ALSO NOTIFY usage_events",
             .kind = .create_rule,
             .reason = .create_rule_not_planned_by_generated_parser,
@@ -1755,11 +1768,6 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "CREATE SERVER usage_server FOREIGN DATA WRAPPER postgres_fdw",
             .kind = .create_server,
             .reason = .create_server_not_planned_by_generated_parser,
-        },
-        .{
-            .sql = "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=example dbname=usage' PUBLICATION usage_pub",
-            .kind = .create_subscription,
-            .reason = .create_subscription_not_planned_by_generated_parser,
         },
         .{
             .sql = "CREATE TRIGGER usage_audit BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage()",
@@ -1867,11 +1875,6 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .drop_policy_not_planned_by_generated_parser,
         },
         .{
-            .sql = "DROP PUBLICATION IF EXISTS usage_pub",
-            .kind = .drop_publication,
-            .reason = .drop_publication_not_planned_by_generated_parser,
-        },
-        .{
             .sql = "DROP RULE IF EXISTS usage_insert ON usage_records",
             .kind = .drop_rule,
             .reason = .drop_rule_not_planned_by_generated_parser,
@@ -1880,11 +1883,6 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "DROP SERVER IF EXISTS usage_server CASCADE",
             .kind = .drop_server,
             .reason = .drop_server_not_planned_by_generated_parser,
-        },
-        .{
-            .sql = "DROP SUBSCRIPTION IF EXISTS usage_sub",
-            .kind = .drop_subscription,
-            .reason = .drop_subscription_not_planned_by_generated_parser,
         },
         .{
             .sql = "DROP TRIGGER IF EXISTS usage_audit ON usage_records",
@@ -2201,6 +2199,102 @@ test "sql adapter parsed sql owns typed statement variants" {
         else => return error.TestUnexpectedResult,
     }
     switch (drop_tablespace.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var create_publication = try ParsedSql.initAlloc(alloc, "CREATE PUBLICATION usage_pub FOR TABLE usage_records");
+    defer create_publication.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, create_publication.generatedStatementKind().?);
+    switch (create_publication.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_publication, ddl_ast.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 6 }, ddl_ast.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (create_publication.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var alter_publication = try ParsedSql.initAlloc(alloc, "ALTER PUBLICATION usage_pub ADD TABLE usage_events");
+    defer alter_publication.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, alter_publication.generatedStatementKind().?);
+    switch (alter_publication.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_publication, ddl_ast.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 6 }, ddl_ast.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (alter_publication.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_publication = try ParsedSql.initAlloc(alloc, "DROP PUBLICATION IF EXISTS usage_pub");
+    defer drop_publication.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, drop_publication.generatedStatementKind().?);
+    switch (drop_publication.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.drop_publication, ddl_ast.kind);
+            try std.testing.expect(ddl_ast.if_exists);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl_ast.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (drop_publication.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var create_subscription = try ParsedSql.initAlloc(alloc, "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=db' PUBLICATION usage_pub");
+    defer create_subscription.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, create_subscription.generatedStatementKind().?);
+    switch (create_subscription.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_subscription, ddl_ast.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 7 }, ddl_ast.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (create_subscription.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var alter_subscription = try ParsedSql.initAlloc(alloc, "ALTER SUBSCRIPTION usage_sub DISABLE");
+    defer alter_subscription.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, alter_subscription.generatedStatementKind().?);
+    switch (alter_subscription.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_subscription, ddl_ast.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 4 }, ddl_ast.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (alter_subscription.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_subscription = try ParsedSql.initAlloc(alloc, "DROP SUBSCRIPTION IF EXISTS usage_sub");
+    defer drop_subscription.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, drop_subscription.generatedStatementKind().?);
+    switch (drop_subscription.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.drop_subscription, ddl_ast.kind);
+            try std.testing.expect(ddl_ast.if_exists);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl_ast.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (drop_subscription.statement) {
         .ddl => {},
         else => return error.TestUnexpectedResult,
     }

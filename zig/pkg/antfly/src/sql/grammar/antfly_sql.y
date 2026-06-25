@@ -92,6 +92,8 @@ ddl_statement:
   | create_sequence_statement
   | create_type_statement
   | create_tablespace_statement
+  | create_publication_statement
+  | create_subscription_statement
   | create_index_statement
   | create_extension_statement
   | alter_table_statement
@@ -101,6 +103,8 @@ ddl_statement:
   | alter_type_statement
   | alter_schema_statement
   | alter_tablespace_statement
+  | alter_publication_statement
+  | alter_subscription_statement
   | drop_statement
   | relation_population_statement
   ;
@@ -150,6 +154,14 @@ create_type_statement:
 
 create_tablespace_statement:
     CREATE TABLESPACE qualified_name diagnostic_tail
+  ;
+
+create_publication_statement:
+    CREATE PUBLICATION qualified_name diagnostic_tail
+  ;
+
+create_subscription_statement:
+    CREATE SUBSCRIPTION qualified_name diagnostic_tail
   ;
 
 relation_population_statement:
@@ -221,6 +233,14 @@ alter_tablespace_statement:
     ALTER TABLESPACE qualified_name RENAME TO qualified_name
   ;
 
+alter_publication_statement:
+    ALTER PUBLICATION qualified_name diagnostic_tail
+  ;
+
+alter_subscription_statement:
+    ALTER SUBSCRIPTION qualified_name diagnostic_tail
+  ;
+
 alter_table_relation_prefix_opt:
     /* empty */
   | IF EXISTS
@@ -239,6 +259,8 @@ drop_statement:
   | DROP SEQUENCE if_exists_opt qualified_name drop_behavior_opt
   | DROP TYPE if_exists_opt qualified_name drop_behavior_opt
   | DROP TABLESPACE if_exists_opt qualified_name
+  | DROP PUBLICATION if_exists_opt qualified_name
+  | DROP SUBSCRIPTION if_exists_opt qualified_name
   ;
 
 drop_database_force_opt:
@@ -368,26 +390,20 @@ unsupported_statement:
   | CREATE FOREIGN TABLE diagnostic_tail_opt
   | CREATE MATERIALIZED VIEW diagnostic_tail_opt
   | CREATE POLICY diagnostic_tail_opt
-  | CREATE PUBLICATION diagnostic_tail_opt
   | CREATE RULE diagnostic_tail_opt
   | CREATE SERVER diagnostic_tail_opt
-  | CREATE SUBSCRIPTION diagnostic_tail_opt
   | CREATE TRIGGER diagnostic_tail_opt
   | ALTER FOREIGN TABLE diagnostic_tail_opt
   | ALTER MATERIALIZED VIEW diagnostic_tail_opt
   | ALTER POLICY diagnostic_tail_opt
-  | ALTER PUBLICATION diagnostic_tail_opt
   | ALTER RULE diagnostic_tail_opt
   | ALTER SERVER diagnostic_tail_opt
-  | ALTER SUBSCRIPTION diagnostic_tail_opt
   | ALTER TRIGGER diagnostic_tail_opt
   | DROP FOREIGN TABLE diagnostic_tail_opt
   | DROP MATERIALIZED VIEW diagnostic_tail_opt
   | DROP POLICY diagnostic_tail_opt
-  | DROP PUBLICATION diagnostic_tail_opt
   | DROP RULE diagnostic_tail_opt
   | DROP SERVER diagnostic_tail_opt
-  | DROP SUBSCRIPTION diagnostic_tail_opt
   | DROP TRIGGER diagnostic_tail_opt
   | CALL diagnostic_tail_opt
   | CHECKPOINT diagnostic_tail_opt

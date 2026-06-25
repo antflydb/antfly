@@ -3287,6 +3287,13 @@ pub fn ddlPlanFromGeneratedAstAlloc(
         .alter_tablespace,
         .drop_tablespace,
         => try tablespaceCatalogPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options),
+        .create_publication,
+        .alter_publication,
+        .drop_publication,
+        .create_subscription,
+        .alter_subscription,
+        .drop_subscription,
+        => try logicalReplicationCatalogPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options),
         .create_index => .{ .create_index = try createIndexPlanFromGeneratedAstAlloc(alloc, tokens, ast, options.create_index_options) },
         .alter_table => if (generatedAlterTableUsesRowSecurityRuntimeBoundary(tokens, ast))
             .{ .row_security_catalog = .{ .alter_table = try rowSecurityAlterTablePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } }
@@ -3320,6 +3327,12 @@ fn generatedDdlUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated
         .drop_sequence,
         .drop_enum_type,
         .drop_tablespace,
+        .create_publication,
+        .alter_publication,
+        .drop_publication,
+        .create_subscription,
+        .alter_subscription,
+        .drop_subscription,
         .drop_index,
         .drop_schema,
         .drop_database,
@@ -3727,6 +3740,127 @@ fn validateGeneratedTablespaceDdlAst(tokens: []const grammar.Token, ast: generat
             if (object_name.end != end) return error.UnsupportedSqlShape;
         },
         else => return error.UnsupportedSqlShape,
+    }
+}
+
+fn logicalReplicationCatalogPlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+    options: DdlPlanParserOptions,
+) !LoweredDdlPlan {
+    try validateGeneratedLogicalReplicationDdlAst(tokens, ast);
+    var pos: usize = 0;
+    var plan = try parseDdlPlanAlloc(alloc, tokens, &pos, options);
+    errdefer plan.deinit(alloc);
+    if (pos != tokens.len) return error.UnsupportedSqlShape;
+    switch (ast.kind) {
+        .create_publication => switch (plan) {
+            .logical_replication => |logical| switch (logical) {
+                .publication => |publication| switch (publication) {
+                    .create => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .alter_publication => switch (plan) {
+            .logical_replication => |logical| switch (logical) {
+                .publication => |publication| switch (publication) {
+                    .alter => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .drop_publication => switch (plan) {
+            .logical_replication => |logical| switch (logical) {
+                .publication => |publication| switch (publication) {
+                    .drop => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .create_subscription => switch (plan) {
+            .logical_replication => |logical| switch (logical) {
+                .subscription => |subscription| switch (subscription) {
+                    .create => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .alter_subscription => switch (plan) {
+            .logical_replication => |logical| switch (logical) {
+                .subscription => |subscription| switch (subscription) {
+                    .alter => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .drop_subscription => switch (plan) {
+            .logical_replication => |logical| switch (logical) {
+                .subscription => |subscription| switch (subscription) {
+                    .drop => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+    return plan;
+}
+
+fn validateGeneratedLogicalReplicationDdlAst(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) !void {
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    const object_name = ast.object_name_tokens orelse return error.UnsupportedSqlShape;
+    if (object_name.start >= object_name.end or object_name.end > end) return error.UnsupportedSqlShape;
+    switch (ast.kind) {
+        .create_publication => try validateGeneratedLogicalReplicationTailDdlAst(tokens, ast, end, object_name, "create", "publication", "for"),
+        .alter_publication => try validateGeneratedLogicalReplicationTailDdlAst(tokens, ast, end, object_name, "alter", "publication", "add"),
+        .create_subscription => try validateGeneratedLogicalReplicationTailDdlAst(tokens, ast, end, object_name, "create", "subscription", "connection"),
+        .alter_subscription => try validateGeneratedLogicalReplicationTailDdlAst(tokens, ast, end, object_name, "alter", "subscription", null),
+        .drop_publication, .drop_subscription => {
+            const object_keyword = switch (ast.kind) {
+                .drop_publication => "publication",
+                .drop_subscription => "subscription",
+                else => unreachable,
+            };
+            if (end < 3 or !tokens[0].matchesKeyword("drop") or !tokens[1].matchesKeyword(object_keyword)) return error.UnsupportedSqlShape;
+            var name_index: usize = 2;
+            const if_exists = consumeGeneratedPlanIfExists(tokens, &name_index, end);
+            if (if_exists != ast.if_exists) return error.UnsupportedSqlShape;
+            if (object_name.start != name_index) return error.UnsupportedSqlShape;
+            if (object_name.end != end) return error.UnsupportedSqlShape;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
+fn validateGeneratedLogicalReplicationTailDdlAst(
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+    end: usize,
+    object_name: generated_parser.GeneratedSqlTokenRange,
+    command_keyword: []const u8,
+    object_keyword: []const u8,
+    first_tail_keyword: ?[]const u8,
+) !void {
+    if (end < 4 or !tokens[0].matchesKeyword(command_keyword) or !tokens[1].matchesKeyword(object_keyword)) return error.UnsupportedSqlShape;
+    if (object_name.start != 2) return error.UnsupportedSqlShape;
+    const operation = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+    if (operation.start != object_name.end or operation.end != end or operation.start >= end) return error.UnsupportedSqlShape;
+    if (first_tail_keyword) |keyword| {
+        if (!tokens[operation.start].matchesKeyword(keyword)) return error.UnsupportedSqlShape;
     }
 }
 
@@ -4381,6 +4515,8 @@ fn validateGeneratedDdlAstSpans(
         .create_sequence,
         .create_enum_type,
         .create_tablespace,
+        .create_publication,
+        .create_subscription,
         .create_index,
         .create_extension,
         .create_graph_index,
@@ -4394,6 +4530,8 @@ fn validateGeneratedDdlAstSpans(
         .alter_domain,
         .alter_sequence,
         .alter_enum_type,
+        .alter_publication,
+        .alter_subscription,
         => .alter,
         .drop_table,
         .drop_view,
@@ -4401,6 +4539,8 @@ fn validateGeneratedDdlAstSpans(
         .drop_sequence,
         .drop_enum_type,
         .drop_tablespace,
+        .drop_publication,
+        .drop_subscription,
         .drop_index,
         .drop_schema,
         .drop_database,
@@ -13406,6 +13546,21 @@ test "sql adapter ddl plan lowers notification and logical replication catalog d
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var malformed_publication = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CREATE PUBLICATION usage_pub FOR TABLE usage_records;",
+    );
+    defer malformed_publication.deinit(alloc);
+    if (malformed_publication.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.alter_table_operation_tokens = .{ .start = 2, .end = malformed_publication.items().len },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_publication));
 }
 
 test "sql adapter ddl plan lowers type system catalog ddl plans" {
@@ -15917,12 +16072,6 @@ test "sql adapter generated utility unsupported AST lowers to typed catalog plan
         .{ .sql = "GRANT SELECT ON TABLE usage_records TO app_reader;", .kind = .grant },
         .{ .sql = "REVOKE SELECT ON TABLE usage_records FROM app_reader;", .kind = .revoke },
         .{ .sql = "LOCK TABLE usage_records IN SHARE MODE;", .kind = .lock },
-        .{ .sql = "CREATE PUBLICATION pub_usage FOR TABLE usage_records;", .kind = .create_publication },
-        .{ .sql = "ALTER PUBLICATION pub_usage ADD TABLE audit_records;", .kind = .alter_publication },
-        .{ .sql = "DROP PUBLICATION IF EXISTS pub_usage;", .kind = .drop_publication },
-        .{ .sql = "CREATE SUBSCRIPTION sub_usage CONNECTION 'host=db' PUBLICATION pub_usage;", .kind = .create_subscription },
-        .{ .sql = "ALTER SUBSCRIPTION sub_usage DISABLE;", .kind = .alter_subscription },
-        .{ .sql = "DROP SUBSCRIPTION IF EXISTS sub_usage;", .kind = .drop_subscription },
         .{ .sql = "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION touch_updated_at('updated_at_ns');", .kind = .create_trigger },
         .{ .sql = "DROP TRIGGER IF EXISTS update_timestamp ON usage_records;", .kind = .drop_trigger },
     };
@@ -15958,20 +16107,6 @@ test "sql adapter generated utility unsupported AST lowers to typed catalog plan
             .lock => switch (lowered) {
                 .transaction_control => |transaction| switch (transaction) {
                     .table_lock => {},
-                    else => return error.TestUnexpectedResult,
-                },
-                else => return error.TestUnexpectedResult,
-            },
-            .create_publication, .alter_publication, .drop_publication => switch (lowered) {
-                .logical_replication => |logical| switch (logical) {
-                    .publication => {},
-                    else => return error.TestUnexpectedResult,
-                },
-                else => return error.TestUnexpectedResult,
-            },
-            .create_subscription, .alter_subscription, .drop_subscription => switch (lowered) {
-                .logical_replication => |logical| switch (logical) {
-                    .subscription => {},
                     else => return error.TestUnexpectedResult,
                 },
                 else => return error.TestUnexpectedResult,

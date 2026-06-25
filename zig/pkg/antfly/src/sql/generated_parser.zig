@@ -59,6 +59,8 @@ pub const GeneratedSqlDdlKind = enum {
     create_sequence,
     create_enum_type,
     create_tablespace,
+    create_publication,
+    create_subscription,
     create_index,
     create_extension,
     alter_table,
@@ -68,12 +70,16 @@ pub const GeneratedSqlDdlKind = enum {
     alter_domain,
     alter_sequence,
     alter_enum_type,
+    alter_publication,
+    alter_subscription,
     drop_table,
     drop_view,
     drop_domain,
     drop_sequence,
     drop_enum_type,
     drop_tablespace,
+    drop_publication,
+    drop_subscription,
     drop_index,
     drop_schema,
     drop_database,
@@ -1951,6 +1957,8 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.sequence)) return .{ .ddl = .create_sequence };
         if (second.matchesKeywordTag(.type)) return .{ .ddl = .create_enum_type };
         if (second.matchesKeywordTag(.tablespace)) return .{ .ddl = .create_tablespace };
+        if (second.matchesKeywordTag(.publication)) return .{ .ddl = .create_publication };
+        if (second.matchesKeywordTag(.subscription)) return .{ .ddl = .create_subscription };
         if (second.matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
         if (second.matchesKeywordTag(.unique) and tokens.len > 2 and tokens[2].matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
         if (second.matchesKeywordTag(.foreign) and tokens.len > 2 and tokens[2].matchesKeywordTag(.table)) return .{ .unsupported = .create_foreign_table };
@@ -1960,10 +1968,8 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         }
         if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .unsupported = .create_materialized_view };
         if (second.matchesKeywordTag(.policy)) return .{ .unsupported = .create_policy };
-        if (second.matchesKeywordTag(.publication)) return .{ .unsupported = .create_publication };
         if (second.matchesKeywordTag(.rule)) return .{ .unsupported = .create_rule };
         if (second.matchesKeywordTag(.server)) return .{ .unsupported = .create_server };
-        if (second.matchesKeywordTag(.subscription)) return .{ .unsupported = .create_subscription };
         if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .create_trigger };
         if (second.matchesKeywordTag(.extension)) return .{ .extension_index = .create_extension };
     }
@@ -1998,10 +2004,10 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         const second = tokens[1];
         if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .unsupported = .alter_materialized_view };
         if (second.matchesKeywordTag(.policy)) return .{ .unsupported = .alter_policy };
-        if (second.matchesKeywordTag(.publication)) return .{ .unsupported = .alter_publication };
+        if (second.matchesKeywordTag(.publication)) return .{ .ddl = .alter_publication };
         if (second.matchesKeywordTag(.rule)) return .{ .unsupported = .alter_rule };
         if (second.matchesKeywordTag(.server)) return .{ .unsupported = .alter_server };
-        if (second.matchesKeywordTag(.subscription)) return .{ .unsupported = .alter_subscription };
+        if (second.matchesKeywordTag(.subscription)) return .{ .ddl = .alter_subscription };
         if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .alter_trigger };
     }
     if (first.matchesKeywordTag(.drop) and tokens.len > 1) {
@@ -2012,6 +2018,8 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.sequence)) return .{ .ddl = .drop_sequence };
         if (second.matchesKeywordTag(.type)) return .{ .ddl = .drop_enum_type };
         if (second.matchesKeywordTag(.tablespace)) return .{ .ddl = .drop_tablespace };
+        if (second.matchesKeywordTag(.publication)) return .{ .ddl = .drop_publication };
+        if (second.matchesKeywordTag(.subscription)) return .{ .ddl = .drop_subscription };
         if (second.matchesKeywordTag(.index)) return .{ .extension_index = .drop_index };
         if (second.matchesKeywordTag(.schema)) return .{ .ddl = .drop_schema };
         if (second.matchesKeywordTag(.database)) return .{ .ddl = .drop_database };
@@ -2019,10 +2027,8 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.foreign) and tokens.len > 2 and tokens[2].matchesKeywordTag(.table)) return .{ .unsupported = .drop_foreign_table };
         if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .unsupported = .drop_materialized_view };
         if (second.matchesKeywordTag(.policy)) return .{ .unsupported = .drop_policy };
-        if (second.matchesKeywordTag(.publication)) return .{ .unsupported = .drop_publication };
         if (second.matchesKeywordTag(.rule)) return .{ .unsupported = .drop_rule };
         if (second.matchesKeywordTag(.server)) return .{ .unsupported = .drop_server };
-        if (second.matchesKeywordTag(.subscription)) return .{ .unsupported = .drop_subscription };
         if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .drop_trigger };
     }
     if (first.matchesKeywordTag(.insert)) {
@@ -2494,6 +2500,22 @@ fn buildDdlAst(
                 }
             }
         },
+        .create_publication => {
+            if (end > 2 and tokens[1].matchesKeywordTag(.publication)) {
+                ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 2, end);
+                if (ast.object_name_tokens) |publication_range| {
+                    if (publication_range.end < end) ast.alter_table_operation_tokens = .{ .start = publication_range.end, .end = end };
+                }
+            }
+        },
+        .create_subscription => {
+            if (end > 2 and tokens[1].matchesKeywordTag(.subscription)) {
+                ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 2, end);
+                if (ast.object_name_tokens) |subscription_range| {
+                    if (subscription_range.end < end) ast.alter_table_operation_tokens = .{ .start = subscription_range.end, .end = end };
+                }
+            }
+        },
         .create_index => {
             if (tokens.len > 2 and tokens[1].matchesKeywordTag(.unique) and tokens[2].matchesKeywordTag(.index)) {
                 ast.unique = true;
@@ -2605,6 +2627,22 @@ fn buildDdlAst(
                 }
             }
         },
+        .alter_publication => {
+            if (end > 2 and tokens[1].matchesKeywordTag(.publication)) {
+                ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 2, end);
+                if (ast.object_name_tokens) |publication_range| {
+                    if (publication_range.end < end) ast.alter_table_operation_tokens = .{ .start = publication_range.end, .end = end };
+                }
+            }
+        },
+        .alter_subscription => {
+            if (end > 2 and tokens[1].matchesKeywordTag(.subscription)) {
+                ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 2, end);
+                if (ast.object_name_tokens) |subscription_range| {
+                    if (subscription_range.end < end) ast.alter_table_operation_tokens = .{ .start = subscription_range.end, .end = end };
+                }
+            }
+        },
         .drop_database => {
             ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
             ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
@@ -2636,6 +2674,14 @@ fn buildDdlAst(
             ast.cascade = findKeyword(tokens, index + 1, end, .cascade) != null;
         },
         .drop_tablespace => {
+            ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
+            ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
+        },
+        .drop_publication => {
+            ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
+            ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
+        },
+        .drop_subscription => {
             ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
             ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
         },
@@ -5891,6 +5937,12 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_tablespace }, (try parseSqlAlloc(alloc, "CREATE TABLESPACE fastspace LOCATION '/var/lib/antfly/fastspace'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_tablespace }, (try parseSqlAlloc(alloc, "ALTER TABLESPACE fastspace RENAME TO fastspace_archive")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_tablespace }, (try parseSqlAlloc(alloc, "DROP TABLESPACE IF EXISTS fastspace_archive")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_publication }, (try parseSqlAlloc(alloc, "CREATE PUBLICATION usage_pub FOR TABLE usage_records")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_publication }, (try parseSqlAlloc(alloc, "ALTER PUBLICATION usage_pub ADD TABLE usage_events")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_publication }, (try parseSqlAlloc(alloc, "DROP PUBLICATION IF EXISTS usage_pub")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_subscription }, (try parseSqlAlloc(alloc, "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=db' PUBLICATION usage_pub")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_subscription }, (try parseSqlAlloc(alloc, "ALTER SUBSCRIPTION usage_sub DISABLE")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_subscription }, (try parseSqlAlloc(alloc, "DROP SUBSCRIPTION IF EXISTS usage_sub")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .relation_population }, (try parseSqlAlloc(alloc, "SELECT account_id, total INTO usage_archive FROM usage_records WHERE total > 10")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .relation_population }, (try parseSqlAlloc(alloc, "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT account_id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_schema }, (try parseSqlAlloc(alloc, "ALTER SCHEMA analytics RENAME TO reporting")).statement);
@@ -6073,6 +6125,28 @@ test "generated SQL parser facade builds control AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const create_publication_sql = "CREATE PUBLICATION usage_pub FOR TABLE usage_records";
+    const create_publication_result = try parseSqlAlloc(alloc, create_publication_sql);
+    switch (create_publication_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.create_publication, ddl.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 6 }, ddl.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const create_subscription_sql = "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=db' PUBLICATION usage_pub";
+    const create_subscription_result = try parseSqlAlloc(alloc, create_subscription_sql);
+    switch (create_subscription_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.create_subscription, ddl.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 7 }, ddl.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const extension_sql = "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public VERSION '1.3'";
     const extension_result = try parseSqlAlloc(alloc, extension_sql);
     switch (extension_result.ast.?) {
@@ -6175,6 +6249,28 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlDdlKind.alter_tablespace, ddl.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 6 }, ddl.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const alter_publication_sql = "ALTER PUBLICATION usage_pub ADD TABLE usage_events";
+    const alter_publication_result = try parseSqlAlloc(alloc, alter_publication_sql);
+    switch (alter_publication_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.alter_publication, ddl.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 6 }, ddl.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const alter_subscription_sql = "ALTER SUBSCRIPTION usage_sub DISABLE";
+    const alter_subscription_result = try parseSqlAlloc(alloc, alter_subscription_sql);
+    switch (alter_subscription_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.alter_subscription, ddl.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, ddl.alter_table_operation_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -6300,6 +6396,28 @@ test "generated SQL parser facade builds control AST spans" {
     switch (drop_tablespace_result.ast.?) {
         .ddl => |ddl| {
             try std.testing.expectEqual(GeneratedSqlDdlKind.drop_tablespace, ddl.kind);
+            try std.testing.expect(ddl.if_exists);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const drop_publication_sql = "DROP PUBLICATION IF EXISTS usage_pub";
+    const drop_publication_result = try parseSqlAlloc(alloc, drop_publication_sql);
+    switch (drop_publication_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.drop_publication, ddl.kind);
+            try std.testing.expect(ddl.if_exists);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const drop_subscription_sql = "DROP SUBSCRIPTION IF EXISTS usage_sub";
+    const drop_subscription_result = try parseSqlAlloc(alloc, drop_subscription_sql);
+    switch (drop_subscription_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.drop_subscription, ddl.kind);
             try std.testing.expect(ddl.if_exists);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl.object_name_tokens.?);
         },
@@ -9145,12 +9263,6 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 8 },
         },
         .{
-            .sql = "ALTER PUBLICATION usage_pub ADD TABLE usage_records",
-            .kind = .alter_publication,
-            .reason = .alter_publication_not_planned_by_generated_parser,
-            .subject_tokens = .{ .start = 1, .end = 6 },
-        },
-        .{
             .sql = "ALTER RULE usage_insert ON usage_records RENAME TO usage_insert_v2",
             .kind = .alter_rule,
             .reason = .alter_rule_not_planned_by_generated_parser,
@@ -9161,12 +9273,6 @@ test "generated SQL parser facade builds extended read AST spans" {
             .kind = .alter_server,
             .reason = .alter_server_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 5 },
-        },
-        .{
-            .sql = "ALTER SUBSCRIPTION usage_sub DISABLE",
-            .kind = .alter_subscription,
-            .reason = .alter_subscription_not_planned_by_generated_parser,
-            .subject_tokens = .{ .start = 1, .end = 4 },
         },
         .{
             .sql = "ALTER TRIGGER usage_audit ON usage_records RENAME TO usage_audit_v2",
@@ -9211,12 +9317,6 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 11 },
         },
         .{
-            .sql = "CREATE PUBLICATION usage_pub FOR TABLE usage_records",
-            .kind = .create_publication,
-            .reason = .create_publication_not_planned_by_generated_parser,
-            .subject_tokens = .{ .start = 1, .end = 6 },
-        },
-        .{
             .sql = "CREATE RULE usage_insert AS ON INSERT TO usage_records DO ALSO NOTIFY usage_events",
             .kind = .create_rule,
             .reason = .create_rule_not_planned_by_generated_parser,
@@ -9226,12 +9326,6 @@ test "generated SQL parser facade builds extended read AST spans" {
             .sql = "CREATE SERVER usage_server FOREIGN DATA WRAPPER postgres_fdw",
             .kind = .create_server,
             .reason = .create_server_not_planned_by_generated_parser,
-            .subject_tokens = .{ .start = 1, .end = 7 },
-        },
-        .{
-            .sql = "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=example dbname=usage' PUBLICATION usage_pub",
-            .kind = .create_subscription,
-            .reason = .create_subscription_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 7 },
         },
         .{
@@ -9319,12 +9413,6 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 7 },
         },
         .{
-            .sql = "DROP PUBLICATION IF EXISTS usage_pub",
-            .kind = .drop_publication,
-            .reason = .drop_publication_not_planned_by_generated_parser,
-            .subject_tokens = .{ .start = 1, .end = 5 },
-        },
-        .{
             .sql = "DROP RULE IF EXISTS usage_insert ON usage_records",
             .kind = .drop_rule,
             .reason = .drop_rule_not_planned_by_generated_parser,
@@ -9335,12 +9423,6 @@ test "generated SQL parser facade builds extended read AST spans" {
             .kind = .drop_server,
             .reason = .drop_server_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 6 },
-        },
-        .{
-            .sql = "DROP SUBSCRIPTION IF EXISTS usage_sub",
-            .kind = .drop_subscription,
-            .reason = .drop_subscription_not_planned_by_generated_parser,
-            .subject_tokens = .{ .start = 1, .end = 5 },
         },
         .{
             .sql = "DROP TRIGGER IF EXISTS usage_audit ON usage_records",
