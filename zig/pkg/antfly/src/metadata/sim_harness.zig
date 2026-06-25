@@ -5687,6 +5687,7 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
     var routers: [4]PublicApiRouter(4) = undefined;
+    var forwarders: [4]PublicApiMetadataForwarder(4) = undefined;
     var read_sources: [4]api_table_reads.HostedProvisionedTableReadSource = undefined;
     var write_sources: [4]api_table_writes.HostedProvisionedTableWriteSource = undefined;
     var api_base_uris: [4][]const u8 = undefined;
@@ -5708,6 +5709,7 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
         &status_sources,
         &catalog_sources,
         &routers,
+        &forwarders,
         &read_sources,
         &write_sources,
         .{},
@@ -5888,6 +5890,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
     var routers: [4]PublicApiRouter(4) = undefined;
+    var forwarders: [4]PublicApiMetadataForwarder(4) = undefined;
     var read_sources: [4]api_table_reads.HostedProvisionedTableReadSource = undefined;
     var write_sources: [4]api_table_writes.HostedProvisionedTableWriteSource = undefined;
     var api_base_uris: [4][]const u8 = undefined;
@@ -5909,6 +5912,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
         &status_sources,
         &catalog_sources,
         &routers,
+        &forwarders,
         &read_sources,
         &write_sources,
         .{},

@@ -6158,21 +6158,17 @@ pub const ApiHttpServer = struct {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         if (self.tableExists(table_name) catch return error.InternalFailure) return error.TableAlreadyExists;
 
-        if (self.source.restoreTable(self.alloc, table_name, location_uri, backup_id) catch |err| switch (err) {
-            error.UnsupportedOperation => false,
-            error.InvalidBackupRequest => {
-                if (self.tableExists(table_name) catch return error.InternalFailure) return error.TableAlreadyExists;
-                return error.InvalidBackupRequest;
-            },
-            else => return mapExecuteRestoreError(err),
-        }) {
-            if (self.cfg.swarm_mode) {
-                self.restoreLocalTableDataFromManifest(table_name, location, backup_id) catch |err| {
-                    std.log.err("swarm local restore data apply failed table={s} backup_id={s} err={}", .{ table_name, backup_id, err });
-                    return mapExecuteRestoreError(err);
-                };
+        if (!self.cfg.swarm_mode) {
+            if (self.source.restoreTable(self.alloc, table_name, location_uri, backup_id) catch |err| switch (err) {
+                error.UnsupportedOperation => false,
+                error.InvalidBackupRequest => {
+                    if (self.tableExists(table_name) catch return error.InternalFailure) return error.TableAlreadyExists;
+                    return error.InvalidBackupRequest;
+                },
+                else => return mapExecuteRestoreError(err),
+            }) {
+                return;
             }
-            return;
         }
 
         self.restoreOwnedTableWithRetry(table_name, location, backup_id) catch |err| switch (err) {
@@ -6672,7 +6668,7 @@ pub const ApiHttpServer = struct {
 
             // For overwrite, skip the metadata restore path and use the owned-table
             // restore which creates the table and copies data synchronously.
-            if (!is_overwrite) {
+            if (!is_overwrite and !self.cfg.swarm_mode) {
                 const restored_via_metadata = self.source.restoreTable(alloc, table_name, req.location, table_backup_id) catch |err| switch (err) {
                     error.UnsupportedOperation => false,
                     else => {
@@ -6693,25 +6689,6 @@ pub const ApiHttpServer = struct {
                     },
                 };
                 if (restored_via_metadata) {
-                    if (self.cfg.swarm_mode) {
-                        self.restoreLocalTableDataFromManifest(table_name, location, table_backup_id) catch |err| {
-                            std.log.err("cluster restore local data apply failed table={s} backup_id={s} err={}", .{
-                                table_name,
-                                table_backup_id,
-                                err,
-                            });
-                            statuses[i].@"error" = switch (err) {
-                                error.UnsupportedOperation => "method not allowed",
-                                error.UnsupportedBackupFormat => "restore does not support this backup layout",
-                                error.UnsupportedBackupMigrationState => "restore does not support active schema migration",
-                                error.TableAlreadyExists => "table already exists",
-                                error.TableNotFound => "not found",
-                                error.InvalidBackupRequest => "invalid restore request",
-                                else => "restore failed",
-                            };
-                            continue;
-                        };
-                    }
                     statuses[i].status = "triggered";
                     continue;
                 }
