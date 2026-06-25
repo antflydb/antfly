@@ -35,7 +35,7 @@ The current Rust implementation returns planned host calls such as `db.write(mem
 ## Package Layout
 
 ```text
-extensions/memoryaf/0.0.1/
+extensions/memoryaf/
   extension.json
   Cargo.toml
   src/lib.rs
