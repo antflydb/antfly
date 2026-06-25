@@ -324,10 +324,11 @@ Generated unsupported nodes now also participate in the parsed statement
 boundary: generated-covered unsupported heads that are not intentionally
 supported by the existing catalog planner become terminal parsed unsupported
 statements and fail closed before legacy DDL probing. Generated unsupported
-heads that already have legacy catalog/runtime support, such as remaining
-materialized-view catalog variants like `ALTER MATERIALIZED VIEW`, stay on an
-explicit compatibility allowlist until their generated AST-to-plan
-implementations are promoted.
+heads that already have legacy catalog/runtime support stay on an explicit
+compatibility allowlist until their generated AST-to-plan implementations are
+promoted; unsupported materialized-view variants such as
+`ALTER MATERIALIZED VIEW` are intentionally outside that allowlist until Antfly
+has a typed plan for them.
 
 ## Compatibility Policy
 
@@ -885,7 +886,9 @@ variants for:
   and stable unsupported reason metadata. Parsed SQL now distinguishes
   generated unsupported statements from ordinary DDL for unsupported heads that
   are not on the legacy-supported compatibility allowlist, so lowerers fail
-  closed instead of trying a generic DDL parse for those shapes.
+  closed instead of trying a generic DDL parse for those shapes; unsupported
+  materialized-view variants such as `ALTER MATERIALIZED VIEW` are part of that
+  fail-closed path rather than the materialized-view catalog boundary.
 
 Later statement-family cutovers should add closed variants for:
 

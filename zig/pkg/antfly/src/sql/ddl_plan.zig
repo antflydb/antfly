@@ -14461,6 +14461,17 @@ test "sql adapter generated materialized view unsupported AST lowers to catalog 
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_subject));
+
+    var unsupported_alter_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "ALTER MATERIALIZED VIEW users_mv RENAME TO users_mv_v2;",
+    );
+    defer unsupported_alter_sql.deinit(alloc);
+    switch (unsupported_alter_sql.statement) {
+        .unsupported => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &unsupported_alter_sql));
 }
 
 test "sql adapter generated row policy unsupported AST lowers to catalog plans" {
