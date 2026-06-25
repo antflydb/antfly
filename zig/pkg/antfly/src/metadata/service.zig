@@ -282,6 +282,7 @@ pub const MetadataStatus = metadata_api.MetadataStatus;
 
 const LinearizableMetadataReadTracker = struct {
     alloc: std.mem.Allocator,
+    metadata_group_id: raft_engine.core.types.GroupId,
     mutex: std.Io.Mutex = .init,
     next_request_id: std.atomic.Value(u64) = .init(1),
     requests: std.AutoHashMapUnmanaged(u64, bool) = .empty,
@@ -333,11 +334,13 @@ const LinearizableMetadataReadTracker = struct {
         read_states: []const raft_engine.core.ReadState,
     ) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        for (read_states) |read_state| {
-            if (!std.mem.startsWith(u8, read_state.request_ctx, linearizable_metadata_read_prefix)) continue;
-            const suffix = read_state.request_ctx[linearizable_metadata_read_prefix.len..];
-            const request_id = std.fmt.parseUnsigned(u64, suffix, 10) catch continue;
-            self.markComplete(request_id);
+        if (group_id == self.metadata_group_id) {
+            for (read_states) |read_state| {
+                if (!std.mem.startsWith(u8, read_state.request_ctx, linearizable_metadata_read_prefix)) continue;
+                const suffix = read_state.request_ctx[linearizable_metadata_read_prefix.len..];
+                const request_id = std.fmt.parseUnsigned(u64, suffix, 10) catch continue;
+                self.markComplete(request_id);
+            }
         }
         if (self.downstream) |downstream| try downstream.onReadStates(group_id, read_states);
     }
@@ -2194,6 +2197,7 @@ pub const MetadataHttpService = struct {
         errdefer if (read_tracker_owned) alloc.destroy(read_tracker);
         read_tracker.* = .{
             .alloc = alloc,
+            .metadata_group_id = metadata_group_id,
             .downstream = http_deps.read_state_observer,
         };
         http_deps.read_state_observer = read_tracker.observer();
@@ -8946,13 +8950,29 @@ test "metadata service committed metadata changes request lifecycle reconcile ho
 }
 
 test "linearizable metadata read tracker completes only matching request" {
-    var tracker = LinearizableMetadataReadTracker{ .alloc = std.testing.allocator };
+    var tracker = LinearizableMetadataReadTracker{
+        .alloc = std.testing.allocator,
+        .metadata_group_id = 42,
+    };
     defer tracker.deinit();
 
     const first_id = try tracker.registerRequest();
     const second_id = try tracker.registerRequest();
 
-    tracker.markComplete(second_id);
+    const second_ctx = try std.fmt.allocPrint(std.testing.allocator, "{s}{d}", .{ linearizable_metadata_read_prefix, second_id });
+    defer std.testing.allocator.free(second_ctx);
+
+    try tracker.observer().onReadStates(43, &.{.{
+        .index = 1,
+        .request_ctx = second_ctx,
+    }});
+    try std.testing.expect(!tracker.isComplete(first_id));
+    try std.testing.expect(!tracker.isComplete(second_id));
+
+    try tracker.observer().onReadStates(42, &.{.{
+        .index = 1,
+        .request_ctx = second_ctx,
+    }});
 
     try std.testing.expect(!tracker.isComplete(first_id));
     try std.testing.expect(tracker.isComplete(second_id));
