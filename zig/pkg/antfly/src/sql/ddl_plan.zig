@@ -3170,7 +3170,10 @@ pub fn ddlPlanFromGeneratedAstAlloc(
             break :blk .{ .create_table = try parseCreateTablePlanAlloc(alloc, tail, &pos, options.column_definition_options) };
         },
         .create_index => .{ .create_index = try createIndexPlanFromGeneratedAstAlloc(alloc, tokens, ast, options.create_index_options) },
-        .alter_table => .{ .alter_table = try alterTablePlanFromGeneratedAstAlloc(alloc, tokens, ast, options.column_definition_options) },
+        .alter_table => if (generatedAlterTableUsesRowSecurityRuntimeBoundary(tokens, ast))
+            .{ .row_security_catalog = .{ .alter_table = try rowSecurityAlterTablePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } }
+        else
+            .{ .alter_table = try alterTablePlanFromGeneratedAstAlloc(alloc, tokens, ast, options.column_definition_options) },
         .drop_table => .{ .drop_table = try dropTablePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) },
         .drop_index => .{ .drop_index = try dropIndexPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) },
         else => try simpleDdlPlanFromGeneratedAstAlloc(alloc, tokens, ast),
@@ -3190,7 +3193,7 @@ fn generatedDdlUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated
         => true,
         .create_table => generatedCreateTableUsesRuntimeBoundary(tokens, ast),
         .create_index => generatedCreateIndexUsesRuntimeBoundary(tokens, ast),
-        .alter_table => generatedAlterTableUsesRuntimeBoundary(tokens, ast),
+        .alter_table => generatedAlterTableUsesRowSecurityRuntimeBoundary(tokens, ast) or generatedAlterTableUsesRuntimeBoundary(tokens, ast),
         .create_graph_index, .create_graph_metric => false,
     };
 }
@@ -3238,6 +3241,16 @@ fn generatedAlterTableUsesRuntimeBoundary(tokens: []const grammar.Token, ast: ge
     return false;
 }
 
+fn generatedAlterTableUsesRowSecurityRuntimeBoundary(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) bool {
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return false;
+    if (ast.if_exists) return false;
+    const operation_range = ast.alter_table_operation_tokens orelse return false;
+    if (!generatedRangeWithinStatement(operation_range, end) or operation_range.start >= operation_range.end) return false;
+    if (generatedRangeHasKind(tokens, operation_range, .comma)) return false;
+    return generatedRangeMatchesKeywords(tokens, operation_range, &.{ "enable", "row", "level", "security" }) or
+        generatedRangeMatchesKeywords(tokens, operation_range, &.{ "disable", "row", "level", "security" });
+}
+
 fn generatedRangeWithinStatement(range: generated_parser.GeneratedSqlTokenRange, end: usize) bool {
     return range.start <= range.end and range.end <= end;
 }
@@ -3248,6 +3261,15 @@ fn generatedRangeHasKind(tokens: []const grammar.Token, range: generated_parser.
         if (token.kind == kind) return true;
     }
     return false;
+}
+
+fn generatedRangeMatchesKeywords(tokens: []const grammar.Token, range: generated_parser.GeneratedSqlTokenRange, keywords: []const []const u8) bool {
+    if (range.end > tokens.len or range.start > range.end) return false;
+    if (range.end - range.start != keywords.len) return false;
+    for (keywords, 0..) |keyword, offset| {
+        if (!tokens[range.start + offset].matchesKeyword(keyword)) return false;
+    }
+    return true;
 }
 
 fn generatedRangeContainsText(tokens: []const grammar.Token, range: generated_parser.GeneratedSqlTokenRange, text: []const u8) bool {
@@ -3665,6 +3687,30 @@ fn alterTablePlanFromGeneratedAstAlloc(
     var plan = try parseAlterTablePlanAlloc(alloc, tokens[1..end], &pos, options);
     errdefer plan.deinit(alloc);
     if (plan.if_exists != ast.if_exists) return error.UnsupportedSqlShape;
+    return plan;
+}
+
+fn rowSecurityAlterTablePlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+) !AlterRowSecurityPlan {
+    const end = try requireGeneratedDdlHeader(tokens, ast.statement_span, .alter, .table);
+    if (ast.if_exists) return error.UnsupportedSqlShape;
+
+    const table_range = try requireGeneratedTokenRangeAt(ast.object_name_tokens, 2, end);
+    const operation_range = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+    if (operation_range.start != table_range.end or operation_range.end != end) return error.UnsupportedSqlShape;
+    if (!generatedAlterTableUsesRowSecurityRuntimeBoundary(tokens, ast)) return error.UnsupportedSqlShape;
+
+    var pos: usize = 1;
+    var plan = try parseAlterRowSecurityPlanTailAlloc(alloc, tokens, &pos);
+    errdefer plan.deinit(alloc);
+    if (!generatedStatementConsumedThrough(tokens, end, pos)) return error.UnsupportedSqlShape;
+
+    const generated_table_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, table_range);
+    defer alloc.free(@constCast(generated_table_name));
+    if (!std.ascii.eqlIgnoreCase(generated_table_name, plan.table_name)) return error.UnsupportedSqlShape;
     return plan;
 }
 
@@ -12934,6 +12980,21 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
         else => return error.TestUnexpectedResult,
     }
 
+    var runtime_row_security = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ENABLE ROW LEVEL SECURITY;");
+    defer runtime_row_security.deinit(alloc);
+    var runtime_row_security_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_row_security);
+    defer runtime_row_security_plan.deinit(alloc);
+    switch (runtime_row_security_plan) {
+        .row_security_catalog => |plan| switch (plan) {
+            .alter_table => |alter| {
+                try std.testing.expectEqualStrings("generated_usage_records", alter.table_name);
+                try std.testing.expect(alter.enabled);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     var malformed_generated_ddl = try tokenized.ParsedSql.initAlloc(alloc, "CREATE DATABASE tenant_ops;");
     defer malformed_generated_ddl.deinit(alloc);
     if (malformed_generated_ddl.generated_statement) |*generated_statement| {
@@ -12945,6 +13006,18 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_generated_ddl));
+
+    var malformed_generated_row_security = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records DISABLE ROW LEVEL SECURITY;");
+    defer malformed_generated_row_security.deinit(alloc);
+    if (malformed_generated_row_security.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.object_name_tokens = .{ .start = 1, .end = 2 },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_generated_row_security));
 
     var malformed_generated_session = try tokenized.ParsedSql.initAlloc(alloc, "SET search_path TO public;");
     defer malformed_generated_session.deinit(alloc);
