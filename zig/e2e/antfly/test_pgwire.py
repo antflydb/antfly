@@ -234,6 +234,24 @@ def test_pgwire_simple_query_accepts_multiple_statements(pgwire_server):
     assert rows == [["row:b", "closed"]]
 
 
+def test_pgwire_ready_for_query_tracks_transaction_status(pgwire_server):
+    with socket.create_connection((pgwire_server.host, pgwire_server.pgwire_port), timeout=5) as sock:
+        _pgwire_startup(sock)
+        begin_messages = _pgwire_simple_query(sock, "BEGIN;")
+        commit_messages = _pgwire_simple_query(sock, "COMMIT;")
+        begin_again_messages = _pgwire_simple_query(sock, "START TRANSACTION;")
+        rollback_messages = _pgwire_simple_query(sock, "ROLLBACK;")
+
+    assert [message["tag"] for message in begin_messages if message["type"] == "command"] == ["BEGIN"]
+    assert [message["status"] for message in begin_messages if message["type"] == "ready"] == ["T"]
+    assert [message["tag"] for message in commit_messages if message["type"] == "command"] == ["COMMIT"]
+    assert [message["status"] for message in commit_messages if message["type"] == "ready"] == ["I"]
+    assert [message["tag"] for message in begin_again_messages if message["type"] == "command"] == ["BEGIN"]
+    assert [message["status"] for message in begin_again_messages if message["type"] == "ready"] == ["T"]
+    assert [message["tag"] for message in rollback_messages if message["type"] == "command"] == ["ROLLBACK"]
+    assert [message["status"] for message in rollback_messages if message["type"] == "ready"] == ["I"]
+
+
 def test_pgwire_extended_query_binds_text_parameters(pgwire_server):
     table = _table_name("pgwire_extended")
 
@@ -377,6 +395,7 @@ def _pgwire_simple_query(sock: socket.socket, sql: str) -> list[dict[str, Any]]:
         elif tag == b"E":
             raise AssertionError(f"pgwire query error: {payload!r}")
         elif tag == b"Z":
+            messages.append({"type": "ready", "status": payload.decode()})
             return messages
         elif tag in {b"I", b"n"}:
             continue
@@ -421,6 +440,7 @@ def _pgwire_extended_query(sock: socket.socket, sql: str, params: list[str | Non
         elif tag == b"E":
             raise AssertionError(f"pgwire extended query error: {payload!r}")
         elif tag == b"Z":
+            messages.append({"type": "ready", "status": payload.decode()})
             return messages
         elif tag in {b"1", b"2", b"3", b"n", b"s"}:
             if tag == b"n":

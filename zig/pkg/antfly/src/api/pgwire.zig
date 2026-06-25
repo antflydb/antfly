@@ -211,6 +211,7 @@ const Connection = struct {
     session_id: ?u64 = null,
     database: ?[]u8 = null,
     namespace: ?[]u8 = null,
+    ready_for_query_status: u8 = 'I',
     unnamed_statement: ?[]u8 = null,
     unnamed_statement_parameter_oids: []i32 = &.{},
     unnamed_portal: ?[]u8 = null,
@@ -590,6 +591,7 @@ const Connection = struct {
             .result => |*result| {
                 defer result.deinit(self.api_server.alloc);
                 self.session_id = result.session_id;
+                self.ready_for_query_status = pgwire_module.readyForQueryStatus(result.transaction_status);
                 if (!result.has_row_description) {
                     try self.sendNoData();
                     return false;
@@ -618,6 +620,7 @@ const Connection = struct {
             },
             .result => |*result| {
                 defer result.deinit(self.api_server.alloc);
+                self.ready_for_query_status = pgwire_module.readyForQueryStatus(result.transaction_status);
                 try self.encodeSqlResult(sql, result, include_row_description);
                 return true;
             },
@@ -847,7 +850,8 @@ const Connection = struct {
     }
 
     fn sendReadyForQuery(self: *Connection) !void {
-        try self.sendMessage('Z', "I");
+        const payload = [_]u8{self.ready_for_query_status};
+        try self.sendMessage('Z', &payload);
         try self.writer.flush();
     }
 
@@ -1172,6 +1176,14 @@ fn pgwireTypeForAntflyType(
     };
 }
 
+fn readyForQueryStatus(status: http_server.ApiHttpServer.PublicSqlTransactionStatus) u8 {
+    return switch (status) {
+        .idle => 'I',
+        .in_transaction => 'T',
+        .failed_transaction => 'E',
+    };
+}
+
 fn commandTagForDdlSql(alloc: std.mem.Allocator, sql: []const u8) ?[]const u8 {
     var parsed_sql = sql_adapter.ParsedSql.initAlloc(alloc, sql) catch return null;
     defer parsed_sql.deinit(alloc);
@@ -1194,6 +1206,7 @@ fn commandTagForParsedDdl(parsed_sql: *const sql_adapter.ParsedSql) []const u8 {
     if (first.matchesKeywordTag(.reset)) return "RESET";
     if (first.matchesKeywordTag(.discard)) return "DISCARD";
     if (first.matchesKeywordTag(.begin)) return "BEGIN";
+    if (first.matchesKeyword("start") and raw.token_start + 1 < raw.token_end and tokens[raw.token_start + 1].matchesKeyword("transaction")) return "BEGIN";
     if (first.matchesKeywordTag(.commit)) return "COMMIT";
     if (first.matchesKeywordTag(.rollback)) return "ROLLBACK";
     if (first.matchesKeywordTag(.listen)) return "LISTEN";

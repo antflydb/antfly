@@ -507,6 +507,7 @@ pub const SqlCatalogSessionState = struct {
     transaction_local_settings_base: ?[]const catalog_resources.SqlSessionSetting = null,
     transaction_local_search_path: bool = false,
     transaction_local_settings: bool = false,
+    in_sql_transaction: bool = false,
 
     pub fn fromSessionAlloc(
         alloc: std.mem.Allocator,
@@ -534,6 +535,7 @@ pub const SqlCatalogSessionState = struct {
         }
         out.transaction_local_search_path = self.transaction_local_search_path;
         out.transaction_local_settings = self.transaction_local_settings;
+        out.in_sql_transaction = self.in_sql_transaction;
         return out;
     }
 
@@ -559,6 +561,7 @@ pub const SqlCatalogSessionState = struct {
         }
         state.transaction_local_search_path = owned_session.transaction_local_search_path;
         state.transaction_local_settings = owned_session.transaction_local_settings;
+        state.in_sql_transaction = owned_session.in_sql_transaction;
         return state;
     }
 
@@ -576,6 +579,7 @@ pub const SqlCatalogSessionState = struct {
         }
         owned.transaction_local_search_path = self.transaction_local_search_path;
         owned.transaction_local_settings = self.transaction_local_settings;
+        owned.in_sql_transaction = self.in_sql_transaction;
         return owned;
     }
 
@@ -2816,6 +2820,8 @@ fn appendSqlCatalogSessionStateJson(
     }
     try out.appendSlice(alloc, ",\"transaction_local_settings\":");
     try out.appendSlice(alloc, if (state.transaction_local_settings) "true" else "false");
+    try out.appendSlice(alloc, ",\"in_sql_transaction\":");
+    try out.appendSlice(alloc, if (state.in_sql_transaction) "true" else "false");
     try out.appendSlice(alloc, ",\"transaction_local_settings_base\":");
     if (state.transaction_local_settings_base) |base| {
         try appendSqlSessionSettingsJson(alloc, out, base);
@@ -3024,6 +3030,7 @@ fn parseSqlCatalogSessionStateValue(alloc: std.mem.Allocator, value: std.json.Va
         .settings = try parseSqlSessionSettingsValueAlloc(alloc, obj.get("settings") orelse return error.InvalidTransactionSessionRecord),
         .transaction_local_search_path = (try optionalBool(obj, "transaction_local_search_path")) orelse false,
         .transaction_local_settings = (try optionalBool(obj, "transaction_local_settings")) orelse false,
+        .in_sql_transaction = (try optionalBool(obj, "in_sql_transaction")) orelse false,
     };
     errdefer state.deinit(alloc);
 

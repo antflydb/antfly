@@ -4334,6 +4334,24 @@ pub const ApiHttpServer = struct {
         return false;
     }
 
+    fn parsedSqlTransactionBoundaryStartsSession(parsed_sql: *const sql_adapter.ParsedSql) bool {
+        const tokens = parsed_sql.items();
+        const raw = parsed_sql.statement.raw();
+        if (raw.token_start >= raw.token_end or raw.token_start >= tokens.len) return false;
+        const first = tokens[raw.token_start];
+        if (first.matchesKeywordTag(.begin)) return true;
+        if (first.matchesKeyword("start")) {
+            const next = raw.token_start + 1;
+            return next < raw.token_end and tokens[next].matchesKeyword("transaction");
+        }
+        return false;
+    }
+
+    fn publicSqlTransactionStatus(_: *ApiHttpServer, session: *const sql_adapter.OwnedSqlCatalogSession) PublicSqlTransactionStatus {
+        if (session.in_sql_transaction or session.transaction_local_search_path or session.transaction_local_settings) return .in_transaction;
+        return .idle;
+    }
+
     fn publicSqlReadOnlyActive(_: *ApiHttpServer, session: *const sql_adapter.OwnedSqlCatalogSession) !bool {
         return session.request_read_only or try sql_adapter.sqlEffectiveTransactionReadOnlyFromSession(session.session());
     }
@@ -4409,6 +4427,9 @@ pub const ApiHttpServer = struct {
     }
 
     fn applyTransactionModePlanToSession(self: *ApiHttpServer, session: *sql_adapter.OwnedSqlCatalogSession, plan: sql_adapter.TransactionModePlan) !bool {
+        if (plan.starter == .begin or plan.starter == .start_transaction) {
+            session.in_sql_transaction = true;
+        }
         const access_mode = plan.access_mode orelse return false;
         const value = switch (access_mode) {
             .read_only => "on",
@@ -4451,6 +4472,13 @@ pub const ApiHttpServer = struct {
             .adapter_noop => |noop| {
                 if (noop.reason == .transaction_control and parsedSqlTransactionBoundaryClearsLocalSession(parsed_sql)) {
                     try session.clearTransactionLocalState(self.alloc);
+                    var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
+                    applied.noop = true;
+                    try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+                    return applied;
+                }
+                if (noop.reason == .transaction_control and parsedSqlTransactionBoundaryStartsSession(parsed_sql)) {
+                    session.in_sql_transaction = true;
                     var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
                     applied.noop = true;
                     try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
@@ -4604,6 +4632,12 @@ pub const ApiHttpServer = struct {
         applied: tables_api.AppliedRelationalSqlDdlRecord,
     };
 
+    pub const PublicSqlTransactionStatus = enum {
+        idle,
+        in_transaction,
+        failed_transaction,
+    };
+
     pub const PublicSqlResult = struct {
         pub const Read = struct {
             result: table_reads.LoweredSqlReadPlanResult,
@@ -4618,6 +4652,7 @@ pub const ApiHttpServer = struct {
 
         session_id: u64,
         statement_kind: []const u8,
+        transaction_status: PublicSqlTransactionStatus = .idle,
         result: union(enum) {
             ddl: tables_api.AppliedRelationalSqlDdlRecord,
             read: Read,
@@ -4652,6 +4687,7 @@ pub const ApiHttpServer = struct {
     pub const PublicSqlDescribeResult = struct {
         session_id: u64,
         statement_kind: []const u8,
+        transaction_status: PublicSqlTransactionStatus = .idle,
         has_row_description: bool = false,
         columns: []const runtime_schema_mod.RelationalColumn = &.{},
 
@@ -6373,12 +6409,20 @@ pub const ApiHttpServer = struct {
             var outcome = try self.handlePublicSqlWrite(&parsed_sql, &session, authenticated_identity);
             errdefer outcome.deinit(self.alloc);
             try self.savePublicSqlSession(session);
+            switch (outcome) {
+                .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(&session),
+                .response => {},
+            }
             return outcome;
         }
         if (parsed_sql.readStatementKind() != null) {
             var outcome = try self.handlePublicSqlRead(&parsed_sql, &session, authenticated_identity);
             errdefer outcome.deinit(self.alloc);
             try self.savePublicSqlSession(session);
+            switch (outcome) {
+                .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(&session),
+                .response => {},
+            }
             return outcome;
         }
 
@@ -6403,6 +6447,7 @@ pub const ApiHttpServer = struct {
         return .{ .result = .{
             .session_id = session_id,
             .statement_kind = "ddl",
+            .transaction_status = self.publicSqlTransactionStatus(&session),
             .result = .{ .ddl = applied },
         } };
     }
@@ -6425,6 +6470,10 @@ pub const ApiHttpServer = struct {
             var outcome = try self.describePublicSqlReadColumnsAlloc(&parsed_sql, &session, authenticated_identity);
             errdefer outcome.deinit(self.alloc);
             try self.savePublicSqlSession(session);
+            switch (outcome) {
+                .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(&session),
+                .response => {},
+            }
             return outcome;
         }
 
@@ -6434,6 +6483,7 @@ pub const ApiHttpServer = struct {
         return .{ .result = .{
             .session_id = session_id,
             .statement_kind = statement_kind,
+            .transaction_status = self.publicSqlTransactionStatus(&session),
             .has_row_description = false,
         } };
     }
