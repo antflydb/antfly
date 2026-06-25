@@ -3278,6 +3278,10 @@ pub fn ddlPlanFromGeneratedAstAlloc(
         .alter_sequence,
         .drop_sequence,
         => try sequenceCatalogPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options),
+        .create_enum_type,
+        .alter_enum_type,
+        .drop_enum_type,
+        => try enumTypeCatalogPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options),
         .create_index => .{ .create_index = try createIndexPlanFromGeneratedAstAlloc(alloc, tokens, ast, options.create_index_options) },
         .alter_table => if (generatedAlterTableUsesRowSecurityRuntimeBoundary(tokens, ast))
             .{ .row_security_catalog = .{ .alter_table = try rowSecurityAlterTablePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } }
@@ -3296,14 +3300,17 @@ fn generatedDdlUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated
         .create_view,
         .create_domain,
         .create_sequence,
+        .create_enum_type,
         .create_extension,
         .alter_view,
         .alter_domain,
         .alter_sequence,
+        .alter_enum_type,
         .drop_table,
         .drop_view,
         .drop_domain,
         .drop_sequence,
+        .drop_enum_type,
         .drop_index,
         .drop_schema,
         .drop_database,
@@ -3565,6 +3572,76 @@ fn validateGeneratedSequenceDdlAst(tokens: []const grammar.Token, ast: generated
         },
         .drop_sequence => {
             if (end < 3 or !tokens[0].matchesKeyword("drop") or !tokens[1].matchesKeyword("sequence")) return error.UnsupportedSqlShape;
+            var name_index: usize = 2;
+            const if_exists = consumeGeneratedPlanIfExists(tokens, &name_index, end);
+            if (if_exists != ast.if_exists) return error.UnsupportedSqlShape;
+            if (object_name.start != name_index) return error.UnsupportedSqlShape;
+            const has_cascade = generatedRangeHasKeyword(tokens, .{ .start = object_name.end, .end = end }, "cascade");
+            if (has_cascade != ast.cascade) return error.UnsupportedSqlShape;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
+fn enumTypeCatalogPlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+    options: DdlPlanParserOptions,
+) !LoweredDdlPlan {
+    try validateGeneratedEnumTypeDdlAst(tokens, ast);
+    var pos: usize = 0;
+    var plan = try parseDdlPlanAlloc(alloc, tokens, &pos, options);
+    errdefer plan.deinit(alloc);
+    if (pos != tokens.len) return error.UnsupportedSqlShape;
+    switch (ast.kind) {
+        .create_enum_type => switch (plan) {
+            .enum_type_catalog => |catalog| switch (catalog) {
+                .create => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .alter_enum_type => switch (plan) {
+            .enum_type_catalog => |catalog| switch (catalog) {
+                .add_value => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .drop_enum_type => switch (plan) {
+            .enum_type_catalog => |catalog| switch (catalog) {
+                .drop => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+    return plan;
+}
+
+fn validateGeneratedEnumTypeDdlAst(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) !void {
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    const object_name = ast.object_name_tokens orelse return error.UnsupportedSqlShape;
+    if (object_name.start >= object_name.end or object_name.end > end) return error.UnsupportedSqlShape;
+    switch (ast.kind) {
+        .create_enum_type => {
+            if (end < 5 or !tokens[0].matchesKeyword("create") or !tokens[1].matchesKeyword("type")) return error.UnsupportedSqlShape;
+            if (object_name.start != 2) return error.UnsupportedSqlShape;
+            const operation = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+            if (operation.start != object_name.end or operation.end != end or operation.start >= end) return error.UnsupportedSqlShape;
+            if (!tokens[operation.start].matchesKeyword("as")) return error.UnsupportedSqlShape;
+        },
+        .alter_enum_type => {
+            if (end < 5 or !tokens[0].matchesKeyword("alter") or !tokens[1].matchesKeyword("type")) return error.UnsupportedSqlShape;
+            if (object_name.start != 2) return error.UnsupportedSqlShape;
+            const operation = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+            if (operation.start != object_name.end or operation.end != end or operation.start >= end) return error.UnsupportedSqlShape;
+            if (!tokens[operation.start].matchesKeyword("add")) return error.UnsupportedSqlShape;
+        },
+        .drop_enum_type => {
+            if (end < 3 or !tokens[0].matchesKeyword("drop") or !tokens[1].matchesKeyword("type")) return error.UnsupportedSqlShape;
             var name_index: usize = 2;
             const if_exists = consumeGeneratedPlanIfExists(tokens, &name_index, end);
             if (if_exists != ast.if_exists) return error.UnsupportedSqlShape;
@@ -4198,6 +4275,7 @@ fn validateGeneratedDdlAstSpans(
         .create_view,
         .create_domain,
         .create_sequence,
+        .create_enum_type,
         .create_index,
         .create_extension,
         .create_graph_index,
@@ -4208,11 +4286,13 @@ fn validateGeneratedDdlAstSpans(
         .alter_view,
         .alter_domain,
         .alter_sequence,
+        .alter_enum_type,
         => .alter,
         .drop_table,
         .drop_view,
         .drop_domain,
         .drop_sequence,
+        .drop_enum_type,
         .drop_index,
         .drop_schema,
         .drop_database,
@@ -12243,6 +12323,21 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
+    var create_enum_type = try lowerDdlPlanForTestAlloc(alloc, "CREATE TYPE usage_status AS ENUM ('open', 'done');");
+    defer create_enum_type.deinit(alloc);
+    switch (create_enum_type) {
+        .enum_type_catalog => |plan| switch (plan) {
+            .create => |create| {
+                try std.testing.expectEqualStrings("usage_status", create.type_name);
+                try std.testing.expectEqual(@as(usize, 2), create.values.len);
+                try std.testing.expectEqualStrings("open", create.values[0]);
+                try std.testing.expectEqualStrings("done", create.values[1]);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     var add_enum_value = try lowerDdlPlanForTestAlloc(alloc, "ALTER TYPE usage_status ADD VALUE IF NOT EXISTS 'archived' AFTER 'done';");
     defer add_enum_value.deinit(alloc);
     switch (add_enum_value) {
@@ -12258,6 +12353,44 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var drop_enum_type = try lowerDdlPlanForTestAlloc(alloc, "DROP TYPE IF EXISTS usage_status CASCADE;");
+    defer drop_enum_type.deinit(alloc);
+    switch (drop_enum_type) {
+        .enum_type_catalog => |plan| switch (plan) {
+            .drop => |drop| {
+                try std.testing.expectEqualStrings("usage_status", drop.type_name);
+                try std.testing.expect(drop.if_exists);
+                try std.testing.expect(drop.cascade);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var malformed_generated_create_enum = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TYPE usage_status AS ENUM ('open', 'done');");
+    defer malformed_generated_create_enum.deinit(alloc);
+    if (malformed_generated_create_enum.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.object_name_tokens = .{ .start = 1, .end = 2 },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_enum));
+
+    var malformed_generated_alter_enum = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TYPE usage_status ADD VALUE 'archived';");
+    defer malformed_generated_alter_enum.deinit(alloc);
+    if (malformed_generated_alter_enum.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.alter_table_operation_tokens = .{ .start = 2, .end = malformed_generated_alter_enum.items().len },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_generated_alter_enum));
 
     var serial_identity = try lowerDdlPlanForTestAlloc(alloc, "CREATE TABLE usage_records (id bigserial PRIMARY KEY, status text);");
     defer serial_identity.deinit(alloc);

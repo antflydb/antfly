@@ -90,12 +90,14 @@ ddl_statement:
   | create_view_statement
   | create_domain_statement
   | create_sequence_statement
+  | create_type_statement
   | create_index_statement
   | create_extension_statement
   | alter_table_statement
   | alter_view_statement
   | alter_domain_statement
   | alter_sequence_statement
+  | alter_type_statement
   | drop_statement
   | relation_population_statement
   ;
@@ -137,6 +139,10 @@ create_domain_statement:
 
 create_sequence_statement:
     CREATE SEQUENCE if_not_exists_opt qualified_name diagnostic_tail_opt
+  ;
+
+create_type_statement:
+    CREATE TYPE qualified_name AS diagnostic_tail
   ;
 
 relation_population_statement:
@@ -196,6 +202,10 @@ alter_sequence_statement:
     ALTER SEQUENCE if_exists_opt qualified_name diagnostic_tail
   ;
 
+alter_type_statement:
+    ALTER TYPE qualified_name diagnostic_tail
+  ;
+
 alter_table_relation_prefix_opt:
     /* empty */
   | IF EXISTS
@@ -212,6 +222,7 @@ drop_statement:
   | DROP VIEW if_exists_opt qualified_name drop_behavior_opt
   | DROP DOMAIN if_exists_opt qualified_name drop_behavior_opt
   | DROP SEQUENCE if_exists_opt qualified_name drop_behavior_opt
+  | DROP TYPE if_exists_opt qualified_name drop_behavior_opt
   ;
 
 drop_database_force_opt:

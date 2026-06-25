@@ -458,6 +458,10 @@ fn isIncompleteGeneratedDdlBoundary(tokens: []const Token, raw_statement: RawSql
             if (end <= start + 3) return true;
             return isGeneratedDdlTrailingBoundary(last);
         }
+        if (tokenMatchesKeyword(tokens[start + 1], .type)) {
+            if (end <= start + 3) return true;
+            return isGeneratedDdlTrailingBoundary(last);
+        }
         if (tokenMatchesKeyword(tokens[start + 1], .index)) {
             if (end <= start + 3) return true;
             return isGeneratedDdlTrailingBoundary(last);
@@ -486,11 +490,16 @@ fn isIncompleteGeneratedDdlBoundary(tokens: []const Token, raw_statement: RawSql
         if (end <= start + 3) return true;
         return isGeneratedDdlTrailingBoundary(last);
     }
+    if (tokenMatchesKeyword(first, .alter) and tokenMatchesKeyword(tokens[start + 1], .type)) {
+        if (end <= start + 3) return true;
+        return isGeneratedDdlTrailingBoundary(last);
+    }
     if (tokenMatchesKeyword(first, .drop)) {
         if (tokenMatchesKeyword(tokens[start + 1], .table) or
             tokenMatchesKeyword(tokens[start + 1], .view) or
             tokenMatchesKeyword(tokens[start + 1], .domain) or
             tokenMatchesKeyword(tokens[start + 1], .sequence) or
+            tokenMatchesKeyword(tokens[start + 1], .type) or
             tokenMatchesKeyword(tokens[start + 1], .index) or
             tokenMatchesKeyword(tokens[start + 1], .database) or
             tokenMatchesKeyword(tokens[start + 1], .schema) or
@@ -515,6 +524,7 @@ fn isGeneratedDdlTrailingBoundary(token: Token) bool {
         tokenMatchesKeyword(token, .where) or
         tokenMatchesKeyword(token, .include) or
         tokenMatchesKeyword(token, .add) or
+        tokenMatchesKeyword(token, .before) or
         tokenMatchesKeyword(token, .drop) or
         tokenMatchesKeyword(token, .rename) or
         tokenMatchesKeyword(token, .validate) or
@@ -1365,6 +1375,10 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE SEQUENCE order_id_seq AS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER SEQUENCE order_id_seq RESTART"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP SEQUENCE IF EXISTS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE TYPE"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE TYPE usage_status AS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER TYPE usage_status ADD"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP TYPE IF EXISTS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT DISTINCT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT DISTINCT ON ("));
@@ -2023,6 +2037,55 @@ test "sql adapter parsed sql owns typed statement variants" {
         else => return error.TestUnexpectedResult,
     }
     switch (drop_sequence.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var create_enum_type = try ParsedSql.initAlloc(alloc, "CREATE TYPE usage_status AS ENUM ('open', 'done')");
+    defer create_enum_type.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, create_enum_type.generatedStatementKind().?);
+    switch (create_enum_type.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_enum_type, ddl_ast.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 10 }, ddl_ast.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (create_enum_type.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var alter_enum_type = try ParsedSql.initAlloc(alloc, "ALTER TYPE usage_status ADD VALUE IF NOT EXISTS 'archived' AFTER 'done'");
+    defer alter_enum_type.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, alter_enum_type.generatedStatementKind().?);
+    switch (alter_enum_type.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_enum_type, ddl_ast.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 11 }, ddl_ast.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (alter_enum_type.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_enum_type = try ParsedSql.initAlloc(alloc, "DROP TYPE IF EXISTS usage_status CASCADE");
+    defer drop_enum_type.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, drop_enum_type.generatedStatementKind().?);
+    switch (drop_enum_type.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.drop_enum_type, ddl_ast.kind);
+            try std.testing.expect(ddl_ast.if_exists);
+            try std.testing.expect(ddl_ast.cascade);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl_ast.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (drop_enum_type.statement) {
         .ddl => {},
         else => return error.TestUnexpectedResult,
     }

@@ -79,6 +79,10 @@ Sequence catalog DDL heads, including `CREATE SEQUENCE`, `ALTER SEQUENCE`, and
 `DROP SEQUENCE`, now use the generated DDL boundary with retained object,
 option-tail, and drop-behavior metadata before delegating sequence option
 semantics to the existing typed sequence catalog planner.
+Enum type catalog DDL heads, including `CREATE TYPE ... AS ENUM`,
+`ALTER TYPE ... ADD VALUE`, and `DROP TYPE`, now use the generated DDL
+boundary with retained type-name, value-tail, and drop-behavior metadata before
+delegating enum value semantics to the existing typed enum catalog planner.
 Generated
 `CREATE INDEX` ASTs also retain
 `UNIQUE`, method, element-list, covering-index `INCLUDE (...)`, options, and
@@ -90,12 +94,12 @@ now parse and classify through the generated DDL family with retained target
 name spans before delegating to the existing relation-population planner.
 Incomplete covered DDL clause-boundary shapes for `CREATE TABLE`, lifetime
 prefixed `CREATE [TEMP|TEMPORARY|UNLOGGED] TABLE`, `CREATE VIEW`,
-`CREATE DOMAIN`, `CREATE SEQUENCE`, `CREATE INDEX`, `ALTER TABLE`,
-`ALTER VIEW`, `ALTER DOMAIN`, `ALTER SEQUENCE`, `DROP TABLE`, `DROP VIEW`,
-`DROP DOMAIN`, and `DROP SEQUENCE` now fail closed through the generated parser
-instead of falling back to the legacy DDL classifier, while rich DDL syntax
-that is not yet generated-covered still falls back to the existing typed DDL
-parser.
+`CREATE DOMAIN`, `CREATE SEQUENCE`, `CREATE TYPE`, `CREATE INDEX`,
+`ALTER TABLE`, `ALTER VIEW`, `ALTER DOMAIN`, `ALTER SEQUENCE`, `ALTER TYPE`,
+`DROP TABLE`, `DROP VIEW`, `DROP DOMAIN`, `DROP SEQUENCE`, and `DROP TYPE` now
+fail closed through the generated parser instead of falling back to the legacy
+DDL classifier, while rich DDL syntax that is not yet generated-covered still
+falls back to the existing typed DDL parser.
 Simple DML now has generated-parser corpus
 coverage, retained generated raw and AST nodes for covered write statements,
 structured generated DML ranges for target tables, sources, assignments,
@@ -1022,6 +1026,8 @@ Generated grammar work needs evidence at multiple levels:
   `DROP INDEX`, generated domain catalog DDL for `CREATE DOMAIN`,
   `ALTER DOMAIN`, and `DROP DOMAIN`, generated sequence catalog DDL for
   `CREATE SEQUENCE`, `ALTER SEQUENCE`, and `DROP SEQUENCE`, generated
+  enum type catalog DDL for `CREATE TYPE`, `ALTER TYPE`, and `DROP TYPE`,
+  generated
   `CREATE INDEX` including retained partial predicate indexes with field or
   expression predicates, and generated
   `ALTER TABLE ADD/DROP/RENAME COLUMN`, `ADD PRIMARY KEY`, `ADD UNIQUE`,

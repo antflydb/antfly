@@ -57,16 +57,19 @@ pub const GeneratedSqlDdlKind = enum {
     create_view,
     create_domain,
     create_sequence,
+    create_enum_type,
     create_index,
     create_extension,
     alter_table,
     alter_view,
     alter_domain,
     alter_sequence,
+    alter_enum_type,
     drop_table,
     drop_view,
     drop_domain,
     drop_sequence,
+    drop_enum_type,
     drop_index,
     drop_schema,
     drop_database,
@@ -1942,6 +1945,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.view)) return .{ .ddl = .create_view };
         if (second.matchesKeywordTag(.domain)) return .{ .ddl = .create_domain };
         if (second.matchesKeywordTag(.sequence)) return .{ .ddl = .create_sequence };
+        if (second.matchesKeywordTag(.type)) return .{ .ddl = .create_enum_type };
         if (second.matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
         if (second.matchesKeywordTag(.unique) and tokens.len > 2 and tokens[2].matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
         if (second.matchesKeywordTag(.foreign) and tokens.len > 2 and tokens[2].matchesKeywordTag(.table)) return .{ .unsupported = .create_foreign_table };
@@ -1976,6 +1980,9 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.alter) and tokens.len > 1 and tokens[1].matchesKeywordTag(.sequence)) {
         return .{ .ddl = .alter_sequence };
     }
+    if (first.matchesKeywordTag(.alter) and tokens.len > 1 and tokens[1].matchesKeywordTag(.type)) {
+        return .{ .ddl = .alter_enum_type };
+    }
     if (first.matchesKeywordTag(.alter) and tokens.len > 1) {
         const second = tokens[1];
         if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .unsupported = .alter_materialized_view };
@@ -1992,6 +1999,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.view)) return .{ .ddl = .drop_view };
         if (second.matchesKeywordTag(.domain)) return .{ .ddl = .drop_domain };
         if (second.matchesKeywordTag(.sequence)) return .{ .ddl = .drop_sequence };
+        if (second.matchesKeywordTag(.type)) return .{ .ddl = .drop_enum_type };
         if (second.matchesKeywordTag(.index)) return .{ .extension_index = .drop_index };
         if (second.matchesKeywordTag(.schema)) return .{ .ddl = .drop_schema };
         if (second.matchesKeywordTag(.database)) return .{ .ddl = .drop_database };
@@ -2458,6 +2466,14 @@ fn buildDdlAst(
                 }
             }
         },
+        .create_enum_type => {
+            if (end > 2 and tokens[1].matchesKeywordTag(.type)) {
+                ast.object_name_tokens = generatedQualifiedNameRange(tokens, 2, end);
+                if (ast.object_name_tokens) |type_range| {
+                    if (type_range.end < end) ast.alter_table_operation_tokens = .{ .start = type_range.end, .end = end };
+                }
+            }
+        },
         .create_index => {
             if (tokens.len > 2 and tokens[1].matchesKeywordTag(.unique) and tokens[2].matchesKeywordTag(.index)) {
                 ast.unique = true;
@@ -2545,6 +2561,14 @@ fn buildDdlAst(
                 }
             }
         },
+        .alter_enum_type => {
+            if (end > 2 and tokens[1].matchesKeywordTag(.type)) {
+                ast.object_name_tokens = generatedQualifiedNameRange(tokens, 2, end);
+                if (ast.object_name_tokens) |type_range| {
+                    if (type_range.end < end) ast.alter_table_operation_tokens = .{ .start = type_range.end, .end = end };
+                }
+            }
+        },
         .drop_database => {
             ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
             ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
@@ -2566,6 +2590,11 @@ fn buildDdlAst(
             ast.cascade = findKeyword(tokens, index + 1, end, .cascade) != null;
         },
         .drop_sequence => {
+            ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
+            ast.object_name_tokens = generatedQualifiedNameRange(tokens, index, end);
+            ast.cascade = findKeyword(tokens, index + 1, end, .cascade) != null;
+        },
+        .drop_enum_type => {
             ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
             ast.object_name_tokens = generatedQualifiedNameRange(tokens, index, end);
             ast.cascade = findKeyword(tokens, index + 1, end, .cascade) != null;
@@ -5816,6 +5845,9 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_sequence }, (try parseSqlAlloc(alloc, "CREATE SEQUENCE order_id_seq AS bigint START WITH 10")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_sequence }, (try parseSqlAlloc(alloc, "ALTER SEQUENCE IF EXISTS order_id_seq RESTART WITH 1000")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_sequence }, (try parseSqlAlloc(alloc, "DROP SEQUENCE IF EXISTS order_id_seq CASCADE")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_enum_type }, (try parseSqlAlloc(alloc, "CREATE TYPE usage_status AS ENUM ('open', 'done')")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_enum_type }, (try parseSqlAlloc(alloc, "ALTER TYPE usage_status ADD VALUE IF NOT EXISTS 'archived' AFTER 'done'")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_enum_type }, (try parseSqlAlloc(alloc, "DROP TYPE IF EXISTS usage_status CASCADE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .relation_population }, (try parseSqlAlloc(alloc, "SELECT account_id, total INTO usage_archive FROM usage_records WHERE total > 10")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .relation_population }, (try parseSqlAlloc(alloc, "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT account_id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_schema }, (try parseSqlAlloc(alloc, "DROP SCHEMA analytics CASCADE")).statement);
@@ -5975,6 +6007,17 @@ test "generated SQL parser facade builds control AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const create_enum_type_sql = "CREATE TYPE usage_status AS ENUM ('open', 'done')";
+    const create_enum_type_result = try parseSqlAlloc(alloc, create_enum_type_sql);
+    switch (create_enum_type_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.create_enum_type, ddl.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 10 }, ddl.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const extension_sql = "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public VERSION '1.3'";
     const extension_result = try parseSqlAlloc(alloc, extension_sql);
     switch (extension_result.ast.?) {
@@ -6093,6 +6136,17 @@ test "generated SQL parser facade builds control AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const alter_enum_type_sql = "ALTER TYPE usage_status ADD VALUE IF NOT EXISTS 'archived' AFTER 'done'";
+    const alter_enum_type_result = try parseSqlAlloc(alloc, alter_enum_type_sql);
+    switch (alter_enum_type_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.alter_enum_type, ddl.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 11 }, ddl.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const drop_index_sql = "DROP INDEX IF EXISTS usage_status_idx";
     const drop_index_result = try parseSqlAlloc(alloc, drop_index_sql);
     switch (drop_index_result.ast.?) {
@@ -6145,6 +6199,18 @@ test "generated SQL parser facade builds control AST spans" {
     switch (drop_sequence_result.ast.?) {
         .ddl => |ddl| {
             try std.testing.expectEqual(GeneratedSqlDdlKind.drop_sequence, ddl.kind);
+            try std.testing.expect(ddl.if_exists);
+            try std.testing.expect(ddl.cascade);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const drop_enum_type_sql = "DROP TYPE IF EXISTS usage_status CASCADE";
+    const drop_enum_type_result = try parseSqlAlloc(alloc, drop_enum_type_sql);
+    switch (drop_enum_type_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.drop_enum_type, ddl.kind);
             try std.testing.expect(ddl.if_exists);
             try std.testing.expect(ddl.cascade);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl.object_name_tokens.?);
