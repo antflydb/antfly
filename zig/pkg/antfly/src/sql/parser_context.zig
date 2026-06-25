@@ -275,6 +275,12 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
 
         pub fn ddlColumnDefinitionOptions(ptr: *ParserType) ddl_plan.DdlColumnDefinitionOptions {
             return .{
+                .schema = ptr.schema,
+                .params = ptr.params,
+                .function_bindings = ptr.function_bindings,
+                .field_expression_qualifiers = ptr.field_expression_qualifiers,
+                .returning_expression_qualifiers = ptr.returning_expression_qualifiers,
+                .defer_row_expression_field_validation = ptr.defer_row_expression_field_validation,
                 .expression_options = Accessors.ddlExpressionOptions(ptr),
                 .parse_rewrite_expression = true,
             };

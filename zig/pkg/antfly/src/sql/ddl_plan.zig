@@ -3262,7 +3262,15 @@ fn generatedAlterTableOperationSegmentUsesRuntimeBoundary(tokens: []const gramma
     if (start >= end or end > tokens.len) return false;
     const first = tokens[start];
     if (first.matchesKeywordTag(.add)) {
-        return start + 1 < end and tokens[start + 1].matchesKeywordTag(.column);
+        if (start + 1 >= end) return false;
+        if (tokens[start + 1].matchesKeywordTag(.column)) return true;
+        if (tokens[start + 1].matchesKeyword("period")) return true;
+        var constraint_kind_index = start + 1;
+        if (tokens[constraint_kind_index].matchesKeywordTag(.constraint)) {
+            if (constraint_kind_index + 2 >= end) return false;
+            constraint_kind_index += 2;
+        }
+        return generatedAlterTableAddConstraintKindUsesRuntimeBoundary(tokens[constraint_kind_index]);
     }
     if (first.matchesKeywordTag(.drop)) {
         return start + 1 < end and tokens[start + 1].matchesKeywordTag(.column);
@@ -3274,6 +3282,13 @@ fn generatedAlterTableOperationSegmentUsesRuntimeBoundary(tokens: []const gramma
         return start + 1 < end and tokens[start + 1].matchesKeywordTag(.constraint);
     }
     return false;
+}
+
+fn generatedAlterTableAddConstraintKindUsesRuntimeBoundary(token: grammar.Token) bool {
+    return token.matchesKeyword("primary") or
+        token.matchesKeyword("unique") or
+        token.matchesKeyword("foreign") or
+        token.matchesKeyword("check");
 }
 
 fn generatedAlterTableUsesRowSecurityRuntimeBoundary(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) bool {
@@ -3736,8 +3751,20 @@ fn alterTablePlanFromGeneratedAstAlloc(
     const operation_range = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
     if (operation_range.start != index or operation_range.end != end or operation_range.start >= operation_range.end) return error.UnsupportedSqlShape;
 
-    var pos: usize = 0;
-    var plan = try parseAlterTablePlanAlloc(alloc, tokens[1..end], &pos, options);
+    const alter_tokens = tokens[1..end];
+    var state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = alter_tokens,
+        .schema = options.schema,
+        .params = options.params,
+        .function_bindings = options.function_bindings,
+        .field_expression_qualifiers = options.field_expression_qualifiers,
+        .returning_expression_qualifiers = options.returning_expression_qualifiers,
+        .defer_row_expression_field_validation = options.defer_row_expression_field_validation,
+    };
+    var local_options = parser_context.ParserState.ContextAccessors.ddlColumnDefinitionOptions(&state);
+    local_options.parse_rewrite_expression = options.parse_rewrite_expression;
+    var plan = try parseAlterTablePlanAlloc(alloc, alter_tokens, &state.pos, local_options);
     errdefer plan.deinit(alloc);
     if (plan.if_exists != ast.if_exists) return error.UnsupportedSqlShape;
     return plan;
@@ -7858,6 +7885,12 @@ pub fn parseOptionalSupportedDdlCollationAlloc(
 }
 
 pub const DdlColumnDefinitionOptions = struct {
+    schema: runtime_schema.TableSchema = .{},
+    params: []const value_mod.SqlValue = &.{},
+    function_bindings: lower_expr.SqlFunctionBindings = .{},
+    field_expression_qualifiers: []const []const u8 = &.{},
+    returning_expression_qualifiers: []const []const u8 = &.{},
+    defer_row_expression_field_validation: bool = false,
     expression_options: DdlExpressionOptions,
     parse_rewrite_expression: bool = true,
 };
@@ -13303,6 +13336,58 @@ test "sql adapter generated create table and index AST lowers to DDL plans" {
                 try std.testing.expectEqual(legacy.operations.len, generated.operations.len);
                 switch (generated.operations[0]) {
                     .validate_constraint => |constraint_name| try std.testing.expectEqualStrings("usage_records_amount_check", constraint_name),
+                    else => return error.TestUnexpectedResult,
+                }
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const alter_constraint_sql =
+        \\ALTER TABLE usage_records
+        \\  ADD COLUMN tenant_status_key text GENERATED ALWAYS AS (concat(tenant_id, ':', status)) STORED,
+        \\  ADD CONSTRAINT usage_records_tenant_status_key UNIQUE (tenant_id, status),
+        \\  ADD CONSTRAINT usage_records_tenant_fkey FOREIGN KEY (tenant_id) REFERENCES tenants (id) MATCH FULL ON DELETE SET NULL,
+        \\  ADD CONSTRAINT usage_records_amount_check CHECK (amount >= 0);
+    ;
+    var generated_alter_constraint = try generatedDdlPlanForTestAlloc(alloc, alter_constraint_sql);
+    defer generated_alter_constraint.deinit(alloc);
+    var legacy_alter_constraint = try lowerDdlPlanForTestAlloc(alloc, alter_constraint_sql);
+    defer legacy_alter_constraint.deinit(alloc);
+    switch (generated_alter_constraint) {
+        .alter_table => |generated| switch (legacy_alter_constraint) {
+            .alter_table => |legacy| {
+                try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
+                try std.testing.expectEqual(legacy.operations.len, generated.operations.len);
+                switch (generated.operations[0]) {
+                    .add_column => |operation| {
+                        try std.testing.expectEqualStrings("tenant_status_key", operation.column.name);
+                        try std.testing.expect(operation.column.generated != null);
+                        try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.concat, operation.column.generated.?.op);
+                    },
+                    else => return error.TestUnexpectedResult,
+                }
+                switch (generated.operations[1]) {
+                    .add_unique_constraint => |constraint| {
+                        try std.testing.expectEqualStrings("usage_records_tenant_status_key", constraint.name);
+                        try std.testing.expectEqual(@as(usize, 2), constraint.columns.len);
+                    },
+                    else => return error.TestUnexpectedResult,
+                }
+                switch (generated.operations[2]) {
+                    .add_foreign_key => |foreign_key| {
+                        try std.testing.expectEqualStrings("usage_records_tenant_fkey", foreign_key.name);
+                        try std.testing.expectEqual(runtime_schema.ForeignKeyMatch.full, foreign_key.match);
+                    },
+                    else => return error.TestUnexpectedResult,
+                }
+                switch (generated.operations[3]) {
+                    .add_check => |check| {
+                        try std.testing.expectEqualStrings("usage_records_amount_check", check.name);
+                        try std.testing.expectEqualStrings("amount", check.field);
+                        try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, check.op);
+                    },
                     else => return error.TestUnexpectedResult,
                 }
             },
