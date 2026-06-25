@@ -610,6 +610,9 @@ Unsupported DDL remains on the existing parser until
    item/expression/alias spans before typed select-list planning, and typed
    projection planning must consume the same generated projection span for
    generated simple, aggregate, window, join, and lateral reads. Generated
+   source clauses now require typed source planning for generated simple,
+   aggregate, window, and set-operation right-hand reads to consume the same
+   retained generated source span before later clauses are planned. Generated
    aggregate `GROUP BY` clauses now similarly
    validate generated item/expression list spans before typed grouping
    planning, and typed grouping must consume the same generated group-list

@@ -17,6 +17,7 @@ const std = @import("std");
 const docstore_mod = @import("../docstore.zig");
 const internal_keys = @import("../internal_keys.zig");
 const schema_mod = @import("../schema.zig");
+const schema_api_mod = @import("../../schema/mod.zig");
 const transactions_mod = @import("../transactions.zig");
 const mapper = @import("document_mapper.zig");
 const db_internal = @import("internal.zig");
@@ -27,6 +28,8 @@ const platform_clock = @import("../../platform/clock.zig");
 const temporal_typed_dv = @import("../../section/typed_doc_values.zig");
 
 const Allocator = std.mem.Allocator;
+const expectRelationalTemporalPriceRow = @import("test_support.zig").expectRelationalTemporalPriceRow;
+const expectRelationalTemporalPrimarySelectorPriceRow = @import("test_support.zig").expectRelationalTemporalPrimarySelectorPriceRow;
 
 const temporal_bound_neg_infinity_tag: u8 = 0xf0;
 const temporal_bound_pos_infinity_tag: u8 = 0xf1;
@@ -5684,4 +5687,3044 @@ test "db direct schema apply rejects added unique constraints with duplicate exi
     const durable_schema = (try schema_mod.loadSchema(db.core.store, alloc)) orelse return error.TestUnexpectedResult;
     defer schema_mod.freeSchema(alloc, durable_schema);
     try std.testing.expectEqual(@as(usize, 0), durable_schema.unique_constraints.len);
+}
+
+test "relational expression partial predicates maintain indexes and unique owners" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","x-antfly-index-where-expressions":[{"lhs":{"op":"lower","args":[{"field":"status"}]},"op":"eq","rhs":{"value":"active"}}]},"status":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id","email","status","name"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_active_email_key","columns":["email"],"where_expressions":[{"lhs":{"op":"lower","args":[{"field":"status"}]},"op":"eq","rhs":{"value":"active"}}]}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:active", .value = "{\"id\":\"u1\",\"email\":\"shared@example.test\",\"status\":\"ACTIVE\",\"name\":\"Active\"}" },
+            .{ .key = "user:inactive", .value = "{\"id\":\"u2\",\"email\":\"shared@example.test\",\"status\":\"inactive\",\"name\":\"Inactive\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const active_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "email", "user:active");
+    defer alloc.free(active_index_key);
+    const active_index = try db.core.store.get(alloc, active_index_key);
+    defer alloc.free(active_index);
+
+    const inactive_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "email", "user:inactive");
+    defer alloc.free(inactive_index_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, inactive_index_key));
+
+    const active_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:active") orelse return error.TestExpectedEqual;
+    defer alloc.free(active_row);
+    const active_tuple = (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, active_row, runtime_schema.unique_constraints[0])) orelse return error.TestExpectedEqual;
+    defer alloc.free(active_tuple);
+    const owner_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_active_email_key", active_tuple);
+    defer alloc.free(owner_key);
+    const owner = try db.core.store.get(alloc, owner_key);
+    defer alloc.free(owner);
+    try std.testing.expectEqualStrings("user:active", owner);
+
+    const inactive_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:inactive") orelse return error.TestExpectedEqual;
+    defer alloc.free(inactive_row);
+    if (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, inactive_row, runtime_schema.unique_constraints[0])) |inactive_tuple| {
+        alloc.free(inactive_tuple);
+        return error.TestExpectedEqual;
+    }
+
+    const lower_status_operands = [_]types.RelationalRowsExpression{.{
+        .kind = .field,
+        .field = "status",
+    }};
+    const active_expression_rhs = [_]types.RelationalRowsExpression{.{
+        .kind = .value,
+        .value_json = "\"active\"",
+    }};
+    const active_expression_predicates = [_]types.RelationalRowsExpressionCondition{.{
+        .lhs = .{
+            .kind = .lower,
+            .operands = lower_status_operands[0..],
+        },
+        .op = .eq,
+        .rhs = active_expression_rhs[0..],
+    }};
+    try std.testing.expect(!(try db.searchRuntimeRelationalColumnIndexUsableForQuery(alloc, runtime_schema.relational_columns[1], .{
+        .predicates = &.{},
+        .expressions = &.{},
+    })));
+    try std.testing.expect(try db.searchRuntimeRelationalColumnIndexUsableForQuery(alloc, runtime_schema.relational_columns[1], .{
+        .predicates = &.{},
+        .expressions = active_expression_predicates[0..],
+    }));
+    const semantic_index_predicates = [_]schema_mod.RelationalCheck{
+        .{
+            .name = "",
+            .field = "email",
+            .op = .eq,
+            .value_json = "\"shared@example.test\"",
+        },
+        .{
+            .name = "",
+            .field = "status",
+            .op = .eq,
+            .value_json = "\"ACTIVE\"",
+        },
+    };
+    try std.testing.expect(try db.searchRuntimeRelationalColumnIndexUsableForQuery(alloc, runtime_schema.relational_columns[1], .{
+        .predicates = semantic_index_predicates[0..],
+        .expressions = &.{},
+    }));
+
+    try db.core.store.delete(active_index_key);
+    const email_predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "email",
+        .op = .eq,
+        .value_json = "\"shared@example.test\"",
+    }};
+    const select = [_][]const u8{ "id", "status" };
+    var active_query = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = email_predicates[0..],
+        .expression_predicates = active_expression_predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+    });
+    defer active_query.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), active_query.total);
+    try std.testing.expectEqual(@as(usize, 1), active_query.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"ACTIVE\"}", active_query.rows[0]);
+
+    var semantic_query = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = semantic_index_predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+    });
+    defer semantic_query.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), semantic_query.total);
+    try std.testing.expectEqual(@as(usize, 1), semantic_query.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"ACTIVE\"}", semantic_query.rows[0]);
+}
+
+test "relational text expression partial predicates maintain indexes and unique owners" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","x-antfly-index-where-expressions":[{"lhs":{"op":"split_part","args":[{"field":"status"},{"value":"-"},{"value":1}]},"op":"eq","rhs":{"value":"active"}},{"lhs":{"op":"regexp_replace","args":[{"field":"status"},{"value":"[0-9]+"},{"value":"#"},{"value":"g"}]},"op":"eq","rhs":{"value":"active-#"}},{"lhs":{"op":"starts_with","args":[{"field":"tag"},{"value":"h"}]},"op":"eq","rhs":{"value":true}}]},"status":{"type":"keyword"},"tag":{"type":"keyword"}},"required":["id","email","status","tag"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_hot_email_key","columns":["email"],"where_expressions":[{"lhs":{"op":"replace","args":[{"field":"tag"},{"value":"-"},{"value":""}]},"op":"eq","rhs":{"value":"hot"}},{"lhs":{"op":"regexp_replace","args":[{"field":"status"},{"value":"[0-9]+"},{"value":"#"},{"value":"g"}]},"op":"eq","rhs":{"value":"active-#"}}]}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:active", .value = "{\"id\":\"u1\",\"email\":\"shared@example.test\",\"status\":\"active-2026\",\"tag\":\"h-ot\"}" },
+            .{ .key = "user:inactive", .value = "{\"id\":\"u2\",\"email\":\"shared@example.test\",\"status\":\"inactive-open\",\"tag\":\"cold\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const active_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "email", "user:active");
+    defer alloc.free(active_index_key);
+    const active_index = try db.core.store.get(alloc, active_index_key);
+    defer alloc.free(active_index);
+
+    const inactive_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "email", "user:inactive");
+    defer alloc.free(inactive_index_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, inactive_index_key));
+
+    const active_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:active") orelse return error.TestExpectedEqual;
+    defer alloc.free(active_row);
+    const active_tuple = (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, active_row, runtime_schema.unique_constraints[0])) orelse return error.TestExpectedEqual;
+    defer alloc.free(active_tuple);
+    const owner_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_hot_email_key", active_tuple);
+    defer alloc.free(owner_key);
+    const owner = try db.core.store.get(alloc, owner_key);
+    defer alloc.free(owner);
+    try std.testing.expectEqualStrings("user:active", owner);
+
+    const inactive_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:inactive") orelse return error.TestExpectedEqual;
+    defer alloc.free(inactive_row);
+    if (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, inactive_row, runtime_schema.unique_constraints[0])) |inactive_tuple| {
+        alloc.free(inactive_tuple);
+        return error.TestExpectedEqual;
+    }
+}
+
+test "relational scalar expression partial predicates maintain indexes and unique owners" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","x-antfly-index-where-expressions":[{"lhs":{"op":"add","args":[{"field":"amount"},{"field":"bonus"}]},"op":"gte","rhs":{"value":10}},{"lhs":{"op":"cast","to":"numeric","args":[{"field":"rank_text"}]},"op":"eq","rhs":{"value":6}},{"lhs":{"op":"greatest","args":[{"field":"amount"},{"field":"bonus"}]},"op":"gte","rhs":{"value":6}},{"lhs":{"op":"least","args":[{"field":"amount"},{"field":"cap"}]},"op":"lte","rhs":{"value":5}}]},"status":{"type":"keyword"},"amount":{"type":"numeric"},"bonus":{"type":"numeric"},"cap":{"type":"numeric"},"rank_text":{"type":"keyword"}},"required":["id","email","status","amount","bonus","cap","rank_text"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_active_email_key","columns":["email"],"where_expressions":[{"lhs":{"op":"nullif","args":[{"field":"status"},{"value":"blocked"}]},"op":"is_not_null"},{"lhs":{"op":"mod","args":[{"field":"amount"},{"value":2}]},"op":"eq","rhs":{"value":0}}]}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:active", .value = "{\"id\":\"u1\",\"email\":\"shared@example.test\",\"status\":\"active\",\"amount\":6,\"bonus\":4,\"cap\":5,\"rank_text\":\"6\"}" },
+            .{ .key = "user:inactive", .value = "{\"id\":\"u2\",\"email\":\"shared@example.test\",\"status\":\"blocked\",\"amount\":3,\"bonus\":1,\"cap\":5,\"rank_text\":\"3\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const active_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "email", "user:active");
+    defer alloc.free(active_index_key);
+    const active_index = try db.core.store.get(alloc, active_index_key);
+    defer alloc.free(active_index);
+
+    const inactive_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "email", "user:inactive");
+    defer alloc.free(inactive_index_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, inactive_index_key));
+
+    const active_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:active") orelse return error.TestExpectedEqual;
+    defer alloc.free(active_row);
+    const active_tuple = (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, active_row, runtime_schema.unique_constraints[0])) orelse return error.TestExpectedEqual;
+    defer alloc.free(active_tuple);
+    const owner_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_active_email_key", active_tuple);
+    defer alloc.free(owner_key);
+    const owner = try db.core.store.get(alloc, owner_key);
+    defer alloc.free(owner);
+    try std.testing.expectEqualStrings("user:active", owner);
+
+    const inactive_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:inactive") orelse return error.TestExpectedEqual;
+    defer alloc.free(inactive_row);
+    if (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, inactive_row, runtime_schema.unique_constraints[0])) |inactive_tuple| {
+        alloc.free(inactive_tuple);
+        return error.TestExpectedEqual;
+    }
+}
+
+test "relational boolean and pattern expression partial predicates maintain indexes and unique owners" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","x-antfly-index-where-expressions":[{"lhs":{"op":"ilike","args":[{"field":"name"},{"value":"al%"}]},"op":"eq","rhs":{"value":true}},{"lhs":{"op":"bool_and","args":[{"field":"enabled"},{"value":true}]},"op":"eq","rhs":{"value":true}}]},"name":{"type":"keyword"},"status":{"type":"keyword"},"enabled":{"type":"boolean"},"archived":{"type":"boolean"}},"required":["id","email","name","status","enabled","archived"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_visible_email_key","columns":["email"],"where_expressions":[{"lhs":{"op":"like","args":[{"field":"status"},{"value":"act%"}]},"op":"eq","rhs":{"value":true}},{"lhs":{"op":"bool_not","args":[{"field":"archived"}]},"op":"eq","rhs":{"value":true}}]}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:visible", .value = "{\"id\":\"u1\",\"email\":\"shared@example.test\",\"name\":\"Alice\",\"status\":\"active\",\"enabled\":true,\"archived\":false}" },
+            .{ .key = "user:hidden", .value = "{\"id\":\"u2\",\"email\":\"shared@example.test\",\"name\":\"Bob\",\"status\":\"blocked\",\"enabled\":false,\"archived\":true}" },
+        },
+        .sync_level = .write,
+    });
+
+    const visible_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "email", "user:visible");
+    defer alloc.free(visible_index_key);
+    const visible_index = try db.core.store.get(alloc, visible_index_key);
+    defer alloc.free(visible_index);
+
+    const hidden_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "email", "user:hidden");
+    defer alloc.free(hidden_index_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, hidden_index_key));
+
+    const visible_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:visible") orelse return error.TestExpectedEqual;
+    defer alloc.free(visible_row);
+    const visible_tuple = (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, visible_row, runtime_schema.unique_constraints[0])) orelse return error.TestExpectedEqual;
+    defer alloc.free(visible_tuple);
+    const owner_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_visible_email_key", visible_tuple);
+    defer alloc.free(owner_key);
+    const owner = try db.core.store.get(alloc, owner_key);
+    defer alloc.free(owner);
+    try std.testing.expectEqualStrings("user:visible", owner);
+
+    const hidden_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:hidden") orelse return error.TestExpectedEqual;
+    defer alloc.free(hidden_row);
+    if (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, hidden_row, runtime_schema.unique_constraints[0])) |hidden_tuple| {
+        alloc.free(hidden_tuple);
+        return error.TestExpectedEqual;
+    }
+}
+
+test "relational array and json object expression partial predicates maintain indexes and unique owners" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","x-antfly-index-where-expressions":[{"lhs":{"op":"array_position","args":[{"field":"tags"},{"value":"hot"}]},"op":"eq","rhs":{"value":1}},{"lhs":{"op":"array_to_string","args":[{"op":"array_append","args":[{"field":"tags"},{"value":"vip"}]},{"value":","}]},"op":"eq","rhs":{"value":"hot,vip"}},{"lhs":{"op":"json_build_object","args":[{"value":"source"},{"op":"json_extract","args":[{"field":"metadata"}],"path":"source","as_text":true}]},"op":"eq","rhs":{"value":{"source":"api"}}}]},"tags":{"type":"array","items":{"type":"keyword"}},"scope":{"type":"keyword"},"metadata":{"type":"json"}},"required":["id","email","tags","scope","metadata"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_array_json_email_key","columns":["email"],"where_expressions":[{"lhs":{"op":"array_to_string","args":[{"op":"array_replace","args":[{"field":"tags"},{"value":"hot"},{"value":"warm"}]},{"value":","}]},"op":"eq","rhs":{"value":"warm"}},{"lhs":{"op":"array_position","args":[{"op":"string_to_array","args":[{"field":"scope"},{"value":" "}]},{"value":"read"}]},"op":"eq","rhs":{"value":1}}]}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:visible", .value = "{\"id\":\"u1\",\"email\":\"shared@example.test\",\"tags\":[\"hot\"],\"scope\":\"read write\",\"metadata\":{\"source\":\"api\"}}" },
+            .{ .key = "user:hidden", .value = "{\"id\":\"u2\",\"email\":\"shared@example.test\",\"tags\":[\"cold\"],\"scope\":\"write\",\"metadata\":{\"source\":\"cli\"}}" },
+        },
+        .sync_level = .write,
+    });
+
+    const visible_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "email", "user:visible");
+    defer alloc.free(visible_index_key);
+    const visible_index = try db.core.store.get(alloc, visible_index_key);
+    defer alloc.free(visible_index);
+
+    const hidden_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "email", "user:hidden");
+    defer alloc.free(hidden_index_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, hidden_index_key));
+
+    const visible_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:visible") orelse return error.TestExpectedEqual;
+    defer alloc.free(visible_row);
+    const visible_tuple = (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, visible_row, runtime_schema.unique_constraints[0])) orelse return error.TestExpectedEqual;
+    defer alloc.free(visible_tuple);
+    const owner_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_array_json_email_key", visible_tuple);
+    defer alloc.free(owner_key);
+    const owner = try db.core.store.get(alloc, owner_key);
+    defer alloc.free(owner);
+    try std.testing.expectEqualStrings("user:visible", owner);
+
+    const hidden_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:hidden") orelse return error.TestExpectedEqual;
+    defer alloc.free(hidden_row);
+    if (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, hidden_row, runtime_schema.unique_constraints[0])) |hidden_tuple| {
+        alloc.free(hidden_tuple);
+        return error.TestExpectedEqual;
+    }
+}
+
+test "relational temporal and case expression partial predicates maintain indexes and unique owners" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword","x-antfly-index-where-expressions":[{"lhs":{"op":"date_trunc","args":[{"value":"hour"},{"field":"created_at_ns"}]},"op":"eq","rhs":{"value":3600000000000}},{"lhs":{"op":"case","cases":[{"when":{"lhs":{"field":"status"},"op":"eq","rhs":{"value":"active"}},"then":{"value":true}}],"else":{"value":false}},"op":"eq","rhs":{"value":true}}]},"status":{"type":"keyword"},"created_at_ns":{"type":"datetime"}},"required":["id","email","status","created_at_ns"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_temporal_email_key","columns":["email"],"where_expressions":[{"lhs":{"op":"date_bin","args":[{"op":"interval_ns","args":[{"value":3600000000000}]},{"field":"created_at_ns"},{"value":0}]},"op":"eq","rhs":{"value":3600000000000}},{"lhs":{"op":"date_part","args":[{"value":"hour"},{"field":"created_at_ns"}]},"op":"eq","rhs":{"value":1}}]}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:visible", .value = "{\"id\":\"u1\",\"email\":\"shared@example.test\",\"status\":\"active\",\"created_at_ns\":3700000000000}" },
+            .{ .key = "user:hidden", .value = "{\"id\":\"u2\",\"email\":\"shared@example.test\",\"status\":\"inactive\",\"created_at_ns\":7300000000000}" },
+        },
+        .sync_level = .write,
+    });
+
+    const visible_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "email", "user:visible");
+    defer alloc.free(visible_index_key);
+    const visible_index = try db.core.store.get(alloc, visible_index_key);
+    defer alloc.free(visible_index);
+
+    const hidden_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "email", "user:hidden");
+    defer alloc.free(hidden_index_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, hidden_index_key));
+
+    const visible_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:visible") orelse return error.TestExpectedEqual;
+    defer alloc.free(visible_row);
+    const visible_tuple = (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, visible_row, runtime_schema.unique_constraints[0])) orelse return error.TestExpectedEqual;
+    defer alloc.free(visible_tuple);
+    const owner_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_temporal_email_key", visible_tuple);
+    defer alloc.free(owner_key);
+    const owner = try db.core.store.get(alloc, owner_key);
+    defer alloc.free(owner);
+    try std.testing.expectEqualStrings("user:visible", owner);
+
+    const hidden_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:hidden") orelse return error.TestExpectedEqual;
+    defer alloc.free(hidden_row);
+    if (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, hidden_row, runtime_schema.unique_constraints[0])) |hidden_tuple| {
+        alloc.free(hidden_tuple);
+        return error.TestExpectedEqual;
+    }
+}
+
+test "db foreign key action job applies set-null children in durable pages" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"set_null"}]}
+        ;
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        try db.setSchema(runtime_schema);
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "customer:wide-job", .value = "{\"id\":\"customer:wide-job\"}" },
+                .{ .key = "order:wide-job:1", .value = "{\"id\":\"order:wide-job:1\",\"customer_id\":\"customer:wide-job\",\"status\":\"open\"}" },
+                .{ .key = "order:wide-job:2", .value = "{\"id\":\"order:wide-job:2\",\"customer_id\":\"customer:wide-job\",\"status\":\"open\"}" },
+                .{ .key = "order:wide-job:3", .value = "{\"id\":\"order:wide-job:3\",\"customer_id\":\"customer:wide-job\",\"status\":\"open\"}" },
+            },
+        });
+
+        const scheduled = try db.scheduleForeignKeyActionJobAt(
+            "fk-action:set-null:customer-wide-job",
+            "set_null",
+            "worker:fk-action:scheduler",
+            "orders_customer_id_fkey",
+            "customers",
+            "customer:wide-job",
+            2,
+            100_000,
+        );
+        defer db.freeForeignKeyActionJobRecord(scheduled);
+        try std.testing.expectEqualStrings("pending", scheduled.status);
+        try std.testing.expect(!scheduled.completed);
+        try std.testing.expectEqual(@as(u32, 0), scheduled.attempts);
+        try std.testing.expectEqual(@as(u64, 0), scheduled.claimed_at_ns);
+        try std.testing.expectEqual(@as(u64, 0), scheduled.lease_until_ns);
+
+        const scheduled_again = try db.scheduleForeignKeyActionJobAt(
+            "fk-action:set-null:customer-wide-job",
+            "set_null",
+            "worker:fk-action:scheduler",
+            "orders_customer_id_fkey",
+            "customers",
+            "customer:wide-job",
+            2,
+            150_000,
+        );
+        defer db.freeForeignKeyActionJobRecord(scheduled_again);
+        try std.testing.expectEqualStrings("pending", scheduled_again.status);
+        try std.testing.expectEqual(@as(u64, scheduled.created_at_ns), scheduled_again.created_at_ns);
+
+        const first = try db.claimAndRunForeignKeyActionJobPageAt(
+            "fk-action:set-null:customer-wide-job",
+            "set_null",
+            "worker:fk-action:a",
+            "orders_customer_id_fkey",
+            "customers",
+            "customer:wide-job",
+            2,
+            1,
+            200_000,
+        );
+        defer db.freeForeignKeyActionJobRecord(first);
+        try std.testing.expectEqualStrings("pending", first.status);
+        try std.testing.expect(!first.completed);
+        try std.testing.expectEqual(@as(u64, 2), first.applied_children);
+        try std.testing.expect(first.next_child_table != null);
+        try std.testing.expect(first.next_child_key != null);
+
+        const row_one = (try db.get(alloc, "order:wide-job:1")) orelse return error.TestExpectedEqual;
+        defer alloc.free(row_one);
+        const row_two = (try db.get(alloc, "order:wide-job:2")) orelse return error.TestExpectedEqual;
+        defer alloc.free(row_two);
+        const row_three = (try db.get(alloc, "order:wide-job:3")) orelse return error.TestExpectedEqual;
+        defer alloc.free(row_three);
+        try std.testing.expect(std.mem.indexOf(u8, row_one, "customer_id") == null);
+        try std.testing.expect(std.mem.indexOf(u8, row_two, "customer_id") == null);
+        try std.testing.expect(std.mem.indexOf(u8, row_three, "\"customer_id\":\"customer:wide-job\"") != null);
+    }
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const loaded = (try db.loadForeignKeyActionJobRecord("fk-action:set-null:customer-wide-job")) orelse return error.TestExpectedEqual;
+        defer db.freeForeignKeyActionJobRecord(loaded);
+        try std.testing.expectEqualStrings("pending", loaded.status);
+        try std.testing.expectEqual(@as(u64, 2), loaded.applied_children);
+        try std.testing.expect(loaded.next_child_table != null);
+        try std.testing.expect(loaded.next_child_key != null);
+
+        const second = try db.claimAndRunForeignKeyActionJobPageAt(
+            "fk-action:set-null:customer-wide-job",
+            "set_null",
+            "worker:fk-action:b",
+            "orders_customer_id_fkey",
+            "customers",
+            "customer:wide-job",
+            2,
+            1,
+            2_000_000,
+        );
+        defer db.freeForeignKeyActionJobRecord(second);
+        try std.testing.expectEqualStrings("complete", second.status);
+        try std.testing.expect(second.completed);
+        try std.testing.expectEqual(@as(u64, 3), second.applied_children);
+        try std.testing.expect(second.next_child_table == null);
+        try std.testing.expect(second.next_child_key == null);
+
+        const row_three = (try db.get(alloc, "order:wide-job:3")) orelse return error.TestExpectedEqual;
+        defer alloc.free(row_three);
+        try std.testing.expect(std.mem.indexOf(u8, row_three, "customer_id") == null);
+    }
+}
+
+test "db foreign key action job applies cascade children in durable pages" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"cascade"}]}
+        ;
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        try db.setSchema(runtime_schema);
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "customer:cascade-job", .value = "{\"id\":\"customer:cascade-job\"}" },
+                .{ .key = "order:cascade-job:1", .value = "{\"id\":\"order:cascade-job:1\",\"customer_id\":\"customer:cascade-job\",\"status\":\"open\"}" },
+                .{ .key = "order:cascade-job:2", .value = "{\"id\":\"order:cascade-job:2\",\"customer_id\":\"customer:cascade-job\",\"status\":\"open\"}" },
+                .{ .key = "order:cascade-job:3", .value = "{\"id\":\"order:cascade-job:3\",\"customer_id\":\"customer:cascade-job\",\"status\":\"open\"}" },
+            },
+        });
+
+        const scheduled = try db.scheduleForeignKeyActionJobAt(
+            "fk-action:cascade:customer-cascade-job",
+            "cascade",
+            "worker:fk-action:scheduler",
+            "orders_customer_id_fkey",
+            "customers",
+            "customer:cascade-job",
+            2,
+            100_000,
+        );
+        defer db.freeForeignKeyActionJobRecord(scheduled);
+        try std.testing.expectEqualStrings("pending", scheduled.status);
+        try std.testing.expect(!scheduled.completed);
+
+        const first = try db.claimAndRunForeignKeyActionJobPageAt(
+            "fk-action:cascade:customer-cascade-job",
+            "cascade",
+            "worker:fk-action:a",
+            "orders_customer_id_fkey",
+            "customers",
+            "customer:cascade-job",
+            2,
+            1,
+            200_000,
+        );
+        defer db.freeForeignKeyActionJobRecord(first);
+        try std.testing.expectEqualStrings("pending", first.status);
+        try std.testing.expect(!first.completed);
+        try std.testing.expectEqual(@as(u64, 2), first.applied_children);
+        try std.testing.expect(first.next_child_table != null);
+        try std.testing.expect(first.next_child_key != null);
+
+        try std.testing.expect((try db.get(alloc, "order:cascade-job:1")) == null);
+        try std.testing.expect((try db.get(alloc, "order:cascade-job:2")) == null);
+        const row_three = (try db.get(alloc, "order:cascade-job:3")) orelse return error.TestExpectedEqual;
+        defer alloc.free(row_three);
+        try std.testing.expect(std.mem.indexOf(u8, row_three, "\"customer_id\":\"customer:cascade-job\"") != null);
+    }
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const loaded = (try db.loadForeignKeyActionJobRecord("fk-action:cascade:customer-cascade-job")) orelse return error.TestExpectedEqual;
+        defer db.freeForeignKeyActionJobRecord(loaded);
+        try std.testing.expectEqualStrings("pending", loaded.status);
+        try std.testing.expectEqual(@as(u64, 2), loaded.applied_children);
+        try std.testing.expect(loaded.next_child_table != null);
+        try std.testing.expect(loaded.next_child_key != null);
+
+        const second = try db.claimAndRunForeignKeyActionJobPageAt(
+            "fk-action:cascade:customer-cascade-job",
+            "cascade",
+            "worker:fk-action:b",
+            "orders_customer_id_fkey",
+            "customers",
+            "customer:cascade-job",
+            2,
+            1,
+            2_000_000,
+        );
+        defer db.freeForeignKeyActionJobRecord(second);
+        try std.testing.expectEqualStrings("complete", second.status);
+        try std.testing.expect(second.completed);
+        try std.testing.expectEqual(@as(u64, 3), second.applied_children);
+        try std.testing.expect(second.next_child_table == null);
+        try std.testing.expect(second.next_child_key == null);
+
+        try std.testing.expect((try db.get(alloc, "order:cascade-job:3")) == null);
+        const remaining_refs = try db.listForeignKeyRefChildrenForParent(alloc, "orders_customer_id_fkey", "customers", "customer:cascade-job", 10);
+        defer db.freeForeignKeyRefChildren(alloc, remaining_refs);
+        try std.testing.expectEqual(@as(usize, 0), remaining_refs.len);
+    }
+}
+
+test "db foreign key modeled relational identity workload covers repair and actions" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"id":{"type":"keyword"},"email":{"type":"keyword"},"customer_id":{"type":"keyword"},"customer_email":{"type":"keyword"},"nullable_customer_id":{"type":"keyword"},"deferred_customer_id":{"type":"keyword"},"order_id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["tenant_id","id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","id"]},"unique_constraints":[{"name":"row_tenant_email_key","columns":["tenant_id","email"]}],"foreign_keys":[{"name":"orders_customer_pk_fkey","columns":["tenant_id","customer_id"],"references":{"table":"row","columns":["tenant_id","id"]},"on_delete":"restrict","on_update":"restrict","match":"simple","timing":"immediate","validation_state":"enforced"},{"name":"orders_customer_email_fkey","columns":["tenant_id","customer_email"],"references":{"table":"row","columns":["tenant_id","email"]},"on_delete":"restrict","on_update":"restrict","match":"simple","timing":"immediate","validation_state":"enforced"},{"name":"orders_customer_nullable_fkey","columns":["nullable_customer_id"],"references":{"table":"row","columns":["_id"]},"on_delete":"set_null","on_update":"restrict","match":"simple","timing":"immediate","validation_state":"enforced"},{"name":"orders_deferred_customer_fkey","columns":["tenant_id","deferred_customer_id"],"references":{"table":"row","columns":["tenant_id","id"]},"on_delete":"no_action","on_update":"no_action","match":"simple","timing":"deferred","validation_state":"enforced"},{"name":"lines_order_fkey","columns":["tenant_id","order_id"],"references":{"table":"row","columns":["tenant_id","id"]},"on_delete":"cascade","on_update":"restrict","match":"simple","timing":"immediate","validation_state":"enforced"}]}
+    ;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        try db.setSchema(runtime_schema);
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "customer:a", .value = "{\"tenant_id\":\"t1\",\"id\":\"customer:a\",\"email\":\"ada@example.test\"}" },
+                .{ .key = "customer:b", .value = "{\"tenant_id\":\"t1\",\"id\":\"customer:b\",\"email\":\"grace@example.test\"}" },
+                .{ .key = "customer:c", .value = "{\"tenant_id\":\"t1\",\"id\":\"customer:c\",\"email\":\"linus@example.test\"}" },
+                .{ .key = "order:identity", .value = "{\"tenant_id\":\"t1\",\"id\":\"order:identity\",\"customer_id\":\"customer:a\",\"customer_email\":\"ada@example.test\",\"status\":\"open\"}" },
+                .{ .key = "line:identity:1", .value = "{\"tenant_id\":\"t1\",\"id\":\"line:identity:1\",\"order_id\":\"order:identity\",\"status\":\"open\"}" },
+                .{ .key = "line:identity:2", .value = "{\"tenant_id\":\"t1\",\"id\":\"line:identity:2\",\"order_id\":\"order:identity\",\"status\":\"open\"}" },
+                .{ .key = "order:set-null:1", .value = "{\"tenant_id\":\"t1\",\"id\":\"order:set-null:1\",\"nullable_customer_id\":\"customer:b\",\"status\":\"open\"}" },
+                .{ .key = "order:set-null:2", .value = "{\"tenant_id\":\"t1\",\"id\":\"order:set-null:2\",\"nullable_customer_id\":\"customer:b\",\"status\":\"open\"}" },
+                .{ .key = "order:deferred", .value = "{\"tenant_id\":\"t1\",\"id\":\"order:deferred\",\"deferred_customer_id\":\"customer:c\",\"status\":\"open\"}" },
+            },
+        });
+
+        try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+            .writes = &.{.{ .key = "order:missing-parent", .value = "{\"tenant_id\":\"t1\",\"id\":\"order:missing-parent\",\"customer_id\":\"customer:missing\"}" }},
+        }));
+        try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+            .writes = &.{.{ .key = "customer:a", .value = "{\"tenant_id\":\"t1\",\"id\":\"customer:a\",\"email\":\"ada-renamed@example.test\"}" }},
+        }));
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "order:identity", .value = "{\"tenant_id\":\"t1\",\"id\":\"order:identity\",\"customer_id\":\"customer:b\",\"customer_email\":\"grace@example.test\",\"status\":\"open\"}" }},
+        });
+
+        const clean_after_move = try db.validateForeignKeyRefsInRange("", "");
+        try std.testing.expect(clean_after_move.valid());
+
+        const stale_pk_row = try mapper.buildRelationalRowValueAlloc(alloc, "{\"tenant_id\":\"t1\",\"id\":\"stale-source\",\"customer_id\":\"customer:a\"}", runtime_schema.relational_columns);
+        defer alloc.free(stale_pk_row);
+        const stale_pk_parent = (try relational_store_mod.foreignKeyReferenceValueAlloc(alloc, stale_pk_row, runtime_schema.foreign_keys[0])) orelse return error.TestExpectedEqual;
+        defer alloc.free(stale_pk_parent);
+        const current_pk_row = try mapper.buildRelationalRowValueAlloc(alloc, "{\"tenant_id\":\"t1\",\"id\":\"order:identity\",\"customer_id\":\"customer:b\"}", runtime_schema.relational_columns);
+        defer alloc.free(current_pk_row);
+        const current_pk_parent = (try relational_store_mod.foreignKeyReferenceValueAlloc(alloc, current_pk_row, runtime_schema.foreign_keys[0])) orelse return error.TestExpectedEqual;
+        defer alloc.free(current_pk_parent);
+
+        const stale_txn = try db.beginTransaction(44_000);
+        try db.writeTransaction(stale_txn, .{
+            .foreign_key_ref_writes = &.{
+                .{
+                    .constraint_name = "orders_customer_pk_fkey",
+                    .parent_table = "row",
+                    .parent_key = stale_pk_parent,
+                    .child_table = "row",
+                    .child_key = "order:identity",
+                },
+                .{
+                    .constraint_name = "orders_customer_pk_fkey",
+                    .parent_table = "row",
+                    .parent_key = stale_pk_parent,
+                    .child_table = "row",
+                    .child_key = "order:missing",
+                },
+            },
+        });
+        try db.commitTransaction(stale_txn, 44_001);
+
+        const stale_owner_report = try db.validateForeignKeyRefOwnerForParent("orders_customer_pk_fkey", "row", stale_pk_parent);
+        try std.testing.expectEqual(@as(u64, 2), stale_owner_report.scanned_ref_rows);
+        try std.testing.expectEqual(@as(u64, 2), stale_owner_report.stale_ref_rows);
+        const repaired_owner_report = try db.repairForeignKeyRefOwnerForParent("orders_customer_pk_fkey", "row", stale_pk_parent);
+        try std.testing.expectEqual(@as(u64, 2), repaired_owner_report.deleted_stale_ref_rows);
+
+        const current_ref_key = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "orders_customer_pk_fkey", "row", current_pk_parent, "row", "order:identity");
+        defer alloc.free(current_ref_key);
+        try db.core.store.delete(current_ref_key);
+        const missing_ref_report = try db.validateForeignKeyRefsInRangeForConstraint("orders_customer_pk_fkey", "", "");
+        try std.testing.expect(!missing_ref_report.valid());
+        try std.testing.expectEqual(@as(u64, 1), missing_ref_report.missing_ref_rows);
+        const repaired_ref_report = try db.repairForeignKeyRefsInRangeForConstraint("orders_customer_pk_fkey", "", "");
+        try std.testing.expectEqual(@as(u64, 1), repaired_ref_report.repaired_ref_rows);
+
+        const set_null_row = try mapper.buildRelationalRowValueAlloc(alloc, "{\"tenant_id\":\"t1\",\"id\":\"set-null-source\",\"nullable_customer_id\":\"customer:b\"}", runtime_schema.relational_columns);
+        defer alloc.free(set_null_row);
+        const set_null_parent = (try relational_store_mod.foreignKeyReferenceValueAlloc(alloc, set_null_row, runtime_schema.foreign_keys[2])) orelse return error.TestExpectedEqual;
+        defer alloc.free(set_null_parent);
+        const cascade_row = try mapper.buildRelationalRowValueAlloc(alloc, "{\"tenant_id\":\"t1\",\"id\":\"line-source\",\"order_id\":\"order:identity\"}", runtime_schema.relational_columns);
+        defer alloc.free(cascade_row);
+        const cascade_parent = (try relational_store_mod.foreignKeyReferenceValueAlloc(alloc, cascade_row, runtime_schema.foreign_keys[4])) orelse return error.TestExpectedEqual;
+        defer alloc.free(cascade_parent);
+
+        const set_null_first = try db.claimAndRunForeignKeyActionJobPageAt(
+            "fk-action:modeled:set-null",
+            "set_null",
+            "worker:modeled:a",
+            "orders_customer_nullable_fkey",
+            "row",
+            set_null_parent,
+            1,
+            1,
+            45_000,
+        );
+        defer db.freeForeignKeyActionJobRecord(set_null_first);
+        try std.testing.expectEqualStrings("pending", set_null_first.status);
+        try std.testing.expectEqual(@as(u64, 1), set_null_first.applied_children);
+        try std.testing.expect(set_null_first.next_child_key != null);
+
+        const cascade_first = try db.claimAndRunForeignKeyActionJobPageAt(
+            "fk-action:modeled:cascade",
+            "cascade",
+            "worker:modeled:a",
+            "lines_order_fkey",
+            "row",
+            cascade_parent,
+            1,
+            1,
+            45_100,
+        );
+        defer db.freeForeignKeyActionJobRecord(cascade_first);
+        try std.testing.expectEqualStrings("pending", cascade_first.status);
+        try std.testing.expectEqual(@as(u64, 1), cascade_first.applied_children);
+        try std.testing.expect(cascade_first.next_child_key != null);
+    }
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        try db.setSchema(runtime_schema);
+
+        const set_null_row = try mapper.buildRelationalRowValueAlloc(alloc, "{\"tenant_id\":\"t1\",\"id\":\"set-null-source\",\"nullable_customer_id\":\"customer:b\"}", runtime_schema.relational_columns);
+        defer alloc.free(set_null_row);
+        const set_null_parent = (try relational_store_mod.foreignKeyReferenceValueAlloc(alloc, set_null_row, runtime_schema.foreign_keys[2])) orelse return error.TestExpectedEqual;
+        defer alloc.free(set_null_parent);
+        const cascade_row = try mapper.buildRelationalRowValueAlloc(alloc, "{\"tenant_id\":\"t1\",\"id\":\"line-source\",\"order_id\":\"order:identity\"}", runtime_schema.relational_columns);
+        defer alloc.free(cascade_row);
+        const cascade_parent = (try relational_store_mod.foreignKeyReferenceValueAlloc(alloc, cascade_row, runtime_schema.foreign_keys[4])) orelse return error.TestExpectedEqual;
+        defer alloc.free(cascade_parent);
+
+        const loaded_set_null = (try db.loadForeignKeyActionJobRecord("fk-action:modeled:set-null")) orelse return error.TestExpectedEqual;
+        defer db.freeForeignKeyActionJobRecord(loaded_set_null);
+        try std.testing.expectEqualStrings("pending", loaded_set_null.status);
+        try std.testing.expectEqual(@as(u64, 1), loaded_set_null.applied_children);
+        const loaded_cascade = (try db.loadForeignKeyActionJobRecord("fk-action:modeled:cascade")) orelse return error.TestExpectedEqual;
+        defer db.freeForeignKeyActionJobRecord(loaded_cascade);
+        try std.testing.expectEqualStrings("pending", loaded_cascade.status);
+        try std.testing.expectEqual(@as(u64, 1), loaded_cascade.applied_children);
+
+        const set_null_second = try db.claimAndRunForeignKeyActionJobPageAt(
+            "fk-action:modeled:set-null",
+            "set_null",
+            "worker:modeled:b",
+            "orders_customer_nullable_fkey",
+            "row",
+            set_null_parent,
+            1,
+            1,
+            2_000_000,
+        );
+        defer db.freeForeignKeyActionJobRecord(set_null_second);
+        try std.testing.expectEqualStrings("complete", set_null_second.status);
+        try std.testing.expectEqual(@as(u64, 2), set_null_second.applied_children);
+
+        const cascade_second = try db.claimAndRunForeignKeyActionJobPageAt(
+            "fk-action:modeled:cascade",
+            "cascade",
+            "worker:modeled:b",
+            "lines_order_fkey",
+            "row",
+            cascade_parent,
+            1,
+            1,
+            2_100_000,
+        );
+        defer db.freeForeignKeyActionJobRecord(cascade_second);
+        try std.testing.expectEqualStrings("complete", cascade_second.status);
+        try std.testing.expectEqual(@as(u64, 2), cascade_second.applied_children);
+
+        const set_null_duplicate = try db.claimAndRunForeignKeyActionJobPageAt(
+            "fk-action:modeled:set-null",
+            "set_null",
+            "worker:modeled:duplicate",
+            "orders_customer_nullable_fkey",
+            "row",
+            set_null_parent,
+            1,
+            1,
+            2_200_000,
+        );
+        defer db.freeForeignKeyActionJobRecord(set_null_duplicate);
+        try std.testing.expectEqualStrings("complete", set_null_duplicate.status);
+        try std.testing.expect(set_null_duplicate.completed);
+        try std.testing.expectEqual(@as(u64, 2), set_null_duplicate.applied_children);
+        try std.testing.expectEqual(@as(u32, set_null_second.attempts), set_null_duplicate.attempts);
+        try std.testing.expectEqualStrings(set_null_second.worker_id, set_null_duplicate.worker_id);
+
+        const cascade_duplicate = try db.claimAndRunForeignKeyActionJobPageAt(
+            "fk-action:modeled:cascade",
+            "cascade",
+            "worker:modeled:duplicate",
+            "lines_order_fkey",
+            "row",
+            cascade_parent,
+            1,
+            1,
+            2_300_000,
+        );
+        defer db.freeForeignKeyActionJobRecord(cascade_duplicate);
+        try std.testing.expectEqualStrings("complete", cascade_duplicate.status);
+        try std.testing.expect(cascade_duplicate.completed);
+        try std.testing.expectEqual(@as(u64, 2), cascade_duplicate.applied_children);
+        try std.testing.expectEqual(@as(u32, cascade_second.attempts), cascade_duplicate.attempts);
+        try std.testing.expectEqualStrings(cascade_second.worker_id, cascade_duplicate.worker_id);
+
+        const set_null_one = (try db.get(alloc, "order:set-null:1")) orelse return error.TestExpectedEqual;
+        defer alloc.free(set_null_one);
+        const set_null_two = (try db.get(alloc, "order:set-null:2")) orelse return error.TestExpectedEqual;
+        defer alloc.free(set_null_two);
+        try std.testing.expect(std.mem.indexOf(u8, set_null_one, "nullable_customer_id") == null);
+        try std.testing.expect(std.mem.indexOf(u8, set_null_two, "nullable_customer_id") == null);
+        try std.testing.expect((try db.get(alloc, "line:identity:1")) == null);
+        try std.testing.expect((try db.get(alloc, "line:identity:2")) == null);
+
+        const final_report = try db.validateForeignKeyRefsInRange("", "");
+        try std.testing.expect(final_report.valid());
+        try std.testing.expectEqual(@as(u64, 0), final_report.missing_parent_rows);
+        try std.testing.expectEqual(@as(u64, 0), final_report.missing_ref_rows);
+        try std.testing.expectEqual(@as(u64, 0), final_report.stale_ref_rows);
+    }
+}
+
+test "db foreign key action job rejects stale page finish after lease handoff" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const scheduled = try db.scheduleForeignKeyActionJobAt(
+        "fk-action:set-null:stale-finish",
+        "set_null",
+        "worker:fk-action:scheduler",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:stale-finish",
+        2,
+        100_000,
+    );
+    defer db.freeForeignKeyActionJobRecord(scheduled);
+
+    const first_claim = try db.claimForeignKeyActionJobPageAt(
+        "fk-action:set-null:stale-finish",
+        "set_null",
+        "worker:fk-action:a",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:stale-finish",
+        2,
+        1,
+        200_000,
+    );
+    defer db.freeForeignKeyActionJobRecord(first_claim);
+    try std.testing.expectEqualStrings("claimed", first_claim.status);
+    try std.testing.expectEqual(@as(u32, 1), first_claim.attempts);
+
+    const second_claim = try db.claimForeignKeyActionJobPageAt(
+        "fk-action:set-null:stale-finish",
+        "set_null",
+        "worker:fk-action:b",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:stale-finish",
+        2,
+        60_000,
+        first_claim.lease_until_ns +| 1,
+    );
+    defer db.freeForeignKeyActionJobRecord(second_claim);
+    try std.testing.expectEqualStrings("claimed", second_claim.status);
+    try std.testing.expectEqualStrings("worker:fk-action:b", second_claim.worker_id);
+    try std.testing.expectEqual(@as(u32, 2), second_claim.attempts);
+
+    try std.testing.expectError(error.ForeignKeyIntegrityClaimBusy, db.finishClaimedForeignKeyActionJobPageAt(
+        first_claim,
+        1,
+        false,
+        "row",
+        "order:stale",
+        null,
+        second_claim.claimed_at_ns +| 1,
+    ));
+
+    const loaded = (try db.loadForeignKeyActionJobRecord("fk-action:set-null:stale-finish")) orelse return error.TestExpectedEqual;
+    defer db.freeForeignKeyActionJobRecord(loaded);
+    try std.testing.expectEqualStrings("claimed", loaded.status);
+    try std.testing.expectEqualStrings("worker:fk-action:b", loaded.worker_id);
+    try std.testing.expectEqual(@as(u32, 2), loaded.attempts);
+    try std.testing.expectEqual(@as(u64, 0), loaded.applied_children);
+    try std.testing.expect(loaded.next_child_table == null);
+    try std.testing.expect(loaded.next_child_key == null);
+
+    try std.testing.expectError(error.InvalidForeignKeyActionJob, db.finishClaimedForeignKeyActionJobPageAt(
+        second_claim,
+        0,
+        false,
+        null,
+        null,
+        null,
+        second_claim.claimed_at_ns +| 2,
+    ));
+    try std.testing.expectError(error.InvalidForeignKeyActionJob, db.finishClaimedForeignKeyActionJobPageAt(
+        second_claim,
+        0,
+        false,
+        "row",
+        null,
+        null,
+        second_claim.claimed_at_ns +| 2,
+    ));
+    try std.testing.expectError(error.InvalidForeignKeyActionJob, db.finishClaimedForeignKeyActionJobPageAt(
+        second_claim,
+        0,
+        true,
+        "row",
+        "order:cursor",
+        null,
+        second_claim.claimed_at_ns +| 2,
+    ));
+    try std.testing.expectError(error.InvalidForeignKeyActionJob, db.finishClaimedForeignKeyActionJobPageAt(
+        second_claim,
+        0,
+        true,
+        null,
+        null,
+        "FailedButComplete",
+        second_claim.claimed_at_ns +| 2,
+    ));
+    try std.testing.expectError(error.InvalidForeignKeyActionJob, db.finishClaimedForeignKeyActionJobPageAt(
+        second_claim,
+        1,
+        false,
+        null,
+        null,
+        "FailedWithoutCursor",
+        second_claim.claimed_at_ns +| 2,
+    ));
+
+    const finished = try db.finishClaimedForeignKeyActionJobPageAt(
+        second_claim,
+        1,
+        false,
+        "row",
+        "order:cursor",
+        null,
+        second_claim.claimed_at_ns +| 2,
+    );
+    defer db.freeForeignKeyActionJobRecord(finished);
+    try std.testing.expectEqualStrings("pending", finished.status);
+    try std.testing.expectEqual(@as(u64, 1), finished.applied_children);
+    try std.testing.expect(finished.next_child_table != null);
+    try std.testing.expectEqualStrings("row", finished.next_child_table.?);
+    try std.testing.expect(finished.next_child_key != null);
+    try std.testing.expectEqualStrings("order:cursor", finished.next_child_key.?);
+
+    try std.testing.expectError(error.ForeignKeyIntegrityClaimBusy, db.finishClaimedForeignKeyActionJobPageAt(
+        second_claim,
+        1,
+        false,
+        "row",
+        "order:cursor",
+        null,
+        second_claim.claimed_at_ns +| 3,
+    ));
+    const loaded_after_duplicate_finish = (try db.loadForeignKeyActionJobRecord("fk-action:set-null:stale-finish")) orelse return error.TestExpectedEqual;
+    defer db.freeForeignKeyActionJobRecord(loaded_after_duplicate_finish);
+    try std.testing.expectEqualStrings("pending", loaded_after_duplicate_finish.status);
+    try std.testing.expectEqual(@as(u64, 1), loaded_after_duplicate_finish.applied_children);
+    try std.testing.expect(loaded_after_duplicate_finish.next_child_table != null);
+    try std.testing.expectEqualStrings("row", loaded_after_duplicate_finish.next_child_table.?);
+    try std.testing.expect(loaded_after_duplicate_finish.next_child_key != null);
+    try std.testing.expectEqualStrings("order:cursor", loaded_after_duplicate_finish.next_child_key.?);
+}
+
+test "db foreign key action job requeue preserves durable cursor and clears failed claim" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const scheduled = try db.scheduleForeignKeyActionJobAt(
+        "fk-action:set-null:requeue",
+        "set_null",
+        "worker:fk-action:scheduler",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:requeue",
+        8,
+        100_000,
+    );
+    defer db.freeForeignKeyActionJobRecord(scheduled);
+
+    try std.testing.expectError(error.InvalidForeignKeyActionJob, db.requeueForeignKeyActionJobAt(
+        "fk-action:set-null:requeue",
+        "set_null",
+        "worker:fk-action:retry",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:requeue",
+        4,
+        199_000,
+    ));
+
+    const claimed = try db.claimForeignKeyActionJobPageAt(
+        "fk-action:set-null:requeue",
+        "set_null",
+        "worker:fk-action:failed",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:requeue",
+        8,
+        60_000,
+        200_000,
+    );
+    defer db.freeForeignKeyActionJobRecord(claimed);
+    try std.testing.expectEqualStrings("claimed", claimed.status);
+
+    const failed = try db.finishClaimedForeignKeyActionJobPageAt(
+        claimed,
+        3,
+        false,
+        "row",
+        "order:requeue:cursor",
+        "OperatorPaused",
+        210_000,
+    );
+    defer db.freeForeignKeyActionJobRecord(failed);
+    try std.testing.expectEqualStrings("invalid", failed.status);
+    try std.testing.expect(!failed.completed);
+    try std.testing.expectEqual(@as(u64, 3), failed.applied_children);
+    try std.testing.expectEqual(@as(u32, 1), failed.attempts);
+    try std.testing.expectEqualStrings("worker:fk-action:failed", failed.worker_id);
+    try std.testing.expect(failed.lease_until_ns > 210_000);
+    try std.testing.expect(failed.next_child_table != null);
+    try std.testing.expectEqualStrings("row", failed.next_child_table.?);
+    try std.testing.expect(failed.next_child_key != null);
+    try std.testing.expectEqualStrings("order:requeue:cursor", failed.next_child_key.?);
+    try std.testing.expect(failed.last_error != null);
+    try std.testing.expectEqualStrings("OperatorPaused", failed.last_error.?);
+    try std.testing.expectEqual(@as(u64, 1), failed.failure_count);
+    try std.testing.expect(failed.first_failed_at_ns != null);
+    try std.testing.expectEqual(@as(u64, 210_000), failed.first_failed_at_ns.?);
+    try std.testing.expect(failed.last_failed_at_ns != null);
+    try std.testing.expectEqual(@as(u64, 210_000), failed.last_failed_at_ns.?);
+    try std.testing.expectEqual(@as(u64, 0), failed.requeue_count);
+    try std.testing.expect(failed.last_requeued_at_ns == null);
+
+    try std.testing.expectError(error.InvalidForeignKeyActionJob, db.claimForeignKeyActionJobPageAt(
+        "fk-action:set-null:requeue",
+        "set_null",
+        "worker:fk-action:auto-retry",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:requeue",
+        4,
+        60_000,
+        failed.lease_until_ns +| 1,
+    ));
+
+    try std.testing.expectError(error.InvalidForeignKeyActionJob, db.requeueForeignKeyActionJobAt(
+        "fk-action:set-null:requeue",
+        "cascade",
+        "worker:fk-action:retry",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:requeue",
+        4,
+        220_000,
+    ));
+
+    const requeued = try db.requeueForeignKeyActionJobAt(
+        "fk-action:set-null:requeue",
+        "set_null",
+        "worker:fk-action:retry",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:requeue",
+        4,
+        220_000,
+    );
+    defer db.freeForeignKeyActionJobRecord(requeued);
+    try std.testing.expectEqualStrings("pending", requeued.status);
+    try std.testing.expect(!requeued.completed);
+    try std.testing.expectEqualStrings("worker:fk-action:retry", requeued.worker_id);
+    try std.testing.expectEqual(@as(usize, 4), requeued.page_limit);
+    try std.testing.expectEqual(@as(u64, 0), requeued.claimed_at_ns);
+    try std.testing.expectEqual(@as(u64, 0), requeued.lease_until_ns);
+    try std.testing.expectEqual(@as(u32, 1), requeued.attempts);
+    try std.testing.expectEqual(@as(u64, 3), requeued.applied_children);
+    try std.testing.expect(requeued.next_child_table != null);
+    try std.testing.expectEqualStrings("row", requeued.next_child_table.?);
+    try std.testing.expect(requeued.next_child_key != null);
+    try std.testing.expectEqualStrings("order:requeue:cursor", requeued.next_child_key.?);
+    try std.testing.expect(requeued.last_error == null);
+    try std.testing.expectEqual(@as(u64, 1), requeued.failure_count);
+    try std.testing.expect(requeued.first_failed_at_ns != null);
+    try std.testing.expectEqual(@as(u64, 210_000), requeued.first_failed_at_ns.?);
+    try std.testing.expect(requeued.last_failed_at_ns != null);
+    try std.testing.expectEqual(@as(u64, 210_000), requeued.last_failed_at_ns.?);
+    try std.testing.expectEqual(@as(u64, 1), requeued.requeue_count);
+    try std.testing.expect(requeued.last_requeued_at_ns != null);
+    try std.testing.expectEqual(@as(u64, 220_000), requeued.last_requeued_at_ns.?);
+
+    const retry_claim = try db.claimForeignKeyActionJobPageAt(
+        "fk-action:set-null:requeue",
+        "set_null",
+        "worker:fk-action:next",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:requeue",
+        4,
+        60_000,
+        221_000,
+    );
+    defer db.freeForeignKeyActionJobRecord(retry_claim);
+    try std.testing.expectEqualStrings("claimed", retry_claim.status);
+    try std.testing.expectEqualStrings("worker:fk-action:next", retry_claim.worker_id);
+    try std.testing.expectEqual(@as(u32, 2), retry_claim.attempts);
+    try std.testing.expectEqual(@as(u64, 3), retry_claim.applied_children);
+    try std.testing.expect(retry_claim.next_child_table != null);
+    try std.testing.expectEqualStrings("row", retry_claim.next_child_table.?);
+    try std.testing.expect(retry_claim.next_child_key != null);
+    try std.testing.expectEqualStrings("order:requeue:cursor", retry_claim.next_child_key.?);
+    try std.testing.expectEqual(@as(u64, 1), retry_claim.failure_count);
+    try std.testing.expectEqual(@as(u64, 1), retry_claim.requeue_count);
+
+    const completed = try db.finishClaimedForeignKeyActionJobPageAt(
+        retry_claim,
+        0,
+        true,
+        null,
+        null,
+        null,
+        222_000,
+    );
+    defer db.freeForeignKeyActionJobRecord(completed);
+    try std.testing.expectEqualStrings("complete", completed.status);
+    try std.testing.expect(completed.completed);
+    try std.testing.expectEqual(@as(u64, 1), completed.failure_count);
+    try std.testing.expectEqual(@as(u64, 1), completed.requeue_count);
+
+    const completed_claim = try db.claimForeignKeyActionJobPageAt(
+        "fk-action:set-null:requeue",
+        "set_null",
+        "worker:fk-action:after-complete",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:requeue",
+        99,
+        60_000,
+        223_000,
+    );
+    defer db.freeForeignKeyActionJobRecord(completed_claim);
+    try std.testing.expectEqualStrings("complete", completed_claim.status);
+    try std.testing.expect(completed_claim.completed);
+    try std.testing.expectEqualStrings("worker:fk-action:next", completed_claim.worker_id);
+    try std.testing.expectEqual(@as(usize, 4), completed_claim.page_limit);
+    try std.testing.expectEqual(@as(u64, 221_000), completed_claim.claimed_at_ns);
+    try std.testing.expectEqual(retry_claim.lease_until_ns, completed_claim.lease_until_ns);
+    try std.testing.expectEqual(@as(u32, 2), completed_claim.attempts);
+    try std.testing.expectEqual(@as(u64, 3), completed_claim.applied_children);
+    try std.testing.expectEqual(@as(u64, 1), completed_claim.failure_count);
+    try std.testing.expectEqual(@as(u64, 1), completed_claim.requeue_count);
+
+    try std.testing.expectError(error.InvalidForeignKeyActionJob, db.requeueForeignKeyActionJobAt(
+        "fk-action:set-null:requeue",
+        "set_null",
+        "worker:fk-action:retry",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:requeue",
+        4,
+        223_000,
+    ));
+}
+
+test "db foreign key ref children page by child cursor" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const owner_write_txn = try db.beginTransaction(28_000);
+    try db.writeTransaction(owner_write_txn, .{
+        .foreign_key_ref_writes = &.{
+            .{
+                .constraint_name = "orders_customer_id_fkey",
+                .parent_table = "customers",
+                .parent_key = "customer:page",
+                .child_table = "row",
+                .child_key = "order:a",
+            },
+            .{
+                .constraint_name = "orders_customer_id_fkey",
+                .parent_table = "customers",
+                .parent_key = "customer:page",
+                .child_table = "row",
+                .child_key = "order:b",
+            },
+            .{
+                .constraint_name = "orders_customer_id_fkey",
+                .parent_table = "customers",
+                .parent_key = "customer:page",
+                .child_table = "row",
+                .child_key = "order:c",
+            },
+        },
+    });
+    try db.commitTransaction(owner_write_txn, 28_001);
+
+    try std.testing.expectError(error.ForeignKeyActionLimitExceeded, db.listForeignKeyRefChildrenForParent(alloc, "orders_customer_id_fkey", "customers", "customer:page", 2));
+
+    var first_page = try db.listForeignKeyRefChildrenPageForParent(alloc, "orders_customer_id_fkey", "customers", "customer:page", null, null, 2);
+    defer db.freeForeignKeyRefChildrenPage(alloc, &first_page);
+    try std.testing.expect(!first_page.complete);
+    try std.testing.expectEqual(@as(usize, 2), first_page.children.len);
+    try std.testing.expectEqualStrings("order:a", first_page.children[0].child_key);
+    try std.testing.expectEqualStrings("order:b", first_page.children[1].child_key);
+    try std.testing.expectEqualStrings("row", first_page.next_child_table.?);
+    try std.testing.expectEqualStrings("order:b", first_page.next_child_key.?);
+
+    var second_page = try db.listForeignKeyRefChildrenPageForParent(
+        alloc,
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:page",
+        first_page.next_child_table,
+        first_page.next_child_key,
+        2,
+    );
+    defer db.freeForeignKeyRefChildrenPage(alloc, &second_page);
+    try std.testing.expect(second_page.complete);
+    try std.testing.expectEqual(@as(usize, 1), second_page.children.len);
+    try std.testing.expectEqualStrings("order:c", second_page.children[0].child_key);
+    try std.testing.expect(second_page.next_child_table == null);
+    try std.testing.expect(second_page.next_child_key == null);
+}
+
+test "db foreign key ref owner validation repairs stale parent prefix rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "customer:owner", .value = "{\"id\":\"customer:owner\"}" },
+            .{ .key = "customer:other", .value = "{\"id\":\"customer:other\"}" },
+            .{ .key = "order:valid", .value = "{\"id\":\"order:valid\",\"customer_id\":\"customer:owner\"}" },
+            .{ .key = "order:moved", .value = "{\"id\":\"order:moved\",\"customer_id\":\"customer:other\"}" },
+        },
+    });
+
+    const stale_write_txn = try db.beginTransaction(29_000);
+    try db.writeTransaction(stale_write_txn, .{
+        .foreign_key_ref_writes = &.{
+            .{
+                .constraint_name = "orders_customer_id_fkey",
+                .parent_table = "customers",
+                .parent_key = "customer:owner",
+                .child_table = "row",
+                .child_key = "order:missing",
+            },
+            .{
+                .constraint_name = "orders_customer_id_fkey",
+                .parent_table = "customers",
+                .parent_key = "customer:owner",
+                .child_table = "row",
+                .child_key = "order:moved",
+            },
+        },
+    });
+    try db.commitTransaction(stale_write_txn, 29_001);
+
+    const validate_report = try db.validateForeignKeyRefOwnerForParent("orders_customer_id_fkey", "customers", "customer:owner");
+    try std.testing.expectEqual(@as(u64, 3), validate_report.scanned_ref_rows);
+    try std.testing.expectEqual(@as(u64, 2), validate_report.stale_ref_rows);
+    try std.testing.expectEqual(@as(u64, 0), validate_report.deleted_stale_ref_rows);
+
+    const dry_run_report = try db.dryRunRepairForeignKeyRefOwnerForParent("orders_customer_id_fkey", "customers", "customer:owner");
+    try std.testing.expectEqual(@as(u64, 3), dry_run_report.scanned_ref_rows);
+    try std.testing.expectEqual(@as(u64, 2), dry_run_report.stale_ref_rows);
+    try std.testing.expectEqual(@as(u64, 2), dry_run_report.deleted_stale_ref_rows);
+
+    const before_repair = try db.listForeignKeyRefChildrenForParent(alloc, "orders_customer_id_fkey", "customers", "customer:owner", 10);
+    defer db.freeForeignKeyRefChildren(alloc, before_repair);
+    try std.testing.expectEqual(@as(usize, 3), before_repair.len);
+
+    const repair_report = try db.repairForeignKeyRefOwnerForParent("orders_customer_id_fkey", "customers", "customer:owner");
+    try std.testing.expectEqual(@as(u64, 3), repair_report.scanned_ref_rows);
+    try std.testing.expectEqual(@as(u64, 2), repair_report.stale_ref_rows);
+    try std.testing.expectEqual(@as(u64, 2), repair_report.deleted_stale_ref_rows);
+
+    const after_repair = try db.listForeignKeyRefChildrenForParent(alloc, "orders_customer_id_fkey", "customers", "customer:owner", 10);
+    defer db.freeForeignKeyRefChildren(alloc, after_repair);
+    try std.testing.expectEqual(@as(usize, 1), after_repair.len);
+    try std.testing.expectEqualStrings("order:valid", after_repair[0].child_key);
+
+    const final_report = try db.validateForeignKeyRefOwnerForParent("orders_customer_id_fkey", "customers", "customer:owner");
+    try std.testing.expectEqual(@as(u64, 1), final_report.scanned_ref_rows);
+    try std.testing.expectEqual(@as(u64, 0), final_report.stale_ref_rows);
+}
+
+test "db foreign key ref owner range validation repairs stale parent-key span rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "customer:a", .value = "{\"id\":\"customer:a\"}" },
+            .{ .key = "customer:b", .value = "{\"id\":\"customer:b\"}" },
+            .{ .key = "customer:z", .value = "{\"id\":\"customer:z\"}" },
+            .{ .key = "order:a-valid", .value = "{\"id\":\"order:a-valid\",\"customer_id\":\"customer:a\"}" },
+            .{ .key = "order:b-moved", .value = "{\"id\":\"order:b-moved\",\"customer_id\":\"customer:z\"}" },
+        },
+    });
+
+    const stale_write_txn = try db.beginTransaction(30_000);
+    try db.writeTransaction(stale_write_txn, .{
+        .foreign_key_ref_writes = &.{
+            .{
+                .constraint_name = "orders_customer_id_fkey",
+                .parent_table = "customers",
+                .parent_key = "customer:b",
+                .child_table = "row",
+                .child_key = "order:missing-b",
+            },
+            .{
+                .constraint_name = "orders_customer_id_fkey",
+                .parent_table = "customers",
+                .parent_key = "customer:b",
+                .child_table = "row",
+                .child_key = "order:b-moved",
+            },
+            .{
+                .constraint_name = "orders_customer_id_fkey",
+                .parent_table = "customers",
+                .parent_key = "customer:z",
+                .child_table = "row",
+                .child_key = "order:missing-z",
+            },
+        },
+    });
+    try db.commitTransaction(stale_write_txn, 30_001);
+
+    const validate_report = try db.validateForeignKeyRefOwnerRange("orders_customer_id_fkey", "customers", "", "customer:m");
+    try std.testing.expectEqual(@as(u64, 3), validate_report.scanned_ref_rows);
+    try std.testing.expectEqual(@as(u64, 2), validate_report.stale_ref_rows);
+    try std.testing.expectEqual(@as(u64, 0), validate_report.deleted_stale_ref_rows);
+
+    const dry_run_report = try db.dryRunRepairForeignKeyRefOwnerRange("orders_customer_id_fkey", "customers", "", "customer:m");
+    try std.testing.expectEqual(@as(u64, 3), dry_run_report.scanned_ref_rows);
+    try std.testing.expectEqual(@as(u64, 2), dry_run_report.stale_ref_rows);
+    try std.testing.expectEqual(@as(u64, 2), dry_run_report.deleted_stale_ref_rows);
+
+    const before_repair_low = try db.validateForeignKeyRefOwnerRange("orders_customer_id_fkey", "customers", "", "customer:m");
+    try std.testing.expectEqual(@as(u64, 3), before_repair_low.scanned_ref_rows);
+    try std.testing.expectEqual(@as(u64, 2), before_repair_low.stale_ref_rows);
+
+    const worker_report = try db.claimAndRunForeignKeyIntegrityWorkUnitAt(
+        "claim:owner-low",
+        "worker:owner",
+        41,
+        "owner_range",
+        .repair,
+        "orders_customer_id_fkey",
+        "",
+        "customer:m",
+        60_000,
+        31_000,
+    );
+    try std.testing.expectEqual(@as(u64, 3), worker_report.scanned_ref_rows);
+    try std.testing.expectEqual(@as(u64, 2), worker_report.stale_ref_rows);
+    try std.testing.expectEqual(@as(u64, 2), worker_report.deleted_stale_ref_rows);
+
+    const worker_claim = (try db.loadForeignKeyIntegrityClaimRecord("claim:owner-low")) orelse return error.TestUnexpectedResult;
+    defer db.freeForeignKeyIntegrityClaimRecord(worker_claim);
+    try std.testing.expectEqualStrings("owner_range", worker_claim.phase);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", worker_claim.constraint_name.?);
+
+    const owner_progress = (try db.loadForeignKeyIntegrityProgressRecordForPhase("owner_range", .repair, "orders_customer_id_fkey", "", "customer:m")) orelse return error.TestUnexpectedResult;
+    defer db.freeForeignKeyIntegrityProgressRecord(owner_progress);
+    try std.testing.expectEqualStrings("owner_range", owner_progress.phase);
+    try std.testing.expectEqual(@as(u64, 2), owner_progress.report.deleted_stale_ref_rows);
+    try std.testing.expect((try db.loadForeignKeyIntegrityProgressRecord(.repair, "orders_customer_id_fkey", "", "customer:m")) == null);
+
+    const repaired_low = try db.validateForeignKeyRefOwnerRange("orders_customer_id_fkey", "customers", "", "customer:m");
+    try std.testing.expectEqual(@as(u64, 1), repaired_low.scanned_ref_rows);
+    try std.testing.expectEqual(@as(u64, 0), repaired_low.stale_ref_rows);
+
+    const moved_child = (try db.get(alloc, "order:b-moved")) orelse return error.TestExpectedEqual;
+    defer alloc.free(moved_child);
+    try std.testing.expectEqualStrings("{\"id\":\"order:b-moved\",\"customer_id\":\"customer:z\"}", moved_child);
+
+    const untouched_high = try db.validateForeignKeyRefOwnerRange("orders_customer_id_fkey", "customers", "customer:m", "");
+    try std.testing.expectEqual(@as(u64, 2), untouched_high.scanned_ref_rows);
+    try std.testing.expectEqual(@as(u64, 1), untouched_high.stale_ref_rows);
+}
+
+test "db relational foreign keys enforce parent existence and restrict deletes" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .writes = &.{.{ .key = "order:missing", .value = "{\"id\":\"order:missing\",\"customer_id\":\"customer:missing\"}" }},
+    }));
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "order:1", .value = "{\"id\":\"order:1\",\"customer_id\":\"customer:a\"}" },
+            .{ .key = "customer:a", .value = "{\"id\":\"customer:a\"}" },
+        },
+    });
+
+    const fk_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "orders_customer_id_fkey", "customers", "customer:a", "row", "order:1");
+    defer alloc.free(fk_ref);
+    const ref_value = try db.core.store.get(alloc, fk_ref);
+    defer alloc.free(ref_value);
+    try std.testing.expectEqualStrings("", ref_value);
+
+    try db.core.store.putBatch(&.{}, &.{fk_ref});
+    const missing_ref_report = try db.validateForeignKeyRefsInRange("", "");
+    try std.testing.expect(!missing_ref_report.valid());
+    try std.testing.expectEqual(@as(u64, 1), missing_ref_report.missing_ref_rows);
+    try std.testing.expectEqual(@as(u64, 0), missing_ref_report.missing_parent_rows);
+    try std.testing.expectEqual(@as(u64, 0), missing_ref_report.repaired_ref_rows);
+
+    const missing_ref_violations = try db.listForeignKeyViolationsInRange("", "");
+    defer db.freeForeignKeyIntegrityViolations(missing_ref_violations);
+    try std.testing.expectEqual(@as(usize, 1), missing_ref_violations.len);
+    try std.testing.expectEqual(relational_store_mod.ForeignKeyIntegrityViolationKind.missing_ref, missing_ref_violations[0].kind);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", missing_ref_violations[0].constraint_name);
+    try std.testing.expectEqualStrings("order:1", missing_ref_violations[0].child_key);
+    try std.testing.expectEqualStrings("customer:a", missing_ref_violations[0].parent_key);
+
+    const dry_run_ref_report = try db.dryRunRepairForeignKeyRefsInRange("", "");
+    try std.testing.expect(!dry_run_ref_report.valid());
+    try std.testing.expectEqual(@as(u64, 1), dry_run_ref_report.missing_ref_rows);
+    try std.testing.expectEqual(@as(u64, 1), dry_run_ref_report.repaired_ref_rows);
+
+    const after_dry_run_ref_report = try db.validateForeignKeyRefsInRange("", "");
+    try std.testing.expect(!after_dry_run_ref_report.valid());
+    try std.testing.expectEqual(@as(u64, 1), after_dry_run_ref_report.missing_ref_rows);
+    try std.testing.expectEqual(@as(u64, 0), after_dry_run_ref_report.repaired_ref_rows);
+
+    const repair_ref_report = try db.repairForeignKeyRefsInRange("", "");
+    try std.testing.expect(!repair_ref_report.valid());
+    try std.testing.expectEqual(@as(u64, 1), repair_ref_report.missing_ref_rows);
+    try std.testing.expectEqual(@as(u64, 1), repair_ref_report.repaired_ref_rows);
+
+    const repaired_ref_report = try db.validateForeignKeyRefsInRange("", "");
+    try std.testing.expect(repaired_ref_report.valid());
+    try std.testing.expectEqual(@as(u64, 0), repaired_ref_report.missing_ref_rows);
+    try std.testing.expectEqual(@as(u64, 1), repaired_ref_report.scanned_ref_rows);
+
+    const validate_progress = (try db.loadForeignKeyIntegrityProgressRecord(.validate, null, "", "")) orelse return error.TestUnexpectedResult;
+    defer db.freeForeignKeyIntegrityProgressRecord(validate_progress);
+    try std.testing.expectEqualStrings("validate", validate_progress.mode);
+    try std.testing.expect(validate_progress.completed);
+    try std.testing.expect(validate_progress.valid);
+    try std.testing.expectEqualStrings("", validate_progress.lower_doc_key);
+    try std.testing.expectEqualStrings("", validate_progress.upper_doc_key);
+    try std.testing.expectEqual(@as(u64, 0), validate_progress.report.missing_ref_rows);
+    try std.testing.expectEqual(@as(u64, 1), validate_progress.report.scanned_ref_rows);
+
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .deletes = &.{"customer:a"},
+    }));
+
+    try db.batch(.{
+        .deletes = &.{ "customer:a", "order:1" },
+    });
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, fk_ref));
+    try std.testing.expect((try db.get(alloc, "customer:a")) == null);
+    try std.testing.expect((try db.get(alloc, "order:1")) == null);
+
+    const missing_txn = try db.beginTransaction(10_000);
+    try db.writeIntents(missing_txn, &.{
+        .{ .key = "order:txn-missing", .value = "{\"id\":\"order:txn-missing\",\"customer_id\":\"customer:txn-missing\"}" },
+    }, &.{});
+    try std.testing.expectError(error.ForeignKeyViolation, db.commitTransaction(missing_txn, 10_001));
+    try db.abortTransaction(missing_txn, 10_002);
+
+    const create_txn = try db.beginTransaction(11_000);
+    try db.writeIntents(create_txn, &.{
+        .{ .key = "a:order:txn", .value = "{\"id\":\"a:order:txn\",\"customer_id\":\"z:customer:txn\"}" },
+        .{ .key = "z:customer:txn", .value = "{\"id\":\"z:customer:txn\"}" },
+    }, &.{});
+    try db.commitTransaction(create_txn, 11_001);
+
+    const txn_fk_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "orders_customer_id_fkey", "customers", "z:customer:txn", "row", "a:order:txn");
+    defer alloc.free(txn_fk_ref);
+    const txn_ref_value = try db.core.store.get(alloc, txn_fk_ref);
+    defer alloc.free(txn_ref_value);
+    try std.testing.expectEqualStrings("", txn_ref_value);
+
+    const delete_txn = try db.beginTransaction(12_000);
+    try db.writeTransaction(delete_txn, .{
+        .deletes = &.{ "z:customer:txn", "a:order:txn" },
+    });
+    try db.commitTransaction(delete_txn, 12_001);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, txn_fk_ref));
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 2), stats.foreign_keys.child_write_rejects);
+    try std.testing.expectEqual(@as(u64, 1), stats.foreign_keys.parent_delete_rejects);
+    try std.testing.expectEqual(@as(u64, 3), stats.foreign_keys.validation_runs);
+    try std.testing.expectEqual(@as(u64, 1), stats.foreign_keys.dry_run_runs);
+    try std.testing.expectEqual(@as(u64, 1), stats.foreign_keys.repair_runs);
+    try std.testing.expectEqual(@as(u64, 4), stats.foreign_keys.missing_ref_rows);
+    try std.testing.expectEqual(@as(u64, 2), stats.foreign_keys.repaired_ref_rows);
+}
+
+test "db relational foreign keys no_action preserves action and blocks parent deletes" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"no_action"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+    try std.testing.expectEqual(schema_mod.ForeignKeyAction.no_action, runtime_schema.foreign_keys[0].on_delete);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "customer:no-action", .value = "{\"id\":\"customer:no-action\"}" },
+            .{ .key = "order:no-action", .value = "{\"id\":\"order:no-action\",\"customer_id\":\"customer:no-action\"}" },
+        },
+    });
+
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .deletes = &.{"customer:no-action"},
+    }));
+
+    try db.batch(.{ .deletes = &.{ "order:no-action", "customer:no-action" } });
+    try std.testing.expect((try db.get(alloc, "customer:no-action")) == null);
+}
+
+test "db relational foreign keys setSchema accepts deferred and rejects controller-only states" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const relational_columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "customer_id", .path = "customer_id", .field_type = .keyword, .nullable = true },
+    };
+
+    const deferred_foreign_keys = [_]schema_mod.ForeignKey{.{
+        .name = "orders_customer_id_fkey",
+        .child_columns = &.{"customer_id"},
+        .parent_table = "customers",
+        .parent_columns = &.{"_id"},
+        .on_delete = .restrict,
+        .timing = .deferred,
+    }};
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "row",
+        .storage_mode = .relational,
+        .relational_columns = relational_columns[0..],
+        .foreign_keys = deferred_foreign_keys[0..],
+    });
+
+    const validating_foreign_keys = [_]schema_mod.ForeignKey{.{
+        .name = "orders_customer_id_fkey",
+        .child_columns = &.{"customer_id"},
+        .parent_table = "customers",
+        .parent_columns = &.{"_id"},
+        .on_delete = .restrict,
+        .validation_state = .validating,
+    }};
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, db.setSchema(.{
+        .version = 1,
+        .default_type = "row",
+        .storage_mode = .relational,
+        .relational_columns = relational_columns[0..],
+        .foreign_keys = validating_foreign_keys[0..],
+    }));
+
+    const invalid_foreign_keys = [_]schema_mod.ForeignKey{.{
+        .name = "orders_customer_id_fkey",
+        .child_columns = &.{"customer_id"},
+        .parent_table = "customers",
+        .parent_columns = &.{"_id"},
+        .on_delete = .restrict,
+        .validation_state = .invalid,
+    }};
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, db.setSchema(.{
+        .version = 1,
+        .default_type = "row",
+        .storage_mode = .relational,
+        .relational_columns = relational_columns[0..],
+        .foreign_keys = invalid_foreign_keys[0..],
+    }));
+}
+
+test "db relational foreign keys integrity ignores unvalidated constraints" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","validation_state":"unvalidated"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "order:unvalidated", .value = "{\"id\":\"order:unvalidated\",\"customer_id\":\"customer:missing\"}" }},
+    });
+
+    const report = try db.validateForeignKeyRefsInRange("", "");
+    try std.testing.expect(report.valid());
+    try std.testing.expectEqual(@as(u64, 0), report.scanned_child_rows);
+    try std.testing.expectEqual(@as(u64, 0), report.referenced_child_rows);
+    try std.testing.expectEqual(@as(u64, 0), report.missing_parent_rows);
+    try std.testing.expectEqual(@as(u64, 0), report.missing_ref_rows);
+
+    const dry_run_report = try db.dryRunRepairForeignKeyRefsInRange("", "");
+    try std.testing.expect(dry_run_report.valid());
+    try std.testing.expectEqual(@as(u64, 0), dry_run_report.scanned_child_rows);
+    try std.testing.expectEqual(@as(u64, 0), dry_run_report.repaired_ref_rows);
+
+    const repair_report = try db.repairForeignKeyRefsInRange("", "");
+    try std.testing.expect(repair_report.valid());
+    try std.testing.expectEqual(@as(u64, 0), repair_report.scanned_child_rows);
+    try std.testing.expectEqual(@as(u64, 0), repair_report.repaired_ref_rows);
+
+    const violations = try db.listForeignKeyViolationsInRange("", "");
+    defer db.freeForeignKeyIntegrityViolations(violations);
+    try std.testing.expectEqual(@as(usize, 0), violations.len);
+
+    const explain = try db.explainForeignKeyDelete("customer:missing");
+    try std.testing.expect(!explain.exists);
+    try std.testing.expectEqual(@as(u64, 0), explain.planned_row_deletes);
+    try std.testing.expectEqual(@as(u64, 0), explain.planned_index_deletes);
+    try std.testing.expectEqual(@as(u64, 0), explain.planned_writes);
+
+    try std.testing.expect((try db.loadForeignKeyIntegrityProgressRecord(.validate, null, "", "")) == null);
+    try std.testing.expect((try db.loadForeignKeyIntegrityProgressRecord(.dry_run, null, "", "")) == null);
+    try std.testing.expect((try db.loadForeignKeyIntegrityProgressRecord(.repair, null, "", "")) == null);
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 0), stats.foreign_keys.validation_runs);
+    try std.testing.expectEqual(@as(u64, 0), stats.foreign_keys.dry_run_runs);
+    try std.testing.expectEqual(@as(u64, 0), stats.foreign_keys.repair_runs);
+    try std.testing.expectEqual(@as(u64, 0), stats.foreign_keys.scanned_child_rows);
+
+    const adoption_report = try db.validateForeignKeyRefsInRangeForConstraint("orders_customer_id_fkey", "", "");
+    try std.testing.expect(!adoption_report.valid());
+    try std.testing.expectEqual(@as(u64, 1), adoption_report.scanned_child_rows);
+    try std.testing.expectEqual(@as(u64, 1), adoption_report.referenced_child_rows);
+    try std.testing.expectEqual(@as(u64, 1), adoption_report.missing_parent_rows);
+    try std.testing.expectEqual(@as(u64, 1), adoption_report.missing_ref_rows);
+
+    const adoption_violations = try db.listForeignKeyViolationsInRangeForConstraint("orders_customer_id_fkey", "", "");
+    defer db.freeForeignKeyIntegrityViolations(adoption_violations);
+    try std.testing.expectEqual(@as(usize, 2), adoption_violations.len);
+}
+
+test "db relational foreign keys set nullable children null on parent delete" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"set_null"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "customer:set-null", .value = "{\"id\":\"customer:set-null\"}" },
+            .{ .key = "order:set-null", .value = "{\"id\":\"order:set-null\",\"customer_id\":\"customer:set-null\",\"status\":\"open\"}" },
+        },
+    });
+
+    try db.batch(.{ .deletes = &.{"customer:set-null"} });
+
+    const child = (try db.get(alloc, "order:set-null")) orelse return error.TestExpectedEqual;
+    defer alloc.free(child);
+    try std.testing.expectEqualStrings("{\"id\":\"order:set-null\",\"status\":\"open\"}", child);
+    try std.testing.expect((try db.get(alloc, "customer:set-null")) == null);
+
+    const fk_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "orders_customer_id_fkey", "customers", "customer:set-null", "row", "order:set-null");
+    defer alloc.free(fk_ref);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, fk_ref));
+
+    const report = try db.validateForeignKeyRefsInRange("", "");
+    try std.testing.expect(report.valid());
+    try std.testing.expectEqual(@as(u64, 0), report.referenced_child_rows);
+    try std.testing.expectEqual(@as(u64, 0), report.scanned_ref_rows);
+}
+
+test "db relational foreign keys cascade deletes through local children" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"parent_id":{"type":"keyword"},"title":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"nodes_parent_id_fkey","columns":["parent_id"],"references":{"table":"nodes","columns":["_id"]},"on_delete":"cascade"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "node:root", .value = "{\"id\":\"node:root\",\"title\":\"root\"}" },
+            .{ .key = "node:child", .value = "{\"id\":\"node:child\",\"parent_id\":\"node:root\",\"title\":\"child\"}" },
+            .{ .key = "node:grandchild", .value = "{\"id\":\"node:grandchild\",\"parent_id\":\"node:child\",\"title\":\"grandchild\"}" },
+        },
+    });
+
+    try db.batch(.{ .deletes = &.{"node:root"} });
+    try std.testing.expect((try db.get(alloc, "node:root")) == null);
+    try std.testing.expect((try db.get(alloc, "node:child")) == null);
+    try std.testing.expect((try db.get(alloc, "node:grandchild")) == null);
+
+    const root_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "nodes_parent_id_fkey", "nodes", "node:root", "row", "node:child");
+    defer alloc.free(root_ref);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, root_ref));
+    const child_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "nodes_parent_id_fkey", "nodes", "node:child", "row", "node:grandchild");
+    defer alloc.free(child_ref);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, child_ref));
+
+    const report = try db.validateForeignKeyRefsInRange("", "");
+    try std.testing.expect(report.valid());
+    try std.testing.expectEqual(@as(u64, 0), report.scanned_child_rows);
+    try std.testing.expectEqual(@as(u64, 0), report.scanned_ref_rows);
+}
+
+test "db relational foreign keys can reference local unique parent columns" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"ref_email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]}],"foreign_keys":[{"name":"users_ref_email_fkey","columns":["ref_email"],"references":{"table":"row","columns":["email"]},"on_delete":"restrict"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .writes = &.{.{ .key = "user:child-missing", .value = "{\"id\":\"user:child-missing\",\"ref_email\":\"missing@example.com\"}" }},
+    }));
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"parent@example.com\"}" },
+            .{ .key = "user:child", .value = "{\"id\":\"user:child\",\"ref_email\":\"parent@example.com\"}" },
+        },
+    });
+
+    const valid_report = try db.validateForeignKeyRefsInRange("", "");
+    try std.testing.expect(valid_report.valid());
+    try std.testing.expectEqual(@as(u64, 2), valid_report.scanned_child_rows);
+    try std.testing.expectEqual(@as(u64, 1), valid_report.referenced_child_rows);
+    try std.testing.expectEqual(@as(u64, 1), valid_report.scanned_ref_rows);
+
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .deletes = &.{"user:parent"},
+    }));
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .writes = &.{.{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"new-parent@example.com\"}" }},
+    }));
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "user:child", .value = "{\"id\":\"user:child\"}" }},
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"new-parent@example.com\"}" }},
+    });
+
+    const create_txn = try db.beginTransaction(30_000);
+    try db.writeIntents(create_txn, &.{
+        .{ .key = "user:a-txn-parent", .value = "{\"id\":\"user:a-txn-parent\",\"email\":\"txn-parent@example.com\"}" },
+        .{ .key = "user:z-txn-child", .value = "{\"id\":\"user:z-txn-child\",\"ref_email\":\"txn-parent@example.com\"}" },
+    }, &.{});
+    try db.commitTransaction(create_txn, 30_001);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:diag-parent", .value = "{\"id\":\"user:diag-parent\",\"email\":\"diag@example.com\"}" },
+            .{ .key = "user:diag-child", .value = "{\"id\":\"user:diag-child\",\"ref_email\":\"diag@example.com\"}" },
+        },
+    });
+    const diag_parent_row = try relational_store_mod.rowKeyAlloc(alloc, "user:diag-parent");
+    defer alloc.free(diag_parent_row);
+    try db.core.store.putBatch(&.{}, &.{diag_parent_row});
+
+    const diag_violations = try db.listForeignKeyViolationsInRange("user:diag", "user:diag~");
+    defer db.freeForeignKeyIntegrityViolations(diag_violations);
+    try std.testing.expectEqual(@as(usize, 1), diag_violations.len);
+    try std.testing.expectEqual(relational_store_mod.ForeignKeyIntegrityViolationKind.missing_parent, diag_violations[0].kind);
+    try std.testing.expectEqualStrings("users_ref_email_fkey", diag_violations[0].constraint_name);
+    try std.testing.expectEqualStrings("user:diag-child", diag_violations[0].child_key);
+    try std.testing.expectEqual(@as(usize, 1), diag_violations[0].parent_values.len);
+    try std.testing.expectEqualStrings("email", diag_violations[0].parent_values[0].column);
+    try std.testing.expectEqualStrings("diag@example.com", diag_violations[0].parent_values[0].value);
+    try std.testing.expect(diag_violations[0].observed_parent_key == null);
+    try std.testing.expectEqual(@as(usize, 0), diag_violations[0].observed_parent_values.len);
+}
+
+test "db relational foreign keys allow multiple constraints on the same child columns" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_row_fkey","columns":["customer_id"],"references":{"table":"row","columns":["_id"]},"on_delete":"restrict"},{"name":"orders_customer_id_customers_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "parent:shared", .value = "{\"id\":\"parent:shared\"}" },
+            .{ .key = "order:shared", .value = "{\"id\":\"order:shared\",\"customer_id\":\"parent:shared\",\"status\":\"open\"}" },
+        },
+    });
+
+    const row_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "orders_customer_id_row_fkey", "row", "parent:shared", "row", "order:shared");
+    defer alloc.free(row_ref);
+    const row_ref_value = try db.core.store.get(alloc, row_ref);
+    defer alloc.free(row_ref_value);
+    try std.testing.expectEqualStrings("", row_ref_value);
+
+    const customers_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "orders_customer_id_customers_fkey", "customers", "parent:shared", "row", "order:shared");
+    defer alloc.free(customers_ref);
+    const customers_ref_value = try db.core.store.get(alloc, customers_ref);
+    defer alloc.free(customers_ref_value);
+    try std.testing.expectEqualStrings("", customers_ref_value);
+
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .deletes = &.{"parent:shared"},
+    }));
+}
+
+test "db relational foreign keys reject partial match full composite references" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"email":{"type":"keyword"},"customer_email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_tenant_email_key","columns":["tenant_id","email"]}],"foreign_keys":[{"name":"users_customer_tenant_email_fkey","columns":["tenant_id","customer_email"],"references":{"table":"row","columns":["tenant_id","email"]},"match":"full"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const all_null_txn = try db.beginTransaction(14_942);
+    try db.writeTransaction(all_null_txn, .{
+        .writes = &.{.{ .key = "user:all-null", .value = "{\"id\":\"user:all-null\"}" }},
+    });
+    try db.commitTransaction(all_null_txn, 14_943);
+
+    const partial_txn = try db.beginTransaction(14_944);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(partial_txn, .{
+        .writes = &.{.{ .key = "user:partial", .value = "{\"id\":\"user:partial\",\"tenant_id\":\"tenant:1\"}" }},
+    }));
+    try db.abortTransaction(partial_txn, 14_945);
+}
+
+test "db relational temporal primary keys enforce without-overlaps intervals" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"sku":{"type":"keyword"},"valid_from":{"type":"numeric"},"valid_to":{"type":"numeric"},"price":{"type":"numeric"}},"required":["sku","valid_from"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["sku"],"without_overlaps_period":"valid_time"}}
+    ;
+    var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "price:a:v1", .value = "{\"sku\":\"sku:a\",\"valid_from\":0,\"valid_to\":10,\"price\":10}" },
+            .{ .key = "price:a:v2", .value = "{\"sku\":\"sku:a\",\"valid_from\":10,\"valid_to\":20,\"price\":12}" },
+            .{ .key = "price:b:v1", .value = "{\"sku\":\"sku:b\",\"valid_from\":5,\"valid_to\":15,\"price\":7}" },
+        },
+    });
+
+    try std.testing.expectError(error.UniqueConstraintViolation, db.batch(.{
+        .writes = &.{.{ .key = "price:a:overlap", .value = "{\"sku\":\"sku:a\",\"valid_from\":5,\"valid_to\":6,\"price\":11}" }},
+    }));
+    try std.testing.expectError(error.InvalidColumnValue, db.batch(.{
+        .writes = &.{.{ .key = "price:a:invalid", .value = "{\"sku\":\"sku:a\",\"valid_from\":30,\"valid_to\":30,\"price\":15}" }},
+    }));
+    try std.testing.expectError(error.UniqueConstraintViolation, db.batch(.{
+        .writes = &.{.{ .key = "price:a:v2", .value = "{\"sku\":\"sku:a\",\"valid_from\":9,\"valid_to\":20,\"price\":13}" }},
+    }));
+
+    try db.batch(.{ .deletes = &.{"price:a:v1"} });
+    try db.batch(.{
+        .writes = &.{.{ .key = "price:a:replacement", .value = "{\"sku\":\"sku:a\",\"valid_from\":5,\"valid_to\":9,\"price\":14}" }},
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "price:c:v1", .value = "{\"sku\":\"sku:c\",\"valid_from\":0,\"valid_to\":20,\"price\":8}" },
+            .{ .key = "price:c:current", .value = "{\"sku\":\"sku:c\",\"valid_from\":20,\"price\":9}" },
+        },
+    });
+    try std.testing.expectError(error.UniqueConstraintViolation, db.batch(.{
+        .writes = &.{.{ .key = "price:c:overlap-open", .value = "{\"sku\":\"sku:c\",\"valid_from\":40,\"valid_to\":50,\"price\":10}" }},
+    }));
+}
+
+test "db relational temporal foreign keys require covered parent periods" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"sku":{"type":"keyword"},"parent_sku":{"type":"keyword"},"valid_from":{"type":"numeric"},"valid_to":{"type":"numeric"},"price":{"type":"numeric"}},"required":["sku","valid_from"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["sku"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"price_parent_period_fkey","columns":["parent_sku"],"period":"valid_time","references":{"table":"row","columns":["sku"],"period":"valid_time"},"validation_state":"enforced"}]}
+    ;
+    var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "price:parent:v1", .value = "{\"sku\":\"parent\",\"valid_from\":0,\"valid_to\":5,\"price\":10}" },
+            .{ .key = "price:parent:v2", .value = "{\"sku\":\"parent\",\"valid_from\":5,\"valid_to\":10,\"price\":12}" },
+            .{ .key = "price:gap:v1", .value = "{\"sku\":\"gap\",\"valid_from\":0,\"valid_to\":4,\"price\":7}" },
+            .{ .key = "price:gap:v2", .value = "{\"sku\":\"gap\",\"valid_from\":6,\"valid_to\":10,\"price\":8}" },
+            .{ .key = "price:open:v1", .value = "{\"sku\":\"open\",\"valid_from\":10,\"price\":14}" },
+        },
+    });
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "price:child:covered", .value = "{\"sku\":\"child:covered\",\"parent_sku\":\"parent\",\"valid_from\":2,\"valid_to\":8,\"price\":99}" }},
+    });
+
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .writes = &.{.{ .key = "price:child:gap", .value = "{\"sku\":\"child:gap\",\"parent_sku\":\"gap\",\"valid_from\":3,\"valid_to\":7,\"price\":99}" }},
+    }));
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .writes = &.{.{ .key = "price:child:missing", .value = "{\"sku\":\"child:missing\",\"parent_sku\":\"missing\",\"valid_from\":1,\"valid_to\":2,\"price\":99}" }},
+    }));
+    try db.batch(.{
+        .writes = &.{.{ .key = "price:child:open-covered", .value = "{\"sku\":\"child:open-covered\",\"parent_sku\":\"open\",\"valid_from\":12,\"valid_to\":100,\"price\":99}" }},
+    });
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "price:child:covered", .value = "{\"sku\":\"child:covered\",\"parent_sku\":\"parent\",\"valid_from\":1,\"valid_to\":9,\"price\":101}" }},
+    });
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .writes = &.{.{ .key = "price:child:covered", .value = "{\"sku\":\"child:covered\",\"parent_sku\":\"parent\",\"valid_from\":8,\"valid_to\":12,\"price\":102}" }},
+    }));
+
+    const covered_parent_row = try mapper.buildRelationalRowValueAlloc(alloc, "{\"sku\":\"child:proof\",\"parent_sku\":\"parent\",\"valid_from\":2,\"valid_to\":8,\"price\":50}", runtime_schema.relational_columns);
+    defer alloc.free(covered_parent_row);
+    const covered_parent_key = try relational_store_mod.foreignKeyReferenceValueAlloc(alloc, covered_parent_row, runtime_schema.foreign_keys[0]);
+    defer alloc.free(covered_parent_key.?);
+
+    const proof_txn = try db.beginTransaction(3_000);
+    try db.writeTransaction(proof_txn, .{
+        .foreign_key_parent_checks = &.{.{
+            .constraint_name = "price_parent_period_fkey",
+            .child_table = "row",
+            .child_key = "price:child:proof",
+            .parent_table = "row",
+            .parent_key = covered_parent_key.?,
+            .parent_constraint_name = relational_store_mod.primary_key_constraint_name,
+            .child_period_start_json = "2",
+            .child_period_end_json = "8",
+            .timing = .immediate,
+        }},
+    });
+    try db.abortTransaction(proof_txn, 3_001);
+
+    const gap_txn = try db.beginTransaction(3_010);
+    defer db.abortTransaction(gap_txn, 3_011) catch {};
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(gap_txn, .{
+        .foreign_key_parent_checks = &.{.{
+            .constraint_name = "price_parent_period_fkey",
+            .child_table = "row",
+            .child_key = "price:child:proof",
+            .parent_table = "row",
+            .parent_key = covered_parent_key.?,
+            .parent_constraint_name = relational_store_mod.primary_key_constraint_name,
+            .child_period_start_json = "8",
+            .child_period_end_json = "12",
+            .timing = .immediate,
+        }},
+    }));
+}
+
+test "db relational temporal foreign key delete actions respect remaining parent coverage" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var set_null_path_buf: [256]u8 = undefined;
+    const set_null_path = tempPath(&set_null_path_buf);
+    defer cleanupTempDir(set_null_path);
+
+    var set_null_db = try DB.open(alloc, std.mem.span(set_null_path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer set_null_db.close();
+
+    const set_null_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"sku":{"type":"keyword"},"parent_sku":{"type":"keyword"},"valid_from":{"type":"numeric"},"valid_to":{"type":"numeric"},"price":{"type":"numeric"}},"required":["sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["sku"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"price_parent_period_fkey","columns":["parent_sku"],"period":"valid_time","references":{"table":"row","columns":["sku"],"period":"valid_time"},"on_delete":"set_null","validation_state":"enforced"}]}
+    ;
+    var set_null_parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, set_null_schema_json);
+    defer set_null_parsed_schema.deinit(alloc);
+    const set_null_runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, set_null_parsed_schema);
+    defer schema_mod.freeSchema(alloc, set_null_runtime_schema);
+    try set_null_db.setSchema(set_null_runtime_schema);
+
+    try set_null_db.batch(.{
+        .writes = &.{
+            .{ .key = "price:parent:v1", .value = "{\"sku\":\"parent\",\"valid_from\":0,\"valid_to\":5,\"price\":10}" },
+            .{ .key = "price:parent:v2", .value = "{\"sku\":\"parent\",\"valid_from\":5,\"valid_to\":10,\"price\":12}" },
+            .{ .key = "price:child:covered", .value = "{\"sku\":\"child:covered\",\"parent_sku\":\"parent\",\"valid_from\":6,\"valid_to\":8,\"price\":99}" },
+        },
+    });
+
+    try set_null_db.batch(.{ .deletes = &.{"price:parent:v1"} });
+    const covered_child = (try set_null_db.get(alloc, "price:child:covered")) orelse return error.TestExpectedEqual;
+    defer alloc.free(covered_child);
+    try std.testing.expect(std.mem.indexOf(u8, covered_child, "\"parent_sku\":\"parent\"") != null);
+
+    try set_null_db.batch(.{ .deletes = &.{"price:parent:v2"} });
+    const uncovered_child = (try set_null_db.get(alloc, "price:child:covered")) orelse return error.TestExpectedEqual;
+    defer alloc.free(uncovered_child);
+    try std.testing.expect(std.mem.indexOf(u8, uncovered_child, "\"parent_sku\"") == null);
+
+    var set_null_update_path_buf: [256]u8 = undefined;
+    const set_null_update_path = tempPath(&set_null_update_path_buf);
+    defer cleanupTempDir(set_null_update_path);
+
+    var set_null_update_db = try DB.open(alloc, std.mem.span(set_null_update_path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer set_null_update_db.close();
+
+    const set_null_update_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"sku":{"type":"keyword"},"parent_sku":{"type":"keyword"},"valid_from":{"type":"numeric"},"valid_to":{"type":"numeric"},"price":{"type":"numeric"}},"required":["sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["sku"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"price_parent_period_fkey","columns":["parent_sku"],"period":"valid_time","references":{"table":"row","columns":["sku"],"period":"valid_time"},"on_update":"set_null","validation_state":"enforced"}]}
+    ;
+    var set_null_update_parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, set_null_update_schema_json);
+    defer set_null_update_parsed_schema.deinit(alloc);
+    const set_null_update_runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, set_null_update_parsed_schema);
+    defer schema_mod.freeSchema(alloc, set_null_update_runtime_schema);
+    try set_null_update_db.setSchema(set_null_update_runtime_schema);
+
+    try set_null_update_db.batch(.{
+        .writes = &.{
+            .{ .key = "price:parent:v1", .value = "{\"sku\":\"parent\",\"valid_from\":0,\"valid_to\":5,\"price\":10}" },
+            .{ .key = "price:parent:v2", .value = "{\"sku\":\"parent\",\"valid_from\":5,\"valid_to\":10,\"price\":12}" },
+            .{ .key = "price:child:covered", .value = "{\"sku\":\"child:covered\",\"parent_sku\":\"parent\",\"valid_from\":6,\"valid_to\":8,\"price\":99}" },
+        },
+    });
+
+    try set_null_update_db.batch(.{
+        .writes = &.{.{ .key = "price:parent:v1", .value = "{\"sku\":\"parent\",\"valid_from\":0,\"valid_to\":4,\"price\":10}" }},
+    });
+    const update_covered_child = (try set_null_update_db.get(alloc, "price:child:covered")) orelse return error.TestExpectedEqual;
+    defer alloc.free(update_covered_child);
+    try std.testing.expect(std.mem.indexOf(u8, update_covered_child, "\"parent_sku\":\"parent\"") != null);
+
+    try set_null_update_db.batch(.{
+        .writes = &.{.{ .key = "price:parent:v2", .value = "{\"sku\":\"parent\",\"valid_from\":5,\"valid_to\":7,\"price\":12}" }},
+    });
+    const update_uncovered_child = (try set_null_update_db.get(alloc, "price:child:covered")) orelse return error.TestExpectedEqual;
+    defer alloc.free(update_uncovered_child);
+    try std.testing.expect(std.mem.indexOf(u8, update_uncovered_child, "\"parent_sku\"") == null);
+
+    var cascade_path_buf: [256]u8 = undefined;
+    const cascade_path = tempPath(&cascade_path_buf);
+    defer cleanupTempDir(cascade_path);
+
+    var cascade_db = try DB.open(alloc, std.mem.span(cascade_path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer cascade_db.close();
+
+    const cascade_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"sku":{"type":"keyword"},"parent_sku":{"type":"keyword"},"valid_from":{"type":"numeric"},"valid_to":{"type":"numeric"},"price":{"type":"numeric"}},"required":["sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["sku"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"price_parent_period_fkey","columns":["parent_sku"],"period":"valid_time","references":{"table":"row","columns":["sku"],"period":"valid_time"},"on_delete":"cascade","validation_state":"enforced"}]}
+    ;
+    var cascade_parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, cascade_schema_json);
+    defer cascade_parsed_schema.deinit(alloc);
+    const cascade_runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, cascade_parsed_schema);
+    defer schema_mod.freeSchema(alloc, cascade_runtime_schema);
+    try cascade_db.setSchema(cascade_runtime_schema);
+
+    try cascade_db.batch(.{
+        .writes = &.{
+            .{ .key = "price:parent:v1", .value = "{\"sku\":\"parent\",\"valid_from\":0,\"valid_to\":5,\"price\":10}" },
+            .{ .key = "price:parent:v2", .value = "{\"sku\":\"parent\",\"valid_from\":5,\"valid_to\":10,\"price\":12}" },
+            .{ .key = "price:child:covered", .value = "{\"sku\":\"child:covered\",\"parent_sku\":\"parent\",\"valid_from\":6,\"valid_to\":8,\"price\":99}" },
+        },
+    });
+
+    try cascade_db.batch(.{ .deletes = &.{"price:parent:v1"} });
+    const cascade_child = (try cascade_db.get(alloc, "price:child:covered")) orelse return error.TestExpectedEqual;
+    defer alloc.free(cascade_child);
+    try std.testing.expect(std.mem.indexOf(u8, cascade_child, "\"parent_sku\":\"parent\"") != null);
+
+    try cascade_db.batch(.{ .deletes = &.{"price:parent:v2"} });
+    try std.testing.expect((try cascade_db.get(alloc, "price:child:covered")) == null);
+}
+
+test "db relational temporal foreign key repair rebuilds coverage refs" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"sku":{"type":"keyword"},"parent_sku":{"type":"keyword"},"valid_from":{"type":"numeric"},"valid_to":{"type":"numeric"},"price":{"type":"numeric"}},"required":["sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["sku"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"price_parent_period_fkey","columns":["parent_sku"],"period":"valid_time","references":{"table":"row","columns":["sku"],"period":"valid_time"},"validation_state":"enforced"}]}
+    ;
+    var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "price:parent:v1", .value = "{\"sku\":\"parent\",\"valid_from\":0,\"valid_to\":5,\"price\":10}" },
+            .{ .key = "price:parent:v2", .value = "{\"sku\":\"parent\",\"valid_from\":5,\"valid_to\":10,\"price\":12}" },
+            .{ .key = "price:child:covered", .value = "{\"sku\":\"child:covered\",\"parent_sku\":\"parent\",\"valid_from\":2,\"valid_to\":8,\"price\":99}" },
+        },
+    });
+
+    const child_row = try mapper.buildRelationalRowValueAlloc(
+        alloc,
+        "{\"sku\":\"child:covered\",\"parent_sku\":\"parent\",\"valid_from\":2,\"valid_to\":8,\"price\":99}",
+        runtime_schema.relational_columns,
+    );
+    defer alloc.free(child_row);
+    const parent_key = (try relational_store_mod.foreignKeyReferenceValueAlloc(alloc, child_row, runtime_schema.foreign_keys[0])) orelse return error.TestExpectedEqual;
+    defer alloc.free(parent_key);
+    const ref_key = try internal_keys.relationalForeignKeyRefKeyAlloc(
+        alloc,
+        "price_parent_period_fkey",
+        "row",
+        parent_key,
+        "row",
+        "price:child:covered",
+    );
+    defer alloc.free(ref_key);
+
+    const clean_report = try db.validateForeignKeyRefsInRangeForConstraint("price_parent_period_fkey", "", "");
+    try std.testing.expect(clean_report.valid());
+    try db.core.store.delete(ref_key);
+
+    const missing_report = try db.validateForeignKeyRefsInRangeForConstraint("price_parent_period_fkey", "", "");
+    try std.testing.expect(!missing_report.valid());
+    try std.testing.expectEqual(@as(u64, 1), missing_report.missing_ref_rows);
+
+    const repaired_report = try db.repairForeignKeyRefsInRangeForConstraint("price_parent_period_fkey", "", "");
+    try std.testing.expectEqual(@as(u64, 1), repaired_report.repaired_ref_rows);
+    const validate_repaired_report = try db.validateForeignKeyRefsInRangeForConstraint("price_parent_period_fkey", "", "");
+    try std.testing.expect(validate_repaired_report.valid());
+
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .deletes = &.{"price:parent:v1"},
+    }));
+}
+
+test "db relational temporal portion mutation requires temporal primary identity" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"sku":{"type":"keyword"},"valid_from":{"type":"numeric"},"valid_to":{"type":"numeric"},"price":{"type":"numeric"}},"required":["sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["sku"]}}
+    ;
+    var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const txn_id = try db.beginTransaction(2_000);
+    defer db.abortTransaction(txn_id, 2_001) catch {};
+    const predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "sku",
+        .op = .eq,
+        .value_json = "\"sku:a\"",
+    }};
+    const operations = [_]types.TransformOp{.{
+        .op = .set,
+        .path = "price",
+        .value_json = "99",
+    }};
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.mutateRelationalRowsFromSource(alloc, runtime_schema, .{
+        .kind = .update,
+        .source = .{
+            .predicates = predicates[0..],
+            .row_claim = .{
+                .mode = .for_update,
+                .owner_id = "session:temporal-non-primary",
+                .txn_id = txn_id,
+            },
+        },
+        .operations = operations[0..],
+        .temporal_portion = .{
+            .period = "valid_time",
+            .from_json = "3",
+            .to_json = "7",
+        },
+    }));
+}
+
+test "db relational temporal mutation source splits portions transactionally" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"sku":{"type":"keyword"},"valid_from":{"type":"numeric"},"valid_to":{"type":"numeric"},"price":{"type":"numeric"}},"required":["sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["sku"],"without_overlaps_period":"valid_time"}}
+    ;
+    var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "price:a:v1", .value = "{\"sku\":\"sku:a\",\"valid_from\":0,\"valid_to\":10,\"price\":10}" },
+            .{ .key = "price:b:v1", .value = "{\"sku\":\"sku:b\",\"valid_from\":0,\"valid_to\":10,\"price\":20}" },
+        },
+        .timestamp_ns = 1_000,
+    });
+
+    const update_txn = try db.beginTransaction(2_000);
+    const update_predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "sku",
+        .op = .eq,
+        .value_json = "\"sku:a\"",
+    }};
+    const update_operations = [_]types.TransformOp{.{
+        .op = .set,
+        .path = "price",
+        .value_json = "99",
+    }};
+    var update = try db.mutateRelationalRowsFromSource(alloc, runtime_schema, .{
+        .kind = .update,
+        .source = .{
+            .predicates = update_predicates[0..],
+            .row_claim = .{
+                .mode = .for_update,
+                .owner_id = "session:temporal-update",
+                .txn_id = update_txn,
+            },
+        },
+        .operations = update_operations[0..],
+        .temporal_portion = .{
+            .period = "valid_time",
+            .from_json = "3",
+            .to_json = "7",
+        },
+        .returning_all = true,
+    });
+    defer update.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), update.matched);
+    try std.testing.expectEqual(@as(u32, 1), update.staged);
+    try std.testing.expectEqual(@as(usize, 1), update.returning_rows.len);
+    try expectRelationalTemporalPriceRow(alloc, update.returning_rows[0], "sku:a", 3, 7, 99);
+    try db.commitTransaction(update_txn, 2_010);
+
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "valid_from",
+        .direction = .asc,
+    }};
+    var sku_a_rows = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = update_predicates[0..],
+        .select_all = true,
+        .order_by = order_by[0..],
+    });
+    defer sku_a_rows.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), sku_a_rows.total);
+    try std.testing.expectEqual(@as(usize, 3), sku_a_rows.rows.len);
+    try expectRelationalTemporalPriceRow(alloc, sku_a_rows.rows[0], "sku:a", 0, 3, 10);
+    try expectRelationalTemporalPriceRow(alloc, sku_a_rows.rows[1], "sku:a", 3, 7, 99);
+    try expectRelationalTemporalPriceRow(alloc, sku_a_rows.rows[2], "sku:a", 7, 10, 10);
+    try expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "2", 0, 3, 10);
+    try expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "5", 3, 7, 99);
+    try expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "8", 7, 10, 10);
+
+    const repeat_update_txn = try db.beginTransaction(2_012);
+    const repeat_update_operations = [_]types.TransformOp{.{
+        .op = .set,
+        .path = "price",
+        .value_json = "77",
+    }};
+    var repeat_update = try db.mutateRelationalRowsFromSource(alloc, runtime_schema, .{
+        .kind = .update,
+        .source = .{
+            .predicates = update_predicates[0..],
+            .row_claim = .{
+                .mode = .for_update,
+                .owner_id = "session:temporal-repeat-update",
+                .txn_id = repeat_update_txn,
+            },
+        },
+        .operations = repeat_update_operations[0..],
+        .temporal_portion = .{
+            .period = "valid_time",
+            .from_json = "8",
+            .to_json = "9",
+        },
+        .returning_all = true,
+    });
+    defer repeat_update.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), repeat_update.matched);
+    try std.testing.expectEqual(@as(u32, 1), repeat_update.staged);
+    try std.testing.expectEqual(@as(usize, 1), repeat_update.returning_rows.len);
+    try expectRelationalTemporalPriceRow(alloc, repeat_update.returning_rows[0], "sku:a", 8, 9, 77);
+    try db.commitTransaction(repeat_update_txn, 2_018);
+
+    var repeated_rows = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = update_predicates[0..],
+        .select_all = true,
+        .order_by = order_by[0..],
+    });
+    defer repeated_rows.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 5), repeated_rows.total);
+    try std.testing.expectEqual(@as(usize, 5), repeated_rows.rows.len);
+    try expectRelationalTemporalPriceRow(alloc, repeated_rows.rows[0], "sku:a", 0, 3, 10);
+    try expectRelationalTemporalPriceRow(alloc, repeated_rows.rows[1], "sku:a", 3, 7, 99);
+    try expectRelationalTemporalPriceRow(alloc, repeated_rows.rows[2], "sku:a", 7, 8, 10);
+    try expectRelationalTemporalPriceRow(alloc, repeated_rows.rows[3], "sku:a", 8, 9, 77);
+    try expectRelationalTemporalPriceRow(alloc, repeated_rows.rows[4], "sku:a", 9, 10, 10);
+    try expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "8.5", 8, 9, 77);
+
+    const multi_row_update_txn = try db.beginTransaction(2_019);
+    const multi_row_update_operations = [_]types.TransformOp{.{
+        .op = .set,
+        .path = "price",
+        .value_json = "55",
+    }};
+    var multi_row_update = try db.mutateRelationalRowsFromSource(alloc, runtime_schema, .{
+        .kind = .update,
+        .source = .{
+            .predicates = update_predicates[0..],
+            .row_claim = .{
+                .mode = .for_update,
+                .owner_id = "session:temporal-multi-row-update",
+                .txn_id = multi_row_update_txn,
+            },
+        },
+        .operations = multi_row_update_operations[0..],
+        .temporal_portion = .{
+            .period = "valid_time",
+            .from_json = "3",
+            .to_json = "9",
+        },
+        .returning_all = true,
+    });
+    defer multi_row_update.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 5), multi_row_update.matched);
+    try std.testing.expectEqual(@as(u32, 3), multi_row_update.staged);
+    try std.testing.expectEqual(@as(usize, 3), multi_row_update.returning_rows.len);
+    try expectRelationalTemporalPriceRow(alloc, multi_row_update.returning_rows[0], "sku:a", 3, 7, 55);
+    try expectRelationalTemporalPriceRow(alloc, multi_row_update.returning_rows[1], "sku:a", 7, 8, 55);
+    try expectRelationalTemporalPriceRow(alloc, multi_row_update.returning_rows[2], "sku:a", 8, 9, 55);
+    try db.commitTransaction(multi_row_update_txn, 2_019);
+
+    var multi_row_rows = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = update_predicates[0..],
+        .select_all = true,
+        .order_by = order_by[0..],
+    });
+    defer multi_row_rows.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 5), multi_row_rows.total);
+    try std.testing.expectEqual(@as(usize, 5), multi_row_rows.rows.len);
+    try expectRelationalTemporalPriceRow(alloc, multi_row_rows.rows[0], "sku:a", 0, 3, 10);
+    try expectRelationalTemporalPriceRow(alloc, multi_row_rows.rows[1], "sku:a", 3, 7, 55);
+    try expectRelationalTemporalPriceRow(alloc, multi_row_rows.rows[2], "sku:a", 7, 8, 55);
+    try expectRelationalTemporalPriceRow(alloc, multi_row_rows.rows[3], "sku:a", 8, 9, 55);
+    try expectRelationalTemporalPriceRow(alloc, multi_row_rows.rows[4], "sku:a", 9, 10, 10);
+    try expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "4", 3, 7, 55);
+    try expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "7.5", 7, 8, 55);
+    try expectRelationalTemporalPrimarySelectorPriceRow(alloc, &db, runtime_schema, "sku:a", "8.5", 8, 9, 55);
+
+    const scanned_rows = try relational_store_mod.scanRowsAlloc(alloc, db.core.store, "", "");
+    defer relational_store_mod.freeRows(alloc, scanned_rows);
+    for (scanned_rows) |row| {
+        if (std.mem.indexOf(u8, row.doc_key, "~period:")) |first_period_suffix| {
+            const nested_suffix_start = first_period_suffix + "~period:".len;
+            try std.testing.expect(std.mem.indexOf(u8, row.doc_key[nested_suffix_start..], "~period:") == null);
+        }
+    }
+
+    const invalid_txn = try db.beginTransaction(2_020);
+    defer db.abortTransaction(invalid_txn, 2_021) catch {};
+    const invalid_operations = [_]types.TransformOp{.{
+        .op = .set,
+        .path = "valid_from",
+        .value_json = "4",
+    }};
+    try std.testing.expectError(error.InvalidQueryRequest, db.mutateRelationalRowsFromSource(alloc, runtime_schema, .{
+        .kind = .update,
+        .source = .{
+            .predicates = update_predicates[0..],
+            .row_claim = .{
+                .mode = .for_update,
+                .owner_id = "session:temporal-invalid",
+                .txn_id = invalid_txn,
+            },
+        },
+        .operations = invalid_operations[0..],
+        .temporal_portion = .{
+            .period = "valid_time",
+            .from_json = "4",
+            .to_json = "5",
+        },
+    }));
+
+    const delete_txn = try db.beginTransaction(2_030);
+    const delete_predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "sku",
+        .op = .eq,
+        .value_json = "\"sku:b\"",
+    }};
+    var delete = try db.mutateRelationalRowsFromSource(alloc, runtime_schema, .{
+        .kind = .delete,
+        .source = .{
+            .predicates = delete_predicates[0..],
+            .row_claim = .{
+                .mode = .for_update,
+                .owner_id = "session:temporal-delete",
+                .txn_id = delete_txn,
+            },
+        },
+        .temporal_portion = .{
+            .period = "valid_time",
+            .from_json = "2",
+            .to_json = "8",
+        },
+        .returning_all = true,
+    });
+    defer delete.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), delete.matched);
+    try std.testing.expectEqual(@as(u32, 1), delete.staged);
+    try std.testing.expectEqual(@as(usize, 1), delete.returning_rows.len);
+    try expectRelationalTemporalPriceRow(alloc, delete.returning_rows[0], "sku:b", 2, 8, 20);
+    try db.commitTransaction(delete_txn, 2_040);
+
+    var sku_b_rows = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = delete_predicates[0..],
+        .select_all = true,
+        .order_by = order_by[0..],
+    });
+    defer sku_b_rows.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), sku_b_rows.total);
+    try std.testing.expectEqual(@as(usize, 2), sku_b_rows.rows.len);
+    try expectRelationalTemporalPriceRow(alloc, sku_b_rows.rows[0], "sku:b", 0, 2, 20);
+    try expectRelationalTemporalPriceRow(alloc, sku_b_rows.rows[1], "sku:b", 8, 10, 20);
+}
+
+test "db relational temporal mutation source preserves foreign key coverage" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"sku":{"type":"keyword"},"parent_sku":{"type":"keyword"},"valid_from":{"type":"numeric"},"valid_to":{"type":"numeric"},"price":{"type":"numeric"}},"required":["sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["sku"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"price_parent_period_fkey","columns":["parent_sku"],"period":"valid_time","references":{"table":"row","columns":["sku"],"period":"valid_time"},"validation_state":"enforced"}]}
+    ;
+    var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "price:parent:v1", .value = "{\"sku\":\"parent\",\"valid_from\":0,\"valid_to\":10,\"price\":10}" },
+            .{ .key = "price:child:v1", .value = "{\"sku\":\"child\",\"parent_sku\":\"parent\",\"valid_from\":0,\"valid_to\":10,\"price\":20}" },
+        },
+        .timestamp_ns = 1_000,
+    });
+
+    const update_txn = try db.beginTransaction(2_000);
+    const child_predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "sku",
+        .op = .eq,
+        .value_json = "\"child\"",
+    }};
+    const update_operations = [_]types.TransformOp{.{
+        .op = .set,
+        .path = "price",
+        .value_json = "25",
+    }};
+    var update = try db.mutateRelationalRowsFromSource(alloc, runtime_schema, .{
+        .kind = .update,
+        .source = .{
+            .predicates = child_predicates[0..],
+            .row_claim = .{
+                .mode = .for_update,
+                .owner_id = "session:temporal-fk-update",
+                .txn_id = update_txn,
+            },
+        },
+        .operations = update_operations[0..],
+        .temporal_portion = .{
+            .period = "valid_time",
+            .from_json = "3",
+            .to_json = "7",
+        },
+        .returning_all = true,
+    });
+    defer update.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), update.matched);
+    try std.testing.expectEqual(@as(u32, 1), update.staged);
+    try std.testing.expectEqual(@as(usize, 1), update.returning_rows.len);
+    try expectRelationalTemporalPriceRow(alloc, update.returning_rows[0], "child", 3, 7, 25);
+    try db.commitTransaction(update_txn, 2_010);
+
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "valid_from",
+        .direction = .asc,
+    }};
+    var child_rows = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = child_predicates[0..],
+        .select_all = true,
+        .order_by = order_by[0..],
+    });
+    defer child_rows.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), child_rows.total);
+    try std.testing.expectEqual(@as(usize, 3), child_rows.rows.len);
+    try expectRelationalTemporalPriceRow(alloc, child_rows.rows[0], "child", 0, 3, 20);
+    try expectRelationalTemporalPriceRow(alloc, child_rows.rows[1], "child", 3, 7, 25);
+    try expectRelationalTemporalPriceRow(alloc, child_rows.rows[2], "child", 7, 10, 20);
+
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .deletes = &.{"price:parent:v1"},
+        .timestamp_ns = 3_000,
+    }));
+}
+
+test "db relational temporal workload combines portion splits foreign key repair and owner validation" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"sku":{"type":"keyword"},"parent_sku":{"type":"keyword"},"valid_from":{"type":"numeric"},"valid_to":{"type":"numeric"},"price":{"type":"numeric"}},"required":["sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["sku"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"price_parent_period_fkey","columns":["parent_sku"],"period":"valid_time","references":{"table":"row","columns":["sku"],"period":"valid_time"},"validation_state":"enforced"}]}
+    ;
+    var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "price:parent:v1", .value = "{\"sku\":\"parent\",\"valid_from\":0,\"valid_to\":5,\"price\":10}" },
+            .{ .key = "price:parent:v2", .value = "{\"sku\":\"parent\",\"valid_from\":5,\"valid_to\":10,\"price\":12}" },
+            .{ .key = "price:child:v1", .value = "{\"sku\":\"child\",\"parent_sku\":\"parent\",\"valid_from\":0,\"valid_to\":10,\"price\":20}" },
+        },
+        .timestamp_ns = 1_000,
+    });
+
+    const update_txn = try db.beginTransaction(2_000);
+    const child_predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "sku",
+        .op = .eq,
+        .value_json = "\"child\"",
+    }};
+    const update_operations = [_]types.TransformOp{.{
+        .op = .set,
+        .path = "price",
+        .value_json = "25",
+    }};
+    var update = try db.mutateRelationalRowsFromSource(alloc, runtime_schema, .{
+        .kind = .update,
+        .source = .{
+            .predicates = child_predicates[0..],
+            .row_claim = .{
+                .mode = .for_update,
+                .owner_id = "session:temporal-combined",
+                .txn_id = update_txn,
+            },
+        },
+        .operations = update_operations[0..],
+        .temporal_portion = .{
+            .period = "valid_time",
+            .from_json = "3",
+            .to_json = "7",
+        },
+        .returning_all = true,
+    });
+    defer update.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), update.matched);
+    try std.testing.expectEqual(@as(u32, 1), update.staged);
+    try expectRelationalTemporalPriceRow(alloc, update.returning_rows[0], "child", 3, 7, 25);
+    try db.commitTransaction(update_txn, 2_010);
+
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "valid_from",
+        .direction = .asc,
+    }};
+    var child_rows = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = child_predicates[0..],
+        .select_all = true,
+        .order_by = order_by[0..],
+    });
+    defer child_rows.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), child_rows.total);
+    try expectRelationalTemporalPriceRow(alloc, child_rows.rows[0], "child", 0, 3, 20);
+    try expectRelationalTemporalPriceRow(alloc, child_rows.rows[1], "child", 3, 7, 25);
+    try expectRelationalTemporalPriceRow(alloc, child_rows.rows[2], "child", 7, 10, 20);
+
+    const clean_fk_report = try db.validateForeignKeyRefsInRangeForConstraint("price_parent_period_fkey", "", "");
+    try std.testing.expect(clean_fk_report.valid());
+    const clean_unique_report = try db.validateUniqueConstraintRowsInRange("", "");
+    try std.testing.expect(clean_unique_report.valid());
+
+    const middle_child_row = try mapper.buildRelationalRowValueAlloc(
+        alloc,
+        "{\"sku\":\"child\",\"parent_sku\":\"parent\",\"valid_from\":3,\"valid_to\":7,\"price\":25}",
+        runtime_schema.relational_columns,
+    );
+    defer alloc.free(middle_child_row);
+    const parent_key = (try relational_store_mod.foreignKeyReferenceValueAlloc(alloc, middle_child_row, runtime_schema.foreign_keys[0])) orelse return error.TestExpectedEqual;
+    defer alloc.free(parent_key);
+    const fk_ref_lower = [_]u8{internal_keys.relational_foreign_key_ref_namespace};
+    const fk_ref_upper = [_]u8{internal_keys.relational_foreign_key_ref_namespace + 1};
+    const fk_refs = try db.core.store.scanRange(alloc, fk_ref_lower[0..], fk_ref_upper[0..]);
+    defer docstore_mod.DocStore.freeResults(alloc, fk_refs);
+    var ref_key: ?[]u8 = null;
+    defer if (ref_key) |key| alloc.free(key);
+    for (fk_refs) |entry| {
+        var decoded = (try internal_keys.decodeRelationalForeignKeyRefKeyAlloc(alloc, entry.key)) orelse continue;
+        defer decoded.deinit(alloc);
+        if (!std.mem.eql(u8, decoded.constraint_name, "price_parent_period_fkey")) continue;
+        if (!std.mem.eql(u8, decoded.parent_table, "row")) continue;
+        if (!std.mem.eql(u8, decoded.parent_key, parent_key)) continue;
+        if (!std.mem.eql(u8, decoded.child_table, "row")) continue;
+        ref_key = try alloc.dupe(u8, entry.key);
+        break;
+    }
+    const current_ref_key = ref_key orelse return error.TestExpectedEqual;
+    try db.core.store.delete(current_ref_key);
+
+    const missing_ref_report = try db.validateForeignKeyRefsInRangeForConstraint("price_parent_period_fkey", "", "");
+    try std.testing.expect(!missing_ref_report.valid());
+    try std.testing.expectEqual(@as(u64, 1), missing_ref_report.missing_ref_rows);
+
+    const repaired_ref_report = try db.repairForeignKeyRefsInRangeForConstraint("price_parent_period_fkey", "", "");
+    try std.testing.expect(!repaired_ref_report.valid());
+    try std.testing.expectEqual(@as(u64, 1), repaired_ref_report.repaired_ref_rows);
+    const repaired_validate_report = try db.validateForeignKeyRefsInRangeForConstraint("price_parent_period_fkey", "", "");
+    try std.testing.expect(repaired_validate_report.valid());
+
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .deletes = &.{"price:parent:v1"},
+        .timestamp_ns = 3_000,
+    }));
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .writes = &.{.{ .key = "price:parent:v1", .value = "{\"sku\":\"parent\",\"valid_from\":0,\"valid_to\":4,\"price\":10}" }},
+        .timestamp_ns = 3_100,
+    }));
 }

@@ -5119,3 +5119,394 @@ pub fn Impl(comptime DB: type) type {
         }
     };
 }
+
+test "db derived async replay batch persists per-index applied sequence watermark" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" },
+        },
+        .sync_level = .full_index,
+    });
+    const applied = try db.core.loadAppliedSequence(alloc, "ft_v1");
+    try std.testing.expect(applied > 0);
+}
+
+test "db derived async replay batch truncates replay logs after managed indexes catch up" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" },
+        },
+    });
+
+    _ = try db_test_support.waitForAppliedSequenceAdvance(alloc, &db, "ft_v1", 0);
+
+    var remaining_journal_entries: usize = std.math.maxInt(usize);
+    var attempts: usize = 0;
+    while (attempts < db_test_support.default_test_wait_attempts) : (attempts += 1) {
+        const journal_entries = try db.core.store.iterateReplayFrom(alloc, 1);
+        defer {
+            for (journal_entries) |*entry| entry.deinit(alloc);
+            alloc.free(journal_entries);
+        }
+        remaining_journal_entries = journal_entries.len;
+        if (remaining_journal_entries == 0) break;
+        platform.time.sleepNs(10 * std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(usize, 0), remaining_journal_entries);
+}
+
+test "db derived async replay io_threaded executor processes indexed writes" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .executor = .{ .backend = .io_threaded },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"machine\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var result = try db_test_support.waitForSearchResult(alloc, &db, .{
+        .index_name = "ft_v1",
+        .query = .{ .match_all = {} },
+    }, 1);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "db derived async replay reopen replays pending derived embeddings from durable log" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var appended_sequence: u64 = 0;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+        });
+
+        const req = types.BatchRequest{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dv_v1\":[1,0]}}" },
+            },
+        };
+
+        var extracted = try mapper.extractWrite(alloc, req.writes[0].key, req.writes[0].value);
+        defer extracted.deinit(alloc);
+
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, req.writes[0].key);
+        defer alloc.free(stored_key);
+        try db.core.store.putBatch(&.{
+            .{ .key = stored_key, .value = extracted.cleaned_value.? },
+        }, &.{});
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
+        defer alloc.free(artifact_key);
+        try db_test_support.putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
+        extracted.dense_embeddings[0].artifact_key = try alloc.dupe(u8, artifact_key);
+
+        var derived_batch = try @import("write_path.zig").buildDerivedBatch(alloc, req, &.{extracted}, &.{}, &.{});
+        defer derived_types.deinitDerivedBatch(alloc, &derived_batch);
+
+        appended_sequence = try db.derivedAsyncAppendDerivedBatchRecord(derived_batch);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+
+    var result = try reopened.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{
+            .vector = &[_]f32{ 1, 0 },
+            .k = 1,
+        },
+        .limit = 1,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+
+    const applied = try reopened.core.loadAppliedSequence(alloc, "dv_v1");
+    try std.testing.expectEqual(appended_sequence, applied);
+}
+
+test "db derived async replay reopen replays pending derived embeddings with durable lsm primary backend" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var appended_sequence: u64 = 0;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+        });
+
+        const req = types.BatchRequest{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dv_v1\":[1,0]}}" },
+            },
+        };
+
+        var extracted = try mapper.extractWrite(alloc, req.writes[0].key, req.writes[0].value);
+        defer extracted.deinit(alloc);
+
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, req.writes[0].key);
+        defer alloc.free(stored_key);
+        try db.core.store.putBatch(&.{
+            .{ .key = stored_key, .value = extracted.cleaned_value.? },
+        }, &.{});
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
+        defer alloc.free(artifact_key);
+        try db_test_support.putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
+        extracted.dense_embeddings[0].artifact_key = try alloc.dupe(u8, artifact_key);
+
+        var derived_batch = try @import("write_path.zig").buildDerivedBatch(alloc, req, &.{extracted}, &.{}, &.{});
+        defer derived_types.deinitDerivedBatch(alloc, &derived_batch);
+
+        appended_sequence = try db.derivedAsyncAppendDerivedBatchRecord(derived_batch);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+    });
+    defer reopened.close();
+
+    var result = try reopened.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{
+            .vector = &[_]f32{ 1, 0 },
+            .k = 1,
+        },
+        .limit = 1,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+
+    const applied = try reopened.core.loadAppliedSequence(alloc, "dv_v1");
+    try std.testing.expectEqual(appended_sequence, applied);
+}
+
+test "db derived async replay replay respects per-index applied watermarks" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var appended_sequence: u64 = 0;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+        });
+        try db.addIndex(.{
+            .name = "gr_v1",
+            .kind = .graph,
+            .config_json = "{\"edge_types\":[{\"name\":\"related\"}]}",
+        });
+
+        const req = types.BatchRequest{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dv_v1\":[1,0]}}" },
+            },
+        };
+
+        var extracted = try mapper.extractWrite(alloc, req.writes[0].key, req.writes[0].value);
+        defer extracted.deinit(alloc);
+
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, req.writes[0].key);
+        defer alloc.free(stored_key);
+        try db.core.store.putBatch(&.{
+            .{ .key = stored_key, .value = extracted.cleaned_value.? },
+        }, &.{});
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
+        defer alloc.free(artifact_key);
+        try db_test_support.putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
+        extracted.dense_embeddings[0].artifact_key = try alloc.dupe(u8, artifact_key);
+
+        var derived_batch = try @import("write_path.zig").buildDerivedBatch(alloc, req, &.{extracted}, &.{}, &.{});
+        defer derived_types.deinitDerivedBatch(alloc, &derived_batch);
+
+        appended_sequence = try db.derivedAsyncAppendDerivedBatchRecord(derived_batch);
+
+        try db.core.saveAppliedSequence("dv_v1", appended_sequence);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer reopened.close();
+
+    var result = try reopened.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{
+            .vector = &[_]f32{ 1, 0 },
+            .k = 1,
+        },
+        .limit = 1,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), result.total_hits);
+
+    const dense_applied = try reopened.core.loadAppliedSequence(alloc, "dv_v1");
+    try std.testing.expectEqual(appended_sequence, dense_applied);
+
+    const graph_applied = try reopened.core.loadAppliedSequence(alloc, "gr_v1");
+    try std.testing.expectEqual(@as(u64, 0), graph_applied);
+}
+
+test "db derived async replay replay applies dense embeddings from artifact payloads" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+        });
+
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+        defer alloc.free(stored_key);
+        try db.core.store.put(stored_key, "{\"title\":\"alpha\"}");
+
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
+        defer alloc.free(artifact_key);
+        try db_test_support.putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 0, 1 });
+
+        const derived_batch = derived_types.DerivedBatch{
+            .dense_embeddings = &.{
+                .{
+                    .index_name = "dv_v1",
+                    .doc_key = "doc:a",
+                    .artifact_key = artifact_key,
+                    .vector = &[_]f32{ 1, 0 },
+                },
+            },
+        };
+
+        _ = try db.derivedAsyncAppendDerivedBatchRecord(derived_batch);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+
+    var result = try reopened.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{
+            .vector = &[_]f32{ 0, 1 },
+            .k = 1,
+        },
+        .limit = 1,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}

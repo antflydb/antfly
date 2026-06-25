@@ -245,6 +245,10 @@ const autoBulkIngestGroupBatchOps = table_write_bulk_ingest.autoBulkIngestGroupB
 
 const moveDroppedGroupPathToTrash = table_write_backup_restore.moveDroppedGroupPathToTrash;
 const deleteGroupPathIfPresent = table_write_backup_restore.deleteGroupPathIfPresent;
+const prepareLocalTablePathForRestore = table_write_backup_restore.prepareLocalTablePathForRestore;
+const exportPortableBackupShard = table_write_backup_restore.exportPortableBackupShard;
+const readBackupFileAlloc = table_write_backup_restore.readBackupFileAlloc;
+const freeBackupShards = table_write_backup_restore.freeBackupShards;
 
 pub const mutateRowsJoinedFromRecursiveCtePlanAlloc = table_write_relational_mutation.mutateRowsJoinedFromRecursiveCtePlanAlloc;
 pub const mutateRowsJoinedFromRecursiveCtePlanWithSessionAlloc = table_write_relational_mutation.mutateRowsJoinedFromRecursiveCtePlanWithSessionAlloc;
@@ -13886,22 +13890,6 @@ fn catchUpManagedDb(
     };
 }
 
-fn prepareLocalTablePathForRestore(alloc: std.mem.Allocator, path: []const u8) !void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
-
-    try fs_paths.createDirPathPortable(io, path);
-
-    const indexes_path = try std.fmt.allocPrint(alloc, "{s}/indexes", .{path});
-    defer alloc.free(indexes_path);
-    std.Io.Dir.cwd().deleteTree(io, indexes_path) catch {};
-
-    const snapshots_path = try std.fmt.allocPrint(alloc, "{s}.snapshots", .{path});
-    defer alloc.free(snapshots_path);
-    std.Io.Dir.cwd().deleteTree(io, snapshots_path) catch {};
-}
-
 fn sleepNs(duration_ns: u64) void {
     var req = std.posix.timespec{
         .sec = @intCast(duration_ns / std.time.ns_per_s),
@@ -14109,73 +14097,6 @@ const SchemaValidationWriteState = struct {
         return out;
     }
 };
-
-fn portableBackupShardRelPath(alloc: std.mem.Allocator, backup_id: []const u8) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{s}.afb", .{backup_id});
-}
-
-fn exportPortableBackupShard(
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    backup_root: []const u8,
-    backup_id: []const u8,
-    group_id: u64,
-) ![]backups_api.ShardSnapshot {
-    const rel_path = try portableBackupShardRelPath(alloc, backup_id);
-    errdefer alloc.free(rel_path);
-
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(alloc);
-    try portable_backup.exportPortable(alloc, db.core.store, &out);
-
-    const dest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, rel_path });
-    defer alloc.free(dest_path);
-    try writeBackupFile(dest_path, out.items);
-
-    const byte_range = db.getRange();
-    const shards = try alloc.alloc(backups_api.ShardSnapshot, 1);
-    shards[0] = .{
-        .group_id = group_id,
-        .start_key = try alloc.dupe(u8, byte_range.start),
-        .end_key = if (byte_range.end.len > 0) try alloc.dupe(u8, byte_range.end) else null,
-        .snapshot_path = rel_path,
-    };
-    return shards;
-}
-
-fn writeBackupFile(path: []const u8, body: []const u8) !void {
-    if (std.fs.path.dirname(path)) |parent| {
-        var io_parent = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_parent.deinit();
-        try fs_paths.createDirPathPortable(io_parent.io(), parent);
-    }
-
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
-    var file = try fs_paths.createFilePortable(io, path, .{ .truncate = true });
-    defer file.close(io);
-    var buf: [8192]u8 = undefined;
-    var writer = file.writer(io, &buf);
-    try writer.interface.writeAll(body);
-    try writer.end();
-}
-
-fn readBackupFileAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    defer io_impl.deinit();
-    return try std.Io.Dir.cwd().readFileAlloc(
-        io_impl.io(),
-        path,
-        alloc,
-        .limited(backups_api.max_portable_backup_file_bytes),
-    );
-}
-
-fn freeBackupShards(alloc: std.mem.Allocator, shards: []const backups_api.ShardSnapshot) void {
-    for (shards) |shard| shard.deinit(alloc);
-    alloc.free(@constCast(shards));
-}
 
 fn resolveWritesForSchemaValidation(
     alloc: std.mem.Allocator,

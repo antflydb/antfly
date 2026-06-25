@@ -298,6 +298,30 @@ fn generatedProjectionClauseEnd(
     return error.UnsupportedSqlShape;
 }
 
+fn generatedSourceClauseEnd(
+    tokens: []const Token,
+    pos: usize,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !?usize {
+    const read = generated_read_ast orelse return null;
+    if (read.source_tokens) |range| {
+        if (range.start == pos) {
+            if (range.end > tokens.len) return error.UnsupportedSqlShape;
+            return range.end;
+        }
+    }
+    if (read.kind == .set_operation) {
+        if (read.set_operation.right_source_tokens) |right_range| {
+            if (right_range.start == pos) {
+                if (right_range.end > tokens.len) return error.UnsupportedSqlShape;
+                return right_range.end;
+            }
+        }
+        return null;
+    }
+    return error.UnsupportedSqlShape;
+}
+
 fn generatedGroupClauseEnd(
     tokens: []const Token,
     keyword_index: usize,
@@ -15928,6 +15952,7 @@ pub fn parseSelectAlloc(
     }
 
     try parser.expectKeyword(tokens, pos, "from");
+    const generated_source_end = try generatedSourceClauseEnd(tokens, pos.*, options.generated_read_ast);
     const table_ref = if (direct_graph_source) |source| table_ref: {
         if (pos.* != source.function_start) return error.UnsupportedSqlShape;
         pos.* = source.source_end;
@@ -15940,6 +15965,9 @@ pub fn parseSelectAlloc(
     } else {
         inferred_qualifiers = .{ table_ref.name, table_ref.alias };
         current_context.field_expression_qualifiers = inferred_qualifiers[0..];
+    }
+    if (generated_source_end) |end| {
+        if (pos.* != end) return error.UnsupportedSqlShape;
     }
     const source_is_cte = direct_graph_source != null or plan_mod.findCteByName(options.available_ctes, table_ref.name) != null;
     if (source_is_cte) current_context.defer_row_expression_field_validation = true;
@@ -16276,6 +16304,7 @@ pub fn parseAggregateAlloc(
     } else if (select.aggregations.len == 0) return error.UnsupportedSqlShape;
 
     try parser.expectKeyword(tokens, pos, "from");
+    const generated_source_end = try generatedSourceClauseEnd(tokens, pos.*, options.generated_read_ast);
     const table_ref = if (direct_graph_source) |source| table_ref: {
         if (pos.* != source.function_start) return error.UnsupportedSqlShape;
         pos.* = source.source_end;
@@ -16288,6 +16317,9 @@ pub fn parseAggregateAlloc(
     } else {
         inferred_qualifiers = .{ table_ref.name, table_ref.alias };
         current_context.field_expression_qualifiers = inferred_qualifiers[0..];
+    }
+    if (generated_source_end) |end| {
+        if (pos.* != end) return error.UnsupportedSqlShape;
     }
     const source_is_cte = direct_graph_source != null or plan_mod.findCteByName(options.available_ctes, table_ref.name) != null;
     if (source_is_cte) current_context.defer_row_expression_field_validation = true;
@@ -16727,6 +16759,7 @@ pub fn parseWindowSelectAlloc(
     if (select.windows.len == 0) return error.UnsupportedSqlShape;
 
     try parser.expectKeyword(tokens, pos, "from");
+    const generated_source_end = try generatedSourceClauseEnd(tokens, pos.*, options.generated_read_ast);
     const table_ref = if (direct_graph_source) |source| table_ref: {
         if (pos.* != source.function_start) return error.UnsupportedSqlShape;
         pos.* = source.source_end;
@@ -16739,6 +16772,9 @@ pub fn parseWindowSelectAlloc(
     } else {
         inferred_qualifiers = .{ table_ref.name, table_ref.alias };
         current_context.field_expression_qualifiers = inferred_qualifiers[0..];
+    }
+    if (generated_source_end) |end| {
+        if (pos.* != end) return error.UnsupportedSqlShape;
     }
     const source_is_cte = direct_graph_source != null or plan_mod.findCteByName(options.available_ctes, table_ref.name) != null;
     if (source_is_cte) current_context.defer_row_expression_field_validation = true;
@@ -29283,6 +29319,22 @@ fn corruptGeneratedReadFirstProjectionExpressionItem(parsed_sql: *tokenized.Pars
     return error.TestUnexpectedResult;
 }
 
+fn corruptGeneratedReadSourceRange(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |*read| {
+                    if (read.source_tokens == null or read.projection_items.items.len == 0) return error.TestUnexpectedResult;
+                    read.source_tokens = read.projection_items.items[0];
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 test "sql adapter lower expr lowers grouped aggregate queries with generated group validation" {
     const alloc = std.testing.allocator;
     const schema_json =
@@ -29323,6 +29375,19 @@ test "sql adapter lower expr lowers grouped aggregate queries with generated gro
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
         alloc,
         &malformed_projection,
+        schema,
+        &.{},
+    ));
+
+    var malformed_source = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT status, SUM(amount) AS total FROM usage_records GROUP BY status ORDER BY total DESC LIMIT 5",
+    );
+    defer malformed_source.deinit(alloc);
+    try corruptGeneratedReadSourceRange(&malformed_source);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
+        alloc,
+        &malformed_source,
         schema,
         &.{},
     ));

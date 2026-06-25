@@ -85,6 +85,7 @@ const table_read_relational_rows = @import("table_reads/relational_rows.zig");
 const table_read_external_lake = @import("table_reads/external_lake.zig");
 const table_read_remote_wire = @import("table_reads/remote_wire.zig");
 const table_read_fanout = @import("table_reads/fanout.zig");
+const table_read_graph = @import("table_reads/graph.zig");
 
 fn nativeCatalogTableNameAlloc(
     alloc: std.mem.Allocator,
@@ -108,6 +109,10 @@ const encodeScanRequest = table_read_remote_wire.encodeScanRequest;
 const encodeQueryRequest = table_read_remote_wire.encodeQueryRequest;
 const parseRemoteSearchResult = table_read_remote_wire.parseRemoteSearchResult;
 const parseRemoteSearchResultForHostedQuery = table_read_remote_wire.parseRemoteSearchResultForHostedQuery;
+const GraphMetricFanInShardRequest = table_read_graph.GraphMetricFanInShardRequest;
+const prepareGraphMetricFanInShardRequest = table_read_graph.prepareGraphMetricFanInShardRequest;
+const validateGraphHydrateResolvedDocFilterForDb = table_read_graph.validateGraphHydrateResolvedDocFilterForDb;
+const graphHydrateResolvedDocFilterAllows = table_read_graph.graphHydrateResolvedDocFilterAllows;
 const appendJsonFieldName = table_read_remote_wire.appendJsonFieldName;
 const appendJsonFieldString = table_read_remote_wire.appendJsonFieldString;
 const appendJsonFieldU32 = table_read_remote_wire.appendJsonFieldU32;
@@ -6523,127 +6528,6 @@ fn docIdentityInternalWorkerPolicy(boundary: DocIdentityInternalWorkerBoundary) 
         .graph_result_ref,
         => .validates_generation_projection,
     };
-}
-
-fn graphHydrateRequestHasResolvedDocFilter(req: distributed_graph.GraphHydrateRequest) bool {
-    return req.resolved_doc_filter != null;
-}
-
-fn validateGraphHydrateResolvedDocFilterForDb(req: distributed_graph.GraphHydrateRequest, db: *db_mod.DB) !void {
-    if (!graphHydrateRequestHasResolvedDocFilter(req)) return;
-    const ctx = req.resolved_doc_filter_wire_context orelse return error.UnsupportedQueryRequest;
-    if (!ctx.namespace.eql(db.core.identity_namespace)) return error.DocIdentityNamespaceMismatch;
-    const generation = try db.currentIdentityReadGenerationForRequest(req.identity_read_generation);
-    if (generation != ctx.identity_read_generation) return error.UnsupportedQueryRequest;
-}
-
-fn graphHydrateResolvedDocFilterAllows(req: distributed_graph.GraphHydrateRequest, key: []const u8, ordinal: ?doc_set.DocOrdinal) bool {
-    const ptr = req.resolved_doc_filter orelse return true;
-    const filter: *const doc_set.ResolvedDocFilter = @ptrCast(@alignCast(ptr));
-    return graphHydrateResolvedDocSetIncludes(&filter.include, key, ordinal) and
-        !graphHydrateResolvedDocSetIncludes(&filter.exclude, key, ordinal);
-}
-
-fn graphHydrateResolvedDocSetIncludes(set: *const doc_set.ResolvedDocSet, key: []const u8, ordinal: ?doc_set.DocOrdinal) bool {
-    return switch (set.*) {
-        .all => true,
-        .none => false,
-        .doc_keys => |keys| blk: {
-            for (keys) |candidate| {
-                if (std.mem.eql(u8, candidate, key)) break :blk true;
-            }
-            break :blk false;
-        },
-        .ordinals, .ordinal_bitmap => if (ordinal) |value| set.containsOrdinal(value) else false,
-    };
-}
-
-const GraphMetricFanInShardRequest = struct {
-    req: db_mod.types.SearchRequest,
-    graph_queries: []db_mod.types.NamedGraphQuery = &.{},
-
-    fn deinit(self: *GraphMetricFanInShardRequest, alloc: std.mem.Allocator) void {
-        if (self.graph_queries.len > 0) alloc.free(self.graph_queries);
-        self.* = undefined;
-    }
-};
-
-fn graphSearchQueryNeedsInternalMetricStatus(query: graph_query_mod.GraphQuery) bool {
-    return query.metrics.len > 0 or query.order_by.len > 0 or query.where_metric.len > 0;
-}
-
-fn searchRequestNeedsInternalGraphMetricStatus(req: db_mod.types.SearchRequest) bool {
-    for (req.graph_queries) |query| {
-        if (!query.query.include_metric_status and graphSearchQueryNeedsInternalMetricStatus(query.query)) return true;
-    }
-    return false;
-}
-
-fn prepareGraphMetricFanInShardRequest(
-    alloc: std.mem.Allocator,
-    req: db_mod.types.SearchRequest,
-) !GraphMetricFanInShardRequest {
-    if (!searchRequestNeedsInternalGraphMetricStatus(req)) {
-        return .{ .req = req };
-    }
-
-    const graph_queries = try alloc.alloc(db_mod.types.NamedGraphQuery, req.graph_queries.len);
-    @memcpy(graph_queries, req.graph_queries);
-    for (graph_queries) |*query| {
-        if (graphSearchQueryNeedsInternalMetricStatus(query.query)) {
-            query.query.include_metric_status = true;
-        }
-    }
-
-    var out = req;
-    out.graph_queries = graph_queries;
-    return .{
-        .req = out,
-        .graph_queries = graph_queries,
-    };
-}
-
-test "graph metric fan-in shard request carries internal status without mutating public request" {
-    const alloc = std.testing.allocator;
-    const graph_queries = [_]db_mod.types.NamedGraphQuery{
-        .{
-            .name = "ranked",
-            .query = .{
-                .query_type = .neighbors,
-                .index_name = "graph_idx",
-                .start_nodes = .{ .keys = &.{"doc:a"} },
-                .order_by = &.{.{
-                    .name = "pagerank",
-                    .direction = .desc,
-                    .freshness = .published,
-                }},
-                .include_metric_status = false,
-            },
-        },
-        .{
-            .name = "plain",
-            .query = .{
-                .query_type = .neighbors,
-                .index_name = "graph_idx",
-                .start_nodes = .{ .keys = &.{"doc:a"} },
-                .include_metric_status = false,
-            },
-        },
-    };
-    const req = db_mod.types.SearchRequest{
-        .query = .{ .match_all = {} },
-        .graph_queries = &graph_queries,
-    };
-
-    var shard_req = try prepareGraphMetricFanInShardRequest(alloc, req);
-    defer shard_req.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 2), shard_req.req.graph_queries.len);
-    try std.testing.expect(shard_req.req.graph_queries.ptr != req.graph_queries.ptr);
-    try std.testing.expect(shard_req.req.graph_queries[0].query.include_metric_status);
-    try std.testing.expect(!shard_req.req.graph_queries[1].query.include_metric_status);
-    try std.testing.expect(!req.graph_queries[0].query.include_metric_status);
-    try std.testing.expect(!req.graph_queries[1].query.include_metric_status);
 }
 
 fn queryProvisionedAcrossGroups(

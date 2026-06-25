@@ -20,6 +20,8 @@ const aggregations_mod = @import("aggregations.zig");
 const algebraic_mod = @import("algebraic/mod.zig");
 const artifact_ids = @import("artifact_ids.zig");
 const db_internal = @import("internal.zig");
+const db_config = @import("config.zig");
+const derived_types = @import("derived/derived_types.zig");
 const doc_identity = @import("doc_identity.zig");
 const doc_set = @import("doc_set.zig");
 const docstore_mod = @import("../docstore.zig");
@@ -250,6 +252,715 @@ test "resolved doc set from search hits uses complete hit ordinals" {
         .{ .id = @constCast("doc:b") },
     };
     try std.testing.expect((try resolvedDocSetFromSearchHitOrdinalsAlloc(alloc, &mixed)) == null);
+}
+
+test "relational table full-text search loads stored_data from base rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    // Relational schema: returned documents and structured filters should read
+    // the relational base row, not duplicated segment typed_doc_values.
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"datetime"},"active":{"type":"boolean"},"location":{"type":"geopoint"},"attrs":{"type":"json"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "row:a",
+            .value =
+            \\{"title":"hello world","status":"open","amount":42.5,"created_at":100,"active":true,"location":{"lat":0,"lon":0},"attrs":{"version":"old"}}
+            ,
+        }},
+        .sync_level = .full_index,
+    });
+
+    const text_entry = db.core.textIndexEntry("ft_v1") orelse return error.TestExpectedEqual;
+    const snapshot = text_entry.persistent.snapshot();
+    try std.testing.expect(snapshot.segments.len > 0);
+    for (snapshot.segments) |*segment| {
+        try std.testing.expect(segment.reader.getSection("status", .typed_doc_values) == null);
+        try std.testing.expect(segment.reader.getSection("amount", .typed_doc_values) == null);
+        try std.testing.expect(segment.reader.getSection("created_at", .typed_doc_values) == null);
+        try std.testing.expect(segment.reader.getSection("active", .typed_doc_values) == null);
+        try std.testing.expect(segment.reader.getSection("location", .typed_doc_values) == null);
+        try std.testing.expect(segment.reader.getSection("attrs", .typed_doc_values) == null);
+    }
+
+    const replacement_json =
+        \\{"title":"base row wins","status":"closed","amount":77.25,"created_at":200,"active":false,"location":{"lat":37.78,"lon":-122.42},"attrs":{"version":"new","nested":{"ok":true}}}
+    ;
+    const replacement_row = try mapper.buildRelationalRowValueAlloc(alloc, replacement_json, runtime_schema.relational_columns);
+    defer alloc.free(replacement_row);
+    var replacement_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (replacement_writes.items) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        replacement_writes.deinit(alloc);
+    }
+    var replacement_deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (replacement_deletes.items) |key| alloc.free(@constCast(key));
+        replacement_deletes.deinit(alloc);
+    }
+    const replacement_row_copy = try alloc.dupe(u8, replacement_row);
+    var replacement_row_copy_owned = true;
+    errdefer if (replacement_row_copy_owned) alloc.free(replacement_row_copy);
+    try relational_store_mod.appendUpsertOwnedBatch(
+        alloc,
+        db.core.store,
+        &replacement_writes,
+        &replacement_deletes,
+        "row:a",
+        replacement_row_copy,
+    );
+    replacement_row_copy_owned = false;
+    try db.core.store.putBatch(replacement_writes.items, replacement_deletes.items);
+
+    var result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "hello" } },
+        .include_stored = true,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expect(result.hits[0].stored_data != null);
+
+    // Search still matches the full-text segment, but stored_data comes from the
+    // relational base row. If this path reads segment typed_doc_values, these
+    // assertions see the original 42.5/true row instead.
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, result.hits[0].stored_data.?, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("base row wins", obj.get("title").?.string);
+    const amount = obj.get("amount").?;
+    const amount_num: f64 = switch (amount) {
+        .float => |f| f,
+        .integer => |n| @floatFromInt(n),
+        else => unreachable,
+    };
+    try std.testing.expectEqual(@as(f64, 77.25), amount_num);
+    try std.testing.expectEqualStrings("closed", obj.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 200), obj.get("created_at").?.integer);
+    try std.testing.expect(!obj.get("active").?.bool);
+    try std.testing.expectEqualStrings("new", obj.get("attrs").?.object.get("version").?.string);
+    try std.testing.expect(obj.get("attrs").?.object.get("nested").?.object.get("ok").?.bool);
+
+    const aggregation_requests = [_]aggregations_mod.SearchAggregationRequest{
+        .{ .name = "amount_sum", .type = "sum", .field = "amount" },
+        .{ .name = "by_status", .type = "terms", .field = "status", .size = 5 },
+    };
+    const aggregation_results = try aggregations_mod.computeSearchAggregations(alloc, aggregation_requests[0..], result, .{});
+    defer aggregations_mod.deinitResults(alloc, aggregation_results);
+    try std.testing.expectEqual(@as(usize, 2), aggregation_results.len);
+    try std.testing.expectEqualStrings("77.25", aggregation_results[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), aggregation_results[1].buckets.len);
+    try std.testing.expectEqualStrings("\"closed\"", aggregation_results[1].buckets[0].key_json);
+    try std.testing.expectEqual(@as(i64, 1), aggregation_results[1].buckets[0].count);
+
+    var filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "hello" } },
+        .filter_query_json = "{\"numeric_range\":{\"field\":\"amount\",\"min\":70.0}}",
+        .include_stored = true,
+        .limit = 10,
+    });
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", filtered.hits[0].id);
+
+    var top_level_filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .numeric_range = .{ .field = "amount", .min = 70.0 } },
+        .include_stored = true,
+        .limit = 10,
+    });
+    defer top_level_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), top_level_filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", top_level_filtered.hits[0].id);
+
+    var bool_filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "hello" } },
+        .filter_query_json = "{\"bool_field\":{\"field\":\"active\",\"value\":false}}",
+        .limit = 10,
+    });
+    defer bool_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), bool_filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", bool_filtered.hits[0].id);
+
+    var keyword_filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "hello" } },
+        .filter_query_json = "{\"term\":{\"field\":\"status\",\"term\":\"closed\"}}",
+        .limit = 10,
+    });
+    defer keyword_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), keyword_filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", keyword_filtered.hits[0].id);
+
+    var stale_keyword_filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "hello" } },
+        .filter_query_json = "{\"term\":{\"field\":\"status\",\"term\":\"open\"}}",
+        .limit = 10,
+    });
+    defer stale_keyword_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 0), stale_keyword_filtered.total_hits);
+
+    var term_range_filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "hello" } },
+        .filter_query_json = "{\"term_range\":{\"field\":\"status\",\"min\":\"cl\",\"max\":\"cm\"}}",
+        .limit = 10,
+    });
+    defer term_range_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), term_range_filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", term_range_filtered.hits[0].id);
+
+    var date_filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .date_range = .{ .field = "created_at", .start_ns = 150 } },
+        .include_stored = true,
+        .limit = 10,
+    });
+    defer date_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), date_filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", date_filtered.hits[0].id);
+
+    var geo_distance_filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "hello" } },
+        .filter_query_json = "{\"geo_distance\":{\"field\":\"location\",\"lat\":37.78,\"lon\":-122.42,\"radius_meters\":1000}}",
+        .limit = 10,
+    });
+    defer geo_distance_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), geo_distance_filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", geo_distance_filtered.hits[0].id);
+
+    var geo_bbox_filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "hello" } },
+        .filter_query_json = "{\"geo_bbox\":{\"field\":\"location\",\"min_lat\":37.0,\"min_lon\":-123.0,\"max_lat\":38.0,\"max_lon\":-122.0}}",
+        .limit = 10,
+    });
+    defer geo_bbox_filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), geo_bbox_filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", geo_bbox_filtered.hits[0].id);
+}
+
+test "relational column filter pushdown declines stale identity generations" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "row:a", .value = "{\"title\":\"alpha\",\"status\":\"active\"}" }},
+    });
+    const active_generation = db.core.nextDerivedSequence();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "row:a", .value = "{\"title\":\"alpha\",\"status\":\"archived\"}" }},
+    });
+    const current_generation = db.core.nextDerivedSequence();
+
+    const stale = try db.searchRuntimeResolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, .{
+        .term = .{ .field = "status", .term = "active" },
+    }, active_generation);
+    try std.testing.expect(stale == null);
+
+    var current = (try db.searchRuntimeResolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, .{
+        .term = .{ .field = "status", .term = "archived" },
+    }, current_generation)) orelse return error.TestExpectedEqual;
+    defer current.deinit(alloc);
+    const ids = (try db.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &current, current_generation)) orelse return error.TestExpectedEqual;
+    defer {
+        for (ids) |id| alloc.free(@constCast(id));
+        alloc.free(ids);
+    }
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    try std.testing.expectEqualStrings("row:a", ids[0]);
+}
+
+test "relational unindexed column filters fall back to base rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric","x-antfly-index":false}},"required":["title","amount"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"title\":\"alpha\",\"amount\":42.5}" },
+            .{ .key = "row:b", .value = "{\"title\":\"alpha\",\"amount\":7.0}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const amount_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "amount", "row:a");
+    defer alloc.free(amount_index_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, amount_index_key));
+
+    var filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "alpha" } },
+        .filter_query_json = "{\"numeric_range\":{\"field\":\"amount\",\"min\":40.0}}",
+        .limit = 10,
+    });
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", filtered.hits[0].id);
+}
+
+test "relational indexed array_any filters use array element indexes" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"title\":\"alpha\",\"tags\":[\"hot\",\"new\"]}" },
+            .{ .key = "row:b", .value = "{\"title\":\"alpha\",\"tags\":[\"cold\"]}" },
+            .{ .key = "row:c", .value = "{\"title\":\"alpha\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var parsed_hot = try std.json.parseFromSlice(std.json.Value, alloc, "\"hot\"", .{});
+    defer parsed_hot.deinit();
+    const hot_key = try relational_store_mod.arrayElementIndexKeyForValueAlloc(alloc, parsed_hot.value);
+    defer alloc.free(hot_key);
+    const hot_index_key = try internal_keys.relationalArrayElementIndexKeyAlloc(alloc, "tags", hot_key, "row:a");
+    defer alloc.free(hot_index_key);
+    const hot_index_value = try db.core.store.get(alloc, hot_index_key);
+    defer alloc.free(hot_index_value);
+    const indexed_hot_ids = try relational_store_mod.scanArrayElementDocKeysAlloc(alloc, db.core.store, "tags", hot_key, "", "");
+    defer relational_store_mod.freeDocKeys(alloc, indexed_hot_ids);
+    try std.testing.expectEqual(@as(usize, 1), indexed_hot_ids.len);
+    try std.testing.expectEqualStrings("row:a", indexed_hot_ids[0]);
+
+    var direct_resolved = (try db.searchRuntimeResolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, .{
+        .array_any = .{ .field = "tags", .value = parsed_hot.value },
+    }, null)) orelse return error.TestExpectedEqual;
+    defer direct_resolved.deinit(alloc);
+    const direct_ids = (try db.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &direct_resolved, null)) orelse return error.TestExpectedEqual;
+    defer {
+        for (direct_ids) |id| alloc.free(@constCast(id));
+        alloc.free(direct_ids);
+    }
+    try std.testing.expectEqual(@as(usize, 1), direct_ids.len);
+    try std.testing.expectEqualStrings("row:a", direct_ids[0]);
+
+    var unfiltered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "alpha" } },
+        .limit = 10,
+    });
+    defer unfiltered.deinit();
+    try std.testing.expectEqual(@as(u32, 3), unfiltered.total_hits);
+
+    var filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "alpha" } },
+        .filter_query_json = "{\"array_any\":{\"field\":\"tags\",\"value\":\"hot\"}}",
+        .limit = 10,
+    });
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", filtered.hits[0].id);
+
+    var missing = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "alpha" } },
+        .filter_query_json = "{\"array_any\":{\"field\":\"tags\",\"value\":\"missing\"}}",
+        .limit = 10,
+    });
+    defer missing.deinit();
+    try std.testing.expectEqual(@as(u32, 0), missing.total_hits);
+}
+
+test "relational indexed json_contains filters use json value indexes" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"attrs":{"type":"json"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"title\":\"alpha\",\"attrs\":{\"billing\":{\"plan\":\"pro\"},\"flags\":[\"active\",\"beta\"]}}" },
+            .{ .key = "row:b", .value = "{\"title\":\"alpha\",\"attrs\":{\"billing\":{\"plan\":\"free\"},\"flags\":[\"active\"]}}" },
+            .{ .key = "row:c", .value = "{\"title\":\"alpha\",\"attrs\":{\"billing\":{\"plan\":\"pro\"},\"flags\":[\"archived\"]}}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var parsed_pro = try std.json.parseFromSlice(std.json.Value, alloc, "\"pro\"", .{});
+    defer parsed_pro.deinit();
+    const pro_key = try relational_store_mod.jsonValueIndexKeyForValueAlloc(alloc, parsed_pro.value);
+    defer alloc.free(pro_key);
+    const pro_index_key = try internal_keys.relationalJsonValueIndexKeyAlloc(alloc, "attrs", "billing.plan", pro_key, "row:a");
+    defer alloc.free(pro_index_key);
+    const pro_index_value = try db.core.store.get(alloc, pro_index_key);
+    defer alloc.free(pro_index_value);
+
+    var wanted = try std.json.parseFromSlice(std.json.Value, alloc, "{\"billing\":{\"plan\":\"pro\"},\"flags\":[\"active\"]}", .{});
+    defer wanted.deinit();
+    const indexed_ids = try relational_store_mod.scanJsonContainmentDocKeysAlloc(alloc, db.core.store, "attrs", wanted.value, "", "");
+    defer relational_store_mod.freeDocKeys(alloc, indexed_ids);
+    try std.testing.expectEqual(@as(usize, 1), indexed_ids.len);
+    try std.testing.expectEqualStrings("row:a", indexed_ids[0]);
+
+    var direct_resolved = (try db.searchRuntimeResolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, .{
+        .json_contains = .{ .field = "attrs", .value = wanted.value },
+    }, null)) orelse return error.TestExpectedEqual;
+    defer direct_resolved.deinit(alloc);
+    const direct_ids = (try db.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &direct_resolved, null)) orelse return error.TestExpectedEqual;
+    defer {
+        for (direct_ids) |id| alloc.free(@constCast(id));
+        alloc.free(direct_ids);
+    }
+    try std.testing.expectEqual(@as(usize, 1), direct_ids.len);
+    try std.testing.expectEqualStrings("row:a", direct_ids[0]);
+
+    var filtered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "title", .text = "alpha" } },
+        .filter_query_json = "{\"json_contains\":{\"field\":\"attrs\",\"value\":{\"billing\":{\"plan\":\"pro\"},\"flags\":[\"active\"]}}}",
+        .limit = 10,
+    });
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(u32, 1), filtered.total_hits);
+    try std.testing.expectEqualStrings("row:a", filtered.hits[0].id);
+}
+
+test "relational embedded json search intersects with top-level relational filters" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"type":"keyword"},"attrs":{"type":"json","schema":{"type":"object","properties":{"title":{"type":"text"},"plan":{"type":"keyword"}},"additionalProperties":true}}},"required":["status"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_json",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "row:active",
+                .value = "{\"status\":\"active\",\"attrs\":{\"title\":\"nebula plan\",\"plan\":\"pro\",\"notes\":\"alpha note\"}}",
+            },
+            .{
+                .key = "row:archived",
+                .value = "{\"status\":\"archived\",\"attrs\":{\"title\":\"nebula archive\",\"plan\":\"free\",\"notes\":\"beta note\"}}",
+            },
+        },
+        .sync_level = .full_index,
+    });
+
+    var active = try db.search(alloc, .{
+        .index_name = "ft_json",
+        .query = .{ .match = .{ .field = "attrs.title", .text = "nebula" } },
+        .filter_query_json = "{\"term\":{\"field\":\"status\",\"term\":\"active\"}}",
+        .include_stored = true,
+        .limit = 10,
+    });
+    defer active.deinit();
+    try std.testing.expectEqual(@as(u32, 1), active.total_hits);
+    try std.testing.expectEqualStrings("row:active", active.hits[0].id);
+    try std.testing.expect(active.hits[0].stored_data != null);
+    try std.testing.expect(std.mem.indexOf(u8, active.hits[0].stored_data.?, "\"attrs\":{\"title\":\"nebula plan\"") != null);
+
+    var archived = try db.search(alloc, .{
+        .index_name = "ft_json",
+        .query = .{ .term = .{ .field = "attrs.plan", .term = "free" } },
+        .filter_query_json = "{\"term\":{\"field\":\"status\",\"term\":\"archived\"}}",
+        .include_stored = true,
+        .limit = 10,
+    });
+    defer archived.deinit();
+    try std.testing.expectEqual(@as(u32, 1), archived.total_hits);
+    try std.testing.expectEqualStrings("row:archived", archived.hits[0].id);
+
+    var mismatched = try db.search(alloc, .{
+        .index_name = "ft_json",
+        .query = .{ .term = .{ .field = "attrs.plan", .term = "free" } },
+        .filter_query_json = "{\"term\":{\"field\":\"status\",\"term\":\"active\"}}",
+        .limit = 10,
+    });
+    defer mismatched.deinit();
+    try std.testing.expectEqual(@as(u32, 0), mismatched.total_hits);
+}
+
+test "relational text backfill ignores generic primary rows" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "row:a",
+            .value = "{\"title\":\"base row\",\"amount\":10}",
+        }},
+    });
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:a");
+    defer alloc.free(primary_key);
+    try db.core.store.put(primary_key, "{\"title\":\"stale primary\",\"amount\":999}");
+
+    try db.addIndex(.{
+        .name = "ft_backfill",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    var stale = try db.search(alloc, .{
+        .index_name = "ft_backfill",
+        .query = .{ .match = .{ .field = "title", .text = "stale" } },
+        .include_stored = true,
+    });
+    defer stale.deinit();
+    try std.testing.expectEqual(@as(u32, 0), stale.total_hits);
+
+    var base = try db.search(alloc, .{
+        .index_name = "ft_backfill",
+        .query = .{ .match = .{ .field = "title", .text = "base" } },
+        .include_stored = true,
+    });
+    defer base.deinit();
+    try std.testing.expectEqual(@as(u32, 1), base.total_hits);
+    try std.testing.expect(base.hits[0].stored_data != null);
+    try std.testing.expect(std.mem.indexOf(u8, base.hits[0].stored_data.?, "\"title\":\"base row\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, base.hits[0].stored_data.?, "stale primary") == null);
+}
+
+test "relational derived replay reads base row keyspace" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.addIndex(.{
+        .name = "ft_replay_relational",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    const doc_json = "{\"title\":\"async replay row\",\"amount\":9.5}";
+    const row_value = try mapper.buildRelationalRowValueAlloc(alloc, doc_json, runtime_schema.relational_columns);
+    defer alloc.free(row_value);
+    const relational_key = try relational_store_mod.rowKeyAlloc(alloc, "row:async");
+    defer alloc.free(relational_key);
+    try db.core.store.put(relational_key, row_value);
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:async");
+    defer alloc.free(primary_key);
+    const maybe_primary = db.core.store.get(alloc, primary_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (maybe_primary) |primary_value| {
+        defer alloc.free(primary_value);
+        return error.TestExpectedEqual;
+    }
+
+    const targets = [_]derived_types.DerivedTargetRef{.{
+        .kind = .full_text,
+        .index_name = "ft_replay_relational",
+    }};
+    const docs = [_]derived_types.DerivedDocument{.{
+        .key = "row:async",
+        .targets = &targets,
+    }};
+    const batch = derived_types.DerivedBatch{
+        .sequence = 1,
+        .documents = &docs,
+    };
+    var replay_ctx = db_internal.ReplayApplyContext(DB){ .db = &db };
+    try std.testing.expect(try DB.derivedAsyncApplyDerivedBatchToIndexReplay(&replay_ctx, batch, .{
+        .name = "ft_replay_relational",
+        .kind = .full_text,
+    }));
+
+    var result = try db.search(alloc, .{
+        .index_name = "ft_replay_relational",
+        .query = .{ .match = .{ .field = "title", .text = "async" } },
+        .include_stored = true,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("row:async", result.hits[0].id);
+    try std.testing.expect(result.hits[0].stored_data != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.hits[0].stored_data.?, "\"amount\":9.5") != null);
 }
 
 fn benchQueryProfileEnabled() bool {
@@ -4715,4 +5426,917 @@ pub fn Impl(comptime DB: type) type {
             return try Self.executeSearchGraphQuery(self, alloc, graph_query, start_key_refs, target_keys);
         }
     };
+}
+
+test "db search runtime reopen reopens persisted index catalog and text index" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"first alpha\"}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"body\":\"second body\"}" },
+            },
+        });
+
+        try db.addIndex(.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+
+        try std.testing.expectEqual(@as(u32, 1), db.core.index_manager.count());
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{});
+        defer reopened.close();
+
+        try std.testing.expectEqual(@as(u32, 1), reopened.core.index_manager.count());
+
+        var result = try reopened.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .match = .{ .field = "body", .text = "alpha" } },
+            .limit = 10,
+        });
+        defer result.deinit();
+
+        try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+        try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+    }
+}
+
+test "db search runtime reopen delete index persists across reopen" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"first alpha\"}" },
+            },
+        });
+
+        try db.addIndex(.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+
+        try std.testing.expect(try db.deleteIndex("ft_v1"));
+        try std.testing.expectEqual(@as(u32, 0), db.core.index_manager.count());
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{});
+        defer reopened.close();
+
+        try std.testing.expectEqual(@as(u32, 0), reopened.core.index_manager.count());
+        try std.testing.expectError(error.IndexNotFound, reopened.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .term = .{ .field = "title", .term = "alpha" } },
+            .limit = 10,
+        }));
+    }
+}
+
+test "db search runtime reopen delete index persists across reopen with durable lsm primary backend" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const primary_backend: db_config.PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = primary_backend,
+        });
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"first alpha\"}" },
+            },
+        });
+
+        try db.addIndex(.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+
+        try std.testing.expect(try db.deleteIndex("ft_v1"));
+        try std.testing.expectEqual(@as(u32, 0), db.core.index_manager.count());
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = primary_backend,
+        });
+        defer reopened.close();
+
+        try std.testing.expectEqual(@as(u32, 0), reopened.core.index_manager.count());
+        try std.testing.expectError(error.IndexNotFound, reopened.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .term = .{ .field = "title", .term = "alpha" } },
+            .limit = 10,
+        }));
+    }
+}
+
+test "db search runtime reopen indexed delete removes hits across reopen" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"first alpha\"}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"body\":\"second alpha\"}" },
+            },
+        });
+
+        try db.addIndex(.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+
+        try db.batch(.{
+            .deletes = &.{"doc:a"},
+            .sync_level = .full_index,
+        });
+
+        var result = try db.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .match = .{ .field = "body", .text = "alpha" } },
+            .limit = 10,
+        });
+        defer result.deinit();
+
+        try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+        try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{});
+        defer reopened.close();
+
+        var result = try reopened.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .match = .{ .field = "body", .text = "alpha" } },
+            .limit = 10,
+        });
+        defer result.deinit();
+
+        try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+        try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    }
+}
+
+test "db search runtime reopen indexed delete removes hits across reopen with durable lsm primary backend" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const primary_backend: db_config.PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = primary_backend,
+        });
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"first alpha\"}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"body\":\"second alpha\"}" },
+            },
+        });
+
+        try db.addIndex(.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+
+        try db.batch(.{
+            .deletes = &.{"doc:a"},
+            .sync_level = .full_index,
+        });
+
+        var result = try db.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .match = .{ .field = "body", .text = "alpha" } },
+            .limit = 10,
+        });
+        defer result.deinit();
+
+        try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+        try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = primary_backend,
+        });
+        defer reopened.close();
+
+        var result = try reopened.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .match = .{ .field = "body", .text = "alpha" } },
+            .limit = 10,
+        });
+        defer result.deinit();
+
+        try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+        try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+    }
+}
+
+test "db search runtime reopen indexed overwrite replaces old hits across reopen" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"first alpha\"}" },
+            },
+        });
+
+        try db.addIndex(.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"replaced body\"}" },
+            },
+            .sync_level = .full_index,
+        });
+
+        var alpha = try db.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .match = .{ .field = "body", .text = "alpha" } },
+            .limit = 10,
+        });
+        defer alpha.deinit();
+        try std.testing.expectEqual(@as(u32, 0), alpha.total_hits);
+
+        var replaced = try db.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .match = .{ .field = "body", .text = "replaced" } },
+            .limit = 10,
+        });
+        defer replaced.deinit();
+        try std.testing.expectEqual(@as(u32, 1), replaced.total_hits);
+        try std.testing.expectEqualStrings("doc:a", replaced.hits[0].id);
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{});
+        defer reopened.close();
+
+        var alpha = try reopened.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .match = .{ .field = "body", .text = "alpha" } },
+            .limit = 10,
+        });
+        defer alpha.deinit();
+        try std.testing.expectEqual(@as(u32, 0), alpha.total_hits);
+
+        var replaced = try reopened.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .match = .{ .field = "body", .text = "replaced" } },
+            .limit = 10,
+        });
+        defer replaced.deinit();
+        try std.testing.expectEqual(@as(u32, 1), replaced.total_hits);
+        try std.testing.expectEqualStrings("doc:a", replaced.hits[0].id);
+    }
+}
+
+test "db search runtime reopen indexed overwrite replaces old hits across reopen with durable lsm primary backend" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const primary_backend: db_config.PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = primary_backend,
+        });
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"first alpha\"}" },
+            },
+        });
+
+        try db.addIndex(.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"replaced body\"}" },
+            },
+            .sync_level = .full_index,
+        });
+
+        var result = try db.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .match = .{ .field = "body", .text = "alpha" } },
+            .limit = 10,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 0), result.total_hits);
+
+        var replaced = try db.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .match = .{ .field = "body", .text = "replaced" } },
+            .limit = 10,
+        });
+        defer replaced.deinit();
+        try std.testing.expectEqual(@as(u32, 1), replaced.total_hits);
+        try std.testing.expectEqualStrings("doc:a", replaced.hits[0].id);
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = primary_backend,
+        });
+        defer reopened.close();
+
+        var result = try reopened.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .match = .{ .field = "body", .text = "alpha" } },
+            .limit = 10,
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 0), result.total_hits);
+
+        var replaced = try reopened.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .match = .{ .field = "body", .text = "replaced" } },
+            .limit = 10,
+        });
+        defer replaced.deinit();
+        try std.testing.expectEqual(@as(u32, 1), replaced.total_hits);
+        try std.testing.expectEqualStrings("doc:a", replaced.hits[0].id);
+    }
+}
+
+test "db search runtime reopen phrase query survives text compaction deletes and reopen" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+
+        for (0..6) |i| {
+            const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
+            defer alloc.free(key);
+
+            const body = switch (i) {
+                0 => "alpha beta",
+                1 => "alpha beta gamma",
+                2 => "alpha only",
+                3 => "beta only",
+                4 => "alpha beta delta",
+                else => "gamma delta",
+            };
+            const value = try std.fmt.allocPrint(
+                alloc,
+                "{{\"title\":\"both\",\"body\":\"{s}\"}}",
+                .{body},
+            );
+            defer alloc.free(value);
+
+            try db.batch(.{
+                .writes = &.{.{
+                    .key = key,
+                    .value = value,
+                }},
+                .sync_level = .full_index,
+            });
+        }
+
+        try db.batch(.{
+            .deletes = &.{"doc:1"},
+            .sync_level = .full_index,
+        });
+
+        const text_index = db.core.index_manager.textIndex("ft_v1").?;
+        try std.testing.expect(text_index.snapshot().segments.len < 6);
+
+        var result = try db.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .match_phrase = .{ .field = "body", .text = "alpha beta" } },
+            .limit = 10,
+        });
+        defer result.deinit();
+
+        try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+        try std.testing.expect(
+            (std.mem.eql(u8, result.hits[0].id, "doc:0") and std.mem.eql(u8, result.hits[1].id, "doc:4")) or
+                (std.mem.eql(u8, result.hits[0].id, "doc:4") and std.mem.eql(u8, result.hits[1].id, "doc:0")),
+        );
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{});
+        defer reopened.close();
+
+        var result = try reopened.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .match_phrase = .{ .field = "body", .text = "alpha beta" } },
+            .limit = 10,
+        });
+        defer result.deinit();
+
+        try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+        try std.testing.expect(
+            (std.mem.eql(u8, result.hits[0].id, "doc:0") and std.mem.eql(u8, result.hits[1].id, "doc:4")) or
+                (std.mem.eql(u8, result.hits[0].id, "doc:4") and std.mem.eql(u8, result.hits[1].id, "doc:0")),
+        );
+    }
+}
+
+test "db search runtime reopen prefix wildcard and regexp queries use text dictionary filters" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:0", .value = "{\"title\":\"small\",\"body\":\"small smart\"}" },
+            .{ .key = "doc:1", .value = "{\"title\":\"smile\",\"body\":\"smile\"}" },
+            .{ .key = "doc:2", .value = "{\"title\":\"alpha\",\"body\":\"alpha beta\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var prefix = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .prefix = .{ .field = "title", .prefix = "sm" } },
+        .limit = 10,
+    });
+    defer prefix.deinit();
+    try std.testing.expectEqual(@as(u32, 2), prefix.total_hits);
+
+    var wildcard = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .wildcard = .{ .field = "title", .pattern = "smi*" } },
+        .limit = 10,
+    });
+    defer wildcard.deinit();
+    try std.testing.expectEqual(@as(u32, 1), wildcard.total_hits);
+    try std.testing.expectEqualStrings("doc:1", wildcard.hits[0].id);
+
+    var regexp = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .regexp = .{ .field = "title", .pattern = "sm(a|i).*" } },
+        .limit = 10,
+    });
+    defer regexp.deinit();
+    try std.testing.expectEqual(@as(u32, 2), regexp.total_hits);
+}
+
+test "db search runtime reopen typed and dictionary queries survive compaction delete and reopen" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+        const jan3 = (try db_internal.parseRfc3339ToNs("2026-01-03T00:00:00Z")).?;
+        const jan5 = (try db_internal.parseRfc3339ToNs("2026-01-05T00:00:00Z")).?;
+
+        try db.addIndex(.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+
+        const docs = [_]struct { key: []const u8, value: []const u8 }{
+            .{ .key = "doc:0", .value = "{\"title\":\"smal\",\"body\":\"alpha zero\",\"price\":10,\"published_at\":\"2026-01-01T00:00:00Z\",\"location\":{\"lat\":37.7749,\"lon\":-122.4194}}" },
+            .{ .key = "doc:1", .value = "{\"title\":\"small\",\"body\":\"alpha one\",\"price\":20,\"published_at\":\"2026-01-02T00:00:00Z\",\"location\":{\"lat\":37.7750,\"lon\":-122.4195}}" },
+            .{ .key = "doc:2", .value = "{\"title\":\"smile\",\"body\":\"alpha two\",\"price\":30,\"published_at\":\"2026-01-03T00:00:00Z\",\"location\":{\"lat\":40.7128,\"lon\":-74.0060}}" },
+            .{ .key = "doc:3", .value = "{\"title\":\"beta\",\"body\":\"alpha three\",\"price\":40,\"published_at\":\"2026-01-04T00:00:00Z\",\"location\":{\"lat\":34.0522,\"lon\":-118.2437}}" },
+            .{ .key = "doc:4", .value = "{\"title\":\"gamma\",\"body\":\"alpha four\",\"price\":50,\"published_at\":\"2026-01-05T00:00:00Z\",\"location\":{\"lat\":47.6062,\"lon\":-122.3321}}" },
+            .{ .key = "doc:5", .value = "{\"title\":\"delta\",\"body\":\"alpha five\",\"price\":60,\"published_at\":\"2026-01-06T00:00:00Z\",\"location\":{\"lat\":41.8781,\"lon\":-87.6298}}" },
+        };
+
+        for (docs) |doc| {
+            try db.batch(.{
+                .writes = &.{.{
+                    .key = doc.key,
+                    .value = doc.value,
+                }},
+                .sync_level = .full_index,
+            });
+        }
+
+        try db.batch(.{
+            .deletes = &.{"doc:1"},
+            .sync_level = .full_index,
+        });
+
+        const text_index = db.core.index_manager.textIndex("ft_v1").?;
+        try std.testing.expect(text_index.snapshot().segments.len < docs.len);
+
+        var fuzzy = try db.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .fuzzy = .{ .field = "title", .term = "small", .max_edits = 1 } },
+            .limit = 10,
+        });
+        defer fuzzy.deinit();
+        try std.testing.expectEqual(@as(u32, 1), fuzzy.total_hits);
+        try std.testing.expectEqualStrings("doc:0", fuzzy.hits[0].id);
+
+        var numeric = try db.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .numeric_range = .{
+                .field = "price",
+                .min = 15,
+                .max = 35,
+                .inclusive_min = true,
+                .inclusive_max = false,
+            } },
+            .limit = 10,
+        });
+        defer numeric.deinit();
+        try std.testing.expectEqual(@as(u32, 1), numeric.total_hits);
+        try std.testing.expectEqualStrings("doc:2", numeric.hits[0].id);
+
+        var date = try db.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .date_range = .{
+                .field = "published_at",
+                .start_ns = jan3,
+                .end_ns = jan5,
+                .inclusive_start = true,
+                .inclusive_end = false,
+            } },
+            .limit = 10,
+        });
+        defer date.deinit();
+        try std.testing.expectEqual(@as(u32, 2), date.total_hits);
+        try std.testing.expect(
+            (std.mem.eql(u8, date.hits[0].id, "doc:2") and std.mem.eql(u8, date.hits[1].id, "doc:3")) or
+                (std.mem.eql(u8, date.hits[0].id, "doc:3") and std.mem.eql(u8, date.hits[1].id, "doc:2")),
+        );
+
+        var bbox = try db.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .geo_bbox = .{
+                .field = "location",
+                .min_lat = 37.70,
+                .min_lon = -122.50,
+                .max_lat = 37.80,
+                .max_lon = -122.40,
+            } },
+            .limit = 10,
+        });
+        defer bbox.deinit();
+        try std.testing.expectEqual(@as(u32, 1), bbox.total_hits);
+        try std.testing.expectEqualStrings("doc:0", bbox.hits[0].id);
+
+        var ids = try db.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .doc_id = .{ .ids = &.{ "doc:0", "doc:1", "doc:4" } } },
+            .limit = 10,
+        });
+        defer ids.deinit();
+        try std.testing.expectEqual(@as(u32, 2), ids.total_hits);
+        try std.testing.expect(
+            (std.mem.eql(u8, ids.hits[0].id, "doc:0") and std.mem.eql(u8, ids.hits[1].id, "doc:4")) or
+                (std.mem.eql(u8, ids.hits[0].id, "doc:4") and std.mem.eql(u8, ids.hits[1].id, "doc:0")),
+        );
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{});
+        defer reopened.close();
+        const jan3 = (try db_internal.parseRfc3339ToNs("2026-01-03T00:00:00Z")).?;
+        const jan5 = (try db_internal.parseRfc3339ToNs("2026-01-05T00:00:00Z")).?;
+
+        var fuzzy = try reopened.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .fuzzy = .{ .field = "title", .term = "small", .max_edits = 1 } },
+            .limit = 10,
+        });
+        defer fuzzy.deinit();
+        try std.testing.expectEqual(@as(u32, 1), fuzzy.total_hits);
+        try std.testing.expectEqualStrings("doc:0", fuzzy.hits[0].id);
+
+        var numeric = try reopened.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .numeric_range = .{
+                .field = "price",
+                .min = 15,
+                .max = 35,
+                .inclusive_min = true,
+                .inclusive_max = false,
+            } },
+            .limit = 10,
+        });
+        defer numeric.deinit();
+        try std.testing.expectEqual(@as(u32, 1), numeric.total_hits);
+        try std.testing.expectEqualStrings("doc:2", numeric.hits[0].id);
+
+        var date = try reopened.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .date_range = .{
+                .field = "published_at",
+                .start_ns = jan3,
+                .end_ns = jan5,
+                .inclusive_start = true,
+                .inclusive_end = false,
+            } },
+            .limit = 10,
+        });
+        defer date.deinit();
+        try std.testing.expectEqual(@as(u32, 2), date.total_hits);
+        try std.testing.expect(
+            (std.mem.eql(u8, date.hits[0].id, "doc:2") and std.mem.eql(u8, date.hits[1].id, "doc:3")) or
+                (std.mem.eql(u8, date.hits[0].id, "doc:3") and std.mem.eql(u8, date.hits[1].id, "doc:2")),
+        );
+
+        var bbox = try reopened.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .geo_bbox = .{
+                .field = "location",
+                .min_lat = 37.70,
+                .min_lon = -122.50,
+                .max_lat = 37.80,
+                .max_lon = -122.40,
+            } },
+            .limit = 10,
+        });
+        defer bbox.deinit();
+        try std.testing.expectEqual(@as(u32, 1), bbox.total_hits);
+        try std.testing.expectEqualStrings("doc:0", bbox.hits[0].id);
+
+        var ids = try reopened.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .doc_id = .{ .ids = &.{ "doc:0", "doc:1", "doc:4" } } },
+            .limit = 10,
+        });
+        defer ids.deinit();
+        try std.testing.expectEqual(@as(u32, 2), ids.total_hits);
+        try std.testing.expect(
+            (std.mem.eql(u8, ids.hits[0].id, "doc:0") and std.mem.eql(u8, ids.hits[1].id, "doc:4")) or
+                (std.mem.eql(u8, ids.hits[0].id, "doc:4") and std.mem.eql(u8, ids.hits[1].id, "doc:0")),
+        );
+    }
+}
+
+test "db search runtime reopen mixed-type stored fields survive text compaction and reopen" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+
+        const docs = [_]struct { key: []const u8, value: []const u8 }{
+            .{ .key = "doc:0", .value = "{\"title\":\"alpha\",\"mixed_scalar\":\"zulu\"}" },
+            .{ .key = "doc:1", .value = "{\"title\":\"alpha\",\"mixed_scalar\":5}" },
+            .{ .key = "doc:2", .value = "{\"title\":\"alpha\",\"mixed_scalar\":true}" },
+            .{ .key = "doc:3", .value = "{\"title\":\"alpha\",\"mixed_scalar\":[\"bravo\"]}" },
+            .{ .key = "doc:4", .value = "{\"title\":\"alpha\",\"mixed_scalar\":{\"priority\":1}}" },
+            .{ .key = "doc:5", .value = "{\"title\":\"alpha\",\"mixed_scalar\":\"charlie\"}" },
+        };
+
+        for (docs) |doc| {
+            try db.batch(.{
+                .writes = &.{.{
+                    .key = doc.key,
+                    .value = doc.value,
+                }},
+                .sync_level = .full_index,
+            });
+        }
+
+        try db.batch(.{
+            .deletes = &.{"doc:5"},
+            .sync_level = .full_index,
+        });
+
+        const text_index = db.core.index_manager.textIndex("ft_v1").?;
+        try std.testing.expect(text_index.snapshot().segments.len < docs.len);
+
+        var match = try db.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .match = .{ .field = "title", .text = "alpha", .analyzer = null } },
+            .limit = 10,
+        });
+        defer match.deinit();
+        try std.testing.expectEqual(@as(u32, 5), match.total_hits);
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{});
+        defer reopened.close();
+
+        var match = try reopened.search(alloc, .{
+            .index_name = "ft_v1",
+            .query = .{ .match = .{ .field = "title", .text = "alpha", .analyzer = null } },
+            .limit = 10,
+        });
+        defer match.deinit();
+        try std.testing.expectEqual(@as(u32, 5), match.total_hits);
+    }
+}
+
+test "db search runtime reopen persists byte range across reopen" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.updateRange(.{ .start = "doc:b", .end = "doc:m" });
+        const byte_range = db.getRange();
+        try std.testing.expectEqualStrings("doc:b", byte_range.start);
+        try std.testing.expectEqualStrings("doc:m", byte_range.end);
+    }
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const byte_range = db.getRange();
+        try std.testing.expectEqualStrings("doc:b", byte_range.start);
+        try std.testing.expectEqualStrings("doc:m", byte_range.end);
+        try std.testing.expectError(error.KeyOutOfRange, db.batch(.{
+            .writes = &.{.{ .key = "doc:z", .value = "{\"title\":\"outside\"}" }},
+        }));
+        try db.batchWithoutRangeValidation(.{
+            .writes = &.{.{ .key = "doc:z", .value = "{\"title\":\"outside\"}" }},
+        });
+        const outside = (try db.get(alloc, "doc:z")).?;
+        defer alloc.free(outside);
+        try std.testing.expectEqualStrings("{\"title\":\"outside\"}", outside);
+    }
+}
+
+test "db search runtime reopen updateRange constrains index backfill" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const doc_a_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+    defer alloc.free(doc_a_key);
+    const doc_b_key = try internal_keys.documentKeyAlloc(alloc, "doc:b");
+    defer alloc.free(doc_b_key);
+    const doc_c_key = try internal_keys.documentKeyAlloc(alloc, "doc:c");
+    defer alloc.free(doc_c_key);
+    try db.core.store.put(doc_a_key, "{\"title\":\"alpha\"}");
+    try db.core.store.put(doc_b_key, "{\"title\":\"beta\"}");
+    try db.core.store.put(doc_c_key, "{\"title\":\"gamma\"}");
+
+    try db.updateRange(.{ .start = "doc:b", .end = "doc:c\xff" });
+    try db.addIndex(.{
+        .name = "ft_range",
+        .kind = .full_text,
+        .config_json = "{\"store\":true}",
+    });
+
+    const text_index = db.core.index_manager.textIndex("ft_range").?;
+    try std.testing.expectEqual(@as(u32, 2), text_index.snapshot().global_doc_count);
 }

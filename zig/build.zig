@@ -3538,20 +3538,8 @@ pub fn build(b: *std.Build) void {
     const lib_db_enrichment_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
-            "storage.db.db.test.db batch plans generated enrichment",
-            "storage.db.db.test.db computeEnrichments",
-            "storage.db.db.test.db leased enrichment",
-            "storage.db.db.test.db shared embedding enrichment",
-            "storage.db.db.test.db dense index can reference existing",
-            "storage.db.db.test.db persists shorthand chunk enrichment",
-            "storage.db.db.test.db listEnrichments",
-            "storage.db.db.test.db dense parent paging",
-            "storage.db.db.test.db batch persists per-index applied sequence",
-            "storage.db.db.test.db batch truncates derived log",
-            "storage.db.db.test.db io_threaded executor processes indexed writes",
-            "storage.db.db.test.db reopen replays pending derived embeddings",
-            "storage.db.db.test.db replay respects per-index applied watermarks",
-            "storage.db.db.test.db replay applies dense embeddings from artifact payloads",
+            "storage.db.enrichment.enrichment_runtime.test.db enrichment runtime ",
+            "storage.db.derived_async.test.db derived async replay ",
             "storage.db.split_restore_test.test.db split cutover",
             "storage.db.split_restore_test.test.db merge-style cutover",
         },
@@ -3563,14 +3551,7 @@ pub fn build(b: *std.Build) void {
     const lib_db_enrichment_worker_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
-            "storage.db.db.test.db batch plans generated enrichment",
-            "storage.db.db.test.db computeEnrichments",
-            "storage.db.db.test.db leased enrichment worker",
-            "storage.db.db.test.db shared embedding enrichment",
-            "storage.db.db.test.db dense index can reference existing",
-            "storage.db.db.test.db persists shorthand chunk enrichment",
-            "storage.db.db.test.db listEnrichments",
-            "storage.db.db.test.db dense parent paging",
+            "storage.db.enrichment.enrichment_runtime.test.db enrichment runtime ",
         },
     });
     const run_lib_db_enrichment_worker_tests = b.addRunArtifact(lib_db_enrichment_worker_tests);
@@ -3580,12 +3561,7 @@ pub fn build(b: *std.Build) void {
     const lib_db_enrichment_replay_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
-            "storage.db.db.test.db batch persists per-index applied sequence",
-            "storage.db.db.test.db batch truncates derived log",
-            "storage.db.db.test.db io_threaded executor processes indexed writes",
-            "storage.db.db.test.db reopen replays pending derived embeddings",
-            "storage.db.db.test.db replay respects per-index applied watermarks",
-            "storage.db.db.test.db replay applies dense embeddings from artifact payloads",
+            "storage.db.derived_async.test.db derived async replay ",
         },
     });
     const run_lib_db_enrichment_replay_tests = b.addRunArtifact(lib_db_enrichment_replay_tests);
@@ -3689,18 +3665,7 @@ pub fn build(b: *std.Build) void {
     const lib_db_reopen_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
-            "storage.db.db.test.db reopens persisted",
-            "storage.db.db.test.db delete index persists",
-            "storage.db.db.test.db indexed delete removes",
-            "storage.db.db.test.db indexed overwrite replaces",
-            "storage.db.db.test.db compacts tiny text segments",
-            "storage.db.db.test.db phrase query survives",
-            "storage.db.db.test.db prefix wildcard and regexp",
-            "storage.db.db.test.db typed and dictionary queries survive",
-            "storage.db.db.test.db mixed-type stored fields survive",
-            "storage.db.db.test.db persists byte range across reopen",
-            "storage.db.db.test.db snapshot copies current store and derived log",
-            "storage.db.db.test.db updateRange constrains index backfill",
+            "storage.db.search_runtime.test.db search runtime reopen ",
         },
     });
     const run_lib_db_reopen_tests = b.addRunArtifact(lib_db_reopen_tests);
@@ -3711,9 +3676,7 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "storage.db.db.test.db writes and reads timestamp",
-            "storage.db.db.test.db lookup hides expired",
-            "storage.db.db.test.db search filters expired",
-            "storage.db.db.test.db ttl cleanup",
+            "storage.db.maintenance.ttl_runtime.test.",
             "storage.db.db.test.db exposes local transaction lifecycle",
             "storage.db.db.test.db relational foreign keys",
             "storage.db.db.test.db relational unique constraints enforce committed scalar values",
@@ -4890,6 +4853,7 @@ pub fn build(b: *std.Build) void {
             "provisioned query runtime db opens with catalog identity namespace",
             "provisioned query runtime db rejects stale identity namespace",
             "fanout planner uses io cap and request shape",
+            "graph hydrate resolved doc filter applies include and exclude sets",
             "provisioned table read source executes relational row query plans across ranges",
             "routed rows query plan executes over scanned owner rows with ctes",
             "external lake rows query and aggregate plans route through lake scan hook",
@@ -5979,8 +5943,6 @@ pub fn build(b: *std.Build) void {
     const db_schema_default_filters = [_][]const u8{
         "storage.db.schema_runtime.test.",
         "storage.db.relational_integrity.test.",
-        "partial predicates maintain indexes and unique owners",
-        "db system-versioned relational tables",
     };
     const db_schema_tests = b.addTest(.{
         .root_module = db_test_mod,
@@ -5998,9 +5960,12 @@ pub fn build(b: *std.Build) void {
     const db_foreign_key_test_step = b.step("db-foreign-key-test", "Run focused storage/db foreign-key unit tests");
     db_foreign_key_test_step.dependOn(&run_db_foreign_key_tests.step);
 
+    const db_temporal_default_filters = [_][]const u8{
+        "storage.db.relational_integrity.test.db relational temporal",
+    };
     const db_temporal_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = selectTestFilters(b, &.{"db relational temporal"}),
+        .filters = selectTestFilters(b, &db_temporal_default_filters),
     });
     const run_db_temporal_tests = b.addRunArtifact(db_temporal_tests);
     const db_temporal_test_step = b.step("db-temporal-test", "Run focused storage/db application-time temporal unit tests");
@@ -6008,16 +5973,36 @@ pub fn build(b: *std.Build) void {
 
     const db_relational_rows_default_filters = [_][]const u8{
         "storage.db.relational_rows.test.",
-        "storage.db.db.test.relational rows query ",
-        "storage.db.db.test.relational rows set operation",
     };
     const db_relational_rows_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = selectTestFilters(b, &db_relational_rows_default_filters),
     });
     const run_db_relational_rows_tests = b.addRunArtifact(db_relational_rows_tests);
-    const db_relational_rows_test_step = b.step("db-relational-rows-test", "Run focused storage/db relational row query and set-operation tests");
+    const db_relational_rows_test_step = b.step("db-relational-rows-test", "Run focused storage/db relational row tests");
     db_relational_rows_test_step.dependOn(&run_db_relational_rows_tests.step);
+
+    const db_search_runtime_default_filters = [_][]const u8{
+        "storage.db.search_runtime.test.",
+    };
+    const db_search_runtime_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = selectTestFilters(b, &db_search_runtime_default_filters),
+    });
+    const run_db_search_runtime_tests = b.addRunArtifact(db_search_runtime_tests);
+    const db_search_runtime_test_step = b.step("db-search-runtime-test", "Run focused storage/db search runtime tests");
+    db_search_runtime_test_step.dependOn(&run_db_search_runtime_tests.step);
+
+    const db_ttl_runtime_default_filters = [_][]const u8{
+        "storage.db.maintenance.ttl_runtime.test.",
+    };
+    const db_ttl_runtime_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = selectTestFilters(b, &db_ttl_runtime_default_filters),
+    });
+    const run_db_ttl_runtime_tests = b.addRunArtifact(db_ttl_runtime_tests);
+    const db_ttl_runtime_test_step = b.step("db-ttl-runtime-test", "Run focused storage/db TTL runtime tests");
+    db_ttl_runtime_test_step.dependOn(&run_db_ttl_runtime_tests.step);
 
     const db_enrichment_tests = b.addTest(.{
         .root_module = db_test_mod,

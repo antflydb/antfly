@@ -21,11 +21,14 @@ const Allocator = std.mem.Allocator;
 const common_secrets = @import("../../../common/secrets.zig");
 const backend_erased = @import("../../backend_erased.zig");
 const backend_scan = @import("../../backend_scan.zig");
+const docstore_mod = @import("../../docstore.zig");
 const internal_keys = @import("../../internal_keys.zig");
+const artifact_ids = @import("../artifact_ids.zig");
 const relational_row_codec = @import("../algebraic/relational_row_codec.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
 const change_journal_mod = @import("../derived/change_journal.zig");
 const replay_source_mod = @import("../derived/replay_source.zig");
+const replay_stream_mod = @import("../derived/replay_stream.zig");
 const derived_types = @import("../derived/derived_types.zig");
 const enrichment_types = @import("enrichment_types.zig");
 const enrichment_artifact_codec = @import("artifact_codec.zig");
@@ -44,6 +47,7 @@ const chunking_types_mod = @import("../../../chunking/types.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
 const ownership_mod = @import("../ownership.zig");
 const types = @import("../types.zig");
+const db_config = @import("../config.zig");
 const platform_clock = @import("../../../platform/clock.zig");
 const background_runtime_mod = @import("../../background_runtime.zig");
 const template = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
@@ -59,6 +63,13 @@ const scraping = if (builtin.os.tag == .freestanding or build_options.bench_mini
 else
     @import("antfly_scraping");
 const mapper = @import("../document_mapper.zig");
+const db_test_support = @import("../test_support.zig");
+const tempPath = db_test_support.tempPath;
+const cleanupTempDir = db_test_support.cleanupTempDir;
+const waitForSearchResult = db_test_support.waitForSearchResult;
+const waitForAppliedSequenceAdvance = db_test_support.waitForAppliedSequenceAdvance;
+const waitForDenseIndexResultsWithAttempts = db_test_support.waitForDenseIndexResultsWithAttempts;
+const slow_test_wait_attempts = db_test_support.slow_test_wait_attempts;
 
 fn getenv(name: [*:0]const u8) ?[]const u8 {
     return platform.env.getenv(name);
@@ -7077,4 +7088,1001 @@ test "extractSourceText with template and scrubHtml helper" {
     const result = try extractSourceText(alloc, .{}, doc, request) orelse return error.TestUnexpectedResult;
     defer alloc.free(result);
     try std.testing.expectEqualStrings("HelloWorld", result);
+}
+
+test "db enrichment runtime batch marks generated enrichment replay for generator-enabled dense index" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_size\":256,\"chunk_overlap\":32}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"needs generated embedding\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const journal_entries = try replay_stream_mod.iterateFrom(alloc, db.core.store, 1);
+    defer {
+        for (journal_entries) |*entry| entry.deinit(alloc);
+        alloc.free(journal_entries);
+    }
+    try std.testing.expectEqual(@as(usize, 1), journal_entries.len);
+
+    var journal_record = try change_journal_mod.decodeRecord(alloc, journal_entries[0].payload);
+    defer journal_record.deinit();
+
+    try std.testing.expect(journal_record.record.changed_doc_keys.len >= 1);
+    try std.testing.expectEqualStrings("doc:a", journal_record.record.changed_doc_keys[0]);
+    try std.testing.expect(change_journal_mod.recordHasHint(journal_record.record, .enrichment));
+    try std.testing.expect(!change_journal_mod.recordHasHint(journal_record.record, .dense_vector));
+}
+
+test "db enrichment runtime computeEnrichments synchronously builds chunk and embedding outputs" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+    });
+    try db.addIndex(.{
+        .name = "ft_chunks",
+        .kind = .full_text,
+        .config_json = "{\"chunk_name\":\"body_chunks_v1\"}",
+    });
+
+    var result = try db.computeEnrichments(alloc, &.{
+        .{
+            .key = "doc:a",
+            .value = "{\"body\":\"abcdefghijklmno\"}",
+        },
+    });
+    defer result.deinit(alloc);
+
+    var chunk_artifacts: usize = 0;
+    var embedding_artifacts: usize = 0;
+    for (result.artifact_writes) |write| {
+        if (write.artifact_ref.kind == .chunk) {
+            chunk_artifacts += 1;
+        } else if (write.artifact_ref.kind == .embedding) {
+            embedding_artifacts += 1;
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), chunk_artifacts);
+    try std.testing.expectEqual(@as(usize, 3), embedding_artifacts);
+    try std.testing.expectEqual(@as(usize, 3), result.documents.len);
+    try std.testing.expectEqual(@as(usize, 3), result.dense_embeddings.len);
+    try std.testing.expectEqual(@as(usize, 0), result.failed_keys.len);
+    try std.testing.expectEqualStrings("ft_chunks", result.documents[0].target_index_names[0]);
+    try std.testing.expectEqualStrings("dv_v1", result.dense_embeddings[0].index_name);
+}
+
+test "db enrichment runtime leased enrichment worker generates dense embeddings" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"generated vector text\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expect(stats.enrichment.enabled);
+    try std.testing.expect(stats.enrichment.lease_owned);
+    try std.testing.expect(stats.enrichment.has_lease);
+    try std.testing.expect(stats.enrichment.acquisition_count > 0);
+    try std.testing.expectEqual(@as(u64, 1), stats.enrichment.applied_sequence);
+
+    const query_vec = try deterministic.interface().embedDense(alloc, "", "generated vector text", 3);
+    defer alloc.free(query_vec);
+
+    var result = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{
+            .vector = query_vec,
+            .k = 1,
+        },
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "body_dense_v1");
+    defer alloc.free(artifact_key);
+    const artifacts = try db.core.store.scanPrefix(alloc, artifact_key);
+    defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+    try std.testing.expectEqual(@as(usize, 1), artifacts.len);
+    try std.testing.expectEqualStrings(artifact_key, artifacts[0].key);
+    try enrichment_artifact_codec.expectDenseEmbeddingValue(alloc, artifacts[0].value, enrichment_artifact_codec.hashSource("generated vector text"), 3);
+}
+
+test "db enrichment runtime leased enrichment worker generates dense embeddings with durable lsm primary backend" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"body_dense_v1\"}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"generated vector text\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.executor.waitForAll(2);
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expect(stats.enrichment.enabled);
+    try std.testing.expect(stats.enrichment.lease_owned);
+    try std.testing.expect(stats.enrichment.has_lease);
+    try std.testing.expect(stats.enrichment.acquisition_count > 0);
+    try std.testing.expectEqual(@as(u64, 1), stats.enrichment.applied_sequence);
+
+    const query_vec = try deterministic.interface().embedDense(alloc, "", "generated vector text", 3);
+    defer alloc.free(query_vec);
+
+    var result = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{
+            .vector = query_vec,
+            .k = 1,
+        },
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "body_dense_v1");
+    defer alloc.free(artifact_key);
+    const artifacts = try db.core.store.scanPrefix(alloc, artifact_key);
+    defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+    try std.testing.expectEqual(@as(usize, 1), artifacts.len);
+    try std.testing.expectEqualStrings(artifact_key, artifacts[0].key);
+    try enrichment_artifact_codec.expectDenseEmbeddingValue(alloc, artifacts[0].value, enrichment_artifact_codec.hashSource("generated vector text"), 3);
+}
+
+test "db enrichment runtime leased enrichment worker materializes chunk artifacts" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
+    defer alloc.free(chunk_prefix);
+    const chunk_zero = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    defer alloc.free(chunk_zero);
+    const artifacts = try db.core.store.scanPrefix(alloc, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+
+    var chunk_count: usize = 0;
+    var embedding_count: usize = 0;
+    for (artifacts) |entry| {
+        if (internal_keys.isChunkArtifactRecordKey(entry.key)) {
+            if (chunk_count == 0) {
+                try std.testing.expectEqualStrings(chunk_zero, entry.key);
+                try std.testing.expect(std.mem.indexOf(u8, entry.value, "\"abcdefgh\"") != null);
+            }
+            chunk_count += 1;
+            continue;
+        }
+        if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) {
+            embedding_count += 1;
+            try enrichment_artifact_codec.expectDenseEmbeddingWithSourceHash(alloc, entry.value, 3);
+        }
+    }
+    try std.testing.expect(chunk_count > 0);
+    try std.testing.expectEqual(@as(usize, 3), embedding_count);
+}
+
+test "db enrichment runtime leased enrichment worker keeps chunk storage ephemeral when store_chunks is false" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"text\":{\"target_tokens\":8,\"overlap_tokens\":2}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
+    defer alloc.free(chunk_prefix);
+    const artifacts = try db.core.store.scanPrefix(alloc, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+
+    var chunk_count: usize = 0;
+    for (artifacts) |entry| {
+        if (internal_keys.isChunkArtifactRecordKey(entry.key)) chunk_count += 1;
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), chunk_count);
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+}
+
+test "db enrichment runtime leased enrichment worker persists chunk storage when full text consumes chunked text" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"text\":{\"target_tokens\":8,\"overlap_tokens\":2}}}}",
+    });
+    try db.addIndex(.{
+        .name = "ft_chunks",
+        .kind = .full_text,
+        .config_json = "{\"chunk_name\":\"body_chunks_v1\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.enrichment_runtime.?.waitForApplied(1);
+
+    const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
+    defer alloc.free(chunk_prefix);
+    const artifacts = try db.core.store.scanPrefix(alloc, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+
+    var chunk_count: usize = 0;
+    for (artifacts) |entry| {
+        if (internal_keys.isChunkArtifactRecordKey(entry.key)) chunk_count += 1;
+    }
+
+    try std.testing.expect(chunk_count > 0);
+}
+
+test "db enrichment runtime leased enrichment worker persists chunk storage when chunker enables full text indexing" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"artifact_name\":\"body_chunks_v1\",\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"full_text_index\":{},\"text\":{\"target_tokens\":8,\"overlap_tokens\":2}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.enrichment_runtime.?.waitForApplied(1);
+
+    const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
+    defer alloc.free(chunk_prefix);
+    const artifacts = try db.core.store.scanPrefix(alloc, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+
+    var chunk_count: usize = 0;
+    for (artifacts) |entry| {
+        if (internal_keys.isChunkArtifactRecordKey(entry.key)) chunk_count += 1;
+    }
+
+    try std.testing.expect(chunk_count > 0);
+}
+
+test "db enrichment runtime leased enrichment worker materializes chunk artifacts with durable lsm primary backend" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
+    defer alloc.free(chunk_prefix);
+    const chunk_zero = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    defer alloc.free(chunk_zero);
+    const artifacts = try db.core.store.scanPrefix(alloc, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+
+    var chunk_count: usize = 0;
+    var embedding_count: usize = 0;
+    for (artifacts) |entry| {
+        if (internal_keys.isChunkArtifactRecordKey(entry.key)) {
+            if (chunk_count == 0) {
+                try std.testing.expectEqualStrings(chunk_zero, entry.key);
+                try std.testing.expect(std.mem.indexOf(u8, entry.value, "\"abcdefgh\"") != null);
+            }
+            chunk_count += 1;
+            continue;
+        }
+        if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) {
+            embedding_count += 1;
+            try enrichment_artifact_codec.expectDenseEmbeddingWithSourceHash(alloc, entry.value, 3);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), chunk_count);
+    try std.testing.expectEqual(@as(usize, 3), embedding_count);
+}
+
+test "db enrichment runtime shared embedding enrichment feeds multiple dense indexes" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+
+    const shared_cfg = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"shared_dense_v1\"}}";
+    try db.addIndex(.{
+        .name = "dv_a",
+        .kind = .dense_vector,
+        .config_json = shared_cfg,
+    });
+    try db.addIndex(.{
+        .name = "dv_b",
+        .kind = .dense_vector,
+        .config_json = shared_cfg,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"shared embedding text\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const shared_artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "shared_dense_v1");
+    defer alloc.free(shared_artifact_key);
+    const artifacts = try db.core.store.scanPrefix(alloc, shared_artifact_key);
+    defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+    try std.testing.expectEqual(@as(usize, 1), artifacts.len);
+
+    const query_vec = try deterministic.interface().embedDense(alloc, "", "shared embedding text", 3);
+    defer alloc.free(query_vec);
+
+    var result_a = try db.search(alloc, .{
+        .index_name = "dv_a",
+        .dense = .{ .vector = query_vec, .k = 1 },
+    });
+    defer result_a.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result_a.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result_a.hits[0].id);
+
+    var result_b = try db.search(alloc, .{
+        .index_name = "dv_b",
+        .dense = .{ .vector = query_vec, .k = 1 },
+    });
+    defer result_b.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result_b.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result_b.hits[0].id);
+}
+
+test "db enrichment runtime shared embedding enrichment feeds multiple dense indexes with durable lsm primary backend" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+
+    const shared_cfg = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"shared_dense_v1\"}}";
+    try db.addIndex(.{
+        .name = "dv_a",
+        .kind = .dense_vector,
+        .config_json = shared_cfg,
+    });
+    try db.addIndex(.{
+        .name = "dv_b",
+        .kind = .dense_vector,
+        .config_json = shared_cfg,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"shared embedding text\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const shared_artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "shared_dense_v1");
+    defer alloc.free(shared_artifact_key);
+    const artifacts = try db.core.store.scanPrefix(alloc, shared_artifact_key);
+    defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+    try std.testing.expectEqual(@as(usize, 1), artifacts.len);
+
+    const query_vec = try deterministic.interface().embedDense(alloc, "", "shared embedding text", 3);
+    defer alloc.free(query_vec);
+
+    var result_a = try db.search(alloc, .{
+        .index_name = "dv_a",
+        .dense = .{ .vector = query_vec, .k = 1 },
+    });
+    defer result_a.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result_a.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result_a.hits[0].id);
+
+    var result_b = try db.search(alloc, .{
+        .index_name = "dv_b",
+        .dense = .{ .vector = query_vec, .k = 1 },
+    });
+    defer result_b.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result_b.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result_b.hits[0].id);
+}
+
+test "db enrichment runtime dense index can reference existing whole-doc embedding enrichment" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_gen",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"shared_dense_v1\"}}",
+    });
+    try db.addIndex(.{
+        .name = "dv_ref",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"shared_dense_v1\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"reference embedding text\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const query_vec = try deterministic.interface().embedDense(alloc, "", "reference embedding text", 3);
+    defer alloc.free(query_vec);
+
+    var result = try db.search(alloc, .{
+        .index_name = "dv_ref",
+        .dense = .{ .vector = query_vec, .k = 1 },
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "db enrichment runtime dense index can reference existing chunk embedding enrichment" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_gen",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+    });
+    try db.addIndex(.{
+        .name = "dv_ref",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"chunk_dense_v1\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    _ = try waitForAppliedSequenceAdvance(alloc, &db, "dv_ref", 0);
+
+    const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
+    defer alloc.free(query_vec);
+    const dv_ref = db.core.index_manager.denseIndex("dv_ref") orelse return error.IndexNotFound;
+    var direct = try waitForDenseIndexResultsWithAttempts(&dv_ref.index, query_vec, 3, 1, slow_test_wait_attempts);
+    defer direct.deinit();
+
+    const internal_id = if (direct.takeMetadata(0)) |metadata|
+        metadata
+    else blk: {
+        const hit = direct.getHits()[0];
+        break :blk (try dv_ref.index.getMetadata(hit.vector_id)) orelse return error.TestUnexpectedResult;
+    };
+    defer alloc.free(internal_id);
+    var identity = try artifact_ids.resolvePublicHitIdentityAlloc(alloc, internal_id);
+    defer identity.deinit(alloc);
+    const artifact_ref = identity.artifact_ref orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(types.ArtifactKind.chunk, artifact_ref.kind);
+    try std.testing.expectEqualStrings("doc:a", artifact_ref.document_id);
+    try std.testing.expectEqualStrings("body_chunks_v1", artifact_ref.name);
+    try std.testing.expect(artifact_ref.chunk_id != null);
+}
+
+test "db enrichment runtime persists shorthand chunk enrichment catalog across reopen" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"body_dense_v1\"}}",
+        });
+
+        const enrichment = (try db.getEnrichment(alloc, .chunk, "body_chunks_v1")) orelse return error.TestUnexpectedResult;
+        defer {
+            var tmp = enrichment;
+            tmp.deinit(alloc);
+        }
+        try std.testing.expectEqualStrings("body", enrichment.field);
+        try std.testing.expectEqual(@as(u32, 8), enrichment.chunk_size);
+        try std.testing.expectEqual(@as(u32, 2), enrichment.chunk_overlap);
+
+        const embedding = (try db.getEnrichment(alloc, .embedding, "body_dense_v1")) orelse return error.TestUnexpectedResult;
+        defer {
+            var tmp = embedding;
+            tmp.deinit(alloc);
+        }
+        try std.testing.expectEqualStrings("body", embedding.field);
+        try std.testing.expectEqualStrings("body_chunks_v1", embedding.source_artifact_name);
+        try std.testing.expectEqual(@as(u32, 3), embedding.expected_dims);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+
+    const enrichment = (try reopened.getEnrichment(alloc, .chunk, "body_chunks_v1")) orelse return error.TestUnexpectedResult;
+    defer {
+        var tmp = enrichment;
+        tmp.deinit(alloc);
+    }
+    try std.testing.expectEqualStrings("body", enrichment.field);
+    try std.testing.expectEqual(@as(u32, 8), enrichment.chunk_size);
+    try std.testing.expectEqual(@as(u32, 2), enrichment.chunk_overlap);
+
+    const embedding = (try reopened.getEnrichment(alloc, .embedding, "body_dense_v1")) orelse return error.TestUnexpectedResult;
+    defer {
+        var tmp = embedding;
+        tmp.deinit(alloc);
+    }
+    try std.testing.expectEqualStrings("body", embedding.field);
+    try std.testing.expectEqualStrings("body_chunks_v1", embedding.source_artifact_name);
+    try std.testing.expectEqual(@as(u32, 3), embedding.expected_dims);
+}
+
+test "db enrichment runtime persists shorthand chunk enrichment catalog across reopen with durable lsm primary backend" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const primary_backend: db_config.PrimaryBackend = .{ .lsm = db_config.primary_lsm_options_default };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = primary_backend,
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"body_dense_v1\"}}",
+        });
+
+        const enrichment = (try db.getEnrichment(alloc, .chunk, "body_chunks_v1")) orelse return error.TestUnexpectedResult;
+        defer {
+            var tmp = enrichment;
+            tmp.deinit(alloc);
+        }
+        try std.testing.expectEqualStrings("body", enrichment.field);
+        try std.testing.expectEqual(@as(u32, 8), enrichment.chunk_size);
+        try std.testing.expectEqual(@as(u32, 2), enrichment.chunk_overlap);
+
+        const embedding = (try db.getEnrichment(alloc, .embedding, "body_dense_v1")) orelse return error.TestUnexpectedResult;
+        defer {
+            var tmp = embedding;
+            tmp.deinit(alloc);
+        }
+        try std.testing.expectEqualStrings("body", embedding.field);
+        try std.testing.expectEqualStrings("body_chunks_v1", embedding.source_artifact_name);
+        try std.testing.expectEqual(@as(u32, 3), embedding.expected_dims);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = primary_backend,
+    });
+    defer reopened.close();
+
+    const enrichment = (try reopened.getEnrichment(alloc, .chunk, "body_chunks_v1")) orelse return error.TestUnexpectedResult;
+    defer {
+        var tmp = enrichment;
+        tmp.deinit(alloc);
+    }
+    try std.testing.expectEqualStrings("body", enrichment.field);
+    try std.testing.expectEqual(@as(u32, 8), enrichment.chunk_size);
+    try std.testing.expectEqual(@as(u32, 2), enrichment.chunk_overlap);
+
+    const embedding = (try reopened.getEnrichment(alloc, .embedding, "body_dense_v1")) orelse return error.TestUnexpectedResult;
+    defer {
+        var tmp = embedding;
+        tmp.deinit(alloc);
+    }
+    try std.testing.expectEqualStrings("body", embedding.field);
+    try std.testing.expectEqualStrings("body_chunks_v1", embedding.source_artifact_name);
+    try std.testing.expectEqual(@as(u32, 3), embedding.expected_dims);
+}
+
+test "db enrichment runtime listEnrichments returns explicit definitions across reopen" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addEnrichment(.{
+            .name = "body_chunks_v1",
+            .kind = .chunk,
+            .field = "body",
+            .chunk_size = 8,
+            .chunk_overlap = 2,
+        });
+        try db.addEnrichment(.{
+            .name = "body_dense_v1",
+            .kind = .embedding,
+            .field = "body",
+            .source_artifact_name = "body_chunks_v1",
+            .expected_dims = 3,
+        });
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+
+    const enrichments = try reopened.listEnrichments(alloc);
+    defer types.freeEnrichmentConfigs(alloc, enrichments);
+    try std.testing.expectEqual(@as(usize, 2), enrichments.len);
+    try std.testing.expectEqualStrings("body_chunks_v1", enrichments[0].name);
+    try std.testing.expectEqual(.chunk, enrichments[0].kind);
+    try std.testing.expectEqualStrings("body_dense_v1", enrichments[1].name);
+    try std.testing.expectEqual(.embedding, enrichments[1].kind);
+}
+
+test "db enrichment runtime listEnrichments returns explicit definitions across reopen with durable lsm primary backend" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const primary_backend: db_config.PrimaryBackend = .{ .lsm = db_config.primary_lsm_options_default };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = primary_backend,
+        });
+        defer db.close();
+
+        try db.addEnrichment(.{
+            .name = "body_chunks_v1",
+            .kind = .chunk,
+            .field = "body",
+            .chunk_size = 8,
+            .chunk_overlap = 2,
+        });
+        try db.addEnrichment(.{
+            .name = "body_dense_v1",
+            .kind = .embedding,
+            .field = "body",
+            .source_artifact_name = "body_chunks_v1",
+            .expected_dims = 3,
+        });
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = primary_backend,
+    });
+    defer reopened.close();
+
+    const enrichments = try reopened.listEnrichments(alloc);
+    defer types.freeEnrichmentConfigs(alloc, enrichments);
+    try std.testing.expectEqual(@as(usize, 2), enrichments.len);
+    try std.testing.expectEqualStrings("body_chunks_v1", enrichments[0].name);
+    try std.testing.expectEqual(.chunk, enrichments[0].kind);
+    try std.testing.expectEqualStrings("body_dense_v1", enrichments[1].name);
+    try std.testing.expectEqual(.embedding, enrichments[1].kind);
+}
+
+test "db enrichment runtime dense parent paging fetches enough chunk hits before grouping" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"abcdefghabcdefghabcdefgh\"}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"abcdefzz\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
+    defer alloc.free(query_vec);
+
+    var first_parent = try waitForSearchResult(alloc, &db, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 1 },
+        .return_mode = .parent,
+        .limit = 1,
+    }, 1);
+    defer first_parent.deinit();
+    try std.testing.expectEqual(@as(u32, 2), first_parent.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), first_parent.hits.len);
+    try std.testing.expectEqualStrings("doc:a", first_parent.hits[0].id);
+
+    var second_parent = try waitForSearchResult(alloc, &db, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 1 },
+        .return_mode = .parent,
+        .limit = 1,
+        .offset = 1,
+    }, 1);
+    defer second_parent.deinit();
+    try std.testing.expectEqual(@as(u32, 2), second_parent.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), second_parent.hits.len);
+    try std.testing.expectEqualStrings("doc:b", second_parent.hits[0].id);
 }
