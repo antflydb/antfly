@@ -292,20 +292,27 @@ remains the next migration boundary for larger DDL, query, DML, and Antfly
 extension families.
 Unsupported generated diagnostics also cover PostgreSQL materialized-view DDL
 entry points, including `CREATE MATERIALIZED VIEW`, `ALTER MATERIALIZED VIEW`,
-and `DROP MATERIALIZED VIEW`; procedural blocks with `DO`; foreign-table DDL;
-trigger and rewrite-rule DDL, including `ALTER TRIGGER` and `ALTER RULE`;
-row-security policy DDL; logical-replication publication and subscription DDL;
-and foreign-server DDL. These common unsupported PostgreSQL dump/admin shapes
-now have stable unsupported AST reasons instead of generic parser fallback.
+`DROP MATERIALIZED VIEW`, and `REFRESH MATERIALIZED VIEW`; procedural blocks
+with `DO`; foreign-table DDL; trigger and rewrite-rule DDL, including
+`ALTER TRIGGER` and `ALTER RULE`; row-security policy DDL; logical-replication
+publication and subscription DDL; and foreign-server DDL. These common
+unsupported PostgreSQL dump/admin shapes now have stable unsupported AST
+reasons instead of generic parser fallback. Legacy-supported materialized-view
+catalog operations now use those generated unsupported AST nodes as a validated
+boundary before delegating to the typed materialized-view catalog planner:
+`CREATE MATERIALIZED VIEW`, `DROP MATERIALIZED VIEW`, and
+`REFRESH MATERIALIZED VIEW` fail closed if generated kind, reason, span, subject,
+or command keywords are corrupted.
 Generated unsupported nodes now also participate in the parsed statement
 boundary: generated-covered unsupported heads that are not intentionally
 supported by the existing catalog planner become terminal parsed unsupported
 statements and fail closed before legacy DDL probing. Generated unsupported
 heads that already have legacy catalog/runtime support, such as `EXPLAIN`,
-`COPY`, materialized-view catalog DDL, row-policy catalog DDL, notification
-commands, maintenance commands, and cursor/savepoint catalog commands, stay on
-an explicit compatibility allowlist until their generated AST-to-plan
-implementations are promoted.
+`COPY`, remaining materialized-view catalog variants such as
+`ALTER MATERIALIZED VIEW`, row-policy catalog DDL, notification commands,
+maintenance commands, and cursor/savepoint catalog commands, stay on an explicit
+compatibility allowlist until their generated AST-to-plan implementations are
+promoted.
 
 ## Compatibility Policy
 
