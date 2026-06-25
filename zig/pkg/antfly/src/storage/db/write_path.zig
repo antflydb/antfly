@@ -3066,6 +3066,228 @@ fn chunkCacheTupleKeyAlloc(alloc: Allocator, components: []const []const u8) ![]
     return try out.toOwnedSlice(alloc);
 }
 
+test "db write path allocates final document ordinal then rejects new documents" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    const last_allocatable = std.math.maxInt(doc_identity.DocOrdinal) - 1;
+    var value: [4]u8 = undefined;
+    std.mem.writeInt(u32, &value, last_allocatable, .big);
+    try db.core.store.put(internal_keys.identity_next_ordinal_key[0..], &value);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:last", .value = "{\"name\":\"last\"}" }},
+        .sync_level = .write,
+    });
+
+    {
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, last_allocatable), try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:last"));
+    }
+
+    const exhausted = try db.stats(alloc);
+    defer types.freeDBStats(alloc, exhausted);
+    try std.testing.expectEqual(std.math.maxInt(doc_identity.DocOrdinal), exhausted.doc_identity.next_ordinal);
+    try std.testing.expectEqual(@as(u64, 0), exhausted.doc_identity.ordinal_capacity_remaining);
+    try std.testing.expect(exhausted.doc_identity.ordinal_capacity_exhausted);
+    try std.testing.expect(exhausted.doc_identity.rebuild_required);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:last", .value = "{\"name\":\"updated-last\"}" }},
+        .sync_level = .full_index,
+    });
+    const updated = (try db.get(alloc, "doc:last")) orelse return error.TestExpectedEqual;
+    defer alloc.free(updated);
+    try std.testing.expectEqualStrings("{\"name\":\"updated-last\"}", updated);
+
+    try std.testing.expectError(error.DocOrdinalExhausted, db.batch(.{
+        .writes = &.{.{ .key = "doc:overflow", .value = "{\"name\":\"overflow\"}" }},
+        .sync_level = .write,
+    }));
+}
+
+test "db write path allocates final document ordinal with all index families present" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+    try db.addIndex(.{
+        .name = "sp_v1",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse\"}",
+    });
+    try db.addIndex(.{
+        .name = "graph_v1",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+    try db.addIndex(.{
+        .name = "alg_v1",
+        .kind = .algebraic,
+        .config_json =
+        \\{
+        \\  "version": 1,
+        \\  "table": "docs",
+        \\  "group_fields": [{"name":"category","path":"category","type":"string"}],
+        \\  "measure_fields": [{"name":"score","path":"score","type":"number"}],
+        \\  "materializations": [{"name":"count_by_category","op":"count","group_by":["category"]}]
+        \\}
+        ,
+    });
+
+    const last_allocatable = std.math.maxInt(doc_identity.DocOrdinal) - 1;
+    var value: [4]u8 = undefined;
+    std.mem.writeInt(u32, &value, last_allocatable, .big);
+    try db.core.store.put(internal_keys.identity_next_ordinal_key[0..], &value);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:last",
+            .value = "{\"body\":\"final ordinal token\",\"category\":\"keep\",\"score\":1.0,\"embedding\":[0.0,1.0],\"sparse\":{\"indices\":[1],\"values\":[1.0]}}",
+        }},
+        .graph_writes = &.{.{
+            .index_name = "graph_v1",
+            .source = "doc:last",
+            .target = "doc:last",
+            .edge_type = "self",
+            .weight = 1.0,
+        }},
+        .sync_level = .full_index,
+    });
+
+    {
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, last_allocatable), try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:last"));
+    }
+
+    const exhausted = try db.stats(alloc);
+    defer types.freeDBStats(alloc, exhausted);
+    try std.testing.expectEqual(std.math.maxInt(doc_identity.DocOrdinal), exhausted.doc_identity.next_ordinal);
+    try std.testing.expect(exhausted.doc_identity.ordinal_capacity_exhausted);
+    try std.testing.expect(exhausted.doc_identity.rebuild_required);
+
+    try std.testing.expectError(error.DocOrdinalExhausted, db.batch(.{
+        .writes = &.{.{ .key = "doc:overflow", .value = "{\"body\":\"overflow\"}" }},
+        .sync_level = .full_index,
+    }));
+}
+
+test "db write path rejects new document writes at ordinal exhaustion for every sync level" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:existing", .value = "{\"name\":\"existing\"}" }},
+        .sync_level = .write,
+    });
+
+    var value: [4]u8 = undefined;
+    std.mem.writeInt(u32, &value, std.math.maxInt(doc_identity.DocOrdinal), .big);
+    try db.core.store.put(internal_keys.identity_next_ordinal_key[0..], &value);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:existing", .value = "{\"name\":\"updated\"}" }},
+        .sync_level = .full_index,
+    });
+    const existing = (try db.get(alloc, "doc:existing")) orelse return error.TestExpectedEqual;
+    defer alloc.free(existing);
+    try std.testing.expectEqualStrings("{\"name\":\"updated\"}", existing);
+
+    const levels = [_]types.SyncLevel{
+        .propose,
+        .write,
+        .full_text,
+        .enrichments,
+        .aknn,
+        .full_index,
+    };
+    for (levels, 0..) |level, i| {
+        var key_buf: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "doc:new:{d}", .{i});
+        try std.testing.expectError(error.DocOrdinalExhausted, db.batch(.{
+            .writes = &.{.{ .key = key, .value = "{\"name\":\"new\"}" }},
+            .sync_level = level,
+        }));
+        try std.testing.expect((try db.get(alloc, key)) == null);
+    }
+}
+
+test "db write path caches identity visibility summary after local writes" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
+    });
+    try std.testing.expect(db.identity_visibility_summary_cache != null);
+    try std.testing.expect(try db.internalAllDocsVisibleAtGeneration(db.core.nextDerivedSequence()));
+
+    try db.batch(.{
+        .deletes = &.{"doc:a"},
+    });
+    try std.testing.expect(db.identity_visibility_summary_cache != null);
+    try std.testing.expect(!(try db.internalAllDocsVisibleAtGeneration(db.core.nextDerivedSequence())));
+}
+
 test "db write path document extraction templated inline source size is rejected before persistence" {
     const DB = @import("mod.zig").DB;
     const db_test_support = @import("test_support.zig");

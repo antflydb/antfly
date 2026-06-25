@@ -379,7 +379,9 @@ such as `ALTER INDEX`, `ALTER SYSTEM`, `CREATE/DROP ACCESS METHOD`,
 `CLUSTER`, `COMMENT`, `GRANT`/`REVOKE`, `LISTEN`/`NOTIFY`, `LOCK`, `CALL`,
 `CHECKPOINT`, `LOAD`, `REFRESH`, `SECURITY LABEL`, and `UNLISTEN`, plus
 simple cursor and transaction-control statements such as `CLOSE`, `DECLARE`,
-`FETCH`, `MOVE`, `SAVEPOINT`, and `RELEASE`, plus simple `EXPLAIN` forms with stable reason metadata. Generated
+`FETCH`, `MOVE`, `SAVEPOINT`, and `RELEASE`, plus common PostgreSQL extension
+catalog families for conversions, event triggers, extended statistics, and
+text-search configurations, plus simple `EXPLAIN` forms with stable reason metadata. Generated
 unsupported AST heads that Antfly already plans through typed catalog/control
 planners now route to the parsed DDL family explicitly; generated `EXPLAIN`
 routes to the parsed explain family explicitly; and unsupported heads without
@@ -391,7 +393,9 @@ entry points that Antfly does not type yet, including
 `ALTER MATERIALIZED VIEW`; procedural blocks with `DO`; foreign-table DDL;
 trigger and rewrite-rule DDL, including `ALTER TRIGGER` and `ALTER RULE`;
 foreign-server DDL; access-method DDL; ownership maintenance statements; and
-`ALTER INDEX`/`ALTER SYSTEM`. These common unsupported
+`ALTER INDEX`/`ALTER SYSTEM`. PostgreSQL conversion, event-trigger, extended
+statistics, and text-search configuration DDL now share the same generated
+unsupported AST and reason coverage. These common unsupported
 PostgreSQL dump/admin shapes now have stable unsupported AST reasons instead of
 generic parser fallback. Legacy-supported materialized-view catalog operations
 now use generated DDL AST nodes as a validated boundary before delegating to the
@@ -1080,7 +1084,8 @@ Generated grammar work needs evidence at multiple levels:
   `SECURITY LABEL`, `UNLISTEN`, cursor commands `CLOSE`/`DECLARE`/`FETCH`/`MOVE`,
   transaction-control commands `SAVEPOINT`/`RELEASE`, PostgreSQL foreign-data
   declarations for foreign data wrappers, foreign tables, servers, and user
-  mappings, plus language, rule, and trigger DDL, and bare, simple, optioned,
+  mappings, plus language, rule, trigger, conversion, event-trigger, extended
+  statistics, and text-search configuration DDL, and bare, simple, optioned,
   and `EXPLAIN ANALYZE` forms now produce generated unsupported AST nodes with
   stable reason metadata and subject ranges where available.
 - AST shape tests for source spans, identifier normalization, literals,

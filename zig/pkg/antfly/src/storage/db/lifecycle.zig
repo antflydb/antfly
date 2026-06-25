@@ -5441,6 +5441,522 @@ test "db lifecycle dense target advance is blocked while catch-up bulk session i
     try std.testing.expect(!can_advance);
 }
 
+test "db lifecycle persists configured doc identity namespace for batch writes" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 11, .range_id = 13 };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .identity_namespace = namespace,
+        });
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" },
+            },
+        });
+
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:a")).?;
+        const state = (try doc_identity.lookupStateTxn(&txn, ordinal)).?;
+        try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(namespace, "doc:a"), state.canonical_doc_id);
+
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(namespace.table_id, stats.doc_identity.namespace_table_id);
+        try std.testing.expectEqual(namespace.shard_id, stats.doc_identity.namespace_shard_id);
+        try std.testing.expectEqual(namespace.range_id, stats.doc_identity.namespace_range_id);
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+        });
+        defer reopened.close();
+        try std.testing.expect(reopened.core.identity_namespace.eql(namespace));
+    }
+
+    try std.testing.expectError(error.IdentityNamespaceMismatch, DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .identity_namespace = .{ .table_id = 7, .shard_id = 11, .range_id = 14 },
+    }));
+}
+
+test "db lifecycle preferred identity namespace seeds new stores but preserves existing namespace" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var managed_path_buf: [256]u8 = undefined;
+    const managed_path = tempPath(&managed_path_buf);
+    defer cleanupTempDir(managed_path);
+
+    const managed_namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 7001, .range_id = 7001 };
+    {
+        var db = try DB.open(alloc, std.mem.span(managed_path), .{
+            .start_index_workers = false,
+            .identity_namespace = managed_namespace,
+            .prefer_existing_identity_namespace = true,
+        });
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
+        });
+        try std.testing.expect(db.core.identity_namespace.eql(managed_namespace));
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(managed_path), .{
+            .start_index_workers = false,
+            .identity_namespace = .{ .table_id = 7, .shard_id = 7002, .range_id = 7002 },
+            .prefer_existing_identity_namespace = true,
+        });
+        defer reopened.close();
+        try std.testing.expect(reopened.core.identity_namespace.eql(managed_namespace));
+    }
+
+    var legacy_path_buf: [256]u8 = undefined;
+    const legacy_path = tempPath(&legacy_path_buf);
+    defer cleanupTempDir(legacy_path);
+
+    {
+        var legacy = try DB.open(alloc, std.mem.span(legacy_path), .{
+            .start_index_workers = false,
+        });
+        defer legacy.close();
+        try legacy.batch(.{
+            .writes = &.{.{ .key = "doc:legacy", .value = "{\"name\":\"legacy\"}" }},
+        });
+    }
+
+    {
+        var opened = try DB.open(alloc, std.mem.span(legacy_path), .{
+            .start_index_workers = false,
+            .identity_namespace = managed_namespace,
+            .prefer_existing_identity_namespace = true,
+        });
+        defer opened.close();
+        try std.testing.expect(opened.core.identity_namespace.eql(doc_identity.default_namespace));
+    }
+}
+
+test "db lifecycle can reassign identity namespace for rebuild" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const doc_set = @import("doc_set.zig");
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const old_namespace = doc_identity.Namespace{ .table_id = 8, .shard_id = 801, .range_id = 8001 };
+    const new_namespace = doc_identity.Namespace{ .table_id = 8, .shard_id = 802, .range_id = 8002 };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .identity_namespace = old_namespace,
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
+    });
+
+    {
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:a")).?;
+        const state = (try doc_identity.lookupStateTxn(&txn, ordinal)).?;
+        try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(old_namespace, "doc:a"), state.canonical_doc_id);
+    }
+
+    try db.reassignIdentityNamespaceForInternalTransition(new_namespace);
+    try std.testing.expect(db.core.identity_namespace.eql(new_namespace));
+
+    {
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:a")).?;
+        const state = (try doc_identity.lookupStateTxn(&txn, ordinal)).?;
+        try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(new_namespace, "doc:a"), state.canonical_doc_id);
+        try std.testing.expectEqual(@as(u32, 1), ordinal);
+        try std.testing.expectEqual(@as(u64, 1), state.created_generation);
+    }
+
+    const stats = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(new_namespace.table_id, stats.doc_identity.namespace_table_id);
+    try std.testing.expectEqual(new_namespace.shard_id, stats.doc_identity.namespace_shard_id);
+    try std.testing.expectEqual(new_namespace.range_id, stats.doc_identity.namespace_range_id);
+    try std.testing.expect(!stats.doc_identity.rebuild_required);
+
+    const generation = try db.currentIdentityReadGenerationForRequest(null);
+    var filter = doc_set.ResolvedDocFilter{
+        .include = try doc_set.fromOrdinalsAlloc(alloc, &.{1}),
+    };
+    defer filter.deinit(alloc);
+
+    try std.testing.expectError(error.DocIdentityNamespaceMismatch, db.search(alloc, .{
+        .limit = 10,
+        .identity_read_generation = generation,
+        .resolved_doc_filter = &filter,
+        .resolved_doc_filter_wire_context = .{
+            .namespace = old_namespace,
+            .identity_read_generation = generation,
+        },
+    }));
+
+    var ok = try db.search(alloc, .{
+        .limit = 10,
+        .identity_read_generation = generation,
+        .resolved_doc_filter = &filter,
+        .resolved_doc_filter_wire_context = .{
+            .namespace = new_namespace,
+            .identity_read_generation = generation,
+        },
+    });
+    defer ok.deinit();
+    try std.testing.expectEqual(@as(u32, 1), ok.total_hits);
+}
+
+test "db lifecycle strict namespace reopen recovers after identity reassignment repair" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const doc_set = @import("doc_set.zig");
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const old_namespace = doc_identity.Namespace{ .table_id = 38, .shard_id = 3801, .range_id = 38001 };
+    const new_namespace = doc_identity.Namespace{ .table_id = 38, .shard_id = 3802, .range_id = 38002 };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .identity_namespace = old_namespace,
+        });
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
+        });
+    }
+
+    try std.testing.expectError(error.IdentityNamespaceMismatch, DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .identity_namespace = new_namespace,
+    }));
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .identity_namespace = old_namespace,
+        });
+        defer db.close();
+        try db.reassignIdentityNamespaceForInternalTransition(new_namespace);
+    }
+
+    {
+        var repaired = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .identity_namespace = new_namespace,
+        });
+        defer repaired.close();
+
+        var filtered = try repaired.search(alloc, .{
+            .query = .{ .match_all = {} },
+            .filter_doc_ids = &.{"doc:a"},
+            .filter_doc_ids_positive = true,
+            .limit = 10,
+        });
+        defer filtered.deinit();
+        try std.testing.expectEqual(@as(u32, 1), filtered.total_hits);
+        try std.testing.expectEqualStrings("doc:a", filtered.hits[0].id);
+        try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 1), filtered.hits[0].doc_ordinal);
+
+        var txn = try repaired.core.store.beginProbeTxn();
+        defer txn.abort();
+        const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:a")).?;
+        const state = (try doc_identity.lookupStateTxn(&txn, ordinal)).?;
+        try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(new_namespace, "doc:a"), state.canonical_doc_id);
+        try std.testing.expectEqual(@as(?doc_identity.DocOrdinal, null), try doc_identity.lookupCanonicalOrdinalTxn(&txn, doc_identity.canonicalDocIdForNamespace(old_namespace, "doc:a")));
+    }
+}
+
+test "db lifecycle identity namespace reassignment refreshes transaction recovery hook context" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const TxnResolverRecorder = db_test_support.TxnResolverRecorder;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const old_namespace = doc_identity.Namespace{ .table_id = 28, .shard_id = 2801, .range_id = 28001 };
+    const new_namespace = doc_identity.Namespace{ .table_id = 28, .shard_id = 2802, .range_id = 28002 };
+    var recorder = TxnResolverRecorder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .identity_namespace = old_namespace,
+        .transaction_recovery = .{
+            .enabled = true,
+            .interval_ms = 60_000,
+            .resolver_ctx = &recorder,
+            .resolve_participant_fn = TxnResolverRecorder.resolve,
+        },
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
+    });
+
+    const identity_ctx = db.transaction_recovery_identity_context orelse return error.TestExpectedEqual;
+    try std.testing.expect(identity_ctx.identity_namespace.eql(old_namespace));
+    try std.testing.expect(db.transaction_runtime.?.config.resolution_extra_hooks.build != null);
+    try std.testing.expectEqual(
+        @intFromPtr(identity_ctx),
+        @intFromPtr(db.transaction_runtime.?.config.resolution_extra_hooks.ctx.?),
+    );
+
+    try db.reassignIdentityNamespaceForInternalTransition(new_namespace);
+    try std.testing.expect(db.core.identity_namespace.eql(new_namespace));
+    try std.testing.expect(identity_ctx.identity_namespace.eql(new_namespace));
+
+    var txn = try db.core.store.beginProbeTxn();
+    defer txn.abort();
+    const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:a")).?;
+    const state = (try doc_identity.lookupStateTxn(&txn, ordinal)).?;
+    try std.testing.expectEqual(doc_identity.canonicalDocIdForNamespace(new_namespace, "doc:a"), state.canonical_doc_id);
+}
+
+test "db lifecycle setSchema refreshes transaction recovery relational mode context" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const TxnResolverRecorder = db_test_support.TxnResolverRecorder;
+    const schema_api_mod = @import("../../schema/mod.zig");
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var recorder = TxnResolverRecorder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .transaction_recovery = .{
+            .enabled = true,
+            .interval_ms = 60_000,
+            .resolver_ctx = &recorder,
+            .resolve_participant_fn = TxnResolverRecorder.resolve,
+        },
+    });
+    defer db.close();
+
+    const identity_ctx = db.transaction_recovery_identity_context orelse return error.TestExpectedEqual;
+    try std.testing.expect(!identity_ctx.relational_base_rows);
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try std.testing.expect(identity_ctx.relational_base_rows);
+}
+
+test "db lifecycle identity namespace reassignment is unavailable on status-only handles" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const old_namespace = doc_identity.Namespace{ .table_id = 18, .shard_id = 1801, .range_id = 18001 };
+    const new_namespace = doc_identity.Namespace{ .table_id = 18, .shard_id = 1802, .range_id = 18002 };
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .identity_namespace = old_namespace,
+        });
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
+        });
+    }
+
+    {
+        var status_db = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .status_only,
+            .start_index_workers = false,
+            .identity_namespace = old_namespace,
+        });
+        defer status_db.close();
+        try std.testing.expectError(error.ReadOnly, status_db.reassignIdentityNamespaceForInternalTransition(new_namespace));
+        const stats = try status_db.runtimeStatusStatsConsistent(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(old_namespace.table_id, stats.doc_identity.namespace_table_id);
+        try std.testing.expectEqual(old_namespace.shard_id, stats.doc_identity.namespace_shard_id);
+        try std.testing.expectEqual(old_namespace.range_id, stats.doc_identity.namespace_range_id);
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .identity_namespace = old_namespace,
+        });
+        defer reopened.close();
+        try std.testing.expect(reopened.core.identity_namespace.eql(old_namespace));
+    }
+}
+
+test "db lifecycle stats expose document identity coverage and tombstones" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" },
+            .{ .key = "doc:b", .value = "{\"name\":\"beta\"}" },
+        },
+    });
+
+    var resolved_existing = try db.internalResolveDocSetForIdsAlloc(alloc, &.{"doc:a"});
+    defer resolved_existing.deinit(alloc);
+    var resolved_missing = try db.internalResolveDocSetForIdsAlloc(alloc, &.{"doc:missing"});
+    defer resolved_missing.deinit(alloc);
+
+    const fast = try db.stats(alloc);
+    defer types.freeDBStats(alloc, fast);
+    try std.testing.expectEqual(@as(u32, 3), fast.doc_identity.next_ordinal);
+    try std.testing.expectEqual(@as(u64, 2), fast.doc_identity.allocated_ordinals);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(doc_identity.DocOrdinal) - 3), fast.doc_identity.ordinal_capacity_remaining);
+    try std.testing.expect(!fast.doc_identity.ordinal_capacity_exhausted);
+    try std.testing.expect(!fast.doc_identity.rebuild_required);
+    try std.testing.expect(!fast.doc_identity.complete);
+    try std.testing.expectEqual(@as(u64, 2), fast.doc_set_planning.resolved_set_count);
+    try std.testing.expectEqual(@as(u64, 1), fast.doc_set_planning.ordinal_list_count);
+    try std.testing.expectEqual(@as(u64, 1), fast.doc_set_planning.ordinal_list_docs);
+    try std.testing.expectEqual(@as(u64, 1), fast.doc_set_planning.doc_key_list_count);
+    try std.testing.expectEqual(@as(u64, 1), fast.doc_set_planning.doc_key_list_docs);
+    try std.testing.expectEqual(@as(u64, 1), fast.doc_set_planning.missing_ordinal_coverage_count);
+
+    try db.batch(.{
+        .deletes = &.{"doc:b"},
+    });
+
+    const diagnostic = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, diagnostic);
+    try std.testing.expect(diagnostic.doc_identity.complete);
+    try std.testing.expectEqual(@as(u32, 3), diagnostic.doc_identity.next_ordinal);
+    try std.testing.expectEqual(@as(u64, 2), diagnostic.doc_identity.allocated_ordinals);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(doc_identity.DocOrdinal) - 3), diagnostic.doc_identity.ordinal_capacity_remaining);
+    try std.testing.expect(!diagnostic.doc_identity.ordinal_capacity_exhausted);
+    try std.testing.expect(!diagnostic.doc_identity.rebuild_required);
+    try std.testing.expectEqual(@as(u64, 2), diagnostic.doc_identity.state_rows);
+    try std.testing.expectEqual(@as(u64, 1), diagnostic.doc_identity.live_ordinals);
+    try std.testing.expectEqual(@as(u64, 1), diagnostic.doc_identity.tombstone_ordinals);
+    try std.testing.expect(diagnostic.doc_identity.min_created_generation > 0);
+    try std.testing.expectEqual(diagnostic.doc_identity.min_created_generation, diagnostic.doc_identity.max_created_generation);
+    try std.testing.expect(diagnostic.doc_identity.min_deleted_generation > diagnostic.doc_identity.min_created_generation);
+    try std.testing.expectEqual(diagnostic.doc_identity.min_deleted_generation, diagnostic.doc_identity.max_deleted_generation);
+    try std.testing.expectEqual(@as(u64, 1), diagnostic.doc_identity.scanned_primary_docs);
+    try std.testing.expectEqual(@as(u64, 0), diagnostic.doc_identity.primary_docs_missing_ordinals);
+    try std.testing.expectEqual(@as(u64, 0), diagnostic.doc_identity.primary_docs_missing_identity_state);
+    try std.testing.expectEqual(@as(u64, 0), diagnostic.doc_identity.primary_docs_with_tombstone_ordinals);
+
+    const legacy_key = try internal_keys.documentKeyAlloc(alloc, "doc:legacy");
+    defer alloc.free(legacy_key);
+    try db.core.store.put(legacy_key, "{\"name\":\"legacy\"}");
+
+    const resurrected_key = try internal_keys.documentKeyAlloc(alloc, "doc:b");
+    defer alloc.free(resurrected_key);
+    try db.core.store.put(resurrected_key, "{\"name\":\"resurrected\"}");
+
+    const repaired_diagnostic = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, repaired_diagnostic);
+    try std.testing.expectEqual(@as(u64, 3), repaired_diagnostic.doc_identity.scanned_primary_docs);
+    try std.testing.expectEqual(@as(u64, 1), repaired_diagnostic.doc_identity.primary_docs_missing_ordinals);
+    try std.testing.expectEqual(@as(u64, 0), repaired_diagnostic.doc_identity.primary_docs_missing_identity_state);
+    try std.testing.expectEqual(@as(u64, 1), repaired_diagnostic.doc_identity.primary_docs_with_tombstone_ordinals);
+    try std.testing.expect(repaired_diagnostic.doc_identity.rebuild_required);
+}
+
+test "db lifecycle stats flag document identity ordinal capacity exhaustion" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    var value: [4]u8 = undefined;
+    std.mem.writeInt(u32, &value, std.math.maxInt(doc_identity.DocOrdinal), .big);
+    try db.core.store.put(internal_keys.identity_next_ordinal_key[0..], &value);
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(std.math.maxInt(doc_identity.DocOrdinal), stats.doc_identity.next_ordinal);
+    try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.ordinal_capacity_remaining);
+    try std.testing.expect(stats.doc_identity.ordinal_capacity_exhausted);
+    try std.testing.expect(stats.doc_identity.rebuild_required);
+
+    try std.testing.expectError(error.DocOrdinalExhausted, db.batch(.{
+        .writes = &.{.{ .key = "doc:overflow", .value = "{\"name\":\"overflow\"}" }},
+    }));
+}
+
 test "db lifecycle group created-at metadata is written once and readable" {
     const DB = @import("mod.zig").DB;
     const db_test_support = @import("test_support.zig");

@@ -161,6 +161,35 @@ fn dependOnAll(step: *std.Build.Step, dependencies: []const *std.Build.Step) voi
     }
 }
 
+const FilteredTestStepOptions = struct {
+    simple_runner: bool = false,
+};
+
+fn addFilteredTestStep(
+    b: *std.Build,
+    root_module: *std.Build.Module,
+    step_name: []const u8,
+    description: []const u8,
+    default_filters: []const []const u8,
+    options: FilteredTestStepOptions,
+) *std.Build.Step.Run {
+    const tests = if (options.simple_runner) b.addTest(.{
+        .root_module = root_module,
+        .filters = selectTestFilters(b, default_filters),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    }) else b.addTest(.{
+        .root_module = root_module,
+        .filters = selectTestFilters(b, default_filters),
+    });
+    const run = b.addRunArtifact(tests);
+    const step = b.step(step_name, description);
+    step.dependOn(&run.step);
+    return run;
+}
+
 fn addDelegatedPackageStep(
     b: *std.Build,
     package_step_prefix: []const u8,
@@ -3486,17 +3515,7 @@ pub fn build(b: *std.Build) void {
         "data runtime records HA standby replication round failures",
         "data runtime records HA standby apply failures without stopping run round",
     };
-    const lib_data_runtime_tests = b.addTest(.{
-        .root_module = data_runtime_test_mod,
-        .filters = selectTestFilters(b, &lib_data_runtime_default_filters),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_data_runtime_tests = b.addRunArtifact(lib_data_runtime_tests);
-    const lib_data_runtime_test_step = b.step("lib-data-runtime-test", "Run focused data runtime tests");
-    lib_data_runtime_test_step.dependOn(&run_lib_data_runtime_tests.step);
+    const run_lib_data_runtime_tests = addFilteredTestStep(b, data_runtime_test_mod, "lib-data-runtime-test", "Run focused data runtime tests", &lib_data_runtime_default_filters, .{ .simple_runner = true });
 
     const lib_data_storage_default_filters = [_][]const u8{
         "db split sync coordinator allocates destination identity namespace",
@@ -3506,147 +3525,72 @@ pub fn build(b: *std.Build) void {
         "db merge coordinator bootstraps relational rows and column entries",
         "db merge coordinator rollback reapplies target namespace for persisted reassignment opt-in",
     };
-    const lib_data_storage_tests = b.addTest(.{
-        .root_module = data_storage_test_mod,
-        .filters = selectTestFilters(b, &lib_data_storage_default_filters),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_data_storage_tests = b.addRunArtifact(lib_data_storage_tests);
-    const lib_data_storage_test_step = b.step("lib-data-storage-test", "Run focused data storage tests");
-    lib_data_storage_test_step.dependOn(&run_lib_data_storage_tests.step);
+    const run_lib_data_storage_tests = addFilteredTestStep(b, data_storage_test_mod, "lib-data-storage-test", "Run focused data storage tests", &lib_data_storage_default_filters, .{ .simple_runner = true });
 
-    const lib_db_enrichment_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "storage.db.enrichment.enrichment_runtime.test.db enrichment runtime ",
-            "storage.db.derived_async.test.db derived async ",
-            "storage.db.split_restore_test.test.db split cutover",
-            "storage.db.split_restore_test.test.db merge-style cutover",
-        },
-    });
-    const run_lib_db_enrichment_tests = b.addRunArtifact(lib_db_enrichment_tests);
-    const lib_db_enrichment_step = b.step("lib-db-enrichment-test", "Run root-module DB enrichment/replay/cutover tests");
-    lib_db_enrichment_step.dependOn(&run_lib_db_enrichment_tests.step);
+    _ = addFilteredTestStep(b, lib_test_mod, "lib-db-enrichment-test", "Run root-module DB enrichment/replay/cutover tests", &.{
+        "storage.db.enrichment.enrichment_runtime.test.db enrichment runtime ",
+        "storage.db.derived_async.test.db derived async ",
+        "storage.db.split_restore_test.test.db split cutover",
+        "storage.db.split_restore_test.test.db merge-style cutover",
+    }, .{});
 
-    const lib_db_enrichment_worker_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "storage.db.enrichment.enrichment_runtime.test.db enrichment runtime ",
-        },
-    });
-    const run_lib_db_enrichment_worker_tests = b.addRunArtifact(lib_db_enrichment_worker_tests);
-    const lib_db_enrichment_worker_step = b.step("lib-db-enrichment-worker-test", "Run root-module DB enrichment worker tests");
-    lib_db_enrichment_worker_step.dependOn(&run_lib_db_enrichment_worker_tests.step);
+    _ = addFilteredTestStep(b, lib_test_mod, "lib-db-enrichment-worker-test", "Run root-module DB enrichment worker tests", &.{
+        "storage.db.enrichment.enrichment_runtime.test.db enrichment runtime ",
+    }, .{});
 
-    const lib_db_enrichment_replay_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "storage.db.derived_async.test.db derived async ",
-        },
-    });
-    const run_lib_db_enrichment_replay_tests = b.addRunArtifact(lib_db_enrichment_replay_tests);
-    const lib_db_enrichment_replay_step = b.step("lib-db-enrichment-replay-test", "Run root-module DB enrichment replay tests");
-    lib_db_enrichment_replay_step.dependOn(&run_lib_db_enrichment_replay_tests.step);
+    _ = addFilteredTestStep(b, lib_test_mod, "lib-db-enrichment-replay-test", "Run root-module DB enrichment replay tests", &.{
+        "storage.db.derived_async.test.db derived async ",
+    }, .{});
 
-    const lib_db_enrichment_cutover_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "storage.db.split_restore_test.test.db split cutover",
-            "storage.db.split_restore_test.test.db merge-style cutover",
-        },
-    });
-    const run_lib_db_enrichment_cutover_tests = b.addRunArtifact(lib_db_enrichment_cutover_tests);
-    const lib_db_enrichment_cutover_step = b.step("lib-db-enrichment-cutover-test", "Run root-module DB enrichment cutover tests");
-    lib_db_enrichment_cutover_step.dependOn(&run_lib_db_enrichment_cutover_tests.step);
+    _ = addFilteredTestStep(b, lib_test_mod, "lib-db-enrichment-cutover-test", "Run root-module DB enrichment cutover tests", &.{
+        "storage.db.split_restore_test.test.db split cutover",
+        "storage.db.split_restore_test.test.db merge-style cutover",
+    }, .{});
 
-    const lib_db_enrichment_split_cutover_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "storage.db.split_restore_test.test.db split cutover enrichment ",
-        },
-    });
-    const run_lib_db_enrichment_split_cutover_tests = b.addRunArtifact(lib_db_enrichment_split_cutover_tests);
-    const lib_db_enrichment_split_cutover_step = b.step("lib-db-enrichment-split-cutover-test", "Run root-module DB enrichment split cutover tests");
-    lib_db_enrichment_split_cutover_step.dependOn(&run_lib_db_enrichment_split_cutover_tests.step);
+    _ = addFilteredTestStep(b, lib_test_mod, "lib-db-enrichment-split-cutover-test", "Run root-module DB enrichment split cutover tests", &.{
+        "storage.db.split_restore_test.test.db split cutover enrichment ",
+    }, .{});
 
-    const lib_db_enrichment_merge_cutover_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "storage.db.split_restore_test.test.db merge-style cutover enrichment ",
-        },
-    });
-    const run_lib_db_enrichment_merge_cutover_tests = b.addRunArtifact(lib_db_enrichment_merge_cutover_tests);
-    const lib_db_enrichment_merge_cutover_step = b.step("lib-db-enrichment-merge-cutover-test", "Run root-module DB enrichment merge cutover tests");
-    lib_db_enrichment_merge_cutover_step.dependOn(&run_lib_db_enrichment_merge_cutover_tests.step);
+    _ = addFilteredTestStep(b, lib_test_mod, "lib-db-enrichment-merge-cutover-test", "Run root-module DB enrichment merge cutover tests", &.{
+        "storage.db.split_restore_test.test.db merge-style cutover enrichment ",
+    }, .{});
 
-    const lib_db_enrichment_split_cutover_reopen_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{"storage.db.split_restore_test.test.db split cutover enrichment resume "},
-    });
-    const run_lib_db_enrichment_split_cutover_reopen_tests = b.addRunArtifact(lib_db_enrichment_split_cutover_reopen_tests);
-    const lib_db_enrichment_split_cutover_reopen_step = b.step("lib-db-enrichment-split-cutover-reopen-test", "Run root-module DB split cutover reopen test");
-    lib_db_enrichment_split_cutover_reopen_step.dependOn(&run_lib_db_enrichment_split_cutover_reopen_tests.step);
+    _ = addFilteredTestStep(b, lib_test_mod, "lib-db-enrichment-split-cutover-reopen-test", "Run root-module DB split cutover reopen test", &.{
+        "storage.db.split_restore_test.test.db split cutover enrichment resume ",
+    }, .{});
 
-    const lib_db_enrichment_merge_cutover_reopen_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{"storage.db.split_restore_test.test.db merge-style cutover enrichment resume "},
-    });
-    const run_lib_db_enrichment_merge_cutover_reopen_tests = b.addRunArtifact(lib_db_enrichment_merge_cutover_reopen_tests);
-    const lib_db_enrichment_merge_cutover_reopen_step = b.step("lib-db-enrichment-merge-cutover-reopen-test", "Run root-module DB merge cutover reopen test");
-    lib_db_enrichment_merge_cutover_reopen_step.dependOn(&run_lib_db_enrichment_merge_cutover_reopen_tests.step);
+    _ = addFilteredTestStep(b, lib_test_mod, "lib-db-enrichment-merge-cutover-reopen-test", "Run root-module DB merge cutover reopen test", &.{
+        "storage.db.split_restore_test.test.db merge-style cutover enrichment resume ",
+    }, .{});
 
-    const lib_db_query_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "storage.db.db.test.db full-text",
-            "storage.db.db.test.db dense ",
-            "storage.db.db.test.db sparse ",
-            "storage.db.db.test.db graph ",
-            "storage.db.db.test.db search ",
-            "storage.db.db.test.db document _edges",
-            "storage.db.db.test.db document _embeddings",
-            "storage.db.search_runtime.test.db search runtime indexing ",
-            "storage.db.search_runtime.test.db search runtime graph composition ",
-            "storage.db.search_runtime.test.db search runtime text schema ",
-            "storage.db.search_runtime.test.db search runtime identity ",
-        },
-    });
-    const run_lib_db_query_tests = b.addRunArtifact(lib_db_query_tests);
-    const lib_db_query_step = b.step("lib-db-query-test", "Run root-module DB query/indexing tests");
-    lib_db_query_step.dependOn(&run_lib_db_query_tests.step);
+    _ = addFilteredTestStep(b, lib_test_mod, "lib-db-query-test", "Run root-module DB query/indexing tests", &.{
+        "storage.db.db.test.db full-text",
+        "storage.db.db.test.db dense ",
+        "storage.db.db.test.db sparse ",
+        "storage.db.db.test.db graph ",
+        "storage.db.db.test.db search ",
+        "storage.db.db.test.db document _edges",
+        "storage.db.db.test.db document _embeddings",
+        "storage.db.search_runtime.test.db search runtime indexing ",
+        "storage.db.search_runtime.test.db search runtime graph composition ",
+        "storage.db.search_runtime.test.db search runtime text schema ",
+        "storage.db.search_runtime.test.db search runtime identity ",
+    }, .{});
 
-    const lib_db_result_shape_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{"db query result shape "},
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_db_result_shape_tests = b.addRunArtifact(lib_db_result_shape_tests);
-    const lib_db_result_shape_step = b.step("lib-db-result-shape-test", "Run focused DB query doc id boundary tests");
-    lib_db_result_shape_step.dependOn(&run_lib_db_result_shape_tests.step);
+    const run_lib_db_result_shape_tests = addFilteredTestStep(b, lib_test_mod, "lib-db-result-shape-test", "Run focused DB query doc id boundary tests", &.{
+        "db query result shape ",
+    }, .{ .simple_runner = true });
 
-    const lib_db_txn_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        // Keep DB refactor targets module/category scoped: move tests into
-        // owning modules and name them with stable prefixes instead of adding
-        // individual test titles here.
-        .filters = &.{
-            "storage.db.transactions.test.",
-            "storage.db.relational_integrity.test.db relational integrity transaction ",
-            "storage.db.relational_integrity.test.db relational integrity constraints ",
-            "storage.db.write_path.test.db write path ",
-            "storage.db.db.test.db writes and reads timestamp",
-            "storage.db.maintenance.ttl_runtime.test.",
-        },
-    });
-    const run_lib_db_txn_tests = b.addRunArtifact(lib_db_txn_tests);
-    const lib_db_txn_step = b.step("lib-db-txn-test", "Run focused DB write/TTL/transaction tests");
-    lib_db_txn_step.dependOn(&run_lib_db_txn_tests.step);
+    // DB refactor targets should stay module/category scoped: move tests into
+    // owning modules and name them with stable prefixes instead of adding
+    // individual test titles here.
+    _ = addFilteredTestStep(b, lib_test_mod, "lib-db-txn-test", "Run focused DB write/TTL/transaction tests", &.{
+        "storage.db.transactions.test.",
+        "storage.db.relational_integrity.test.db relational integrity transaction ",
+        "storage.db.relational_integrity.test.db relational integrity constraints ",
+        "storage.db.write_path.test.db write path ",
+        "storage.db.maintenance.ttl_runtime.test.",
+    }, .{});
 
     const lib_metadata_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -4599,9 +4543,9 @@ pub fn build(b: *std.Build) void {
             "near-u32 ordinal pressure preserves sparse high ordinal state through reassignment",
             "db stats flag document identity ordinal capacity exhaustion",
             "db stats expose document identity coverage and tombstones",
-            "db allocates final document ordinal with all index families present",
+            "db write path allocates final document ordinal with all index families present",
             "db lsm primary compaction preserves doc identity ordinals",
-            "db rejects new document writes at ordinal exhaustion for every sync level",
+            "db write path rejects new document writes at ordinal exhaustion for every sync level",
             "db transaction intent writes reject new documents at ordinal exhaustion",
             "db restore snapshot rejects invalid doc identity metadata",
             "db deferred restore rejects strict doc identity namespace mismatch",
@@ -5098,12 +5042,12 @@ pub fn build(b: *std.Build) void {
             "cache invalidates ownership move prefix without reviving pinned generations",
             "db text compaction preserves ordinal filters across reopen",
             "db lsm primary compaction preserves doc identity ordinals",
-            "db allocates final document ordinal with all index families present",
+            "db write path allocates final document ordinal with all index families present",
             "identity namespace reassignment preserves snapshot generations and rejects stale writers",
             "near-u32 ordinal pressure preserves sparse high ordinal state through reassignment",
             "index manager split handoff preserves interleaved write and query summaries",
             "db stats flag document identity ordinal capacity exhaustion",
-            "db rejects new document writes at ordinal exhaustion for every sync level",
+            "db write path rejects new document writes at ordinal exhaustion for every sync level",
             "db transaction intent writes reject new documents at ordinal exhaustion",
             "storage.db.search_runtime.test.db search runtime identity ",
             "doc filter wire rejects old required-field fixtures but tolerates additive fields",
@@ -5867,25 +5811,13 @@ pub fn build(b: *std.Build) void {
     const db_sim_default_filters = [_][]const u8{
         "storage.db.db_sim_test.test.",
     };
-    const db_sim_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = selectTestFilters(b, &db_sim_default_filters),
-    });
-    const run_db_sim_tests = b.addRunArtifact(db_sim_tests);
-    const db_sim_step = b.step("db-sim-test", "Run DB simulation and replay tests");
-    db_sim_step.dependOn(&run_db_sim_tests.step);
+    const run_db_sim_tests = addFilteredTestStep(b, db_test_mod, "db-sim-test", "Run DB simulation and replay tests", &db_sim_default_filters, .{});
     sim_test_step.dependOn(&run_db_sim_tests.step);
 
     const db_split_restore_lifecycle_default_filters = [_][]const u8{
         "storage.db.split_restore_test.test.",
     };
-    const db_split_restore_lifecycle_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = selectTestFilters(b, &db_split_restore_lifecycle_default_filters),
-    });
-    const run_db_split_restore_lifecycle_tests = b.addRunArtifact(db_split_restore_lifecycle_tests);
-    const db_split_restore_lifecycle_step = b.step("db-split-restore-lifecycle-test", "Run DB split/restore lifecycle regression tests");
-    db_split_restore_lifecycle_step.dependOn(&run_db_split_restore_lifecycle_tests.step);
+    _ = addFilteredTestStep(b, db_test_mod, "db-split-restore-lifecycle-test", "Run DB split/restore lifecycle regression tests", &db_split_restore_lifecycle_default_filters, .{});
 
     const storage_workload_sim_step = b.step("storage-sim-test", "Run legacy deterministic storage workload simulations that still use real storage I/O");
     storage_workload_sim_step.dependOn(&run_wal_sim_tests.step);
@@ -5918,105 +5850,49 @@ pub fn build(b: *std.Build) void {
         "storage.db.schema_runtime.test.",
         "storage.db.relational_integrity.test.",
     };
-    const db_schema_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = selectTestFilters(b, &db_schema_default_filters),
-    });
-    const run_db_schema_tests = b.addRunArtifact(db_schema_tests);
-    const db_schema_test_step = b.step("db-schema-test", "Run focused storage/db schema validation tests");
-    db_schema_test_step.dependOn(&run_db_schema_tests.step);
+    _ = addFilteredTestStep(b, db_test_mod, "db-schema-test", "Run focused storage/db schema validation tests", &db_schema_default_filters, .{});
 
     const db_write_path_default_filters = [_][]const u8{
         "storage.db.write_path.test.",
     };
-    const db_write_path_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = selectTestFilters(b, &db_write_path_default_filters),
-    });
-    const run_db_write_path_tests = b.addRunArtifact(db_write_path_tests);
-    const db_write_path_test_step = b.step("db-write-path-test", "Run focused storage/db write-path tests");
-    db_write_path_test_step.dependOn(&run_db_write_path_tests.step);
+    _ = addFilteredTestStep(b, db_test_mod, "db-write-path-test", "Run focused storage/db write-path tests", &db_write_path_default_filters, .{});
 
-    const db_foreign_key_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = selectTestFilters(b, &.{"foreign key"}),
-    });
-    const run_db_foreign_key_tests = b.addRunArtifact(db_foreign_key_tests);
-    const db_foreign_key_test_step = b.step("db-foreign-key-test", "Run focused storage/db foreign-key unit tests");
-    db_foreign_key_test_step.dependOn(&run_db_foreign_key_tests.step);
+    _ = addFilteredTestStep(b, db_test_mod, "db-foreign-key-test", "Run focused storage/db foreign-key unit tests", &.{
+        "foreign key",
+    }, .{});
 
     const db_temporal_default_filters = [_][]const u8{
         "storage.db.relational_integrity.test.db relational temporal",
     };
-    const db_temporal_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = selectTestFilters(b, &db_temporal_default_filters),
-    });
-    const run_db_temporal_tests = b.addRunArtifact(db_temporal_tests);
-    const db_temporal_test_step = b.step("db-temporal-test", "Run focused storage/db application-time temporal unit tests");
-    db_temporal_test_step.dependOn(&run_db_temporal_tests.step);
+    _ = addFilteredTestStep(b, db_test_mod, "db-temporal-test", "Run focused storage/db application-time temporal unit tests", &db_temporal_default_filters, .{});
 
     const db_relational_rows_default_filters = [_][]const u8{
         "storage.db.relational_rows.test.",
     };
-    const db_relational_rows_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = selectTestFilters(b, &db_relational_rows_default_filters),
-    });
-    const run_db_relational_rows_tests = b.addRunArtifact(db_relational_rows_tests);
-    const db_relational_rows_test_step = b.step("db-relational-rows-test", "Run focused storage/db relational row tests");
-    db_relational_rows_test_step.dependOn(&run_db_relational_rows_tests.step);
+    _ = addFilteredTestStep(b, db_test_mod, "db-relational-rows-test", "Run focused storage/db relational row tests", &db_relational_rows_default_filters, .{});
 
     const db_search_runtime_default_filters = [_][]const u8{
         "storage.db.search_runtime.test.",
     };
-    const db_search_runtime_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = selectTestFilters(b, &db_search_runtime_default_filters),
-    });
-    const run_db_search_runtime_tests = b.addRunArtifact(db_search_runtime_tests);
-    const db_search_runtime_test_step = b.step("db-search-runtime-test", "Run focused storage/db search runtime tests");
-    db_search_runtime_test_step.dependOn(&run_db_search_runtime_tests.step);
+    _ = addFilteredTestStep(b, db_test_mod, "db-search-runtime-test", "Run focused storage/db search runtime tests", &db_search_runtime_default_filters, .{});
 
     const db_lifecycle_default_filters = [_][]const u8{
         "storage.db.lifecycle.test.",
     };
-    const db_lifecycle_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = selectTestFilters(b, &db_lifecycle_default_filters),
-    });
-    const run_db_lifecycle_tests = b.addRunArtifact(db_lifecycle_tests);
-    const db_lifecycle_test_step = b.step("db-lifecycle-test", "Run focused storage/db lifecycle tests");
-    db_lifecycle_test_step.dependOn(&run_db_lifecycle_tests.step);
+    _ = addFilteredTestStep(b, db_test_mod, "db-lifecycle-test", "Run focused storage/db lifecycle tests", &db_lifecycle_default_filters, .{});
 
-    const lib_db_reopen_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = &.{
-            "storage.db.search_runtime.test.db search runtime reopen ",
-        },
-    });
-    const run_lib_db_reopen_tests = b.addRunArtifact(lib_db_reopen_tests);
-    const lib_db_reopen_step = b.step("lib-db-reopen-test", "Run root-module DB reopen/compaction tests");
-    lib_db_reopen_step.dependOn(&run_lib_db_reopen_tests.step);
+    _ = addFilteredTestStep(b, db_test_mod, "lib-db-reopen-test", "Run root-module DB reopen/compaction tests", &.{
+        "storage.db.search_runtime.test.db search runtime reopen ",
+    }, .{});
 
     const db_ttl_runtime_default_filters = [_][]const u8{
         "storage.db.maintenance.ttl_runtime.test.",
     };
-    const db_ttl_runtime_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = selectTestFilters(b, &db_ttl_runtime_default_filters),
-    });
-    const run_db_ttl_runtime_tests = b.addRunArtifact(db_ttl_runtime_tests);
-    const db_ttl_runtime_test_step = b.step("db-ttl-runtime-test", "Run focused storage/db TTL runtime tests");
-    db_ttl_runtime_test_step.dependOn(&run_db_ttl_runtime_tests.step);
+    _ = addFilteredTestStep(b, db_test_mod, "db-ttl-runtime-test", "Run focused storage/db TTL runtime tests", &db_ttl_runtime_default_filters, .{});
 
-    const db_enrichment_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = &.{"enrichment"},
-    });
-    const run_db_enrichment_tests = b.addRunArtifact(db_enrichment_tests);
-    const db_enrichment_test_step = b.step("db-enrichment-test", "Run storage/db enrichment-related unit tests");
-    db_enrichment_test_step.dependOn(&run_db_enrichment_tests.step);
+    _ = addFilteredTestStep(b, db_test_mod, "db-enrichment-test", "Run storage/db enrichment-related unit tests", &.{
+        "enrichment",
+    }, .{});
 
     const sparse_test_mod = makeLmdbModule(b, "pkg/antfly/src/sparse_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     sparse_test_mod.addImport("bloom", bloom_mod);

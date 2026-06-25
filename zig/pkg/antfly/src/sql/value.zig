@@ -304,13 +304,7 @@ pub fn parseSqlColumnValueAlloc(
     }
     if (parser.matchToken(tokens, pos, .placeholder)) |token| {
         const value = try boundSqlValue(token, params);
-        if (column.field_type == .json) {
-            return switch (value) {
-                .json => |json| try alloc.dupe(u8, json),
-                else => try value.jsonAlloc(alloc),
-            };
-        }
-        return try value.jsonAlloc(alloc);
+        return try boundSqlColumnValueJsonAlloc(alloc, value, column);
     }
     if (parser.matchToken(tokens, pos, .string)) |token| {
         if (column.field_type == .json) {
@@ -324,6 +318,43 @@ pub fn parseSqlColumnValueAlloc(
     if (parser.matchToken(tokens, pos, .number)) |token| return try alloc.dupe(u8, token.text);
     if (parser.matchToken(tokens, pos, .minus) != null) return try parseSqlNegativeNumberJsonAfterMinusAlloc(alloc, tokens, pos);
     return error.UnsupportedSqlShape;
+}
+
+fn boundSqlColumnValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    value: SqlValue,
+    column: runtime_schema.RelationalColumn,
+) ![]const u8 {
+    if (column.field_type == .json) {
+        return switch (value) {
+            .json => |json| try alloc.dupe(u8, json),
+            else => try value.jsonAlloc(alloc),
+        };
+    }
+    if (value == .string) {
+        const text = value.string;
+        switch (column.field_type) {
+            .numeric, .datetime => {
+                if (sqlStringIsJsonNumber(alloc, text)) return try alloc.dupe(u8, text);
+            },
+            .boolean => {
+                if (std.ascii.eqlIgnoreCase(text, "t") or
+                    std.ascii.eqlIgnoreCase(text, "true") or
+                    std.mem.eql(u8, text, "1"))
+                {
+                    return try alloc.dupe(u8, "true");
+                }
+                if (std.ascii.eqlIgnoreCase(text, "f") or
+                    std.ascii.eqlIgnoreCase(text, "false") or
+                    std.mem.eql(u8, text, "0"))
+                {
+                    return try alloc.dupe(u8, "false");
+                }
+            },
+            else => {},
+        }
+    }
+    return try value.jsonAlloc(alloc);
 }
 
 pub fn parseUuidV4ValueJsonAlloc(
@@ -1496,6 +1527,38 @@ test "sql adapter value parses limit offset and fetch values" {
     var fetch_number_pos: usize = 8;
     try std.testing.expectEqual(@as(?u32, 5), try parseFetchLimitValue(tokens[0..], &fetch_number_pos, params[0..]));
     try std.testing.expectEqual(@as(usize, 12), fetch_number_pos);
+}
+
+test "sql adapter value coerces text placeholders through column type" {
+    const alloc = std.testing.allocator;
+    const tokens = [_]Token{
+        .{ .kind = .placeholder, .text = "$1" },
+        .{ .kind = .placeholder, .text = "$2" },
+        .{ .kind = .placeholder, .text = "$3" },
+    };
+    const params = [_]SqlValue{
+        .{ .string = "42" },
+        .{ .string = "true" },
+        .{ .string = "42" },
+    };
+    const numeric_column: runtime_schema.RelationalColumn = .{ .name = "amount", .path = "amount", .field_type = .numeric };
+    const bool_column: runtime_schema.RelationalColumn = .{ .name = "active", .path = "active", .field_type = .boolean };
+    const text_column: runtime_schema.RelationalColumn = .{ .name = "label", .path = "label", .field_type = .text };
+
+    var numeric_pos: usize = 0;
+    const numeric_json = try parseSqlColumnValueAlloc(alloc, tokens[0..], &numeric_pos, params[0..], numeric_column, currentRealtimeNs());
+    defer alloc.free(numeric_json);
+    try std.testing.expectEqualStrings("42", numeric_json);
+
+    var bool_pos: usize = 1;
+    const bool_json = try parseSqlColumnValueAlloc(alloc, tokens[0..], &bool_pos, params[0..], bool_column, currentRealtimeNs());
+    defer alloc.free(bool_json);
+    try std.testing.expectEqualStrings("true", bool_json);
+
+    var text_pos: usize = 2;
+    const text_json = try parseSqlColumnValueAlloc(alloc, tokens[0..], &text_pos, params[0..], text_column, currentRealtimeNs());
+    defer alloc.free(text_json);
+    try std.testing.expectEqualStrings("\"42\"", text_json);
 }
 
 test "sql adapter value validates json values and defaults" {

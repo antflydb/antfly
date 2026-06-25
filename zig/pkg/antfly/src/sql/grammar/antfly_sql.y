@@ -481,6 +481,7 @@ unsupported_statement:
   | CREATE ACCESS METHOD diagnostic_tail_opt
   | CREATE FOREIGN DATA identifier_name diagnostic_tail_opt
   | CREATE FOREIGN TABLE diagnostic_tail_opt
+  | CREATE identifier_name TRIGGER diagnostic_tail_opt
   | CREATE identifier_name diagnostic_tail_opt
   | CREATE identifier_name identifier_name diagnostic_tail_opt
   | CREATE RULE diagnostic_tail_opt
@@ -489,6 +490,7 @@ unsupported_statement:
   | ALTER FOREIGN DATA identifier_name diagnostic_tail_opt
   | ALTER FOREIGN TABLE diagnostic_tail_opt
   | ALTER INDEX diagnostic_tail_opt
+  | ALTER identifier_name TRIGGER diagnostic_tail_opt
   | ALTER identifier_name identifier_name diagnostic_tail_opt
   | ALTER MATERIALIZED VIEW diagnostic_tail_opt
   | ALTER RULE diagnostic_tail_opt
@@ -498,6 +500,7 @@ unsupported_statement:
   | DROP ACCESS METHOD diagnostic_tail_opt
   | DROP FOREIGN DATA identifier_name diagnostic_tail_opt
   | DROP FOREIGN TABLE diagnostic_tail_opt
+  | DROP identifier_name TRIGGER diagnostic_tail_opt
   | DROP identifier_name diagnostic_tail_opt
   | DROP identifier_name identifier_name diagnostic_tail_opt
   | DROP OWNED diagnostic_tail_opt

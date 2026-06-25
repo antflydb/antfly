@@ -26108,6 +26108,26 @@ test "api http server applies prepared statement SQL plans to session runtime" {
     );
 }
 
+test "api http server decodes public sql params into owned sql values" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, "[\"open\",10,true,null,{\"ok\":true}]", .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .array);
+
+    var params = try ApiHttpServer.publicSqlParamsFromJsonAlloc(alloc, parsed.value.array.items);
+    defer params.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 5), params.values.len);
+    try std.testing.expect(params.values[0] == .string);
+    try std.testing.expectEqualStrings("open", params.values[0].string);
+    try std.testing.expect(params.values[1] == .integer);
+    try std.testing.expectEqual(@as(i64, 10), params.values[1].integer);
+    try std.testing.expect(params.values[2] == .bool);
+    try std.testing.expect(params.values[2].bool);
+    try std.testing.expect(params.values[3] == .null);
+    try std.testing.expect(params.values[4] == .json);
+    try std.testing.expectEqualStrings("{\"ok\":true}", params.values[4].json);
+}
+
 test "api http server exposes psql-style SQL session endpoint" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {

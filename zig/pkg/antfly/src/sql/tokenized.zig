@@ -1547,6 +1547,8 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         => true,
         .explain,
         .alter_index,
+        .alter_conversion,
+        .alter_event_trigger,
         .alter_foreign_data_wrapper,
         .alter_foreign_table,
         .alter_materialized_view,
@@ -1554,10 +1556,14 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .alter_rule,
         .alter_server,
         .alter_system,
+        .alter_statistics,
+        .alter_text_search_configuration,
         .alter_trigger,
         .alter_user_mapping,
         .checkpoint,
         .create_access_method,
+        .create_conversion,
+        .create_event_trigger,
         .create_foreign_data_wrapper,
         .create_foreign_table,
         .create_language,
@@ -1565,9 +1571,13 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .create_policy,
         .create_rule,
         .create_server,
+        .create_statistics,
+        .create_text_search_configuration,
         .create_user_mapping,
         .do_block,
         .drop_access_method,
+        .drop_conversion,
+        .drop_event_trigger,
         .drop_foreign_data_wrapper,
         .drop_foreign_table,
         .drop_language,
@@ -1576,6 +1586,8 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .drop_policy,
         .drop_rule,
         .drop_server,
+        .drop_statistics,
+        .drop_text_search_configuration,
         .drop_user_mapping,
         .load,
         .move,
@@ -2186,6 +2198,16 @@ test "sql adapter parsed sql owns typed statement variants" {
         reason: generated_parser.GeneratedSqlUnsupportedReason,
     }{
         .{
+            .sql = "ALTER CONVERSION usage_conv RENAME TO usage_conv_v2",
+            .kind = .alter_conversion,
+            .reason = .alter_conversion_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "ALTER EVENT TRIGGER usage_ddl_start DISABLE",
+            .kind = .alter_event_trigger,
+            .reason = .alter_event_trigger_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "ALTER INDEX usage_status_idx RENAME TO usage_status_idx_v2",
             .kind = .alter_index,
             .reason = .alter_index_not_planned_by_generated_parser,
@@ -2219,6 +2241,16 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "ALTER SYSTEM SET work_mem = '64MB'",
             .kind = .alter_system,
             .reason = .alter_system_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "ALTER STATISTICS usage_stats SET STATISTICS 100",
+            .kind = .alter_statistics,
+            .reason = .alter_statistics_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "ALTER TEXT SEARCH CONFIGURATION usage_search RENAME TO usage_search_v2",
+            .kind = .alter_text_search_configuration,
+            .reason = .alter_text_search_configuration_not_planned_by_generated_parser,
         },
         .{
             .sql = "ALTER TRIGGER usage_audit ON usage_records RENAME TO usage_audit_v2",
@@ -2266,6 +2298,16 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .create_access_method_not_planned_by_generated_parser,
         },
         .{
+            .sql = "CREATE CONVERSION usage_conv FOR 'UTF8' TO 'LATIN1' FROM utf8_to_latin1",
+            .kind = .create_conversion,
+            .reason = .create_conversion_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "CREATE EVENT TRIGGER usage_ddl_start ON ddl_command_start EXECUTE FUNCTION audit_ddl()",
+            .kind = .create_event_trigger,
+            .reason = .create_event_trigger_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "CREATE FOREIGN TABLE foreign_usage_records (id text) SERVER usage_fdw",
             .kind = .create_foreign_table,
             .reason = .create_foreign_table_not_planned_by_generated_parser,
@@ -2289,6 +2331,16 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "CREATE SERVER usage_server FOREIGN DATA WRAPPER postgres_fdw",
             .kind = .create_server,
             .reason = .create_server_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "CREATE STATISTICS usage_stats ON tenant_id, status FROM usage_records",
+            .kind = .create_statistics,
+            .reason = .create_statistics_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "CREATE TEXT SEARCH CONFIGURATION usage_search (COPY = pg_catalog.english)",
+            .kind = .create_text_search_configuration,
+            .reason = .create_text_search_configuration_not_planned_by_generated_parser,
         },
         .{
             .sql = "CREATE TRIGGER usage_audit BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage()",
@@ -2326,6 +2378,16 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .drop_access_method_not_planned_by_generated_parser,
         },
         .{
+            .sql = "DROP CONVERSION IF EXISTS usage_conv",
+            .kind = .drop_conversion,
+            .reason = .drop_conversion_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "DROP EVENT TRIGGER IF EXISTS usage_ddl_start",
+            .kind = .drop_event_trigger,
+            .reason = .drop_event_trigger_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "DROP LANGUAGE IF EXISTS usage_lang CASCADE",
             .kind = .drop_language,
             .reason = .drop_language_not_planned_by_generated_parser,
@@ -2334,6 +2396,16 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "DROP OWNED BY usage_role CASCADE",
             .kind = .drop_owned,
             .reason = .drop_owned_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "DROP STATISTICS IF EXISTS usage_stats",
+            .kind = .drop_statistics,
+            .reason = .drop_statistics_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "DROP TEXT SEARCH CONFIGURATION IF EXISTS usage_search",
+            .kind = .drop_text_search_configuration,
+            .reason = .drop_text_search_configuration_not_planned_by_generated_parser,
         },
         .{
             .sql = "FETCH FROM usage_cursor",
@@ -2439,7 +2511,17 @@ test "sql adapter parsed sql owns typed statement variants" {
     for (unsupported_diagnostics) |case| {
         var parsed = try ParsedSql.initAlloc(alloc, case.sql);
         defer parsed.deinit(alloc);
-        try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.unsupported, parsed.generatedStatementKind().?);
+        const generated_kind = parsed.generatedStatementKind() orelse {
+            std.debug.print("missing generated unsupported statement for SQL: {s}\n", .{case.sql});
+            if (try generated_parser.diagnosticAlloc(alloc, parsed.items())) |diagnostic| {
+                defer alloc.free(diagnostic.expected);
+                std.debug.print("generated diagnostic at token {d} actual {s}; expected:", .{ diagnostic.token_index, diagnostic.actual });
+                for (diagnostic.expected) |expected| std.debug.print(" {s}", .{expected});
+                std.debug.print("\n", .{});
+            }
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.unsupported, generated_kind);
         switch (parsed.generated_statement.?.ast.?) {
             .unsupported => |unsupported| {
                 try std.testing.expectEqual(case.kind, unsupported.kind);
