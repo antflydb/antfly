@@ -3274,6 +3274,10 @@ pub fn ddlPlanFromGeneratedAstAlloc(
         .alter_domain,
         .drop_domain,
         => try domainCatalogPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options),
+        .create_sequence,
+        .alter_sequence,
+        .drop_sequence,
+        => try sequenceCatalogPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options),
         .create_index => .{ .create_index = try createIndexPlanFromGeneratedAstAlloc(alloc, tokens, ast, options.create_index_options) },
         .alter_table => if (generatedAlterTableUsesRowSecurityRuntimeBoundary(tokens, ast))
             .{ .row_security_catalog = .{ .alter_table = try rowSecurityAlterTablePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } }
@@ -3291,12 +3295,15 @@ fn generatedDdlUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated
         .create_schema,
         .create_view,
         .create_domain,
+        .create_sequence,
         .create_extension,
         .alter_view,
         .alter_domain,
+        .alter_sequence,
         .drop_table,
         .drop_view,
         .drop_domain,
+        .drop_sequence,
         .drop_index,
         .drop_schema,
         .drop_database,
@@ -3480,6 +3487,84 @@ fn validateGeneratedDomainDdlAst(tokens: []const grammar.Token, ast: generated_p
         },
         .drop_domain => {
             if (end < 3 or !tokens[0].matchesKeyword("drop") or !tokens[1].matchesKeyword("domain")) return error.UnsupportedSqlShape;
+            var name_index: usize = 2;
+            const if_exists = consumeGeneratedPlanIfExists(tokens, &name_index, end);
+            if (if_exists != ast.if_exists) return error.UnsupportedSqlShape;
+            if (object_name.start != name_index) return error.UnsupportedSqlShape;
+            const has_cascade = generatedRangeHasKeyword(tokens, .{ .start = object_name.end, .end = end }, "cascade");
+            if (has_cascade != ast.cascade) return error.UnsupportedSqlShape;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
+fn sequenceCatalogPlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+    options: DdlPlanParserOptions,
+) !LoweredDdlPlan {
+    try validateGeneratedSequenceDdlAst(tokens, ast);
+    var pos: usize = 0;
+    var plan = try parseDdlPlanAlloc(alloc, tokens, &pos, options);
+    errdefer plan.deinit(alloc);
+    if (pos != tokens.len) return error.UnsupportedSqlShape;
+    switch (ast.kind) {
+        .create_sequence => switch (plan) {
+            .sequence_catalog => |catalog| switch (catalog) {
+                .create => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .alter_sequence => switch (plan) {
+            .sequence_catalog => |catalog| switch (catalog) {
+                .alter => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .drop_sequence => switch (plan) {
+            .sequence_catalog => |catalog| switch (catalog) {
+                .drop => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+    return plan;
+}
+
+fn validateGeneratedSequenceDdlAst(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) !void {
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    const object_name = ast.object_name_tokens orelse return error.UnsupportedSqlShape;
+    if (object_name.start >= object_name.end or object_name.end > end) return error.UnsupportedSqlShape;
+    switch (ast.kind) {
+        .create_sequence => {
+            if (end < 3 or !tokens[0].matchesKeyword("create") or !tokens[1].matchesKeyword("sequence")) return error.UnsupportedSqlShape;
+            var name_index: usize = 2;
+            const if_not_exists = consumeGeneratedPlanIfNotExists(tokens, &name_index, end);
+            if (if_not_exists != ast.if_not_exists) return error.UnsupportedSqlShape;
+            if (object_name.start != name_index) return error.UnsupportedSqlShape;
+            if (object_name.end < end) {
+                const operation = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+                if (operation.start != object_name.end or operation.end != end) return error.UnsupportedSqlShape;
+            } else if (ast.alter_table_operation_tokens != null) {
+                return error.UnsupportedSqlShape;
+            }
+        },
+        .alter_sequence => {
+            if (end < 4 or !tokens[0].matchesKeyword("alter") or !tokens[1].matchesKeyword("sequence")) return error.UnsupportedSqlShape;
+            var name_index: usize = 2;
+            const if_exists = consumeGeneratedPlanIfExists(tokens, &name_index, end);
+            if (if_exists != ast.if_exists) return error.UnsupportedSqlShape;
+            if (object_name.start != name_index) return error.UnsupportedSqlShape;
+            const operation = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+            if (operation.start != object_name.end or operation.end != end or operation.start >= end) return error.UnsupportedSqlShape;
+        },
+        .drop_sequence => {
+            if (end < 3 or !tokens[0].matchesKeyword("drop") or !tokens[1].matchesKeyword("sequence")) return error.UnsupportedSqlShape;
             var name_index: usize = 2;
             const if_exists = consumeGeneratedPlanIfExists(tokens, &name_index, end);
             if (if_exists != ast.if_exists) return error.UnsupportedSqlShape;
@@ -4112,6 +4197,7 @@ fn validateGeneratedDdlAstSpans(
         .create_table,
         .create_view,
         .create_domain,
+        .create_sequence,
         .create_index,
         .create_extension,
         .create_graph_index,
@@ -4121,10 +4207,12 @@ fn validateGeneratedDdlAstSpans(
         .alter_table,
         .alter_view,
         .alter_domain,
+        .alter_sequence,
         => .alter,
         .drop_table,
         .drop_view,
         .drop_domain,
+        .drop_sequence,
         .drop_index,
         .drop_schema,
         .drop_database,
@@ -12337,6 +12425,44 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var drop_sequence = try lowerDdlPlanForTestAlloc(alloc, "DROP SEQUENCE IF EXISTS users_owned_id_seq CASCADE;");
+    defer drop_sequence.deinit(alloc);
+    switch (drop_sequence) {
+        .sequence_catalog => |plan| switch (plan) {
+            .drop => |drop| {
+                try std.testing.expectEqualStrings("users_owned_id_seq", drop.sequence_name);
+                try std.testing.expect(drop.if_exists);
+                try std.testing.expect(drop.cascade);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var malformed_generated_create_sequence = try tokenized.ParsedSql.initAlloc(alloc, "CREATE SEQUENCE users_owned_id_seq AS bigint START WITH 10;");
+    defer malformed_generated_create_sequence.deinit(alloc);
+    if (malformed_generated_create_sequence.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.object_name_tokens = .{ .start = 1, .end = 2 },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_generated_create_sequence));
+
+    var malformed_generated_alter_sequence = try tokenized.ParsedSql.initAlloc(alloc, "ALTER SEQUENCE users_owned_id_seq RESTART WITH 1000;");
+    defer malformed_generated_alter_sequence.deinit(alloc);
+    if (malformed_generated_alter_sequence.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.alter_table_operation_tokens = .{ .start = 2, .end = malformed_generated_alter_sequence.items().len },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_generated_alter_sequence));
 
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "CREATE SEQUENCE users_id_seq NO MINVALUE MINVALUE 1;"));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "CREATE SEQUENCE users_id_seq NO MAXVALUE MAXVALUE 100;"));
