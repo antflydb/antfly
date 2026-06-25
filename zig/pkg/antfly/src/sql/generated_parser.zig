@@ -1512,6 +1512,8 @@ pub const simple_ddl_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CREATE SCHEMA IF NOT EXISTS analytics", .kind = .ddl },
     .{ .sql = "CREATE TABLE usage_records (id text PRIMARY KEY, status text DEFAULT 'open')", .kind = .ddl },
     .{ .sql = "CREATE TABLE IF NOT EXISTS usage_records (id text PRIMARY KEY)", .kind = .ddl },
+    .{ .sql = "CREATE TEMP TABLE usage_session_records (id uuid PRIMARY KEY, status text)", .kind = .ddl },
+    .{ .sql = "CREATE UNLOGGED TABLE IF NOT EXISTS usage_ingest_records (id uuid PRIMARY KEY, payload jsonb)", .kind = .ddl },
     .{ .sql = "SELECT account_id, total INTO public.usage_archive FROM usage_records WHERE total > 10", .kind = .ddl },
     .{ .sql = "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT account_id FROM usage_records WITH NO DATA", .kind = .ddl },
     .{ .sql = "ALTER TABLE usage_records ADD COLUMN status text", .kind = .ddl },
@@ -1914,6 +1916,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.deallocate)) return .{ .prepared = .deallocate };
     if (first.matchesKeywordTag(.create) and tokens.len > 1) {
         if (generatedCreateTableAsTargetRange(tokens, 0, statementTokenEnd(tokens)) != null) return .{ .ddl = .relation_population };
+        if (generatedCreateTableTargetRange(tokens, 0, statementTokenEnd(tokens)) != null) return .{ .ddl = .create_table };
         const second = tokens[1];
         if (second.matchesKeywordTag(.database)) return .{ .ddl = .create_database };
         if (second.matchesKeywordTag(.schema)) return .{ .ddl = .create_schema };
@@ -2073,6 +2076,15 @@ fn generatedCreateTableAsTargetRange(tokens: []const token_mod.Token, start: usi
     index = target.end;
     if (index >= end or !tokens[index].matchesKeywordTag(.as)) return null;
     return target;
+}
+
+fn generatedCreateTableTargetRange(tokens: []const token_mod.Token, start: usize, end: usize) ?GeneratedSqlTokenRange {
+    var index = start + 1;
+    consumeGeneratedRelationLifetime(tokens, &index, end);
+    if (index >= end or !tokens[index].matchesKeywordTag(.table)) return null;
+    index += 1;
+    _ = consumeGeneratedIfNotExists(tokens, &index, end);
+    return generatedQualifiedNameRange(tokens, index, end);
 }
 
 fn consumeGeneratedRelationLifetime(tokens: []const token_mod.Token, index: *usize, end: usize) void {
@@ -2380,6 +2392,13 @@ fn buildDdlAst(
             if (index + 1 < end and tokens[index].matchesKeyword("version") and tokens[index + 1].kind == .string) {
                 ast.version_tokens = .{ .start = index + 1, .end = index + 2 };
             }
+        },
+        .create_table => {
+            index = 1;
+            consumeGeneratedRelationLifetime(tokens, &index, end);
+            if (index < end and tokens[index].matchesKeywordTag(.table)) index += 1;
+            ast.if_not_exists = consumeGeneratedIfNotExists(tokens, &index, end);
+            ast.object_name_tokens = generatedQualifiedNameRange(tokens, index, end);
         },
         .create_index => {
             if (tokens.len > 2 and tokens[1].matchesKeywordTag(.unique) and tokens[2].matchesKeywordTag(.index)) {
@@ -5685,6 +5704,8 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .transaction = .rollback }, (try parseSqlAlloc(alloc, "ROLLBACK")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .prepared = .execute }, (try parseSqlAlloc(alloc, "EXECUTE read_stmt()")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_table }, (try parseSqlAlloc(alloc, "CREATE TABLE usage_records (id text)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_table }, (try parseSqlAlloc(alloc, "CREATE TEMP TABLE usage_session_records (id uuid)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_table }, (try parseSqlAlloc(alloc, "CREATE UNLOGGED TABLE IF NOT EXISTS usage_ingest_records (id uuid)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .relation_population }, (try parseSqlAlloc(alloc, "SELECT account_id, total INTO usage_archive FROM usage_records WHERE total > 10")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .relation_population }, (try parseSqlAlloc(alloc, "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT account_id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_schema }, (try parseSqlAlloc(alloc, "DROP SCHEMA analytics CASCADE")).statement);
@@ -5792,6 +5813,19 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqualStrings("CREATE", spanText(ddl_sql, ddl.command_span));
             try std.testing.expect(ddl.if_not_exists);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, ddl.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const create_unlogged_table_sql = "CREATE UNLOGGED TABLE IF NOT EXISTS usage_ingest_records (id uuid)";
+    const create_unlogged_table_result = try parseSqlAlloc(alloc, create_unlogged_table_sql);
+    switch (create_unlogged_table_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.create_table, ddl.kind);
+            try std.testing.expectEqualStrings(create_unlogged_table_sql, spanText(create_unlogged_table_sql, ddl.statement_span));
+            try std.testing.expectEqualStrings("CREATE", spanText(create_unlogged_table_sql, ddl.command_span));
+            try std.testing.expect(ddl.if_not_exists);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, ddl.object_name_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

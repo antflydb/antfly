@@ -65,6 +65,9 @@ also validates the retained statement span, command span, and command-kind
 metadata before dispatching to catalog, table, index, or alter-table planning.
 Generated AST-to-plan parity also covers seed `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, and `DROP INDEX`
 forms using the same parser options as the existing lowerer. Generated
+`CREATE TABLE` classification now includes `TEMP`/`TEMPORARY` and `UNLOGGED`
+relation-lifetime prefixes with retained target-name spans.
+Generated
 `CREATE INDEX` ASTs also retain
 `UNIQUE`, method, element-list, covering-index `INCLUDE (...)`, options, and
 partial-index `WHERE ...` token ranges and generated-first create-index

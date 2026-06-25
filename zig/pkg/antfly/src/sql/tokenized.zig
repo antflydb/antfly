@@ -1370,6 +1370,18 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .ddl), std.meta.activeTag(generated_create_table_as.statement));
+
+    var generated_lifetime_table = try ParsedSql.initAlloc(alloc, "CREATE UNLOGGED TABLE IF NOT EXISTS usage_ingest_records (id uuid)");
+    defer generated_lifetime_table.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, generated_lifetime_table.generatedStatementKind().?);
+    switch (generated_lifetime_table.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_table, ddl_ast.kind);
+            try std.testing.expect(ddl_ast.if_not_exists);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .ddl), std.meta.activeTag(generated_lifetime_table.statement));
 }
 
 test "sql adapter parsed sql builds non-contiguous child statements from parent tokens" {
