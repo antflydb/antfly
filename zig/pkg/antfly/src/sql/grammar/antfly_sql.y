@@ -378,12 +378,12 @@ insert_statement:
   ;
 
 update_statement:
-    UPDATE qualified_name SET assignment_list where_clause_opt returning_clause_opt
-  | UPDATE qualified_name SET assignment_list FROM table_reference_list where_clause_opt returning_clause_opt
+    UPDATE qualified_name SET assignment_list where_clause_opt row_lock_clause_opt returning_clause_opt
+  | UPDATE qualified_name SET assignment_list FROM table_reference_list where_clause_opt row_lock_clause_opt returning_clause_opt
   ;
 
 delete_statement:
-    DELETE FROM qualified_name using_clause_opt where_clause_opt returning_clause_opt
+    DELETE FROM qualified_name using_clause_opt where_clause_opt row_lock_clause_opt returning_clause_opt
   ;
 
 truncate_statement:
@@ -407,7 +407,12 @@ truncate_identity_opt:
   ;
 
 merge_statement:
-    MERGE INTO qualified_name USING table_reference ON expression merge_action_list
+    MERGE INTO qualified_name table_alias_opt USING table_reference ON expression merge_action_list returning_clause_opt
+  ;
+
+table_alias_opt:
+    /* empty */
+  | AS identifier_name
   ;
 
 read_statement:
@@ -874,9 +879,16 @@ merge_action_list:
   ;
 
 merge_action:
-    WHEN MATCHED THEN UPDATE SET assignment_list
-  | WHEN MATCHED THEN DELETE
-  | WHEN NOT MATCHED THEN INSERT insert_columns_opt VALUES value_tuple
+    WHEN MATCHED merge_condition_opt THEN UPDATE SET assignment_list
+  | WHEN MATCHED merge_condition_opt THEN DELETE
+  | WHEN MATCHED merge_condition_opt THEN DO NOTHING
+  | WHEN NOT MATCHED merge_condition_opt THEN INSERT insert_columns_opt VALUES value_tuple
+  | WHEN NOT MATCHED merge_condition_opt THEN DO NOTHING
+  ;
+
+merge_condition_opt:
+    /* empty */
+  | AND expression
   ;
 
 index_method_opt:

@@ -13279,7 +13279,9 @@ fn updateJoinedSourceFromGeneratedDmlAstAlloc(
     const tokens = parsed_sql.items();
     const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     try validateGeneratedUpdateJoinedRanges(tokens, ast, end);
-    try validateGeneratedDmlRelationSourceBodyAlloc(alloc, parsed_sql, ast);
+    if (ast.source_tokens != null) {
+        try validateGeneratedDmlRelationSourceBodyAlloc(alloc, parsed_sql, ast);
+    }
 
     const parser_context = @import("parser_context.zig");
     var parser_state = parser_context.ParserState{
@@ -13323,7 +13325,9 @@ fn deleteJoinedSourceFromGeneratedDmlAstAlloc(
     const tokens = parsed_sql.items();
     const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     try validateGeneratedDeleteJoinedRanges(tokens, ast, end);
-    try validateGeneratedDmlRelationSourceBodyAlloc(alloc, parsed_sql, ast);
+    if (ast.source_tokens != null) {
+        try validateGeneratedDmlRelationSourceBodyAlloc(alloc, parsed_sql, ast);
+    }
 
     const parser_context = @import("parser_context.zig");
     var parser_state = parser_context.ParserState{
@@ -13361,11 +13365,14 @@ fn validateGeneratedUpdateJoinedRanges(
     const assignments_range = ast.assignments_tokens orelse return error.UnsupportedSqlShape;
     if (assignments_range.start == 0 or assignments_range.start >= assignments_range.end or assignments_range.end > end) return error.UnsupportedSqlShape;
     if (!tokens[assignments_range.start - 1].matchesKeywordTag(.set)) return error.UnsupportedSqlShape;
-    const source_range = ast.source_tokens orelse return error.UnsupportedSqlShape;
-    if (source_range.start == 0 or source_range.start >= source_range.end or source_range.end > end) return error.UnsupportedSqlShape;
-    if (!tokens[source_range.start - 1].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
-    if (source_range.start - 1 != assignments_range.end) return error.UnsupportedSqlShape;
-    try validateGeneratedJoinedTailRanges(tokens, end, source_range.end, ast.where_tokens, ast.returning_tokens);
+    if (ast.source_tokens) |source_range| {
+        if (source_range.start == 0 or source_range.start >= source_range.end or source_range.end > end) return error.UnsupportedSqlShape;
+        if (!tokens[source_range.start - 1].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
+        if (source_range.start - 1 != assignments_range.end) return error.UnsupportedSqlShape;
+        try validateGeneratedJoinedTailRanges(tokens, end, source_range.end, ast.where_tokens, ast.returning_tokens);
+    } else {
+        try validateGeneratedJoinedTailRanges(tokens, end, assignments_range.end, ast.where_tokens, ast.returning_tokens);
+    }
 }
 
 fn validateGeneratedDeleteJoinedRanges(
@@ -13376,11 +13383,14 @@ fn validateGeneratedDeleteJoinedRanges(
     const start = try generatedDmlCommandStart(tokens, ast, end);
     if (start + 6 >= end or !tokens[start].matchesKeywordTag(.delete) or !tokens[start + 1].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
     const target_range = try requireGeneratedDmlTokenRangeAt(ast.target_table_tokens, start + 2, end);
-    const source_range = ast.source_tokens orelse return error.UnsupportedSqlShape;
-    if (source_range.start == 0 or source_range.start >= source_range.end or source_range.end > end) return error.UnsupportedSqlShape;
-    if (!tokens[source_range.start - 1].matchesKeywordTag(.using)) return error.UnsupportedSqlShape;
-    if (source_range.start - 1 != target_range.end) return error.UnsupportedSqlShape;
-    try validateGeneratedJoinedTailRanges(tokens, end, source_range.end, ast.where_tokens, ast.returning_tokens);
+    if (ast.source_tokens) |source_range| {
+        if (source_range.start == 0 or source_range.start >= source_range.end or source_range.end > end) return error.UnsupportedSqlShape;
+        if (!tokens[source_range.start - 1].matchesKeywordTag(.using)) return error.UnsupportedSqlShape;
+        if (source_range.start - 1 != target_range.end) return error.UnsupportedSqlShape;
+        try validateGeneratedJoinedTailRanges(tokens, end, source_range.end, ast.where_tokens, ast.returning_tokens);
+    } else {
+        try validateGeneratedJoinedTailRanges(tokens, end, target_range.end, ast.where_tokens, ast.returning_tokens);
+    }
 }
 
 fn validateGeneratedJoinedTailRanges(

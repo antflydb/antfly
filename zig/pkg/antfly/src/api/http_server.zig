@@ -6632,7 +6632,12 @@ pub const ApiHttpServer = struct {
     }
 
     fn postgresCompatibilityTokenTextMatches(token: anytype, expected: []const u8) bool {
-        return token.kind == .identifier and std.ascii.eqlIgnoreCase(token.text, expected);
+        if (token.kind != .identifier) return false;
+        if (std.ascii.eqlIgnoreCase(token.text, expected)) return true;
+        const dot = std.mem.indexOfScalar(u8, token.text, '.') orelse return false;
+        if (std.mem.indexOfScalar(u8, token.text[dot + 1 ..], '.') != null) return false;
+        return std.ascii.eqlIgnoreCase(token.text[0..dot], "pg_catalog") and
+            std.ascii.eqlIgnoreCase(token.text[dot + 1 ..], expected);
     }
 
     fn postgresCompatibilityOptionalAliasOnly(tokens: anytype) bool {

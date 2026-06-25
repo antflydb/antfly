@@ -267,8 +267,10 @@ def test_pgwire_postgres_compatibility_probes_return_rows(pgwire_server):
     with socket.create_connection((pgwire_server.host, pgwire_server.pgwire_port), timeout=5) as sock:
         _pgwire_startup(sock)
         version_messages = _pgwire_simple_query(sock, "SELECT version();")
+        catalog_version_messages = _pgwire_simple_query(sock, "SELECT pg_catalog.version();")
         server_version_messages = _pgwire_simple_query(sock, "SHOW server_version;")
         current_setting_messages = _pgwire_simple_query(sock, "SELECT current_setting('server_version_num');")
+        catalog_current_setting_messages = _pgwire_simple_query(sock, "SELECT pg_catalog.current_setting('server_version_num');")
         search_path_messages = _pgwire_simple_query(sock, "SHOW search_path;")
         show_all_messages = _pgwire_simple_query(sock, "SHOW ALL;")
 
@@ -279,6 +281,14 @@ def test_pgwire_postgres_compatibility_probes_return_rows(pgwire_server):
     assert len(version_rows) == 1
     assert "Antfly" in version_rows[0][0]
     assert [message["tag"] for message in version_messages if message["type"] == "command"] == ["SELECT 1"]
+
+    assert [message for message in catalog_version_messages if message["type"] == "columns"] == [
+        {"type": "columns", "columns": ["version"], "oids": [PG_TEXT_OID]}
+    ]
+    catalog_version_rows = [message["values"] for message in catalog_version_messages if message["type"] == "row"]
+    assert len(catalog_version_rows) == 1
+    assert "Antfly" in catalog_version_rows[0][0]
+    assert [message["tag"] for message in catalog_version_messages if message["type"] == "command"] == ["SELECT 1"]
 
     assert [message for message in server_version_messages if message["type"] == "columns"] == [
         {"type": "columns", "columns": ["server_version"], "oids": [PG_TEXT_OID]}
@@ -291,6 +301,12 @@ def test_pgwire_postgres_compatibility_probes_return_rows(pgwire_server):
     ]
     assert [message["values"] for message in current_setting_messages if message["type"] == "row"] == [["160000"]]
     assert [message["tag"] for message in current_setting_messages if message["type"] == "command"] == ["SELECT 1"]
+
+    assert [message for message in catalog_current_setting_messages if message["type"] == "columns"] == [
+        {"type": "columns", "columns": ["current_setting"], "oids": [PG_TEXT_OID]}
+    ]
+    assert [message["values"] for message in catalog_current_setting_messages if message["type"] == "row"] == [["160000"]]
+    assert [message["tag"] for message in catalog_current_setting_messages if message["type"] == "command"] == ["SELECT 1"]
 
     assert [message["values"] for message in search_path_messages if message["type"] == "row"] == [["public"]]
 
