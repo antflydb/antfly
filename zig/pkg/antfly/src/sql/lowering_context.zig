@@ -2945,6 +2945,13 @@ fn validateGeneratedExpressionAstRanges(
         try validateGeneratedReadListAstContainedByRange(expression.case_condition_items, expression_tokens);
         try validateGeneratedReadListAstContainedByRange(expression.case_result_items, expression_tokens);
         try validateGeneratedReadListAstContainedByRange(expression.boolean_condition_items, expression_tokens);
+        try validateGeneratedReadListAstBoundaryExpressions(
+            tokens,
+            read_ast,
+            expression.boolean_condition_items,
+            expression.boolean_first_condition,
+            expression.boolean_last_condition,
+        );
     } else if (expression.case_condition_items.count != 0 or
         expression.case_result_items.count != 0 or
         expression.boolean_condition_items.count != 0)
@@ -4693,6 +4700,28 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     };
     malformed_boolean_chain_read_ast.where_expression.boolean_condition_items.first_tokens =
         malformed_boolean_chain_read_ast.where_expression.boolean_condition_items.last_tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_boolean_chain_parsed_sql, malformed_boolean_chain_read_ast),
+    );
+
+    malformed_boolean_chain_read_ast = switch (malformed_boolean_chain_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_boolean_chain_read_ast.where_expression.boolean_condition_items.expression_items[0] =
+        malformed_boolean_chain_read_ast.projection_items.expression_items[0];
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_boolean_chain_parsed_sql, malformed_boolean_chain_read_ast),
+    );
+
+    malformed_boolean_chain_read_ast = switch (malformed_boolean_chain_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_boolean_chain_read_ast.where_expression.boolean_condition_items.expressions[2].tokens =
+        malformed_boolean_chain_read_ast.projection_items.expression_items[0];
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_boolean_chain_parsed_sql, malformed_boolean_chain_read_ast),
