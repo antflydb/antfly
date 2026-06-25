@@ -438,7 +438,7 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: gen
         try validateGeneratedReadListAstContainedByOptionalRange(join.using_columns, join.using_column_tokens);
     }
     try validateGeneratedJoinAstRanges(tokens, read_ast, read_ast.join_items);
-    try validateGeneratedJoinTreeMetadata(read_ast);
+    try validateGeneratedJoinTreeMetadata(tokens, read_ast);
 
     switch (read_ast.kind) {
         .query => {
@@ -587,6 +587,7 @@ fn validateGeneratedCteBodyMetadata(tokens: []const tokenized.Token, cte: genera
     if (cte.body_source_tokens) |source_tokens| {
         if (source_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
         try validateGeneratedJoinTreeMetadataForSource(
+            tokens,
             source_tokens,
             cte.body_join_items,
             cte.body_join_tree_root_index,
@@ -691,8 +692,12 @@ fn validateGeneratedCteBodyMetadata(tokens: []const tokenized.Token, cte: genera
     }
 }
 
-fn validateGeneratedJoinTreeMetadata(read_ast: generated_parser.GeneratedSqlReadAst) !void {
+fn validateGeneratedJoinTreeMetadata(
+    tokens: []const tokenized.Token,
+    read_ast: generated_parser.GeneratedSqlReadAst,
+) !void {
     return validateGeneratedJoinTreeMetadataForSource(
+        tokens,
         read_ast.source_tokens,
         read_ast.join_items,
         read_ast.join_tree_root_index,
@@ -707,6 +712,7 @@ fn validateGeneratedJoinTreeMetadata(read_ast: generated_parser.GeneratedSqlRead
 }
 
 fn validateGeneratedJoinTreeMetadataForSource(
+    tokens: []const tokenized.Token,
     source_tokens: ?generated_parser.GeneratedSqlTokenRange,
     join_items: []const generated_parser.GeneratedSqlJoinAst,
     join_tree_root_index: ?usize,
@@ -765,10 +771,11 @@ fn validateGeneratedJoinTreeMetadataForSource(
         switch (join.condition_kind) {
             .on => {
                 const predicate = join.predicate_tokens orelse return error.UnsupportedSqlShape;
+                if (!tokens[join.condition_tokens.start].matchesKeywordTag(.on)) return error.UnsupportedSqlShape;
                 if (join.using_tokens != null or join.using_column_tokens != null or join.using_columns.count != 0) {
                     return error.UnsupportedSqlShape;
                 }
-                if (predicate.start < join.condition_tokens.start or predicate.end > join.condition_tokens.end) {
+                if (predicate.start != join.condition_tokens.start + 1 or predicate.end != join.condition_tokens.end) {
                     return error.UnsupportedSqlShape;
                 }
                 if (!generatedExpressionAstHasMetadata(join.predicate_expression)) return error.UnsupportedSqlShape;
@@ -776,11 +783,18 @@ fn validateGeneratedJoinTreeMetadataForSource(
             .using => {
                 const using_tokens = join.using_tokens orelse return error.UnsupportedSqlShape;
                 const using_column_tokens = join.using_column_tokens orelse return error.UnsupportedSqlShape;
+                if (!tokens[join.condition_tokens.start].matchesKeywordTag(.using)) return error.UnsupportedSqlShape;
                 if (join.predicate_tokens != null or generatedExpressionAstHasMetadata(join.predicate_expression)) {
                     return error.UnsupportedSqlShape;
                 }
                 if (!std.meta.eql(using_tokens, join.condition_tokens)) return error.UnsupportedSqlShape;
-                if (using_column_tokens.start < using_tokens.start or using_column_tokens.end > using_tokens.end) {
+                if (using_tokens.start + 1 >= using_tokens.end or
+                    tokens[using_tokens.start + 1].kind != .lparen or
+                    tokens[using_tokens.end - 1].kind != .rparen)
+                {
+                    return error.UnsupportedSqlShape;
+                }
+                if (using_column_tokens.start != using_tokens.start + 2 or using_column_tokens.end != using_tokens.end - 1) {
                     return error.UnsupportedSqlShape;
                 }
                 if (join.using_columns.count == 0) return error.UnsupportedSqlShape;
@@ -5137,6 +5151,23 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_join_child_parsed_sql, malformed_join_child_read_ast),
     );
 
+    var malformed_join_condition_keyword_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.id = accounts.id",
+    );
+    defer malformed_join_condition_keyword_parsed_sql.deinit(alloc);
+    const malformed_join_condition_keyword_generated_raw = malformed_join_condition_keyword_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_join_condition_keyword_read_ast = switch (malformed_join_condition_keyword_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    const malformed_join_predicate_tokens = malformed_join_condition_keyword_read_ast.join_items[0].predicate_tokens orelse return error.UnsupportedSqlShape;
+    malformed_join_condition_keyword_read_ast.join_items[0].condition_tokens = malformed_join_predicate_tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_join_condition_keyword_parsed_sql, malformed_join_condition_keyword_read_ast),
+    );
+
     var malformed_using_join_parsed_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
         "SELECT usage_records.id FROM usage_records JOIN accounts USING (id)",
@@ -5148,6 +5179,20 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         else => return error.UnsupportedSqlShape,
     };
     malformed_using_join_read_ast.join_items[0].using_column_tokens = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_using_join_parsed_sql, malformed_using_join_read_ast),
+    );
+
+    malformed_using_join_read_ast = switch (malformed_using_join_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    const malformed_using_condition_tokens = malformed_using_join_read_ast.join_items[0].using_tokens orelse return error.UnsupportedSqlShape;
+    malformed_using_join_read_ast.join_items[0].using_column_tokens = .{
+        .start = malformed_using_condition_tokens.start + 1,
+        .end = malformed_using_condition_tokens.end - 1,
+    };
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_using_join_parsed_sql, malformed_using_join_read_ast),
@@ -5429,6 +5474,17 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         else => return error.UnsupportedSqlShape,
     };
     malformed_cte_body_join_read_ast.cte_items[0].body_join_items[1].left_child_index = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_cte_body_join_parsed_sql, malformed_cte_body_join_read_ast),
+    );
+
+    malformed_cte_body_join_read_ast = switch (malformed_cte_body_join_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    const malformed_cte_body_join_predicate = malformed_cte_body_join_read_ast.cte_items[0].body_join_items[0].predicate_tokens orelse return error.UnsupportedSqlShape;
+    malformed_cte_body_join_read_ast.cte_items[0].body_join_items[0].condition_tokens = malformed_cte_body_join_predicate;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_cte_body_join_parsed_sql, malformed_cte_body_join_read_ast),
