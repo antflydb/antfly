@@ -315,15 +315,16 @@ maintenance planning. Legacy-supported cursor and savepoint commands use the
 validated unsupported boundary for `DECLARE`, `FETCH`, `CLOSE`, `SAVEPOINT`,
 and `RELEASE` before delegating to typed cursor/savepoint planning; `MOVE`
 remains an unsupported generated diagnostic because there is no typed cursor
-plan for it yet.
+plan for it yet. Bulk I/O commands use the validated unsupported boundary for
+`COPY` before delegating to typed bulk I/O planning.
 Generated unsupported nodes now also participate in the parsed statement
 boundary: generated-covered unsupported heads that are not intentionally
 supported by the existing catalog planner become terminal parsed unsupported
 statements and fail closed before legacy DDL probing. Generated unsupported
 heads that already have legacy catalog/runtime support, such as `EXPLAIN`,
-`COPY`, remaining materialized-view catalog variants such as
-`ALTER MATERIALIZED VIEW`, stay on an explicit compatibility allowlist until
-their generated AST-to-plan implementations are promoted.
+remaining materialized-view catalog variants such as `ALTER MATERIALIZED VIEW`,
+stay on an explicit compatibility allowlist until their generated AST-to-plan
+implementations are promoted.
 
 ## Compatibility Policy
 

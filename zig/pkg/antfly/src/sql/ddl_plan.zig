@@ -8897,6 +8897,7 @@ pub fn relationalIndexLifecycleName(lifecycle: runtime_schema.RelationalIndexLif
 }
 
 const GeneratedUnsupportedCatalogBoundaryFamily = enum {
+    bulk_io,
     cursor_savepoint,
     maintenance,
     materialized_view,
@@ -8914,6 +8915,7 @@ fn generatedUnsupportedCatalogBoundary(
 ) ?GeneratedUnsupportedCatalogBoundary {
     return switch (statement) {
         .unsupported => |kind| switch (kind) {
+            .copy => .{ .family = .bulk_io, .kind = kind },
             .close, .declare, .fetch, .release, .savepoint => .{ .family = .cursor_savepoint, .kind = kind },
             .analyze, .cluster, .reindex, .vacuum => .{ .family = .maintenance, .kind = kind },
             .create_materialized_view, .drop_materialized_view, .refresh => .{ .family = .materialized_view, .kind = kind },
@@ -9004,6 +9006,14 @@ fn validateGeneratedUnsupportedCatalogAst(
         return error.UnsupportedSqlShape;
     }
     switch (boundary.family) {
+        .bulk_io => switch (boundary.kind) {
+            .copy => {
+                if (end < 1 or !tokens[0].matchesKeyword("copy")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            else => return error.UnsupportedSqlShape,
+        },
         .cursor_savepoint => switch (boundary.kind) {
             .close => {
                 if (end < 1 or !tokens[0].matchesKeyword("close")) {
@@ -9132,6 +9142,13 @@ fn catalogDdlPlanFromGeneratedUnsupportedAstAlloc(
     }
     if (pos.* != tokens.len) return error.UnsupportedSqlShape;
     switch (boundary.family) {
+        .bulk_io => switch (boundary.kind) {
+            .copy => switch (plan) {
+                .bulk_io => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
         .cursor_savepoint => switch (boundary.kind) {
             .close => switch (plan) {
                 .cursor_portal => |cursor| switch (cursor) {
@@ -14860,6 +14877,80 @@ test "sql adapter generated cursor and savepoint unsupported AST lowers to catal
     var malformed_subject = try tokenized.ParsedSql.initAlloc(
         alloc,
         "SAVEPOINT before_retry;",
+    );
+    defer malformed_subject.deinit(alloc);
+    if (malformed_subject.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.subject_tokens = .{ .start = 0, .end = malformed_subject.items().len },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_subject));
+}
+
+test "sql adapter generated copy unsupported AST lowers to bulk io plan" {
+    const alloc = std.testing.allocator;
+
+    var copy_from_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv);",
+    );
+    defer copy_from_sql.deinit(alloc);
+    var copy_from_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &copy_from_sql);
+    defer copy_from_plan.deinit(alloc);
+    switch (copy_from_plan) {
+        .bulk_io => |plan| {
+            try std.testing.expectEqual(BulkIoDirection.from, plan.direction);
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 2), plan.columns.len);
+            try std.testing.expectEqualStrings("id", plan.columns[0]);
+            try std.testing.expectEqualStrings("status", plan.columns[1]);
+            try std.testing.expectEqual(BulkIoEndpointKind.stream, plan.endpoint_kind);
+            try std.testing.expectEqualStrings("STDIN", plan.endpoint);
+            try std.testing.expectEqualStrings("csv", plan.format orelse return error.TestUnexpectedResult);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var copy_where_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv) WHERE status = 'active';",
+    );
+    defer copy_where_sql.deinit(alloc);
+    var copy_where_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &copy_where_sql);
+    defer copy_where_plan.deinit(alloc);
+    switch (copy_where_plan) {
+        .bulk_io => |plan| {
+            try std.testing.expectEqual(BulkIoDirection.from, plan.direction);
+            try std.testing.expectEqual(@as(usize, 1), plan.where_expressions.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, plan.where_expressions[0].lhs.kind);
+            try std.testing.expectEqualStrings("status", plan.where_expressions[0].lhs.field);
+            try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, plan.where_expressions[0].op);
+            try std.testing.expectEqualStrings("\"active\"", plan.where_expressions[0].rhs[0].value_json);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var malformed_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "COPY usage_records FROM STDIN;",
+    );
+    defer malformed_kind.deinit(alloc);
+    if (malformed_kind.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.kind = .vacuum,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_kind));
+
+    var malformed_subject = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "COPY usage_records FROM STDIN;",
     );
     defer malformed_subject.deinit(alloc);
     if (malformed_subject.generated_statement) |*generated_statement| {
