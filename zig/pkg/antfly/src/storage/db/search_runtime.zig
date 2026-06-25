@@ -7132,6 +7132,162 @@ test "db search runtime dense chunk consumer supports parent and parent_with_chu
     );
 }
 
+test "db search runtime dense chunk full_index supports parent search for template chunked embeddings" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "semantic_template_chunked_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"source_template\":\"{{title}}\",\"artifact_name\":\"semantic_template_chunked_idx_chunks\",\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"full_text_index\":{},\"text\":{\"target_tokens\":4,\"overlap_tokens\":1,\"separator\":\" \"}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha routing only in template chunks\",\"body\":\"body text without the keyword\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const query_vec = try deterministic.interface().embedDense(alloc, "", "alpha routing only in template chunks", 3);
+    defer alloc.free(query_vec);
+
+    var result = try db.search(alloc, .{
+        .index_name = "semantic_template_chunked_idx",
+        .dense = .{ .vector = query_vec, .k = 5 },
+        .return_mode = .parent,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "db search runtime dense chunk full_index supports parent search when chunk artifacts are ephemeral" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "semantic_template_chunked_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"source_template\":\"{{title}}\",\"artifact_name\":\"semantic_template_chunked_idx_chunks\",\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"text\":{\"target_tokens\":4,\"overlap_tokens\":1,\"separator\":\" \"}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha routing only in template chunks\",\"body\":\"body text without the keyword\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "semantic_template_chunked_idx_chunks");
+    defer alloc.free(chunk_prefix);
+    const chunk_records = try db.core.store.scanPrefix(alloc, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, chunk_records);
+    var chunk_count: usize = 0;
+    for (chunk_records) |entry| {
+        if (internal_keys.isChunkArtifactRecordKey(entry.key)) chunk_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), chunk_count);
+
+    const query_vec = try deterministic.interface().embedDense(alloc, "", "alpha routing only in template chunks", 3);
+    defer alloc.free(query_vec);
+
+    var result = try db.search(alloc, .{
+        .index_name = "semantic_template_chunked_idx",
+        .dense = .{ .vector = query_vec, .k = 5 },
+        .return_mode = .parent,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "db search runtime dense chunk reopened full_index supports parent search when chunk artifacts are ephemeral" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .enrichment = .{
+                .owner_id = "worker-a",
+                .dense_embedder = deterministic.interface(),
+            },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "semantic_template_chunked_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"source_template\":\"{{title}}\",\"artifact_name\":\"semantic_template_chunked_idx_chunks\",\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"text\":{\"target_tokens\":4,\"overlap_tokens\":1,\"separator\":\" \"}}}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha routing only in template chunks\",\"body\":\"body text without the keyword\"}" },
+            },
+            .sync_level = .full_index,
+        });
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+
+    const query_vec = try deterministic.interface().embedDense(alloc, "", "alpha routing only in template chunks", 3);
+    defer alloc.free(query_vec);
+
+    var result = try reopened.search(alloc, .{
+        .index_name = "semantic_template_chunked_idx",
+        .dense = .{ .vector = query_vec, .k = 5 },
+        .return_mode = .parent,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
 test "db search runtime projection lookup includes unified artifact projection when _artifacts is requested" {
     const DB = @import("mod.zig").DB;
     const db_test_support = @import("test_support.zig");

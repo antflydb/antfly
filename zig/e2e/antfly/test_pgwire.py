@@ -42,6 +42,7 @@ from conftest import (
 )
 
 PG_BOOL_OID = 16
+PG_INT4_OID = 23
 PG_TEXT_OID = 25
 PG_TIMESTAMPTZ_OID = 1184
 PG_NUMERIC_OID = 1700
@@ -398,6 +399,44 @@ def test_pgwire_extended_query_binds_text_parameters(pgwire_server):
     assert [message["values"] for message in select_messages if message["type"] == "row"] == [["row:extended", "ready"]]
 
 
+def test_pgwire_extended_query_binds_binary_parameters_and_results(pgwire_server):
+    table = _table_name("pgwire_binary")
+
+    with socket.create_connection((pgwire_server.host, pgwire_server.pgwire_port), timeout=5) as sock:
+        _pgwire_startup(sock)
+        _pgwire_simple_query(sock, f"CREATE TABLE {table} (id text PRIMARY KEY, amount numeric, active boolean, attrs jsonb);")
+        insert_messages = _pgwire_extended_query_with_formats(
+            sock,
+            f"INSERT INTO {table} (id, amount, active, attrs) VALUES ($1, $2, $3, $4);",
+            [PG_TEXT_OID, PG_INT4_OID, PG_BOOL_OID, PG_JSONB_OID],
+            [1, 1, 1, 1],
+            [b"row:binary", struct.pack("!i", 42), b"\x01", b'\x01{"mode":"binary"}'],
+            [],
+            raw_rows=False,
+        )
+        select_messages = _pgwire_extended_query_with_formats(
+            sock,
+            f"SELECT id, amount, active, attrs FROM {table} WHERE id = $1;",
+            [PG_TEXT_OID],
+            [1],
+            [b"row:binary"],
+            [1],
+            raw_rows=True,
+        )
+
+    assert [message["tag"] for message in insert_messages if message["type"] == "command"] == ["INSERT 0 1"]
+    assert [message for message in select_messages if message["type"] == "columns"] == [
+        {"type": "columns", "columns": ["id", "amount", "active", "attrs"], "oids": [PG_TEXT_OID, PG_NUMERIC_OID, PG_BOOL_OID, PG_JSONB_OID]}
+    ]
+    rows = [message["values"] for message in select_messages if message["type"] == "row"]
+    assert len(rows) == 1
+    assert rows[0][0] == b"row:binary"
+    assert rows[0][1] == b"\x00\x01\x00\x00\x00\x00\x00\x00\x00\x2a"
+    assert rows[0][2] == b"\x01"
+    assert rows[0][3][0] == 1
+    assert json.loads(rows[0][3][1:].decode()) == {"mode": "binary"}
+
+
 def test_pgwire_statement_describe_returns_parameters_and_row_description(pgwire_server):
     table = _table_name("pgwire_describe")
 
@@ -601,6 +640,61 @@ def _pgwire_extended_query(sock: socket.socket, sql: str, params: list[str | Non
             messages.append({"type": "message", "tag": tag.decode(errors="replace"), "columns": columns})
 
 
+def _pgwire_extended_query_with_formats(
+    sock: socket.socket,
+    sql: str,
+    parameter_oids: list[int],
+    parameter_formats: list[int],
+    params: list[bytes | None],
+    result_formats: list[int],
+    *,
+    raw_rows: bool,
+) -> list[dict[str, Any]]:
+    statement_name = b""
+    portal_name = b""
+    parse_payload = statement_name + b"\x00" + sql.encode() + b"\x00" + struct.pack("!h", len(parameter_oids))
+    for oid in parameter_oids:
+        parse_payload += struct.pack("!i", oid)
+    _pgwire_send_message(sock, b"P", parse_payload)
+
+    bind_payload = portal_name + b"\x00" + statement_name + b"\x00" + struct.pack("!h", len(parameter_formats))
+    for fmt in parameter_formats:
+        bind_payload += struct.pack("!h", fmt)
+    bind_payload += struct.pack("!h", len(params))
+    for param in params:
+        if param is None:
+            bind_payload += struct.pack("!i", -1)
+        else:
+            bind_payload += struct.pack("!i", len(param)) + param
+    bind_payload += struct.pack("!h", len(result_formats))
+    for fmt in result_formats:
+        bind_payload += struct.pack("!h", fmt)
+    _pgwire_send_message(sock, b"B", bind_payload)
+    _pgwire_send_message(sock, b"D", b"P" + portal_name + b"\x00")
+    _pgwire_send_message(sock, b"E", portal_name + b"\x00" + struct.pack("!i", 0))
+    _pgwire_send_message(sock, b"S", b"")
+
+    messages: list[dict[str, Any]] = []
+    while True:
+        tag, payload = _pgwire_read_message(sock)
+        if tag == b"T":
+            description = _pgwire_row_description(payload)
+            messages.append({"type": "columns", "columns": [column["name"] for column in description], "oids": [column["type_oid"] for column in description]})
+        elif tag == b"D":
+            messages.append({"type": "row", "values": _pgwire_data_row_raw(payload) if raw_rows else _pgwire_data_row(payload)})
+        elif tag == b"C":
+            messages.append({"type": "command", "tag": payload.split(b"\x00", 1)[0].decode()})
+        elif tag == b"E":
+            raise AssertionError(f"pgwire extended query error: {payload!r}")
+        elif tag == b"Z":
+            messages.append({"type": "ready", "status": payload.decode()})
+            return messages
+        elif tag in {b"1", b"2", b"3", b"n", b"s", b"t"}:
+            continue
+        else:
+            messages.append({"type": "message", "tag": tag.decode(errors="replace")})
+
+
 def _pgwire_describe_statement(sock: socket.socket, sql: str, parameter_oids: list[int]) -> list[dict[str, Any]]:
     statement_name = b"describe_stmt"
     parse_payload = statement_name + b"\x00" + sql.encode() + b"\x00" + struct.pack("!h", len(parameter_oids))
@@ -699,6 +793,21 @@ def _pgwire_data_row(payload: bytes) -> list[str | None]:
             values.append(None)
             continue
         values.append(payload[offset : offset + length].decode())
+        offset += length
+    return values
+
+
+def _pgwire_data_row_raw(payload: bytes) -> list[bytes | None]:
+    count = struct.unpack("!h", payload[:2])[0]
+    offset = 2
+    values: list[bytes | None] = []
+    for _ in range(count):
+        length = struct.unpack("!i", payload[offset : offset + 4])[0]
+        offset += 4
+        if length == -1:
+            values.append(None)
+            continue
+        values.append(payload[offset : offset + length])
         offset += length
     return values
 

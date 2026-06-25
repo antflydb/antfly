@@ -10219,6 +10219,7 @@ fn generatedUnsupportedExpectedReason(kind: generated_parser.GeneratedSqlUnsuppo
         .copy => .copy_not_planned_by_generated_parser,
         .alter_index => .alter_index_not_planned_by_generated_parser,
         .alter_conversion => .alter_conversion_not_planned_by_generated_parser,
+        .alter_default_privileges => .alter_default_privileges_not_planned_by_generated_parser,
         .alter_event_trigger => .alter_event_trigger_not_planned_by_generated_parser,
         .alter_foreign_table => .alter_foreign_table_not_planned_by_generated_parser,
         .alter_foreign_data_wrapper => .alter_foreign_data_wrapper_not_planned_by_generated_parser,

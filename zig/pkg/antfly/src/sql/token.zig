@@ -269,6 +269,7 @@ pub const TokenKeyword = enum {
     prepare,
     prepared,
     primary,
+    privileges,
     procedure,
     program,
     publication,

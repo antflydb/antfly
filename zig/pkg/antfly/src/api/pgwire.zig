@@ -27,12 +27,16 @@ const cancel_request_code: i32 = 80877102;
 const max_packet_len: i32 = 16 * 1024 * 1024;
 const bool_oid: i32 = 16;
 const bool_type_size: i16 = 1;
+const int8_oid: i32 = 20;
+const int2_oid: i32 = 21;
+const int4_oid: i32 = 23;
 const text_oid: i32 = 25;
 const text_type_size: i16 = -1;
 const numeric_oid: i32 = 1700;
 const jsonb_oid: i32 = 3802;
 const timestamptz_oid: i32 = 1184;
 const timestamptz_type_size: i16 = 8;
+const postgres_epoch_unix_seconds: i64 = 946_684_800;
 const text_format: i16 = 0;
 const binary_format: i16 = 1;
 
@@ -52,6 +56,7 @@ const PreparedStatement = struct {
 const Portal = struct {
     sql: []u8,
     params: []sql_adapter.SqlValue = &.{},
+    result_formats: []i16 = &.{},
 };
 
 const CancelEntry = struct {
@@ -416,7 +421,7 @@ const Connection = struct {
                 const statement = std.mem.trim(u8, rest[0..end], " \t\r\n");
                 if (statement.len != 0) {
                     executed = true;
-                    if (!try self.executeAndEncodeOne(statement, &.{}, true, true)) return;
+                    if (!try self.executeAndEncodeOne(statement, &.{}, &.{}, true, true)) return;
                 }
                 rest = rest[end + 1 ..];
                 continue;
@@ -425,7 +430,7 @@ const Connection = struct {
             const trailing = std.mem.trim(u8, rest, " \t\r\n");
             if (trailing.len != 0) {
                 executed = true;
-                if (!try self.executeAndEncodeOne(trailing, &.{}, true, true)) return;
+                if (!try self.executeAndEncodeOne(trailing, &.{}, &.{}, true, true)) return;
             }
             break;
         }
@@ -491,19 +496,20 @@ const Connection = struct {
             }
         }
         for (params, 0..) |*parameter, index| {
-            if (pgwire_module.parameterFormat(parameter_formats[0..parameter_format_len], index) == binary_format) {
-                try self.sendError("0A000", "binary pgwire parameters are not implemented");
-                return;
-            }
+            const format = pgwire_module.parameterFormat(parameter_formats[0..parameter_format_len], index);
             const value_len = try cursor.takeInt(i32);
             if (value_len < -1) return error.InvalidPgwireMessage;
             if (value_len == -1) {
                 parameter.* = .null;
             } else {
-                const text = try cursor.takeBytes(@intCast(value_len));
-                parameter.* = pgwire_module.sqlValueFromTextParameterAlloc(self.alloc, statement.parameter_oids[index], text) catch |err| switch (err) {
+                const encoded = try cursor.takeBytes(@intCast(value_len));
+                parameter.* = pgwire_module.sqlValueFromPgwireParameterAlloc(self.alloc, statement.parameter_oids[index], format, encoded) catch |err| switch (err) {
                     error.InvalidPgwireParameter => {
                         try self.sendError("22023", "invalid pgwire parameter");
+                        return;
+                    },
+                    error.UnsupportedPgwireParameterFormat => {
+                        try self.sendError("0A000", "unsupported pgwire parameter format");
                         return;
                     },
                     else => return err,
@@ -514,22 +520,23 @@ const Connection = struct {
 
         const result_format_count = try cursor.takeInt(i16);
         if (result_format_count < 0) return error.InvalidPgwireMessage;
-        var i: usize = 0;
-        while (i < @as(usize, @intCast(result_format_count))) : (i += 1) {
-            const format = try cursor.takeInt(i16);
-            if (format == binary_format) {
-                try self.sendError("0A000", "binary pgwire results are not implemented");
-                return;
-            }
+        const result_format_len: usize = @intCast(result_format_count);
+        const result_formats = try self.alloc.alloc(i16, result_format_len);
+        var result_formats_transferred = false;
+        errdefer if (!result_formats_transferred and result_formats.len > 0) self.alloc.free(result_formats);
+        for (result_formats) |*format| {
+            format.* = try cursor.takeInt(i16);
+            if (format.* != text_format and format.* != binary_format) return error.InvalidPgwireMessage;
         }
         try cursor.expectEnd();
 
         const owned_sql = try self.alloc.dupe(u8, statement.sql);
         var sql_transferred = false;
         errdefer if (!sql_transferred) self.alloc.free(owned_sql);
-        try self.setPortal(portal_name, .{ .sql = owned_sql, .params = params });
+        try self.setPortal(portal_name, .{ .sql = owned_sql, .params = params, .result_formats = result_formats });
         sql_transferred = true;
         params_transferred = true;
+        result_formats_transferred = true;
         try self.sendBindComplete();
     }
 
@@ -549,7 +556,7 @@ const Connection = struct {
                 if (statement.parameter_oids.len != 0) {
                     try self.sendNoData();
                 } else {
-                    _ = try self.describeAndEncodeOne(statement.sql, &.{});
+                    _ = try self.describeAndEncodeOne(statement.sql, &.{}, &.{});
                 }
             },
             'P' => {
@@ -557,7 +564,7 @@ const Connection = struct {
                     try self.sendError("34000", "portal does not exist");
                     return;
                 };
-                if (try self.describeAndEncodeOne(active_portal.sql, active_portal.params)) try self.markPortalDescribed(name);
+                if (try self.describeAndEncodeOne(active_portal.sql, active_portal.params, active_portal.result_formats)) try self.markPortalDescribed(name);
             },
             else => return error.InvalidPgwireMessage,
         }
@@ -572,7 +579,7 @@ const Connection = struct {
             try self.sendError("34000", "portal does not exist");
             return;
         };
-        _ = try self.executeAndEncodeOne(active_portal.sql, active_portal.params, false, !self.portalDescribed(portal_name));
+        _ = try self.executeAndEncodeOne(active_portal.sql, active_portal.params, active_portal.result_formats, false, !self.portalDescribed(portal_name));
     }
 
     fn handleClose(self: *Connection, payload: []const u8) !void {
@@ -681,7 +688,7 @@ const Connection = struct {
         return self.described_portals.contains(name);
     }
 
-    fn describeAndEncodeOne(self: *Connection, sql: []const u8, params: []const sql_adapter.SqlValue) !bool {
+    fn describeAndEncodeOne(self: *Connection, sql: []const u8, params: []const sql_adapter.SqlValue, result_formats: []const i16) !bool {
         var outcome = self.describeSql(sql, params) catch |err| {
             std.log.warn("pgwire sql describe failed err={}", .{err});
             try self.sendError("XX000", "internal sql describe error");
@@ -704,13 +711,20 @@ const Connection = struct {
                 }
                 const columns = try pgwire_module.pgwireColumnsForRelationalColumnsAlloc(self.alloc, result.columns);
                 defer self.alloc.free(columns);
-                try self.sendRowDescription(columns);
+                try self.sendRowDescription(columns, result_formats);
                 return true;
             },
         }
     }
 
-    fn executeAndEncodeOne(self: *Connection, sql: []const u8, params: []const sql_adapter.SqlValue, send_ready_on_error: bool, include_row_description: bool) !bool {
+    fn executeAndEncodeOne(
+        self: *Connection,
+        sql: []const u8,
+        params: []const sql_adapter.SqlValue,
+        result_formats: []const i16,
+        send_ready_on_error: bool,
+        include_row_description: bool,
+    ) !bool {
         if (self.consumeCancelRequested()) {
             self.markTransactionError();
             try self.sendError("57014", "canceling statement due to user request");
@@ -747,7 +761,7 @@ const Connection = struct {
             .result => |*result| {
                 defer result.deinit(self.api_server.alloc);
                 self.ready_for_query_status = pgwire_module.readyForQueryStatus(result.transaction_status);
-                try self.encodeSqlResult(sql, result, include_row_description);
+                try self.encodeSqlResult(result, result_formats, include_row_description);
                 return true;
             },
         }
@@ -775,23 +789,28 @@ const Connection = struct {
         }, null);
     }
 
-    fn encodeSqlResult(self: *Connection, sql: []const u8, result: *const http_server.ApiHttpServer.PublicSqlResult, include_row_description: bool) !void {
+    fn encodeSqlResult(
+        self: *Connection,
+        result: *const http_server.ApiHttpServer.PublicSqlResult,
+        result_formats: []const i16,
+        include_row_description: bool,
+    ) !void {
         self.session_id = result.session_id;
         switch (result.result) {
-            .ddl => |applied| try self.sendCommandComplete(pgwire_module.commandTagForDdlSql(self.alloc, sql) orelse pgwire_module.commandTagForDdlApplied(applied)),
+            .ddl => |ddl| try self.sendCommandComplete(if (ddl.command_tag.len != 0) ddl.command_tag else pgwire_module.commandTagForDdlApplied(ddl.applied)),
             .read => |read| {
                 const rows = pgwire_module.readResultRows(read);
                 const tag = try pgwire_module.commandTagForRows(self.alloc, "SELECT", rows.len);
                 defer self.alloc.free(tag);
                 const columns = try pgwire_module.readResultColumnsAlloc(self.alloc, read);
                 defer if (columns) |typed_columns| self.alloc.free(typed_columns);
-                try self.sendJsonRows(rows, columns, tag, include_row_description);
+                try self.sendJsonRows(rows, columns, tag, result_formats, include_row_description);
             },
             .rows_batch => |rows_batch| {
                 if (rows_batch.returning_rows.len > 0) {
                     const tag = try pgwire_module.commandTagForRows(self.alloc, result.statement_kind, rows_batch.returning_rows.len);
                     defer self.alloc.free(tag);
-                    try self.sendJsonRows(rows_batch.returning_rows, null, tag, include_row_description);
+                    try self.sendJsonRows(rows_batch.returning_rows, null, tag, result_formats, include_row_description);
                 } else {
                     const tag = try pgwire_module.commandTagForRowsBatch(self.alloc, result.statement_kind, rows_batch);
                     defer self.alloc.free(tag);
@@ -802,7 +821,7 @@ const Connection = struct {
                 if (mutation_source.returning_rows.len > 0) {
                     const tag = try pgwire_module.commandTagForRows(self.alloc, result.statement_kind, mutation_source.returning_rows.len);
                     defer self.alloc.free(tag);
-                    try self.sendJsonRows(mutation_source.returning_rows, null, tag, include_row_description);
+                    try self.sendJsonRows(mutation_source.returning_rows, null, tag, result_formats, include_row_description);
                 } else {
                     const tag = try pgwire_module.commandTagForMutationSource(self.alloc, result.statement_kind, mutation_source);
                     defer self.alloc.free(tag);
@@ -817,14 +836,15 @@ const Connection = struct {
         rows: []const std.json.Value,
         schema_columns: ?[]const PgwireColumn,
         tag: []const u8,
+        result_formats: []const i16,
     ) !void {
         var row_description: std.Io.Writer.Allocating = .init(self.alloc);
         defer row_description.deinit();
         if (schema_columns) |columns| {
             try row_description.writer.writeInt(i16, @intCast(columns.len), .big);
-            for (columns) |column| try pgwire_module.appendColumnDescription(&row_description.writer, column);
+            for (columns, 0..) |column, index| try pgwire_module.appendColumnDescription(&row_description.writer, column, pgwire_module.resultFormat(result_formats, index));
             try self.sendMessage('T', row_description.written());
-            try self.sendDataRowsForColumnNames(rows, columns);
+            try self.sendDataRowsForColumnNames(rows, columns, result_formats);
             try self.sendCommandComplete(tag);
             return;
         }
@@ -839,7 +859,11 @@ const Connection = struct {
         const first_row_columns = rows[0].object;
         try row_description.writer.writeInt(i16, @intCast(first_row_columns.count()), .big);
         var column_it = first_row_columns.iterator();
-        while (column_it.next()) |entry| try pgwire_module.appendColumnDescription(&row_description.writer, .{ .name = entry.key_ptr.* });
+        var column_index: usize = 0;
+        while (column_it.next()) |entry| : (column_index += 1) {
+            const format = pgwire_module.resultFormat(result_formats, column_index);
+            try pgwire_module.appendColumnDescription(&row_description.writer, .{ .name = entry.key_ptr.* }, format);
+        }
         try self.sendMessage('T', row_description.written());
 
         for (rows) |row| {
@@ -847,8 +871,9 @@ const Connection = struct {
             defer data.deinit();
             try data.writer.writeInt(i16, @intCast(first_row_columns.count()), .big);
             var value_it = first_row_columns.iterator();
-            while (value_it.next()) |entry| {
-                try self.appendDataValue(&data.writer, row, .{ .name = entry.key_ptr.* });
+            var value_index: usize = 0;
+            while (value_it.next()) |entry| : (value_index += 1) {
+                try self.appendDataValue(&data.writer, row, .{ .name = entry.key_ptr.* }, pgwire_module.resultFormat(result_formats, value_index));
             }
             try self.sendMessage('D', data.written());
         }
@@ -861,14 +886,15 @@ const Connection = struct {
         rows: []const []const u8,
         schema_columns: ?[]const PgwireColumn,
         tag: []const u8,
+        result_formats: []const i16,
         include_row_description: bool,
     ) !void {
         if (schema_columns) |columns| {
-            if (include_row_description) try self.sendRowDescription(columns);
+            if (include_row_description) try self.sendRowDescription(columns, result_formats);
             for (rows) |row_json| {
                 var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, row_json, .{ .allocate = .alloc_always });
                 defer parsed.deinit();
-                try self.sendDataRowForColumnNames(parsed.value, columns);
+                try self.sendDataRowForColumnNames(parsed.value, columns, result_formats);
             }
             try self.sendCommandComplete(tag);
             return;
@@ -903,39 +929,39 @@ const Connection = struct {
         var column_index: usize = 0;
         while (column_it.next()) |entry| : (column_index += 1) columns[column_index] = .{ .name = entry.key_ptr.* };
 
-        if (include_row_description) try self.sendRowDescription(columns);
-        try self.sendDataRowForColumnNames(first_row.value, columns);
+        if (include_row_description) try self.sendRowDescription(columns, result_formats);
+        try self.sendDataRowForColumnNames(first_row.value, columns, result_formats);
         for (rows[1..]) |row_json| {
             var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, row_json, .{ .allocate = .alloc_always });
             defer parsed.deinit();
-            try self.sendDataRowForColumnNames(parsed.value, columns);
+            try self.sendDataRowForColumnNames(parsed.value, columns, result_formats);
         }
         try self.sendCommandComplete(tag);
     }
 
-    fn sendRowDescription(self: *Connection, columns: []const PgwireColumn) !void {
+    fn sendRowDescription(self: *Connection, columns: []const PgwireColumn, result_formats: []const i16) !void {
         var row_description: std.Io.Writer.Allocating = .init(self.alloc);
         defer row_description.deinit();
         try row_description.writer.writeInt(i16, @intCast(columns.len), .big);
-        for (columns) |column| try pgwire_module.appendColumnDescription(&row_description.writer, column);
+        for (columns, 0..) |column, index| try pgwire_module.appendColumnDescription(&row_description.writer, column, pgwire_module.resultFormat(result_formats, index));
         try self.sendMessage('T', row_description.written());
     }
 
-    fn sendDataRowsForColumnNames(self: *Connection, rows: []const std.json.Value, columns: []const PgwireColumn) !void {
+    fn sendDataRowsForColumnNames(self: *Connection, rows: []const std.json.Value, columns: []const PgwireColumn, result_formats: []const i16) !void {
         for (rows) |row| {
-            try self.sendDataRowForColumnNames(row, columns);
+            try self.sendDataRowForColumnNames(row, columns, result_formats);
         }
     }
 
-    fn sendDataRowForColumnNames(self: *Connection, row: std.json.Value, columns: []const PgwireColumn) !void {
+    fn sendDataRowForColumnNames(self: *Connection, row: std.json.Value, columns: []const PgwireColumn, result_formats: []const i16) !void {
         var data: std.Io.Writer.Allocating = .init(self.alloc);
         defer data.deinit();
         try data.writer.writeInt(i16, @intCast(columns.len), .big);
-        for (columns) |column| try self.appendDataValue(&data.writer, row, column);
+        for (columns, 0..) |column, index| try self.appendDataValue(&data.writer, row, column, pgwire_module.resultFormat(result_formats, index));
         try self.sendMessage('D', data.written());
     }
 
-    fn appendDataValue(self: *Connection, writer: *std.Io.Writer, row: std.json.Value, column: PgwireColumn) !void {
+    fn appendDataValue(self: *Connection, writer: *std.Io.Writer, row: std.json.Value, column: PgwireColumn, format: i16) !void {
         if (row != .object) {
             try writer.writeInt(i32, -1, .big);
             return;
@@ -946,6 +972,13 @@ const Connection = struct {
         };
         if (value == .null) {
             try writer.writeInt(i32, -1, .big);
+            return;
+        }
+        if (format == binary_format) {
+            var encoded = try pgwire_module.pgwireValueBinaryAlloc(self.alloc, value, column);
+            defer encoded.deinit();
+            try writer.writeInt(i32, @intCast(encoded.written().len), .big);
+            try writer.writeAll(encoded.written());
             return;
         }
         const text = try pgwire_module.pgwireValueTextAlloc(self.alloc, value, column);
@@ -1137,6 +1170,7 @@ fn freePortal(alloc: std.mem.Allocator, portal: Portal) void {
     alloc.free(portal.sql);
     for (portal.params) |value| http_server.ApiHttpServer.freePublicSqlParam(alloc, value);
     if (portal.params.len > 0) alloc.free(portal.params);
+    if (portal.result_formats.len > 0) alloc.free(portal.result_formats);
 }
 
 fn freePortalMap(alloc: std.mem.Allocator, map: *std.StringHashMapUnmanaged(Portal)) void {
@@ -1161,9 +1195,22 @@ fn parameterFormat(formats: []const i16, index: usize) i16 {
     return text_format;
 }
 
+fn resultFormat(formats: []const i16, index: usize) i16 {
+    return parameterFormat(formats, index);
+}
+
+fn sqlValueFromPgwireParameterAlloc(alloc: std.mem.Allocator, oid: i32, format: i16, encoded: []const u8) !sql_adapter.SqlValue {
+    return switch (format) {
+        text_format => try sqlValueFromTextParameterAlloc(alloc, oid, encoded),
+        binary_format => try sqlValueFromBinaryParameterAlloc(alloc, oid, encoded),
+        else => error.UnsupportedPgwireParameterFormat,
+    };
+}
+
 fn sqlValueFromTextParameterAlloc(alloc: std.mem.Allocator, oid: i32, text: []const u8) !sql_adapter.SqlValue {
     return switch (oid) {
         bool_oid => .{ .bool = try boolSqlValueFromText(text) },
+        int2_oid, int4_oid, int8_oid => .{ .integer = try std.fmt.parseInt(i64, text, 10) },
         numeric_oid => numericSqlValueFromText(text) catch .{ .string = try alloc.dupe(u8, text) },
         jsonb_oid => blk: {
             var parsed = std.json.parseFromSlice(std.json.Value, alloc, text, .{}) catch return error.InvalidPgwireParameter;
@@ -1171,6 +1218,47 @@ fn sqlValueFromTextParameterAlloc(alloc: std.mem.Allocator, oid: i32, text: []co
             break :blk .{ .json = try alloc.dupe(u8, text) };
         },
         else => .{ .string = try alloc.dupe(u8, text) },
+    };
+}
+
+fn sqlValueFromBinaryParameterAlloc(alloc: std.mem.Allocator, oid: i32, encoded: []const u8) !sql_adapter.SqlValue {
+    return switch (oid) {
+        bool_oid => blk: {
+            if (encoded.len != 1) return error.InvalidPgwireParameter;
+            break :blk .{ .bool = encoded[0] != 0 };
+        },
+        int2_oid => blk: {
+            if (encoded.len != 2) return error.InvalidPgwireParameter;
+            break :blk .{ .integer = std.mem.readInt(i16, encoded[0..2], .big) };
+        },
+        int4_oid => blk: {
+            if (encoded.len != 4) return error.InvalidPgwireParameter;
+            break :blk .{ .integer = std.mem.readInt(i32, encoded[0..4], .big) };
+        },
+        int8_oid => blk: {
+            if (encoded.len != 8) return error.InvalidPgwireParameter;
+            break :blk .{ .integer = std.mem.readInt(i64, encoded[0..8], .big) };
+        },
+        numeric_oid => blk: {
+            const text = try numericTextFromPgBinaryAlloc(alloc, encoded);
+            defer alloc.free(text);
+            break :blk numericSqlValueFromText(text) catch .{ .string = try alloc.dupe(u8, text) };
+        },
+        timestamptz_oid => blk: {
+            if (encoded.len != 8) return error.InvalidPgwireParameter;
+            const pg_micros = std.mem.readInt(i64, encoded[0..8], .big);
+            const unix_micros = pg_micros + postgres_epoch_unix_seconds * std.time.us_per_s;
+            break :blk .{ .integer = unix_micros * std.time.ns_per_us };
+        },
+        jsonb_oid => blk: {
+            if (encoded.len == 0 or encoded[0] != 1) return error.InvalidPgwireParameter;
+            const json = encoded[1..];
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, json, .{}) catch return error.InvalidPgwireParameter;
+            defer parsed.deinit();
+            break :blk .{ .json = try alloc.dupe(u8, json) };
+        },
+        text_oid => .{ .string = try alloc.dupe(u8, encoded) },
+        else => .{ .string = try alloc.dupe(u8, encoded) },
     };
 }
 
@@ -1195,6 +1283,59 @@ fn numericSqlValueFromText(text: []const u8) !sql_adapter.SqlValue {
         return .{ .integer = integer };
     } else |_| {}
     return .{ .float = try std.fmt.parseFloat(f64, text) };
+}
+
+fn numericTextFromPgBinaryAlloc(alloc: std.mem.Allocator, encoded: []const u8) ![]u8 {
+    if (encoded.len < 8 or encoded.len % 2 != 0) return error.InvalidPgwireParameter;
+    const ndigits = std.mem.readInt(i16, encoded[0..2], .big);
+    const weight = std.mem.readInt(i16, encoded[2..4], .big);
+    const sign = std.mem.readInt(i16, encoded[4..6], .big);
+    const dscale = std.mem.readInt(i16, encoded[6..8], .big);
+    if (ndigits < 0 or dscale < 0) return error.InvalidPgwireParameter;
+    const digit_count: usize = @intCast(ndigits);
+    if (encoded.len != 8 + digit_count * 2) return error.InvalidPgwireParameter;
+    if (sign == @as(i16, @bitCast(@as(u16, 0xC000)))) return try alloc.dupe(u8, "NaN");
+    if (sign != 0 and sign != @as(i16, @bitCast(@as(u16, 0x4000)))) return error.InvalidPgwireParameter;
+    if (digit_count == 0) return try alloc.dupe(u8, "0");
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    if (sign != 0) try out.writer.writeByte('-');
+
+    const integer_groups: isize = @as(isize, weight) + 1;
+    if (integer_groups <= 0) {
+        try out.writer.writeByte('0');
+    } else {
+        var group_index: isize = 0;
+        while (group_index < integer_groups) : (group_index += 1) {
+            const digit = if (group_index < digit_count) pgNumericDigit(encoded, @intCast(group_index)) else 0;
+            if (group_index == 0) {
+                try out.writer.print("{d}", .{digit});
+            } else {
+                try out.writer.print("{d:0>4}", .{digit});
+            }
+        }
+    }
+
+    if (dscale > 0) {
+        try out.writer.writeByte('.');
+        var remaining: usize = @intCast(dscale);
+        var group_index: isize = @max(integer_groups, 0);
+        while (remaining > 0) : (group_index += 1) {
+            const digit = if (group_index >= 0 and group_index < digit_count) pgNumericDigit(encoded, @intCast(group_index)) else 0;
+            var group_buf: [4]u8 = undefined;
+            const group_text = try std.fmt.bufPrint(&group_buf, "{d:0>4}", .{digit});
+            const n = @min(remaining, group_text.len);
+            try out.writer.writeAll(group_text[0..n]);
+            remaining -= n;
+        }
+    }
+
+    return try out.toOwnedSlice();
+}
+
+fn pgNumericDigit(encoded: []const u8, index: usize) u16 {
+    return std.mem.readInt(u16, encoded[8 + index * 2 ..][0..2], .big);
 }
 
 fn inferredTextParameterOidsAlloc(alloc: std.mem.Allocator, sql: []const u8) ![]i32 {
@@ -1342,92 +1483,6 @@ fn readyForQueryStatus(status: http_server.ApiHttpServer.PublicSqlTransactionSta
     };
 }
 
-fn commandTagForDdlSql(alloc: std.mem.Allocator, sql: []const u8) ?[]const u8 {
-    var parsed_sql = sql_adapter.ParsedSql.initAlloc(alloc, sql) catch return null;
-    defer parsed_sql.deinit(alloc);
-    return commandTagForParsedDdl(&parsed_sql);
-}
-
-fn commandTagForParsedDdl(parsed_sql: *const sql_adapter.ParsedSql) []const u8 {
-    const tokens = parsed_sql.items();
-    const raw = parsed_sql.raw_statement;
-    if (raw.token_start >= raw.token_end or raw.token_end > tokens.len) return "DDL";
-    const first = tokens[raw.token_start];
-    if (first.matchesKeywordTag(.create)) return commandTagForCreateDdl(tokens[raw.token_start + 1 .. raw.token_end]);
-    if (first.matchesKeywordTag(.alter)) return commandTagForDdlObject("ALTER", tokens[raw.token_start + 1 .. raw.token_end]);
-    if (first.matchesKeywordTag(.drop)) return commandTagForDdlObject("DROP", tokens[raw.token_start + 1 .. raw.token_end]);
-    if (first.matchesKeywordTag(.truncate)) return "TRUNCATE";
-    if (first.matchesKeywordTag(.grant)) return "GRANT";
-    if (first.matchesKeywordTag(.revoke)) return "REVOKE";
-    if (first.matchesKeywordTag(.set)) return "SET";
-    if (first.matchesKeywordTag(.show)) return "SHOW";
-    if (first.matchesKeywordTag(.reset)) return "RESET";
-    if (first.matchesKeywordTag(.discard)) return "DISCARD";
-    if (first.matchesKeywordTag(.begin)) return "BEGIN";
-    if (first.matchesKeyword("start") and raw.token_start + 1 < raw.token_end and tokens[raw.token_start + 1].matchesKeyword("transaction")) return "BEGIN";
-    if (first.matchesKeywordTag(.commit)) return "COMMIT";
-    if (first.matchesKeywordTag(.rollback)) return "ROLLBACK";
-    if (first.matchesKeywordTag(.listen)) return "LISTEN";
-    if (first.matchesKeywordTag(.notify)) return "NOTIFY";
-    if (first.matchesKeywordTag(.unlisten)) return "UNLISTEN";
-    if (first.matchesKeywordTag(.prepare)) return "PREPARE";
-    if (first.matchesKeywordTag(.execute)) return "EXECUTE";
-    if (first.matchesKeywordTag(.deallocate)) return "DEALLOCATE";
-    if (first.matchesKeywordTag(.call)) return "CALL";
-    return "DDL";
-}
-
-fn commandTagForCreateDdl(tokens: []const sql_adapter.Token) []const u8 {
-    var index: usize = 0;
-    while (index < tokens.len and createDdlModifier(tokens[index])) : (index += 1) {}
-    if (index >= tokens.len) return "CREATE";
-    if (tokens[index].matchesKeywordTag(.index)) return "CREATE INDEX";
-    return commandTagForDdlObject("CREATE", tokens[index..]);
-}
-
-fn createDdlModifier(token: sql_adapter.Token) bool {
-    return token.matchesKeywordTag(.unique) or
-        token.matchesKeywordTag(.@"or") or
-        token.matchesKeywordTag(.replace) or
-        token.matchesKeyword("temporary") or
-        token.matchesKeyword("temp") or
-        token.matchesKeyword("unlogged") or
-        token.matchesKeyword("concurrently");
-}
-
-fn commandTagForDdlObject(comptime verb: []const u8, tokens: []const sql_adapter.Token) []const u8 {
-    for (tokens) |token| {
-        if (ddlObjectModifier(token)) continue;
-        if (token.matchesKeywordTag(.table)) return verb ++ " TABLE";
-        if (token.matchesKeywordTag(.index)) return verb ++ " INDEX";
-        if (token.matchesKeywordTag(.database)) return verb ++ " DATABASE";
-        if (token.matchesKeywordTag(.schema)) return verb ++ " SCHEMA";
-        if (token.matchesKeyword("tablespace")) return verb ++ " TABLESPACE";
-        if (token.matchesKeywordTag(.extension)) return verb ++ " EXTENSION";
-        if (token.matchesKeyword("role")) return verb ++ " ROLE";
-        if (token.matchesKeywordTag(.function)) return verb ++ " FUNCTION";
-        if (token.matchesKeywordTag(.procedure)) return verb ++ " PROCEDURE";
-        if (token.matchesKeywordTag(.trigger)) return verb ++ " TRIGGER";
-        if (token.matchesKeywordTag(.view)) return verb ++ " VIEW";
-        if (token.matchesKeywordTag(.policy)) return verb ++ " POLICY";
-        return verb;
-    }
-    return verb;
-}
-
-fn ddlObjectModifier(token: sql_adapter.Token) bool {
-    return token.matchesKeywordTag(.@"if") or
-        token.matchesKeywordTag(.not) or
-        token.matchesKeywordTag(.exists) or
-        token.matchesKeywordTag(.only) or
-        token.matchesKeyword("concurrently") or
-        token.matchesKeywordTag(.@"or") or
-        token.matchesKeywordTag(.replace) or
-        token.matchesKeyword("temporary") or
-        token.matchesKeyword("temp") or
-        token.matchesKeyword("unlogged");
-}
-
 fn commandTagForDdlApplied(applied: anytype) []const u8 {
     if (applied.created_table) return "CREATE TABLE";
     if (applied.dropped_table) return "DROP TABLE";
@@ -1468,6 +1523,40 @@ fn commandVerb(statement_kind: []const u8) []const u8 {
     return statement_kind;
 }
 
+fn pgwireValueBinaryAlloc(alloc: std.mem.Allocator, value: std.json.Value, column: PgwireColumn) !std.Io.Writer.Allocating {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    switch (column.type_oid) {
+        bool_oid => try out.writer.writeByte(if (jsonValueBool(value) orelse return error.InvalidPgwireValue) 1 else 0),
+        int2_oid => try out.writer.writeInt(i16, @intCast(try jsonValueI64(value)), .big),
+        int4_oid => try out.writer.writeInt(i32, @intCast(try jsonValueI64(value)), .big),
+        int8_oid => try out.writer.writeInt(i64, try jsonValueI64(value), .big),
+        numeric_oid => {
+            const text = try jsonValueTextAlloc(alloc, value);
+            defer alloc.free(text);
+            try appendPgBinaryNumeric(alloc, &out.writer, text);
+        },
+        timestamptz_oid => {
+            const ns = (try jsonValueNanoseconds(value)) orelse return error.InvalidPgwireValue;
+            const unix_micros: i64 = @intCast(@divFloor(ns, std.time.ns_per_us));
+            const pg_micros = unix_micros - postgres_epoch_unix_seconds * std.time.us_per_s;
+            try out.writer.writeInt(i64, pg_micros, .big);
+        },
+        jsonb_oid => {
+            const text = try jsonValueTextAlloc(alloc, value);
+            defer alloc.free(text);
+            try out.writer.writeByte(1);
+            try out.writer.writeAll(text);
+        },
+        else => {
+            const text = try pgwireValueTextAlloc(alloc, value, column);
+            defer alloc.free(text);
+            try out.writer.writeAll(text);
+        },
+    }
+    return out;
+}
+
 fn jsonValueTextAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
     return switch (value) {
         .string => |text| try alloc.dupe(u8, text),
@@ -1481,6 +1570,23 @@ fn pgwireValueTextAlloc(alloc: std.mem.Allocator, value: std.json.Value, column:
         if (try jsonValueNanoseconds(value)) |ns| return try timestampNsTextAlloc(alloc, ns);
     }
     return try jsonValueTextAlloc(alloc, value);
+}
+
+fn jsonValueBool(value: std.json.Value) ?bool {
+    return switch (value) {
+        .bool => |boolean| boolean,
+        .string => |text| boolSqlValueFromText(text) catch null,
+        else => null,
+    };
+}
+
+fn jsonValueI64(value: std.json.Value) !i64 {
+    return switch (value) {
+        .integer => |number| number,
+        .float => |number| @intFromFloat(number),
+        .number_string, .string => |text| std.fmt.parseInt(i64, text, 10) catch return error.InvalidPgwireValue,
+        else => error.InvalidPgwireValue,
+    };
 }
 
 fn jsonValueNanoseconds(value: std.json.Value) !?u64 {
@@ -1510,7 +1616,61 @@ fn timestampNsTextAlloc(alloc: std.mem.Allocator, ns: u64) ![]u8 {
     });
 }
 
-fn appendColumnDescription(writer: *std.Io.Writer, column: PgwireColumn) !void {
+fn appendPgBinaryNumeric(alloc: std.mem.Allocator, writer: *std.Io.Writer, text: []const u8) !void {
+    if (std.mem.indexOfAny(u8, text, "eE") != null) return error.InvalidPgwireValue;
+    var body = text;
+    var sign: i16 = 0;
+    if (std.mem.startsWith(u8, body, "-")) {
+        sign = @bitCast(@as(u16, 0x4000));
+        body = body[1..];
+    } else if (std.mem.startsWith(u8, body, "+")) {
+        body = body[1..];
+    }
+
+    const decimal = std.mem.indexOfScalar(u8, body, '.');
+    const integer_raw = if (decimal) |pos| body[0..pos] else body;
+    const fractional_raw = if (decimal) |pos| body[pos + 1 ..] else "";
+    var integer_start: usize = 0;
+    while (integer_start < integer_raw.len and integer_raw[integer_start] == '0') : (integer_start += 1) {}
+    const integer_digits = integer_raw[integer_start..];
+    const dscale: i16 = @intCast(fractional_raw.len);
+
+    var groups: std.ArrayListUnmanaged(u16) = .empty;
+    defer groups.deinit(alloc);
+
+    const integer_group_count: usize = if (integer_digits.len == 0) 0 else (integer_digits.len + 3) / 4;
+    if (integer_group_count != 0) {
+        const first_group_len = integer_digits.len - (integer_group_count - 1) * 4;
+        var group_start: usize = 0;
+        var group_len = first_group_len;
+        while (group_start < integer_digits.len) {
+            const group = try std.fmt.parseInt(u16, integer_digits[group_start .. group_start + group_len], 10);
+            try groups.append(alloc, group);
+            group_start += group_len;
+            group_len = 4;
+        }
+    }
+
+    var frac_index: usize = 0;
+    while (frac_index < fractional_raw.len) : (frac_index += 4) {
+        var group_buf = [_]u8{'0'} ** 4;
+        const len = @min(@as(usize, 4), fractional_raw.len - frac_index);
+        @memcpy(group_buf[0..len], fractional_raw[frac_index .. frac_index + len]);
+        const group = try std.fmt.parseInt(u16, &group_buf, 10);
+        try groups.append(alloc, group);
+    }
+
+    while (groups.items.len > 0 and groups.items[groups.items.len - 1] == 0) _ = groups.pop();
+
+    const weight: i16 = if (integer_group_count == 0) -1 else @intCast(integer_group_count - 1);
+    try writer.writeInt(i16, @intCast(groups.items.len), .big);
+    try writer.writeInt(i16, weight, .big);
+    try writer.writeInt(i16, sign, .big);
+    try writer.writeInt(i16, dscale, .big);
+    for (groups.items) |group| try writer.writeInt(u16, group, .big);
+}
+
+fn appendColumnDescription(writer: *std.Io.Writer, column: PgwireColumn, format: i16) !void {
     try writer.writeAll(column.name);
     try writer.writeByte(0);
     try writer.writeInt(i32, 0, .big);
@@ -1518,7 +1678,7 @@ fn appendColumnDescription(writer: *std.Io.Writer, column: PgwireColumn) !void {
     try writer.writeInt(i32, column.type_oid, .big);
     try writer.writeInt(i16, column.type_size, .big);
     try writer.writeInt(i32, -1, .big);
-    try writer.writeInt(i16, text_format, .big);
+    try writer.writeInt(i16, format, .big);
 }
 
 fn sqlstateForHttpResponse(status: u16, body: []const u8) []const u8 {
@@ -1695,23 +1855,6 @@ test "pgwire cancel registry matches backend key data" {
     try std.testing.expect(!conn.consumeCancelRequested());
 }
 
-test "pgwire ddl command tags preserve concrete statement shape" {
-    const cases = [_]struct {
-        sql: []const u8,
-        tag: []const u8,
-    }{
-        .{ .sql = "CREATE TABLE events (id text PRIMARY KEY);", .tag = "CREATE TABLE" },
-        .{ .sql = "CREATE INDEX events_status_idx ON events (status);", .tag = "CREATE INDEX" },
-        .{ .sql = "CREATE UNIQUE INDEX events_id_idx ON events (id);", .tag = "CREATE INDEX" },
-        .{ .sql = "DROP INDEX IF EXISTS events_status_idx;", .tag = "DROP INDEX" },
-        .{ .sql = "ALTER TABLE events ADD COLUMN status text;", .tag = "ALTER TABLE" },
-        .{ .sql = "CREATE SCHEMA analytics;", .tag = "CREATE SCHEMA" },
-    };
-    for (cases) |case| {
-        try std.testing.expectEqualStrings(case.tag, commandTagForDdlSql(std.testing.allocator, case.sql).?);
-    }
-}
-
 test "pgwire parse infers text parameter oids outside literals and comments" {
     const sql =
         \\SELECT '$1' AS literal, id
@@ -1755,6 +1898,62 @@ test "pgwire text parameters decode to typed sql values without rewriting sql" {
     try std.testing.expectEqualStrings("{\"ok\":true}", json_value.json);
 
     try std.testing.expectError(error.InvalidPgwireParameter, sqlValueFromTextParameterAlloc(alloc, jsonb_oid, "{bad"));
+}
+
+test "pgwire binary parameters decode to typed sql values" {
+    const alloc = std.testing.allocator;
+
+    const bool_value = try sqlValueFromPgwireParameterAlloc(alloc, bool_oid, binary_format, &.{1});
+    defer http_server.ApiHttpServer.freePublicSqlParam(alloc, bool_value);
+    try std.testing.expect(bool_value == .bool);
+    try std.testing.expect(bool_value.bool);
+
+    var int4_bytes: [4]u8 = undefined;
+    std.mem.writeInt(i32, &int4_bytes, 42, .big);
+    const int4_value = try sqlValueFromPgwireParameterAlloc(alloc, int4_oid, binary_format, &int4_bytes);
+    defer http_server.ApiHttpServer.freePublicSqlParam(alloc, int4_value);
+    try std.testing.expect(int4_value == .integer);
+    try std.testing.expectEqual(@as(i64, 42), int4_value.integer);
+
+    var ts_bytes: [8]u8 = undefined;
+    std.mem.writeInt(i64, &ts_bytes, 1_000_000, .big);
+    const ts_value = try sqlValueFromPgwireParameterAlloc(alloc, timestamptz_oid, binary_format, &ts_bytes);
+    defer http_server.ApiHttpServer.freePublicSqlParam(alloc, ts_value);
+    try std.testing.expect(ts_value == .integer);
+    try std.testing.expectEqual(@as(i64, (postgres_epoch_unix_seconds + 1) * std.time.ns_per_s), ts_value.integer);
+
+    const json_value = try sqlValueFromPgwireParameterAlloc(alloc, jsonb_oid, binary_format, "\x01{\"ok\":true}");
+    defer http_server.ApiHttpServer.freePublicSqlParam(alloc, json_value);
+    try std.testing.expect(json_value == .json);
+    try std.testing.expectEqualStrings("{\"ok\":true}", json_value.json);
+}
+
+test "pgwire binary result encoders use postgres wire layouts" {
+    const alloc = std.testing.allocator;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"active":true,"amount":12.5,"created_at":946684800000000000,"attrs":{"tier":"gold"}}
+    , .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    const row = parsed.value;
+
+    var bool_binary = try pgwireValueBinaryAlloc(alloc, row.object.get("active").?, .{ .name = "active", .type_oid = bool_oid, .type_size = bool_type_size, .antfly_type = .boolean });
+    defer bool_binary.deinit();
+    try std.testing.expectEqualSlices(u8, &.{1}, bool_binary.written());
+
+    var numeric_binary = try pgwireValueBinaryAlloc(alloc, row.object.get("amount").?, .{ .name = "amount", .type_oid = numeric_oid, .type_size = text_type_size, .antfly_type = .numeric });
+    defer numeric_binary.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 0, 2, 0, 0, 0, 0, 0, 1, 0, 12, 0x13, 0x88 }, numeric_binary.written());
+
+    var ts_binary = try pgwireValueBinaryAlloc(alloc, row.object.get("created_at").?, .{ .name = "created_at", .type_oid = timestamptz_oid, .type_size = timestamptz_type_size, .antfly_type = .datetime });
+    defer ts_binary.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0, 0 }, ts_binary.written());
+
+    var json_binary = try pgwireValueBinaryAlloc(alloc, row.object.get("attrs").?, .{ .name = "attrs", .type_oid = jsonb_oid, .type_size = text_type_size, .antfly_type = .json });
+    defer json_binary.deinit();
+    try std.testing.expect(json_binary.written().len > 1);
+    try std.testing.expectEqual(@as(u8, 1), json_binary.written()[0]);
+    try std.testing.expect(std.mem.indexOf(u8, json_binary.written()[1..], "\"tier\"") != null);
 }
 
 test "pgwire relational column descriptions use postgres-compatible text types" {

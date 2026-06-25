@@ -4718,11 +4718,21 @@ pub const ApiHttpServer = struct {
             }
         };
 
+        pub const Ddl = struct {
+            applied: tables_api.AppliedRelationalSqlDdlRecord,
+            command_tag: []const u8 = "DDL",
+
+            pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+                self.applied.deinit(alloc);
+                self.* = undefined;
+            }
+        };
+
         session_id: u64,
         statement_kind: []const u8,
         transaction_status: PublicSqlTransactionStatus = .idle,
         result: union(enum) {
-            ddl: tables_api.AppliedRelationalSqlDdlRecord,
+            ddl: Ddl,
             read: Read,
             rows_batch: relational_rows_api.OwnedRowsBatchRequest,
             mutation_source: db_mod.types.RelationalRowsMutationSourceResult,
@@ -4730,7 +4740,7 @@ pub const ApiHttpServer = struct {
 
         pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             switch (self.result) {
-                .ddl => |*applied| applied.deinit(alloc),
+                .ddl => |*ddl| ddl.deinit(alloc),
                 .read => |*read| read.deinit(alloc),
                 .rows_batch => |*rows_batch| rows_batch.deinit(alloc),
                 .mutation_source => |*mutation_source| mutation_source.deinit(alloc),
@@ -4883,13 +4893,13 @@ pub const ApiHttpServer = struct {
 
     fn encodePublicSqlResultAlloc(self: *ApiHttpServer, result: PublicSqlResult) ![]u8 {
         return switch (result.result) {
-            .ddl => |applied| blk: {
+            .ddl => |ddl| blk: {
                 var response = try jsonResponse(self.alloc, PublicSqlResponse{
                     .kind = "ddl",
                     .session_id = result.session_id,
                     .statement_kind = "ddl",
-                    .noop = applied.noop,
-                    .applied = applied,
+                    .noop = ddl.applied.noop,
+                    .applied = ddl.applied,
                 });
                 defer response.deinit(self.alloc);
                 break :blk try self.alloc.dupe(u8, response.body);
@@ -4898,6 +4908,86 @@ pub const ApiHttpServer = struct {
             .rows_batch => |rows_batch| try self.encodePublicSqlRowsBatchResultAlloc(result.session_id, result.statement_kind, rows_batch),
             .mutation_source => |mutation_source| try self.encodePublicSqlRowsMutationSourceResultAlloc(result.session_id, result.statement_kind, mutation_source),
         };
+    }
+
+    fn publicSqlDdlCommandTag(parsed_sql: *const sql_adapter.ParsedSql) []const u8 {
+        const tokens = parsed_sql.items();
+        const raw = parsed_sql.raw_statement;
+        if (raw.token_start >= raw.token_end or raw.token_end > tokens.len) return "DDL";
+        const first = tokens[raw.token_start];
+        if (first.matchesKeywordTag(.create)) return publicSqlCreateDdlCommandTag(tokens[raw.token_start + 1 .. raw.token_end]);
+        if (first.matchesKeywordTag(.alter)) return publicSqlDdlObjectCommandTag("ALTER", tokens[raw.token_start + 1 .. raw.token_end]);
+        if (first.matchesKeywordTag(.drop)) return publicSqlDdlObjectCommandTag("DROP", tokens[raw.token_start + 1 .. raw.token_end]);
+        if (first.matchesKeywordTag(.truncate)) return "TRUNCATE";
+        if (first.matchesKeywordTag(.grant)) return "GRANT";
+        if (first.matchesKeywordTag(.revoke)) return "REVOKE";
+        if (first.matchesKeywordTag(.set)) return "SET";
+        if (first.matchesKeywordTag(.show)) return "SHOW";
+        if (first.matchesKeywordTag(.reset)) return "RESET";
+        if (first.matchesKeywordTag(.discard)) return "DISCARD";
+        if (first.matchesKeywordTag(.begin)) return "BEGIN";
+        if (first.matchesKeyword("start") and raw.token_start + 1 < raw.token_end and tokens[raw.token_start + 1].matchesKeyword("transaction")) return "BEGIN";
+        if (first.matchesKeywordTag(.commit)) return "COMMIT";
+        if (first.matchesKeywordTag(.rollback)) return "ROLLBACK";
+        if (first.matchesKeywordTag(.listen)) return "LISTEN";
+        if (first.matchesKeywordTag(.notify)) return "NOTIFY";
+        if (first.matchesKeywordTag(.unlisten)) return "UNLISTEN";
+        if (first.matchesKeywordTag(.prepare)) return "PREPARE";
+        if (first.matchesKeywordTag(.execute)) return "EXECUTE";
+        if (first.matchesKeywordTag(.deallocate)) return "DEALLOCATE";
+        if (first.matchesKeywordTag(.call)) return "CALL";
+        return "DDL";
+    }
+
+    fn publicSqlCreateDdlCommandTag(tokens: []const sql_adapter.Token) []const u8 {
+        var index: usize = 0;
+        while (index < tokens.len and publicSqlCreateDdlModifier(tokens[index])) : (index += 1) {}
+        if (index >= tokens.len) return "CREATE";
+        if (tokens[index].matchesKeywordTag(.index)) return "CREATE INDEX";
+        return publicSqlDdlObjectCommandTag("CREATE", tokens[index..]);
+    }
+
+    fn publicSqlCreateDdlModifier(token: sql_adapter.Token) bool {
+        return token.matchesKeywordTag(.unique) or
+            token.matchesKeywordTag(.@"or") or
+            token.matchesKeywordTag(.replace) or
+            token.matchesKeyword("temporary") or
+            token.matchesKeyword("temp") or
+            token.matchesKeyword("unlogged") or
+            token.matchesKeyword("concurrently");
+    }
+
+    fn publicSqlDdlObjectCommandTag(comptime verb: []const u8, tokens: []const sql_adapter.Token) []const u8 {
+        for (tokens) |token| {
+            if (publicSqlDdlObjectModifier(token)) continue;
+            if (token.matchesKeywordTag(.table)) return verb ++ " TABLE";
+            if (token.matchesKeywordTag(.index)) return verb ++ " INDEX";
+            if (token.matchesKeywordTag(.database)) return verb ++ " DATABASE";
+            if (token.matchesKeywordTag(.schema)) return verb ++ " SCHEMA";
+            if (token.matchesKeyword("tablespace")) return verb ++ " TABLESPACE";
+            if (token.matchesKeywordTag(.extension)) return verb ++ " EXTENSION";
+            if (token.matchesKeyword("role")) return verb ++ " ROLE";
+            if (token.matchesKeywordTag(.function)) return verb ++ " FUNCTION";
+            if (token.matchesKeywordTag(.procedure)) return verb ++ " PROCEDURE";
+            if (token.matchesKeywordTag(.trigger)) return verb ++ " TRIGGER";
+            if (token.matchesKeywordTag(.view)) return verb ++ " VIEW";
+            if (token.matchesKeywordTag(.policy)) return verb ++ " POLICY";
+            return verb;
+        }
+        return verb;
+    }
+
+    fn publicSqlDdlObjectModifier(token: sql_adapter.Token) bool {
+        return token.matchesKeywordTag(.@"if") or
+            token.matchesKeywordTag(.not) or
+            token.matchesKeywordTag(.exists) or
+            token.matchesKeywordTag(.only) or
+            token.matchesKeyword("concurrently") or
+            token.matchesKeywordTag(.@"or") or
+            token.matchesKeywordTag(.replace) or
+            token.matchesKeyword("temporary") or
+            token.matchesKeyword("temp") or
+            token.matchesKeyword("unlogged");
     }
 
     fn applyLoweredPublicSqlRowsBatch(
@@ -6939,7 +7029,10 @@ pub const ApiHttpServer = struct {
             .session_id = session_id,
             .statement_kind = "ddl",
             .transaction_status = self.publicSqlTransactionStatus(&session),
-            .result = .{ .ddl = applied },
+            .result = .{ .ddl = .{
+                .applied = applied,
+                .command_tag = publicSqlDdlCommandTag(&parsed_sql),
+            } },
         } };
     }
 
@@ -25631,6 +25724,26 @@ test "api http server enforces SQL row security WITH CHECK on row writes" {
     );
 
     try std.testing.expect(reads.lookup_calls >= 3);
+}
+
+test "api http server derives public SQL DDL command tags from parsed statements" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        sql: []const u8,
+        tag: []const u8,
+    }{
+        .{ .sql = "CREATE TABLE events (id text PRIMARY KEY);", .tag = "CREATE TABLE" },
+        .{ .sql = "CREATE INDEX events_status_idx ON events (status);", .tag = "CREATE INDEX" },
+        .{ .sql = "CREATE UNIQUE INDEX events_id_idx ON events (id);", .tag = "CREATE INDEX" },
+        .{ .sql = "DROP INDEX IF EXISTS events_status_idx;", .tag = "DROP INDEX" },
+        .{ .sql = "ALTER TABLE events ADD COLUMN status text;", .tag = "ALTER TABLE" },
+        .{ .sql = "CREATE SCHEMA analytics;", .tag = "CREATE SCHEMA" },
+    };
+    for (cases) |case| {
+        var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, case.sql);
+        defer parsed_sql.deinit(alloc);
+        try std.testing.expectEqualStrings(case.tag, ApiHttpServer.publicSqlDdlCommandTag(&parsed_sql));
+    }
 }
 
 test "api http server applies SQL DDL with explicit catalog session" {

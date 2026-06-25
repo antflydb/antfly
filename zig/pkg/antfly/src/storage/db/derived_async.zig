@@ -2223,6 +2223,97 @@ test "dense catch-up maintenance cooldown skips light repeated maintenance" {
     try std.testing.expect(TestImpl.shouldRunDenseCatchUpMaintenance(&ctx, "vec", 1, now_ns + denseCatchUpMaintenanceCooldownNs()));
 }
 
+test "db derived async runUntilIdle drains lazy dense posting maintenance" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"use_quantization\":false,\"lazy_posting_maintenance\":true,\"auto_posting_maintenance_max_postings\":0}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"embedding\":[1.0,0.0]}" },
+            .{ .key = "doc:b", .value = "{\"embedding\":[3.0,0.0]}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    {
+        const entry = db.core.denseIndex("dv_v1") orelse return error.IndexNotFound;
+        var txn = try entry.index.beginWriteTxn();
+        errdefer txn.abort();
+        var root = try entry.index.loadNode(&txn, entry.index.metadata.root_node);
+        defer root.deinit(alloc);
+        try root.ensureUnbacked(alloc);
+        root.posting_state.noteMembersChanged(root.members.len);
+        try entry.index.saveNode(&txn, &root);
+        try entry.index.finishWriteTxn(&txn);
+        entry.index.invalidateNodeCache(root.id);
+    }
+
+    {
+        const stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].hbc_posting.dirty_postings);
+    }
+
+    try db.runUntilIdle();
+
+    {
+        const stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 0), stats.indexes[0].hbc_posting.dirty_postings);
+        try std.testing.expect(stats.indexes[0].hbc_posting.maintenance_repaired_postings > 0);
+    }
+}
+
+test "db derived async collectManagedSyncTargets includes graph index for graph artifact journal changes" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "gr_v1",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+
+    const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "gr_v1", "links", "doc:b");
+
+    var batch = derived_types.DerivedBatch{
+        .changed_artifact_keys = try alloc.dupe([]const u8, &.{artifact_key}),
+    };
+    defer derived_types.deinitDerivedBatch(alloc, &batch);
+
+    var sync_targets = try db.derivedAsyncCollectManagedSyncTargets(alloc, batch);
+    defer sync_targets.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), sync_targets.all_indexes.len);
+    try std.testing.expectEqualStrings("gr_v1", sync_targets.all_indexes[0]);
+}
+
 pub fn denseCatchUpStartupMaxRecords() usize {
     return cachedEnvUsize(
         &dense_catch_up_startup_max_records_cache,
@@ -5462,6 +5553,53 @@ test "db derived async replay skips and deletes corrupt dense embedding artifact
 
     const dense_applied = try reopened.core.loadAppliedSequence(alloc, "dv_v1");
     try std.testing.expectEqual(appended_sequence, dense_applied);
+}
+
+test "db derived async dense artifact rebuild deletes corrupt stored embedding artifacts" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+    });
+
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
+    defer alloc.free(artifact_key);
+    try db.core.store.put(artifact_key, "bad-artifact");
+
+    const rebuilt = try db.rebuildDenseIndexesFromStoredEmbeddingArtifacts(alloc);
+    try std.testing.expectEqual(@as(usize, 0), rebuilt);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, artifact_key));
+}
+
+test "db derived async dense artifact rebuild write cleanup tolerates artifact-backed empty vectors" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var writes = std.ArrayListUnmanaged(mapper.DenseEmbeddingWrite).empty;
+    defer writes.deinit(alloc);
+
+    try writes.append(alloc, .{
+        .index_name = try alloc.dupe(u8, "dv_v1"),
+        .doc_key = try alloc.dupe(u8, "doc:a"),
+        .artifact_key = try alloc.dupe(u8, "artifact:dense:doc:a"),
+        .vector = &.{},
+    });
+
+    DB.derivedAsyncFreeDenseArtifactRebuildWrites(alloc, &writes);
+    try std.testing.expectEqual(@as(usize, 0), writes.items.len);
 }
 
 test "db derived async replay applies sparse embeddings from artifact payloads" {

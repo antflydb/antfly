@@ -68,6 +68,7 @@ const db_test_support = @import("../test_support.zig");
 const tempPath = db_test_support.tempPath;
 const cleanupTempDir = db_test_support.cleanupTempDir;
 const waitForSearchResult = db_test_support.waitForSearchResult;
+const waitForDenseSearchResult = db_test_support.waitForDenseSearchResult;
 const waitForAppliedSequenceAdvance = db_test_support.waitForAppliedSequenceAdvance;
 const waitForDenseIndexResultsWithAttempts = db_test_support.waitForDenseIndexResultsWithAttempts;
 const slow_test_wait_attempts = db_test_support.slow_test_wait_attempts;
@@ -10491,6 +10492,93 @@ test "db enrichment runtime listEnrichments returns explicit definitions across 
     try std.testing.expectEqual(.chunk, enrichments[0].kind);
     try std.testing.expectEqualStrings("body_dense_v1", enrichments[1].name);
     try std.testing.expectEqual(.embedding, enrichments[1].kind);
+}
+
+test "db enrichment runtime addEnrichment supports explicit shared definitions" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "body_chunks_v1",
+        .kind = .chunk,
+        .field = "body",
+        .chunk_size = 8,
+        .chunk_overlap = 2,
+    });
+    try db.addEnrichment(.{
+        .name = "chunk_dense_v1",
+        .kind = .embedding,
+        .field = "body",
+        .source_artifact_name = "body_chunks_v1",
+        .expected_dims = 3,
+    });
+
+    try db.addIndex(.{
+        .name = "dv_ref",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"chunk_dense_v1\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.enrichment_runtime.?.waitForApplied(1);
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
+    defer alloc.free(query_vec);
+
+    const req: types.SearchRequest = .{
+        .index_name = "dv_ref",
+        .dense = .{ .vector = query_vec, .k = 3 },
+        .return_mode = .chunk,
+    };
+    var dense_result = try waitForDenseSearchResult(alloc, &db, req, 1);
+    dense_result.deinit();
+
+    var result = try waitForSearchResult(alloc, &db, req, 1);
+    defer result.deinit();
+    const chunk_zero = try artifact_ids.chunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    defer alloc.free(chunk_zero);
+    const chunk_one = try artifact_ids.chunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 1);
+    defer alloc.free(chunk_one);
+    try std.testing.expect(std.mem.eql(u8, result.hits[0].id, chunk_zero) or
+        std.mem.eql(u8, result.hits[0].id, chunk_one));
+
+    const chunk = (try db.getEnrichment(alloc, .chunk, "body_chunks_v1")) orelse return error.TestUnexpectedResult;
+    defer {
+        var tmp = chunk;
+        tmp.deinit(alloc);
+    }
+    try std.testing.expectEqualStrings("body", chunk.field);
+
+    const embedding = (try db.getEnrichment(alloc, .embedding, "chunk_dense_v1")) orelse return error.TestUnexpectedResult;
+    defer {
+        var tmp = embedding;
+        tmp.deinit(alloc);
+    }
+    try std.testing.expectEqualStrings("body_chunks_v1", embedding.source_artifact_name);
+
+    const enrichments = try db.listEnrichments(alloc);
+    defer types.freeEnrichmentConfigs(alloc, enrichments);
+    try std.testing.expectEqual(@as(usize, 2), enrichments.len);
 }
 
 test "db enrichment runtime listEnrichments returns explicit definitions across reopen with durable lsm primary backend" {

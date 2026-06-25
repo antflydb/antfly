@@ -3044,6 +3044,13 @@ pub fn build(b: *std.Build) void {
         "write cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
         "provisioned table write cache retires stale db when index metadata changes",
         "primary lookup adopts seeded write cache across visible generation bump",
+        "pgwire cancel registry matches backend key data",
+        "pgwire parse infers text parameter oids outside literals and comments",
+        "pgwire text parameters decode to typed sql values without rewriting sql",
+        "pgwire binary parameters decode to typed sql values",
+        "pgwire binary result encoders use postgres wire layouts",
+        "pgwire relational column descriptions use postgres-compatible text types",
+        "pgwire sqlstate mapping preserves postgres error classes",
         "retrieval agent treats aggregations as first-class tool capability",
         "retrieval agent requires filter and aggregate tools for filtered aggregations",
         "retrieval agent ignores empty map-valued tool fields for policy and strategy",
@@ -3116,8 +3123,6 @@ pub fn build(b: *std.Build) void {
         "graph hits cleanup page resumes after reopen with published pair visible",
         "graph hits failed planned build preserves prior published pair",
         "graph hits coordinator publish failure preserves prior published pair after reopen",
-        "db single-vector failed planned rebuild preserves published public reads",
-        "db paired hits failed planned rebuild preserves published public reads",
         "graph hits planned build drains partitioned paired pages across workers",
         "graph hits larger manifest resumes across reopen boundaries",
         "graph metric failed planned build cleans abandoned scores and job namespace",
@@ -3178,6 +3183,8 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_graph_metric_lifecycle_tests = b.addRunArtifact(graph_metric_lifecycle_tests);
+    const graph_metric_lifecycle_step = b.step("graph-metric-lifecycle-test", "Run focused graph metric planned lifecycle tests");
+    graph_metric_lifecycle_step.dependOn(&run_graph_metric_lifecycle_tests.step);
     const graph_metric_query_fan_in_tests = b.addTest(.{
         .root_module = api_query_test_mod,
         .filters = selectTestFilters(b, &graph_metric_query_fan_in_default_filters),
@@ -3909,7 +3916,7 @@ pub fn build(b: *std.Build) void {
         "api http server serves local index runtime backfill status",
         "api http server graph metric action endpoint returns updated status",
         "api http server serves provisioned index runtime backfill status across shards",
-        "pgwire ddl command tags preserve concrete statement shape",
+        "api http server derives public SQL DDL command tags from parsed statements",
         "optional pgwire listener rejects host without port",
         "api http server serves database and namespace catalog routes",
         "explicit catalog routes declare qualified namespace and table permissions",
@@ -4008,7 +4015,7 @@ pub fn build(b: *std.Build) void {
             "api http server hydrates trusted principal role settings from antfly user manager",
             "api http server resolves row filter role settings for target database",
             "api http server resolves document SQL row filters through catalog target resources",
-            "pgwire ddl command tags preserve concrete statement shape",
+            "api http server derives public SQL DDL command tags from parsed statements",
             "optional pgwire listener rejects host without port",
             "explicit catalog routes declare qualified namespace and table permissions",
             "api http server serves ARD catalogs with public bootstrap and authenticated tenant entries",
@@ -5867,6 +5874,11 @@ pub fn build(b: *std.Build) void {
         "storage.db.search_runtime.test.",
     };
     _ = addFilteredTestStep(b, db_test_mod, "db-search-runtime-test", "Run focused storage/db search runtime tests", &db_search_runtime_default_filters, .{});
+
+    const db_derived_async_default_filters = [_][]const u8{
+        "storage.db.derived_async.test.",
+    };
+    _ = addFilteredTestStep(b, db_test_mod, "db-derived-async-test", "Run focused storage/db derived async tests", &db_derived_async_default_filters, .{});
 
     const db_lifecycle_default_filters = [_][]const u8{
         "storage.db.lifecycle.test.",

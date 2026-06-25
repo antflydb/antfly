@@ -1548,6 +1548,7 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .explain,
         .alter_index,
         .alter_conversion,
+        .alter_default_privileges,
         .alter_event_trigger,
         .alter_foreign_data_wrapper,
         .alter_foreign_table,

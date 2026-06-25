@@ -177,6 +177,7 @@ pub const GeneratedSqlUnsupportedKind = enum {
     copy,
     alter_index,
     alter_conversion,
+    alter_default_privileges,
     alter_event_trigger,
     alter_foreign_table,
     alter_foreign_data_wrapper,
@@ -256,6 +257,7 @@ pub const GeneratedSqlUnsupportedReason = enum {
     copy_not_planned_by_generated_parser,
     alter_index_not_planned_by_generated_parser,
     alter_conversion_not_planned_by_generated_parser,
+    alter_default_privileges_not_planned_by_generated_parser,
     alter_event_trigger_not_planned_by_generated_parser,
     alter_foreign_table_not_planned_by_generated_parser,
     alter_foreign_data_wrapper_not_planned_by_generated_parser,
@@ -1839,6 +1841,7 @@ pub const simple_graph_corpus = [_]GeneratedSqlCorpusCase{
 pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "ALTER INDEX usage_status_idx RENAME TO usage_status_idx_v2", .kind = .unsupported },
     .{ .sql = "ALTER CONVERSION usage_conv RENAME TO usage_conv_v2", .kind = .unsupported },
+    .{ .sql = "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO readonly", .kind = .unsupported },
     .{ .sql = "ALTER EVENT TRIGGER usage_ddl_start DISABLE", .kind = .unsupported },
     .{ .sql = "ALTER FOREIGN TABLE foreign_usage_records RENAME TO foreign_usage_archive", .kind = .unsupported },
     .{ .sql = "ALTER FOREIGN DATA WRAPPER usage_fdw OPTIONS (ADD host 'localhost')", .kind = .unsupported },
@@ -2190,6 +2193,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.alter) and tokens.len > 1) {
         const second = tokens[1];
         if (second.matchesKeyword("conversion")) return .{ .unsupported = .alter_conversion };
+        if (second.matchesKeywordTag(.default) and tokens.len > 2 and tokens[2].matchesKeywordTag(.privileges)) return .{ .unsupported = .alter_default_privileges };
         if (second.matchesKeyword("event") and tokens.len > 2 and tokens[2].matchesKeywordTag(.trigger)) return .{ .unsupported = .alter_event_trigger };
         if (second.matchesKeywordTag(.index)) return .{ .unsupported = .alter_index };
         if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .unsupported = .alter_materialized_view };
@@ -2412,6 +2416,7 @@ fn buildUnsupportedAst(
             .copy => .copy_not_planned_by_generated_parser,
             .alter_index => .alter_index_not_planned_by_generated_parser,
             .alter_conversion => .alter_conversion_not_planned_by_generated_parser,
+            .alter_default_privileges => .alter_default_privileges_not_planned_by_generated_parser,
             .alter_event_trigger => .alter_event_trigger_not_planned_by_generated_parser,
             .alter_foreign_table => .alter_foreign_table_not_planned_by_generated_parser,
             .alter_foreign_data_wrapper => .alter_foreign_data_wrapper_not_planned_by_generated_parser,
@@ -6498,6 +6503,7 @@ test "generated SQL parser facade exposes typed read and unsupported statement n
     try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .alter_metric }, (try parseSqlAlloc(alloc, "ALTER GRAPH INDEX docs_edge_graph ADD METRIC pagerank_v1 USING pagerank")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .analyze }, (try parseSqlAlloc(alloc, "ANALYZE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_conversion }, (try parseSqlAlloc(alloc, "ALTER CONVERSION usage_conv RENAME TO usage_conv_v2")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_default_privileges }, (try parseSqlAlloc(alloc, "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO readonly")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_event_trigger }, (try parseSqlAlloc(alloc, "ALTER EVENT TRIGGER usage_ddl_start DISABLE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_index }, (try parseSqlAlloc(alloc, "ALTER INDEX usage_status_idx RENAME TO usage_status_idx_v2")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_materialized_view }, (try parseSqlAlloc(alloc, "ALTER MATERIALIZED VIEW usage_summary RENAME TO usage_summary_v2")).statement);
@@ -10045,6 +10051,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .kind = .alter_conversion,
             .reason = .alter_conversion_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 6 },
+        },
+        .{
+            .sql = "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO readonly",
+            .kind = .alter_default_privileges,
+            .reason = .alter_default_privileges_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 12 },
         },
         .{
             .sql = "ALTER EVENT TRIGGER usage_ddl_start DISABLE",
