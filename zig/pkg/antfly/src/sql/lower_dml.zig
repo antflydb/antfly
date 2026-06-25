@@ -12341,7 +12341,7 @@ fn lowerGeneratedDmlWritePlanForDmlTestAlloc(
         .dml => |ast| ast,
         else => return error.UnsupportedSqlShape,
     };
-    return try lowerWritePlanFromGeneratedDmlAstAlloc(alloc, &parsed_sql, dml_ast, schema, params, options);
+    return try lowerWritePlanFromGeneratedDmlAstDirectAlloc(alloc, &parsed_sql, dml_ast, schema, params, options);
 }
 
 fn lowerWritePlanParsedSqlForDmlTestAlloc(
@@ -12488,22 +12488,6 @@ pub fn lowerWritePlanFromGeneratedDmlAstDirectAlloc(
         }
     }
     return error.UnsupportedSqlShape;
-}
-
-pub fn lowerWritePlanFromGeneratedDmlAstAlloc(
-    alloc: std.mem.Allocator,
-    parsed_sql: *const tokenized.ParsedSql,
-    dml_ast: generated_parser.GeneratedSqlDmlAst,
-    schema: runtime_schema.TableSchema,
-    params: []const sql_value.SqlValue,
-    options: plan_mod.LowerWritePlanOptions,
-) !plan_mod.LoweredWritePlan {
-    if (lowerWritePlanFromGeneratedDmlAstDirectAlloc(alloc, parsed_sql, dml_ast, schema, params, options)) |lowered| {
-        return lowered;
-    } else |err| switch (err) {
-        error.UnsupportedSqlShape => return try lowerWritePlanParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, options),
-        else => return err,
-    }
 }
 
 fn insertValuesFromGeneratedDmlAstAlloc(

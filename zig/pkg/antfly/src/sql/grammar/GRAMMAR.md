@@ -339,6 +339,9 @@ Unsupported DDL remains on the existing parser until
    DML ASTs when the generated parser covers the statement, using direct
    generated AST-to-plan lowerers where available and falling back to the
    classifier path only for generated shapes that are not direct-lowered yet.
+   Generated-DML-specific coverage now calls the direct generated lowerer
+   without retrying the classifier path, so promoted generated DML cases fail
+   closed if their AST-to-plan contract regresses.
    Incomplete migrated DML clause-boundary shapes for insert, update, delete,
    truncate, and merge now use generated fail-closed diagnostics instead of
    classifier fallback.
