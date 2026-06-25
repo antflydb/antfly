@@ -181,6 +181,18 @@ fn firstSseEventData(events: []const TestSseEvent, name: []const u8) ?[]const u8
     return null;
 }
 
+fn firstStepCompletedEventIndex(alloc: std.mem.Allocator, events: []const TestSseEvent, name: []const u8) !?usize {
+    for (events, 0..) |event, i| {
+        if (!std.mem.eql(u8, event.event, "step_completed")) continue;
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, event.data, .{});
+        defer parsed.deinit();
+        const event_name = parsed.value.object.get("name") orelse continue;
+        if (event_name != .string) continue;
+        if (std.mem.eql(u8, event_name.string, name)) return i;
+    }
+    return null;
+}
+
 fn findStepByName(steps: []const AgentStep, name: []const u8) ?AgentStep {
     for (steps) |step| {
         if (std.mem.eql(u8, step.name, name)) return step;
@@ -470,6 +482,10 @@ const LiveEmitter = struct {
 fn appendStep(alloc: std.mem.Allocator, steps: *std.ArrayListUnmanaged(AgentStep), live: *LiveEmitter, step: AgentStep) !void {
     try steps.append(alloc, step);
     try live.emitStep(step);
+}
+
+fn recordStep(alloc: std.mem.Allocator, steps: *std.ArrayListUnmanaged(AgentStep), step: AgentStep) !void {
+    try steps.append(alloc, step);
 }
 
 fn finishAgentResult(
@@ -2756,7 +2772,6 @@ fn executeRecursiveRetrievalGeneration(
     defer skipped_children.deinit(arena);
     var recursive_steps = std.ArrayListUnmanaged(AgentStep).empty;
     defer recursive_steps.deinit(arena);
-    var buffered_live = LiveEmitter{ .alloc = arena };
     var token_budget_skips: usize = 0;
     var wall_time_exhausted = false;
 
@@ -2814,7 +2829,7 @@ fn executeRecursiveRetrievalGeneration(
             null,
             "max_child_context_tokens",
         ));
-        try appendStep(arena, &recursive_steps, &buffered_live, .{
+        try appendStep(arena, &recursive_steps, live, .{
             .kind = .recursive_subcall,
             .name = try std.fmt.allocPrint(arena, "recursive_subcall_{d}", .{skipped.child_index + 1}),
             .action = try std.fmt.allocPrint(arena, "skipped recursive context object {s} because it exceeded max_child_context_tokens", .{skipped.context_object.id}),
@@ -2836,7 +2851,7 @@ fn executeRecursiveRetrievalGeneration(
         &successful_context_ids,
         &trace_subcalls,
         &recursive_steps,
-        &buffered_live,
+        live,
         &wall_time_exhausted,
     );
     const actual_concurrency = execution_stats.max_actual_concurrency;
@@ -2852,7 +2867,7 @@ fn executeRecursiveRetrievalGeneration(
         .status = .success,
         .details = try buildRecursiveDecompositionDetails(arena, recursive_cfg, hits.len, child_count, scheduled_concurrency, actual_concurrency),
     });
-    for (recursive_steps.items) |step| try appendStep(arena, steps, live, step);
+    for (recursive_steps.items) |step| try recordStep(arena, steps, step);
 
     const merge_messages = try buildRecursiveMergeMessages(arena, request.query, summaries.items, recursive_cfg, cfg);
     var merge_executed = true;
@@ -9556,6 +9571,105 @@ test "retrieval agent supports fixed-body sse streaming" {
     var parsed_done = try parseJsonBody(RetrievalAgentResult, std.testing.allocator, firstSseEventData(events, "done").?);
     defer parsed_done.deinit();
     try std.testing.expect(std.mem.indexOf(u8, parsed_done.value.generation.?, "Generated answer citing doc:a") != null);
+}
+
+test "retrieval agent recursive sse emits child progress before final ordered trace" {
+    const FakeRunner = struct {
+        fn iface() QueryRunner {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .run_query = runQuery },
+            };
+        }
+
+        fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
+            return .{
+                .json = try alloc.dupe(u8,
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}},{"_id":"doc:b","_score":0.9,"_source":{"content":"beta body"}}]}}]}
+                ),
+            };
+        }
+    };
+
+    const FakeGeneration = struct {
+        fn iface() GenerationRunner {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_chain = executeChain,
+                    .execute_chain_with_timeout_ms = executeChainWithTimeoutMs,
+                },
+            };
+        }
+
+        fn executeChainWithTimeoutMs(ptr: *anyopaque, alloc: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage, timeout_ms: u64) !generating.GenerateResult {
+            try std.testing.expect(timeout_ms > 0);
+            return try executeChain(ptr, alloc, chain, messages);
+        }
+
+        fn executeChain(_: *anyopaque, alloc: std.mem.Allocator, _: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+            const is_merge = std.mem.indexOf(u8, messages[1].content.?.text, "Child outputs:") != null;
+            return .{
+                .content = try alloc.dupe(u8, if (is_merge) "merged recursive answer" else "child recursive summary"),
+                .allocator = alloc,
+            };
+        }
+    };
+
+    const body =
+        \\{"query":"find alpha","stream":true,"execution_mode":"recursive","recursive":{"max_depth":1,"max_subcalls":2,"max_concurrency":1,"split_policy":"by_document","merge_policy":"verify","child_tool_policy":"inherit_narrowed","allowed_context_object_types":["document"]},"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true}},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
+    ;
+
+    const Sink = struct {
+        events: std.ArrayListUnmanaged(TestSseEvent) = .empty,
+
+        fn iface(self: *@This()) EventSink {
+            return .{ .ptr = self, .emit_json_fn = emitJson };
+        }
+
+        fn emitJson(ptr: *anyopaque, alloc: std.mem.Allocator, event_name: []const u8, json: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.events.append(alloc, .{
+                .event = try alloc.dupe(u8, event_name),
+                .data = try alloc.dupe(u8, json),
+            });
+        }
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            for (self.events.items) |event| {
+                alloc.free(event.event);
+                alloc.free(event.data);
+            }
+            self.events.deinit(alloc);
+        }
+    };
+
+    var sink = Sink{};
+    defer sink.deinit(std.testing.allocator);
+    const encoded = try executeWithEventSink(std.testing.allocator, FakeRunner.iface(), FakeGeneration.iface(), body, sink.iface());
+    defer std.testing.allocator.free(encoded.body);
+    const events = try parseSseEventsAlloc(std.testing.allocator, encoded.body);
+    defer std.testing.allocator.free(events);
+
+    try std.testing.expectEqualStrings("text/event-stream", encoded.content_type);
+    const subcall_index = (try firstStepCompletedEventIndex(std.testing.allocator, sink.events.items, "recursive_subcall_1")) orelse return error.MissingRecursiveSubcallStep;
+    const decomposition_index = (try firstStepCompletedEventIndex(std.testing.allocator, sink.events.items, "recursive_decomposition")) orelse return error.MissingRecursiveDecompositionStep;
+    try std.testing.expect(subcall_index < decomposition_index);
+
+    var parsed_done = try parseJsonBody(RetrievalAgentResult, std.testing.allocator, firstSseEventData(events, "done").?);
+    defer parsed_done.deinit();
+    try std.testing.expectEqualStrings("merged recursive answer", parsed_done.value.generation.?);
+    try std.testing.expect(parsed_done.value.steps != null);
+    var done_decomposition_index: ?usize = null;
+    var done_subcall_index: ?usize = null;
+    for (parsed_done.value.steps.?, 0..) |step, i| {
+        if (step.kind == null) continue;
+        if (step.kind.? == .recursive_decomposition and done_decomposition_index == null) done_decomposition_index = i;
+        if (step.kind.? == .recursive_subcall and done_subcall_index == null) done_subcall_index = i;
+    }
+    try std.testing.expect(done_decomposition_index != null);
+    try std.testing.expect(done_subcall_index != null);
+    try std.testing.expect(done_decomposition_index.? < done_subcall_index.?);
 }
 
 test "retrieval agent sse emits followup events" {
