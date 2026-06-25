@@ -5978,6 +5978,8 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "db schema checks",
             "db schema apply validates",
+            "db table schema apply",
+            "db staged algebraic pending",
             "db direct schema apply",
             "db executes claimed schema rewrite",
             "db executes claimed full schema rewrite",
