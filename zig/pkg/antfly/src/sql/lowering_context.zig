@@ -586,6 +586,7 @@ fn validateGeneratedCteBodyMetadata(tokens: []const tokenized.Token, cte: genera
     }
     if (cte.body_source_tokens) |source_tokens| {
         if (source_tokens.start <= projection_tokens.end) return error.UnsupportedSqlShape;
+        try validateGeneratedReadRangePrecededByKeyword(tokens, source_tokens, .from);
         try validateGeneratedJoinTreeMetadataForSource(
             tokens,
             source_tokens,
@@ -5482,6 +5483,23 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_cte_body_projection_parsed_sql, malformed_cte_body_projection_read_ast),
+    );
+
+    var malformed_cte_body_source_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH source_rows AS (SELECT id FROM usage_records WHERE active IS TRUE) SELECT id FROM source_rows",
+    );
+    defer malformed_cte_body_source_parsed_sql.deinit(alloc);
+    const malformed_cte_body_source_generated_raw = malformed_cte_body_source_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_cte_body_source_read_ast = switch (malformed_cte_body_source_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_cte_body_source_read_ast.cte_items[0].body_source_tokens =
+        malformed_cte_body_source_read_ast.cte_items[0].body_where_tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_cte_body_source_parsed_sql, malformed_cte_body_source_read_ast),
     );
 
     var malformed_cte_body_projection_list_parsed_sql = try tokenized.ParsedSql.initAlloc(
