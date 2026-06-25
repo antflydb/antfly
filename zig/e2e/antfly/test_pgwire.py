@@ -228,6 +228,29 @@ def test_pgwire_simple_query_accepts_multiple_statements(pgwire_server):
     assert rows == [["row:b", "closed"]]
 
 
+def test_pgwire_extended_query_binds_text_parameters(pgwire_server):
+    table = _table_name("pgwire_extended")
+
+    with socket.create_connection((pgwire_server.host, pgwire_server.pgwire_port), timeout=5) as sock:
+        _pgwire_startup(sock)
+        create_messages = _pgwire_simple_query(sock, f"CREATE TABLE {table} (id text PRIMARY KEY, status text);")
+        insert_messages = _pgwire_extended_query(
+            sock,
+            f"INSERT INTO {table} (id, status) VALUES ($1, $2);",
+            ["row:extended", "ready"],
+        )
+        select_messages = _pgwire_extended_query(
+            sock,
+            f"SELECT id, status FROM {table} WHERE id = $1;",
+            ["row:extended"],
+        )
+
+    assert [message["tag"] for message in create_messages if message["type"] == "command"] == ["CREATE TABLE"]
+    assert [message["tag"] for message in insert_messages if message["type"] == "command"] == ["INSERT 0 1"]
+    assert [message["tag"] for message in select_messages if message["type"] == "command"] == ["SELECT 1"]
+    assert [message["values"] for message in select_messages if message["type"] == "row"] == [["row:extended", "ready"]]
+
+
 def test_metadata_pgwire_simple_query_uses_public_api_sql(metadata_pgwire_server):
     table = _table_name("metadata_pgwire")
 
@@ -277,6 +300,50 @@ def _pgwire_simple_query(sock: socket.socket, sql: str) -> list[dict[str, Any]]:
             continue
         else:
             messages.append({"type": "message", "tag": tag.decode(errors="replace"), "columns": columns})
+
+
+def _pgwire_extended_query(sock: socket.socket, sql: str, params: list[str | None]) -> list[dict[str, Any]]:
+    statement_name = b""
+    portal_name = b""
+    parse_payload = statement_name + b"\x00" + sql.encode() + b"\x00" + struct.pack("!h", 0)
+    _pgwire_send_message(sock, b"P", parse_payload)
+
+    bind_payload = portal_name + b"\x00" + statement_name + b"\x00" + struct.pack("!h", 0)
+    bind_payload += struct.pack("!h", len(params))
+    for param in params:
+        if param is None:
+            bind_payload += struct.pack("!i", -1)
+        else:
+            encoded = param.encode()
+            bind_payload += struct.pack("!i", len(encoded)) + encoded
+    bind_payload += struct.pack("!h", 0)
+    _pgwire_send_message(sock, b"B", bind_payload)
+    _pgwire_send_message(sock, b"D", b"P" + portal_name + b"\x00")
+    _pgwire_send_message(sock, b"E", portal_name + b"\x00" + struct.pack("!i", 0))
+    _pgwire_send_message(sock, b"S", b"")
+
+    columns: list[str] = []
+    messages: list[dict[str, Any]] = []
+    while True:
+        tag, payload = _pgwire_read_message(sock)
+        if tag == b"T":
+            columns = _pgwire_row_description(payload)
+        elif tag == b"D":
+            messages.append({"type": "row", "values": _pgwire_data_row(payload)})
+        elif tag == b"C":
+            messages.append({"type": "command", "tag": payload.split(b"\x00", 1)[0].decode()})
+        elif tag == b"E":
+            raise AssertionError(f"pgwire extended query error: {payload!r}")
+        elif tag == b"Z":
+            return messages
+        elif tag in {b"1", b"2", b"3", b"n", b"s"}:
+            continue
+        else:
+            messages.append({"type": "message", "tag": tag.decode(errors="replace"), "columns": columns})
+
+
+def _pgwire_send_message(sock: socket.socket, tag: bytes, payload: bytes) -> None:
+    sock.sendall(tag + struct.pack("!i", len(payload) + 4) + payload)
 
 
 def _pgwire_read_message(sock: socket.socket) -> tuple[bytes, bytes]:

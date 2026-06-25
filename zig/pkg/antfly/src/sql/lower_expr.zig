@@ -138,6 +138,7 @@ fn validateGeneratedOrderListForClause(
         const expression_range = list.expression_items[index];
         if (expression_range.start < item.start or expression_range.end > item.end or expression_range.start >= expression_range.end) return error.UnsupportedSqlShape;
         if (!generatedTokenRangeEqual(list.expressions[index].tokens orelse return error.UnsupportedSqlShape, expression_range)) return error.UnsupportedSqlShape;
+        try validateGeneratedExpressionPayloads(tokens, list.expressions[index]);
 
         const direction_end = if (list.direction_items[index]) |direction_range| blk: {
             if (direction_range.start != expression_range.end or direction_range.end > item.end or direction_range.start >= direction_range.end) return error.UnsupportedSqlShape;
@@ -225,6 +226,7 @@ fn validateGeneratedExpressionListForClause(
         const expression_range = list.expression_items[index];
         if (!generatedTokenRangeEqual(expression_range, item)) return error.UnsupportedSqlShape;
         if (!generatedTokenRangeEqual(list.expressions[index].tokens orelse return error.UnsupportedSqlShape, expression_range)) return error.UnsupportedSqlShape;
+        try validateGeneratedExpressionPayloads(tokens, list.expressions[index]);
     }
 }
 
@@ -331,6 +333,7 @@ fn validateGeneratedProjectionListForClause(
         const expression_range = list.expression_items[index];
         if (expression_range.start < item.start or expression_range.end > item.end or expression_range.start >= expression_range.end) return error.UnsupportedSqlShape;
         if (!generatedTokenRangeEqual(list.expressions[index].tokens orelse return error.UnsupportedSqlShape, expression_range)) return error.UnsupportedSqlShape;
+        try validateGeneratedExpressionPayloads(tokens, list.expressions[index]);
 
         if (list.alias_items[index]) |alias_range| {
             const alias_name_range = list.alias_name_items[index] orelse return error.UnsupportedSqlShape;
@@ -446,6 +449,111 @@ fn validateGeneratedArrayConstructorPayloads(
     }
 }
 
+fn validateGeneratedFunctionCallPayloads(
+    tokens: []const Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) anyerror!void {
+    const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
+    const name_tokens = expression.function_name_tokens orelse return error.UnsupportedSqlShape;
+    if (name_tokens.start != expression_tokens.start or name_tokens.end >= expression_tokens.end or name_tokens.start >= name_tokens.end) return error.UnsupportedSqlShape;
+    if (name_tokens.end >= tokens.len or tokens[name_tokens.end].kind != .lparen) return error.UnsupportedSqlShape;
+
+    const function_close = if (expression.argument_tokens) |argument_tokens| blk: {
+        if (argument_tokens.start != name_tokens.end + 1 or argument_tokens.end >= expression_tokens.end) return error.UnsupportedSqlShape;
+        if (argument_tokens.start >= argument_tokens.end or tokens[argument_tokens.end].kind != .rparen) return error.UnsupportedSqlShape;
+        const value_start = if (expression.argument_distinct_tokens) |distinct_tokens| distinct: {
+            if (distinct_tokens.start != argument_tokens.start or distinct_tokens.end != distinct_tokens.start + 1) return error.UnsupportedSqlShape;
+            if (!tokens[distinct_tokens.start].matchesKeywordTag(.distinct)) return error.UnsupportedSqlShape;
+            break :distinct distinct_tokens.end;
+        } else argument_tokens.start;
+        const value_tokens = expression.argument_value_tokens orelse return error.UnsupportedSqlShape;
+        if (value_tokens.start != value_start or value_tokens.end > argument_tokens.end or value_tokens.start >= value_tokens.end) return error.UnsupportedSqlShape;
+        if (expression.argument_order_tokens) |order_tokens| {
+            if (value_tokens.end + 2 > argument_tokens.end or value_tokens.end >= tokens.len) return error.UnsupportedSqlShape;
+            if (!tokens[value_tokens.end].matchesKeywordTag(.order) or !tokens[value_tokens.end + 1].matchesKeywordTag(.by)) return error.UnsupportedSqlShape;
+            if (order_tokens.start != value_tokens.end + 2 or order_tokens.end != argument_tokens.end) return error.UnsupportedSqlShape;
+            try validateGeneratedOrderListForClause(tokens, order_tokens, expression.argument_order_items);
+        } else if (value_tokens.end != argument_tokens.end or expression.argument_order_items.count != 0) {
+            return error.UnsupportedSqlShape;
+        }
+        try validateGeneratedExpressionListForClause(tokens, value_tokens, expression.argument_items);
+        break :blk argument_tokens.end;
+    } else blk: {
+        if (name_tokens.end + 1 >= expression_tokens.end or tokens[name_tokens.end + 1].kind != .rparen) return error.UnsupportedSqlShape;
+        if (expression.argument_distinct_tokens != null or
+            expression.argument_value_tokens != null or
+            expression.argument_order_tokens != null or
+            expression.argument_items.count != 0 or
+            expression.argument_order_items.count != 0)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        break :blk name_tokens.end + 1;
+    };
+
+    var cursor = function_close + 1;
+    if (expression.within_group_tokens) |within_group_tokens| {
+        const order_tokens = expression.within_group_order_tokens orelse return error.UnsupportedSqlShape;
+        if (within_group_tokens.start != cursor or within_group_tokens.end > expression_tokens.end) return error.UnsupportedSqlShape;
+        if (within_group_tokens.start + 6 > within_group_tokens.end) return error.UnsupportedSqlShape;
+        if (!tokens[within_group_tokens.start].matchesKeywordTag(.within) or
+            !tokens[within_group_tokens.start + 1].matchesKeywordTag(.group) or
+            tokens[within_group_tokens.start + 2].kind != .lparen or
+            !tokens[within_group_tokens.start + 3].matchesKeywordTag(.order) or
+            !tokens[within_group_tokens.start + 4].matchesKeywordTag(.by) or
+            tokens[within_group_tokens.end - 1].kind != .rparen)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        if (order_tokens.start != within_group_tokens.start + 5 or order_tokens.end != within_group_tokens.end - 1) return error.UnsupportedSqlShape;
+        try validateGeneratedOrderListForClause(tokens, order_tokens, expression.within_group_order_items);
+        cursor = within_group_tokens.end;
+    } else if (expression.within_group_order_tokens != null or expression.within_group_order_items.count != 0) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (expression.filter_tokens) |filter_tokens| {
+        const predicate_tokens = expression.filter_predicate_tokens orelse return error.UnsupportedSqlShape;
+        if (filter_tokens.start != cursor or filter_tokens.end > expression_tokens.end) return error.UnsupportedSqlShape;
+        if (filter_tokens.start + 4 > filter_tokens.end or
+            !tokens[filter_tokens.start].matchesKeywordTag(.filter) or
+            tokens[filter_tokens.start + 1].kind != .lparen or
+            !tokens[filter_tokens.start + 2].matchesKeywordTag(.where) or
+            tokens[filter_tokens.end - 1].kind != .rparen)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        if (predicate_tokens.start != filter_tokens.start + 3 or predicate_tokens.end != filter_tokens.end - 1) return error.UnsupportedSqlShape;
+        try validateGeneratedChildExpressionPayloads(tokens, predicate_tokens, expression.filter_expression_kind, expression.filter_expression);
+        cursor = filter_tokens.end;
+    } else if (expression.filter_predicate_tokens != null or expression.filter_expression != null or expression.filter_expression_kind != null) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (expression.over_tokens) |over_tokens| {
+        if (over_tokens.start != cursor or over_tokens.end != expression_tokens.end) return error.UnsupportedSqlShape;
+        try validateGeneratedWindowOverClauseForSpec(tokens, over_tokens.start, over_tokens.end, &expression);
+        cursor = over_tokens.end;
+    } else if (expression.over_name_tokens != null or
+        expression.over_definition_tokens != null or
+        expression.over_partition_tokens != null or
+        expression.over_partition_items.count != 0 or
+        expression.over_order_tokens != null or
+        expression.over_order_items.count != 0 or
+        expression.over_frame_tokens != null or
+        expression.over_frame_start_expression_tokens != null or
+        expression.over_frame_start_expression != null or
+        expression.over_frame_start_expression_kind != null or
+        expression.over_frame_end_expression_tokens != null or
+        expression.over_frame_end_expression != null or
+        expression.over_frame_end_expression_kind != null)
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (cursor != expression_tokens.end) return error.UnsupportedSqlShape;
+}
+
 fn validateGeneratedExpressionPayloads(
     tokens: []const Token,
     expression: generated_parser.GeneratedSqlExpressionAst,
@@ -488,6 +596,7 @@ fn validateGeneratedExpressionPayloads(
             try validateGeneratedChildExpressionPayloads(tokens, inner_tokens, expression.inner_expression_kind, expression.inner_expression);
         },
         .array_constructor => try validateGeneratedArrayConstructorPayloads(tokens, expression),
+        .function_call => try validateGeneratedFunctionCallPayloads(tokens, expression),
         else => {},
     }
 
@@ -28090,6 +28199,20 @@ test "sql adapter lower expr lowers cast projections" {
         schema,
         &.{.{ .string = "u1" }},
     ));
+
+    var malformed_generated_cast_child = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT CAST(id AS text) AS id_text FROM usage_records WHERE id = $1",
+    );
+    defer malformed_generated_cast_child.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionCastChildExpressionRange(&malformed_generated_cast_child);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_cast_child,
+        schema,
+        &.{.{ .string = "u1" }},
+        .{},
+    ));
 }
 
 test "sql adapter lower expr ignores harmless identifier casts" {
@@ -30034,6 +30157,49 @@ fn corruptGeneratedReadFirstProjectionExpressionItem(parsed_sql: *tokenized.Pars
                     if (read.projection_items.items.len == 0 or read.projection_items.expression_items.len == 0 or read.group_items.items.len == 0) return error.TestUnexpectedResult;
                     read.projection_items.expression_items[0] = read.group_items.items[0];
                     return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadFirstProjectionCastChildExpressionRange(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |*read| {
+                    const source_tokens = read.source_tokens orelse return error.TestUnexpectedResult;
+                    for (read.projection_items.expressions) |*expression| {
+                        if (expression.cast_expression) |child| {
+                            if (child.tokens == null) return error.TestUnexpectedResult;
+                            child.tokens = source_tokens;
+                            return;
+                        }
+                    }
+                    return error.TestUnexpectedResult;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadFirstProjectionFunctionArgumentExpressionRange(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |*read| {
+                    const source_tokens = read.source_tokens orelse return error.TestUnexpectedResult;
+                    for (read.projection_items.expressions) |*expression| {
+                        if (expression.argument_items.expressions.len == 0) continue;
+                        if (expression.argument_items.expressions[0].tokens == null) return error.TestUnexpectedResult;
+                        expression.argument_items.expressions[0].tokens = source_tokens;
+                        return;
+                    }
+                    return error.TestUnexpectedResult;
                 },
                 else => return error.TestUnexpectedResult,
             }
@@ -33362,6 +33528,20 @@ test "sql adapter lower expr lowers scalar function expressions" {
     try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.order_by.len);
     try std.testing.expect(lowered.plan.query.order_by[0].expression != null);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.length, lowered.plan.query.order_by[0].expression.?.kind);
+
+    var malformed_generated_function_argument = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT char_length(status) AS status_len FROM usage_records WHERE id = $1",
+    );
+    defer malformed_generated_function_argument.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionFunctionArgumentExpressionRange(&malformed_generated_function_argument);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_function_argument,
+        schema,
+        &.{.{ .string = "u1" }},
+        .{},
+    ));
 
     var aggregate = try lowerAggregateForLowerExprTestAlloc(
         alloc,

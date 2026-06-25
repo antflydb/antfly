@@ -238,7 +238,11 @@ final-read pagination now use the same generated range validation on their
 typed lowerer paths. Generated `ORDER BY` lists now validate generated item,
 expression, direction, `USING`, and `NULLS FIRST`/`NULLS LAST` ranges before
 typed order planning, and the typed parser must consume the same generated
-order-list span. Generated CTE read lowering now derives non-recursive final read-family
+order-list span. Generated projection, grouping, generic expression, and
+ordering lists now recursively validate each owned generated expression
+payload before typed lowering can consume the list, including generic
+function-call argument, ordered-argument, `WITHIN GROUP`, `FILTER`, and `OVER`
+payload ranges. Generated CTE read lowering now derives non-recursive final read-family
 dispatch from generated final-select ranges and clause metadata, including
 final set-operation reads, instead of re-entering the legacy read classifier;
 recursive CTEs still dispatch through the recursive CTE family after validating
@@ -654,8 +658,8 @@ Unsupported DDL remains on the existing parser until
    validated left-associative generated join nodes, expression AST
    planning/lowering beyond the current recursive
    predicate/operator/subquery-tail metadata and structural checks, broader function
-   coverage outside the currently validated aggregate and window projection
-   surfaces, broader boolean expression-tree coverage, quantified and `EXISTS`
+   semantic planning outside the currently range-validated generic, aggregate,
+   and window function surfaces, broader boolean expression-tree coverage, quantified and `EXISTS`
    subquery semantic planning/lowering beyond retained generated payload
    validation, remaining specialized expression operators, richer
    inline window-expression semantic planning beyond current generated `OVER`

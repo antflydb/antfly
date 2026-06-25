@@ -26,6 +26,8 @@ const cancel_request_code: i32 = 80877102;
 const max_packet_len: i32 = 16 * 1024 * 1024;
 const text_oid: i32 = 25;
 const text_type_size: i16 = -1;
+const text_format: i16 = 0;
+const binary_format: i16 = 1;
 
 pub const Config = struct {
     bind_host: []const u8,
@@ -190,10 +192,18 @@ const Connection = struct {
     session_id: ?u64 = null,
     database: ?[]u8 = null,
     namespace: ?[]u8 = null,
+    unnamed_statement: ?[]u8 = null,
+    unnamed_portal: ?[]u8 = null,
+    prepared_statements: std.StringHashMapUnmanaged([]u8) = .empty,
+    portals: std.StringHashMapUnmanaged([]u8) = .empty,
 
     fn deinit(self: *Connection) void {
         if (self.database) |database| self.alloc.free(database);
         if (self.namespace) |namespace| self.alloc.free(namespace);
+        if (self.unnamed_statement) |sql| self.alloc.free(sql);
+        if (self.unnamed_portal) |sql| self.alloc.free(sql);
+        pgwire_module.freeSqlMap(self.alloc, &self.prepared_statements);
+        pgwire_module.freeSqlMap(self.alloc, &self.portals);
         self.* = undefined;
     }
 
@@ -211,10 +221,16 @@ const Connection = struct {
 
             switch (tag) {
                 'Q' => try self.handleSimpleQuery(payload),
+                'P' => try self.handleParse(payload),
+                'B' => try self.handleBind(payload),
+                'D' => try self.handleDescribe(payload),
+                'E' => try self.handleExecute(payload),
+                'C' => try self.handleClose(payload),
+                'H' => try self.writer.flush(),
                 'X' => return,
                 'S' => try self.sendReadyForQuery(),
                 else => {
-                    try self.sendError("0A000", "unsupported pgwire message; simple query protocol only");
+                    try self.sendError("0A000", "unsupported pgwire message");
                     try self.sendReadyForQuery();
                 },
             }
@@ -299,7 +315,7 @@ const Connection = struct {
                 const statement = std.mem.trim(u8, rest[0..end], " \t\r\n");
                 if (statement.len != 0) {
                     executed = true;
-                    if (!try self.executeAndEncodeOne(statement)) return;
+                    if (!try self.executeAndEncodeOne(statement, true)) return;
                 }
                 rest = rest[end + 1 ..];
                 continue;
@@ -308,7 +324,7 @@ const Connection = struct {
             const trailing = std.mem.trim(u8, rest, " \t\r\n");
             if (trailing.len != 0) {
                 executed = true;
-                if (!try self.executeAndEncodeOne(trailing)) return;
+                if (!try self.executeAndEncodeOne(trailing, true)) return;
             }
             break;
         }
@@ -319,18 +335,185 @@ const Connection = struct {
         try self.sendReadyForQuery();
     }
 
-    fn executeAndEncodeOne(self: *Connection, sql: []const u8) !bool {
+    fn handleParse(self: *Connection, payload: []const u8) !void {
+        var cursor = PayloadCursor.init(payload);
+        const name = try cursor.takeCString();
+        const sql = try cursor.takeCString();
+        const parameter_count = try cursor.takeInt(i16);
+        if (parameter_count < 0) return error.InvalidPgwireMessage;
+        var i: usize = 0;
+        while (i < @as(usize, @intCast(parameter_count))) : (i += 1) _ = try cursor.takeInt(i32);
+        try cursor.expectEnd();
+        try self.setPreparedStatement(name, sql);
+        try self.sendParseComplete();
+    }
+
+    fn handleBind(self: *Connection, payload: []const u8) !void {
+        var cursor = PayloadCursor.init(payload);
+        const portal_name = try cursor.takeCString();
+        const statement_name = try cursor.takeCString();
+        const statement_sql = self.preparedStatementSql(statement_name) orelse {
+            try self.sendError("26000", "prepared statement does not exist");
+            return;
+        };
+
+        const parameter_format_count = try cursor.takeInt(i16);
+        if (parameter_format_count < 0) return error.InvalidPgwireMessage;
+        var parameter_formats: [16]i16 = undefined;
+        const parameter_format_len: usize = @intCast(parameter_format_count);
+        if (parameter_format_len > parameter_formats.len) return error.InvalidPgwireMessage;
+        for (parameter_formats[0..parameter_format_len]) |*format| format.* = try cursor.takeInt(i16);
+
+        const parameter_count = try cursor.takeInt(i16);
+        if (parameter_count < 0) return error.InvalidPgwireMessage;
+        const parameter_len: usize = @intCast(parameter_count);
+        const parameters = try self.alloc.alloc(?[]const u8, parameter_len);
+        defer self.alloc.free(parameters);
+        for (parameters, 0..) |*parameter, index| {
+            if (pgwire_module.parameterFormat(parameter_formats[0..parameter_format_len], index) == binary_format) {
+                try self.sendError("0A000", "binary pgwire parameters are not implemented");
+                return;
+            }
+            const value_len = try cursor.takeInt(i32);
+            if (value_len < -1) return error.InvalidPgwireMessage;
+            if (value_len == -1) {
+                parameter.* = null;
+            } else {
+                parameter.* = try cursor.takeBytes(@intCast(value_len));
+            }
+        }
+
+        const result_format_count = try cursor.takeInt(i16);
+        if (result_format_count < 0) return error.InvalidPgwireMessage;
+        var i: usize = 0;
+        while (i < @as(usize, @intCast(result_format_count))) : (i += 1) {
+            const format = try cursor.takeInt(i16);
+            if (format == binary_format) {
+                try self.sendError("0A000", "binary pgwire results are not implemented");
+                return;
+            }
+        }
+        try cursor.expectEnd();
+
+        const bound_sql = try pgwire_module.bindSqlParametersAlloc(self.alloc, statement_sql, parameters);
+        errdefer self.alloc.free(bound_sql);
+        try self.setPortal(portal_name, bound_sql);
+        try self.sendBindComplete();
+    }
+
+    fn handleDescribe(self: *Connection, payload: []const u8) !void {
+        if (payload.len == 0) return error.InvalidPgwireMessage;
+        const target = payload[0];
+        var cursor = PayloadCursor.init(payload[1..]);
+        const name = try cursor.takeCString();
+        try cursor.expectEnd();
+        switch (target) {
+            'S' => if (self.preparedStatementSql(name) == null) {
+                try self.sendError("26000", "prepared statement does not exist");
+            } else {
+                try self.sendNoData();
+            },
+            'P' => if (self.portalSql(name) == null) {
+                try self.sendError("34000", "portal does not exist");
+            } else {
+                try self.sendNoData();
+            },
+            else => return error.InvalidPgwireMessage,
+        }
+    }
+
+    fn handleExecute(self: *Connection, payload: []const u8) !void {
+        var cursor = PayloadCursor.init(payload);
+        const portal_name = try cursor.takeCString();
+        _ = try cursor.takeInt(i32);
+        try cursor.expectEnd();
+        const sql = self.portalSql(portal_name) orelse {
+            try self.sendError("34000", "portal does not exist");
+            return;
+        };
+        _ = try self.executeAndEncodeOne(sql, false);
+    }
+
+    fn handleClose(self: *Connection, payload: []const u8) !void {
+        if (payload.len == 0) return error.InvalidPgwireMessage;
+        const target = payload[0];
+        var cursor = PayloadCursor.init(payload[1..]);
+        const name = try cursor.takeCString();
+        try cursor.expectEnd();
+        switch (target) {
+            'S' => try self.removePreparedStatement(name),
+            'P' => try self.removePortal(name),
+            else => return error.InvalidPgwireMessage,
+        }
+        try self.sendCloseComplete();
+    }
+
+    fn setPreparedStatement(self: *Connection, name: []const u8, sql: []const u8) !void {
+        const owned_sql = try self.alloc.dupe(u8, sql);
+        errdefer self.alloc.free(owned_sql);
+        if (name.len == 0) {
+            if (self.unnamed_statement) |old| self.alloc.free(old);
+            self.unnamed_statement = owned_sql;
+            return;
+        }
+        try pgwire_module.putOwnedSql(self.alloc, &self.prepared_statements, name, owned_sql);
+    }
+
+    fn preparedStatementSql(self: *Connection, name: []const u8) ?[]const u8 {
+        if (name.len == 0) return self.unnamed_statement;
+        return self.prepared_statements.get(name);
+    }
+
+    fn removePreparedStatement(self: *Connection, name: []const u8) !void {
+        if (name.len == 0) {
+            if (self.unnamed_statement) |old| self.alloc.free(old);
+            self.unnamed_statement = null;
+            return;
+        }
+        if (self.prepared_statements.fetchRemove(name)) |removed| {
+            self.alloc.free(removed.key);
+            self.alloc.free(removed.value);
+        }
+    }
+
+    fn setPortal(self: *Connection, name: []const u8, owned_sql: []u8) !void {
+        if (name.len == 0) {
+            if (self.unnamed_portal) |old| self.alloc.free(old);
+            self.unnamed_portal = owned_sql;
+            return;
+        }
+        try pgwire_module.putOwnedSql(self.alloc, &self.portals, name, owned_sql);
+    }
+
+    fn portalSql(self: *Connection, name: []const u8) ?[]const u8 {
+        if (name.len == 0) return self.unnamed_portal;
+        return self.portals.get(name);
+    }
+
+    fn removePortal(self: *Connection, name: []const u8) !void {
+        if (name.len == 0) {
+            if (self.unnamed_portal) |old| self.alloc.free(old);
+            self.unnamed_portal = null;
+            return;
+        }
+        if (self.portals.fetchRemove(name)) |removed| {
+            self.alloc.free(removed.key);
+            self.alloc.free(removed.value);
+        }
+    }
+
+    fn executeAndEncodeOne(self: *Connection, sql: []const u8, send_ready_on_error: bool) !bool {
         var response = self.executeSql(sql) catch |err| {
             std.log.warn("pgwire sql execution failed err={}", .{err});
             try self.sendError("XX000", "internal sql execution error");
-            try self.sendReadyForQuery();
+            if (send_ready_on_error) try self.sendReadyForQuery();
             return false;
         };
         defer response.deinit(self.api_server.alloc);
 
         if (response.status < 200 or response.status >= 300) {
             try self.sendError(pgwire_module.sqlstateForHttpStatus(response.status), response.body);
-            try self.sendReadyForQuery();
+            if (send_ready_on_error) try self.sendReadyForQuery();
             return false;
         }
         try self.encodeSqlResponse(sql, response.body);
@@ -500,6 +683,22 @@ const Connection = struct {
         try self.sendMessage('I', "");
     }
 
+    fn sendParseComplete(self: *Connection) !void {
+        try self.sendMessage('1', "");
+    }
+
+    fn sendBindComplete(self: *Connection) !void {
+        try self.sendMessage('2', "");
+    }
+
+    fn sendCloseComplete(self: *Connection) !void {
+        try self.sendMessage('3', "");
+    }
+
+    fn sendNoData(self: *Connection) !void {
+        try self.sendMessage('n', "");
+    }
+
     fn sendCommandComplete(self: *Connection, tag: []const u8) !void {
         var payload: std.Io.Writer.Allocating = .init(self.alloc);
         defer payload.deinit();
@@ -530,6 +729,183 @@ const Connection = struct {
         try self.writer.writeAll(payload);
     }
 };
+
+const PayloadCursor = struct {
+    payload: []const u8,
+    index: usize = 0,
+
+    fn init(payload: []const u8) PayloadCursor {
+        return .{ .payload = payload };
+    }
+
+    fn takeCString(self: *PayloadCursor) ![]const u8 {
+        const start_index = self.index;
+        while (self.index < self.payload.len and self.payload[self.index] != 0) : (self.index += 1) {}
+        if (self.index >= self.payload.len) return error.InvalidPgwireMessage;
+        const out = self.payload[start_index..self.index];
+        self.index += 1;
+        return out;
+    }
+
+    fn takeInt(self: *PayloadCursor, comptime T: type) !T {
+        const size = @sizeOf(T);
+        if (self.index + size > self.payload.len) return error.InvalidPgwireMessage;
+        const out = std.mem.readInt(T, self.payload[self.index..][0..size], .big);
+        self.index += size;
+        return out;
+    }
+
+    fn takeBytes(self: *PayloadCursor, len: usize) ![]const u8 {
+        if (self.index + len > self.payload.len) return error.InvalidPgwireMessage;
+        const out = self.payload[self.index .. self.index + len];
+        self.index += len;
+        return out;
+    }
+
+    fn expectEnd(self: *const PayloadCursor) !void {
+        if (self.index != self.payload.len) return error.InvalidPgwireMessage;
+    }
+};
+
+fn putOwnedSql(
+    alloc: std.mem.Allocator,
+    map: *std.StringHashMapUnmanaged([]u8),
+    name: []const u8,
+    owned_sql: []u8,
+) !void {
+    const owned_name = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned_name);
+    if (map.fetchRemove(name)) |removed| {
+        alloc.free(removed.key);
+        alloc.free(removed.value);
+    }
+    try map.put(alloc, owned_name, owned_sql);
+}
+
+fn freeSqlMap(alloc: std.mem.Allocator, map: *std.StringHashMapUnmanaged([]u8)) void {
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        alloc.free(entry.key_ptr.*);
+        alloc.free(entry.value_ptr.*);
+    }
+    map.deinit(alloc);
+}
+
+fn parameterFormat(formats: []const i16, index: usize) i16 {
+    if (formats.len == 0) return text_format;
+    if (formats.len == 1) return formats[0];
+    if (index < formats.len) return formats[index];
+    return text_format;
+}
+
+fn bindSqlParametersAlloc(alloc: std.mem.Allocator, sql: []const u8, parameters: []const ?[]const u8) ![]u8 {
+    if (parameters.len == 0) return try alloc.dupe(u8, sql);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+
+    var i: usize = 0;
+    var state: enum { normal, single_quote, double_quote, line_comment, block_comment, dollar_quote } = .normal;
+    var dollar_delim: []const u8 = "";
+    while (i < sql.len) {
+        switch (state) {
+            .normal => {
+                if (sql[i] == '$') {
+                    if (dollarQuoteDelimiter(sql[i..])) |delim| {
+                        dollar_delim = delim;
+                        state = .dollar_quote;
+                        try out.writer.writeAll(delim);
+                        i += delim.len;
+                        continue;
+                    }
+                    if (i + 1 < sql.len and std.ascii.isDigit(sql[i + 1])) {
+                        var end = i + 1;
+                        while (end < sql.len and std.ascii.isDigit(sql[end])) : (end += 1) {}
+                        const ordinal = try std.fmt.parseInt(usize, sql[i + 1 .. end], 10);
+                        if (ordinal == 0 or ordinal > parameters.len) return error.InvalidPgwireParameter;
+                        try appendSqlLiteral(&out.writer, parameters[ordinal - 1]);
+                        i = end;
+                        continue;
+                    }
+                }
+                if (sql[i] == '\'') state = .single_quote;
+                if (sql[i] == '"') state = .double_quote;
+                if (sql[i] == '-' and i + 1 < sql.len and sql[i + 1] == '-') {
+                    state = .line_comment;
+                    try out.writer.writeAll(sql[i .. i + 2]);
+                    i += 2;
+                    continue;
+                }
+                if (sql[i] == '/' and i + 1 < sql.len and sql[i + 1] == '*') {
+                    state = .block_comment;
+                    try out.writer.writeAll(sql[i .. i + 2]);
+                    i += 2;
+                    continue;
+                }
+                try out.writer.writeByte(sql[i]);
+                i += 1;
+            },
+            .single_quote => {
+                try out.writer.writeByte(sql[i]);
+                if (sql[i] == '\'' and i + 1 < sql.len and sql[i + 1] == '\'') {
+                    try out.writer.writeByte(sql[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                if (sql[i] == '\'') state = .normal;
+                i += 1;
+            },
+            .double_quote => {
+                try out.writer.writeByte(sql[i]);
+                if (sql[i] == '"' and i + 1 < sql.len and sql[i + 1] == '"') {
+                    try out.writer.writeByte(sql[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                if (sql[i] == '"') state = .normal;
+                i += 1;
+            },
+            .line_comment => {
+                try out.writer.writeByte(sql[i]);
+                if (sql[i] == '\n') state = .normal;
+                i += 1;
+            },
+            .block_comment => {
+                try out.writer.writeByte(sql[i]);
+                if (sql[i] == '*' and i + 1 < sql.len and sql[i + 1] == '/') {
+                    try out.writer.writeByte(sql[i + 1]);
+                    state = .normal;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            },
+            .dollar_quote => {
+                if (std.mem.startsWith(u8, sql[i..], dollar_delim)) {
+                    try out.writer.writeAll(dollar_delim);
+                    state = .normal;
+                    i += dollar_delim.len;
+                    continue;
+                }
+                try out.writer.writeByte(sql[i]);
+                i += 1;
+            },
+        }
+    }
+    return try out.toOwnedSlice();
+}
+
+fn appendSqlLiteral(writer: *std.Io.Writer, value: ?[]const u8) !void {
+    const text = value orelse {
+        try writer.writeAll("NULL");
+        return;
+    };
+    try writer.writeByte('\'');
+    for (text) |byte| {
+        if (byte == '\'') try writer.writeByte('\'');
+        try writer.writeByte(byte);
+    }
+    try writer.writeByte('\'');
+}
 
 fn responseRows(result: ?std.json.Value) ?[]const std.json.Value {
     const value = result orelse return null;
@@ -862,4 +1238,25 @@ test "pgwire ddl command tags preserve concrete statement shape" {
     for (cases) |case| {
         try std.testing.expectEqualStrings(case.tag, commandTagForDdlSql(std.testing.allocator, case.sql).?);
     }
+}
+
+test "pgwire extended bind substitutes text parameters outside literals and comments" {
+    const params = [_]?[]const u8{ "row:1", "ready's" };
+    const sql = try bindSqlParametersAlloc(
+        std.testing.allocator,
+        "SELECT '$1' AS literal, id FROM docs WHERE id = $1 AND status = $2 -- $1\n",
+        &params,
+    );
+    defer std.testing.allocator.free(sql);
+    try std.testing.expectEqualStrings(
+        "SELECT '$1' AS literal, id FROM docs WHERE id = 'row:1' AND status = 'ready''s' -- $1\n",
+        sql,
+    );
+}
+
+test "pgwire extended bind renders null parameters" {
+    const params = [_]?[]const u8{null};
+    const sql = try bindSqlParametersAlloc(std.testing.allocator, "SELECT * FROM docs WHERE deleted_at IS $1", &params);
+    defer std.testing.allocator.free(sql);
+    try std.testing.expectEqualStrings("SELECT * FROM docs WHERE deleted_at IS NULL", sql);
 }

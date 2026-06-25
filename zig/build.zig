@@ -3698,7 +3698,6 @@ pub fn build(b: *std.Build) void {
             "metadata.storage.",
             "metadata.service.test.",
             "metadata.server.test.",
-            "metadata.sim_harness.test.",
             "metadata.runtime.test.",
             "metadata.reconciler.test.",
             "metadata.control_loop.test.",
