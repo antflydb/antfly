@@ -2626,7 +2626,6 @@ const RecursiveChildTask = struct {
     messages: []const generating.ChatMessage,
     estimated_context_tokens: usize,
     token_count_method: RecursiveTokenCountMethod,
-    timeout_ms: u64,
 };
 
 const RecursiveTokenCountMethod = enum {
@@ -2692,11 +2691,12 @@ const RecursiveChildWorker = struct {
     exec: GenerationRunner,
     chain: []const generating.ChainLink,
     task: RecursiveChildTask,
+    timeout_ms: u64,
     result: ?generating.GenerateResult = null,
     err: ?anyerror = null,
 
     fn run(self: *@This()) void {
-        self.result = self.exec.executeChainWithTimeoutMs(std.heap.page_allocator, self.chain, self.task.messages, self.task.timeout_ms) catch |err| {
+        self.result = self.exec.executeChainWithTimeoutMs(std.heap.page_allocator, self.chain, self.task.messages, self.timeout_ms) catch |err| {
             self.err = err;
             return;
         };
@@ -2725,6 +2725,7 @@ fn executeRecursiveRetrievalGeneration(
         recursive_agent.scheduledConcurrency(recursive_cfg, child_count),
         exec.maxConcurrentChainCalls(cfg.chain),
     );
+    const actual_concurrency = if (child_count == 0) 0 else scheduled_concurrency;
     const truncated_by_budget = child_count < hits.len;
     try appendStep(arena, steps, live, .{
         .kind = .recursive_decomposition,
@@ -2734,7 +2735,7 @@ fn executeRecursiveRetrievalGeneration(
         else
             try std.fmt.allocPrint(arena, "partitioned retrieved context into {d} recursive child frames", .{child_count}),
         .status = .success,
-        .details = try buildRecursiveDecompositionDetails(arena, recursive_cfg, hits.len, child_count, scheduled_concurrency),
+        .details = try buildRecursiveDecompositionDetails(arena, recursive_cfg, hits.len, child_count, scheduled_concurrency, actual_concurrency),
     });
 
     var summaries = std.ArrayListUnmanaged([]const u8).empty;
@@ -2792,7 +2793,7 @@ fn executeRecursiveRetrievalGeneration(
                 continue;
             }
         }
-        const timeout_ms = budget.remainingMs() orelse {
+        _ = budget.remainingMs() orelse {
             wall_time_exhausted = true;
             break;
         };
@@ -2802,7 +2803,6 @@ fn executeRecursiveRetrievalGeneration(
             .messages = messages,
             .estimated_context_tokens = token_count.tokens,
             .token_count_method = token_count.method,
-            .timeout_ms = timeout_ms,
         });
     }
 
@@ -2896,10 +2896,15 @@ fn runRecursiveChildTasks(
         }
 
         if (max_concurrency == 1) {
+            const timeout_ms = budget.remainingMs() orelse {
+                wall_time_exhausted.* = true;
+                break;
+            };
             var worker = RecursiveChildWorker{
                 .exec = exec,
                 .chain = cfg.chain,
                 .task = tasks[cursor],
+                .timeout_ms = timeout_ms,
             };
             worker.run();
             if (worker.err) |err| {
@@ -2920,7 +2925,7 @@ fn runRecursiveChildTasks(
                         .name = try std.fmt.allocPrint(arena, "recursive_subcall_{d}", .{worker.task.child_index + 1}),
                         .action = try std.fmt.allocPrint(arena, "skipped recursive context object {s} because max_wall_time_ms was exhausted", .{worker.task.context_object.id}),
                         .status = .skipped,
-                        .details = try buildRecursiveTimeoutSubcallDetails(arena, worker.task),
+                        .details = try buildRecursiveTimeoutSubcallDetails(arena, worker.task, worker.timeout_ms),
                     });
                     break;
                 }
@@ -2935,6 +2940,10 @@ fn runRecursiveChildTasks(
 
         const remaining = tasks.len - cursor;
         const wave_len = @min(remaining, max_concurrency);
+        const timeout_ms = budget.remainingMs() orelse {
+            wall_time_exhausted.* = true;
+            break;
+        };
         const workers = try alloc.alloc(RecursiveChildWorker, wave_len);
         defer alloc.free(workers);
         const threads = try alloc.alloc(std.Thread, wave_len);
@@ -2949,6 +2958,7 @@ fn runRecursiveChildTasks(
                 .exec = exec,
                 .chain = cfg.chain,
                 .task = tasks[cursor + i],
+                .timeout_ms = timeout_ms,
             };
             threads[i] = try std.Thread.spawn(.{}, RecursiveChildWorker.run, .{worker});
             spawned += 1;
@@ -2986,7 +2996,7 @@ fn runRecursiveChildTasks(
                         .name = try std.fmt.allocPrint(arena, "recursive_subcall_{d}", .{worker.task.child_index + 1}),
                         .action = try std.fmt.allocPrint(arena, "skipped recursive context object {s} because max_wall_time_ms was exhausted", .{worker.task.context_object.id}),
                         .status = .skipped,
-                        .details = try buildRecursiveTimeoutSubcallDetails(arena, worker.task),
+                        .details = try buildRecursiveTimeoutSubcallDetails(arena, worker.task, worker.timeout_ms),
                     });
                 }
                 break;
@@ -3039,7 +3049,7 @@ fn appendRecursiveSuccessfulChildResult(
         .name = try std.fmt.allocPrint(arena, "recursive_subcall_{d}", .{worker.task.child_index + 1}),
         .action = try std.fmt.allocPrint(arena, "summarized recursive context object {s}", .{worker.task.context_object.id}),
         .status = .success,
-        .details = try buildRecursiveSubcallDetails(arena, worker.task, summary),
+        .details = try buildRecursiveSubcallDetails(arena, worker.task, worker.timeout_ms, summary),
     });
 }
 
@@ -3152,6 +3162,7 @@ fn buildRecursiveDecompositionDetails(
     hit_count: usize,
     child_count: usize,
     scheduled_concurrency: usize,
+    actual_concurrency: usize,
 ) !std.json.Value {
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, "split_policy", .{ .string = @tagName(cfg.split_policy) });
@@ -3162,6 +3173,7 @@ fn buildRecursiveDecompositionDetails(
     try obj.put(alloc, "max_concurrency", .{ .integer = cfg.max_concurrency });
     try obj.put(alloc, "max_wall_time_ms", .{ .integer = cfg.max_wall_time_ms });
     try obj.put(alloc, "scheduled_concurrency", .{ .integer = @intCast(scheduled_concurrency) });
+    try obj.put(alloc, "actual_concurrency", .{ .integer = @intCast(actual_concurrency) });
     try obj.put(alloc, "requested_concurrency", .{ .integer = cfg.max_concurrency });
     try obj.put(alloc, "hit_count", .{ .integer = @intCast(hit_count) });
     try obj.put(alloc, "child_frame_count", .{ .integer = @intCast(child_count) });
@@ -3174,6 +3186,7 @@ fn buildRecursiveDecompositionDetails(
 fn buildRecursiveSubcallDetails(
     alloc: std.mem.Allocator,
     task: RecursiveChildTask,
+    timeout_ms: u64,
     summary: []const u8,
 ) !std.json.Value {
     var obj = std.json.ObjectMap.empty;
@@ -3182,7 +3195,7 @@ fn buildRecursiveSubcallDetails(
     try obj.put(alloc, "context_id", .{ .string = task.context_object.id });
     try obj.put(alloc, "estimated_context_tokens", .{ .integer = @intCast(task.estimated_context_tokens) });
     try obj.put(alloc, "token_count_method", .{ .string = @tagName(task.token_count_method) });
-    try obj.put(alloc, "timeout_ms", .{ .integer = @intCast(task.timeout_ms) });
+    try obj.put(alloc, "timeout_ms", .{ .integer = @intCast(timeout_ms) });
     try obj.put(alloc, "summary_bytes", .{ .integer = @intCast(summary.len) });
     return .{ .object = obj };
 }
@@ -3233,6 +3246,7 @@ fn buildRecursiveSkippedSubcallDetails(
 fn buildRecursiveTimeoutSubcallDetails(
     alloc: std.mem.Allocator,
     task: RecursiveChildTask,
+    timeout_ms: u64,
 ) !std.json.Value {
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, "child_index", .{ .integer = @intCast(task.child_index) });
@@ -3240,7 +3254,7 @@ fn buildRecursiveTimeoutSubcallDetails(
     try obj.put(alloc, "context_id", .{ .string = task.context_object.id });
     try obj.put(alloc, "estimated_context_tokens", .{ .integer = @intCast(task.estimated_context_tokens) });
     try obj.put(alloc, "token_count_method", .{ .string = @tagName(task.token_count_method) });
-    try obj.put(alloc, "timeout_ms", .{ .integer = @intCast(task.timeout_ms) });
+    try obj.put(alloc, "timeout_ms", .{ .integer = @intCast(timeout_ms) });
     try obj.put(alloc, "skip_reason", .{ .string = "max_wall_time_ms" });
     return .{ .object = obj };
 }

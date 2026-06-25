@@ -961,7 +961,11 @@ test "api retrieval agent recursive mode maps child subcalls and merges" {
     var saw_validation = false;
     for (parsed.value.steps.?) |step| {
         if (step.kind) |kind| switch (kind) {
-            .recursive_decomposition => saw_decomposition = true,
+            .recursive_decomposition => {
+                saw_decomposition = true;
+                try std.testing.expectEqual(@as(i64, 1), step.details.?.object.get("scheduled_concurrency").?.integer);
+                try std.testing.expectEqual(@as(i64, 1), step.details.?.object.get("actual_concurrency").?.integer);
+            },
             .recursive_subcall => {
                 subcall_count += 1;
                 try std.testing.expectEqualStrings("fixed_tokenizer", step.details.?.object.get("token_count_method").?.string);
@@ -1082,6 +1086,7 @@ test "api retrieval agent recursive mode executes child subcalls with configured
         if (step.kind != null and step.kind.? == .recursive_decomposition) break step;
     } else return error.MissingRecursiveDecompositionStep;
     try std.testing.expectEqual(@as(i64, 2), decomposition.details.?.object.get("scheduled_concurrency").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), decomposition.details.?.object.get("actual_concurrency").?.integer);
 }
 
 test "api retrieval agent recursive verify merge fails when child citations are dropped" {
@@ -1412,6 +1417,100 @@ test "api retrieval agent recursive mode stops scheduling after wall time budget
     try std.testing.expectEqual(metadata_openapi.AgentStepStatus.skipped, merge.status.?);
     try std.testing.expect(merge.details.?.object.get("wall_time_exhausted").?.bool);
     try std.testing.expect(merge.details.?.object.get("elapsed_ms").?.integer >= 1);
+}
+
+test "api retrieval agent recursive mode refreshes serial child timeout at launch" {
+    const FakeRunner = struct {
+        fn iface() retrieval_agent.QueryRunner {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .run_query = runQuery },
+            };
+        }
+
+        fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, _: []const u8) !QueryResponse {
+            try std.testing.expectEqualStrings("docs", table_name);
+            return .{
+                .json = try alloc.dupe(u8,
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}},{"_id":"doc:b","_score":0.8,"_source":{"content":"beta body"}}]}}]}
+                ),
+            };
+        }
+    };
+
+    const FakeGeneration = struct {
+        calls: usize = 0,
+        child_calls: usize = 0,
+        first_child_timeout_ms: u64 = 0,
+
+        fn iface(self: *@This()) retrieval_agent.GenerationRunner {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute_chain = executeChain,
+                    .execute_chain_with_timeout_ms = executeChainWithTimeoutMs,
+                },
+            };
+        }
+
+        fn executeChainWithTimeoutMs(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const generating.ChainLink, messages: []const generating.ChatMessage, timeout_ms: u64) !generating.GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(timeout_ms > 0);
+            const is_merge = std.mem.indexOf(u8, messages[1].content.?.text, "Child outputs:") != null;
+            if (is_merge) {
+                return .{
+                    .content = try alloc.dupe(u8, "fresh-timeout merged answer"),
+                    .allocator = alloc,
+                };
+            }
+
+            self.child_calls += 1;
+            if (self.child_calls == 1) {
+                self.first_child_timeout_ms = timeout_ms;
+                sleepMs(150);
+            } else if (self.child_calls == 2) {
+                try std.testing.expect(timeout_ms < self.first_child_timeout_ms);
+            } else {
+                return error.UnexpectedGenerationCall;
+            }
+
+            return .{
+                .content = try alloc.dupe(u8, if (self.child_calls == 1) "first child summary" else "second child summary"),
+                .allocator = alloc,
+            };
+        }
+
+        fn executeChain(ptr: *anyopaque, alloc: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+            return try executeChainWithTimeoutMs(ptr, alloc, chain, messages, std.time.ms_per_s);
+        }
+
+        fn sleepMs(ms: u64) void {
+            var req: std.posix.timespec = .{
+                .sec = @intCast(ms / std.time.ms_per_s),
+                .nsec = @intCast((ms % std.time.ms_per_s) * std.time.ns_per_ms),
+            };
+            while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
+                .SUCCESS => return,
+                .INTR => continue,
+                else => return,
+            };
+        }
+    };
+
+    var fake_generation = FakeGeneration{};
+    const body =
+        \\{"query":"find alpha","stream":false,"execution_mode":"recursive","recursive":{"max_depth":1,"max_subcalls":2,"max_concurrency":1,"max_wall_time_ms":1000,"split_policy":"by_document","merge_policy":"verify","child_tool_policy":"inherit_narrowed","allowed_context_object_types":["document"]},"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true}},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
+    ;
+    const encoded = try retrieval_agent.executeJson(std.testing.allocator, FakeRunner.iface(), fake_generation.iface(), body);
+    defer std.testing.allocator.free(encoded);
+
+    var parsed = try std.json.parseFromSlice(metadata_openapi.RetrievalAgentResult, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(metadata_openapi.AgentStatus.completed, parsed.value.status);
+    try std.testing.expectEqualStrings("fresh-timeout merged answer", parsed.value.generation.?);
+    try std.testing.expectEqual(@as(usize, 3), fake_generation.calls);
+    try std.testing.expectEqual(@as(usize, 2), fake_generation.child_calls);
 }
 
 test "distributed graph result_ref fail-closed guards are covered" {
