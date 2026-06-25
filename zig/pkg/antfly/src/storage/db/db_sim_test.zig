@@ -15,7 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const db_mod = @import("db.zig");
+const db_mod = @import("mod.zig");
 const db_split_sim_fixture = @import("db_split_sim_fixture.zig");
 const fs_paths = @import("../../common/fs_paths.zig");
 const platform_time = @import("../../platform/time.zig");

@@ -183,6 +183,11 @@ pub fn Impl(comptime DB: type) type {
             try preflightMirrorSyncCommit(resources.log_mutex, self.ha_async_effect_mirror);
         }
 
+        pub fn preflightDBMetadataSyncCommit(self: *DB) !void {
+            const resources = self.core.batchExecutionResources();
+            try preflightMirrorSyncCommit(resources.log_mutex, self.ha_async_metadata_mirror);
+        }
+
         pub fn mirrorDBBatchMutationCommit(self: *DB, request: types.BatchRequest) !void {
             const resources = self.core.batchExecutionResources();
             try mirrorBatchMutationCommit(self.alloc, resources.log_mutex, self.ha_async_batch_mirror, request);
@@ -191,6 +196,11 @@ pub fn Impl(comptime DB: type) type {
         pub fn mirrorDBReplayPayloadCommit(self: *DB, payload: []const u8) !void {
             const resources = self.core.batchExecutionResources();
             try mirrorReplayPayloadCommit(resources.log_mutex, self.ha_async_effect_mirror, payload);
+        }
+
+        pub fn mirrorDBSchemaMetadataCommit(self: *DB, table_schema: schema_mod.TableSchema) !void {
+            const resources = self.core.batchExecutionResources();
+            try mirrorSchemaMetadataCommit(self.alloc, resources.log_mutex, self.ha_async_metadata_mirror, table_schema);
         }
 
         pub fn appliedReplicationLsn(self: *DB) anyerror!u64 {

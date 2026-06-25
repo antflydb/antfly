@@ -21,7 +21,7 @@ pub const db = struct {
     pub const doc_set = @import("storage/db/doc_set.zig");
     pub const embedder = @import("storage/db/enrichment/embedder.zig");
     pub const replay_stream = @import("storage/db/derived/replay_stream.zig");
-    pub const BatchProfile = @import("storage/db/db.zig").BatchProfile;
-    pub const OpenOptions = @import("storage/db/db.zig").OpenOptions;
-    pub const DB = @import("storage/db/db.zig").DB;
+    pub const BatchProfile = @import("storage/db/mod.zig").BatchProfile;
+    pub const OpenOptions = @import("storage/db/mod.zig").OpenOptions;
+    pub const DB = @import("storage/db/mod.zig").DB;
 };

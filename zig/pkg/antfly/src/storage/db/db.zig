@@ -37,7 +37,6 @@ const search_runtime = @import("search_runtime.zig");
 const internal_keys = @import("../internal_keys.zig");
 const doc_identity = @import("doc_identity.zig");
 const doc_set = @import("doc_set.zig");
-const shard_mod = @import("../shard.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const resolver_catalog_mod = @import("catalog/resolver_catalog.zig");
 const resolution_runtime_mod = @import("resolution_runtime.zig");
@@ -104,43 +103,6 @@ const platform_clock = @import("../../platform/clock.zig");
 const getenv = db_internal.getenv;
 const readEnvUsize = db_internal.readEnvUsize;
 
-test "document extraction templated inline source size is rejected before persistence" {
-    const alloc = std.testing.allocator;
-
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
-
-    const security = scraping.ContentSecurityConfig{ .max_download_size_bytes = 4 };
-    var remote_content = scraping.RemoteContentConfig{ .security = security };
-    var db = try DB.open(alloc, std.mem.span(path), .{
-        .remote_content = &remote_content,
-        .start_index_workers = false,
-        .ttl_cleanup = .{ .enabled = false },
-    });
-    defer db.close();
-
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .template = "{{url}}",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
-    });
-
-    try std.testing.expectError(error.StreamTooLong, db.batch(.{
-        .writes = &.{.{
-            .key = "doc:templated-too-large",
-            .value = "{\"url\":\"data:text/plain;base64,aGVsbG8=\"}",
-        }},
-        .sync_level = .write,
-    }));
-
-    const doc_key = try internal_keys.documentKeyAlloc(alloc, "doc:templated-too-large");
-    defer alloc.free(doc_key);
-    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, doc_key));
-}
-
 pub const OpenOptions = lifecycle_mod.OpenOptions;
 pub const OpenMode = lifecycle_mod.OpenOptions.OpenMode;
 pub const ForeignKeyIntegrityReport = relational_store_mod.ForeignKeyIntegrityReport;
@@ -179,6 +141,11 @@ const ManagedSyncTargets = db_internal.ManagedSyncTargets;
 
 const AsyncContext = db_internal.AsyncContext(DB);
 
+fn notifyAsyncContextVisibilityHook(ptr: *anyopaque) void {
+    const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
+    if (ctx.query_visibility_hook) |hook| hook.notify(.invalidate);
+}
+
 const denseCatchUpFinishOptions = derived_async.denseCatchUpFinishOptions;
 const denseCatchUpStartupCacheNodes = derived_async.denseCatchUpStartupCacheNodes;
 const denseCatchUpStartupCacheVectors = derived_async.denseCatchUpStartupCacheVectors;
@@ -190,6 +157,8 @@ const ReplayApplyContext = db_internal.ReplayApplyContext(DB);
 
 const TtlCleanupContext = db_internal.TtlCleanupContext(DB);
 
+const AlgebraicDocFilterRequest = search_runtime.AlgebraicDocFilterRequest;
+
 pub const BatchProfile = write_path.BatchProfile;
 const BatchExecutionOptions = write_path.BatchExecutionOptions;
 
@@ -199,8 +168,6 @@ const addBatchProfile = write_path.addBatchProfile;
 const profileDelta = db_internal.profileDelta;
 const logBatchProfile = write_path.logBatchProfile;
 
-var temp_path_nonce: u64 = 0;
-
 const threadedIo = db_internal.threadedIo;
 const monotonicTimeNs = platform.time.monotonicNs;
 const sleepNs = db_internal.sleepNs;
@@ -209,14 +176,6 @@ const yieldToBackground = db_internal.yieldToBackground;
 
 pub const RestoreState = split_restore.RestoreState;
 pub const RestoreIdentity = split_restore.RestoreIdentity;
-
-const ShadowState = struct {
-    manager: *index_manager_mod.IndexManager,
-    base_path: []u8,
-    indexes_path: []u8,
-    range_start: []u8,
-    range_end: []u8,
-};
 
 pub const DB = struct {
     alloc: Allocator,
@@ -259,7 +218,7 @@ pub const DB = struct {
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime,
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime,
     graph_metric_runtime: ?*graph_metric_runtime_mod.GraphMetricRuntime,
-    shadow: ?ShadowState,
+    shadow: ?split_restore.ShadowState,
     bulk_ingest_coalescer: write_path.BulkIngestCoalescer(@This()) = .{},
     flushing_bulk_ingest_coalescer: bool = false,
     bulk_ingest_identity_all_new: bool = false,
@@ -280,37 +239,37 @@ pub const DB = struct {
     const relational_rows_impl = relational_rows.Impl(@This());
     const search_runtime_impl = search_runtime.Impl(@This());
     const derived_async_impl = derived_async.Impl(@This());
-    const AlgebraicDocFilterRequest = search_runtime.AlgebraicDocFilterRequest;
     pub const LifecycleCallbacks = struct {
-        pub const apply_derived_batch_to_index_async = derived_async_impl.applyDerivedBatchToIndexAsync;
-        pub const persist_applied_sequence_async = derived_async_impl.persistAppliedSequenceAsync;
-        pub const truncate_replay_sequence_async = derived_async_impl.truncateReplaySequenceAsync;
-        pub const begin_derived_catch_up_session_async = derived_async_impl.beginDerivedCatchUpSessionAsync;
-        pub const finish_derived_catch_up_session_async = derived_async_impl.finishDerivedCatchUpSessionAsync;
-        pub const can_advance_derived_to_target_async = derived_async_impl.canAdvanceDerivedToTargetAsync;
-        pub const append_derived_batch_from_enrichment = derived_async_impl.appendDerivedBatchFromEnrichment;
-        pub const notify_derived_executor_sequence = derived_async_impl.notifyDerivedExecutorSequence;
-        pub const delete_expired_documents_from_candidates = write_path_impl.deleteExpiredDocumentsFromCandidates;
+        pub const apply_derived_batch_to_index_async = lifecycleApplyDerivedBatchToIndexAsync;
+        pub const persist_applied_sequence_async = lifecyclePersistAppliedSequenceAsync;
+        pub const truncate_replay_sequence_async = lifecycleTruncateReplaySequenceAsync;
+        pub const begin_derived_catch_up_session_async = lifecycleBeginDerivedCatchUpSessionAsync;
+        pub const finish_derived_catch_up_session_async = lifecycleFinishDerivedCatchUpSessionAsync;
+        pub const can_advance_derived_to_target_async = derivedAsyncCanAdvanceDerivedToTargetAsync;
+        pub const append_derived_batch_from_enrichment = lifecycleAppendDerivedBatchFromEnrichment;
+        pub const notify_derived_executor_sequence = lifecycleNotifyDerivedExecutorSequence;
+        pub const delete_expired_documents_from_candidates = lifecycleDeleteExpiredDocumentsFromCandidates;
         pub const notify_async_context_visibility_hook = notifyAsyncContextVisibilityHook;
-        pub const clear_bulk_ingest_seen_doc_keys_locked = write_path_impl.clearBulkIngestSeenDocKeysLocked;
-        pub const deinit_bulk_ingest_coalescer = write_path_impl.deinitBulkIngestCoalescer;
-        pub const replay_pending_derived_batches = derived_async_impl.replayPendingDerivedBatches;
-        pub const start_async_workers = lifecycle_impl.startAsyncWorkers;
-        pub const flush_applied_sequences_for_idle = derived_async_impl.flushAppliedSequencesForIdle;
-        pub const wait_for_sync_level = derived_async_impl.waitForSyncLevel;
-        pub const dense_index_rebuild_state_path_alloc = derived_async_impl.denseIndexRebuildStatePathAlloc;
-        pub const set_dense_catch_up_progress = derived_async_impl.setDenseCatchUpProgress;
+        pub const clear_bulk_ingest_seen_doc_keys_locked = lifecycleClearBulkIngestSeenDocKeysLocked;
+        pub const deinit_bulk_ingest_coalescer = lifecycleDeinitBulkIngestCoalescer;
+        pub const replay_pending_derived_batches = lifecycleReplayPendingDerivedBatches;
+        pub const start_async_workers = lifecycleStartAsyncWorkers;
+        pub const flush_applied_sequences_for_idle = lifecycleFlushAppliedSequencesForIdle;
+        pub const wait_for_sync_level = lifecycleWaitForSyncLevel;
+        pub const dense_index_rebuild_state_path_alloc = lifecycleDenseIndexRebuildStatePathAlloc;
+        pub const set_dense_catch_up_progress = lifecycleSetDenseCatchUpProgress;
         pub const probe_derived_replay_target_sequence = lifecycle_mod.probeDerivedReplayTargetSequence;
         pub const lock_apply = lockApply;
-        pub const populate_algebraic_index_stats = lifecycle_impl.populateAlgebraicIndexStats;
+        pub const populate_algebraic_index_stats = lifecyclePopulateAlgebraicIndexStats;
+        pub const open_mode_requires_read_only_backends = lifecycle_mod.openModeRequiresReadOnlyBackends;
     };
     pub const DerivedAsyncCallbacks = struct {
         pub const dense_catch_up_finish_options = denseCatchUpFinishOptions;
-        pub const apply_derived_batch_to_index_context = derived_async_impl.applyDerivedBatchToIndexContext;
-        pub const apply_derived_batch_to_index_context_profiled = derived_async_impl.applyDerivedBatchToIndexContextProfiled;
+        pub const apply_derived_batch_to_index_context = derivedAsyncApplyDerivedBatchToIndexContext;
+        pub const apply_derived_batch_to_index_context_profiled = derivedAsyncApplyDerivedBatchToIndexContextProfiled;
         pub const save_index_status_snapshots = lifecycle_mod.saveIndexStatusSnapshots;
         pub const async_index_profile_enabled = db_internal.asyncIndexProfileEnabled;
-        pub const replay_pending_derived_batches_context = derived_async_impl.replayPendingDerivedBatchesContext;
+        pub const replay_pending_derived_batches_context = derivedAsyncReplayPendingDerivedBatchesContext;
         pub const open_profile_enabled = lifecycle_mod.openProfileEnabled;
         pub const log_replay_catch_up_profile = derived_async.logReplayCatchUpProfile;
         pub const log_derived_worker_profile = derived_async.logDerivedWorkerProfile;
@@ -318,10 +277,10 @@ pub const DB = struct {
     pub const WritePathCallbacks = struct {
         pub const Profile = BatchProfile;
         pub const Options = BatchExecutionOptions;
-        pub const batch_internal = write_path_impl.batchInternal;
+        pub const batch_internal = writePathBatchInternal;
         pub const open_mode_requires_read_only_backends = lifecycle_mod.openModeRequiresReadOnlyBackends;
-        pub const enforce_ha_write_gate = ha_replication_impl.enforceDBWriteGate;
-        pub const preflight_ha_batch_sync_commit = ha_replication_impl.preflightDBBatchSyncCommit;
+        pub const enforce_ha_write_gate = writePathEnforceHAWriteGate;
+        pub const preflight_ha_batch_sync_commit = writePathPreflightHABatchSyncCommit;
         pub const bench_metrics_enabled = db_internal.benchMetricsEnabled;
         pub const log_batch_profile = logBatchProfile;
         pub const monotonic_time_ns = monotonicTimeNs;
@@ -331,61 +290,428 @@ pub const DB = struct {
         pub const append_row_claim_predicates_for_identity_rewrites = db_transactions.appendRowClaimPredicatesForIdentityRewrites;
         pub const reclaim_expired_row_claim_intents_for_mutation_keys = db_transactions.reclaimExpiredRowClaimIntentsForMutationKeys;
         pub const reclaim_expired_row_claim_intents_for_identity_rewrites = db_transactions.reclaimExpiredRowClaimIntentsForIdentityRewrites;
-        pub const relational_column_index_policy_for_store = schema_runtime_impl.relationalColumnIndexPolicyForStore;
-        pub const relational_columns_for_store = schema_runtime_impl.relationalColumnsForStore;
-        pub const record_foreign_key_child_write_reject = relational_integrity_impl.recordForeignKeyChildWriteReject;
-        pub const record_foreign_key_parent_delete_reject = relational_integrity_impl.recordForeignKeyParentDeleteReject;
+        pub const relational_column_index_policy_for_store = writePathRelationalColumnIndexPolicyForStore;
+        pub const relational_columns_for_store = relationalColumnsForStore;
+        pub const record_foreign_key_child_write_reject = writePathRecordForeignKeyChildWriteReject;
+        pub const record_foreign_key_parent_delete_reject = writePathRecordForeignKeyParentDeleteReject;
         pub const is_metadata_key = db_internal.isMetadataKey;
         pub const augment_extracted_write_with_graph_field_edges = write_path.augmentExtractedWriteWithGraphFieldEdges;
         pub const should_write_timestamp = db_internal.shouldWriteTimestamp;
-        pub const resolve_write_timestamp_ns = internal_impl.resolveWriteTimestampNs;
+        pub const resolve_write_timestamp_ns = writePathResolveWriteTimestampNs;
         pub const make_timestamp_key = db_internal.makeTimestampKey;
         pub const encode_timestamp_value = db_internal.encodeTimestampValue;
         pub const append_system_versioned_history_for_batch = db_transactions.appendSystemVersionedHistoryForBatch;
-        pub const split_shadow_requires_materialized_derived_batch = split_restore_impl.splitShadowRequiresMaterializedDerivedBatch;
+        pub const split_shadow_requires_materialized_derived_batch = writePathSplitShadowRequiresMaterializedDerivedBatch;
         pub const encode_thin_replay_record_payload = write_path.encodeThinReplayRecordPayload;
-        pub const append_precomputed_graph_source_artifacts = write_path_impl.appendPrecomputedGraphSourceArtifacts;
+        pub const append_precomputed_graph_source_artifacts = writePathAppendPrecomputedGraphSourceArtifacts;
         pub const graph_writes_from_artifact_value_alloc = derived_async.graphWritesFromArtifactValueAlloc;
         pub const free_graph_writes = derived_async.freeGraphWrites;
         pub const resolution_mention_state_keys_for_graph_source_alloc = derived_async.resolutionMentionStateKeysForGraphSourceAlloc;
         pub const attach_inline_upsert_document_values = derived_async.attachInlineUpsertDocumentValues;
-        pub const apply_derived_batch_to_shadow_if_needed = derived_async_impl.applyDerivedBatchToShadowIfNeeded;
-        pub const collect_managed_sync_targets = derived_async_impl.collectManagedSyncTargets;
-        pub const encode_change_record_payload = derived_async_impl.encodeChangeRecordPayloadForDB;
-        pub const encode_change_record_payload_context = derived_async_impl.encodeChangeRecordPayload;
-        pub const mirror_ha_batch_mutation_commit = ha_replication_impl.mirrorDBBatchMutationCommit;
-        pub const mirror_ha_replay_payload_commit = ha_replication_impl.mirrorDBReplayPayloadCommit;
-        pub const mirror_ha_replay_payload_best_effort = ha_replication_impl.mirrorDBReplayPayloadBestEffort;
-        pub const should_append_split_delta = split_restore_impl.shouldAppendSplitDelta;
+        pub const apply_derived_batch_to_shadow_if_needed = writePathApplyDerivedBatchToShadowIfNeeded;
+        pub const collect_managed_sync_targets = writePathCollectManagedSyncTargets;
+        pub const encode_change_record_payload = writePathEncodeChangeRecordPayload;
+        pub const encode_change_record_payload_context = writePathEncodeChangeRecordPayloadContext;
+        pub const mirror_ha_batch_mutation_commit = writePathMirrorHABatchMutationCommit;
+        pub const mirror_ha_replay_payload_commit = writePathMirrorHAReplayPayloadCommit;
+        pub const mirror_ha_replay_payload_best_effort = writePathMirrorHAReplayPayloadBestEffort;
+        pub const should_append_split_delta = writePathShouldAppendSplitDelta;
         pub const current_time_ns = db_internal.currentTimeNs;
-        pub const mark_precomputed_enrichment_applied_for_sync = lifecycle_impl.markPrecomputedEnrichmentAppliedForSync;
-        pub const mark_precomputed_enrichment_applied_for_sync_context = derived_async_impl.markPrecomputedEnrichmentAppliedForSyncContext;
-        pub const apply_derived_backlog_pressure = derived_async_impl.applyDerivedBacklogPressure;
-        pub const apply_derived_backlog_pressure_context = derived_async_impl.applyDerivedBacklogPressureContext;
+        pub const mark_precomputed_enrichment_applied_for_sync = writePathMarkPrecomputedEnrichmentAppliedForSync;
+        pub const mark_precomputed_enrichment_applied_for_sync_context = writePathMarkPrecomputedEnrichmentAppliedForSyncContext;
+        pub const apply_derived_backlog_pressure = writePathApplyDerivedBacklogPressure;
+        pub const apply_derived_backlog_pressure_context = writePathApplyDerivedBacklogPressureContext;
         pub const notify_executor_for_sync_level_with_dense_bulk_deferral = db_internal.notifyExecutorForSyncLevelWithDenseBulkDeferral;
-        pub const wait_for_sync_level = derived_async_impl.waitForSyncLevel;
-        pub const wait_for_sync_level_context = derived_async_impl.waitForSyncLevelContext;
-        pub const sync_level_requires_derived_visibility = derived_async_impl.syncLevelRequiresDerivedVisibility;
-        pub const apply_derived_batch = derived_async_impl.applyDerivedBatch;
-        pub const apply_derived_batch_targets = derived_async_impl.applyDerivedBatchTargets;
-        pub const apply_derived_batch_context = derived_async_impl.applyDerivedBatchContext;
-        pub const apply_derived_batch_targets_context = derived_async_impl.applyDerivedBatchTargetsContext;
-        pub const apply_derived_batch_profiled = derived_async_impl.applyDerivedBatchProfiled;
-        pub const apply_derived_batch_targets_profiled = derived_async_impl.applyDerivedBatchTargetsProfiled;
-        pub const notify_resolver_replay_runtimes = lifecycle_impl.notifyResolverReplayRuntimes;
-        pub const notify_resolver_replay_runtimes_for_catalog = derived_async_impl.notifyResolverReplayRuntimesForCatalog;
+        pub const wait_for_sync_level = writePathWaitForSyncLevel;
+        pub const wait_for_sync_level_context = writePathWaitForSyncLevelContext;
+        pub const sync_level_requires_derived_visibility = writePathSyncLevelRequiresDerivedVisibility;
+        pub const apply_derived_batch = writePathApplyDerivedBatch;
+        pub const apply_derived_batch_targets = writePathApplyDerivedBatchTargets;
+        pub const apply_derived_batch_context = writePathApplyDerivedBatchContext;
+        pub const apply_derived_batch_targets_context = writePathApplyDerivedBatchTargetsContext;
+        pub const apply_derived_batch_profiled = writePathApplyDerivedBatchProfiled;
+        pub const apply_derived_batch_targets_profiled = writePathApplyDerivedBatchTargetsProfiled;
+        pub const notify_resolver_replay_runtimes = writePathNotifyResolverReplayRuntimes;
+        pub const notify_resolver_replay_runtimes_for_catalog = writePathNotifyResolverReplayRuntimesForCatalog;
     };
     pub const SchemaRuntimeCallbacks = struct {
-        pub const hydrate_algebraic_observation_status_for_index_best_effort = lifecycle_impl.hydrateAlgebraicObservationStatusForIndexBestEffort;
-        pub const replay_generated_enrichments_from_stored_docs = schema_runtime_impl.replayGeneratedEnrichmentsFromStoredDocs;
-        pub const append_generated_enrichments = write_path_impl.appendGeneratedEnrichments;
-        pub const append_derived_batch_record = derived_async_impl.appendDerivedBatchRecord;
-        pub const notify_resolver_replay_runtimes = lifecycle_impl.notifyResolverReplayRuntimes;
+        pub const hydrate_algebraic_observation_status_for_index_best_effort = schemaRuntimeHydrateAlgebraicObservationStatusForIndexBestEffort;
+        pub const replay_generated_enrichments_from_stored_docs = replayGeneratedEnrichmentsFromStoredDocs;
+        pub const append_generated_enrichments = schemaRuntimeAppendGeneratedEnrichments;
+        pub const append_derived_batch_record = derivedAsyncAppendDerivedBatchRecord;
+        pub const save_index_status_snapshot = schemaRuntimeSaveIndexStatusSnapshot;
+        pub const notify_resolver_replay_runtimes = schemaRuntimeNotifyResolverReplayRuntimes;
+        pub const mirror_ha_schema_metadata_commit = schemaRuntimeMirrorHASchemaMetadataCommit;
     };
     pub const HAReplicationCallbacks = struct {
-        pub const batch_replicated_apply_with_marker = write_path_impl.batchReplicatedApplyWithMarker;
+        pub const batch_replicated_apply_with_marker = haReplicationBatchReplicatedApplyWithMarker;
         pub const apply_ha_derived_effect_record = applyHADerivedEffectRecord;
     };
+
+    fn lifecycleApplyDerivedBatchToIndexAsync(
+        ctx_ptr: *anyopaque,
+        derived_batch: derived_types.DerivedBatch,
+        index_ref: index_manager_mod.ManagedIndexRef,
+    ) !bool {
+        return try derived_async_impl.applyDerivedBatchToIndexAsync(ctx_ptr, derived_batch, index_ref);
+    }
+
+    fn lifecyclePersistAppliedSequenceAsync(ctx_ptr: *anyopaque, index_name: []const u8, sequence: u64, force: bool) !bool {
+        return try derived_async_impl.persistAppliedSequenceAsync(ctx_ptr, index_name, sequence, force);
+    }
+
+    fn lifecycleTruncateReplaySequenceAsync(ctx_ptr: *anyopaque, sequence: u64) !void {
+        return try derived_async_impl.truncateReplaySequenceAsync(ctx_ptr, sequence);
+    }
+
+    fn lifecycleBeginDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) !void {
+        return try derived_async_impl.beginDerivedCatchUpSessionAsync(ctx_ptr, index_ref);
+    }
+
+    fn lifecycleFinishDerivedCatchUpSessionAsync(ctx_ptr: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, success: bool) !void {
+        return try derived_async_impl.finishDerivedCatchUpSessionAsync(ctx_ptr, index_ref, success);
+    }
+
+    fn lifecycleAppendDerivedBatchFromEnrichment(ctx_ptr: *anyopaque, derived_batch: derived_types.DerivedBatch) !u64 {
+        return try derived_async_impl.appendDerivedBatchFromEnrichment(ctx_ptr, derived_batch);
+    }
+
+    fn lifecycleNotifyDerivedExecutorSequence(ctx_ptr: *anyopaque, sequence: u64) void {
+        derived_async_impl.notifyDerivedExecutorSequence(ctx_ptr, sequence);
+    }
+
+    fn lifecycleDeleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const ttl_runtime_mod.DeleteCandidate) !u32 {
+        return try write_path_impl.deleteExpiredDocumentsFromCandidates(ctx_ptr, candidates);
+    }
+
+    fn lifecycleClearBulkIngestSeenDocKeysLocked(self: *DB) void {
+        write_path_impl.clearBulkIngestSeenDocKeysLocked(self);
+    }
+
+    fn lifecycleDeinitBulkIngestCoalescer(self: *DB) void {
+        write_path_impl.deinitBulkIngestCoalescer(self);
+    }
+
+    fn lifecycleReplayPendingDerivedBatches(
+        self: *DB,
+        progress_ctx: ?*anyopaque,
+        progress_hook: ?ReplayProgressHook,
+    ) !void {
+        return try derived_async_impl.replayPendingDerivedBatches(self, progress_ctx, progress_hook);
+    }
+
+    fn lifecycleStartAsyncWorkers(self: *DB) !void {
+        return try lifecycle_impl.startAsyncWorkers(self);
+    }
+
+    fn lifecycleFlushAppliedSequencesForIdle(self: *DB) !void {
+        return try derived_async_impl.flushAppliedSequencesForIdle(self);
+    }
+
+    fn lifecycleWaitForSyncLevel(
+        self: *DB,
+        sync_level: types.SyncLevel,
+        sequence: u64,
+        sync_targets: ManagedSyncTargets,
+    ) !void {
+        return try derived_async_impl.waitForSyncLevel(self, sync_level, sequence, sync_targets);
+    }
+
+    fn lifecycleDenseIndexRebuildStatePathAlloc(self: *DB, alloc: Allocator, index_name: []const u8) ![]u8 {
+        return try derived_async_impl.denseIndexRebuildStatePathAlloc(self, alloc, index_name);
+    }
+
+    fn lifecycleSetDenseCatchUpProgress(ctx: *AsyncContext, progress: ReplayProgress) void {
+        derived_async_impl.setDenseCatchUpProgress(ctx, progress);
+    }
+
+    fn lifecyclePopulateAlgebraicIndexStats(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        item: *types.DBIndexStats,
+        include_adaptive_scans: bool,
+    ) !void {
+        return try lifecycle_impl.populateAlgebraicIndexStats(self, alloc, index_name, item, include_adaptive_scans);
+    }
+
+    fn derivedAsyncApplyDerivedBatchToIndexContext(
+        ctx: *const AsyncContext,
+        derived_batch: derived_types.DerivedBatch,
+        index_ref: index_manager_mod.ManagedIndexRef,
+    ) !void {
+        return try derived_async_impl.applyDerivedBatchToIndexContext(ctx, derived_batch, index_ref);
+    }
+
+    fn derivedAsyncApplyDerivedBatchToIndexContextProfiled(
+        ctx: *const AsyncContext,
+        derived_batch: derived_types.DerivedBatch,
+        index_ref: index_manager_mod.ManagedIndexRef,
+        profile: ?*BatchProfile,
+    ) !void {
+        return try derived_async_impl.applyDerivedBatchToIndexContextProfiled(ctx, derived_batch, index_ref, profile);
+    }
+
+    fn derivedAsyncReplayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
+        return try derived_async_impl.replayPendingDerivedBatchesContext(ctx);
+    }
+
+    fn schemaRuntimeHydrateAlgebraicObservationStatusForIndexBestEffort(self: *DB, index_name: []const u8) void {
+        lifecycle_impl.hydrateAlgebraicObservationStatusForIndexBestEffort(self, index_name);
+    }
+
+    fn schemaRuntimeAppendGeneratedEnrichments(
+        self: *DB,
+        derived_batch_out: *derived_types.DerivedBatch,
+        req: types.BatchRequest,
+        extracted: []const mapper.ExtractedWrite,
+    ) !void {
+        return try write_path_impl.appendGeneratedEnrichments(self, derived_batch_out, req, extracted);
+    }
+
+    fn schemaRuntimeNotifyResolverReplayRuntimes(self: *DB, sequence: u64) void {
+        lifecycle_impl.notifyResolverReplayRuntimes(self, sequence);
+    }
+
+    fn schemaRuntimeSaveIndexStatusSnapshot(self: *DB, index_name: []const u8, sequence: u64) !void {
+        return try lifecycle_mod.saveIndexStatusSnapshots(self.alloc, self.core.store, self.core.index_manager, &[_]apply_state.AppliedSequenceUpdate{.{
+            .index_name = index_name,
+            .sequence = sequence,
+        }});
+    }
+
+    fn schemaRuntimeMirrorHASchemaMetadataCommit(self: *DB, table_schema: schema_mod.TableSchema) !void {
+        return try ha_replication_impl.mirrorDBSchemaMetadataCommit(self, table_schema);
+    }
+
+    fn writePathBatchInternal(
+        self: *DB,
+        req: types.BatchRequest,
+        profile: ?*BatchProfile,
+        opts: BatchExecutionOptions,
+    ) anyerror!void {
+        return try write_path_impl.batchInternal(self, req, profile, opts);
+    }
+
+    fn writePathResolveWriteTimestampNs(self: *DB, fallback_timestamp_ns: u64, value_json: []const u8) !u64 {
+        return try internal_impl.resolveWriteTimestampNs(self, fallback_timestamp_ns, value_json);
+    }
+
+    fn writePathEnforceHAWriteGate(self: *DB) !void {
+        return try ha_replication_impl.enforceDBWriteGate(self);
+    }
+
+    fn writePathPreflightHABatchSyncCommit(self: *DB) !void {
+        return try ha_replication_impl.preflightDBBatchSyncCommit(self);
+    }
+
+    fn writePathMirrorHABatchMutationCommit(self: *DB, request: types.BatchRequest) !void {
+        return try ha_replication_impl.mirrorDBBatchMutationCommit(self, request);
+    }
+
+    fn writePathMirrorHAReplayPayloadCommit(self: *DB, payload: []const u8) !void {
+        return try ha_replication_impl.mirrorDBReplayPayloadCommit(self, payload);
+    }
+
+    fn writePathMirrorHAReplayPayloadBestEffort(self: *DB, payload: []const u8) void {
+        ha_replication_impl.mirrorDBReplayPayloadBestEffort(self, payload);
+    }
+
+    fn writePathApplyDerivedBatchToShadowIfNeeded(self: *DB, derived_batch: derived_types.DerivedBatch) !void {
+        return try derived_async_impl.applyDerivedBatchToShadowIfNeeded(self, derived_batch);
+    }
+
+    fn writePathCollectManagedSyncTargets(
+        alloc: Allocator,
+        index_manager: *index_manager_mod.IndexManager,
+        derived_batch: derived_types.DerivedBatch,
+    ) !ManagedSyncTargets {
+        return try derived_async_impl.collectManagedSyncTargets(alloc, index_manager, derived_batch);
+    }
+
+    fn writePathEncodeChangeRecordPayload(
+        self: *DB,
+        derived_batch: derived_types.DerivedBatch,
+        sequence: u64,
+    ) ![]u8 {
+        return try derived_async_impl.encodeChangeRecordPayloadForDB(self, derived_batch, sequence);
+    }
+
+    fn writePathEncodeChangeRecordPayloadContext(
+        ctx: *const BatchExecutionContext,
+        derived_batch: derived_types.DerivedBatch,
+        sequence: u64,
+    ) ![]u8 {
+        return try derived_async_impl.encodeChangeRecordPayload(ctx, derived_batch, sequence);
+    }
+
+    fn writePathShouldAppendSplitDelta(self: *DB) bool {
+        return split_restore_impl.shouldAppendSplitDelta(self);
+    }
+
+    fn writePathMarkPrecomputedEnrichmentAppliedForSync(
+        self: *DB,
+        sync_level: types.SyncLevel,
+        sequence: u64,
+    ) !void {
+        return try lifecycle_impl.markPrecomputedEnrichmentAppliedForSync(self, sync_level, sequence);
+    }
+
+    fn writePathMarkPrecomputedEnrichmentAppliedForSyncContext(
+        ctx: *const BatchExecutionContext,
+        sync_level: types.SyncLevel,
+        sequence: u64,
+    ) !void {
+        return try derived_async_impl.markPrecomputedEnrichmentAppliedForSyncContext(ctx, sync_level, sequence);
+    }
+
+    fn writePathApplyDerivedBacklogPressure(
+        self: *DB,
+        sequence: u64,
+        sync_level: types.SyncLevel,
+        sync_targets: ManagedSyncTargets,
+    ) !void {
+        return try derived_async_impl.applyDerivedBacklogPressure(self, sequence, sync_level, sync_targets);
+    }
+
+    fn writePathApplyDerivedBacklogPressureContext(
+        ctx: *const BatchExecutionContext,
+        sequence: u64,
+        sync_level: types.SyncLevel,
+        sync_targets: ManagedSyncTargets,
+    ) !void {
+        return try derived_async_impl.applyDerivedBacklogPressureContext(ctx, sequence, sync_level, sync_targets);
+    }
+
+    fn writePathWaitForSyncLevel(
+        self: *DB,
+        sync_level: types.SyncLevel,
+        sequence: u64,
+        sync_targets: ManagedSyncTargets,
+    ) !void {
+        return try derived_async_impl.waitForSyncLevel(self, sync_level, sequence, sync_targets);
+    }
+
+    fn writePathWaitForSyncLevelContext(
+        ctx: *const BatchExecutionContext,
+        sync_level: types.SyncLevel,
+        sequence: u64,
+        sync_targets: ManagedSyncTargets,
+    ) !void {
+        return try derived_async_impl.waitForSyncLevelContext(ctx, sync_level, sequence, sync_targets);
+    }
+
+    fn writePathSyncLevelRequiresDerivedVisibility(sync_level: types.SyncLevel) bool {
+        return derived_async_impl.syncLevelRequiresDerivedVisibility(sync_level);
+    }
+
+    fn writePathApplyDerivedBatch(self: *DB, derived_batch: derived_types.DerivedBatch) !void {
+        return try derived_async_impl.applyDerivedBatch(self, derived_batch);
+    }
+
+    fn writePathApplyDerivedBatchTargets(
+        self: *DB,
+        derived_batch: derived_types.DerivedBatch,
+        index_names: []const []const u8,
+    ) !void {
+        return try derived_async_impl.applyDerivedBatchTargets(self, derived_batch, index_names);
+    }
+
+    fn writePathApplyDerivedBatchContext(
+        ctx: *const BatchExecutionContext,
+        derived_batch: derived_types.DerivedBatch,
+    ) !void {
+        return try derived_async_impl.applyDerivedBatchContext(ctx, derived_batch);
+    }
+
+    fn writePathApplyDerivedBatchTargetsContext(
+        ctx: *const BatchExecutionContext,
+        derived_batch: derived_types.DerivedBatch,
+        index_names: []const []const u8,
+    ) !void {
+        return try derived_async_impl.applyDerivedBatchTargetsContext(ctx, derived_batch, index_names);
+    }
+
+    fn writePathApplyDerivedBatchProfiled(
+        self: *DB,
+        derived_batch: derived_types.DerivedBatch,
+        profile: ?*BatchProfile,
+    ) !void {
+        return try derived_async_impl.applyDerivedBatchProfiled(self, derived_batch, profile);
+    }
+
+    fn writePathApplyDerivedBatchTargetsProfiled(
+        self: *DB,
+        derived_batch: derived_types.DerivedBatch,
+        index_names: []const []const u8,
+        profile: ?*BatchProfile,
+    ) !void {
+        return try derived_async_impl.applyDerivedBatchTargetsProfiled(self, derived_batch, index_names, profile);
+    }
+
+    fn writePathNotifyResolverReplayRuntimes(self: *DB, sequence: u64) void {
+        lifecycle_impl.notifyResolverReplayRuntimes(self, sequence);
+    }
+
+    fn writePathNotifyResolverReplayRuntimesForCatalog(
+        index_manager: *const index_manager_mod.IndexManager,
+        resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime,
+        promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime,
+        sequence: u64,
+    ) void {
+        derived_async_impl.notifyResolverReplayRuntimesForCatalog(
+            index_manager,
+            resolution_runtime,
+            promotion_runtime,
+            sequence,
+        );
+    }
+
+    fn writePathRelationalColumnIndexPolicyForStore(self: *DB) relational_store_mod.ColumnIndexPolicy {
+        return schema_runtime_impl.relationalColumnIndexPolicyForStore(self);
+    }
+
+    fn writePathRecordForeignKeyChildWriteReject(self: *DB) void {
+        relational_integrity_impl.recordForeignKeyChildWriteReject(self);
+    }
+
+    fn writePathRecordForeignKeyParentDeleteReject(self: *DB) void {
+        relational_integrity_impl.recordForeignKeyParentDeleteReject(self);
+    }
+
+    fn writePathSplitShadowRequiresMaterializedDerivedBatch(self: *DB) bool {
+        return split_restore_impl.splitShadowRequiresMaterializedDerivedBatch(self);
+    }
+
+    fn writePathAppendPrecomputedGraphSourceArtifacts(
+        self: *DB,
+        artifact_writes: []const types.BatchWrite,
+        artifact_delete_keys: []const []const u8,
+        owned_graph_artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+        store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+        delete_keys: *std.ArrayListUnmanaged([]const u8),
+        owned_delete_keys: *std.ArrayListUnmanaged([]u8),
+        changed_artifact_keys: *std.ArrayListUnmanaged([]u8),
+    ) !void {
+        return try write_path_impl.appendPrecomputedGraphSourceArtifacts(
+            self,
+            artifact_writes,
+            artifact_delete_keys,
+            owned_graph_artifact_writes,
+            store_writes,
+            delete_keys,
+            owned_delete_keys,
+            changed_artifact_keys,
+        );
+    }
+
+    fn haReplicationBatchReplicatedApplyWithMarker(
+        self: *DB,
+        req: types.BatchRequest,
+        applied_lsn_marker: ?u64,
+    ) anyerror!void {
+        return try write_path_impl.batchReplicatedApplyWithMarker(self, req, applied_lsn_marker);
+    }
 
     pub fn batchContext(self: *DB) BatchExecutionContext {
         return internal_impl.batchContext(self);
@@ -415,54 +741,65 @@ pub const DB = struct {
         lifecycle_impl.setQueryVisibilityHook(self, hook);
     }
 
-    fn notifyAsyncContextVisibilityHook(ptr: *anyopaque) void {
-        const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
-        if (ctx.query_visibility_hook) |hook| hook.notify(.invalidate);
+    fn enforceDurableMutationGate(self: *DB) !void {
+        if (lifecycle_mod.openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try ha_replication_impl.enforceDBWriteGate(self);
     }
 
     pub fn runTransactionRecoveryOnce(self: *DB, config: transaction_runtime_mod.Config) !types.TransactionRecoveryStats {
+        try self.enforceDurableMutationGate();
         return try lifecycle_impl.runTransactionRecoveryOnce(self, config);
     }
 
     pub fn beginBulkIngestSession(self: *DB) !void {
-        try ha_replication_impl.enforceDBWriteGate(self);
+        try self.enforceDurableMutationGate();
         return try write_path_impl.beginBulkIngestSessionAfterGate(self);
     }
 
     pub fn finishBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
-        try ha_replication_impl.enforceDBWriteGate(self);
+        try self.enforceDurableMutationGate();
         return try write_path_impl.finishBulkIngestSessionWithOptionsAfterGate(self, options);
     }
 
     pub fn beginDenseAutoBulkIngestSession(self: *DB) !void {
-        try ha_replication_impl.enforceDBWriteGate(self);
+        try self.enforceDurableMutationGate();
         return try write_path_impl.beginDenseAutoBulkIngestSessionAfterGate(self);
     }
 
     pub fn beginPrimaryStoreAutoBulkIngestSession(self: *DB) !void {
-        try ha_replication_impl.enforceDBWriteGate(self);
+        try self.enforceDurableMutationGate();
         return try write_path_impl.beginPrimaryStoreAutoBulkIngestSessionAfterGate(self);
     }
 
     pub fn finishPrimaryStoreAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
-        try ha_replication_impl.enforceDBWriteGate(self);
+        try self.enforceDurableMutationGate();
         return try write_path_impl.finishPrimaryStoreAutoBulkIngestSessionWithOptionsAfterGate(self, options);
     }
 
     pub fn rollPrimaryStoreAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
-        try self.finishPrimaryStoreAutoBulkIngestSessionWithOptions(options);
-        try self.beginPrimaryStoreAutoBulkIngestSession();
+        try self.enforceDurableMutationGate();
+        try write_path_impl.finishPrimaryStoreAutoBulkIngestSessionWithOptionsAfterGate(self, options);
+        try write_path_impl.beginPrimaryStoreAutoBulkIngestSessionAfterGate(self);
+    }
+
+    pub fn finishDenseAutoBulkIngestSessionWithOptionsAndNotifyExecutor(
+        self: *DB,
+        options: backend_types.BulkIngestFinishOptions,
+        notify_executor: bool,
+    ) !void {
+        try self.enforceDurableMutationGate();
+        return try write_path_impl.finishDenseAutoBulkIngestSessionWithOptionsAfterGate(self, options, notify_executor);
     }
 
     pub fn finishDenseAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
-        try ha_replication_impl.enforceDBWriteGate(self);
+        try self.enforceDurableMutationGate();
         return try write_path_impl.finishDenseAutoBulkIngestSessionWithOptionsAfterGate(self, options, true);
     }
 
     pub fn rollDenseAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
-        try ha_replication_impl.enforceDBWriteGate(self);
+        try self.enforceDurableMutationGate();
         try write_path_impl.finishDenseAutoBulkIngestSessionWithOptionsAfterGate(self, options, true);
-        try self.beginDenseAutoBulkIngestSession();
+        try write_path_impl.beginDenseAutoBulkIngestSessionAfterGate(self);
     }
 
     pub fn abortDenseAutoBulkIngestSession(self: *DB) void {
@@ -542,14 +879,17 @@ pub const DB = struct {
     }
 
     pub fn runLsmMaintenanceStep(self: *DB) !bool {
+        try self.enforceDurableMutationGate();
         return try lifecycle_impl.runLsmMaintenanceStep(self);
     }
 
     pub fn runPrimaryLsmMaintenanceStep(self: *DB) !bool {
+        try self.enforceDurableMutationGate();
         return try lifecycle_impl.runPrimaryLsmMaintenanceStep(self);
     }
 
     pub fn runLsmMaintenanceStepBestEffort(self: *DB) !bool {
+        try self.enforceDurableMutationGate();
         return try lifecycle_impl.runLsmMaintenanceStepBestEffort(self);
     }
 
@@ -558,190 +898,28 @@ pub const DB = struct {
     }
 
     pub fn runLsmMaintenanceUntilIdle(self: *DB) !usize {
+        try self.enforceDurableMutationGate();
         return try lifecycle_impl.runLsmMaintenanceUntilIdle(self);
     }
 
     pub fn retryQuarantinedIndexLoads(self: *DB, force: bool) !index_manager_mod.IndexManager.QuarantineRetryResult {
+        try self.enforceDurableMutationGate();
         return try lifecycle_impl.retryQuarantinedIndexLoads(self, force);
     }
 
     pub fn runDueLsmObsoleteReclaimUntilIdle(self: *DB, max_steps: usize) !usize {
+        try self.enforceDurableMutationGate();
         return try lifecycle_impl.runDueLsmObsoleteReclaimUntilIdle(self, max_steps);
     }
 
-    test "db lsm maintenance reclaims due index obsolete paths before primary compaction" {
-        const alloc = std.testing.allocator;
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
-        defer cleanupTempDir(path);
-
-        var db = try DB.open(alloc, std.mem.span(path), .{
-            .start_index_workers = false,
-            .primary_backend = .{ .lsm = .{
-                .flush_threshold = 1,
-                .defer_flush_on_commit = true,
-                .l0_soft_limit_runs = 100,
-                .obsolete_retention_ns = 0,
-            } },
-            .index_backends = .{
-                .dense_lsm_options = .{
-                    .flush_threshold = 1,
-                    .defer_flush_on_commit = true,
-                    .l0_soft_limit_runs = 100,
-                    .obsolete_retention_ns = 0,
-                },
-            },
-        });
-        defer db.close();
-
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
-        });
-
-        var key_buf: [16]u8 = undefined;
-        for (0..4) |i| {
-            const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
-            try db.batch(.{
-                .writes = &.{.{ .key = key, .value = "{\"embedding\":[1,2]}" }},
-                .sync_level = .write,
-            });
-            switch (db.core.primary_store_owner) {
-                .lsm => |*owner| try owner.handle.backend.sync(true),
-                else => return error.SkipZigTest,
-            }
-        }
-
-        switch (db.core.primary_store_owner) {
-            .lsm => |*owner| try owner.handle.backend.flushBufferedWritesWithOptions(.{ .compact = false, .flush = true }),
-            else => return error.SkipZigTest,
-        }
-
-        switch (db.core.primary_store_owner) {
-            .lsm => |*owner| owner.handle.backend.options.l0_soft_limit_runs = 1,
-            else => return error.SkipZigTest,
-        }
-
-        const dense_entry = db.core.index_manager.denseIndex("dv_v1") orelse return error.TestUnexpectedResult;
-        const dense_backend = switch (dense_entry.index.env_owner) {
-            .lsm => |*handle| handle.backend,
-            else => return error.SkipZigTest,
-        };
-        const dense_root = dense_backend.root_dir orelse return error.TestUnexpectedResult;
-        const obsolete_path = try lsm_backend_mod.repository.runPath(alloc, dense_root, 999_999);
-        defer alloc.free(obsolete_path);
-
-        try lsm_backend_mod.repository.writeFileAbsoluteWithStorage(dense_backend.storage.?, obsolete_path, "obsolete");
-        {
-            const locked = lsm_backend_mod.runtime.lockBackend(lsm_backend_mod.Backend, dense_backend);
-            defer lsm_backend_mod.runtime.unlockBackend(lsm_backend_mod.Backend, dense_backend, locked);
-            try dense_backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete_path));
-            dense_backend.manifest_dirty = false;
-        }
-
-        try expectObsoletePathsReclaimable(dense_backend, 1);
-        try std.testing.expect(try db.runLsmMaintenanceStepBestEffort());
-        try std.testing.expectEqual(@as(u64, 0), dense_backend.snapshotMaintenanceStats().obsolete_paths);
-        try std.testing.expectError(error.FileNotFound, dense_backend.storage.?.readFileAlloc(alloc, obsolete_path, 1024));
-    }
-
-    /// A queued obsolete path only counts as reclaimable once no reader pins
-    /// the backend; transient background readers (index loads, status probes)
-    /// mask it as pinned_by_readers for a moment. Poll instead of asserting a
-    /// single snapshot so loaded CI machines don't flake.
-    fn expectObsoletePathsReclaimable(backend: *lsm_backend_mod.Backend, expected: u64) !void {
-        var attempts: usize = 0;
-        while (backend.snapshotMaintenanceStats().obsolete_paths_reclaimable != expected) : (attempts += 1) {
-            if (attempts >= 2000) {
-                return std.testing.expectEqual(expected, backend.snapshotMaintenanceStats().obsolete_paths_reclaimable);
-            }
-            db_internal.spinOrYield();
-        }
-    }
-
-    test "db primary lsm maintenance step does not reclaim index obsolete paths" {
-        const alloc = std.testing.allocator;
-        var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
-        defer cleanupTempDir(path);
-
-        var db = try DB.open(alloc, std.mem.span(path), .{
-            .start_index_workers = false,
-            .primary_backend = .{ .lsm = .{
-                .flush_threshold = 1,
-                .defer_flush_on_commit = true,
-                .l0_soft_limit_runs = 100,
-                .obsolete_retention_ns = 0,
-            } },
-            .index_backends = .{
-                .dense_lsm_options = .{
-                    .flush_threshold = 1,
-                    .defer_flush_on_commit = true,
-                    .l0_soft_limit_runs = 100,
-                    .obsolete_retention_ns = 0,
-                },
-            },
-        });
-        defer db.close();
-
-        try db.addIndex(.{
-            .name = "dv_v1",
-            .kind = .dense_vector,
-            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
-        });
-
-        const primary_backend = switch (db.core.primary_store_owner) {
-            .lsm => |*owner| owner.handle.backend,
-            else => return error.SkipZigTest,
-        };
-        const primary_root = primary_backend.root_dir orelse return error.TestUnexpectedResult;
-        const primary_obsolete_path = try lsm_backend_mod.repository.runPath(alloc, primary_root, 888_888);
-        defer alloc.free(primary_obsolete_path);
-
-        const dense_entry = db.core.index_manager.denseIndex("dv_v1") orelse return error.TestUnexpectedResult;
-        const dense_backend = switch (dense_entry.index.env_owner) {
-            .lsm => |*handle| handle.backend,
-            else => return error.SkipZigTest,
-        };
-        const dense_root = dense_backend.root_dir orelse return error.TestUnexpectedResult;
-        const dense_obsolete_path = try lsm_backend_mod.repository.runPath(alloc, dense_root, 999_999);
-        defer alloc.free(dense_obsolete_path);
-
-        try lsm_backend_mod.repository.writeFileAbsoluteWithStorage(primary_backend.storage.?, primary_obsolete_path, "primary obsolete");
-        {
-            const locked = lsm_backend_mod.runtime.lockBackend(lsm_backend_mod.Backend, primary_backend);
-            defer lsm_backend_mod.runtime.unlockBackend(lsm_backend_mod.Backend, primary_backend, locked);
-            try primary_backend.queueObsoleteFilePath(try alloc.dupe(u8, primary_obsolete_path));
-            primary_backend.manifest_dirty = false;
-        }
-
-        try lsm_backend_mod.repository.writeFileAbsoluteWithStorage(dense_backend.storage.?, dense_obsolete_path, "dense obsolete");
-        {
-            const locked = lsm_backend_mod.runtime.lockBackend(lsm_backend_mod.Backend, dense_backend);
-            defer lsm_backend_mod.runtime.unlockBackend(lsm_backend_mod.Backend, dense_backend, locked);
-            try dense_backend.queueObsoleteFilePath(try alloc.dupe(u8, dense_obsolete_path));
-            dense_backend.manifest_dirty = false;
-        }
-
-        try expectObsoletePathsReclaimable(primary_backend, 1);
-        try expectObsoletePathsReclaimable(dense_backend, 1);
-
-        _ = try db.runPrimaryLsmMaintenanceStep();
-
-        try std.testing.expectEqual(@as(u64, 0), primary_backend.snapshotMaintenanceStats().obsolete_paths);
-        try std.testing.expectError(error.FileNotFound, primary_backend.storage.?.readFileAlloc(alloc, primary_obsolete_path, 1024));
-        try std.testing.expectEqual(@as(u64, 1), dense_backend.snapshotMaintenanceStats().obsolete_paths);
-        const dense_bytes = try dense_backend.storage.?.readFileAlloc(alloc, dense_obsolete_path, 1024);
-        alloc.free(dense_bytes);
-    }
-
     pub fn batch(self: *DB, req: types.BatchRequest) anyerror!void {
-        return try write_path_impl.batch(self, req);
+        try self.enforceDurableMutationGate();
+        return try write_path_impl.batchAfterGate(self, req);
     }
 
     pub fn batchProfiled(self: *DB, req: types.BatchRequest, profile: *BatchProfile) anyerror!void {
-        return try write_path_impl.batchProfiled(self, req, profile);
+        try self.enforceDurableMutationGate();
+        return try write_path_impl.batchProfiledAfterGate(self, req, profile);
     }
 
     pub fn batchWithDocumentArtifactChildRangeDispatcher(
@@ -749,7 +927,18 @@ pub const DB = struct {
         req: types.BatchRequest,
         dispatcher: DocumentArtifactChildRangeDispatcher,
     ) anyerror!void {
-        return try write_path_impl.batchWithDocumentArtifactChildRangeDispatcher(self, req, dispatcher);
+        try self.enforceDurableMutationGate();
+        return try write_path_impl.batchWithDocumentArtifactChildRangeDispatcherAfterGate(self, req, dispatcher);
+    }
+
+    pub fn coalesceKeyValueRequest(
+        self: *DB,
+        comptime T: type,
+        writes: []const T,
+        deletes: []const []const u8,
+        transforms: []const types.DocumentTransform,
+    ) !write_path.CoalescedKeyValueRequest(T) {
+        return try write_path_impl.coalesceKeyValueRequest(self, T, writes, deletes, transforms);
     }
 
     pub fn drainDocumentArtifactChildRangeOutbox(
@@ -757,13 +946,13 @@ pub const DB = struct {
         dispatcher: DocumentArtifactChildRangeDispatcher,
         limit: usize,
     ) anyerror!DocumentArtifactChildRangeOutboxDrainResult {
-        if (lifecycle_mod.openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        try ha_replication_impl.enforceDBWriteGate(self);
+        try self.enforceDurableMutationGate();
         return try write_path_impl.drainDocumentArtifactChildRangeOutboxAfterGate(self, dispatcher, limit);
     }
 
     pub fn batchWithoutRangeValidation(self: *DB, req: types.BatchRequest) anyerror!void {
-        return try write_path_impl.batchWithoutRangeValidation(self, req);
+        try self.enforceDurableMutationGate();
+        return try write_path_impl.batchWithoutRangeValidationAfterGate(self, req);
     }
 
     pub fn batchReplicatedApply(self: *DB, req: types.BatchRequest) anyerror!void {
@@ -788,8 +977,7 @@ pub const DB = struct {
     }
 
     pub fn applyDocumentArtifactChildRangeBatch(self: *DB, child_batch: DocumentArtifactChildRangeApplyBatch) anyerror!u64 {
-        if (lifecycle_mod.openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        try ha_replication_impl.enforceDBWriteGate(self);
+        try self.enforceDurableMutationGate();
         return try write_path_impl.applyDocumentArtifactChildRangeBatchAfterGate(self, child_batch);
     }
 
@@ -869,6 +1057,7 @@ pub const DB = struct {
     }
 
     pub fn ensureGroupCreatedAtMillis(self: *DB, alloc: Allocator, group_id: u64, now_ms: u64) !u64 {
+        try self.enforceDurableMutationGate();
         return try lifecycle_impl.ensureGroupCreatedAtMillis(self, alloc, group_id, now_ms);
     }
 
@@ -900,8 +1089,7 @@ pub const DB = struct {
         artifact_name: []const u8,
         update: types.DocumentArtifactChildRangePlacementUpdate,
     ) !bool {
-        if (lifecycle_mod.openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        try ha_replication_impl.enforceDBWriteGate(self);
+        try self.enforceDurableMutationGate();
         return try write_path_impl.updateDocumentArtifactChildRangePlacementAfterGate(self, alloc, doc_key, artifact_name, update);
     }
 
@@ -911,8 +1099,7 @@ pub const DB = struct {
         doc_key: []const u8,
         artifact_name: []const u8,
     ) !bool {
-        if (lifecycle_mod.openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        try ha_replication_impl.enforceDBWriteGate(self);
+        try self.enforceDurableMutationGate();
         return try write_path_impl.reprocessDocumentArtifactAfterGate(self, alloc, doc_key, artifact_name);
     }
 
@@ -922,8 +1109,7 @@ pub const DB = struct {
         artifact_name: []const u8,
         req: types.DocumentArtifactTableReprocessRequest,
     ) !types.DocumentArtifactTableReprocessResult {
-        if (lifecycle_mod.openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        try ha_replication_impl.enforceDBWriteGate(self);
+        try self.enforceDurableMutationGate();
         return try write_path_impl.reprocessDocumentArtifactRangeAfterGate(self, alloc, artifact_name, req);
     }
 
@@ -940,7 +1126,8 @@ pub const DB = struct {
     }
 
     pub fn updateRange(self: *DB, byte_range: types.ByteRange) !void {
-        try split_restore_impl.updateRange(self, byte_range);
+        try self.enforceDurableMutationGate();
+        try split_restore_impl.updateRangeAfterGate(self, byte_range);
     }
 
     pub fn getRange(self: *DB) types.ByteRange {
@@ -956,10 +1143,12 @@ pub const DB = struct {
     }
 
     pub fn setSplitState(self: *DB, state: ?types.SplitState) !void {
+        try self.enforceDurableMutationGate();
         try split_restore_impl.setSplitState(self, state);
     }
 
     pub fn clearSplitState(self: *DB) !void {
+        try self.enforceDurableMutationGate();
         try split_restore_impl.clearSplitState(self);
     }
 
@@ -972,10 +1161,12 @@ pub const DB = struct {
     }
 
     pub fn setSplitDeltaFinalSeq(self: *DB, seq: u64) !void {
+        try self.enforceDurableMutationGate();
         try split_restore_impl.setSplitDeltaFinalSeq(self, seq);
     }
 
     pub fn clearSplitDeltaFinalSeq(self: *DB) !void {
+        try self.enforceDurableMutationGate();
         try split_restore_impl.clearSplitDeltaFinalSeq(self);
     }
 
@@ -984,14 +1175,17 @@ pub const DB = struct {
     }
 
     pub fn clearSplitDeltaEntries(self: *DB) !void {
+        try self.enforceDurableMutationGate();
         try split_restore_impl.clearSplitDeltaEntries(self);
     }
 
     pub fn createShadowIndexManager(self: *DB, split_key: []const u8, original_range_end: []const u8) !void {
+        try self.enforceDurableMutationGate();
         try split_restore_impl.createShadowIndexManager(self, split_key, original_range_end);
     }
 
     pub fn closeShadowIndexManager(self: *DB) !void {
+        try self.enforceDurableMutationGate();
         try split_restore_impl.closeShadowIndexManager(self);
     }
 
@@ -1007,22 +1201,27 @@ pub const DB = struct {
         dest_dir2: []const u8,
         prepare_only: bool,
     ) !void {
+        try self.enforceDurableMutationGate();
         try split_restore_impl.split(self, curr_range, split_key, dest_dir1, dest_dir2, prepare_only);
     }
 
     pub fn finalizeSplit(self: *DB, new_range: types.ByteRange) !void {
+        try self.enforceDurableMutationGate();
         try split_restore_impl.finalizeSplit(self, new_range);
     }
 
     pub fn snapshot(self: *DB, id: []const u8) !u64 {
+        try self.enforceDurableMutationGate();
         return try split_restore_impl.snapshot(self, id);
     }
 
     pub fn sync(self: *DB, full: bool) !void {
+        try self.enforceDurableMutationGate();
         try lifecycle_impl.sync(self, full);
     }
 
     pub fn syncIndexes(self: *DB, force: bool) !void {
+        try self.enforceDurableMutationGate();
         try lifecycle_impl.syncIndexes(self, force);
     }
 
@@ -1076,10 +1275,12 @@ pub const DB = struct {
     }
 
     pub fn repairRestoreRuntimeStateStepIfNeeded(self: *DB, alloc: Allocator) !bool {
+        try self.enforceDurableMutationGate();
         return try split_restore_impl.repairRestoreRuntimeStateStepIfNeeded(self, alloc);
     }
 
     pub fn repairRestoreRuntimeStateIfNeeded(self: *DB, alloc: Allocator) !bool {
+        try self.enforceDurableMutationGate();
         return try split_restore_impl.repairRestoreRuntimeStateIfNeeded(self, alloc);
     }
 
@@ -1088,7 +1289,9 @@ pub const DB = struct {
     }
 
     pub fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
-        try schema_runtime_impl.setSchema(self, table_schema);
+        try self.enforceDurableMutationGate();
+        try ha_replication_impl.preflightDBMetadataSyncCommit(self);
+        try schema_runtime_impl.setSchemaAfterGate(self, table_schema);
     }
 
     pub const ApplyTableSchemaOptions = schema_runtime.ApplyTableSchemaOptions;
@@ -1103,11 +1306,18 @@ pub const DB = struct {
         schema_json: []const u8,
         options: ApplyTableSchemaOptions,
     ) !void {
-        try schema_runtime_impl.applyTableSchemaJson(self, alloc, schema_json, options);
+        if (schema_json.len == 0) return;
+        try self.enforceDurableMutationGate();
+        try ha_replication_impl.preflightDBMetadataSyncCommit(self);
+        try schema_runtime_impl.applyTableSchemaJsonAfterGate(self, alloc, schema_json, options);
     }
 
     pub const SchemaRewriteJobExecutionResult = schema_runtime.SchemaRewriteJobExecutionResult;
     pub const SchemaRewriteJobDrainOptions = schema_runtime.SchemaRewriteJobDrainOptions;
+
+    fn enforceSchemaRewriteMutationGate(self: *DB) !void {
+        try self.enforceDurableMutationGate();
+    }
 
     pub fn drainSchemaRewriteJobsForIdle(
         self: *DB,
@@ -1115,6 +1325,7 @@ pub const DB = struct {
         service: anytype,
         options: SchemaRewriteJobDrainOptions,
     ) !usize {
+        try self.enforceSchemaRewriteMutationGate();
         return try schema_runtime_impl.drainSchemaRewriteJobsForIdle(self, alloc, service, options);
     }
 
@@ -1123,6 +1334,7 @@ pub const DB = struct {
         alloc: Allocator,
         job: metadata_table_manager.SchemaRewriteJobRecord,
     ) !SchemaRewriteJobExecutionResult {
+        try self.enforceSchemaRewriteMutationGate();
         return try schema_runtime_impl.executeClaimedSchemaRewriteJob(self, alloc, job);
     }
 
@@ -1140,7 +1352,12 @@ pub const DB = struct {
         lower_doc_key: []const u8,
         upper_doc_key: []const u8,
     ) !relational_store_mod.SecondaryIndexRebuildReport {
+        try self.enforceDurableMutationGate();
         return try schema_runtime_impl.rebuildRelationalSecondaryIndexInRange(self, index_name, index_generation, lower_doc_key, upper_doc_key);
+    }
+
+    fn enforceRelationalIntegrityMutationGate(self: *DB) !void {
+        try self.enforceDurableMutationGate();
     }
 
     pub fn validateForeignKeyRefsInRange(
@@ -1165,6 +1382,7 @@ pub const DB = struct {
         lower_doc_key: []const u8,
         upper_doc_key: []const u8,
     ) !ForeignKeyIntegrityReport {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.repairForeignKeyRefsInRange(self, lower_doc_key, upper_doc_key);
     }
 
@@ -1174,6 +1392,7 @@ pub const DB = struct {
         lower_doc_key: []const u8,
         upper_doc_key: []const u8,
     ) !ForeignKeyIntegrityReport {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.repairForeignKeyRefsInRangeForConstraint(self, constraint_name, lower_doc_key, upper_doc_key);
     }
 
@@ -1215,6 +1434,7 @@ pub const DB = struct {
         lower_doc_key: []const u8,
         upper_doc_key: []const u8,
     ) !UniqueConstraintIntegrityReport {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.repairUniqueConstraintRowsInRange(self, lower_doc_key, upper_doc_key);
     }
 
@@ -1242,6 +1462,7 @@ pub const DB = struct {
         parent_table: []const u8,
         parent_key: []const u8,
     ) !ForeignKeyIntegrityReport {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.repairForeignKeyRefOwnerForParent(self, constraint_name, parent_table, parent_key);
     }
 
@@ -1272,6 +1493,7 @@ pub const DB = struct {
         start_parent_key: []const u8,
         end_parent_key: []const u8,
     ) !ForeignKeyIntegrityReport {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.repairForeignKeyRefOwnerRange(self, constraint_name, parent_table, start_parent_key, end_parent_key);
     }
 
@@ -1391,11 +1613,19 @@ pub const DB = struct {
     /// config swaps, sidecar clears, and rebuild replay are serialized with
     /// normal apply work just like `applyTableSchemaJson`.
     pub fn reloadAlgebraicSchemaConfigs(self: *DB, schema_json: []const u8) !void {
-        try schema_runtime_impl.reloadAlgebraicSchemaConfigs(self, schema_json);
+        if (schema_json.len == 0) return;
+        try self.enforceDurableMutationGate();
+        try schema_runtime_impl.reloadAlgebraicSchemaConfigsAfterGate(self, schema_json);
+    }
+
+    pub fn schemaRuntimeStageAlgebraicSchemaConfigsPending(self: *DB, schema_json: []const u8) !void {
+        if (schema_json.len == 0) return;
+        try self.enforceDurableMutationGate();
+        try schema_runtime_impl.stageAlgebraicSchemaConfigsPending(self, schema_json);
     }
 
     pub fn setSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
-        try schema_runtime_impl.setSchemaJson(self, alloc, schema_json);
+        try self.applyTableSchemaJson(alloc, schema_json, .{});
     }
 
     pub fn getSchemaJson(self: *DB, alloc: Allocator) !?[]u8 {
@@ -1403,26 +1633,37 @@ pub const DB = struct {
     }
 
     pub fn applyLiteSqlTableRecord(self: *DB, alloc: Allocator, table: metadata_table_manager.TableRecord) !void {
-        try schema_runtime_impl.applyLiteSqlTableRecord(self, alloc, table);
+        if (table.schema_json.len == 0) return error.InvalidSchemaUpdateRequest;
+        try self.enforceDurableMutationGate();
+        try ha_replication_impl.preflightDBMetadataSyncCommit(self);
+        try schema_runtime_impl.applyLiteSqlTableRecordAfterGate(self, alloc, table);
     }
 
     pub fn getLiteSqlTableRecordAlloc(self: *DB, alloc: Allocator) !?metadata_table_manager.TableRecord {
         return try schema_runtime_impl.getLiteSqlTableRecordAlloc(self, alloc);
     }
 
+    fn enforceTransactionMutationGate(self: *DB) !void {
+        try self.enforceDurableMutationGate();
+    }
+
     pub fn beginTransaction(self: *DB, timestamp_ns: u64) !transactions_mod.TxnId {
+        try self.enforceTransactionMutationGate();
         return try db_transactions_impl.beginTransaction(self, timestamp_ns);
     }
 
     pub fn beginTransactionWithId(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64) !transactions_mod.TxnId {
+        try self.enforceTransactionMutationGate();
         return try db_transactions_impl.beginTransactionWithId(self, txn_id, timestamp_ns);
     }
 
     pub fn beginTransactionWithParticipants(self: *DB, timestamp_ns: u64, participants: []const []const u8) !transactions_mod.TxnId {
+        try self.enforceTransactionMutationGate();
         return try db_transactions_impl.beginTransactionWithParticipants(self, timestamp_ns, participants);
     }
 
     pub fn beginTransactionWithIdAndParticipants(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, participants: []const []const u8) !transactions_mod.TxnId {
+        try self.enforceTransactionMutationGate();
         return try db_transactions_impl.beginTransactionWithIdAndParticipants(self, txn_id, timestamp_ns, participants);
     }
 
@@ -1432,10 +1673,12 @@ pub const DB = struct {
         intents: []const transactions_mod.WriteIntent,
         predicates: []const transactions_mod.VersionPredicate,
     ) !void {
+        try self.enforceTransactionMutationGate();
         return try db_transactions_impl.writeIntents(self, txn_id, intents, predicates);
     }
 
     pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) !void {
+        try self.enforceTransactionMutationGate();
         return try db_transactions_impl.writeTransaction(self, txn_id, req);
     }
 
@@ -1445,18 +1688,22 @@ pub const DB = struct {
         row_keys: []const []const u8,
         claim: types.RowClaimRequest,
     ) !void {
+        try self.enforceTransactionMutationGate();
         return try db_transactions_impl.claimRowsForTransaction(self, txn_id, row_keys, claim);
     }
 
     pub fn commitTransaction(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64) !void {
+        try self.enforceTransactionMutationGate();
         return try db_transactions_impl.commitTransaction(self, txn_id, timestamp_ns);
     }
 
     pub fn resolveTransactionIntents(self: *DB, txn_id: transactions_mod.TxnId, status: transactions_mod.TxnStatus, commit_version: u64) !void {
+        try self.enforceTransactionMutationGate();
         return try db_transactions_impl.resolveTransactionIntents(self, txn_id, status, commit_version);
     }
 
     pub fn abortTransaction(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64) !void {
+        try self.enforceTransactionMutationGate();
         return try db_transactions_impl.abortTransaction(self, txn_id, timestamp_ns);
     }
 
@@ -1469,6 +1716,7 @@ pub const DB = struct {
     }
 
     pub fn markTransactionParticipantResolved(self: *DB, txn_id: transactions_mod.TxnId, participant: []const u8) !void {
+        try self.enforceTransactionMutationGate();
         return try db_transactions_impl.markTransactionParticipantResolved(self, txn_id, participant);
     }
 
@@ -1481,6 +1729,7 @@ pub const DB = struct {
     }
 
     pub fn recoverTransactions(self: *DB, cutoff_timestamp: u64, resolution_timestamp: u64) !transactions_mod.RecoveryStats {
+        try self.enforceTransactionMutationGate();
         return try db_transactions_impl.recoverTransactions(self, cutoff_timestamp, resolution_timestamp);
     }
 
@@ -1572,18 +1821,22 @@ pub const DB = struct {
     }
 
     pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
+        try self.enforceDurableMutationGate();
         return try schema_runtime_impl.addIndex(self, cfg);
     }
 
     pub fn addEnrichment(self: *DB, cfg: types.EnrichmentConfig) !void {
+        try self.enforceDurableMutationGate();
         return try schema_runtime_impl.addEnrichment(self, cfg);
     }
 
     pub fn upsertEnrichment(self: *DB, cfg: types.EnrichmentConfig) !index_manager_mod.IndexManager.EnrichmentUpsertResult {
+        try self.enforceDurableMutationGate();
         return try schema_runtime_impl.upsertEnrichment(self, cfg);
     }
 
     pub fn addResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
+        try self.enforceDurableMutationGate();
         return try lifecycle_impl.addResolver(self, cfg);
     }
 
@@ -1598,22 +1851,27 @@ pub const DB = struct {
         cfg: index_manager_mod.ResolverConfig,
         options: ResolverUpsertOptions,
     ) !index_manager_mod.IndexManager.ResolverUpsertResult {
+        try self.enforceDurableMutationGate();
         return try lifecycle_impl.upsertResolverWithResultOptions(self, cfg, options);
     }
 
     pub fn upsertResolverWithResult(self: *DB, cfg: index_manager_mod.ResolverConfig) !index_manager_mod.IndexManager.ResolverUpsertResult {
+        try self.enforceDurableMutationGate();
         return try lifecycle_impl.upsertResolverWithResult(self, cfg);
     }
 
     pub fn upsertResolver(self: *DB, cfg: index_manager_mod.ResolverConfig) !void {
+        try self.enforceDurableMutationGate();
         return try lifecycle_impl.upsertResolver(self, cfg);
     }
 
     pub fn drainResolverBackfill(self: *DB) !void {
+        try self.enforceDurableMutationGate();
         return try lifecycle_impl.drainResolverBackfill(self);
     }
 
     pub fn removeResolver(self: *DB, name: []const u8) !bool {
+        try self.enforceDurableMutationGate();
         return try lifecycle_impl.removeResolver(self, name);
     }
 
@@ -1636,7 +1894,8 @@ pub const DB = struct {
         table: []const u8,
         key: []const u8,
     ) !u64 {
-        return try lifecycle_impl.recordReviewDecision(self, doc_key, source_artifact, resolution_artifact, local_id, decision, table, key);
+        try self.enforceDurableMutationGate();
+        return try lifecycle_impl.recordReviewDecisionAfterGate(self, doc_key, source_artifact, resolution_artifact, local_id, decision, table, key);
     }
 
     /// Eager edge rewrite for an entity merge: repoint every inbound edge of
@@ -1652,6 +1911,7 @@ pub const DB = struct {
         old_key: []const u8,
         new_key: []const u8,
     ) !usize {
+        try self.enforceDurableMutationGate();
         return try search_runtime_impl.rewriteEntityEdges(self, alloc, index_name, old_key, new_key);
     }
 
@@ -1672,10 +1932,12 @@ pub const DB = struct {
     }
 
     pub fn evaluateAlgebraicAdaptiveCandidates(self: *DB) !u64 {
+        try self.enforceDurableMutationGate();
         return try schema_runtime_impl.evaluateAlgebraicAdaptiveCandidates(self);
     }
 
     pub fn runAlgebraicAdaptiveWork(self: *DB) !u64 {
+        try self.enforceDurableMutationGate();
         return try schema_runtime_impl.runAlgebraicAdaptiveWork(self);
     }
 
@@ -1691,19 +1953,31 @@ pub const DB = struct {
         return try lifecycle_impl.listDerivedReplayDebt(self, alloc);
     }
 
+    pub fn promotionStageStats(self: *DB) types.ReplayStageStats {
+        return lifecycle_impl.promotionStageStats(self);
+    }
+
+    pub fn graphMetricRuntimeStats(self: *DB) types.GraphMetricRuntimeStats {
+        return lifecycle_impl.graphMetricRuntimeStats(self);
+    }
+
     pub fn compactTextIndexes(self: *DB) !void {
+        try self.enforceDurableMutationGate();
         return try lifecycle_impl.compactTextIndexes(self);
     }
 
     pub fn drainScheduledTextMerges(self: *DB) !void {
+        try self.enforceDurableMutationGate();
         return try lifecycle_impl.drainScheduledTextMerges(self);
     }
 
     pub fn forceCompactTextIndexes(self: *DB) !void {
+        try self.enforceDurableMutationGate();
         return try lifecycle_impl.forceCompactTextIndexes(self);
     }
 
     pub fn bestEffortForceCompactTextIndexes(self: *DB) !void {
+        try self.enforceDurableMutationGate();
         return try lifecycle_impl.bestEffortForceCompactTextIndexes(self);
     }
 
@@ -1727,11 +2001,23 @@ pub const DB = struct {
         return try write_path_impl.computeEnrichments(self, alloc, writes);
     }
 
+    pub fn prepareGeneratedEnrichments(
+        self: *DB,
+        req: types.BatchRequest,
+        extracted: []const mapper.ExtractedWrite,
+        precompute_mode: write_path.GeneratedPrecomputeMode,
+        force_generated_artifact_names: []const []const u8,
+    ) !write_path.PrecomputedGeneratedBatch {
+        return try write_path_impl.prepareGeneratedEnrichments(self, req, extracted, precompute_mode, force_generated_artifact_names);
+    }
+
     pub fn deleteIndex(self: *DB, name: []const u8) !bool {
+        try self.enforceDurableMutationGate();
         return try schema_runtime_impl.deleteIndex(self, name);
     }
 
     pub fn deleteEnrichment(self: *DB, kind: types.EnrichmentKind, name: []const u8) !bool {
+        try self.enforceDurableMutationGate();
         return try schema_runtime_impl.deleteEnrichment(self, kind, name);
     }
 
@@ -1740,22 +2026,27 @@ pub const DB = struct {
     }
 
     pub fn runDerivedUntil(self: *DB, sequence: u64) !void {
+        try self.enforceDurableMutationGate();
         return try lifecycle_impl.runDerivedUntil(self, sequence);
     }
 
     pub fn runDerivedUntilTargets(self: *DB, sequence: u64, index_names: []const []const u8) !void {
+        try self.enforceDurableMutationGate();
         return try lifecycle_impl.runDerivedUntilTargets(self, sequence, index_names);
     }
 
     pub fn runEnrichmentUntil(self: *DB, sequence: u64) !void {
+        try self.enforceDurableMutationGate();
         return try lifecycle_impl.runEnrichmentUntil(self, sequence);
     }
 
     pub fn runMaintenanceUntil(self: *DB, sequence: u64, sync_targets: ManagedSyncTargets) !void {
+        try self.enforceDurableMutationGate();
         return try lifecycle_impl.runMaintenanceUntil(self, sequence, sync_targets);
     }
 
     pub fn runMaintenanceUntilTargets(self: *DB, sequence: u64, index_names: []const []const u8) !void {
+        try self.enforceDurableMutationGate();
         return try lifecycle_impl.runMaintenanceUntilTargets(self, sequence, index_names);
     }
 
@@ -1764,6 +2055,7 @@ pub const DB = struct {
     }
 
     pub fn catchUpPendingDerivedReplay(self: *DB) !void {
+        try self.enforceDurableMutationGate();
         try derived_async_impl.replayPendingDerivedBatches(self, null, null);
     }
 
@@ -1772,14 +2064,75 @@ pub const DB = struct {
         progress_ctx: *anyopaque,
         progress_hook: ReplayProgressHook,
     ) !void {
+        try self.enforceDurableMutationGate();
         try derived_async_impl.replayPendingDerivedBatches(self, progress_ctx, progress_hook);
     }
 
+    pub fn derivedAsyncCanAdvanceDerivedToTargetAsync(
+        ctx_ptr: *anyopaque,
+        index_ref: index_manager_mod.ManagedIndexRef,
+        from_sequence: u64,
+        target_sequence: u64,
+    ) !bool {
+        return try derived_async_impl.canAdvanceDerivedToTargetAsync(ctx_ptr, index_ref, from_sequence, target_sequence);
+    }
+
+    pub fn derivedAsyncAppendDerivedBatchRecord(self: *DB, derived_batch: derived_types.DerivedBatch) !u64 {
+        try self.enforceDurableMutationGate();
+        return try derived_async_impl.appendDerivedBatchRecord(self, derived_batch);
+    }
+
+    pub fn derivedAsyncEncodeChangeRecordPayloadForContext(
+        ctx: *const BatchExecutionContext,
+        derived_batch: derived_types.DerivedBatch,
+        sequence: u64,
+    ) ![]u8 {
+        return try derived_async_impl.encodeChangeRecordPayload(ctx, derived_batch, sequence);
+    }
+
+    pub fn derivedAsyncCollectManagedSyncTargets(
+        self: *DB,
+        alloc: Allocator,
+        derived_batch: derived_types.DerivedBatch,
+    ) !ManagedSyncTargets {
+        return try derived_async_impl.collectManagedSyncTargets(alloc, self.core.index_manager, derived_batch);
+    }
+
+    pub fn derivedAsyncBatchAffectsManagedIndex(
+        self: *DB,
+        derived_batch: derived_types.DerivedBatch,
+        index_ref: index_manager_mod.ManagedIndexRef,
+    ) bool {
+        return derived_async_impl.batchAffectsManagedIndex(self.core.index_manager, derived_batch, index_ref);
+    }
+
+    pub fn derivedAsyncBatchAffectsManagedIndexForReplay(
+        self: *DB,
+        derived_batch: derived_types.DerivedBatch,
+        index_ref: index_manager_mod.ManagedIndexRef,
+    ) !bool {
+        return try derived_async_impl.batchAffectsManagedIndexForReplay(self.core.index_manager, derived_batch, index_ref);
+    }
+
+    pub fn derivedAsyncBatchAdvancesManagedIndexApplyStateForReplay(
+        self: *DB,
+        derived_batch: derived_types.DerivedBatch,
+        index_ref: index_manager_mod.ManagedIndexRef,
+    ) !bool {
+        return try derived_async_impl.batchAdvancesManagedIndexApplyStateForReplay(self.core.index_manager, derived_batch, index_ref);
+    }
+
     pub fn runUntilIdle(self: *DB) !void {
+        try self.enforceDurableMutationGate();
         return try lifecycle_impl.runUntilIdle(self);
     }
 
+    fn enforceGraphMetricMutationGate(self: *DB) !void {
+        try self.enforceDurableMutationGate();
+    }
+
     pub fn runGraphMetricMaintenanceForIdle(self: *DB) !usize {
+        try self.enforceGraphMetricMutationGate();
         return try search_runtime_impl.runGraphMetricMaintenanceForIdle(self);
     }
 
@@ -1787,30 +2140,37 @@ pub const DB = struct {
         self: *DB,
         options: index_manager_mod.IndexManager.GraphMetricPlannedMaintenanceOptions,
     ) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
+        try self.enforceGraphMetricMutationGate();
         return try search_runtime_impl.runGraphMetricPlannedMaintenanceForIdle(self, options);
     }
 
     pub fn runGraphMetricServiceMaintenanceJsonAlloc(self: *DB, alloc: Allocator, body: []const u8) ![]u8 {
+        try self.enforceGraphMetricMutationGate();
         return try search_runtime_impl.runGraphMetricServiceMaintenanceJsonAlloc(self, alloc, body);
     }
 
     pub fn refreshGraphMetric(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+        try self.enforceGraphMetricMutationGate();
         return try search_runtime_impl.refreshGraphMetric(self, alloc, index_name, metric_name);
     }
 
     pub fn rebuildGraphMetric(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+        try self.enforceGraphMetricMutationGate();
         return try search_runtime_impl.rebuildGraphMetric(self, alloc, index_name, metric_name);
     }
 
     pub fn deleteGraphMetricMaterialization(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+        try self.enforceGraphMetricMutationGate();
         return try search_runtime_impl.deleteGraphMetricMaterialization(self, alloc, index_name, metric_name);
     }
 
     pub fn pauseGraphMetricMaintenance(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+        try self.enforceGraphMetricMutationGate();
         return try search_runtime_impl.pauseGraphMetricMaintenance(self, alloc, index_name, metric_name);
     }
 
     pub fn resumeGraphMetricMaintenance(self: *DB, alloc: Allocator, index_name: []const u8, metric_name: []const u8) !types.GraphMetricStatus {
+        try self.enforceGraphMetricMutationGate();
         return try search_runtime_impl.resumeGraphMetricMaintenance(self, alloc, index_name, metric_name);
     }
 
@@ -1821,6 +2181,7 @@ pub const DB = struct {
         metric_name: []const u8,
         target_generation: u64,
     ) !types.GraphMetricStatus {
+        try self.enforceGraphMetricMutationGate();
         return try search_runtime_impl.ensureGraphMetricPlannedBuild(self, alloc, index_name, metric_name, target_generation);
     }
 
@@ -1830,6 +2191,7 @@ pub const DB = struct {
         metric_name: []const u8,
         worker_id: []const u8,
     ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        try self.enforceGraphMetricMutationGate();
         return try search_runtime_impl.runGraphMetricPlannedWorkerPageStep(self, index_name, metric_name, worker_id);
     }
 
@@ -1840,6 +2202,7 @@ pub const DB = struct {
         worker_id: []const u8,
         now_ms: u64,
     ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        try self.enforceGraphMetricMutationGate();
         return try search_runtime_impl.runGraphMetricPlannedWorkerPageStepAt(self, index_name, metric_name, worker_id, now_ms);
     }
 
@@ -1848,6 +2211,7 @@ pub const DB = struct {
         index_name: []const u8,
         metric_name: []const u8,
     ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        try self.enforceGraphMetricMutationGate();
         return try search_runtime_impl.runGraphMetricPlannedCoordinatorStep(self, index_name, metric_name);
     }
 
@@ -1857,6 +2221,7 @@ pub const DB = struct {
         metric_name: []const u8,
         now_ms: u64,
     ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        try self.enforceGraphMetricMutationGate();
         return try search_runtime_impl.runGraphMetricPlannedCoordinatorStepAt(self, index_name, metric_name, now_ms);
     }
 
@@ -1867,6 +2232,7 @@ pub const DB = struct {
         metric_name: []const u8,
         err: anyerror,
     ) !types.GraphMetricStatus {
+        try self.enforceGraphMetricMutationGate();
         return try search_runtime_impl.failGraphMetricPlannedBuild(self, alloc, index_name, metric_name, err);
     }
 
@@ -1878,6 +2244,7 @@ pub const DB = struct {
         target_generation: u64,
         options: graph_mod.GraphIndex.GraphMetricPlannedDrainOptions,
     ) !types.GraphMetricStatus {
+        try self.enforceGraphMetricMutationGate();
         return try search_runtime_impl.runGraphMetricPlannedDrain(self, alloc, index_name, metric_name, target_generation, options);
     }
 
@@ -1885,6 +2252,7 @@ pub const DB = struct {
         self: *DB,
         options: index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepOptions,
     ) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
+        try self.enforceGraphMetricMutationGate();
         return try search_runtime_impl.runGraphMetricPlannedCoordinatorSweep(self, options);
     }
 
@@ -1892,36 +2260,44 @@ pub const DB = struct {
         self: *DB,
         options: index_manager_mod.IndexManager.GraphMetricPlannedWorkerSweepOptions,
     ) !index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult {
+        try self.enforceGraphMetricMutationGate();
         return try search_runtime_impl.runGraphMetricPlannedWorkerSweep(self, options);
     }
 
-    pub const DenseArtifactRebuildTarget = derived_async_impl.DenseArtifactRebuildTarget;
+    pub const DenseArtifactRebuildTarget = derived_async.DenseArtifactRebuildTarget;
 
     pub fn rebuildDenseIndexesForTargetCoverage(self: *DB, alloc: Allocator) !usize {
+        try self.enforceDurableMutationGate();
         return try derived_async_impl.rebuildDenseIndexesForTargetCoverage(self, alloc);
     }
 
     pub fn rebuildSparseIndexesForTargetCoverage(self: *DB, alloc: Allocator) !usize {
+        try self.enforceDurableMutationGate();
         return try derived_async_impl.rebuildSparseIndexesForTargetCoverage(self, alloc);
     }
 
     pub fn rebuildGraphIndexesForTargetCoverage(self: *DB, alloc: Allocator) !void {
+        try self.enforceDurableMutationGate();
         return try split_restore_impl.rebuildGraphIndexesForTargetCoverage(self, alloc);
     }
 
     pub fn runDensePostingMaintenanceForIdle(self: *DB) !usize {
+        try self.enforceDurableMutationGate();
         return try derived_async_impl.runDensePostingMaintenanceForIdle(self);
     }
 
     pub fn runDensePostingMaintenanceForIdleBestEffort(self: *DB) !usize {
+        try self.enforceDurableMutationGate();
         return try derived_async_impl.runDensePostingMaintenanceForIdleBestEffort(self);
     }
 
     pub fn rebuildDenseIndexesFromStoredEmbeddingArtifacts(self: *DB, alloc: Allocator) !usize {
+        try self.enforceDurableMutationGate();
         return try derived_async_impl.rebuildDenseIndexesFromStoredEmbeddingArtifacts(self, alloc);
     }
 
     pub fn rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(self: *DB, alloc: Allocator) !usize {
+        try self.enforceDurableMutationGate();
         return try derived_async_impl.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(self, alloc);
     }
 
@@ -1935,10 +2311,60 @@ pub const DB = struct {
         progress_ctx: ?*anyopaque,
         progress_hook: ?ReplayProgressHook,
     ) !usize {
+        try self.enforceDurableMutationGate();
         return try derived_async_impl.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeededWithProgress(self, alloc, progress_ctx, progress_hook);
     }
 
+    pub fn derivedAsyncRebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(
+        self: *DB,
+        alloc: Allocator,
+        resume_from: ?[]const u8,
+        rebuild_targets: ?[]const DenseArtifactRebuildTarget,
+        target_sequence_override: ?u64,
+        progress_ctx: ?*anyopaque,
+        progress_hook: ?ReplayProgressHook,
+        resume_ctx: ?*anyopaque,
+        resume_hook: ?derived_async.DenseArtifactRebuildResumeHook,
+        rebuild_chunk_size: usize,
+        rebuild_progress_interval: usize,
+    ) !usize {
+        try self.enforceDurableMutationGate();
+        return try derived_async_impl.rebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(
+            self,
+            alloc,
+            resume_from,
+            rebuild_targets,
+            target_sequence_override,
+            progress_ctx,
+            progress_hook,
+            resume_ctx,
+            resume_hook,
+            rebuild_chunk_size,
+            rebuild_progress_interval,
+        );
+    }
+
+    pub fn derivedAsyncDenseIndexRebuildStatePathAlloc(self: *DB, alloc: Allocator, index_name: []const u8) ![]u8 {
+        return try derived_async_impl.denseIndexRebuildStatePathAlloc(self, alloc, index_name);
+    }
+
+    pub fn derivedAsyncFreeDenseArtifactRebuildWrites(
+        alloc: Allocator,
+        writes: *std.ArrayListUnmanaged(mapper.DenseEmbeddingWrite),
+    ) void {
+        derived_async_impl.freeDenseArtifactRebuildWrites(alloc, writes);
+    }
+
+    pub fn derivedAsyncApplyDerivedBatchToIndexReplay(
+        ctx_ptr: *anyopaque,
+        derived_batch: derived_types.DerivedBatch,
+        index_ref: index_manager_mod.ManagedIndexRef,
+    ) !bool {
+        return try derived_async_impl.applyDerivedBatchToIndexReplay(ctx_ptr, derived_batch, index_ref);
+    }
+
     pub fn replayGeneratedEnrichmentsFromStoredDocs(self: *DB, alloc: Allocator) !usize {
+        try self.enforceDurableMutationGate();
         return try schema_runtime_impl.replayGeneratedEnrichmentsFromStoredDocs(self, alloc);
     }
 
@@ -1958,7 +2384,12 @@ pub const DB = struct {
         return try lifecycle_impl.runtimeStatusStatsConsistent(self, alloc);
     }
 
+    pub fn tryRuntimeStatusStatsConsistent(self: *DB, alloc: Allocator) !?types.DBStats {
+        return try lifecycle_impl.tryRuntimeStatusStatsConsistent(self, alloc);
+    }
+
     pub fn reassignIdentityNamespaceForInternalTransition(self: *DB, namespace: doc_identity.Namespace) !void {
+        try self.enforceDurableMutationGate();
         return try lifecycle_impl.reassignIdentityNamespaceForInternalTransition(self, namespace);
     }
 
@@ -1986,12 +2417,191 @@ pub const DB = struct {
         return try relational_integrity_impl.recordForeignKeyIntegrityProgressLocked(self, alloc, mode, constraint_name, lower_doc_key, upper_doc_key, report);
     }
 
-    pub const ForeignKeyIntegrityProgressRecord = relational_integrity_impl.ForeignKeyIntegrityProgressRecord;
-    pub const ForeignKeyIntegrityClaimRecord = relational_integrity_impl.ForeignKeyIntegrityClaimRecord;
-    pub const ForeignKeyIntegrityJobRecord = relational_integrity_impl.ForeignKeyIntegrityJobRecord;
-    pub const ForeignKeyActionJobRecord = relational_integrity_impl.ForeignKeyActionJobRecord;
-    pub const ForeignKeyActionScheduleRecord = relational_integrity_impl.ForeignKeyActionScheduleRecord;
-    pub const UniqueConstraintIntegrityProgressRecord = relational_integrity_impl.UniqueConstraintIntegrityProgressRecord;
+    pub fn appendForeignKeyExternalizedParentCheckIntents(
+        self: *DB,
+        txn_id: types.TxnId,
+        intents: *std.ArrayListUnmanaged(transactions_mod.WriteIntent),
+        owned_keys: *std.ArrayListUnmanaged([]u8),
+        owned_values: *std.ArrayListUnmanaged([]u8),
+        checks: []const types.ForeignKeyParentCheck,
+    ) !void {
+        return try relational_integrity_impl.appendForeignKeyExternalizedParentCheckIntents(self, txn_id, intents, owned_keys, owned_values, checks);
+    }
+
+    pub fn appendForeignKeyConstraintTimingOverrideIntents(
+        self: *DB,
+        txn_id: types.TxnId,
+        intents: *std.ArrayListUnmanaged(transactions_mod.WriteIntent),
+        owned_keys: *std.ArrayListUnmanaged([]u8),
+        owned_values: *std.ArrayListUnmanaged([]u8),
+        overrides: []const types.ForeignKeyConstraintTimingOverride,
+    ) !void {
+        return try relational_integrity_impl.appendForeignKeyConstraintTimingOverrideIntents(self, txn_id, intents, owned_keys, owned_values, overrides);
+    }
+
+    pub fn validateUniqueConstraintMutations(
+        self: *DB,
+        unique_writes: []const types.UniqueConstraintMutation,
+        unique_deletes: []const types.UniqueConstraintMutation,
+    ) !void {
+        return try relational_integrity_impl.validateUniqueConstraintMutations(self, unique_writes, unique_deletes);
+    }
+
+    pub fn appendUniqueConstraintMutationIntents(
+        self: *DB,
+        intents: *std.ArrayListUnmanaged(transactions_mod.WriteIntent),
+        owned_keys: *std.ArrayListUnmanaged([]u8),
+        owned_values: *std.ArrayListUnmanaged([]u8),
+        unique_writes: []const types.UniqueConstraintMutation,
+        unique_deletes: []const types.UniqueConstraintMutation,
+    ) !void {
+        return try relational_integrity_impl.appendUniqueConstraintMutationIntents(self, intents, owned_keys, owned_values, unique_writes, unique_deletes);
+    }
+
+    pub fn appendForeignKeyRefMutationIntents(
+        self: *DB,
+        intents: *std.ArrayListUnmanaged(transactions_mod.WriteIntent),
+        owned_keys: *std.ArrayListUnmanaged([]u8),
+        ref_writes: []const types.ForeignKeyRefMutation,
+        ref_deletes: []const types.ForeignKeyRefMutation,
+    ) !void {
+        return try relational_integrity_impl.appendForeignKeyRefMutationIntents(self, intents, owned_keys, ref_writes, ref_deletes);
+    }
+
+    pub fn applyForeignKeyParentDeleteActions(
+        self: *DB,
+        intents: *std.ArrayListUnmanaged(transactions_mod.WriteIntent),
+        owned_keys: *std.ArrayListUnmanaged([]u8),
+        owned_values: *std.ArrayListUnmanaged([]u8),
+        checks: []const types.ForeignKeyParentDeleteCheck,
+    ) !void {
+        return try relational_integrity_impl.applyForeignKeyParentDeleteActions(self, intents, owned_keys, owned_values, checks);
+    }
+
+    pub fn applyForeignKeySetNullChildActions(
+        self: *DB,
+        intents: *std.ArrayListUnmanaged(transactions_mod.WriteIntent),
+        owned_keys: *std.ArrayListUnmanaged([]u8),
+        owned_values: *std.ArrayListUnmanaged([]u8),
+        actions: []const types.ForeignKeySetNullChildAction,
+    ) !void {
+        return try relational_integrity_impl.applyForeignKeySetNullChildActions(self, intents, owned_keys, owned_values, actions);
+    }
+
+    pub fn applyForeignKeyCascadeChildActions(
+        self: *DB,
+        intents: *std.ArrayListUnmanaged(transactions_mod.WriteIntent),
+        owned_keys: *std.ArrayListUnmanaged([]u8),
+        owned_values: *std.ArrayListUnmanaged([]u8),
+        actions: []const types.ForeignKeyCascadeChildAction,
+    ) !void {
+        return try relational_integrity_impl.applyForeignKeyCascadeChildActions(self, intents, owned_keys, owned_values, actions);
+    }
+
+    pub fn appendForeignKeyConflictIntents(
+        self: *DB,
+        intents: *std.ArrayListUnmanaged(transactions_mod.WriteIntent),
+        owned_keys: *std.ArrayListUnmanaged([]u8),
+        writes: []const types.TransactionWrite,
+        parent_delete_checks: []const types.ForeignKeyParentDeleteCheck,
+        conflict_checks: []const types.ForeignKeyConflictCheck,
+        ref_writes: []const types.ForeignKeyRefMutation,
+    ) !void {
+        return try relational_integrity_impl.appendForeignKeyConflictIntents(self, intents, owned_keys, writes, parent_delete_checks, conflict_checks, ref_writes);
+    }
+
+    pub fn validateForeignKeyParentChecks(
+        self: *DB,
+        checks: []const types.ForeignKeyParentCheck,
+        writes: []const types.TransactionWrite,
+        deletes: []const []const u8,
+        unique_writes: []const types.UniqueConstraintMutation,
+        unique_deletes: []const types.UniqueConstraintMutation,
+    ) !void {
+        return try relational_integrity_impl.validateForeignKeyParentChecks(self, checks, writes, deletes, unique_writes, unique_deletes);
+    }
+
+    pub fn validateForeignKeyReferenceShapes(
+        self: *DB,
+        writes: []const types.TransactionWrite,
+    ) !void {
+        return try relational_integrity_impl.validateForeignKeyReferenceShapes(self, writes);
+    }
+
+    pub fn validateExternalizedForeignKeyParentChecks(
+        self: *DB,
+        checks: []const types.ForeignKeyParentCheck,
+        constraint_timing_overrides: []const types.ForeignKeyConstraintTimingOverride,
+        writes: []const types.TransactionWrite,
+    ) !void {
+        return try relational_integrity_impl.validateExternalizedForeignKeyParentChecks(self, checks, constraint_timing_overrides, writes);
+    }
+
+    pub fn validateForeignKeyConstraintTimingOverrides(
+        self: *DB,
+        overrides: []const types.ForeignKeyConstraintTimingOverride,
+    ) !void {
+        return try relational_integrity_impl.validateForeignKeyConstraintTimingOverrides(self, overrides);
+    }
+
+    pub fn validateForeignKeyParentDeleteChecks(
+        self: *DB,
+        checks: []const types.ForeignKeyParentDeleteCheck,
+        constraint_timing_overrides: []const types.ForeignKeyConstraintTimingOverride,
+        writes: []const types.TransactionWrite,
+        deletes: []const []const u8,
+        ref_writes: []const types.ForeignKeyRefMutation,
+        ref_deletes: []const types.ForeignKeyRefMutation,
+    ) !void {
+        return try relational_integrity_impl.validateForeignKeyParentDeleteChecks(self, checks, constraint_timing_overrides, writes, deletes, ref_writes, ref_deletes);
+    }
+
+    pub fn validateForeignKeyRefMutations(self: *DB, mutations: []const types.ForeignKeyRefMutation) !void {
+        return try relational_integrity_impl.validateForeignKeyRefMutations(self, mutations);
+    }
+
+    pub fn foreignKeyActionJobCanonicalAction(action: []const u8) ?[]const u8 {
+        return relational_integrity_impl.foreignKeyActionJobCanonicalAction(action);
+    }
+
+    pub fn foreignKeyActionScheduleKeyAlloc(alloc: Allocator, schedule_id: []const u8) ![]u8 {
+        return try relational_integrity_impl.foreignKeyActionScheduleKeyAlloc(alloc, schedule_id);
+    }
+
+    pub fn validateForeignKeyActionLineage(cascade_depth: u32, cascade_max_depth: u32) !void {
+        return try relational_integrity_impl.validateForeignKeyActionLineage(cascade_depth, cascade_max_depth);
+    }
+
+    pub fn validateForeignKeyActionJobIdentity(
+        job_id: []const u8,
+        action: []const u8,
+        worker_id: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        updated_parent_key: ?[]const u8,
+    ) !void {
+        return try relational_integrity_impl.validateForeignKeyActionJobIdentity(job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
+    }
+
+    pub fn validateForeignKeyActionScheduleMatches(
+        existing: ForeignKeyActionScheduleRecord,
+        action_job_id: []const u8,
+        action: []const u8,
+        constraint_name: []const u8,
+        parent_table: []const u8,
+        parent_key: []const u8,
+        updated_parent_key: ?[]const u8,
+    ) !void {
+        return try relational_integrity_impl.validateForeignKeyActionScheduleMatches(existing, action_job_id, action, constraint_name, parent_table, parent_key, updated_parent_key);
+    }
+
+    pub const ForeignKeyIntegrityProgressRecord = relational_integrity.ForeignKeyIntegrityProgressRecord;
+    pub const ForeignKeyIntegrityClaimRecord = relational_integrity.ForeignKeyIntegrityClaimRecord;
+    pub const ForeignKeyIntegrityJobRecord = relational_integrity.ForeignKeyIntegrityJobRecord;
+    pub const ForeignKeyActionJobRecord = relational_integrity.ForeignKeyActionJobRecord;
+    pub const ForeignKeyActionScheduleRecord = relational_integrity.ForeignKeyActionScheduleRecord;
+    pub const UniqueConstraintIntegrityProgressRecord = relational_integrity.UniqueConstraintIntegrityProgressRecord;
 
     pub fn freeForeignKeyIntegrityProgressRecord(self: *DB, record: ForeignKeyIntegrityProgressRecord) void {
         relational_integrity_impl.freeForeignKeyIntegrityProgressRecord(self, record);
@@ -2129,6 +2739,7 @@ pub const DB = struct {
         upper_doc_key: []const u8,
         lease_ms: u64,
     ) !ForeignKeyIntegrityClaimRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.claimForeignKeyIntegrityWorkUnit(self, claim_key, worker_id, group_id, phase, planned_action, constraint_name, lower_doc_key, upper_doc_key, lease_ms);
     }
 
@@ -2145,6 +2756,7 @@ pub const DB = struct {
         lease_ms: u64,
         now_ns: u64,
     ) !ForeignKeyIntegrityClaimRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.claimForeignKeyIntegrityWorkUnitAt(self, claim_key, worker_id, group_id, phase, planned_action, constraint_name, lower_doc_key, upper_doc_key, lease_ms, now_ns);
     }
 
@@ -2161,6 +2773,7 @@ pub const DB = struct {
         max_work_units: usize,
         status: []const u8,
     ) !ForeignKeyIntegrityJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.upsertForeignKeyIntegrityJobRecord(self, job_id, table_name, action, worker_id, constraint_name, lower_doc_key, upper_doc_key, lease_ms, max_work_units, status);
     }
 
@@ -2178,6 +2791,7 @@ pub const DB = struct {
         status: []const u8,
         now_ns: u64,
     ) !ForeignKeyIntegrityJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.upsertForeignKeyIntegrityJobRecordAt(self, job_id, table_name, action, worker_id, constraint_name, lower_doc_key, upper_doc_key, lease_ms, max_work_units, status, now_ns);
     }
 
@@ -2188,6 +2802,7 @@ pub const DB = struct {
         valid: bool,
         report: relational_store_mod.ForeignKeyIntegrityReport,
     ) !ForeignKeyIntegrityJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.completeForeignKeyIntegrityJobRecord(self, job_id, status, valid, report);
     }
 
@@ -2201,6 +2816,7 @@ pub const DB = struct {
         violation_sample_count: usize,
         violations_truncated: bool,
     ) !ForeignKeyIntegrityJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.completeForeignKeyIntegrityJobRecordWithDiagnostics(self, job_id, status, valid, report, violation_samples_json, violation_sample_count, violations_truncated);
     }
 
@@ -2212,6 +2828,7 @@ pub const DB = struct {
         report: relational_store_mod.ForeignKeyIntegrityReport,
         now_ns: u64,
     ) !ForeignKeyIntegrityJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.completeForeignKeyIntegrityJobRecordAt(self, job_id, status, valid, report, now_ns);
     }
 
@@ -2226,6 +2843,7 @@ pub const DB = struct {
         violations_truncated: ?bool,
         now_ns: u64,
     ) !ForeignKeyIntegrityJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.completeForeignKeyIntegrityJobRecordWithDiagnosticsAt(self, job_id, status, valid, report, violation_samples_json, violation_sample_count, violations_truncated, now_ns);
     }
 
@@ -2236,6 +2854,7 @@ pub const DB = struct {
         violation_sample_count: usize,
         violations_truncated: bool,
     ) !ForeignKeyIntegrityJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.updateForeignKeyIntegrityJobDiagnostics(self, job_id, violation_samples_json, violation_sample_count, violations_truncated);
     }
 
@@ -2247,6 +2866,7 @@ pub const DB = struct {
         violation_sample_count: usize,
         violations_truncated: bool,
     ) !ForeignKeyIntegrityJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.updateForeignKeyIntegrityJobDiagnosticsWithReport(self, job_id, report, violation_samples_json, violation_sample_count, violations_truncated);
     }
 
@@ -2258,6 +2878,7 @@ pub const DB = struct {
         violations_truncated: bool,
         now_ns: u64,
     ) !ForeignKeyIntegrityJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.updateForeignKeyIntegrityJobDiagnosticsAt(self, job_id, violation_samples_json, violation_sample_count, violations_truncated, now_ns);
     }
 
@@ -2270,126 +2891,157 @@ pub const DB = struct {
         violations_truncated: bool,
         now_ns: u64,
     ) !ForeignKeyIntegrityJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.updateForeignKeyIntegrityJobDiagnosticsWithReportAt(self, job_id, report, violation_samples_json, violation_sample_count, violations_truncated, now_ns);
     }
 
     pub fn claimAndRunForeignKeyActionJobPage(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, lease_ms: u64) !ForeignKeyActionJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.claimAndRunForeignKeyActionJobPage(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit, lease_ms);
     }
 
     pub fn scheduleForeignKeyActionJob(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize) !ForeignKeyActionJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.scheduleForeignKeyActionJob(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit);
     }
 
     pub fn scheduleForeignKeyActionJobWithUpdatedParentKey(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize) !ForeignKeyActionJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.scheduleForeignKeyActionJobWithUpdatedParentKey(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit);
     }
 
     pub fn scheduleForeignKeyActionJobAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, now_ns: u64) !ForeignKeyActionJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.scheduleForeignKeyActionJobAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit, now_ns);
     }
 
     pub fn scheduleForeignKeyActionJobWithUpdatedParentKeyAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, now_ns: u64) !ForeignKeyActionJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.scheduleForeignKeyActionJobWithUpdatedParentKeyAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, now_ns);
     }
 
     pub fn scheduleForeignKeyActionJobWithUpdatedParentKeyAndCascadeLineageAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, cascade_depth: u32, cascade_max_depth: u32, now_ns: u64) !ForeignKeyActionJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.scheduleForeignKeyActionJobWithUpdatedParentKeyAndCascadeLineageAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, cascade_depth, cascade_max_depth, now_ns);
     }
 
     pub fn requeueForeignKeyActionJob(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize) !ForeignKeyActionJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.requeueForeignKeyActionJob(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit);
     }
 
     pub fn requeueForeignKeyActionJobWithUpdatedParentKey(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize) !ForeignKeyActionJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.requeueForeignKeyActionJobWithUpdatedParentKey(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit);
     }
 
     pub fn requeueForeignKeyActionJobAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, now_ns: u64) !ForeignKeyActionJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.requeueForeignKeyActionJobAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit, now_ns);
     }
 
     pub fn requeueForeignKeyActionJobWithUpdatedParentKeyAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, now_ns: u64) !ForeignKeyActionJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.requeueForeignKeyActionJobWithUpdatedParentKeyAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, now_ns);
     }
 
     pub fn scheduleForeignKeyActionSchedule(self: *DB, schedule_id: []const u8, action_job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize) !ForeignKeyActionScheduleRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.scheduleForeignKeyActionSchedule(self, schedule_id, action_job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit);
     }
 
     pub fn scheduleForeignKeyActionScheduleWithUpdatedParentKey(self: *DB, schedule_id: []const u8, action_job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize) !ForeignKeyActionScheduleRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.scheduleForeignKeyActionScheduleWithUpdatedParentKey(self, schedule_id, action_job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit);
     }
 
     pub fn scheduleForeignKeyActionScheduleAt(self: *DB, schedule_id: []const u8, action_job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, now_ns: u64) !ForeignKeyActionScheduleRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.scheduleForeignKeyActionScheduleAt(self, schedule_id, action_job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit, now_ns);
     }
 
     pub fn scheduleForeignKeyActionScheduleWithUpdatedParentKeyAt(self: *DB, schedule_id: []const u8, action_job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, now_ns: u64) !ForeignKeyActionScheduleRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.scheduleForeignKeyActionScheduleWithUpdatedParentKeyAt(self, schedule_id, action_job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, now_ns);
     }
 
     pub fn requeueForeignKeyActionSchedule(self: *DB, schedule_id: []const u8, action_job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize) !ForeignKeyActionScheduleRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.requeueForeignKeyActionSchedule(self, schedule_id, action_job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit);
     }
 
     pub fn requeueForeignKeyActionScheduleAt(self: *DB, schedule_id: []const u8, action_job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, now_ns: u64) !ForeignKeyActionScheduleRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.requeueForeignKeyActionScheduleAt(self, schedule_id, action_job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit, now_ns);
     }
 
     pub fn requeueForeignKeyActionScheduleWithUpdatedParentKeyAt(self: *DB, schedule_id: []const u8, action_job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, now_ns: u64) !ForeignKeyActionScheduleRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.requeueForeignKeyActionScheduleWithUpdatedParentKeyAt(self, schedule_id, action_job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, now_ns);
     }
 
     pub fn markForeignKeyActionScheduleSeeded(self: *DB, schedule_id: []const u8, scheduled_groups: u64) !ForeignKeyActionScheduleRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.markForeignKeyActionScheduleSeeded(self, schedule_id, scheduled_groups);
     }
 
     pub fn markForeignKeyActionScheduleSeededAt(self: *DB, schedule_id: []const u8, scheduled_groups: u64, now_ns: u64) !ForeignKeyActionScheduleRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.markForeignKeyActionScheduleSeededAt(self, schedule_id, scheduled_groups, now_ns);
     }
 
     pub fn claimAndRunForeignKeyActionJobPageAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, lease_ms: u64, now_ns: u64) !ForeignKeyActionJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.claimAndRunForeignKeyActionJobPageAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit, lease_ms, now_ns);
     }
 
     pub fn claimAndRunForeignKeyActionJobPageWithUpdatedParentKeyAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, lease_ms: u64, now_ns: u64) !ForeignKeyActionJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.claimAndRunForeignKeyActionJobPageWithUpdatedParentKeyAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, lease_ms, now_ns);
     }
 
     pub fn claimAndRunForeignKeyActionJobPageWithUpdatedParentKeyAndCascadeLineageAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, lease_ms: u64, cascade_depth: u32, cascade_max_depth: u32, now_ns: u64) !ForeignKeyActionJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.claimAndRunForeignKeyActionJobPageWithUpdatedParentKeyAndCascadeLineageAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, lease_ms, cascade_depth, cascade_max_depth, now_ns);
     }
 
     pub fn claimForeignKeyActionJobPage(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, lease_ms: u64) !ForeignKeyActionJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.claimForeignKeyActionJobPage(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit, lease_ms);
     }
 
     pub fn claimForeignKeyActionJobPageAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, page_limit: usize, lease_ms: u64, now_ns: u64) !ForeignKeyActionJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.claimForeignKeyActionJobPageAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, page_limit, lease_ms, now_ns);
     }
 
     pub fn claimForeignKeyActionJobPageWithUpdatedParentKeyAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, lease_ms: u64, now_ns: u64) !ForeignKeyActionJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.claimForeignKeyActionJobPageWithUpdatedParentKeyAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, lease_ms, now_ns);
     }
 
     pub fn claimForeignKeyActionJobPageWithUpdatedParentKeyAndCascadeLineageAt(self: *DB, job_id: []const u8, action: []const u8, worker_id: []const u8, constraint_name: []const u8, parent_table: []const u8, parent_key: []const u8, updated_parent_key: ?[]const u8, page_limit: usize, lease_ms: u64, cascade_depth: u32, cascade_max_depth: u32, now_ns: u64) !ForeignKeyActionJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.claimForeignKeyActionJobPageWithUpdatedParentKeyAndCascadeLineageAt(self, job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key, page_limit, lease_ms, cascade_depth, cascade_max_depth, now_ns);
     }
 
     pub fn finishClaimedForeignKeyActionJobPage(self: *DB, claimed: ForeignKeyActionJobRecord, applied_count: usize, complete: bool, next_child_table: ?[]const u8, next_child_key: ?[]const u8, last_error: ?[]const u8) !ForeignKeyActionJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.finishClaimedForeignKeyActionJobPage(self, claimed, applied_count, complete, next_child_table, next_child_key, last_error);
     }
 
     pub fn finishClaimedForeignKeyActionJobPageAt(self: *DB, claimed: ForeignKeyActionJobRecord, applied_count: usize, complete: bool, next_child_table: ?[]const u8, next_child_key: ?[]const u8, last_error: ?[]const u8, now_ns: u64) !ForeignKeyActionJobRecord {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.finishClaimedForeignKeyActionJobPageAt(self, claimed, applied_count, complete, next_child_table, next_child_key, last_error, now_ns);
     }
 
     pub fn claimAndRunForeignKeyIntegrityWorkUnit(self: *DB, claim_key: []const u8, worker_id: []const u8, group_id: u64, phase: []const u8, mode: relational_store_mod.ForeignKeyIntegrityMode, constraint_name: ?[]const u8, lower_doc_key: []const u8, upper_doc_key: []const u8, lease_ms: u64) !ForeignKeyIntegrityReport {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.claimAndRunForeignKeyIntegrityWorkUnit(self, claim_key, worker_id, group_id, phase, mode, constraint_name, lower_doc_key, upper_doc_key, lease_ms);
     }
 
     pub fn claimAndRunForeignKeyIntegrityWorkUnitAt(self: *DB, claim_key: []const u8, worker_id: []const u8, group_id: u64, phase: []const u8, mode: relational_store_mod.ForeignKeyIntegrityMode, constraint_name: ?[]const u8, lower_doc_key: []const u8, upper_doc_key: []const u8, lease_ms: u64, now_ns: u64) !ForeignKeyIntegrityReport {
+        try self.enforceRelationalIntegrityMutationGate();
         return try relational_integrity_impl.claimAndRunForeignKeyIntegrityWorkUnitAt(self, claim_key, worker_id, group_id, phase, mode, constraint_name, lower_doc_key, upper_doc_key, lease_ms, now_ns);
     }
 
@@ -2466,6 +3118,7 @@ pub const DB = struct {
         runtime_schema: schema_mod.TableSchema,
         req: types.RelationalRowsMutationSourceRequest,
     ) !types.RelationalRowsMutationSourceResult {
+        try self.enforceDurableMutationGate();
         return try relational_rows_impl.mutateRelationalRowsFromSource(self, alloc, runtime_schema, req);
     }
 
@@ -2539,6 +3192,7 @@ pub const DB = struct {
         matched: u32,
         candidates: []const RelationalRowsMutationSourceCandidate,
     ) !types.RelationalRowsMutationSourceResult {
+        try self.enforceDurableMutationGate();
         return try relational_rows_impl.stagePlannedRelationalRowsMutationSourceAlloc(self, alloc, runtime_schema, req, matched, candidates);
     }
 
@@ -2548,6 +3202,7 @@ pub const DB = struct {
         runtime_schema: schema_mod.TableSchema,
         req: types.RelationalRowsJoinedMutationSourceRequest,
     ) !types.RelationalRowsMutationSourceResult {
+        try self.enforceDurableMutationGate();
         return try relational_rows_impl.mutateRelationalRowsJoinedSourceAlloc(self, alloc, runtime_schema, req);
     }
 
@@ -2680,6 +3335,7 @@ pub const DB = struct {
         matched: u32,
         candidates: []const RelationalRowsJoinedMutationSourceCandidate,
     ) !types.RelationalRowsMutationSourceResult {
+        try self.enforceDurableMutationGate();
         return try relational_rows_impl.stagePlannedRelationalRowsJoinedMutationSourceAlloc(self, alloc, runtime_schema, req, matched, candidates);
     }
 
@@ -2692,6 +3348,7 @@ pub const DB = struct {
         matched: u32,
         candidates: []const RelationalRowsJoinedMutationSourceCandidate,
     ) !types.RelationalRowsMutationSourceResult {
+        try self.enforceDurableMutationGate();
         return try relational_rows_impl.stagePlannedRelationalRowsJoinedMutationSourceWithSourceSchemaAlloc(self, alloc, target_schema, source_schema, req, matched, candidates);
     }
 
@@ -2804,7 +3461,7 @@ pub const DB = struct {
     pub fn applyRelationalRowsClaimToSelectedCandidatesAlloc(
         self: *DB,
         alloc: Allocator,
-        rows: []const RelationalRowsQueryCandidate,
+        rows: []const relational_rows.QueryCandidate,
         selected_indexes: *std.ArrayListUnmanaged(usize),
         claim: types.RowClaimRequest,
         limit: ?u32,
@@ -2926,20 +3583,63 @@ pub const DB = struct {
         return try relational_rows_impl.lateralRelationalRowsFromSourceRowsStaticAlloc(alloc, req, left_rows, right_rows);
     }
 
-    fn relationalRowsJoinedRowJsonAlloc(
-        alloc: Allocator,
-        left_row_json: []const u8,
-        right_row_json: ?[]const u8,
-        select: []const types.RelationalRowsJoinProjection,
-    ) ![]u8 {
-        return try relational_rows.joinedRowJsonAlloc(alloc, left_row_json, right_row_json, select);
+    pub fn reclaimExpiredRowClaimIntentsForRows(
+        self: *DB,
+        claiming_txn_id: types.TxnId,
+        row_keys: []const []const u8,
+        now_ns: u64,
+    ) !usize {
+        return try relational_rows_impl.reclaimExpiredRowClaimIntentsForRows(self, claiming_txn_id, row_keys, now_ns);
     }
 
-    const relationalRowsConcatChecksAlloc = relational_rows.concatChecksAlloc;
+    pub fn reclaimExpiredRowClaimIntentsForMutationKeys(
+        self: *DB,
+        writes: anytype,
+        deletes: []const []const u8,
+        exclude_txn_id: ?types.TxnId,
+        now_ns: u64,
+        comptime already_locked: bool,
+        comptime is_user_row_mutation_key: fn ([]const u8) bool,
+    ) !usize {
+        return try relational_rows_impl.reclaimExpiredRowClaimIntentsForMutationKeys(self, writes, deletes, exclude_txn_id, now_ns, already_locked, is_user_row_mutation_key);
+    }
 
-    const freeRelationalRowsChecks = relational_rows.freeChecks;
+    pub fn reclaimExpiredRowClaimIntentsForIdentityRewrites(
+        self: *DB,
+        rewrites: []const types.RelationalIdentityRewrite,
+        exclude_txn_id: ?types.TxnId,
+        now_ns: u64,
+        comptime already_locked: bool,
+        comptime is_user_row_mutation_key: fn ([]const u8) bool,
+    ) !usize {
+        return try relational_rows_impl.reclaimExpiredRowClaimIntentsForIdentityRewrites(self, rewrites, exclude_txn_id, now_ns, already_locked, is_user_row_mutation_key);
+    }
 
-    const RelationalRowsQueryCandidate = relational_rows.QueryCandidate;
+    pub fn appendSystemVersionedHistoryForBatch(
+        self: *DB,
+        req: types.BatchRequest,
+        sequence: u64,
+        timestamp_ns: u64,
+        writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+        owned_keys: *std.ArrayListUnmanaged([]u8),
+        owned_values: *std.ArrayListUnmanaged([]u8),
+        comptime is_user_row_mutation_key: fn ([]const u8) bool,
+    ) !void {
+        return try relational_rows_impl.appendSystemVersionedHistoryForBatch(self, req, sequence, timestamp_ns, writes, owned_keys, owned_values, is_user_row_mutation_key);
+    }
+
+    pub fn appendSystemVersionedHistoryForTransactionMutations(
+        self: *DB,
+        mutations: []const transactions_mod.OwnedIntentMutation,
+        rewrites: []const types.RelationalIdentityRewrite,
+        commit_version: u64,
+        writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+        owned_keys: *std.ArrayListUnmanaged([]u8),
+        owned_values: *std.ArrayListUnmanaged([]u8),
+        comptime is_user_row_mutation_key: fn ([]const u8) bool,
+    ) !void {
+        return try relational_rows_impl.appendSystemVersionedHistoryForTransactionMutations(self, mutations, rewrites, commit_version, writes, owned_keys, owned_values, is_user_row_mutation_key);
+    }
 
     pub const RelationalRowsMutationSourceCandidate = relational_rows.MutationSourceCandidate;
 
@@ -2958,31 +3658,6 @@ pub const DB = struct {
 
     pub const RelationalRowsQueryOrderKey = relational_rows.QueryOrderKey;
 
-    const RelationalRowsPlannedCandidateSet = relational_rows.PlannedCandidateSet;
-
-    const RelationalRowsPredicateImplications = relational_rows.PredicateImplications;
-
-    fn appendRelationalRowsPlannedCandidateSetAlloc(
-        alloc: Allocator,
-        planned_sets: *std.ArrayListUnmanaged(RelationalRowsPlannedCandidateSet),
-        child: *doc_set.ResolvedDocSet,
-        ordinal: usize,
-    ) !void {
-        try relational_rows.appendPlannedCandidateSetAlloc(alloc, planned_sets, child, ordinal);
-    }
-
-    fn relationalRowsPlannedCandidateSetLessThan(
-        _: void,
-        left: RelationalRowsPlannedCandidateSet,
-        right: RelationalRowsPlannedCandidateSet,
-    ) bool {
-        return relational_rows.plannedCandidateSetLessThan({}, left, right);
-    }
-
-    const relationalRowsUniqueConstraintColumnsAlloc = relational_rows.uniqueConstraintColumnsAlloc;
-
-    const relationalRowsPredicatesImplyUniqueWhere = relational_rows.predicatesImplyUniqueWhere;
-
     pub fn relationalRowsExpressionConditionsImpliedByEqualityPredicatesAlloc(
         alloc: Allocator,
         predicates: []const schema_mod.RelationalCheck,
@@ -2990,23 +3665,6 @@ pub const DB = struct {
     ) !bool {
         return try relational_rows_impl.relationalRowsExpressionConditionsImpliedByEqualityPredicatesAlloc(alloc, predicates, required);
     }
-
-    fn relationalRowsEqualityPredicateObjectJsonAlloc(
-        alloc: Allocator,
-        predicates: []const schema_mod.RelationalCheck,
-    ) !?[]u8 {
-        return try relational_rows.equalityPredicateObjectJsonAlloc(alloc, predicates);
-    }
-
-    const relationalRowsDocKeyInQueryRange = relational_rows.docKeyInQueryRange;
-
-    const relationalRowsQueryPredicatePasses = relational_rows.queryPredicatePasses;
-
-    const relationalRowsMd5HexTextAlloc = relational_rows.md5HexTextAlloc;
-
-    const relationalRowsScalarJsonValueTextAlloc = relational_rows.scalarJsonValueTextAlloc;
-
-    const relationalRowsPhysicalPrimaryKeyFromRowJsonAlloc = relational_rows.physicalPrimaryKeyFromRowJsonAlloc;
 
     pub fn search(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
         return try search_runtime_impl.search(self, alloc, req);
@@ -3082,6 +3740,97 @@ pub const DB = struct {
         return try search_runtime_impl.resolveGraphNodesToDocSet(self, alloc, req, nodes);
     }
 
+    pub fn internalRecordResolvedDocSet(
+        self: *DB,
+        set: *const doc_set.ResolvedDocSet,
+        missing_ordinal_coverage: bool,
+    ) void {
+        internal_impl.recordResolvedDocSet(self, set, missing_ordinal_coverage);
+    }
+
+    pub fn internalResolveDocSetForIdsNoLockAtGenerationAlloc(
+        self: *DB,
+        alloc: Allocator,
+        doc_ids: []const []const u8,
+        generation: ?u64,
+    ) !doc_set.ResolvedDocSet {
+        return try internal_impl.resolveDocSetForIdsNoLockAtGenerationAlloc(self, alloc, doc_ids, generation);
+    }
+
+    pub fn internalResolveDocSetForIdsAlloc(
+        self: *DB,
+        alloc: Allocator,
+        doc_ids: []const []const u8,
+    ) !doc_set.ResolvedDocSet {
+        return try internal_impl.resolveDocSetForIdsAlloc(self, alloc, doc_ids);
+    }
+
+    pub fn internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(
+        self: *DB,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+    ) !?[]const []const u8 {
+        return try internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(self, alloc, set, generation);
+    }
+
+    pub fn internalDocIdsForResolvedDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        set: *const doc_set.ResolvedDocSet,
+    ) !?[]const []const u8 {
+        return try internal_impl.docIdsForResolvedDocSetAlloc(self, alloc, set);
+    }
+
+    pub fn internalResolvedDocFilterForIdsAlloc(
+        self: *DB,
+        include_positive: bool,
+        include_doc_ids: []const []const u8,
+        exclude_doc_ids: []const []const u8,
+        generation: ?u64,
+    ) !doc_set.ResolvedDocFilter {
+        return try internal_impl.resolvedDocFilterForIdsAlloc(self, include_positive, include_doc_ids, exclude_doc_ids, generation);
+    }
+
+    pub fn internalRecordUnsupportedDocSetFilterShape(self: *DB) void {
+        internal_impl.recordUnsupportedDocSetFilterShape(self);
+    }
+
+    pub fn internalAllDocsVisibleAtGeneration(self: *DB, generation: ?u64) !bool {
+        return try internal_impl.allDocsVisibleAtGeneration(self, generation);
+    }
+
+    pub fn internalAllDocsVisibleSummaryFast(self: *DB, generation: ?u64) !bool {
+        return try internal_impl.allDocsVisibleSummaryFast(self, generation);
+    }
+
+    pub fn internalLookupLiveDocOrdinalNoLock(
+        self: *DB,
+        alloc: Allocator,
+        doc_id: []const u8,
+        generation: ?u64,
+    ) !?doc_set.DocOrdinal {
+        return try internal_impl.lookupLiveDocOrdinalNoLock(self, alloc, doc_id, generation);
+    }
+
+    pub fn internalLookupLiveDocOrdinalsNoLock(
+        self: *DB,
+        alloc: Allocator,
+        doc_ids: []const []const u8,
+        generation: ?u64,
+    ) ![]?doc_set.DocOrdinal {
+        return try internal_impl.lookupLiveDocOrdinalsNoLock(self, alloc, doc_ids, generation);
+    }
+
+    pub fn internalAnnotateSearchHitOrdinalsNoLock(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        hits: []types.SearchHit,
+    ) !void {
+        try internal_impl.annotateSearchHitOrdinalsNoLock(self, alloc, req, hits);
+    }
+
     pub fn searchRuntimeProjectLookupStoredBytes(self: *DB, alloc: Allocator, doc_key: []const u8, raw: []const u8, opts: types.LookupOptions) ![]u8 {
         return try search_runtime_impl.projectLookupStoredBytes(self, alloc, doc_key, raw, opts);
     }
@@ -3132,6 +3881,14 @@ pub const DB = struct {
         return try search_runtime_impl.resolvedDocFilterForIdsAlloc(self, include_positive, include_doc_ids, exclude_doc_ids, generation);
     }
 
+    pub fn searchRuntimeResolvedDocFilterForRequestNativeConstraintsAlloc(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+    ) !?doc_set.ResolvedDocFilter {
+        return try search_runtime_impl.resolvedDocFilterForRequestNativeConstraintsAlloc(self, alloc, req);
+    }
+
     pub fn searchRuntimeRecordUnsupportedDocSetFilterShape(self: *DB) void {
         search_runtime_impl.recordUnsupportedDocSetFilterShape(self);
     }
@@ -3144,6 +3901,61 @@ pub const DB = struct {
         generation: ?u64,
     ) !?doc_set.ResolvedDocSet {
         return try search_runtime_impl.resolveRelationalFilterDocSet(self, alloc, runtime_schema, query, generation);
+    }
+
+    pub fn searchRuntimeResolveRelationalFilterQueryDocSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        query: search_mod.SearchQuery,
+        generation: ?u64,
+    ) !?doc_set.ResolvedDocSet {
+        return try search_runtime_impl.resolveRelationalFilterQueryDocSetAlloc(self, alloc, runtime_schema, query, generation);
+    }
+
+    pub fn searchRuntimeResolveRelationalFilterQueryDocSetWithImplicationsAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        query: search_mod.SearchQuery,
+        implications: relational_rows.PredicateImplications,
+        generation: ?u64,
+    ) !?doc_set.ResolvedDocSet {
+        return try search_runtime_impl.resolveRelationalFilterQueryDocSetWithImplicationsAlloc(self, alloc, runtime_schema, query, implications, generation);
+    }
+
+    pub fn searchRuntimeCombineRelationalFilterSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        current: *?doc_set.ResolvedDocSet,
+        child: *const doc_set.ResolvedDocSet,
+        generation: ?u64,
+        mode: relational_rows.FilterCombineMode,
+    ) !void {
+        try search_runtime_impl.combineRelationalFilterSetAlloc(self, alloc, current, child, generation, mode);
+    }
+
+    pub fn searchRuntimeRelationalFilterGenerationCanUseCurrentRows(self: *DB, generation: ?u64) bool {
+        return search_runtime_impl.relationalFilterGenerationCanUseCurrentRows(self, generation);
+    }
+
+    pub fn searchRuntimeRelationalColumnIndexUsableForQuery(
+        self: *DB,
+        alloc: Allocator,
+        column: schema_mod.RelationalColumn,
+        implications: relational_rows.PredicateImplications,
+    ) !bool {
+        return try search_runtime_impl.relationalColumnIndexUsableForQuery(self, alloc, column, implications);
+    }
+
+    pub fn resolveRelationalRowsQueryCandidateSetAlloc(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        req: types.RelationalRowsQueryRequest,
+        generation: ?u64,
+    ) !?doc_set.ResolvedDocSet {
+        return try relational_rows_impl.resolveRelationalRowsQueryCandidateSetAlloc(self, alloc, runtime_schema, req, generation);
     }
 
     pub fn searchRuntimeLiveFilterDocSet(
@@ -3183,6 +3995,16 @@ pub const DB = struct {
         raw: []const u8,
     ) ![]u8 {
         return try search_runtime_impl.projectStoredBytesForSearch(self, alloc, req, doc_key, raw);
+    }
+
+    pub fn searchRuntimeProjectOwnedStoredBytesForSearch(
+        self: *DB,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        doc_key: []const u8,
+        raw: []u8,
+    ) ![]u8 {
+        return try search_runtime_impl.projectOwnedStoredBytesForSearch(self, alloc, req, doc_key, raw);
     }
 
     pub fn searchRuntimeLoadProjectedSearchDocument(
@@ -3478,16 +4300,6 @@ pub const DB = struct {
         return try search_runtime_impl.collectExplicitBackgroundTextStats(self, alloc, requests);
     }
 
-    const relationalArrayColumnValueContains = relational_rows.arrayColumnValueContains;
-
-    const relationalArrayColumnValueContainsAll = relational_rows.arrayColumnValueContainsAll;
-
-    const relationalArrayColumnValueEquals = relational_rows.arrayColumnValueEquals;
-
-    const RelationalFilterCombineMode = relational_rows.FilterCombineMode;
-
-    const relationalColumnForField = relational_rows.columnForField;
-
     pub fn searchDenseProfiled(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
         return try search_runtime_impl.searchDenseProfiled(self, alloc, req, dense);
     }
@@ -3500,17 +4312,44 @@ pub const DB = struct {
     ) !?doc_set.DocOrdinal {
         return try internal_impl.lookupLiveDocOrdinalNoLock(self, alloc, doc_id, generation);
     }
-
-    fn encodeBaseDocumentLookupKeyAlloc(self: *DB, alloc: Allocator, key: []const u8) ![]u8 {
-        if (self.relationalColumnsForStore() != null and !db_internal.isMetadataKey(key) and !internal_keys.isInternalPhysicalTableDataKey(key)) {
-            return try relational_store_mod.rowKeyAlloc(alloc, key);
-        }
-        if (internal_keys.isInternalPhysicalTableDataKey(key) or db_internal.isMetadataKey(key)) {
-            return try alloc.dupe(u8, key);
-        }
-        return try internal_keys.documentKeyAlloc(alloc, key);
-    }
 };
+
+test "document extraction templated inline source size is rejected before persistence" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const security = scraping.ContentSecurityConfig{ .max_download_size_bytes = 4 };
+    var remote_content = scraping.RemoteContentConfig{ .security = security };
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .remote_content = &remote_content,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .template = "{{url}}",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+
+    try std.testing.expectError(error.StreamTooLong, db.batch(.{
+        .writes = &.{.{
+            .key = "doc:templated-too-large",
+            .value = "{\"url\":\"data:text/plain;base64,aGVsbG8=\"}",
+        }},
+        .sync_level = .write,
+    }));
+
+    const doc_key = try internal_keys.documentKeyAlloc(alloc, "doc:templated-too-large");
+    defer alloc.free(doc_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, doc_key));
+}
 
 const systemVersionedHistoryRecordCommitSequence = relational_rows.systemVersionedHistoryRecordCommitSequence;
 
@@ -3543,6 +4382,159 @@ const beginDenseCatchUpSessionTracked = db_internal.beginDenseCatchUpSessionTrac
 const finishDenseCatchUpSessionTracked = db_internal.finishDenseCatchUpSessionTracked;
 const asyncContextHasActiveDenseBulkWork = db_internal.asyncContextHasActiveDenseBulkWork;
 const flushDeferredExternalBulkExecutorNotification = db_internal.flushDeferredExternalBulkExecutorNotification;
+
+test "db lsm maintenance reclaims due index obsolete paths before primary compaction" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .primary_backend = .{ .lsm = .{
+            .flush_threshold = 1,
+            .defer_flush_on_commit = true,
+            .l0_soft_limit_runs = 100,
+            .obsolete_retention_ns = 0,
+        } },
+        .index_backends = .{
+            .dense_lsm_options = .{
+                .flush_threshold = 1,
+                .defer_flush_on_commit = true,
+                .l0_soft_limit_runs = 100,
+                .obsolete_retention_ns = 0,
+            },
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+
+    var key_buf: [16]u8 = undefined;
+    for (0..4) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        try db.batch(.{
+            .writes = &.{.{ .key = key, .value = "{\"embedding\":[1,2]}" }},
+            .sync_level = .write,
+        });
+        switch (db.core.primary_store_owner) {
+            .lsm => |*owner| try owner.handle.backend.sync(true),
+            else => return error.SkipZigTest,
+        }
+    }
+
+    switch (db.core.primary_store_owner) {
+        .lsm => |*owner| try owner.handle.backend.flushBufferedWritesWithOptions(.{ .compact = false, .flush = true }),
+        else => return error.SkipZigTest,
+    }
+
+    switch (db.core.primary_store_owner) {
+        .lsm => |*owner| owner.handle.backend.options.l0_soft_limit_runs = 1,
+        else => return error.SkipZigTest,
+    }
+
+    const dense_entry = db.core.index_manager.denseIndex("dv_v1") orelse return error.TestUnexpectedResult;
+    const dense_backend = switch (dense_entry.index.env_owner) {
+        .lsm => |*handle| handle.backend,
+        else => return error.SkipZigTest,
+    };
+    const dense_root = dense_backend.root_dir orelse return error.TestUnexpectedResult;
+    const obsolete_path = try lsm_backend_mod.repository.runPath(alloc, dense_root, 999_999);
+    defer alloc.free(obsolete_path);
+
+    try lsm_backend_mod.repository.writeFileAbsoluteWithStorage(dense_backend.storage.?, obsolete_path, "obsolete");
+    {
+        const locked = lsm_backend_mod.runtime.lockBackend(lsm_backend_mod.Backend, dense_backend);
+        defer lsm_backend_mod.runtime.unlockBackend(lsm_backend_mod.Backend, dense_backend, locked);
+        try dense_backend.queueObsoleteFilePath(try alloc.dupe(u8, obsolete_path));
+        dense_backend.manifest_dirty = false;
+    }
+
+    try expectObsoletePathsReclaimable(dense_backend, 1);
+    try std.testing.expect(try db.runLsmMaintenanceStepBestEffort());
+    try std.testing.expectEqual(@as(u64, 0), dense_backend.snapshotMaintenanceStats().obsolete_paths);
+    try std.testing.expectError(error.FileNotFound, dense_backend.storage.?.readFileAlloc(alloc, obsolete_path, 1024));
+}
+
+test "db primary lsm maintenance step does not reclaim index obsolete paths" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .primary_backend = .{ .lsm = .{
+            .flush_threshold = 1,
+            .defer_flush_on_commit = true,
+            .l0_soft_limit_runs = 100,
+            .obsolete_retention_ns = 0,
+        } },
+        .index_backends = .{
+            .dense_lsm_options = .{
+                .flush_threshold = 1,
+                .defer_flush_on_commit = true,
+                .l0_soft_limit_runs = 100,
+                .obsolete_retention_ns = 0,
+            },
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}",
+    });
+
+    const primary_backend = switch (db.core.primary_store_owner) {
+        .lsm => |*owner| owner.handle.backend,
+        else => return error.SkipZigTest,
+    };
+    const primary_root = primary_backend.root_dir orelse return error.TestUnexpectedResult;
+    const primary_obsolete_path = try lsm_backend_mod.repository.runPath(alloc, primary_root, 888_888);
+    defer alloc.free(primary_obsolete_path);
+
+    const dense_entry = db.core.index_manager.denseIndex("dv_v1") orelse return error.TestUnexpectedResult;
+    const dense_backend = switch (dense_entry.index.env_owner) {
+        .lsm => |*handle| handle.backend,
+        else => return error.SkipZigTest,
+    };
+    const dense_root = dense_backend.root_dir orelse return error.TestUnexpectedResult;
+    const dense_obsolete_path = try lsm_backend_mod.repository.runPath(alloc, dense_root, 999_999);
+    defer alloc.free(dense_obsolete_path);
+
+    try lsm_backend_mod.repository.writeFileAbsoluteWithStorage(primary_backend.storage.?, primary_obsolete_path, "primary obsolete");
+    {
+        const locked = lsm_backend_mod.runtime.lockBackend(lsm_backend_mod.Backend, primary_backend);
+        defer lsm_backend_mod.runtime.unlockBackend(lsm_backend_mod.Backend, primary_backend, locked);
+        try primary_backend.queueObsoleteFilePath(try alloc.dupe(u8, primary_obsolete_path));
+        primary_backend.manifest_dirty = false;
+    }
+
+    try lsm_backend_mod.repository.writeFileAbsoluteWithStorage(dense_backend.storage.?, dense_obsolete_path, "dense obsolete");
+    {
+        const locked = lsm_backend_mod.runtime.lockBackend(lsm_backend_mod.Backend, dense_backend);
+        defer lsm_backend_mod.runtime.unlockBackend(lsm_backend_mod.Backend, dense_backend, locked);
+        try dense_backend.queueObsoleteFilePath(try alloc.dupe(u8, dense_obsolete_path));
+        dense_backend.manifest_dirty = false;
+    }
+
+    try expectObsoletePathsReclaimable(primary_backend, 1);
+    try expectObsoletePathsReclaimable(dense_backend, 1);
+
+    _ = try db.runPrimaryLsmMaintenanceStep();
+
+    try std.testing.expectEqual(@as(u64, 0), primary_backend.snapshotMaintenanceStats().obsolete_paths);
+    try std.testing.expectError(error.FileNotFound, primary_backend.storage.?.readFileAlloc(alloc, primary_obsolete_path, 1024));
+    try std.testing.expectEqual(@as(u64, 1), dense_backend.snapshotMaintenanceStats().obsolete_paths);
+    const dense_bytes = try dense_backend.storage.?.readFileAlloc(alloc, dense_obsolete_path, 1024);
+    alloc.free(dense_bytes);
+}
 
 test "dense target advance is blocked while catch-up bulk session is active" {
     const alloc = std.testing.allocator;
@@ -3579,17 +4571,15 @@ test "dense target advance is blocked while catch-up bulk session is active" {
     try beginDenseCatchUpSessionTracked(&ctx, "semantic_idx");
     defer finishDenseCatchUpSessionTracked(&ctx, "semantic_idx");
 
-    const can_advance = try DB.derived_async_impl.canAdvanceDerivedToTargetAsync(&ctx, .{
+    const can_advance = try DB.derivedAsyncCanAdvanceDerivedToTargetAsync(&ctx, .{
         .name = "semantic_idx",
         .kind = .dense_vector,
     }, 1, 2);
     try std.testing.expect(!can_advance);
 }
 
-fn profileBenchTestsEnabled() bool {
-    if (comptime builtin.os.tag == .freestanding) return false;
-    return getenv("ANTFLY_RUN_PROFILE_BENCH_TESTS") != null;
-}
+const db_test_support = @import("test_support.zig");
+const profileBenchTestsEnabled = db_test_support.profileBenchTestsEnabled;
 
 const replayDocumentStoreKeyAlloc = derived_async.replayDocumentStoreKeyAlloc;
 const collectDocumentWrites = derived_async.collectDocumentWrites;
@@ -3597,392 +4587,39 @@ const collectTextReplayDeleteKeys = derived_async.collectTextReplayDeleteKeys;
 const freeOwnedKeySlice = derived_async.freeOwnedKeySlice;
 
 const lockAtomic = platform.sync.lockYielding;
-
-fn lockApply(self: *DB) void {
-    self.core.lockApply();
-}
-
-fn stressEnvUsize(name: [*:0]const u8, default_value: usize) usize {
-    const raw = getenv(name) orelse return default_value;
-    return std.fmt.parseInt(usize, raw, 10) catch default_value;
-}
-
-fn stressDenseBackend() hbc_mod.StorageBackend {
-    const raw = getenv("ANTFLY_STRESS_DENSE_BACKEND") orelse return .lsm;
-    if (std.ascii.eqlIgnoreCase(raw, "lmdb")) return .lmdb;
-    return .lsm;
-}
-
-fn stressDenseValue(doc_index: usize, dim_index: usize) f32 {
-    const raw = (doc_index * 131 + dim_index * 17) % 2048;
-    return @as(f32, @floatFromInt(raw)) / 1024.0 - 1.0;
-}
-
-fn fillStressDenseVector(vector: []f32, doc_index: usize) void {
-    for (vector, 0..) |*slot, dim_index| {
-        slot.* = stressDenseValue(doc_index, dim_index);
-    }
-}
-
-fn allocStressDenseDocJson(alloc: Allocator, dims: usize, doc_index: usize) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-
-    try out.appendSlice(alloc, "{\"title\":\"dense\",\"_embeddings\":{\"dv_v1\":[");
-    for (0..dims) |dim_index| {
-        if (dim_index > 0) try out.append(alloc, ',');
-
-        var value_buf: [64]u8 = undefined;
-        const rendered = try std.fmt.bufPrint(&value_buf, "{d}", .{stressDenseValue(doc_index, dim_index)});
-        try out.appendSlice(alloc, rendered);
-    }
-    try out.appendSlice(alloc, "]}}");
-
-    const owned = try alloc.dupe(u8, out.items);
-    out.deinit(alloc);
-    return owned;
-}
-
-fn tempPath(buf: []u8) [*:0]const u8 {
-    const base = "/tmp/antfly-db-test-";
-    const ts = monotonicTimeNs();
-    const pid: u32 = @intCast(std.posix.system.getpid());
-    const nonce = @atomicRmw(u64, &temp_path_nonce, .Add, 1, .monotonic);
-    const path = std.fmt.bufPrint(buf, "{s}{d}-{d}-{d}\x00", .{ base, pid, ts, nonce }) catch unreachable;
-    return @ptrCast(path.ptr);
-}
-
-fn denseTestVectorId(doc_key: []const u8) u64 {
-    const id = std.hash.XxHash64.hash(0, doc_key);
-    return if (id == 0) 1 else id;
-}
-
-fn cleanupTempDir(path: [*:0]const u8) void {
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
-}
-
-fn graphMetricRuntimeWorkerSetHash(worker_ids: []const []const u8) u64 {
-    if (worker_ids.len == 0) return 0;
-    var xor_hash: u64 = 0;
-    var sum_hash: u64 = 0;
-    for (worker_ids) |worker_id| {
-        const item_hash = std.hash.Wyhash.hash(0, worker_id);
-        xor_hash ^= item_hash;
-        sum_hash +%= item_hash;
-    }
-    const fingerprint_words = [_]u64{
-        @intCast(worker_ids.len),
-        xor_hash,
-        sum_hash,
-    };
-    return std.hash.Wyhash.hash(0, std.mem.asBytes(&fingerprint_words));
-}
-
-fn testStoreHasAlgebraicDocFactScalarKeyContaining(alloc: Allocator, store: *docstore_mod.DocStore, needle: []const u8) !bool {
-    const rows = try store.scanRange(alloc, "", "");
-    defer docstore_mod.DocStore.freeResults(alloc, rows);
-    for (rows) |row| {
-        if (std.mem.indexOf(u8, row.key, "docfact_scalar") != null and
-            std.mem.indexOf(u8, row.key, needle) != null) return true;
-    }
-    return false;
-}
-
-const default_test_wait_attempts: usize = 100;
-const slow_test_wait_attempts: usize = 500;
-
-fn waitForSearchResult(alloc: Allocator, db: *DB, req: types.SearchRequest, min_hits: u32) !types.SearchResult {
-    return waitForSearchResultWithAttempts(alloc, db, req, min_hits, default_test_wait_attempts);
-}
-
-fn waitForSearchResultWithAttempts(alloc: Allocator, db: *DB, req: types.SearchRequest, min_hits: u32, max_attempts: usize) !types.SearchResult {
-    var last = try db.search(alloc, req);
-    var attempts: usize = 0;
-    while (last.total_hits < min_hits and attempts < max_attempts) : (attempts += 1) {
-        last.deinit();
-        sleepPollInterval();
-        last = try db.search(alloc, req);
-    }
-    if (last.total_hits < min_hits) {
-        last.deinit();
-        return error.Timeout;
-    }
-    return last;
-}
-
-fn waitForDenseSearchResult(alloc: Allocator, db: *DB, req: types.SearchRequest, min_hits: u32) !types.SearchResult {
-    return waitForDenseSearchResultWithAttempts(alloc, db, req, min_hits, default_test_wait_attempts);
-}
-
-fn waitForDenseSearchResultWithAttempts(alloc: Allocator, db: *DB, req: types.SearchRequest, min_hits: u32, max_attempts: usize) !types.SearchResult {
-    const dense = req.dense orelse return error.InvalidArgument;
-    var last_profiled = try db.searchDenseProfiled(alloc, req, dense);
-    var last = last_profiled.result;
-    var attempts: usize = 0;
-    while (last.total_hits < min_hits and attempts < max_attempts) : (attempts += 1) {
-        last.deinit();
-        sleepPollInterval();
-        last_profiled = try db.searchDenseProfiled(alloc, req, dense);
-        last = last_profiled.result;
-    }
-    if (last.total_hits < min_hits) {
-        last.deinit();
-        return error.Timeout;
-    }
-    return last;
-}
-
-fn waitForDenseIndexResultsWithAttempts(index: *hbc_mod.HBCIndex, query: []const f32, k: usize, min_hits: usize, max_attempts: usize) !hbc_mod.SearchResults {
-    var last = try index.searchWithRequest(.{
-        .query = query,
-        .k = k,
-    });
-    var attempts: usize = 0;
-    while (last.getHits().len < min_hits and attempts < max_attempts) : (attempts += 1) {
-        last.deinit();
-        sleepPollInterval();
-        last = try index.searchWithRequest(.{
-            .query = query,
-            .k = k,
-        });
-    }
-    if (last.getHits().len < min_hits) {
-        last.deinit();
-        return error.Timeout;
-    }
-    return last;
-}
-
-fn waitForAppliedSequenceAdvance(
-    alloc: Allocator,
-    db: *DB,
-    index_name: []const u8,
-    previous: u64,
-) !u64 {
-    var applied = try db.core.loadAppliedSequence(alloc, index_name);
-    var attempts: usize = 0;
-    while (applied <= previous and attempts < 100) : (attempts += 1) {
-        sleepPollInterval();
-        applied = try db.core.loadAppliedSequence(alloc, index_name);
-    }
-    if (applied <= previous) return error.Timeout;
-    return applied;
-}
-
-fn waitForRawDelete(alloc: Allocator, db: *DB, key: []const u8, max_attempts: usize) !void {
-    var attempts: usize = 0;
-    while (attempts < max_attempts) : (attempts += 1) {
-        const raw = try db.get(alloc, key);
-        if (raw == null) return;
-        alloc.free(raw.?);
-        sleepPollInterval();
-    }
-    return error.Timeout;
-}
-
-fn expectedChunkArtifactKeyAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const u8, chunk_id: u32) ![]u8 {
-    return try internal_keys.chunkArtifactKeyAlloc(alloc, doc_key, artifact_name, chunk_id);
-}
-
-fn expectedChunkArtifactPublicIdAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const u8, chunk_id: u32) ![]u8 {
-    const internal_key = try expectedChunkArtifactKeyAlloc(alloc, doc_key, artifact_name, chunk_id);
-    defer alloc.free(internal_key);
-    var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, internal_key)) orelse return error.InvalidInternalUserKey;
-    defer artifact_ref.deinit(alloc);
-    return try artifact_ids.artifactPublicIdAlloc(alloc, artifact_ref);
-}
-
-fn expectedDocumentEmbeddingArtifactKeyAlloc(alloc: Allocator, doc_key: []const u8, embedding_name: []const u8) ![]u8 {
-    return try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_key, embedding_name);
-}
-
-fn putDenseEmbeddingArtifactForTest(db: *DB, alloc: Allocator, artifact_key: []const u8, source_hash: ?u64, vector: []const f32) !void {
-    const payload = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, source_hash, vector);
-    defer alloc.free(payload);
-    try db.core.store.put(artifact_key, payload);
-    try markArtifactPresenceForTest(db);
-}
-
-fn markArtifactPresenceForTest(db: *DB) !void {
-    db.core.artifact_cleanup_maybe.store(true, .release);
-    try db.core.store.put(internal_keys.artifact_presence_key[0..], "1");
-}
-
-fn putSparseEmbeddingArtifactForTest(
-    db: *DB,
-    alloc: Allocator,
-    artifact_key: []const u8,
-    source_hash: ?u64,
-    indices: []const u32,
-    values: []const f32,
-) !void {
-    const payload = try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(alloc, source_hash, indices, values);
-    defer alloc.free(payload);
-    try db.core.store.put(artifact_key, payload);
-    try markArtifactPresenceForTest(db);
-}
-
-fn expectDenseEmbeddingArtifactValue(alloc: Allocator, value: []const u8, source_hash: ?u64, dims: usize) !void {
-    const header = try enrichment_artifact_codec.decodeHeader(value);
-    try std.testing.expectEqual(enrichment_artifact_codec.codec_version, header.version);
-    try std.testing.expectEqual(enrichment_artifact_codec.Kind.dense_embedding, header.kind);
-    try std.testing.expectEqual(source_hash != null, header.flags.has_source_hash);
-    if (source_hash) |expected_hash| try std.testing.expectEqual(expected_hash, header.source_hash);
-
-    const vector = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, value);
-    defer alloc.free(vector);
-    try std.testing.expectEqual(dims, vector.len);
-}
-
-fn expectDenseEmbeddingArtifactWithSourceHash(alloc: Allocator, value: []const u8, dims: usize) !void {
-    const header = try enrichment_artifact_codec.decodeHeader(value);
-    try std.testing.expectEqual(enrichment_artifact_codec.codec_version, header.version);
-    try std.testing.expectEqual(enrichment_artifact_codec.Kind.dense_embedding, header.kind);
-    try std.testing.expect(header.flags.has_source_hash);
-
-    const vector = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, value);
-    defer alloc.free(vector);
-    try std.testing.expectEqual(dims, vector.len);
-}
-
-fn expectSparseEmbeddingArtifactValue(alloc: Allocator, value: []const u8, source_hash: ?u64, count: usize) !void {
-    const header = try enrichment_artifact_codec.decodeHeader(value);
-    try std.testing.expectEqual(enrichment_artifact_codec.codec_version, header.version);
-    try std.testing.expectEqual(enrichment_artifact_codec.Kind.sparse_embedding, header.kind);
-    try std.testing.expectEqual(source_hash != null, header.flags.has_source_hash);
-    if (source_hash) |expected_hash| try std.testing.expectEqual(expected_hash, header.source_hash);
-
-    var sparse = try enrichment_artifact_codec.decodeSparseEmbeddingAlloc(alloc, value);
-    defer sparse.deinit(alloc);
-    try std.testing.expectEqual(count, sparse.indices.len);
-    try std.testing.expectEqual(count, sparse.values.len);
-}
-
-fn expectJsonNumber(value: std.json.Value, expected: f64) !void {
-    const actual: f64 = switch (value) {
-        .integer => |integer| @floatFromInt(integer),
-        .float => |float| float,
-        else => return error.TestUnexpectedResult,
-    };
-    try std.testing.expectApproxEqAbs(expected, actual, 0.000001);
-}
-
-const CountingDenseEmbedder = struct {
-    deterministic: embedder_mod.DeterministicDenseEmbedder = .{},
-    calls: usize = 0,
-
-    fn embedDense(ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32) ![]f32 {
-        const self: *CountingDenseEmbedder = @ptrCast(@alignCast(ptr));
-        self.calls += 1;
-        return try embedder_mod.DeterministicDenseEmbedder.embedDense(&self.deterministic, alloc, embedding_name, text, dims);
-    }
-
-    fn interface(self: *CountingDenseEmbedder) embedder_mod.DenseEmbedder {
-        return .{
-            .ptr = self,
-            .dense_embed_fn = embedDense,
-            .deinit_fn = null,
-        };
-    }
-};
-
-const GateDenseEmbedder = struct {
-    allowed_successes: std.atomic.Value(usize) = .init(1),
-    successful_requests: std.atomic.Value(usize) = .init(0),
-    total_requests: std.atomic.Value(usize) = .init(0),
-    rate_limited_requests: std.atomic.Value(usize) = .init(0),
-
-    fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-        if (needle.len == 0) return true;
-        if (needle.len > haystack.len) return false;
-        var i: usize = 0;
-        while (i + needle.len <= haystack.len) : (i += 1) {
-            var matched = true;
-            for (needle, 0..) |needle_ch, j| {
-                if (std.ascii.toLower(haystack[i + j]) != needle_ch) {
-                    matched = false;
-                    break;
-                }
-            }
-            if (matched) return true;
-        }
-        return false;
-    }
-
-    fn vectorForText(text: []const u8) [3]f32 {
-        if (containsIgnoreCase(text, "alpha") or containsIgnoreCase(text, "concept")) {
-            return .{ 1.0, 0.0, 0.0 };
-        }
-        if (containsIgnoreCase(text, "beta")) {
-            return .{ 0.0, 1.0, 0.0 };
-        }
-        if (containsIgnoreCase(text, "retrieval") or containsIgnoreCase(text, "semantic")) {
-            return .{ 0.8, 0.2, 0.0 };
-        }
-        return .{ 0.0, 0.0, 1.0 };
-    }
-
-    fn embedDense(ptr: *anyopaque, alloc: Allocator, _: []const u8, text: []const u8, dims: u32) ![]f32 {
-        const self: *GateDenseEmbedder = @ptrCast(@alignCast(ptr));
-        _ = self.total_requests.fetchAdd(1, .monotonic);
-        const previous_successes = self.successful_requests.fetchAdd(1, .acq_rel);
-        if (previous_successes >= self.allowed_successes.load(.acquire)) {
-            _ = self.successful_requests.fetchSub(1, .acq_rel);
-            _ = self.rate_limited_requests.fetchAdd(1, .monotonic);
-            return error.EmbedRateLimited;
-        }
-        if (dims != 3) return error.InvalidVectorDimensions;
-        const vector = try alloc.alloc(f32, 3);
-        const values = vectorForText(text);
-        @memcpy(vector, &values);
-        return vector;
-    }
-
-    fn interface(self: *GateDenseEmbedder) embedder_mod.DenseEmbedder {
-        return .{
-            .ptr = self,
-            .dense_embed_fn = embedDense,
-            .deinit_fn = null,
-        };
-    }
-
-    fn allowAll(self: *GateDenseEmbedder) void {
-        self.allowed_successes.store(std.math.maxInt(usize), .release);
-    }
-
-    fn snapshot(self: *GateDenseEmbedder) struct {
-        total_requests: usize,
-        rate_limited_requests: usize,
-        successful_requests: usize,
-    } {
-        return .{
-            .total_requests = self.total_requests.load(.acquire),
-            .rate_limited_requests = self.rate_limited_requests.load(.acquire),
-            .successful_requests = self.successful_requests.load(.acquire),
-        };
-    }
-};
-
-const CountingSparseEmbedder = struct {
-    deterministic: embedder_mod.DeterministicSparseEmbedder = .{},
-    calls: usize = 0,
-
-    fn embedSparse(ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8) !embedder_mod.SparseEmbedding {
-        const self: *CountingSparseEmbedder = @ptrCast(@alignCast(ptr));
-        self.calls += 1;
-        return try embedder_mod.DeterministicSparseEmbedder.embedSparse(&self.deterministic, alloc, embedding_name, text);
-    }
-
-    fn interface(self: *CountingSparseEmbedder) embedder_mod.SparseEmbedder {
-        return .{
-            .ptr = self,
-            .sparse_embed_fn = embedSparse,
-            .deinit_fn = null,
-        };
-    }
-};
+const lockApply = db_test_support.lockApply;
+const stressDenseBackend = db_test_support.stressDenseBackend;
+const allocStressDenseDocJson = db_test_support.allocStressDenseDocJson;
+const tempPath = db_test_support.tempPath;
+const cleanupTempDir = db_test_support.cleanupTempDir;
+const corruptNonEmptyFilesUnderDir = db_test_support.corruptNonEmptyFilesUnderDir;
+const cacheBlockHitsForBench = db_test_support.cacheBlockHitsForBench;
+const expectObsoletePathsReclaimable = db_test_support.expectObsoletePathsReclaimable;
+const expectRelationalTemporalPriceRow = db_test_support.expectRelationalTemporalPriceRow;
+const expectRelationalTemporalPrimarySelectorPriceRow = db_test_support.expectRelationalTemporalPrimarySelectorPriceRow;
+const verifyDbSingleVectorFailedPlannedRebuildPreservesPublishedPublicReads = db_test_support.verifyDbSingleVectorFailedPlannedRebuildPreservesPublishedPublicReads;
+const default_test_wait_attempts = db_test_support.default_test_wait_attempts;
+const slow_test_wait_attempts = db_test_support.slow_test_wait_attempts;
+const waitForSearchResult = db_test_support.waitForSearchResult;
+const waitForSearchResultWithAttempts = db_test_support.waitForSearchResultWithAttempts;
+const waitForDenseSearchResult = db_test_support.waitForDenseSearchResult;
+const waitForDenseSearchResultWithAttempts = db_test_support.waitForDenseSearchResultWithAttempts;
+const waitForDenseIndexResultsWithAttempts = db_test_support.waitForDenseIndexResultsWithAttempts;
+const waitForAppliedSequenceAdvance = db_test_support.waitForAppliedSequenceAdvance;
+const waitForRawDelete = db_test_support.waitForRawDelete;
+const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
+const putSparseEmbeddingArtifactForTest = db_test_support.putSparseEmbeddingArtifactForTest;
+const CountingDenseEmbedder = db_test_support.CountingDenseEmbedder;
+const GateDenseEmbedder = db_test_support.GateDenseEmbedder;
+const CountingSparseEmbedder = db_test_support.CountingSparseEmbedder;
+const TestTransactionRecoveryResolver = db_test_support.TestTransactionRecoveryResolver;
+const TxnResolverRecorder = db_test_support.TxnResolverRecorder;
+const FixedVectorEmbedder = db_test_support.FixedVectorEmbedder;
+const FakePromotionSink = db_test_support.FakePromotionSink;
+const TestAssetProducer = db_test_support.TestAssetProducer;
+const SharedReadLockHold = db_test_support.SharedReadLockHold(DB);
+const ConcurrentReadProbe = db_test_support.ConcurrentReadProbe(DB);
+const ConcurrentWriteProbe = db_test_support.ConcurrentWriteProbe(DB);
 
 test "db batch get match_all search and index registry" {
     const alloc = std.testing.allocator;
@@ -4046,7 +4683,7 @@ test "db match_all consumes resolved ordinal filter" {
         },
     });
 
-    var include = try DB.internal_impl.resolveDocSetForIdsAlloc(&db, alloc, &.{"doc:b"});
+    var include = try db.internalResolveDocSetForIdsAlloc(alloc, &.{"doc:b"});
     errdefer include.deinit(alloc);
     switch (include) {
         .ordinals => |ordinals| {
@@ -4479,12 +5116,12 @@ test "db table schema apply stages algebraic pending before durable schema swap"
             .writes = &.{.{ .key = "doc:1", .value = "{\"old_field\":\"legacy\",\"new_field\":\"fresh\"}" }},
             .sync_level = .full_index,
         });
-        try std.testing.expect(try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, db.core.store, "old_field"));
+        try std.testing.expect(try index_manager_mod.storeHasDocFactScalarKeyContaining(alloc, db.core.store, "old_field"));
 
         // Simulate a crash after the algebraic catalog has been marked pending
         // for schema v2, but before the runtime schema is durably swapped from
         // v1 to v2.
-        try DB.schema_runtime_impl.stageAlgebraicSchemaConfigsPending(&db, schema_v2);
+        try db.schemaRuntimeStageAlgebraicSchemaConfigsPending(schema_v2);
         const staged = db.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(@as(u32, 2), staged.index.config().schema_version);
         try std.testing.expectEqualStrings("rebuild_required", staged.index.config().capability_lifecycle_status);
@@ -4504,7 +5141,7 @@ test "db table schema apply stages algebraic pending before durable schema swap"
         const entry = readonly.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(@as(u32, 2), entry.index.config().schema_version);
         try std.testing.expectEqualStrings("rebuild_required", entry.index.config().capability_lifecycle_status);
-        try std.testing.expect(try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, readonly.core.store, "old_field"));
+        try std.testing.expect(try index_manager_mod.storeHasDocFactScalarKeyContaining(alloc, readonly.core.store, "old_field"));
     }
 
     {
@@ -4515,14 +5152,14 @@ test "db table schema apply stages algebraic pending before durable schema swap"
         // v2, so it must leave the rebuild pending until the schema write lands.
         const pending = writer.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
         try std.testing.expectEqualStrings("rebuild_required", pending.index.config().capability_lifecycle_status);
-        try std.testing.expect(try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, writer.core.store, "old_field"));
+        try std.testing.expect(try index_manager_mod.storeHasDocFactScalarKeyContaining(alloc, writer.core.store, "old_field"));
 
         try writer.applyTableSchemaJson(alloc, schema_v2, .{});
         const current = writer.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(@as(u32, 2), current.index.config().schema_version);
         try std.testing.expectEqualStrings("current", current.index.config().capability_lifecycle_status);
-        try std.testing.expect(!try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, writer.core.store, "old_field"));
-        try std.testing.expect(try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, writer.core.store, "new_field"));
+        try std.testing.expect(!try index_manager_mod.storeHasDocFactScalarKeyContaining(alloc, writer.core.store, "old_field"));
+        try std.testing.expect(try index_manager_mod.storeHasDocFactScalarKeyContaining(alloc, writer.core.store, "new_field"));
 
         const durable_schema = (try schema_mod.loadSchema(writer.core.store, alloc)) orelse return error.TestUnexpectedResult;
         defer schema_mod.freeSchema(alloc, durable_schema);
@@ -4564,9 +5201,9 @@ test "db staged algebraic pending waits for first durable schema" {
             .writes = &.{.{ .key = "doc:1", .value = "{\"old_field\":\"legacy\",\"new_field\":\"fresh\"}" }},
             .sync_level = .full_index,
         });
-        try std.testing.expect(try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, db.core.store, "old_field"));
+        try std.testing.expect(try index_manager_mod.storeHasDocFactScalarKeyContaining(alloc, db.core.store, "old_field"));
 
-        try DB.schema_runtime_impl.stageAlgebraicSchemaConfigsPending(&db, schema_v2);
+        try db.schemaRuntimeStageAlgebraicSchemaConfigsPending(schema_v2);
         const staged = db.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(@as(u32, 2), staged.index.config().schema_version);
         try std.testing.expectEqualStrings("rebuild_required", staged.index.config().capability_lifecycle_status);
@@ -4582,14 +5219,14 @@ test "db staged algebraic pending waits for first durable schema" {
         const pending = writer.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(@as(u32, 2), pending.index.config().schema_version);
         try std.testing.expectEqualStrings("rebuild_required", pending.index.config().capability_lifecycle_status);
-        try std.testing.expect(try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, writer.core.store, "old_field"));
+        try std.testing.expect(try index_manager_mod.storeHasDocFactScalarKeyContaining(alloc, writer.core.store, "old_field"));
 
         try writer.applyTableSchemaJson(alloc, schema_v2, .{});
         const current = writer.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(@as(u32, 2), current.index.config().schema_version);
         try std.testing.expectEqualStrings("current", current.index.config().capability_lifecycle_status);
-        try std.testing.expect(!try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, writer.core.store, "old_field"));
-        try std.testing.expect(try testStoreHasAlgebraicDocFactScalarKeyContaining(alloc, writer.core.store, "new_field"));
+        try std.testing.expect(!try index_manager_mod.storeHasDocFactScalarKeyContaining(alloc, writer.core.store, "old_field"));
+        try std.testing.expect(try index_manager_mod.storeHasDocFactScalarKeyContaining(alloc, writer.core.store, "new_field"));
 
         const durable_schema = (try schema_mod.loadSchema(writer.core.store, alloc)) orelse return error.TestUnexpectedResult;
         defer schema_mod.freeSchema(alloc, durable_schema);
@@ -5216,20 +5853,6 @@ test "db direct schema apply rejects generated columns without deterministic bac
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, db.applyTableSchemaJson(alloc, generated_source_schema, .{}));
 }
 
-fn testUniqueTupleValueAlloc(alloc: Allocator, values: []const []const u8) ![]u8 {
-    const typed_dv = @import("../../section/typed_doc_values.zig");
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-    for (values) |value| {
-        var component = std.ArrayListUnmanaged(u8).empty;
-        defer component.deinit(alloc);
-        try component.append(alloc, @intFromEnum(typed_dv.ValueType.bytes_val));
-        try component.appendSlice(alloc, value);
-        try internal_keys.appendEncodedComponent(&out, alloc, component.items);
-    }
-    return try out.toOwnedSlice(alloc);
-}
-
 test "db direct schema apply validates and builds added unique constraints" {
     const alloc = std.testing.allocator;
 
@@ -5257,7 +5880,7 @@ test "db direct schema apply validates and builds added unique constraints" {
 
     try db.applyTableSchemaJson(alloc, schema_v2, .{});
 
-    const unique_value = try testUniqueTupleValueAlloc(alloc, &.{"a@example.com"});
+    const unique_value = try relational_store_mod.bytesTupleValueAlloc(alloc, &.{"a@example.com"});
     defer alloc.free(unique_value);
     const unique_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_email_key", unique_value);
     defer alloc.free(unique_key);
@@ -5366,7 +5989,7 @@ test "db direct schema apply builds added unique constraints before foreign keys
 
     try db.applyTableSchemaJson(alloc, schema_v2, .{});
 
-    const parent_tuple = try testUniqueTupleValueAlloc(alloc, &.{"a@example.com"});
+    const parent_tuple = try relational_store_mod.bytesTupleValueAlloc(alloc, &.{"a@example.com"});
     defer alloc.free(parent_tuple);
     const unique_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_email_key", parent_tuple);
     defer alloc.free(unique_key);
@@ -5665,9 +6288,9 @@ test "db relational rows check concatenation preserves expression metadata" {
         .value_json = "\"t1\"",
     }};
 
-    const combined = try DB.relationalRowsConcatChecksAlloc(alloc, base[0..], extra[0..]);
+    const combined = try relational_rows.concatChecksAlloc(alloc, base[0..], extra[0..]);
     defer {
-        DB.freeRelationalRowsChecks(alloc, combined);
+        relational_rows.freeChecks(alloc, combined);
         if (combined.len > 0) alloc.free(combined);
     }
 
@@ -5804,10 +6427,6 @@ test "db ttl cleanup enabled requires backend runtime io" {
     }));
 }
 
-const TestTransactionRecoveryResolver = struct {
-    fn resolve(_: *anyopaque, _: transactions_mod.TxnId, _: []const u8, _: transactions_mod.TxnStatus, _: u64) !void {}
-};
-
 test "db transaction recovery enabled requires backend runtime io" {
     const alloc = std.testing.allocator;
 
@@ -5913,7 +6532,7 @@ test "db batch treats reserved namespace bytes as user document ids" {
     try std.testing.expect(raw != null);
     try std.testing.expect(std.mem.indexOf(u8, raw.?, "\"binary\"") != null);
 
-    var resolved = try DB.internal_impl.resolveDocSetForIdsAlloc(&db, alloc, &.{raw_id});
+    var resolved = try db.internalResolveDocSetForIdsAlloc(alloc, &.{raw_id});
     defer resolved.deinit(alloc);
     switch (resolved) {
         .ordinals => |ordinals| {
@@ -5923,7 +6542,7 @@ test "db batch treats reserved namespace bytes as user document ids" {
         else => return error.ExpectedOrdinalDocSet,
     }
 
-    const resolved_doc_ids = (try DB.internal_impl.docIdsForResolvedDocSetAlloc(&db, alloc, &resolved)).?;
+    const resolved_doc_ids = (try db.internalDocIdsForResolvedDocSetAlloc(alloc, &resolved)).?;
     defer {
         for (resolved_doc_ids) |doc_id| alloc.free(@constCast(doc_id));
         alloc.free(resolved_doc_ids);
@@ -5978,7 +6597,7 @@ test "db batch and scan round trip adversarial document ids" {
         try std.testing.expectEqualStrings(expected, raw);
     }
 
-    var resolved = try DB.internal_impl.resolveDocSetForIdsAlloc(&db, alloc, raw_ids[0..]);
+    var resolved = try db.internalResolveDocSetForIdsAlloc(alloc, raw_ids[0..]);
     defer resolved.deinit(alloc);
     switch (resolved) {
         .ordinals => |ordinals| {
@@ -5990,7 +6609,7 @@ test "db batch and scan round trip adversarial document ids" {
         else => return error.ExpectedOrdinalDocSet,
     }
 
-    const resolved_doc_ids = (try DB.internal_impl.docIdsForResolvedDocSetAlloc(&db, alloc, &resolved)).?;
+    const resolved_doc_ids = (try db.internalDocIdsForResolvedDocSetAlloc(alloc, &resolved)).?;
     defer {
         for (resolved_doc_ids) |doc_id| alloc.free(@constCast(doc_id));
         alloc.free(resolved_doc_ids);
@@ -6085,28 +6704,28 @@ test "db resolved doc-set projection honors identity read generation" {
     var resolved = try doc_set.fromOrdinalsAlloc(alloc, &.{ 1, 2 });
     defer resolved.deinit(alloc);
 
-    try std.testing.expectEqual(@as(?[]const []const u8, null), try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &resolved, 1));
-    try std.testing.expectEqual(@as(?[]const []const u8, null), try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &resolved, 2));
-    try std.testing.expectEqual(@as(?[]const []const u8, null), try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &resolved, 3));
-    try std.testing.expectEqual(@as(?[]const []const u8, null), try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &resolved, null));
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &resolved, 1));
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &resolved, 2));
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &resolved, 3));
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &resolved, null));
 
     var created = try doc_set.fromOrdinalsAlloc(alloc, &.{1});
     defer created.deinit(alloc);
-    const visible_doc_ids = (try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &created, 1)) orelse return error.TestUnexpectedResult;
+    const visible_doc_ids = (try db.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &created, 1)) orelse return error.TestUnexpectedResult;
     defer {
         for (visible_doc_ids) |doc_id| alloc.free(@constCast(doc_id));
         alloc.free(visible_doc_ids);
     }
     try std.testing.expectEqual(@as(usize, 1), visible_doc_ids.len);
     try std.testing.expectEqualStrings("doc:a", visible_doc_ids[0]);
-    try std.testing.expectEqual(@as(?[]const []const u8, null), try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &created, 2));
-    try std.testing.expectEqual(@as(?[]const []const u8, null), try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &created, null));
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &created, 2));
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &created, null));
 
     var future = try doc_set.fromOrdinalsAlloc(alloc, &.{2});
     defer future.deinit(alloc);
-    try std.testing.expectEqual(@as(?[]const []const u8, null), try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &future, 1));
-    try std.testing.expectEqual(@as(?[]const []const u8, null), try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &future, 2));
-    const future_doc_ids = (try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &future, 3)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &future, 1));
+    try std.testing.expectEqual(@as(?[]const []const u8, null), try db.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &future, 2));
+    const future_doc_ids = (try db.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &future, 3)) orelse return error.TestUnexpectedResult;
     defer {
         for (future_doc_ids) |doc_id| alloc.free(@constCast(doc_id));
         alloc.free(future_doc_ids);
@@ -6114,7 +6733,7 @@ test "db resolved doc-set projection honors identity read generation" {
     try std.testing.expectEqual(@as(usize, 1), future_doc_ids.len);
     try std.testing.expectEqualStrings("doc:b", future_doc_ids[0]);
 
-    const current_doc_ids = (try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &future, null)) orelse return error.TestUnexpectedResult;
+    const current_doc_ids = (try db.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &future, null)) orelse return error.TestUnexpectedResult;
     defer {
         for (current_doc_ids) |doc_id| alloc.free(@constCast(doc_id));
         alloc.free(current_doc_ids);
@@ -6472,7 +7091,7 @@ test "db identity namespace reassignment is unavailable on status-only handles" 
             .identity_namespace = old_namespace,
         });
         defer status_db.close();
-        try std.testing.expectError(error.UnsupportedOperation, status_db.reassignIdentityNamespaceForInternalTransition(new_namespace));
+        try std.testing.expectError(error.ReadOnly, status_db.reassignIdentityNamespaceForInternalTransition(new_namespace));
         const stats = try status_db.runtimeStatusStatsConsistent(alloc);
         defer types.freeDBStats(alloc, stats);
         try std.testing.expectEqual(old_namespace.table_id, stats.doc_identity.namespace_table_id);
@@ -6509,9 +7128,9 @@ test "db stats expose document identity coverage and tombstones" {
         },
     });
 
-    var resolved_existing = try DB.internal_impl.resolveDocSetForIdsAlloc(&db, alloc, &.{"doc:a"});
+    var resolved_existing = try db.internalResolveDocSetForIdsAlloc(alloc, &.{"doc:a"});
     defer resolved_existing.deinit(alloc);
-    var resolved_missing = try DB.internal_impl.resolveDocSetForIdsAlloc(&db, alloc, &.{"doc:missing"});
+    var resolved_missing = try db.internalResolveDocSetForIdsAlloc(alloc, &.{"doc:missing"});
     defer resolved_missing.deinit(alloc);
 
     const fast = try db.stats(alloc);
@@ -6844,13 +7463,13 @@ test "db caches identity visibility summary after local writes" {
         .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" }},
     });
     try std.testing.expect(db.identity_visibility_summary_cache != null);
-    try std.testing.expect(try DB.internal_impl.allDocsVisibleAtGeneration(&db, db.core.nextDerivedSequence()));
+    try std.testing.expect(try db.internalAllDocsVisibleAtGeneration(db.core.nextDerivedSequence()));
 
     try db.batch(.{
         .deletes = &.{"doc:a"},
     });
     try std.testing.expect(db.identity_visibility_summary_cache != null);
-    try std.testing.expect(!(try DB.internal_impl.allDocsVisibleAtGeneration(&db, db.core.nextDerivedSequence())));
+    try std.testing.expect(!(try db.internalAllDocsVisibleAtGeneration(db.core.nextDerivedSequence())));
 }
 
 test "db lsm primary compaction preserves doc identity ordinals" {
@@ -7031,7 +7650,7 @@ test "db explicit doc-id filter resolution honors identity generation" {
     );
     try db.core.store.putBatchWithReplay(null, delete_identity.items, &.{}, null);
 
-    var visible_at_create = try DB.internal_impl.resolvedDocFilterForIdsAlloc(&db, true, &.{"doc:a"}, &.{}, 1);
+    var visible_at_create = try db.internalResolvedDocFilterForIdsAlloc(true, &.{"doc:a"}, &.{}, 1);
     defer visible_at_create.deinit(alloc);
     switch (visible_at_create.include) {
         .ordinals => |ordinals| {
@@ -7041,7 +7660,7 @@ test "db explicit doc-id filter resolution honors identity generation" {
         else => return error.ExpectedOrdinalDocSet,
     }
 
-    var hidden_at_delete = try DB.internal_impl.resolvedDocFilterForIdsAlloc(&db, true, &.{"doc:a"}, &.{}, 2);
+    var hidden_at_delete = try db.internalResolvedDocFilterForIdsAlloc(true, &.{"doc:a"}, &.{}, 2);
     defer hidden_at_delete.deinit(alloc);
     try std.testing.expectEqual(@as(?usize, 0), hidden_at_delete.include.estimatedCardinality());
 }
@@ -7078,7 +7697,7 @@ test "db doc set planning stats record ordinal bitmap promotion" {
 
     try db.batch(.{ .writes = writes.items });
 
-    var resolved = try DB.internal_impl.resolveDocSetForIdsAlloc(&db, alloc, doc_ids.items);
+    var resolved = try db.internalResolveDocSetForIdsAlloc(alloc, doc_ids.items);
     defer resolved.deinit(alloc);
     switch (resolved) {
         .ordinal_bitmap => |*bitmap| try std.testing.expectEqual(@as(usize, doc_set.bitmap_min_cardinality), bitmap.cardinality()),
@@ -7120,7 +7739,7 @@ test "db sparse index uses identity ordinals as physical doc nums for primary do
     try std.testing.expectEqual(@as(?u32, 1), try sparse_entry.index.debugDocNumForDocId("doc:a"));
     try std.testing.expectEqual(@as(?u32, 2), try sparse_entry.index.debugDocNumForDocId("doc:b"));
 
-    var include = try DB.internal_impl.resolveDocSetForIdsAlloc(&db, alloc, &.{"doc:b"});
+    var include = try db.internalResolveDocSetForIdsAlloc(alloc, &.{"doc:b"});
     errdefer include.deinit(alloc);
     const ordinal = switch (include) {
         .ordinals => |ordinals| blk: {
@@ -7230,7 +7849,7 @@ test "db dense index stores stable vector ids with ordinal filter mappings" {
         .sync_level = .full_index,
     });
 
-    var include = try DB.internal_impl.resolveDocSetForIdsAlloc(&db, alloc, &.{"doc:b"});
+    var include = try db.internalResolveDocSetForIdsAlloc(alloc, &.{"doc:b"});
     errdefer include.deinit(alloc);
     const ordinal = switch (include) {
         .ordinals => |ordinals| blk: {
@@ -7240,7 +7859,7 @@ test "db dense index stores stable vector ids with ordinal filter mappings" {
         else => return error.ExpectedOrdinalDocSet,
     };
     try std.testing.expectEqual(@as(doc_set.DocOrdinal, 2), ordinal);
-    const expected_vector_id = denseTestVectorId("doc:b");
+    const expected_vector_id = index_manager_mod.deterministicDenseVectorId("doc:b");
     try std.testing.expect(expected_vector_id != @as(u64, ordinal));
     try std.testing.expectEqual(@as(?u64, expected_vector_id), try db.core.index_manager.lookupDenseVectorId(db.core.store, "dv_v1", "doc:b"));
 
@@ -7251,7 +7870,7 @@ test "db dense index stores stable vector ids with ordinal filter mappings" {
     include = .all;
     defer filter.deinit(alloc);
 
-    try std.testing.expect(!DB.search_runtime_impl.canUsePublishedDenseSearch(&db, .{
+    try std.testing.expect(!db.searchRuntimeCanUsePublishedDenseSearch(.{
         .index_name = "dv_v1",
         .limit = 1,
         .include_stored = false,
@@ -7319,7 +7938,7 @@ test "db resolved doc filter normalizes doc keys before composing native ids" {
     };
     defer doc_key_filter.deinit(alloc);
 
-    var composed = (try DB.search_runtime_impl.resolvedDocFilterForRequestNativeConstraintsAlloc(&db, alloc, .{
+    var composed = (try db.searchRuntimeResolvedDocFilterForRequestNativeConstraintsAlloc(alloc, .{
         .resolved_doc_filter = &doc_key_filter,
         .filter_doc_ids_positive = true,
         .filter_doc_ids = &.{"doc:b"},
@@ -7338,7 +7957,7 @@ test "db resolved doc filter normalizes doc keys before composing native ids" {
         .include = try doc_set.cloneDocKeysAlloc(alloc, &.{ "doc:a", "missing" }),
     };
     defer partial_doc_key_filter.deinit(alloc);
-    try std.testing.expect((try DB.search_runtime_impl.resolvedDocFilterForRequestNativeConstraintsAlloc(&db, alloc, .{
+    try std.testing.expect((try db.searchRuntimeResolvedDocFilterForRequestNativeConstraintsAlloc(alloc, .{
         .resolved_doc_filter = &partial_doc_key_filter,
         .filter_doc_ids_positive = true,
         .filter_doc_ids = &.{"doc:a"},
@@ -7378,7 +7997,7 @@ test "db vector full text filters project through doc identity ordinals" {
         .sync_level = .full_index,
     });
 
-    try std.testing.expectEqual(@as(?u64, denseTestVectorId("doc:b")), try db.core.index_manager.lookupDenseVectorId(db.core.store, "dv_v1", "doc:b"));
+    try std.testing.expectEqual(@as(?u64, index_manager_mod.deterministicDenseVectorId("doc:b")), try db.core.index_manager.lookupDenseVectorId(db.core.store, "dv_v1", "doc:b"));
 
     var dense_filtered = try db.searchDenseProfiled(alloc, .{
         .index_name = "dv_v1",
@@ -8976,19 +9595,6 @@ test "db batch uses change journal as the replay authority" {
     try std.testing.expectEqual(@as(usize, 1), entries.len);
 }
 
-fn waitForDerivedReplayTarget(db: *DB) !void {
-    const sequence = db.core.nextDerivedSequence();
-    if (sequence == 0) return;
-    try db.executor.waitForAll(sequence);
-}
-
-fn journalRecordHasHint(record: change_journal_mod.Record, hint: change_journal_mod.TargetHint) bool {
-    for (record.target_hints) |candidate| {
-        if (candidate == hint) return true;
-    }
-    return false;
-}
-
 test "db pending work stats track replay stream sequence" {
     const alloc = std.testing.allocator;
 
@@ -9258,26 +9864,6 @@ test "db _edges writes record graph artifacts in the replay stream instead of gr
         try std.testing.expect(internal_keys.isGraphEdgeArtifactKey(artifact_key));
     }
 }
-
-/// Embedder that returns a fixed vector for any text, so a backfilled mention
-/// embedding deterministically matches a candidate's name_embedding.
-const FixedVectorEmbedder = struct {
-    fn interface(self: *FixedVectorEmbedder) embedder_mod.DenseEmbedder {
-        return .{ .ptr = self, .dense_embed_fn = embed };
-    }
-    fn embed(ptr: *anyopaque, alloc: Allocator, embedding_name: []const u8, text: []const u8, dims: u32) anyerror![]f32 {
-        _ = ptr;
-        _ = embedding_name;
-        _ = text;
-        _ = dims;
-        const v = try alloc.alloc(f32, 4);
-        v[0] = 1.0;
-        v[1] = 0.0;
-        v[2] = 0.0;
-        v[3] = 0.0;
-        return v;
-    }
-};
 
 test "db starts resolver replay workers only while resolver catalog is configured" {
     const alloc = std.testing.allocator;
@@ -9714,53 +10300,8 @@ test "db refuses resolver removal while resolution or promotion replay is pendin
     // advancing promotion replay. Removing the resolver here would otherwise
     // erase the catalog signal that older retention logic used.
     try std.testing.expectError(error.ResolverReplayPending, db.removeResolver("kg_pending_remove"));
-    try std.testing.expect(DB.lifecycle_impl.promotionStageStats(&db).catch_up_required);
+    try std.testing.expect(db.promotionStageStats().catch_up_required);
 }
-
-/// Thread-safe capturing entity sink for the promotion integration test.
-const FakePromotionSink = struct {
-    const Upsert = struct { table: []u8, key: []u8, doc: []u8 };
-    alloc: std.mem.Allocator,
-    mutex: std.atomic.Mutex = .unlocked,
-    upserts: std.ArrayListUnmanaged(Upsert) = .empty,
-
-    fn deinit(self: *FakePromotionSink) void {
-        for (self.upserts.items) |u| {
-            self.alloc.free(u.table);
-            self.alloc.free(u.key);
-            self.alloc.free(u.doc);
-        }
-        self.upserts.deinit(self.alloc);
-    }
-
-    fn sink(self: *FakePromotionSink) promotion_runtime_mod.EntitySink {
-        return .{ .ptr = self, .vtable = &vtable };
-    }
-    const vtable = promotion_runtime_mod.EntitySink.VTable{ .upsert = upsertFn };
-
-    fn upsertFn(ptr: *anyopaque, allocator: std.mem.Allocator, table: []const u8, key: []const u8, doc_json: []const u8) anyerror!void {
-        _ = allocator;
-        const self: *FakePromotionSink = @ptrCast(@alignCast(ptr));
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
-        const t = try self.alloc.dupe(u8, table);
-        errdefer self.alloc.free(t);
-        const k = try self.alloc.dupe(u8, key);
-        errdefer self.alloc.free(k);
-        const d = try self.alloc.dupe(u8, doc_json);
-        errdefer self.alloc.free(d);
-        try self.upserts.append(self.alloc, .{ .table = t, .key = k, .doc = d });
-    }
-
-    fn findKey(self: *FakePromotionSink, key: []const u8) ?[]const u8 {
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
-        for (self.upserts.items) |u| {
-            if (std.mem.eql(u8, u.key, key)) return u.doc;
-        }
-        return null;
-    }
-};
 
 test "db promotes resolved entities into entity-document upserts end-to-end" {
     const alloc = std.testing.allocator;
@@ -9910,9 +10451,9 @@ test "db graph replay blocks resolution artifact without resolver contract" {
 
     try db.core.store.put(resolution_key, "{}");
 
-    try std.testing.expect(!DB.derived_async_impl.batchAffectsManagedIndex(db.core.index_manager, batch, index_ref));
-    try std.testing.expect(try DB.derived_async_impl.batchAffectsManagedIndexForReplay(db.core.index_manager, batch, index_ref));
-    try std.testing.expect(try DB.derived_async_impl.batchAdvancesManagedIndexApplyStateForReplay(db.core.index_manager, batch, index_ref));
+    try std.testing.expect(!db.derivedAsyncBatchAffectsManagedIndex(batch, index_ref));
+    try std.testing.expect(try db.derivedAsyncBatchAffectsManagedIndexForReplay(batch, index_ref));
+    try std.testing.expect(try db.derivedAsyncBatchAdvancesManagedIndexApplyStateForReplay(batch, index_ref));
     try std.testing.expectError(
         error.MissingResolverArtifactContract,
         derived_async.materializeGraphSourceArtifactsForIndex(
@@ -9947,8 +10488,8 @@ test "db graph replay blocks resolution artifact without resolver contract" {
         .config_generation = 1,
     });
 
-    try std.testing.expect(DB.derived_async_impl.batchAffectsManagedIndex(db.core.index_manager, batch, index_ref));
-    try std.testing.expect(try DB.derived_async_impl.batchAdvancesManagedIndexApplyStateForReplay(db.core.index_manager, batch, index_ref));
+    try std.testing.expect(db.derivedAsyncBatchAffectsManagedIndex(batch, index_ref));
+    try std.testing.expect(try db.derivedAsyncBatchAdvancesManagedIndexApplyStateForReplay(batch, index_ref));
 }
 
 test "db graph replay ignores resolution artifacts bound to another source contract" {
@@ -10000,14 +10541,14 @@ test "db graph replay ignores resolution artifacts bound to another source contr
     };
 
     const graph_a = index_manager_mod.ManagedIndexRef{ .name = "graph_a", .kind = .graph };
-    try std.testing.expect(!DB.derived_async_impl.batchAffectsManagedIndex(db.core.index_manager, batch, graph_a));
-    try std.testing.expect(!try DB.derived_async_impl.batchAffectsManagedIndexForReplay(db.core.index_manager, batch, graph_a));
-    try std.testing.expect(!try DB.derived_async_impl.batchAdvancesManagedIndexApplyStateForReplay(db.core.index_manager, batch, graph_a));
+    try std.testing.expect(!db.derivedAsyncBatchAffectsManagedIndex(batch, graph_a));
+    try std.testing.expect(!try db.derivedAsyncBatchAffectsManagedIndexForReplay(batch, graph_a));
+    try std.testing.expect(!try db.derivedAsyncBatchAdvancesManagedIndexApplyStateForReplay(batch, graph_a));
 
     const graph_b = index_manager_mod.ManagedIndexRef{ .name = "graph_b", .kind = .graph };
-    try std.testing.expect(DB.derived_async_impl.batchAffectsManagedIndex(db.core.index_manager, batch, graph_b));
-    try std.testing.expect(try DB.derived_async_impl.batchAffectsManagedIndexForReplay(db.core.index_manager, batch, graph_b));
-    try std.testing.expect(try DB.derived_async_impl.batchAdvancesManagedIndexApplyStateForReplay(db.core.index_manager, batch, graph_b));
+    try std.testing.expect(db.derivedAsyncBatchAffectsManagedIndex(batch, graph_b));
+    try std.testing.expect(try db.derivedAsyncBatchAffectsManagedIndexForReplay(batch, graph_b));
+    try std.testing.expect(try db.derivedAsyncBatchAdvancesManagedIndexApplyStateForReplay(batch, graph_b));
 }
 
 test "db materializes doc->entity mention edges as provenance and clears them on delete" {
@@ -11184,7 +11725,7 @@ test "db graph artifact source replay catches up after reopen" {
         defer alloc.free(artifact_key);
         var ctx = db.batchContext();
         const sequence = db.core.store.reserveNextReplaySequence(1);
-        const replay_payload = try DB.derived_async_impl.encodeChangeRecordPayload(&ctx, .{
+        const replay_payload = try DB.derivedAsyncEncodeChangeRecordPayloadForContext(&ctx, .{
             .changed_artifact_keys = &.{artifact_key},
         }, sequence);
         defer alloc.free(replay_payload);
@@ -11231,7 +11772,7 @@ test "db graph edge artifact replay catches up after reopen" {
         defer alloc.free(graph_value);
         var ctx = db.batchContext();
         const sequence = db.core.store.reserveNextReplaySequence(1);
-        const replay_payload = try DB.derived_async_impl.encodeChangeRecordPayload(&ctx, .{
+        const replay_payload = try DB.derivedAsyncEncodeChangeRecordPayloadForContext(&ctx, .{
             .changed_artifact_keys = &.{graph_key},
         }, sequence);
         defer alloc.free(replay_payload);
@@ -11325,8 +11866,8 @@ test "db batch marks generated enrichment replay for generator-enabled dense ind
 
     try std.testing.expect(journal_record.record.changed_doc_keys.len >= 1);
     try std.testing.expectEqualStrings("doc:a", journal_record.record.changed_doc_keys[0]);
-    try std.testing.expect(journalRecordHasHint(journal_record.record, .enrichment));
-    try std.testing.expect(!journalRecordHasHint(journal_record.record, .dense_vector));
+    try std.testing.expect(change_journal_mod.recordHasHint(journal_record.record, .enrichment));
+    try std.testing.expect(!change_journal_mod.recordHasHint(journal_record.record, .dense_vector));
 }
 
 test "db full_index precomputes generated enrichments into the committed batch" {
@@ -11484,10 +12025,10 @@ test "db enrichments precomputes generated enrichments into the committed batch"
 
     try std.testing.expect(journal_record.record.changed_doc_keys.len >= 1);
     try std.testing.expectEqualStrings("doc:a", journal_record.record.changed_doc_keys[0]);
-    try std.testing.expect(journalRecordHasHint(journal_record.record, .full_text));
-    try std.testing.expect(journalRecordHasHint(journal_record.record, .dense_vector));
-    try std.testing.expect(journalRecordHasHint(journal_record.record, .sparse_vector));
-    try std.testing.expect(!journalRecordHasHint(journal_record.record, .enrichment));
+    try std.testing.expect(change_journal_mod.recordHasHint(journal_record.record, .full_text));
+    try std.testing.expect(change_journal_mod.recordHasHint(journal_record.record, .dense_vector));
+    try std.testing.expect(change_journal_mod.recordHasHint(journal_record.record, .sparse_vector));
+    try std.testing.expect(!change_journal_mod.recordHasHint(journal_record.record, .enrichment));
     try std.testing.expect(journal_record.record.changed_artifact_keys.len > 0);
 }
 
@@ -11531,8 +12072,8 @@ test "db replicated apply decouples client enrichment sync from raft apply execu
     var journal_record = try change_journal_mod.decodeRecord(alloc, journal_entries[0].payload);
     defer journal_record.deinit();
 
-    try std.testing.expect(journalRecordHasHint(journal_record.record, .enrichment));
-    try std.testing.expect(!journalRecordHasHint(journal_record.record, .dense_vector));
+    try std.testing.expect(change_journal_mod.recordHasHint(journal_record.record, .enrichment));
+    try std.testing.expect(!change_journal_mod.recordHasHint(journal_record.record, .dense_vector));
     try std.testing.expectEqual(@as(usize, 0), journal_record.record.changed_artifact_keys.len);
 }
 
@@ -11577,56 +12118,6 @@ test "db enrichments precomputed watermark advances across replay entries withou
 
     try std.testing.expectEqual(db.core.nextDerivedSequence(), db.enrichment_runtime.?.stats().applied_sequence);
 }
-
-fn jsonTestNumber(value: std.json.Value) f64 {
-    return switch (value) {
-        .float => |v| v,
-        .integer => |v| @floatFromInt(v),
-        else => 0,
-    };
-}
-
-const TestAssetProducer = struct {
-    calls: usize = 0,
-    generator_calls: usize = 0,
-    reader_calls: usize = 0,
-    transcriber_calls: usize = 0,
-    extractor_calls: usize = 0,
-    reader_output: ?[]const u8 = null,
-    transcriber_output: ?[]const u8 = null,
-    extractor_output: ?[]const u8 = null,
-
-    fn producer(self: *@This()) asset_producer_mod.Producer {
-        return .{
-            .ptr = self,
-            .vtable = &.{ .produce = produce },
-        };
-    }
-
-    fn produce(ptr: *anyopaque, alloc: Allocator, request: asset_producer_mod.Request) ![]u8 {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        self.calls += 1;
-        switch (request.producer_type) {
-            .copy => {},
-            .document_extraction => {},
-            .generator => self.generator_calls += 1,
-            .reader => self.reader_calls += 1,
-            .transcriber => self.transcriber_calls += 1,
-            .extractor => self.extractor_calls += 1,
-        }
-        if (request.producer_type == .extractor) {
-            if (self.extractor_output) |output| return try alloc.dupe(u8, output);
-            return try std.fmt.allocPrint(alloc, "{{\"relations\":[{{\"type\":\"mentions\",\"target\":{{\"document_id\":{f}}}}}]}}", .{std.json.fmt(request.source_text, .{})});
-        }
-        if (request.producer_type == .reader) {
-            if (self.reader_output) |output| return try alloc.dupe(u8, output);
-        }
-        if (request.producer_type == .transcriber) {
-            if (self.transcriber_output) |output| return try alloc.dupe(u8, output);
-        }
-        return try std.fmt.allocPrint(alloc, "{s}:{s}", .{ @tagName(request.producer_type), request.source_text });
-    }
-};
 
 test "db asset producer enrichments execute fake providers and skip unchanged state" {
     const alloc = std.testing.allocator;
@@ -12297,8 +12788,8 @@ test "db document extraction stores structured OCR confidence and coordinates" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.92), parsed.value.object.get("ocr_confidence").?.float, 0.0001);
     const bbox = parsed.value.object.get("ocr_bbox").?.array.items;
     try std.testing.expectEqual(@as(usize, 4), bbox.len);
-    try std.testing.expectApproxEqAbs(@as(f64, 1), jsonTestNumber(bbox[0]), 0.0001);
-    try std.testing.expectApproxEqAbs(@as(f64, 42), jsonTestNumber(bbox[3]), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1), relational_rows.jsonNumberAsF64(bbox[0]) orelse return error.TestUnexpectedResult, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 42), relational_rows.jsonNumberAsF64(bbox[3]) orelse return error.TestUnexpectedResult, 0.0001);
     try std.testing.expectEqualStrings("low contrast", parsed.value.object.get("extraction_warning").?.string);
     const provenance = parsed.value.object.get("provenance").?.object;
     try std.testing.expectApproxEqAbs(@as(f64, 0.92), provenance.get("confidence").?.float, 0.0001);
@@ -13291,7 +13782,7 @@ test "db document extraction skips stable unit local rewrites while replaying fu
     const second_value = "{\"url\":\"data:text/plain,alpha%20beta%20gamma\"}";
     var extracted = [_]mapper.ExtractedWrite{try mapper.extractWrite(alloc, "doc:a", second_value)};
     defer extracted[0].deinit(alloc);
-    var precomputed = try DB.write_path_impl.prepareGeneratedEnrichments(&db, .{
+    var precomputed = try db.prepareGeneratedEnrichments(.{
         .writes = &.{.{ .key = "doc:a", .value = second_value }},
     }, &extracted, .all, &.{});
     defer precomputed.deinit(alloc);
@@ -13822,13 +14313,13 @@ test "db leased enrichment worker generates dense embeddings" {
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
 
-    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "body_dense_v1");
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "body_dense_v1");
     defer alloc.free(artifact_key);
     const artifacts = try db.core.store.scanPrefix(alloc, artifact_key);
     defer docstore_mod.DocStore.freeResults(alloc, artifacts);
     try std.testing.expectEqual(@as(usize, 1), artifacts.len);
     try std.testing.expectEqualStrings(artifact_key, artifacts[0].key);
-    try expectDenseEmbeddingArtifactValue(alloc, artifacts[0].value, enrichment_artifact_codec.hashSource("generated vector text"), 3);
+    try enrichment_artifact_codec.expectDenseEmbeddingValue(alloc, artifacts[0].value, enrichment_artifact_codec.hashSource("generated vector text"), 3);
 }
 
 test "db relational enrichment sources read committed base rows" {
@@ -13937,7 +14428,7 @@ test "db relational dense HBC loader reads committed base rows" {
         .sync_level = .full_index,
     });
 
-    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "row:a", "dv_v1");
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "row:a", "dv_v1");
     defer alloc.free(artifact_key);
     try db.core.store.delete(artifact_key);
     db.clearDenseHbcCaches();
@@ -14020,13 +14511,13 @@ test "db leased enrichment worker generates dense embeddings with durable lsm pr
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
 
-    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "body_dense_v1");
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "body_dense_v1");
     defer alloc.free(artifact_key);
     const artifacts = try db.core.store.scanPrefix(alloc, artifact_key);
     defer docstore_mod.DocStore.freeResults(alloc, artifacts);
     try std.testing.expectEqual(@as(usize, 1), artifacts.len);
     try std.testing.expectEqualStrings(artifact_key, artifacts[0].key);
-    try expectDenseEmbeddingArtifactValue(alloc, artifacts[0].value, enrichment_artifact_codec.hashSource("generated vector text"), 3);
+    try enrichment_artifact_codec.expectDenseEmbeddingValue(alloc, artifacts[0].value, enrichment_artifact_codec.hashSource("generated vector text"), 3);
 }
 
 test "db managed dense enrichment remains searchable after transient rate limits" {
@@ -14214,39 +14705,6 @@ test "db open quarantines dense index with unsupported artifact version" {
     }, 1);
     defer recovered.deinit();
     try std.testing.expect(recovered.total_hits >= 1);
-}
-
-fn corruptNonEmptyFilesUnderDir(alloc: Allocator, root_path: []const u8) !usize {
-    var io_impl = threadedIo();
-    defer io_impl.deinit();
-    const io = io_impl.io();
-
-    var root_dir = try std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true });
-    defer root_dir.close(io);
-
-    var walker = try root_dir.walk(alloc);
-    defer walker.deinit();
-
-    var corrupted: usize = 0;
-    while (try walker.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        const full_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root_path, entry.path });
-        defer alloc.free(full_path);
-        const stat = try std.Io.Dir.cwd().statFile(io, full_path, .{});
-        if (stat.size == 0) continue;
-
-        const bytes = try alloc.alloc(u8, @intCast(stat.size));
-        defer alloc.free(bytes);
-        for (bytes, 0..) |*byte, i| {
-            byte.* = @truncate((i *% 131) +% 17);
-        }
-        try std.Io.Dir.cwd().writeFile(io, .{
-            .sub_path = full_path,
-            .data = bytes,
-        });
-        corrupted += 1;
-    }
-    return corrupted;
 }
 
 test "db drops quarantined dense index after persisted index directory corruption" {
@@ -14481,7 +14939,7 @@ test "db managed dense enrichment delete recreate recovers after corrupt artifac
         try std.testing.expectEqual(@as(?u64, 2), stats.indexes[0].doc_count);
     }
 
-    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "semantic_idx");
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "semantic_idx");
     defer alloc.free(artifact_key);
     try db.core.store.put(artifact_key, "bad-artifact");
 
@@ -14545,7 +15003,7 @@ test "db managed dense enrichment delete recreate recovers after corrupt artifac
         });
         try db.runUntilIdle();
 
-        const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "semantic_idx");
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "semantic_idx");
         defer alloc.free(artifact_key);
         try db.core.store.put(artifact_key, "bad-artifact");
     }
@@ -14628,12 +15086,12 @@ test "db dense enrichment skips unchanged source hash" {
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(usize, 2), counting.calls);
 
-    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "body_dense_v1");
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "body_dense_v1");
     defer alloc.free(artifact_key);
     const artifacts = try db.core.store.scanPrefix(alloc, artifact_key);
     defer docstore_mod.DocStore.freeResults(alloc, artifacts);
     try std.testing.expectEqual(@as(usize, 1), artifacts.len);
-    try expectDenseEmbeddingArtifactValue(alloc, artifacts[0].value, enrichment_artifact_codec.hashSource("new source"), 3);
+    try enrichment_artifact_codec.expectDenseEmbeddingValue(alloc, artifacts[0].value, enrichment_artifact_codec.hashSource("new source"), 3);
 
     const stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
@@ -14781,7 +15239,7 @@ test "db chunked dense enrichment skips unchanged chunks and deletes stale chunk
             try std.testing.expect(std.mem.indexOf(u8, entry.value, "\"xyzuvw\"") != null);
         } else if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) {
             embedding_count += 1;
-            try expectDenseEmbeddingArtifactValue(alloc, entry.value, enrichment_artifact_codec.hashSource("xyzuvw"), 3);
+            try enrichment_artifact_codec.expectDenseEmbeddingValue(alloc, entry.value, enrichment_artifact_codec.hashSource("xyzuvw"), 3);
         }
     }
     try std.testing.expectEqual(@as(usize, 1), chunk_count);
@@ -15049,12 +15507,12 @@ test "db sparse enrichment skips unchanged source hash" {
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(usize, 2), counting.calls);
 
-    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "sp_v1");
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "sp_v1");
     defer alloc.free(artifact_key);
     const artifacts = try db.core.store.scanPrefix(alloc, artifact_key);
     defer docstore_mod.DocStore.freeResults(alloc, artifacts);
     try std.testing.expectEqual(@as(usize, 1), artifacts.len);
-    try expectSparseEmbeddingArtifactValue(alloc, artifacts[0].value, enrichment_artifact_codec.hashSource("new source"), 2);
+    try enrichment_artifact_codec.expectSparseEmbeddingValue(alloc, artifacts[0].value, enrichment_artifact_codec.hashSource("new source"), 2);
 
     const stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
@@ -15120,7 +15578,7 @@ test "db chunked sparse enrichment skips unchanged chunks and deletes stale spar
         if (internal_keys.isChunkArtifactRecordKey(entry.key)) chunk_count += 1;
         if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) {
             sparse_artifact_count += 1;
-            try expectSparseEmbeddingArtifactValue(alloc, entry.value, enrichment_artifact_codec.hashSource("abcdefgh"), 2);
+            try enrichment_artifact_codec.expectSparseEmbeddingValue(alloc, entry.value, enrichment_artifact_codec.hashSource("abcdefgh"), 2);
         }
     }
     try std.testing.expectEqual(@as(usize, 1), chunk_count);
@@ -15141,7 +15599,7 @@ test "db chunked sparse enrichment skips unchanged chunks and deletes stale spar
     });
     defer stale_result.deinit();
 
-    const stale_chunk_id = try expectedChunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 1);
+    const stale_chunk_id = try artifact_ids.chunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 1);
     defer alloc.free(stale_chunk_id);
     for (stale_result.hits) |hit| {
         try std.testing.expect(!std.mem.eql(u8, hit.id, stale_chunk_id));
@@ -15388,7 +15846,7 @@ test "db runUntilIdle can use planned graph metric maintenance when enabled" {
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectGraphMetricPlannedAutoDecision(&db, true, 0, 1, 0);
+    try graph_metric_runtime_mod.expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
 
     try db.runUntilIdle();
 
@@ -15529,7 +15987,7 @@ test "db planned scheduler does not auto retry failed graph metric generation" {
     });
     try db.runDerivedUntil(db.core.nextDerivedSequence());
 
-    try expectGraphMetricPlannedAutoDecision(&db, true, 0, 1, 0);
+    try graph_metric_runtime_mod.expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
     {
         const pending = db.pendingWorkStats().graph_metric;
         try std.testing.expect(pending.hasWork());
@@ -15551,7 +16009,7 @@ test "db planned scheduler does not auto retry failed graph metric generation" {
     try std.testing.expectEqualStrings("InvalidGraphMetricBuildManifest", failed.last_error);
     const failed_target_generation = failed.target_edge_generation;
 
-    try expectGraphMetricPlannedAutoDecision(&db, false, 0, 0, 0);
+    try graph_metric_runtime_mod.expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, false, 0, 0, 0, 0);
     {
         const pending = db.pendingWorkStats().graph_metric;
         try std.testing.expect(!pending.hasWork());
@@ -15591,7 +16049,7 @@ test "db planned scheduler does not auto retry failed graph metric generation" {
     });
     try db.runDerivedUntil(db.core.nextDerivedSequence());
 
-    try expectGraphMetricPlannedAutoDecision(&db, true, 0, 1, 0);
+    try graph_metric_runtime_mod.expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
     const retry_new_generation = try db.runGraphMetricPlannedCoordinatorSweep(.{
         .max_metrics = 8,
         .start_background_builds = true,
@@ -15604,57 +16062,6 @@ test "db planned scheduler does not auto retry failed graph metric generation" {
         try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
         try std.testing.expect(status.building_generation > failed_target_generation);
     }
-}
-
-fn expectGraphMetricPlannedAutoDecision(
-    db: *DB,
-    should_run_planned: bool,
-    active_builds: usize,
-    eligible_queued: usize,
-    ineligible_queued: usize,
-) !void {
-    try expectGraphMetricPlannedAutoDecisionDetailed(
-        db,
-        should_run_planned,
-        active_builds,
-        eligible_queued,
-        0,
-        ineligible_queued,
-    );
-}
-
-fn expectGraphMetricPlannedAutoDecisionDetailed(
-    db: *DB,
-    should_run_planned: bool,
-    active_builds: usize,
-    eligible_queued: usize,
-    deferred_queued: usize,
-    ineligible_queued: usize,
-) !void {
-    const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
-    try std.testing.expectEqual(should_run_planned, decision.shouldRunPlanned());
-    try std.testing.expectEqual(active_builds, decision.active_builds);
-    try std.testing.expectEqual(eligible_queued, decision.eligible_queued);
-    try std.testing.expectEqual(deferred_queued, decision.deferred_queued);
-    try std.testing.expectEqual(ineligible_queued, decision.ineligible_queued);
-}
-
-fn expectGraphMetricDegreeCanaryDecision(
-    db: *DB,
-    should_run_planned: bool,
-    active_degree_builds: usize,
-    eligible_queued_degree: usize,
-    blocked_active_non_degree: usize,
-    blocked_queued_non_degree: usize,
-) !void {
-    const decision = try db.core.index_manager.graphMetricDegreeCanaryDecision(.{});
-    try std.testing.expectEqual(should_run_planned, decision.shouldRunPlanned());
-    try std.testing.expectEqual(active_degree_builds, decision.active_degree_builds);
-    try std.testing.expectEqual(eligible_queued_degree, decision.eligible_queued_degree);
-    try std.testing.expectEqual(blocked_active_non_degree, decision.blocked_active_non_degree);
-    try std.testing.expectEqual(blocked_queued_non_degree, decision.blocked_queued_non_degree);
-    try std.testing.expectEqual(@as(usize, 0), decision.failed_pages);
-    try std.testing.expect(!decision.truncated_pages);
 }
 
 test "db graph metric degree canary gate tracks queued active and capped degree work" {
@@ -15692,7 +16099,7 @@ test "db graph metric degree canary gate tracks queued active and capped degree 
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectGraphMetricDegreeCanaryDecision(&db, true, 0, 1, 0, 0);
+    try graph_metric_runtime_mod.expectDegreeCanaryDecision(db.core.index_manager, .{}, true, 0, 1, 0, 0);
     const queued_decision = try db.core.index_manager.graphMetricDegreeCanaryDecision(.{});
     try std.testing.expectEqual(@as(usize, 0), queued_decision.control_records);
     try std.testing.expect(queued_decision.queued_degree_control_records > 0);
@@ -15707,7 +16114,7 @@ test "db graph metric degree canary gate tracks queued active and capped degree 
         .start_background_builds = true,
     });
     try std.testing.expectEqual(@as(usize, 1), start.builds_started);
-    try expectGraphMetricDegreeCanaryDecision(&db, true, 1, 0, 0, 0);
+    try graph_metric_runtime_mod.expectDegreeCanaryDecision(db.core.index_manager, .{}, true, 1, 0, 0, 0);
 
     const active_decision = try db.core.index_manager.graphMetricDegreeCanaryDecision(.{});
     try std.testing.expect(active_decision.control_records > 0);
@@ -15721,7 +16128,7 @@ test "db graph metric degree canary gate tracks queued active and capped degree 
 
     db.graph_metric_idle_planned_options.max_rounds = 200;
     try db.runUntilIdle();
-    try expectGraphMetricDegreeCanaryDecision(&db, false, 0, 0, 0, 0);
+    try graph_metric_runtime_mod.expectDegreeCanaryDecision(db.core.index_manager, .{}, false, 0, 0, 0, 0);
 }
 
 test "db graph metric degree canary gate blocks non degree queued work" {
@@ -15754,7 +16161,7 @@ test "db graph metric degree canary gate blocks non degree queued work" {
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectGraphMetricDegreeCanaryDecision(&db, false, 0, 1, 0, 1);
+    try graph_metric_runtime_mod.expectDegreeCanaryDecision(db.core.index_manager, .{}, false, 0, 1, 0, 1);
 
     const degree_canary = try db.core.index_manager.shouldRunGraphMetricDegreeCanary(.{});
     try std.testing.expect(!degree_canary);
@@ -15796,7 +16203,7 @@ test "db runUntilIdle degree canary mode uses planned maintenance for one degree
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectGraphMetricDegreeCanaryDecision(&db, true, 0, 1, 0, 0);
+    try graph_metric_runtime_mod.expectDegreeCanaryDecision(db.core.index_manager, .{}, true, 0, 1, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -16175,7 +16582,7 @@ test "db runUntilIdle degree canary mode falls back to local oracle for mixed me
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectGraphMetricDegreeCanaryDecision(&db, false, 0, 1, 0, 1);
+    try graph_metric_runtime_mod.expectDegreeCanaryDecision(db.core.index_manager, .{}, false, 0, 1, 0, 1);
 
     try db.runUntilIdle();
 
@@ -16247,7 +16654,7 @@ test "db runUntilIdle default graph metric maintenance auto chooses planned for 
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectGraphMetricPlannedAutoDecision(&db, true, 0, 1, 0);
+    try graph_metric_runtime_mod.expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -16404,7 +16811,7 @@ test "db runUntilIdle default graph metric maintenance auto can cap larger pager
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectGraphMetricPlannedAutoDecision(&db, false, 0, 0, 1);
+    try graph_metric_runtime_mod.expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, false, 0, 0, 0, 1);
 
     try db.runUntilIdle();
 
@@ -16552,7 +16959,7 @@ test "db runUntilIdle default graph metric maintenance auto chooses bounded plan
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectGraphMetricPlannedAutoDecision(&db, true, 0, 2, 0);
+    try graph_metric_runtime_mod.expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 2, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -16638,7 +17045,7 @@ test "db runUntilIdle default graph metric maintenance auto chooses planned for 
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectGraphMetricPlannedAutoDecision(&db, true, 0, 1, 0);
+    try graph_metric_runtime_mod.expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -16711,7 +17118,7 @@ test "db runUntilIdle default graph metric maintenance auto chooses planned for 
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectGraphMetricPlannedAutoDecision(&db, true, 0, 1, 0);
+    try graph_metric_runtime_mod.expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -16805,7 +17212,7 @@ test "db runUntilIdle default graph metric maintenance auto resumes active plann
     defer started.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
     try std.testing.expectEqual(target_generation, started.building_generation);
-    try expectGraphMetricPlannedAutoDecision(&db, true, 1, 0, 0);
+    try graph_metric_runtime_mod.expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 1, 0, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -16881,7 +17288,7 @@ test "db runUntilIdle auto graph metric maintenance chooses planned for one smal
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectGraphMetricPlannedAutoDecision(&db, true, 0, 1, 0);
+    try graph_metric_runtime_mod.expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -16948,7 +17355,7 @@ test "db runUntilIdle auto graph metric maintenance chooses planned for one degr
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectGraphMetricPlannedAutoDecision(&db, true, 0, 1, 0);
+    try graph_metric_runtime_mod.expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -17016,7 +17423,7 @@ test "db runUntilIdle auto graph metric maintenance chooses planned for one smal
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectGraphMetricPlannedAutoDecision(&db, true, 0, 1, 0);
+    try graph_metric_runtime_mod.expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -17084,7 +17491,7 @@ test "db runUntilIdle auto graph metric maintenance chooses bounded planned for 
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectGraphMetricPlannedAutoDecision(&db, true, 0, 2, 0);
+    try graph_metric_runtime_mod.expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 2, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -17167,7 +17574,7 @@ test "db runUntilIdle auto graph metric maintenance defers queued work at per-in
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectGraphMetricPlannedAutoDecisionDetailed(&db, true, 0, 1, 1, 0);
+    try graph_metric_runtime_mod.expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 1, 0);
 
     try db.runUntilIdle();
 
@@ -17240,7 +17647,7 @@ test "db runUntilIdle auto graph metric maintenance can cap larger pagerank" {
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectGraphMetricPlannedAutoDecision(&db, false, 0, 0, 1);
+    try graph_metric_runtime_mod.expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, false, 0, 0, 0, 1);
 
     try db.runUntilIdle();
 
@@ -17309,7 +17716,7 @@ test "db runUntilIdle auto graph metric maintenance can cap larger eigenvector" 
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectGraphMetricPlannedAutoDecision(&db, false, 0, 0, 1);
+    try graph_metric_runtime_mod.expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, false, 0, 0, 0, 1);
 
     try db.runUntilIdle();
 
@@ -17458,7 +17865,7 @@ test "db runUntilIdle auto graph metric maintenance chooses planned for compatib
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectGraphMetricPlannedAutoDecision(&db, true, 0, 1, 0);
+    try graph_metric_runtime_mod.expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -17547,7 +17954,7 @@ test "db runUntilIdle auto graph metric maintenance falls back for incompatible 
     });
 
     try db.runDerivedUntil(db.core.nextDerivedSequence());
-    try expectGraphMetricPlannedAutoDecision(&db, false, 0, 0, 1);
+    try graph_metric_runtime_mod.expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, false, 0, 0, 0, 1);
 
     try db.runUntilIdle();
 
@@ -17729,7 +18136,7 @@ test "db runUntilIdle auto graph metric maintenance resumes active planned degre
     defer started.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
     try std.testing.expectEqual(target_generation, started.building_generation);
-    try expectGraphMetricPlannedAutoDecision(&db, true, 1, 0, 0);
+    try graph_metric_runtime_mod.expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 1, 0, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -17814,7 +18221,7 @@ test "db runUntilIdle auto graph metric maintenance resumes active planned eigen
     defer started.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
     try std.testing.expectEqual(target_generation, started.building_generation);
-    try expectGraphMetricPlannedAutoDecision(&db, true, 1, 0, 0);
+    try graph_metric_runtime_mod.expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 1, 0, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -17902,7 +18309,7 @@ test "db runUntilIdle auto graph metric maintenance resumes active planned hits 
     defer started.deinit(alloc);
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
     try std.testing.expectEqual(target_generation, started.building_generation);
-    try expectGraphMetricPlannedAutoDecision(&db, true, 1, 0, 0);
+    try graph_metric_runtime_mod.expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 1, 0, 0, 0);
 
     try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
     {
@@ -21618,7 +22025,7 @@ test "db graph metric runtime starts automatically and drains notified backgroun
     try std.testing.expect(fresh);
 
     {
-        const runtime_stats = DB.lifecycle_impl.graphMetricRuntimeStats(&db);
+        const runtime_stats = db.graphMetricRuntimeStats();
         try std.testing.expect(runtime_stats.enabled);
         try std.testing.expectEqual(types.GraphMetricRuntimeRole.combined, runtime_stats.role.?);
         try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-auto-degree"), runtime_stats.runtime_id_hash);
@@ -21735,7 +22142,7 @@ test "db graph metric runtime open-configured split owners publish degree" {
 
             const tick = try coordinator.graph_metric_runtime.?.runOnceDetailed();
             coordinator_total.add(tick);
-            const stats = DB.lifecycle_impl.graphMetricRuntimeStats(&coordinator);
+            const stats = coordinator.graphMetricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.coordinator, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "open-configured-coordinator"), stats.runtime_id_hash);
@@ -21773,7 +22180,7 @@ test "db graph metric runtime open-configured split owners publish degree" {
 
             const tick = try worker_pool.graph_metric_runtime.?.runOnceDetailed();
             worker_total.add(tick);
-            const stats = DB.lifecycle_impl.graphMetricRuntimeStats(&worker_pool);
+            const stats = worker_pool.graphMetricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "open-configured-worker-pool"), stats.runtime_id_hash);
@@ -21781,7 +22188,7 @@ test "db graph metric runtime open-configured split owners publish degree" {
             try std.testing.expect(stats.lease_owned);
             try std.testing.expect(stats.has_lease);
             try std.testing.expect(!stats.started);
-            try std.testing.expectEqual(graphMetricRuntimeWorkerSetHash(workers[0..]), stats.worker_id_hash);
+            try std.testing.expectEqual(graph_metric_runtime_mod.workerSetIdentityHash(workers[0..]), stats.worker_id_hash);
             try std.testing.expectEqual(@as(u64, 2), stats.worker_count);
             try std.testing.expectEqual(@as(u64, 0), stats.total_coordinator_steps);
             try std.testing.expectEqual(@as(u64, 0), stats.total_published);
@@ -22699,7 +23106,7 @@ test "db graph metric runtime background coordinator and worker pool loops publi
         try std.testing.expect(worker_stats.started);
         try std.testing.expectEqual(graph_metric_runtime_mod.Role.worker_pool, worker_stats.role);
         try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-bg-pool-worker-owner"), worker_stats.runtime_id_hash);
-        const expected_worker_hash = graphMetricRuntimeWorkerSetHash(workers[0..]);
+        const expected_worker_hash = graph_metric_runtime_mod.workerSetIdentityHash(workers[0..]);
         try std.testing.expectEqual(expected_worker_hash, worker_stats.worker_id_hash);
         try std.testing.expectEqual(@as(usize, 2), worker_stats.worker_count);
         try std.testing.expect(worker_stats.ticks_started > 0);
@@ -22859,7 +23266,7 @@ test "db graph metric runtime background coordinator and worker pool loops publi
         try std.testing.expect(worker_stats.started);
         try std.testing.expectEqual(graph_metric_runtime_mod.Role.worker_pool, worker_stats.role);
         try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-bg-pagerank-pool-worker-owner"), worker_stats.runtime_id_hash);
-        const expected_worker_hash = graphMetricRuntimeWorkerSetHash(workers[0..]);
+        const expected_worker_hash = graph_metric_runtime_mod.workerSetIdentityHash(workers[0..]);
         try std.testing.expectEqual(expected_worker_hash, worker_stats.worker_id_hash);
         try std.testing.expectEqual(@as(usize, 2), worker_stats.worker_count);
         try std.testing.expect(worker_stats.ticks_started > 0);
@@ -23017,7 +23424,7 @@ test "db graph metric runtime background coordinator and worker pool loops publi
         try std.testing.expect(worker_stats.started);
         try std.testing.expectEqual(graph_metric_runtime_mod.Role.worker_pool, worker_stats.role);
         try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-bg-eigenvector-pool-worker-owner"), worker_stats.runtime_id_hash);
-        const expected_worker_hash = graphMetricRuntimeWorkerSetHash(workers[0..]);
+        const expected_worker_hash = graph_metric_runtime_mod.workerSetIdentityHash(workers[0..]);
         try std.testing.expectEqual(expected_worker_hash, worker_stats.worker_id_hash);
         try std.testing.expectEqual(@as(usize, 2), worker_stats.worker_count);
         try std.testing.expect(worker_stats.ticks_started > 0);
@@ -23180,7 +23587,7 @@ test "db graph metric runtime background coordinator and worker pool loops publi
         try std.testing.expect(worker_stats.started);
         try std.testing.expectEqual(graph_metric_runtime_mod.Role.worker_pool, worker_stats.role);
         try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-bg-hits-pool-worker-owner"), worker_stats.runtime_id_hash);
-        const expected_worker_hash = graphMetricRuntimeWorkerSetHash(workers[0..]);
+        const expected_worker_hash = graph_metric_runtime_mod.workerSetIdentityHash(workers[0..]);
         try std.testing.expectEqual(expected_worker_hash, worker_stats.worker_id_hash);
         try std.testing.expectEqual(@as(usize, 2), worker_stats.worker_count);
         try std.testing.expect(worker_stats.ticks_started > 0);
@@ -23323,7 +23730,7 @@ test "db graph metric runtime background worker pool survives separate reopened 
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-pool-worker-owner"), stats.runtime_id_hash);
             try std.testing.expect(stats.lease_owned);
             try std.testing.expect(stats.has_lease);
-            const expected_worker_hash = graphMetricRuntimeWorkerSetHash(workers[0..]);
+            const expected_worker_hash = graph_metric_runtime_mod.workerSetIdentityHash(workers[0..]);
             try std.testing.expectEqual(expected_worker_hash, stats.worker_id_hash);
             try std.testing.expectEqual(@as(usize, 2), stats.worker_count);
             try std.testing.expectEqual(@as(usize, 0), stats.total_result.coordinator_steps);
@@ -23543,7 +23950,7 @@ test "db graph metric runtime open-configured pagerank worker pool survives sepa
             defer worker_pool.close();
 
             const tick = try worker_pool.graph_metric_runtime.?.runOnceDetailed();
-            const stats = DB.lifecycle_impl.graphMetricRuntimeStats(&worker_pool);
+            const stats = worker_pool.graphMetricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-pagerank-pool-worker-owner"), stats.runtime_id_hash);
@@ -23551,7 +23958,7 @@ test "db graph metric runtime open-configured pagerank worker pool survives sepa
             try std.testing.expect(stats.lease_owned);
             try std.testing.expect(stats.has_lease);
             try std.testing.expect(!stats.started);
-            const expected_worker_hash = graphMetricRuntimeWorkerSetHash(workers[0..]);
+            const expected_worker_hash = graph_metric_runtime_mod.workerSetIdentityHash(workers[0..]);
             try std.testing.expectEqual(expected_worker_hash, stats.worker_id_hash);
             try std.testing.expectEqual(@as(u64, 2), stats.worker_count);
             try std.testing.expectEqual(@as(u64, 0), stats.total_coordinator_steps);
@@ -23581,7 +23988,7 @@ test "db graph metric runtime open-configured pagerank worker pool survives sepa
                 try std.testing.expect(!duplicate_tick.durableProgressed());
                 try std.testing.expectEqual(@as(usize, 0), duplicate_tick.worker_steps);
                 try std.testing.expectEqual(@as(usize, 0), duplicate_tick.pages_completed);
-                const duplicate_stats = DB.lifecycle_impl.graphMetricRuntimeStats(&duplicate_worker_pool);
+                const duplicate_stats = duplicate_worker_pool.graphMetricRuntimeStats();
                 try std.testing.expect(duplicate_stats.enabled);
                 try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, duplicate_stats.role.?);
                 try std.testing.expect(duplicate_stats.lease_owned);
@@ -23618,7 +24025,7 @@ test "db graph metric runtime open-configured pagerank worker pool survives sepa
             defer coordinator.close();
 
             const tick = try coordinator.graph_metric_runtime.?.runOnceDetailed();
-            const stats = DB.lifecycle_impl.graphMetricRuntimeStats(&coordinator);
+            const stats = coordinator.graphMetricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.coordinator, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-pagerank-pool-coordinator-owner"), stats.runtime_id_hash);
@@ -23763,7 +24170,7 @@ test "db graph metric runtime open-configured eigenvector worker pool survives s
             defer worker_pool.close();
 
             const tick = try worker_pool.graph_metric_runtime.?.runOnceDetailed();
-            const stats = DB.lifecycle_impl.graphMetricRuntimeStats(&worker_pool);
+            const stats = worker_pool.graphMetricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-eigenvector-pool-worker-owner"), stats.runtime_id_hash);
@@ -23771,7 +24178,7 @@ test "db graph metric runtime open-configured eigenvector worker pool survives s
             try std.testing.expect(stats.lease_owned);
             try std.testing.expect(stats.has_lease);
             try std.testing.expect(!stats.started);
-            const expected_worker_hash = graphMetricRuntimeWorkerSetHash(workers[0..]);
+            const expected_worker_hash = graph_metric_runtime_mod.workerSetIdentityHash(workers[0..]);
             try std.testing.expectEqual(expected_worker_hash, stats.worker_id_hash);
             try std.testing.expectEqual(@as(u64, 2), stats.worker_count);
             try std.testing.expectEqual(@as(u64, 0), stats.total_coordinator_steps);
@@ -23801,7 +24208,7 @@ test "db graph metric runtime open-configured eigenvector worker pool survives s
                 try std.testing.expect(!duplicate_tick.durableProgressed());
                 try std.testing.expectEqual(@as(usize, 0), duplicate_tick.worker_steps);
                 try std.testing.expectEqual(@as(usize, 0), duplicate_tick.pages_completed);
-                const duplicate_stats = DB.lifecycle_impl.graphMetricRuntimeStats(&duplicate_worker_pool);
+                const duplicate_stats = duplicate_worker_pool.graphMetricRuntimeStats();
                 try std.testing.expect(duplicate_stats.enabled);
                 try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, duplicate_stats.role.?);
                 try std.testing.expect(duplicate_stats.lease_owned);
@@ -23838,7 +24245,7 @@ test "db graph metric runtime open-configured eigenvector worker pool survives s
             defer coordinator.close();
 
             const tick = try coordinator.graph_metric_runtime.?.runOnceDetailed();
-            const stats = DB.lifecycle_impl.graphMetricRuntimeStats(&coordinator);
+            const stats = coordinator.graphMetricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.coordinator, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-eigenvector-pool-coordinator-owner"), stats.runtime_id_hash);
@@ -23980,7 +24387,7 @@ test "db graph metric runtime open-configured hits worker pool survives separate
             defer worker_pool.close();
 
             const tick = try worker_pool.graph_metric_runtime.?.runOnceDetailed();
-            const stats = DB.lifecycle_impl.graphMetricRuntimeStats(&worker_pool);
+            const stats = worker_pool.graphMetricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-hits-pool-worker-owner"), stats.runtime_id_hash);
@@ -23988,7 +24395,7 @@ test "db graph metric runtime open-configured hits worker pool survives separate
             try std.testing.expect(stats.lease_owned);
             try std.testing.expect(stats.has_lease);
             try std.testing.expect(!stats.started);
-            const expected_worker_hash = graphMetricRuntimeWorkerSetHash(workers[0..]);
+            const expected_worker_hash = graph_metric_runtime_mod.workerSetIdentityHash(workers[0..]);
             try std.testing.expectEqual(expected_worker_hash, stats.worker_id_hash);
             try std.testing.expectEqual(@as(u64, 2), stats.worker_count);
             try std.testing.expectEqual(@as(u64, 0), stats.total_coordinator_steps);
@@ -24018,7 +24425,7 @@ test "db graph metric runtime open-configured hits worker pool survives separate
                 try std.testing.expect(!duplicate_tick.durableProgressed());
                 try std.testing.expectEqual(@as(usize, 0), duplicate_tick.worker_steps);
                 try std.testing.expectEqual(@as(usize, 0), duplicate_tick.pages_completed);
-                const duplicate_stats = DB.lifecycle_impl.graphMetricRuntimeStats(&duplicate_worker_pool);
+                const duplicate_stats = duplicate_worker_pool.graphMetricRuntimeStats();
                 try std.testing.expect(duplicate_stats.enabled);
                 try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, duplicate_stats.role.?);
                 try std.testing.expect(duplicate_stats.lease_owned);
@@ -24055,7 +24462,7 @@ test "db graph metric runtime open-configured hits worker pool survives separate
             defer coordinator.close();
 
             const tick = try coordinator.graph_metric_runtime.?.runOnceDetailed();
-            const stats = DB.lifecycle_impl.graphMetricRuntimeStats(&coordinator);
+            const stats = coordinator.graphMetricRuntimeStats();
             try std.testing.expect(stats.enabled);
             try std.testing.expectEqual(types.GraphMetricRuntimeRole.coordinator, stats.role.?);
             try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-hits-pool-coordinator-owner"), stats.runtime_id_hash);
@@ -26513,276 +26920,10 @@ test "db graph metric planned scheduler sweeps active hits work" {
     try std.testing.expect(published_result.graph_metric_results[1].scores[1].score > published_result.graph_metric_results[1].scores[2].score);
 }
 
-fn verifyDbSingleVectorFailedPlannedRebuildPreservesPublishedPublicReads(
-    alloc: std.mem.Allocator,
-    metric_name: []const u8,
-    metric_kind: []const u8,
-) !void {
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
-
-    var db = try DB.open(alloc, std.mem.span(path), .{
-        .start_index_workers = false,
-        .ttl_cleanup = .{ .enabled = false },
-    });
-    defer db.close();
-
-    try db.addIndex(.{
-        .name = "ft_v1",
-        .kind = .full_text,
-        .config_json = "{\"store\":true}",
-    });
-    const graph_config = try std.fmt.allocPrint(
-        alloc,
-        "{{\"metrics\":{{\"{s}\":{{\"enabled\":true,\"kind\":\"{s}\",\"refresh\":\"manual\",\"max_iterations\":4,\"tolerance\":0.000001,\"edge_filter\":{{\"types\":[\"cites\"]}}}}}}}}",
-        .{ metric_name, metric_kind },
-    );
-    defer alloc.free(graph_config);
-    try db.addIndex(.{
-        .name = "graph_idx",
-        .kind = .graph,
-        .config_json = graph_config,
-    });
-
-    try db.batch(.{
-        .writes = &.{
-            .{ .key = "doc:hub-a", .value = "{\"title\":\"hub a\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
-            .{ .key = "doc:hub-b", .value = "{\"title\":\"hub b\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
-            .{ .key = "doc:authority", .value = "{\"title\":\"authority\"}" },
-        },
-        .sync_level = .full_index,
-    });
-    try db.runDerivedUntil(db.core.nextDerivedSequence());
-
-    var refreshed = try db.refreshGraphMetric(alloc, "graph_idx", metric_name);
-    defer refreshed.deinit(alloc);
-    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, refreshed.state);
-    const published_generation = refreshed.published_generation;
-    try std.testing.expect(published_generation > 0);
-
-    var initial = try db.search(alloc, .{
-        .graph_metric_queries = &.{.{
-            .name = "central",
-            .query = .{
-                .index_name = "graph_idx",
-                .metric_name = metric_name,
-                .top_k = 3,
-                .freshness = .fresh,
-            },
-        }},
-        .limit = 0,
-    });
-    defer initial.deinit();
-    try std.testing.expectEqual(@as(usize, 1), initial.graph_metric_results.len);
-    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, initial.graph_metric_results[0].status.state);
-    try std.testing.expectEqual(published_generation, initial.graph_metric_results[0].status.published_generation);
-    try std.testing.expect(initial.graph_metric_results[0].scores.len > 0);
-
-    try db.batch(.{
-        .writes = &.{
-            .{ .key = "doc:new-hub", .value = "{\"title\":\"new hub\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
-        },
-        .sync_level = .full_index,
-    });
-    try db.runDerivedUntil(db.core.nextDerivedSequence());
-
-    const rebuilding_generation = blk: {
-        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
-        const target_generation = graph_entry.index.edge_generation;
-        try std.testing.expect(target_generation > published_generation);
-        var building = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", metric_name, target_generation);
-        defer building.deinit(alloc);
-        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, building.state);
-        try std.testing.expectEqual(target_generation, building.building_generation);
-        break :blk target_generation;
-    };
-
-    var failed = try db.failGraphMetricPlannedBuild(alloc, "graph_idx", metric_name, error.InvalidGraphMetricScore);
-    defer failed.deinit(alloc);
-    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, failed.state);
-    try std.testing.expectEqual(published_generation, failed.published_generation);
-    try std.testing.expectEqual(rebuilding_generation, failed.target_edge_generation);
-
-    var published_after_failure = try db.search(alloc, .{
-        .graph_metric_queries = &.{.{
-            .name = "central",
-            .query = .{
-                .index_name = "graph_idx",
-                .metric_name = metric_name,
-                .top_k = 4,
-                .freshness = .published,
-            },
-        }},
-        .limit = 0,
-    });
-    defer published_after_failure.deinit();
-    try std.testing.expectEqual(@as(usize, 1), published_after_failure.graph_metric_results.len);
-    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, published_after_failure.graph_metric_results[0].status.state);
-    try std.testing.expectEqual(published_generation, published_after_failure.graph_metric_results[0].status.published_generation);
-    try std.testing.expect(published_after_failure.graph_metric_results[0].scores.len > 0);
-    for (published_after_failure.graph_metric_results[0].scores) |score| {
-        try std.testing.expect(!std.mem.eql(u8, score.node, "doc:new-hub"));
-        try std.testing.expect(std.math.isFinite(score.score));
-    }
-
-    const published_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
-        .name = metric_name,
-        .freshness = .published,
-    }};
-    const published_graph_query = graph_query_mod.GraphQuery{
-        .query_type = .neighbors,
-        .index_name = "graph_idx",
-        .start_nodes = .{ .keys = &.{"doc:hub-a"} },
-        .params = .{ .edge_types = &.{"cites"}, .direction = .out, .max_depth = 1 },
-        .metrics = &published_metric_reads,
-        .include_metric_status = true,
-    };
-    var traversal_after_failure = try db.search(alloc, .{
-        .graph_queries = &.{.{ .name = "neighbors", .query = published_graph_query }},
-        .limit = 0,
-    });
-    defer traversal_after_failure.deinit();
-    try std.testing.expectEqual(@as(usize, 1), traversal_after_failure.graph_results.len);
-    try std.testing.expectEqual(@as(usize, 1), traversal_after_failure.graph_results[0].nodes.len);
-    try std.testing.expectEqualStrings("doc:authority", traversal_after_failure.graph_results[0].nodes[0].key);
-    try std.testing.expectEqual(@as(usize, 1), traversal_after_failure.graph_results[0].nodes[0].metrics.len);
-    try std.testing.expectEqualStrings(metric_name, traversal_after_failure.graph_results[0].nodes[0].metrics[0].name);
-    try std.testing.expect(traversal_after_failure.graph_results[0].nodes[0].metrics[0].score != null);
-    try std.testing.expect(std.math.isFinite(traversal_after_failure.graph_results[0].nodes[0].metrics[0].score.?));
-    try std.testing.expectEqual(@as(usize, 1), traversal_after_failure.graph_results[0].metric_status.len);
-    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, traversal_after_failure.graph_results[0].metric_status[0].state);
-    try std.testing.expectEqual(published_generation, traversal_after_failure.graph_results[0].metric_status[0].published_generation);
-
-    const published_metric_orders = [_]graph_query_mod.GraphMetricOrder{.{
-        .name = metric_name,
-        .freshness = .published,
-    }};
-    var published_order_query = published_graph_query;
-    published_order_query.order_by = &published_metric_orders;
-    var traversal_order_after_failure = try db.search(alloc, .{
-        .graph_queries = &.{.{ .name = "neighbors", .query = published_order_query }},
-        .limit = 0,
-    });
-    defer traversal_order_after_failure.deinit();
-    try std.testing.expectEqual(@as(usize, 1), traversal_order_after_failure.graph_results.len);
-    try std.testing.expectEqualStrings("doc:authority", traversal_order_after_failure.graph_results[0].nodes[0].key);
-    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, traversal_order_after_failure.graph_results[0].metric_status[0].state);
-
-    const published_metric_filters = [_]graph_query_mod.GraphMetricFilter{.{
-        .name = metric_name,
-        .op = .gte,
-        .value = 0.0,
-        .freshness = .published,
-    }};
-    var published_filter_query = published_graph_query;
-    published_filter_query.where_metric = &published_metric_filters;
-    var traversal_filter_after_failure = try db.search(alloc, .{
-        .graph_queries = &.{.{ .name = "neighbors", .query = published_filter_query }},
-        .limit = 0,
-    });
-    defer traversal_filter_after_failure.deinit();
-    try std.testing.expectEqual(@as(usize, 1), traversal_filter_after_failure.graph_results.len);
-    try std.testing.expectEqualStrings("doc:authority", traversal_filter_after_failure.graph_results[0].nodes[0].key);
-    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, traversal_filter_after_failure.graph_results[0].metric_status[0].state);
-
-    var rerank_after_failure = try db.search(alloc, .{
-        .index_name = "ft_v1",
-        .full_text = .{ .match_all = {} },
-        .graph_metric_rerank = .{
-            .index_name = "graph_idx",
-            .metric_name = metric_name,
-            .freshness = .published,
-            .weight = 1.0,
-        },
-        .limit = 4,
-        .include_stored = false,
-    });
-    defer rerank_after_failure.deinit();
-    try std.testing.expectEqual(@as(u32, 4), rerank_after_failure.total_hits);
-    const rerank_status = rerank_after_failure.graph_metric_rerank_status orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, rerank_status.state);
-    try std.testing.expectEqual(published_generation, rerank_status.published_generation);
-    var saw_authority_score = false;
-    var saw_new_hub_missing_score = false;
-    for (rerank_after_failure.hits) |hit| {
-        const details = hit.score_details orelse return error.TestUnexpectedResult;
-        try std.testing.expectEqual(published_generation, details.published_generation);
-        if (std.mem.eql(u8, hit.id, "doc:authority")) {
-            saw_authority_score = details.metric_score != null;
-        } else if (std.mem.eql(u8, hit.id, "doc:new-hub")) {
-            saw_new_hub_missing_score = details.metric_score == null;
-        }
-    }
-    try std.testing.expect(saw_authority_score);
-    try std.testing.expect(saw_new_hub_missing_score);
-
-    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
-        .graph_metric_queries = &.{.{
-            .name = "central",
-            .query = .{
-                .index_name = "graph_idx",
-                .metric_name = metric_name,
-                .top_k = 1,
-                .freshness = .fresh,
-            },
-        }},
-        .limit = 0,
-    }));
-
-    const fresh_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
-        .name = metric_name,
-        .freshness = .fresh,
-    }};
-    var fresh_projection_query = published_graph_query;
-    fresh_projection_query.metrics = &fresh_metric_reads;
-    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
-        .graph_queries = &.{.{ .name = "neighbors", .query = fresh_projection_query }},
-        .limit = 0,
-    }));
-
-    const fresh_metric_orders = [_]graph_query_mod.GraphMetricOrder{.{
-        .name = metric_name,
-        .freshness = .fresh,
-    }};
-    var fresh_order_query = published_graph_query;
-    fresh_order_query.order_by = &fresh_metric_orders;
-    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
-        .graph_queries = &.{.{ .name = "neighbors", .query = fresh_order_query }},
-        .limit = 0,
-    }));
-
-    const fresh_metric_filters = [_]graph_query_mod.GraphMetricFilter{.{
-        .name = metric_name,
-        .op = .gte,
-        .value = 0.0,
-        .freshness = .fresh,
-    }};
-    var fresh_filter_query = published_graph_query;
-    fresh_filter_query.where_metric = &fresh_metric_filters;
-    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
-        .graph_queries = &.{.{ .name = "neighbors", .query = fresh_filter_query }},
-        .limit = 0,
-    }));
-
-    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
-        .index_name = "ft_v1",
-        .full_text = .{ .match_all = {} },
-        .graph_metric_rerank = .{
-            .index_name = "graph_idx",
-            .metric_name = metric_name,
-            .freshness = .fresh,
-            .weight = 1.0,
-        },
-        .limit = 4,
-        .include_stored = false,
-    }));
-}
-
 test "db single-vector failed planned rebuild preserves published public reads" {
     const alloc = std.testing.allocator;
-    try verifyDbSingleVectorFailedPlannedRebuildPreservesPublishedPublicReads(alloc, "pagerank", "pagerank");
-    try verifyDbSingleVectorFailedPlannedRebuildPreservesPublishedPublicReads(alloc, "eigenvector", "eigenvector");
+    try verifyDbSingleVectorFailedPlannedRebuildPreservesPublishedPublicReads(DB, alloc, "pagerank", "pagerank");
+    try verifyDbSingleVectorFailedPlannedRebuildPreservesPublishedPublicReads(DB, alloc, "eigenvector", "eigenvector");
 }
 
 test "db paired hits failed planned rebuild preserves published public reads" {
@@ -27327,11 +27468,11 @@ test "db leased enrichment worker materializes chunk artifacts" {
     });
 
     try db.enrichment_runtime.?.waitForApplied(1);
-    try waitForDerivedReplayTarget(&db);
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
 
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
     defer alloc.free(chunk_prefix);
-    const chunk_zero = try expectedChunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    const chunk_zero = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
     defer alloc.free(chunk_zero);
     const artifacts = try db.core.store.scanPrefix(alloc, chunk_prefix);
     defer docstore_mod.DocStore.freeResults(alloc, artifacts);
@@ -27349,7 +27490,7 @@ test "db leased enrichment worker materializes chunk artifacts" {
         }
         if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) {
             embedding_count += 1;
-            try expectDenseEmbeddingArtifactWithSourceHash(alloc, entry.value, 3);
+            try enrichment_artifact_codec.expectDenseEmbeddingWithSourceHash(alloc, entry.value, 3);
         }
     }
     try std.testing.expect(chunk_count > 0);
@@ -27386,7 +27527,7 @@ test "db leased enrichment worker keeps chunk storage ephemeral when store_chunk
     });
 
     try db.enrichment_runtime.?.waitForApplied(1);
-    try waitForDerivedReplayTarget(&db);
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
 
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
     defer alloc.free(chunk_prefix);
@@ -27616,7 +27757,7 @@ test "collectManagedSyncTargets includes graph index for graph artifact journal 
     };
     defer derived_types.deinitDerivedBatch(alloc, &batch);
 
-    var sync_targets = try DB.derived_async_impl.collectManagedSyncTargets(alloc, db.core.index_manager, batch);
+    var sync_targets = try db.derivedAsyncCollectManagedSyncTargets(alloc, batch);
     defer sync_targets.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), sync_targets.all_indexes.len);
@@ -27798,11 +27939,11 @@ test "db leased enrichment worker materializes chunk artifacts with durable lsm 
     });
 
     try db.enrichment_runtime.?.waitForApplied(1);
-    try waitForDerivedReplayTarget(&db);
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
 
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
     defer alloc.free(chunk_prefix);
-    const chunk_zero = try expectedChunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    const chunk_zero = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
     defer alloc.free(chunk_zero);
     const artifacts = try db.core.store.scanPrefix(alloc, chunk_prefix);
     defer docstore_mod.DocStore.freeResults(alloc, artifacts);
@@ -27820,7 +27961,7 @@ test "db leased enrichment worker materializes chunk artifacts with durable lsm 
         }
         if (internal_keys.isDerivedEmbeddingArtifactKey(entry.key)) {
             embedding_count += 1;
-            try expectDenseEmbeddingArtifactWithSourceHash(alloc, entry.value, 3);
+            try enrichment_artifact_codec.expectDenseEmbeddingWithSourceHash(alloc, entry.value, 3);
         }
     }
     try std.testing.expectEqual(@as(usize, 3), chunk_count);
@@ -27863,9 +28004,9 @@ test "db shared embedding enrichment feeds multiple dense indexes" {
     });
 
     try db.enrichment_runtime.?.waitForApplied(1);
-    try waitForDerivedReplayTarget(&db);
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
 
-    const shared_artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "shared_dense_v1");
+    const shared_artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "shared_dense_v1");
     defer alloc.free(shared_artifact_key);
     const artifacts = try db.core.store.scanPrefix(alloc, shared_artifact_key);
     defer docstore_mod.DocStore.freeResults(alloc, artifacts);
@@ -27928,9 +28069,9 @@ test "db shared embedding enrichment feeds multiple dense indexes with durable l
     });
 
     try db.enrichment_runtime.?.waitForApplied(1);
-    try waitForDerivedReplayTarget(&db);
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
 
-    const shared_artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "shared_dense_v1");
+    const shared_artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "shared_dense_v1");
     defer alloc.free(shared_artifact_key);
     const artifacts = try db.core.store.scanPrefix(alloc, shared_artifact_key);
     defer docstore_mod.DocStore.freeResults(alloc, artifacts);
@@ -28001,7 +28142,7 @@ test "db addEnrichment supports explicit shared definitions" {
     });
 
     try db.enrichment_runtime.?.waitForApplied(1);
-    try waitForDerivedReplayTarget(&db);
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
 
     const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
     defer alloc.free(query_vec);
@@ -28016,7 +28157,7 @@ test "db addEnrichment supports explicit shared definitions" {
 
     var result = try waitForSearchResult(alloc, &db, req, 1);
     defer result.deinit();
-    const chunk_zero = try expectedChunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    const chunk_zero = try artifact_ids.chunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
     defer alloc.free(chunk_zero);
     try std.testing.expectEqualStrings(chunk_zero, result.hits[0].id);
 
@@ -28812,7 +28953,7 @@ test "db dense index can reference existing whole-doc embedding enrichment" {
     });
 
     try db.enrichment_runtime.?.waitForApplied(1);
-    try waitForDerivedReplayTarget(&db);
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
 
     const query_vec = try deterministic.interface().embedDense(alloc, "", "reference embedding text", 3);
     defer alloc.free(query_vec);
@@ -28861,7 +29002,7 @@ test "db dense index can reference existing chunk embedding enrichment" {
     });
 
     try db.enrichment_runtime.?.waitForApplied(1);
-    try waitForDerivedReplayTarget(&db);
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
     _ = try waitForAppliedSequenceAdvance(alloc, &db, "dv_ref", 0);
 
     const query_vec = try deterministic.interface().embedDense(alloc, "", "abcdefgh", 3);
@@ -28879,7 +29020,7 @@ test "db dense index can reference existing chunk embedding enrichment" {
     defer alloc.free(internal_id);
     var identity = try artifact_ids.resolvePublicHitIdentityAlloc(alloc, internal_id);
     defer identity.deinit(alloc);
-    const chunk_zero = try expectedChunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    const chunk_zero = try artifact_ids.chunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
     defer alloc.free(chunk_zero);
     try std.testing.expectEqualStrings(chunk_zero, identity.id);
 }
@@ -29140,7 +29281,7 @@ test "db full-text chunk consumer returns parent and chunk modes" {
     defer chunk_result.deinit();
 
     try std.testing.expectEqual(@as(u32, 1), chunk_result.total_hits);
-    const chunk_zero = try expectedChunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    const chunk_zero = try artifact_ids.chunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
     defer alloc.free(chunk_zero);
     try std.testing.expectEqualStrings(chunk_zero, chunk_result.hits[0].id);
     const chunk_ref = chunk_result.hits[0].artifact_ref orelse return error.TestUnexpectedResult;
@@ -29214,7 +29355,7 @@ test "db full-text chunk consumer filters expired parents under ttl" {
     }, 1);
     defer chunk_result.deinit();
     try std.testing.expectEqual(@as(u32, 1), chunk_result.total_hits);
-    const fresh_chunk_zero = try expectedChunkArtifactPublicIdAlloc(alloc, "doc:fresh", "body_chunks_v1", 0);
+    const fresh_chunk_zero = try artifact_ids.chunkArtifactPublicIdAlloc(alloc, "doc:fresh", "body_chunks_v1", 0);
     defer alloc.free(fresh_chunk_zero);
     try std.testing.expectEqualStrings(fresh_chunk_zero, chunk_result.hits[0].id);
 
@@ -29238,9 +29379,9 @@ test "db getArtifact loads stored chunk artifacts by public id" {
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
 
-    const chunk_zero = try expectedChunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    const chunk_zero = try artifact_ids.chunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
     defer alloc.free(chunk_zero);
-    const internal_key = try expectedChunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    const internal_key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
     defer alloc.free(internal_key);
     try db.core.store.put(internal_key, "{\"body\":\"abcdefgh\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":0}");
 
@@ -29352,7 +29493,7 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
     });
 
     try db.enrichment_runtime.?.waitForApplied(1);
-    try waitForDerivedReplayTarget(&db);
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
     defer alloc.free(chunk_prefix);
     const chunk_records = try db.core.store.scanPrefix(alloc, chunk_prefix);
@@ -29370,11 +29511,11 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
         .search_effort = 1.0,
     }, 1);
     defer chunk_result.deinit();
-    const chunk_zero = try expectedChunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    const chunk_zero = try artifact_ids.chunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
     defer alloc.free(chunk_zero);
-    const chunk_one = try expectedChunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 1);
+    const chunk_one = try artifact_ids.chunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 1);
     defer alloc.free(chunk_one);
-    const chunk_two = try expectedChunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 2);
+    const chunk_two = try artifact_ids.chunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 2);
     defer alloc.free(chunk_two);
     try std.testing.expectEqual(@as(u32, 3), chunk_result.total_hits);
     try std.testing.expect(
@@ -29383,7 +29524,7 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes" {
             std.mem.eql(u8, chunk_result.hits[0].id, chunk_two),
     );
 
-    var include = try DB.internal_impl.resolveDocSetForIdsAlloc(&db, alloc, &.{"doc:a"});
+    var include = try db.internalResolveDocSetForIdsAlloc(alloc, &.{"doc:a"});
     errdefer include.deinit(alloc);
     const ordinal = switch (include) {
         .ordinals => |ordinals| blk: {
@@ -29506,7 +29647,7 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes with 
     });
 
     try db.enrichment_runtime.?.waitForApplied(1);
-    try waitForDerivedReplayTarget(&db);
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
     const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "body_chunks_v1");
     defer alloc.free(chunk_prefix);
     const chunk_records = try db.core.store.scanPrefix(alloc, chunk_prefix);
@@ -29524,11 +29665,11 @@ test "db dense chunk consumer supports parent and parent_with_chunks modes with 
         .search_effort = 1.0,
     }, 1);
     defer chunk_result.deinit();
-    const chunk_zero = try expectedChunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    const chunk_zero = try artifact_ids.chunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 0);
     defer alloc.free(chunk_zero);
-    const chunk_one = try expectedChunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 1);
+    const chunk_one = try artifact_ids.chunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 1);
     defer alloc.free(chunk_one);
-    const chunk_two = try expectedChunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 2);
+    const chunk_two = try artifact_ids.chunkArtifactPublicIdAlloc(alloc, "doc:a", "body_chunks_v1", 2);
     defer alloc.free(chunk_two);
     try std.testing.expectEqual(@as(u32, 3), chunk_result.total_hits);
     try std.testing.expect(
@@ -29726,10 +29867,10 @@ test "db io_threaded executor stress applies explicit dense embeddings on lsm ba
     if (getenv("ANTFLY_STRESS_DB_DENSE_REPRO") == null) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    const dims = stressEnvUsize("ANTFLY_STRESS_DENSE_DIMS", 256);
-    const total_docs = stressEnvUsize("ANTFLY_STRESS_DENSE_DOCS", 4096);
-    const batch_size = @max(@as(usize, 1), stressEnvUsize("ANTFLY_STRESS_DENSE_BATCH", 256));
-    const progress_interval = @max(batch_size, stressEnvUsize("ANTFLY_STRESS_DENSE_PROGRESS", batch_size * 8));
+    const dims = index_manager_mod.stressEnvUsize("ANTFLY_STRESS_DENSE_DIMS", 256);
+    const total_docs = index_manager_mod.stressEnvUsize("ANTFLY_STRESS_DENSE_DOCS", 4096);
+    const batch_size = @max(@as(usize, 1), index_manager_mod.stressEnvUsize("ANTFLY_STRESS_DENSE_BATCH", 256));
+    const progress_interval = @max(batch_size, index_manager_mod.stressEnvUsize("ANTFLY_STRESS_DENSE_PROGRESS", batch_size * 8));
     const dense_backend = stressDenseBackend();
 
     var path_buf: [256]u8 = undefined;
@@ -29782,20 +29923,20 @@ test "db io_threaded executor stress applies explicit dense embeddings on lsm ba
         queued_docs = end;
 
         if (queued_docs % progress_interval == 0 or queued_docs == total_docs) {
-            try waitForDerivedReplayTarget(&db);
+            try db.runDerivedUntil(db.core.nextDerivedSequence());
             const entry = db.core.index_manager.denseIndex("dv_v1") orelse return error.IndexNotFound;
             try std.testing.expectEqual(@as(u64, @intCast(queued_docs)), entry.index.stats().active_count);
         }
     }
 
-    try waitForDerivedReplayTarget(&db);
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
     try db.runUntilIdle();
 
     const entry = db.core.index_manager.denseIndex("dv_v1") orelse return error.IndexNotFound;
     try std.testing.expectEqual(@as(u64, @intCast(total_docs)), entry.index.stats().active_count);
 
     const first_vector_id = (try db.core.index_manager.lookupDenseVectorId(db.core.store, "dv_v1", "doc:00000000")) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(denseTestVectorId("doc:00000000"), first_vector_id);
+    try std.testing.expectEqual(index_manager_mod.deterministicDenseVectorId("doc:00000000"), first_vector_id);
     const first_doc = (try db.core.index_manager.lookupDenseDocKey(db.core.store, "dv_v1", first_vector_id)) orelse return error.TestUnexpectedResult;
     defer alloc.free(first_doc);
     try std.testing.expectEqualStrings("doc:00000000", first_doc);
@@ -29803,7 +29944,7 @@ test "db io_threaded executor stress applies explicit dense embeddings on lsm ba
     const expected_last_doc = try std.fmt.allocPrint(alloc, "doc:{d:0>8}", .{total_docs - 1});
     defer alloc.free(expected_last_doc);
     const last_vector_id = (try db.core.index_manager.lookupDenseVectorId(db.core.store, "dv_v1", expected_last_doc)) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(denseTestVectorId(expected_last_doc), last_vector_id);
+    try std.testing.expectEqual(index_manager_mod.deterministicDenseVectorId(expected_last_doc), last_vector_id);
     const last_doc = (try db.core.index_manager.lookupDenseDocKey(db.core.store, "dv_v1", last_vector_id)) orelse return error.TestUnexpectedResult;
     defer alloc.free(last_doc);
     try std.testing.expectEqualStrings(expected_last_doc, last_doc);
@@ -29815,7 +29956,7 @@ test "db io_threaded executor stress applies explicit dense embeddings on lsm ba
 
     const expected_last_vector = try alloc.alloc(f32, dims);
     defer alloc.free(expected_last_vector);
-    fillStressDenseVector(expected_last_vector, total_docs - 1);
+    index_manager_mod.fillStressDenseVector(expected_last_vector, total_docs - 1);
     try std.testing.expectEqualSlices(f32, expected_last_vector, last_vector);
 }
 
@@ -29852,7 +29993,7 @@ test "db reopen replays pending derived embeddings from durable log" {
         try db.core.store.putBatch(&.{
             .{ .key = stored_key, .value = extracted.cleaned_value.? },
         }, &.{});
-        const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
         defer alloc.free(artifact_key);
         try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
         extracted.dense_embeddings[0].artifact_key = try alloc.dupe(u8, artifact_key);
@@ -29860,7 +30001,7 @@ test "db reopen replays pending derived embeddings from durable log" {
         var derived_batch = try write_path.buildDerivedBatch(alloc, req, &.{extracted}, &.{}, &.{});
         defer derived_types.deinitDerivedBatch(alloc, &derived_batch);
 
-        appended_sequence = try DB.derived_async_impl.appendDerivedBatchRecord(&db, derived_batch);
+        appended_sequence = try db.derivedAsyncAppendDerivedBatchRecord(derived_batch);
     }
 
     var reopened = try DB.open(alloc, std.mem.span(path), .{});
@@ -29921,7 +30062,7 @@ test "storage.ha db mirrors appended derived replay records into HA stream" {
         defer db.close();
 
         const changed_artifact_keys = [_][]const u8{artifact_key};
-        const sequence = try DB.derived_async_impl.appendDerivedBatchRecord(&db, .{
+        const sequence = try db.derivedAsyncAppendDerivedBatchRecord(.{
             .changed_artifact_keys = changed_artifact_keys[0..],
         });
         try std.testing.expectEqual(@as(u64, 1), sequence);
@@ -31019,9 +31160,29 @@ test "storage.ha db write gate rejects client writes on standby but allows repli
     });
     defer db.close();
 
+    const NoopDocumentArtifactChildRangeDispatcher = struct {
+        fn apply(_: *anyopaque, _: Allocator, _: DocumentArtifactChildRangeDispatch) anyerror!void {}
+    };
+    var noop_dispatcher_state: u8 = 0;
+    const noop_dispatcher = DocumentArtifactChildRangeDispatcher{
+        .ptr = &noop_dispatcher_state,
+        .apply = NoopDocumentArtifactChildRangeDispatcher.apply,
+    };
+    var blocked_profile = BatchProfile{};
+
     try std.testing.expectError(error.HAReadOnlyStandby, db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"client\"}" }},
     }));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.batchProfiled(.{
+        .writes = &.{.{ .key = "doc:profiled", .value = "{\"title\":\"client\"}" }},
+    }, &blocked_profile));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.batchWithDocumentArtifactChildRangeDispatcher(.{
+        .writes = &.{.{ .key = "doc:dispatch", .value = "{\"title\":\"client\"}" }},
+    }, noop_dispatcher));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.batchWithoutRangeValidation(.{
+        .writes = &.{.{ .key = "doc:norange", .value = "{\"title\":\"client\"}" }},
+    }));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.applyDocumentArtifactChildRangeBatch(.{}));
     try std.testing.expectError(error.HAReadOnlyStandby, db.beginBulkIngestSession());
     try std.testing.expectError(error.HAReadOnlyStandby, db.beginDenseAutoBulkIngestSession());
     try std.testing.expectError(error.HAReadOnlyStandby, db.beginPrimaryStoreAutoBulkIngestSession());
@@ -31035,11 +31196,113 @@ test "storage.ha db write gate rejects client writes on standby but allows repli
     );
     try std.testing.expectError(
         error.HAReadOnlyStandby,
+        db.rollDenseAutoBulkIngestSessionWithOptions(.{}),
+    );
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
         db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(.{}),
     );
     try std.testing.expectError(
         error.HAReadOnlyStandby,
+        db.rollPrimaryStoreAutoBulkIngestSessionWithOptions(.{}),
+    );
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
         db.updateRange(.{ .start = "doc:a", .end = "doc:z" }),
+    );
+    try std.testing.expectError(error.HAReadOnlyStandby, db.setSplitState(null));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.clearSplitState());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.setSplitDeltaFinalSeq(1));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.clearSplitDeltaEntries());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.createShadowIndexManager("doc:m", "doc:z"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.closeShadowIndexManager());
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        db.split(.{ .start = "doc:a", .end = "doc:z" }, "doc:m", "dest1", "dest2", true),
+    );
+    try std.testing.expectError(error.HAReadOnlyStandby, db.finalizeSplit(.{ .start = "doc:a", .end = "doc:m" }));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.snapshot("blocked"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.sync(false));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.syncIndexes(false));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.repairRestoreRuntimeStateStepIfNeeded(alloc));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runGraphMetricMaintenanceForIdle());
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        db.refreshGraphMetric(alloc, "graph_idx", "manual_degree"),
+    );
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runGraphMetricPlannedMaintenanceForIdle(.{}));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runGraphMetricServiceMaintenanceJsonAlloc(alloc, "{}"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.rebuildGraphMetric(alloc, "graph_idx", "manual_degree"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.deleteGraphMetricMaterialization(alloc, "graph_idx", "manual_degree"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.pauseGraphMetricMaintenance(alloc, "graph_idx", "manual_degree"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.resumeGraphMetricMaintenance(alloc, "graph_idx", "manual_degree"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "manual_degree", 1));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runGraphMetricPlannedWorkerPageStep("graph_idx", "manual_degree", "worker-a"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runGraphMetricPlannedCoordinatorStep("graph_idx", "manual_degree"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.failGraphMetricPlannedBuild(alloc, "graph_idx", "manual_degree", error.TestExpectedError));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runGraphMetricPlannedDrain(alloc, "graph_idx", "manual_degree", 1, .{ .worker_ids = &.{"worker-a"} }));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runGraphMetricPlannedCoordinatorSweep(.{}));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runGraphMetricPlannedWorkerSweep(.{ .worker_id = "worker-a" }));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runLsmMaintenanceStep());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.retryQuarantinedIndexLoads(true));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runUntilIdle());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.evaluateAlgebraicAdaptiveCandidates());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.compactTextIndexes());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.deleteIndex("missing"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.deleteEnrichment(.asset, "missing"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.removeResolver("missing"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.rewriteEntityEdges(alloc, "missing", "a", "b"));
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        db.rebuildRelationalSecondaryIndexInRange("missing", 0, "doc:a", "doc:z"),
+    );
+    try std.testing.expectError(error.HAReadOnlyStandby, db.repairForeignKeyRefsInRange("doc:a", "doc:z"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.repairForeignKeyRefsInRangeForConstraint("fk_parent", "doc:a", "doc:z"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.repairUniqueConstraintRowsInRange("doc:a", "doc:z"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.repairForeignKeyRefOwnerForParent("fk_parent", "parent", "p1"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.repairForeignKeyRefOwnerRange("fk_parent", "parent", "p1", "p9"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.claimForeignKeyIntegrityWorkUnit("claim-a", "worker-a", 1, "scan", "repair", null, "doc:a", "doc:z", 1000));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.upsertForeignKeyIntegrityJobRecord("job-a", "child", "repair", "worker-a", null, "doc:a", "doc:z", 1000, 10, "running"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.completeForeignKeyIntegrityJobRecord("job-a", "complete", true, .{}));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.updateForeignKeyIntegrityJobDiagnostics("job-a", "[]", 0, false));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.scheduleForeignKeyActionJob("action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.requeueForeignKeyActionJob("action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.scheduleForeignKeyActionSchedule("schedule-a", "action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.markForeignKeyActionScheduleSeeded("schedule-a", 1));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.claimForeignKeyActionJobPage("action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16, 1000));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.finishClaimedForeignKeyActionJobPage(@as(DB.ForeignKeyActionJobRecord, undefined), 0, false, null, null, null));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.claimAndRunForeignKeyIntegrityWorkUnit("claim-a", "worker-a", 1, "scan", .repair, null, "doc:a", "doc:z", 1000));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.catchUpPendingDerivedReplay());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.derivedAsyncAppendDerivedBatchRecord(.{}));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.rebuildDenseIndexesForTargetCoverage(alloc));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.rebuildSparseIndexesForTargetCoverage(alloc));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.rebuildGraphIndexesForTargetCoverage(alloc));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runDensePostingMaintenanceForIdle());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runDensePostingMaintenanceForIdleBestEffort());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.rebuildDenseIndexesFromStoredEmbeddingArtifacts(alloc));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.replayGeneratedEnrichmentsFromStoredDocs(alloc));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.ensureGroupCreatedAtMillis(alloc, 42, 1234));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.mutateRelationalRowsFromSource(alloc, .{}, .{ .kind = .update }));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.stagePlannedRelationalRowsMutationSourceAlloc(alloc, .{}, .{ .kind = .update }, 0, &.{}));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.mutateRelationalRowsJoinedSourceAlloc(alloc, .{}, .{ .kind = .update }));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.stagePlannedRelationalRowsJoinedMutationSourceAlloc(alloc, .{}, .{ .kind = .update }, 0, &.{}));
+    const blocked_txn: transactions_mod.TxnId = .{ 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42 };
+    try std.testing.expectError(error.HAReadOnlyStandby, db.beginTransaction(1));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.beginTransactionWithId(blocked_txn, 1));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.beginTransactionWithParticipants(1, &.{"remote"}));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.beginTransactionWithIdAndParticipants(blocked_txn, 1, &.{"remote"}));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.writeIntents(blocked_txn, &.{}, &.{}));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.writeTransaction(blocked_txn, .{}));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.claimRowsForTransaction(blocked_txn, &.{"row:a"}, .{}));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.commitTransaction(blocked_txn, 2));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.resolveTransactionIntents(blocked_txn, .committed, 3));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.abortTransaction(blocked_txn, 4));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.markTransactionParticipantResolved(blocked_txn, "remote"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.recoverTransactions(5, 6));
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        db.reassignIdentityNamespaceForInternalTransition(.{ .table_id = 300, .shard_id = 1, .range_id = 1 }),
     );
 
     try db.batchReplicatedApply(.{
@@ -31195,7 +31458,7 @@ test "db reopen replays pending derived embeddings with durable lsm primary back
         try db.core.store.putBatch(&.{
             .{ .key = stored_key, .value = extracted.cleaned_value.? },
         }, &.{});
-        const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
         defer alloc.free(artifact_key);
         try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
         extracted.dense_embeddings[0].artifact_key = try alloc.dupe(u8, artifact_key);
@@ -31203,7 +31466,7 @@ test "db reopen replays pending derived embeddings with durable lsm primary back
         var derived_batch = try write_path.buildDerivedBatch(alloc, req, &.{extracted}, &.{}, &.{});
         defer derived_types.deinitDerivedBatch(alloc, &derived_batch);
 
-        appended_sequence = try DB.derived_async_impl.appendDerivedBatchRecord(&db, derived_batch);
+        appended_sequence = try db.derivedAsyncAppendDerivedBatchRecord(derived_batch);
     }
 
     var reopened = try DB.open(alloc, std.mem.span(path), .{
@@ -31294,7 +31557,7 @@ test "db query_readonly open skips pending derived replay on reopen" {
             .{ .key = stored_key, .value = "{\"title\":\"alpha\"}" },
         }, &.{});
 
-        const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
         defer alloc.free(artifact_key);
         try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
 
@@ -31430,6 +31693,124 @@ test "db query_readonly lsm primary opens physical backend read-only" {
         .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }},
         .sync_level = .write,
     }));
+    const NoopDocumentArtifactChildRangeDispatcher = struct {
+        fn apply(_: *anyopaque, _: Allocator, _: DocumentArtifactChildRangeDispatch) anyerror!void {}
+    };
+    var noop_dispatcher_state: u8 = 0;
+    const noop_dispatcher = DocumentArtifactChildRangeDispatcher{
+        .ptr = &noop_dispatcher_state,
+        .apply = NoopDocumentArtifactChildRangeDispatcher.apply,
+    };
+    var blocked_profile = BatchProfile{};
+    try std.testing.expectError(error.ReadOnly, readonly.batchProfiled(.{
+        .writes = &.{.{ .key = "doc:profiled", .value = "{\"title\":\"beta\"}" }},
+        .sync_level = .write,
+    }, &blocked_profile));
+    try std.testing.expectError(error.ReadOnly, readonly.batchWithDocumentArtifactChildRangeDispatcher(.{
+        .writes = &.{.{ .key = "doc:dispatch", .value = "{\"title\":\"beta\"}" }},
+        .sync_level = .write,
+    }, noop_dispatcher));
+    try std.testing.expectError(error.ReadOnly, readonly.batchWithoutRangeValidation(.{
+        .writes = &.{.{ .key = "doc:norange", .value = "{\"title\":\"beta\"}" }},
+        .sync_level = .write,
+    }));
+    try std.testing.expectError(error.ReadOnly, readonly.applyDocumentArtifactChildRangeBatch(.{}));
+    try std.testing.expectError(error.ReadOnly, readonly.beginBulkIngestSession());
+    try std.testing.expectError(error.ReadOnly, readonly.finishDenseAutoBulkIngestSessionWithOptions(.{}));
+    try std.testing.expectError(error.ReadOnly, readonly.rollDenseAutoBulkIngestSessionWithOptions(.{}));
+    try std.testing.expectError(error.ReadOnly, readonly.rollPrimaryStoreAutoBulkIngestSessionWithOptions(.{}));
+    try std.testing.expectError(error.ReadOnly, readonly.updateRange(.{ .start = "doc:a", .end = "doc:z" }));
+    try std.testing.expectError(error.ReadOnly, readonly.setSplitState(null));
+    try std.testing.expectError(error.ReadOnly, readonly.clearSplitState());
+    try std.testing.expectError(error.ReadOnly, readonly.setSplitDeltaFinalSeq(1));
+    try std.testing.expectError(error.ReadOnly, readonly.clearSplitDeltaEntries());
+    try std.testing.expectError(error.ReadOnly, readonly.createShadowIndexManager("doc:m", "doc:z"));
+    try std.testing.expectError(error.ReadOnly, readonly.closeShadowIndexManager());
+    try std.testing.expectError(
+        error.ReadOnly,
+        readonly.split(.{ .start = "doc:a", .end = "doc:z" }, "doc:m", "dest1", "dest2", true),
+    );
+    try std.testing.expectError(error.ReadOnly, readonly.finalizeSplit(.{ .start = "doc:a", .end = "doc:m" }));
+    try std.testing.expectError(error.ReadOnly, readonly.snapshot("blocked"));
+    try std.testing.expectError(error.ReadOnly, readonly.sync(false));
+    try std.testing.expectError(error.ReadOnly, readonly.syncIndexes(false));
+    try std.testing.expectError(error.ReadOnly, readonly.repairRestoreRuntimeStateStepIfNeeded(alloc));
+    try std.testing.expectError(error.ReadOnly, readonly.runGraphMetricMaintenanceForIdle());
+    try std.testing.expectError(error.ReadOnly, readonly.runGraphMetricPlannedMaintenanceForIdle(.{}));
+    try std.testing.expectError(error.ReadOnly, readonly.runGraphMetricServiceMaintenanceJsonAlloc(alloc, "{}"));
+    try std.testing.expectError(error.ReadOnly, readonly.refreshGraphMetric(alloc, "graph_idx", "manual_degree"));
+    try std.testing.expectError(error.ReadOnly, readonly.rebuildGraphMetric(alloc, "graph_idx", "manual_degree"));
+    try std.testing.expectError(error.ReadOnly, readonly.deleteGraphMetricMaterialization(alloc, "graph_idx", "manual_degree"));
+    try std.testing.expectError(error.ReadOnly, readonly.pauseGraphMetricMaintenance(alloc, "graph_idx", "manual_degree"));
+    try std.testing.expectError(error.ReadOnly, readonly.resumeGraphMetricMaintenance(alloc, "graph_idx", "manual_degree"));
+    try std.testing.expectError(error.ReadOnly, readonly.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "manual_degree", 1));
+    try std.testing.expectError(error.ReadOnly, readonly.runGraphMetricPlannedWorkerPageStep("graph_idx", "manual_degree", "worker-a"));
+    try std.testing.expectError(error.ReadOnly, readonly.runGraphMetricPlannedCoordinatorStep("graph_idx", "manual_degree"));
+    try std.testing.expectError(error.ReadOnly, readonly.failGraphMetricPlannedBuild(alloc, "graph_idx", "manual_degree", error.TestExpectedError));
+    try std.testing.expectError(error.ReadOnly, readonly.runGraphMetricPlannedDrain(alloc, "graph_idx", "manual_degree", 1, .{ .worker_ids = &.{"worker-a"} }));
+    try std.testing.expectError(error.ReadOnly, readonly.runGraphMetricPlannedCoordinatorSweep(.{}));
+    try std.testing.expectError(error.ReadOnly, readonly.runGraphMetricPlannedWorkerSweep(.{ .worker_id = "worker-a" }));
+    try std.testing.expectError(error.ReadOnly, readonly.runLsmMaintenanceStep());
+    try std.testing.expectError(error.ReadOnly, readonly.retryQuarantinedIndexLoads(true));
+    try std.testing.expectError(error.ReadOnly, readonly.runUntilIdle());
+    try std.testing.expectError(error.ReadOnly, readonly.evaluateAlgebraicAdaptiveCandidates());
+    try std.testing.expectError(error.ReadOnly, readonly.compactTextIndexes());
+    try std.testing.expectError(error.ReadOnly, readonly.deleteIndex("missing"));
+    try std.testing.expectError(error.ReadOnly, readonly.deleteEnrichment(.asset, "missing"));
+    try std.testing.expectError(error.ReadOnly, readonly.removeResolver("missing"));
+    try std.testing.expectError(error.ReadOnly, readonly.rewriteEntityEdges(alloc, "missing", "a", "b"));
+    try std.testing.expectError(
+        error.ReadOnly,
+        readonly.rebuildRelationalSecondaryIndexInRange("missing", 0, "doc:a", "doc:z"),
+    );
+    try std.testing.expectError(error.ReadOnly, readonly.repairForeignKeyRefsInRange("doc:a", "doc:z"));
+    try std.testing.expectError(error.ReadOnly, readonly.repairForeignKeyRefsInRangeForConstraint("fk_parent", "doc:a", "doc:z"));
+    try std.testing.expectError(error.ReadOnly, readonly.repairUniqueConstraintRowsInRange("doc:a", "doc:z"));
+    try std.testing.expectError(error.ReadOnly, readonly.repairForeignKeyRefOwnerForParent("fk_parent", "parent", "p1"));
+    try std.testing.expectError(error.ReadOnly, readonly.repairForeignKeyRefOwnerRange("fk_parent", "parent", "p1", "p9"));
+    try std.testing.expectError(error.ReadOnly, readonly.claimForeignKeyIntegrityWorkUnit("claim-a", "worker-a", 1, "scan", "repair", null, "doc:a", "doc:z", 1000));
+    try std.testing.expectError(error.ReadOnly, readonly.upsertForeignKeyIntegrityJobRecord("job-a", "child", "repair", "worker-a", null, "doc:a", "doc:z", 1000, 10, "running"));
+    try std.testing.expectError(error.ReadOnly, readonly.completeForeignKeyIntegrityJobRecord("job-a", "complete", true, .{}));
+    try std.testing.expectError(error.ReadOnly, readonly.updateForeignKeyIntegrityJobDiagnostics("job-a", "[]", 0, false));
+    try std.testing.expectError(error.ReadOnly, readonly.scheduleForeignKeyActionJob("action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16));
+    try std.testing.expectError(error.ReadOnly, readonly.requeueForeignKeyActionJob("action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16));
+    try std.testing.expectError(error.ReadOnly, readonly.scheduleForeignKeyActionSchedule("schedule-a", "action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16));
+    try std.testing.expectError(error.ReadOnly, readonly.markForeignKeyActionScheduleSeeded("schedule-a", 1));
+    try std.testing.expectError(error.ReadOnly, readonly.claimForeignKeyActionJobPage("action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16, 1000));
+    try std.testing.expectError(error.ReadOnly, readonly.finishClaimedForeignKeyActionJobPage(@as(DB.ForeignKeyActionJobRecord, undefined), 0, false, null, null, null));
+    try std.testing.expectError(error.ReadOnly, readonly.claimAndRunForeignKeyIntegrityWorkUnit("claim-a", "worker-a", 1, "scan", .repair, null, "doc:a", "doc:z", 1000));
+    try std.testing.expectError(error.ReadOnly, readonly.catchUpPendingDerivedReplay());
+    try std.testing.expectError(error.ReadOnly, readonly.derivedAsyncAppendDerivedBatchRecord(.{}));
+    try std.testing.expectError(error.ReadOnly, readonly.rebuildDenseIndexesForTargetCoverage(alloc));
+    try std.testing.expectError(error.ReadOnly, readonly.rebuildSparseIndexesForTargetCoverage(alloc));
+    try std.testing.expectError(error.ReadOnly, readonly.rebuildGraphIndexesForTargetCoverage(alloc));
+    try std.testing.expectError(error.ReadOnly, readonly.runDensePostingMaintenanceForIdle());
+    try std.testing.expectError(error.ReadOnly, readonly.runDensePostingMaintenanceForIdleBestEffort());
+    try std.testing.expectError(error.ReadOnly, readonly.rebuildDenseIndexesFromStoredEmbeddingArtifacts(alloc));
+    try std.testing.expectError(error.ReadOnly, readonly.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc));
+    try std.testing.expectError(error.ReadOnly, readonly.replayGeneratedEnrichmentsFromStoredDocs(alloc));
+    try std.testing.expectError(error.ReadOnly, readonly.ensureGroupCreatedAtMillis(alloc, 42, 1234));
+    try std.testing.expectError(error.ReadOnly, readonly.mutateRelationalRowsFromSource(alloc, .{}, .{ .kind = .update }));
+    try std.testing.expectError(error.ReadOnly, readonly.stagePlannedRelationalRowsMutationSourceAlloc(alloc, .{}, .{ .kind = .update }, 0, &.{}));
+    try std.testing.expectError(error.ReadOnly, readonly.mutateRelationalRowsJoinedSourceAlloc(alloc, .{}, .{ .kind = .update }));
+    try std.testing.expectError(error.ReadOnly, readonly.stagePlannedRelationalRowsJoinedMutationSourceAlloc(alloc, .{}, .{ .kind = .update }, 0, &.{}));
+    const blocked_txn: transactions_mod.TxnId = .{ 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43 };
+    try std.testing.expectError(error.ReadOnly, readonly.beginTransaction(1));
+    try std.testing.expectError(error.ReadOnly, readonly.beginTransactionWithId(blocked_txn, 1));
+    try std.testing.expectError(error.ReadOnly, readonly.beginTransactionWithParticipants(1, &.{"remote"}));
+    try std.testing.expectError(error.ReadOnly, readonly.beginTransactionWithIdAndParticipants(blocked_txn, 1, &.{"remote"}));
+    try std.testing.expectError(error.ReadOnly, readonly.writeIntents(blocked_txn, &.{}, &.{}));
+    try std.testing.expectError(error.ReadOnly, readonly.writeTransaction(blocked_txn, .{}));
+    try std.testing.expectError(error.ReadOnly, readonly.claimRowsForTransaction(blocked_txn, &.{"row:a"}, .{}));
+    try std.testing.expectError(error.ReadOnly, readonly.commitTransaction(blocked_txn, 2));
+    try std.testing.expectError(error.ReadOnly, readonly.resolveTransactionIntents(blocked_txn, .committed, 3));
+    try std.testing.expectError(error.ReadOnly, readonly.abortTransaction(blocked_txn, 4));
+    try std.testing.expectError(error.ReadOnly, readonly.markTransactionParticipantResolved(blocked_txn, "remote"));
+    try std.testing.expectError(error.ReadOnly, readonly.recoverTransactions(3, 4));
+    try std.testing.expectError(
+        error.ReadOnly,
+        readonly.reassignIdentityNamespaceForInternalTransition(.{ .table_id = 301, .shard_id = 1, .range_id = 1 }),
+    );
 }
 
 test "db query_readonly lmdb primary does not create missing database" {
@@ -31520,7 +31901,7 @@ test "db writer_no_replay open defers pending derived replay until runUntilIdle"
             .{ .key = stored_key, .value = "{\"title\":\"alpha\"}" },
         }, &.{});
 
-        const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
         defer alloc.free(artifact_key);
         try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
 
@@ -31621,7 +32002,7 @@ test "dense replay progress target matches replay debt target" {
             .{ .key = stored_key, .value = "{\"title\":\"alpha\"}" },
         }, &.{});
 
-        const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
         defer alloc.free(artifact_key);
         try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
 
@@ -31708,7 +32089,7 @@ test "db writer_no_replay starts workers without resuming pending derived replay
             .{ .key = stored_key, .value = "{\"title\":\"alpha\"}" },
         }, &.{});
 
-        const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
         defer alloc.free(artifact_key);
         try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
 
@@ -31972,7 +32353,7 @@ test "db replay respects per-index applied watermarks" {
         try db.core.store.putBatch(&.{
             .{ .key = stored_key, .value = extracted.cleaned_value.? },
         }, &.{});
-        const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
         defer alloc.free(artifact_key);
         try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
         extracted.dense_embeddings[0].artifact_key = try alloc.dupe(u8, artifact_key);
@@ -31980,7 +32361,7 @@ test "db replay respects per-index applied watermarks" {
         var derived_batch = try write_path.buildDerivedBatch(alloc, req, &.{extracted}, &.{}, &.{});
         defer derived_types.deinitDerivedBatch(alloc, &derived_batch);
 
-        appended_sequence = try DB.derived_async_impl.appendDerivedBatchRecord(&db, derived_batch);
+        appended_sequence = try db.derivedAsyncAppendDerivedBatchRecord(derived_batch);
 
         try db.core.saveAppliedSequence("dv_v1", appended_sequence);
     }
@@ -32028,7 +32409,7 @@ test "db replay applies dense embeddings from artifact payloads" {
         defer alloc.free(stored_key);
         try db.core.store.put(stored_key, "{\"title\":\"alpha\"}");
 
-        const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
         defer alloc.free(artifact_key);
         try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 0, 1 });
 
@@ -32043,7 +32424,7 @@ test "db replay applies dense embeddings from artifact payloads" {
             },
         };
 
-        _ = try DB.derived_async_impl.appendDerivedBatchRecord(&db, derived_batch);
+        _ = try db.derivedAsyncAppendDerivedBatchRecord(derived_batch);
     }
 
     var reopened = try DB.open(alloc, std.mem.span(path), .{});
@@ -32085,7 +32466,7 @@ test "db replay skips dense embedding writes when artifact payload is missing" {
         defer alloc.free(stored_key);
         try db.core.store.put(stored_key, "{\"title\":\"alpha\"}");
 
-        const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
         defer alloc.free(artifact_key);
 
         const derived_batch = derived_types.DerivedBatch{
@@ -32099,7 +32480,7 @@ test "db replay skips dense embedding writes when artifact payload is missing" {
             },
         };
 
-        appended_sequence = try DB.derived_async_impl.appendDerivedBatchRecord(&db, derived_batch);
+        appended_sequence = try db.derivedAsyncAppendDerivedBatchRecord(derived_batch);
     }
 
     var reopened = try DB.open(alloc, std.mem.span(path), .{});
@@ -32143,7 +32524,7 @@ test "db replay skips and deletes corrupt dense embedding artifacts" {
         defer alloc.free(stored_key);
         try db.core.store.put(stored_key, "{\"title\":\"alpha\"}");
 
-        const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
         defer alloc.free(artifact_key);
         try db.core.store.put(artifact_key, "bad-artifact");
 
@@ -32158,7 +32539,7 @@ test "db replay skips and deletes corrupt dense embedding artifacts" {
             },
         };
 
-        appended_sequence = try DB.derived_async_impl.appendDerivedBatchRecord(&db, derived_batch);
+        appended_sequence = try db.derivedAsyncAppendDerivedBatchRecord(derived_batch);
     }
 
     var reopened = try DB.open(alloc, std.mem.span(path), .{});
@@ -32176,7 +32557,7 @@ test "db replay skips and deletes corrupt dense embedding artifacts" {
 
     try std.testing.expectEqual(@as(u32, 0), result.total_hits);
 
-    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
     defer alloc.free(artifact_key);
     try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, artifact_key));
 
@@ -32205,7 +32586,7 @@ test "db replay applies sparse embeddings from artifact payloads" {
         defer alloc.free(stored_key);
         try db.core.store.put(stored_key, "{\"title\":\"alpha\"}");
 
-        const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "sp_v1");
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "sp_v1");
         defer alloc.free(artifact_key);
         try putSparseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &.{ 1, 5 }, &.{ 0.5, 0.75 });
 
@@ -32221,7 +32602,7 @@ test "db replay applies sparse embeddings from artifact payloads" {
             },
         };
 
-        _ = try DB.derived_async_impl.appendDerivedBatchRecord(&db, derived_batch);
+        _ = try db.derivedAsyncAppendDerivedBatchRecord(derived_batch);
     }
 
     var reopened = try DB.open(alloc, std.mem.span(path), .{});
@@ -32254,7 +32635,7 @@ test "db replay skips and deletes corrupt sparse embedding artifacts" {
         defer alloc.free(stored_key);
         try db.core.store.put(stored_key, "{\"title\":\"alpha\"}");
 
-        const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "sp_v1");
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "sp_v1");
         defer alloc.free(artifact_key);
         try db.core.store.put(artifact_key, "bad-artifact");
 
@@ -32270,7 +32651,7 @@ test "db replay skips and deletes corrupt sparse embedding artifacts" {
             },
         };
 
-        appended_sequence = try DB.derived_async_impl.appendDerivedBatchRecord(&db, derived_batch);
+        appended_sequence = try db.derivedAsyncAppendDerivedBatchRecord(derived_batch);
     }
 
     var reopened = try DB.open(alloc, std.mem.span(path), .{});
@@ -32280,7 +32661,7 @@ test "db replay skips and deletes corrupt sparse embedding artifacts" {
     const stats = sparse_index.stats();
     try std.testing.expectEqual(@as(u64, 0), stats.doc_count);
 
-    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "sp_v1");
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "sp_v1");
     defer alloc.free(artifact_key);
     try std.testing.expectError(error.NotFound, reopened.core.store.get(alloc, artifact_key));
 
@@ -32365,10 +32746,10 @@ test "db encodeThinReplayRecordPayload preserves async write replay contract" {
     try std.testing.expectEqual(@as(usize, 2), decoded.record.changed_artifact_keys.len);
     try std.testing.expectEqualStrings("artifact:dense:doc:a", decoded.record.changed_artifact_keys[0]);
     try std.testing.expectEqualStrings("artifact:sparse:doc:a", decoded.record.changed_artifact_keys[1]);
-    try std.testing.expect(journalRecordHasHint(decoded.record, .full_text));
-    try std.testing.expect(journalRecordHasHint(decoded.record, .dense_vector));
-    try std.testing.expect(journalRecordHasHint(decoded.record, .sparse_vector));
-    try std.testing.expect(!journalRecordHasHint(decoded.record, .enrichment));
+    try std.testing.expect(change_journal_mod.recordHasHint(decoded.record, .full_text));
+    try std.testing.expect(change_journal_mod.recordHasHint(decoded.record, .dense_vector));
+    try std.testing.expect(change_journal_mod.recordHasHint(decoded.record, .sparse_vector));
+    try std.testing.expect(!change_journal_mod.recordHasHint(decoded.record, .enrichment));
 }
 
 test "db encodeThinReplayRecordPayload treats embedding-only writes as artifact replay" {
@@ -32404,8 +32785,8 @@ test "db encodeThinReplayRecordPayload treats embedding-only writes as artifact 
     try std.testing.expectEqual(@as(usize, 0), decoded.record.changed_doc_keys.len);
     try std.testing.expectEqual(@as(usize, 1), decoded.record.changed_artifact_keys.len);
     try std.testing.expectEqualStrings("artifact:dense:doc:a", decoded.record.changed_artifact_keys[0]);
-    try std.testing.expect(!journalRecordHasHint(decoded.record, .full_text));
-    try std.testing.expect(journalRecordHasHint(decoded.record, .dense_vector));
+    try std.testing.expect(!change_journal_mod.recordHasHint(decoded.record, .full_text));
+    try std.testing.expect(change_journal_mod.recordHasHint(decoded.record, .dense_vector));
 }
 
 test "db thin replay marks artifact-derived target hints" {
@@ -32438,8 +32819,8 @@ test "db thin replay marks artifact-derived target hints" {
     try std.testing.expectEqualStrings(asset_key, decoded.record.changed_artifact_keys[0]);
     try std.testing.expectEqualStrings(chunk_key, decoded.record.changed_artifact_keys[1]);
     try std.testing.expectEqualStrings(graph_key, decoded.record.changed_artifact_keys[2]);
-    try std.testing.expect(journalRecordHasHint(decoded.record, .full_text));
-    try std.testing.expect(journalRecordHasHint(decoded.record, .graph));
+    try std.testing.expect(change_journal_mod.recordHasHint(decoded.record, .full_text));
+    try std.testing.expect(change_journal_mod.recordHasHint(decoded.record, .graph));
 }
 
 test "db encodeThinReplayRecordPayload marks generated enrichment replay for async writes" {
@@ -32472,8 +32853,8 @@ test "db encodeThinReplayRecordPayload marks generated enrichment replay for asy
     try std.testing.expectEqual(@as(u64, 7), decoded.record.sequence);
     try std.testing.expectEqual(@as(usize, 1), decoded.record.changed_doc_keys.len);
     try std.testing.expectEqualStrings("doc:a", decoded.record.changed_doc_keys[0]);
-    try std.testing.expect(journalRecordHasHint(decoded.record, .full_text));
-    try std.testing.expect(journalRecordHasHint(decoded.record, .enrichment));
+    try std.testing.expect(change_journal_mod.recordHasHint(decoded.record, .full_text));
+    try std.testing.expect(change_journal_mod.recordHasHint(decoded.record, .enrichment));
 }
 
 test "db full-text index backfill and search routing" {
@@ -32678,83 +33059,6 @@ test "db sparse backfill resumes after interrupted reopen" {
     }
     return error.TestExpectedEqual;
 }
-
-fn waitForAtomicFlag(flag: *const std.atomic.Value(u8), expected: u8, max_attempts: usize) bool {
-    var attempts: usize = 0;
-    while (attempts < max_attempts) : (attempts += 1) {
-        if (flag.load(.monotonic) == expected) return true;
-        db_internal.spinOrYield();
-    }
-    return flag.load(.monotonic) == expected;
-}
-
-const SharedReadLockHold = struct {
-    db: *DB,
-    acquired: std.atomic.Value(u8) = .init(0),
-    release: std.atomic.Value(u8) = .init(0),
-
-    fn run(self: *@This()) void {
-        self.db.core.lockApplyShared();
-        self.acquired.store(1, .monotonic);
-        while (self.release.load(.monotonic) == 0) {
-            db_internal.spinOrYield();
-        }
-        self.db.core.unlockApplyShared();
-    }
-};
-
-const ConcurrentReadProbe = struct {
-    db: *DB,
-    started: std.atomic.Value(u8) = .init(0),
-    done: std.atomic.Value(u8) = .init(0),
-    failed: std.atomic.Value(u8) = .init(0),
-
-    fn runSearch(self: *@This()) void {
-        self.started.store(1, .monotonic);
-        var result = self.db.search(std.heap.c_allocator, .{
-            .index_name = "ft_v1",
-            .full_text = .{ .match = .{ .field = "title", .text = "alpha" } },
-        }) catch {
-            self.failed.store(1, .monotonic);
-            return;
-        };
-        defer result.deinit();
-        self.done.store(1, .monotonic);
-    }
-
-    fn runScan(self: *@This()) void {
-        self.started.store(1, .monotonic);
-        var result = self.db.scan(std.heap.c_allocator, "", "", .{
-            .include_documents = true,
-            .limit = 10,
-        }) catch {
-            self.failed.store(1, .monotonic);
-            return;
-        };
-        defer result.deinit(std.heap.c_allocator);
-        self.done.store(1, .monotonic);
-    }
-};
-
-const ConcurrentWriteProbe = struct {
-    db: *DB,
-    started: std.atomic.Value(u8) = .init(0),
-    done: std.atomic.Value(u8) = .init(0),
-    failed: std.atomic.Value(u8) = .init(0),
-
-    fn runBatch(self: *@This()) void {
-        self.started.store(1, .monotonic);
-        self.db.batch(.{
-            .writes = &.{
-                .{ .key = "doc:b", .value = "{\"title\":\"bravo\"}" },
-            },
-        }) catch {
-            self.failed.store(1, .monotonic);
-            return;
-        };
-        self.done.store(1, .monotonic);
-    }
-};
 
 test "db dense vector index routes knn search" {
     const alloc = std.testing.allocator;
@@ -33358,9 +33662,9 @@ test "db delete artifact cleanup isolates binary document id prefixes" {
         },
     });
 
-    const first_artifact = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, first_doc, "dense\x00idx");
+    const first_artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, first_doc, "dense\x00idx");
     defer alloc.free(first_artifact);
-    const second_artifact = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, second_doc, "dense\x00idx");
+    const second_artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, second_doc, "dense\x00idx");
     defer alloc.free(second_artifact);
     try putDenseEmbeddingArtifactForTest(&db, alloc, first_artifact, null, &.{ 1.0, 0.0 });
     try putDenseEmbeddingArtifactForTest(&db, alloc, second_artifact, null, &.{ 0.0, 1.0 });
@@ -33376,7 +33680,7 @@ test "db delete artifact cleanup isolates binary document id prefixes" {
 
     const remaining_artifact = try db.core.store.get(alloc, second_artifact);
     defer alloc.free(remaining_artifact);
-    try expectDenseEmbeddingArtifactValue(alloc, remaining_artifact, null, 2);
+    try enrichment_artifact_codec.expectDenseEmbeddingValue(alloc, remaining_artifact, null, 2);
 }
 
 test "db graph index routes neighbor queries and doc deletes clean edges with durable lsm primary backend" {
@@ -33729,11 +34033,11 @@ test "db dense and sparse field-backed vector indexes strip vector fields and pe
     try std.testing.expect(std.mem.indexOf(u8, managed_stored, "\"embedding\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, managed_stored, "\"sparse\"") == null);
 
-    const dense_artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
+    const dense_artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
     defer alloc.free(dense_artifact_key);
     const dense_artifact = try db.core.store.get(alloc, dense_artifact_key);
     defer alloc.free(dense_artifact);
-    const sparse_artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "sp_v1");
+    const sparse_artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "sp_v1");
     defer alloc.free(sparse_artifact_key);
     const sparse_artifact = try db.core.store.get(alloc, sparse_artifact_key);
     defer alloc.free(sparse_artifact);
@@ -34028,7 +34332,7 @@ test "db dense artifact rebuild preserves stable vector ids distinct from ordina
         defer txn.abort();
         const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:b")) orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(@as(doc_identity.DocOrdinal, 2), ordinal);
-        const stable_vector_id = denseTestVectorId("doc:b");
+        const stable_vector_id = index_manager_mod.deterministicDenseVectorId("doc:b");
         try std.testing.expect(stable_vector_id != @as(u64, ordinal));
         try std.testing.expectEqual(@as(?u64, stable_vector_id), try db.core.index_manager.lookupDenseVectorId(db.core.store, "dense_idx", "doc:b"));
     }
@@ -34052,7 +34356,7 @@ test "db dense artifact rebuild preserves stable vector ids distinct from ordina
     var txn = try reopened.core.store.beginProbeTxn();
     defer txn.abort();
     const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:b")) orelse return error.TestUnexpectedResult;
-    const stable_vector_id = denseTestVectorId("doc:b");
+    const stable_vector_id = index_manager_mod.deterministicDenseVectorId("doc:b");
     try std.testing.expect(stable_vector_id != @as(u64, ordinal));
     try std.testing.expectEqual(@as(?u64, stable_vector_id), try reopened.core.index_manager.lookupDenseVectorId(reopened.core.store, "dense_idx", "doc:b"));
 
@@ -34177,7 +34481,7 @@ test "db dense artifact rebuild resumes from persisted state" {
                 .{ .key = stored_key, .value = stored_value },
             }, &.{});
 
-            const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, doc_id, "dense_idx");
+            const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_id, "dense_idx");
             defer alloc.free(artifact_key);
             try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{
                 @floatFromInt(i + 1),
@@ -34219,8 +34523,7 @@ test "db dense artifact rebuild resumes from persisted state" {
 
         try std.testing.expectError(
             error.TestInjectedFailure,
-            DB.derived_async_impl.rebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(
-                &interrupted,
+            interrupted.derivedAsyncRebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(
                 alloc,
                 null,
                 null,
@@ -34310,7 +34613,7 @@ test "db dense artifact rebuild progress counts source artifacts across multiple
                 .{ .key = stored_key, .value = stored_value },
             }, &.{});
 
-            const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, doc_id, "shared_dense_v1");
+            const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_id, "shared_dense_v1");
             defer alloc.free(artifact_key);
             try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{
                 @floatFromInt(i + 1),
@@ -34432,8 +34735,7 @@ test "db chunk-backed dense artifact rebuild stays pending until all chunk artif
 
         try std.testing.expectError(
             error.TestInjectedFailure,
-            DB.derived_async_impl.rebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(
-                &interrupted,
+            interrupted.derivedAsyncRebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(
                 alloc,
                 null,
                 null,
@@ -34523,7 +34825,7 @@ test "db dense artifact rebuild does not let resumed targets skip fresh targets"
                 .{ .key = stored_key, .value = stored_value },
             }, &.{});
 
-            const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, doc_id, "shared_dense_v1");
+            const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_id, "shared_dense_v1");
             defer alloc.free(artifact_key);
             try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{
                 @floatFromInt(i + 1),
@@ -34572,8 +34874,7 @@ test "db dense artifact rebuild does not let resumed targets skip fresh targets"
 
         try std.testing.expectError(
             error.TestInjectedFailure,
-            DB.derived_async_impl.rebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(
-                &interrupted,
+            interrupted.derivedAsyncRebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(
                 alloc,
                 null,
                 &targets,
@@ -34639,11 +34940,11 @@ test "db dense artifact rebuild ignores stale wrong-dimension artifacts when cou
             .{ .key = stored_key, .value = "{\"title\":\"alpha\"}" },
         }, &.{});
 
-        const valid_artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "shared_dense_v1");
+        const valid_artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "shared_dense_v1");
         defer alloc.free(valid_artifact_key);
         try putDenseEmbeddingArtifactForTest(&db, alloc, valid_artifact_key, null, &[_]f32{ 1, 0, 0 });
 
-        const stale_artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:stale", "shared_dense_v1");
+        const stale_artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:stale", "shared_dense_v1");
         defer alloc.free(stale_artifact_key);
         try putDenseEmbeddingArtifactForTest(&db, alloc, stale_artifact_key, null, &[_]f32{ 1, 0 });
     }
@@ -34708,7 +35009,7 @@ test "db dense artifact rebuild clears stale persisted state when no valid artif
             .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true,\"embedding_name\":\"shared_dense_v1\"}",
         });
 
-        const rebuild_root_path = try DB.derived_async_impl.denseIndexRebuildStatePathAlloc(&db, alloc, "dense_idx");
+        const rebuild_root_path = try db.derivedAsyncDenseIndexRebuildStatePathAlloc(alloc, "dense_idx");
         defer alloc.free(rebuild_root_path);
         const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
         try rebuild_state.update("doc:z");
@@ -34725,7 +35026,7 @@ test "db dense artifact rebuild clears stale persisted state when no valid artif
         try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
         try std.testing.expectEqual(@as(usize, 0), try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc));
 
-        const rebuild_root_path = try DB.derived_async_impl.denseIndexRebuildStatePathAlloc(&reopened, alloc, "dense_idx");
+        const rebuild_root_path = try reopened.derivedAsyncDenseIndexRebuildStatePathAlloc(alloc, "dense_idx");
         defer alloc.free(rebuild_root_path);
         const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
         try std.testing.expect((try rebuild_state.check(alloc)) == null);
@@ -34760,7 +35061,7 @@ test "db dense artifact rebuild waits for replay debt instead of raw doc count a
             .{ .key = stored_key, .value = "{\"title\":\"alpha\"}" },
         }, &.{});
 
-        const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
         defer alloc.free(artifact_key);
         try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
 
@@ -36624,7 +36925,7 @@ test "db text compaction preserves ordinal filters across reopen" {
             });
         }
 
-        var include = try DB.internal_impl.resolveDocSetForIdsAlloc(&db, alloc, &.{"doc:8"});
+        var include = try db.internalResolveDocSetForIdsAlloc(alloc, &.{"doc:8"});
         errdefer include.deinit(alloc);
         const resolved_ordinal = switch (include) {
             .ordinals => |ordinals| blk: {
@@ -36667,7 +36968,7 @@ test "db text compaction preserves ordinal filters across reopen" {
         });
         defer reopened.close();
 
-        var include = try DB.internal_impl.resolveDocSetForIdsAlloc(&reopened, alloc, &.{"doc:8"});
+        var include = try reopened.internalResolveDocSetForIdsAlloc(alloc, &.{"doc:8"});
         errdefer include.deinit(alloc);
         const resolved_ordinal = switch (include) {
             .ordinals => |ordinals| blk: {
@@ -38421,9 +38722,9 @@ test "db lookup includes chunk artifacts when _chunks is requested" {
         .sync_level = .full_index,
     });
 
-    const chunk_zero = try expectedChunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    const chunk_zero = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
     defer alloc.free(chunk_zero);
-    const chunk_one = try expectedChunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 1);
+    const chunk_one = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 1);
     defer alloc.free(chunk_one);
     try db.core.store.put(chunk_zero, "{\"body\":\"hello\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":0,\"_start_offset\":0,\"_end_offset\":5}");
     try db.core.store.put(chunk_one, "{\"body\":\"world\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":1,\"_start_offset\":6,\"_end_offset\":11}");
@@ -38476,14 +38777,14 @@ test "db lookup includes unified artifact projection when _artifacts is requeste
         .content_type = "application/json",
     });
 
-    const chunk_zero = try expectedChunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    const chunk_zero = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
     defer alloc.free(chunk_zero);
-    const chunk_one = try expectedChunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 1);
+    const chunk_one = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 1);
     defer alloc.free(chunk_one);
     try db.core.store.put(chunk_zero, "{\"body\":\"hello\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":0,\"_start_offset\":0,\"_end_offset\":5}");
     try db.core.store.put(chunk_one, "{\"body\":\"world\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":1,\"_start_offset\":6,\"_end_offset\":11}");
 
-    const dense_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "body_dense_v1");
+    const dense_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "body_dense_v1");
     defer alloc.free(dense_key);
     try putDenseEmbeddingArtifactForTest(&db, alloc, dense_key, null, &[_]f32{ 1, 2, 3 });
 
@@ -38567,7 +38868,7 @@ test "db search includes chunk artifacts on hydrated hits when _chunks is reques
         .sync_level = .full_index,
     });
 
-    const chunk_zero = try expectedChunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    const chunk_zero = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
     defer alloc.free(chunk_zero);
     try db.core.store.put(chunk_zero, "{\"body\":\"hello\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":0}");
 
@@ -38603,7 +38904,7 @@ test "db scan includes chunk artifacts when _chunks is requested" {
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
     });
 
-    const chunk_zero = try expectedChunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    const chunk_zero = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
     defer alloc.free(chunk_zero);
     try db.core.store.put(chunk_zero, "{\"body\":\"hello\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":0}");
 
@@ -38636,7 +38937,7 @@ test "db lookup does not load chunks for nested _chunks projection without expli
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
     });
 
-    const chunk_zero = try expectedChunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    const chunk_zero = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
     defer alloc.free(chunk_zero);
     try db.core.store.put(chunk_zero, "{\"body\":\"hello\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":0}");
 
@@ -38665,7 +38966,7 @@ test "db lookup loads chunks for _chunks.* selector and allows nested projection
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
     });
 
-    const chunk_zero = try expectedChunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    const chunk_zero = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
     defer alloc.free(chunk_zero);
     try db.core.store.put(chunk_zero, "{\"body\":\"hello\",\"_artifact_name\":\"body_chunks_v1\",\"_chunk_id\":0,\"_start_offset\":0,\"_end_offset\":5}");
 
@@ -38697,7 +38998,7 @@ test "db lookup includes embedding artifacts when _embeddings is requested" {
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
     });
 
-    const dense_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "body_dense_v1");
+    const dense_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "body_dense_v1");
     defer alloc.free(dense_key);
     try putDenseEmbeddingArtifactForTest(&db, alloc, dense_key, null, &[_]f32{ 1, 2, 3 });
 
@@ -38713,8 +39014,8 @@ test "db lookup includes embedding artifacts when _embeddings is requested" {
     try std.testing.expectEqualStrings("alpha", parsed.value.object.get("title").?.string);
     const vector = parsed.value.object.get("_embeddings").?.object.get("body_dense_v1").?.array.items;
     try std.testing.expectEqual(@as(usize, 3), vector.len);
-    try expectJsonNumber(vector[0], 1);
-    try expectJsonNumber(vector[2], 3);
+    try std.testing.expectApproxEqAbs(@as(f64, 1), relational_rows.jsonNumberAsF64(vector[0]) orelse return error.TestUnexpectedResult, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 3), relational_rows.jsonNumberAsF64(vector[2]) orelse return error.TestUnexpectedResult, 0.000001);
 }
 
 test "db search includes embedding artifacts on hydrated hits when _embeddings is requested" {
@@ -38737,7 +39038,7 @@ test "db search includes embedding artifacts on hydrated hits when _embeddings i
         .sync_level = .full_index,
     });
 
-    const dense_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "body_dense_v1");
+    const dense_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "body_dense_v1");
     defer alloc.free(dense_key);
     try putDenseEmbeddingArtifactForTest(&db, alloc, dense_key, null, &[_]f32{ 1, 0 });
 
@@ -38756,7 +39057,7 @@ test "db search includes embedding artifacts on hydrated hits when _embeddings i
     defer parsed.deinit();
     const vector = parsed.value.object.get("_embeddings").?.object.get("body_dense_v1").?.array.items;
     try std.testing.expectEqual(@as(usize, 2), vector.len);
-    try expectJsonNumber(vector[0], 1);
+    try std.testing.expectApproxEqAbs(@as(f64, 1), relational_rows.jsonNumberAsF64(vector[0]) orelse return error.TestUnexpectedResult, 0.000001);
 }
 
 test "db scan includes embedding artifacts when _embeddings is requested" {
@@ -38773,7 +39074,7 @@ test "db scan includes embedding artifacts when _embeddings is requested" {
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
     });
 
-    const dense_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "body_dense_v1");
+    const dense_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "body_dense_v1");
     defer alloc.free(dense_key);
     try putDenseEmbeddingArtifactForTest(&db, alloc, dense_key, null, &[_]f32{ 1, 0 });
 
@@ -38805,7 +39106,7 @@ test "db lookup does not load embeddings for nested _embeddings projection witho
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
     });
 
-    const dense_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "body_dense_v1");
+    const dense_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "body_dense_v1");
     defer alloc.free(dense_key);
     try putDenseEmbeddingArtifactForTest(&db, alloc, dense_key, null, &[_]f32{ 1, 0 });
 
@@ -38834,7 +39135,7 @@ test "db lookup loads embeddings for _embeddings.* selector and allows nested pr
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
     });
 
-    const dense_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "body_dense_v1");
+    const dense_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "body_dense_v1");
     defer alloc.free(dense_key);
     try putDenseEmbeddingArtifactForTest(&db, alloc, dense_key, null, &[_]f32{ 1, 0 });
 
@@ -38848,7 +39149,7 @@ test "db lookup loads embeddings for _embeddings.* selector and allows nested pr
     defer parsed.deinit();
     const vector = parsed.value.object.get("_embeddings").?.object.get("body_dense_v1").?.array.items;
     try std.testing.expectEqual(@as(usize, 2), vector.len);
-    try expectJsonNumber(vector[0], 1);
+    try std.testing.expectApproxEqAbs(@as(f64, 1), relational_rows.jsonNumberAsF64(vector[0]) orelse return error.TestUnexpectedResult, 0.000001);
 }
 
 test "db field selection plan only enables chunk special field for explicit include-all selectors" {
@@ -39397,22 +39698,6 @@ test "db ttl cleanup can run with manual clock" {
     try std.testing.expect(stats.ttl_cleanup.runs > 0);
     try std.testing.expect(stats.ttl_cleanup.deleted_docs > 0);
 }
-
-const TxnResolverRecorder = struct {
-    mutex: std.atomic.Mutex = .unlocked,
-    calls: u32 = 0,
-
-    fn resolve(ctx_ptr: *anyopaque, txn_id: transactions_mod.TxnId, participant: []const u8, status: transactions_mod.TxnStatus, commit_version: u64) anyerror!void {
-        _ = txn_id;
-        _ = status;
-        _ = commit_version;
-        if (!std.mem.eql(u8, participant, "remote")) return error.UnexpectedParticipant;
-        const self: *TxnResolverRecorder = @ptrCast(@alignCast(ctx_ptr));
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
-        self.calls += 1;
-    }
-};
 
 test "db exposes local transaction lifecycle" {
     const alloc = std.testing.allocator;
@@ -42010,7 +42295,7 @@ test "db relational unique constraints enforce committed scalar values" {
     const deleted_user_2_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:2");
     defer if (deleted_user_2_row) |row| alloc.free(row);
     try std.testing.expect(deleted_user_2_row == null);
-    const reusable_email_value = try testUniqueTupleValueAlloc(alloc, &.{"a@example.com"});
+    const reusable_email_value = try relational_store_mod.bytesTupleValueAlloc(alloc, &.{"a@example.com"});
     defer alloc.free(reusable_email_value);
     const reusable_email_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_email_key", reusable_email_value);
     defer alloc.free(reusable_email_key);
@@ -42635,84 +42920,6 @@ test "db relational temporal portion mutation requires temporal primary identity
     }));
 }
 
-fn expectRelationalTemporalPriceRow(
-    alloc: Allocator,
-    row_json: []const u8,
-    sku: []const u8,
-    valid_from: f64,
-    valid_to: f64,
-    price: f64,
-) !void {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, row_json, .{});
-    defer parsed.deinit();
-    const object = parsed.value.object;
-    try std.testing.expectEqualStrings(sku, object.get("sku").?.string);
-    try expectJsonNumberEqual(valid_from, object.get("valid_from").?);
-    try expectJsonNumberEqual(valid_to, object.get("valid_to").?);
-    try expectJsonNumberEqual(price, object.get("price").?);
-}
-
-fn expectRelationalTemporalPrimarySelectorPriceRow(
-    alloc: Allocator,
-    db: *DB,
-    runtime_schema: schema_mod.TableSchema,
-    sku: []const u8,
-    point_json: []const u8,
-    valid_from: f64,
-    valid_to: f64,
-    price: f64,
-) !void {
-    const primary_key = runtime_schema.primary_key orelse return error.TestExpectedEqual;
-    const period_name = primary_key.without_overlaps_period orelse return error.TestExpectedEqual;
-    var period: ?schema_mod.RelationalPeriod = null;
-    for (runtime_schema.periods) |candidate| {
-        if (std.mem.eql(u8, candidate.name, period_name)) {
-            period = candidate;
-            break;
-        }
-    }
-    const resolved_period = period orelse return error.TestExpectedEqual;
-    var start_column: ?schema_mod.RelationalColumn = null;
-    for (runtime_schema.relational_columns) |column| {
-        if (std.mem.eql(u8, column.path, resolved_period.start_column)) {
-            start_column = column;
-            break;
-        }
-    }
-    const resolved_start_column = start_column orelse return error.TestExpectedEqual;
-
-    const tuple_row_json = try std.fmt.allocPrint(
-        alloc,
-        "{{\"sku\":{f},\"valid_from\":0,\"valid_to\":1}}",
-        .{std.json.fmt(sku, .{})},
-    );
-    defer alloc.free(tuple_row_json);
-    const tuple_row = try mapper.buildRelationalRowValueAlloc(alloc, tuple_row_json, runtime_schema.relational_columns);
-    defer alloc.free(tuple_row);
-    const tuple = try relational_store_mod.primaryKeyTupleValueAlloc(alloc, tuple_row, primary_key);
-    defer alloc.free(tuple);
-    const point = try relational_store_mod.temporalPeriodBoundBytesFromJsonAlloc(alloc, point_json, resolved_start_column);
-    defer alloc.free(point);
-    const owner = (try db.lookupRelationalTemporalUniqueOwner(
-        alloc,
-        relational_store_mod.primary_key_constraint_name,
-        tuple,
-        point,
-    )) orelse return error.TestExpectedEqual;
-    defer alloc.free(owner);
-    const row = (try db.get(alloc, owner)) orelse return error.TestExpectedEqual;
-    defer alloc.free(row);
-    try expectRelationalTemporalPriceRow(alloc, row, sku, valid_from, valid_to, price);
-}
-
-fn expectJsonNumberEqual(expected: f64, actual: std.json.Value) !void {
-    switch (actual) {
-        .integer => |value| try std.testing.expectEqual(expected, @as(f64, @floatFromInt(value))),
-        .float => |value| try std.testing.expectEqual(expected, value),
-        else => return error.TestExpectedEqual,
-    }
-}
-
 test "db relational temporal mutation source splits portions transactionally" {
     const alloc = std.testing.allocator;
 
@@ -43218,11 +43425,11 @@ test "db unique constraint integrity repair rebuilds backing rows" {
         .{ .key = "user:grace", .value = "{\"id\":\"user:grace\",\"email\":\"grace@example.test\"}" },
     } });
 
-    const ada_value = try testUniqueTupleValueAlloc(alloc, &.{"ada@example.test"});
+    const ada_value = try relational_store_mod.bytesTupleValueAlloc(alloc, &.{"ada@example.test"});
     defer alloc.free(ada_value);
-    const grace_value = try testUniqueTupleValueAlloc(alloc, &.{"grace@example.test"});
+    const grace_value = try relational_store_mod.bytesTupleValueAlloc(alloc, &.{"grace@example.test"});
     defer alloc.free(grace_value);
-    const stale_value = try testUniqueTupleValueAlloc(alloc, &.{"stale@example.test"});
+    const stale_value = try relational_store_mod.bytesTupleValueAlloc(alloc, &.{"stale@example.test"});
     defer alloc.free(stale_value);
     const ada_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_email_key", ada_value);
     defer alloc.free(ada_key);
@@ -43309,7 +43516,7 @@ test "db transaction unique constraint mutations enforce owner handoff" {
     defer schema_mod.freeSchema(alloc, runtime_schema);
     try db.setSchema(runtime_schema);
 
-    const ada_value = try testUniqueTupleValueAlloc(alloc, &.{"ada@example.com"});
+    const ada_value = try relational_store_mod.bytesTupleValueAlloc(alloc, &.{"ada@example.com"});
     defer alloc.free(ada_value);
 
     const owner_write_txn = try db.beginTransaction(41_000);
@@ -43452,7 +43659,7 @@ test "db transaction-created identity rows remain visible after reopen" {
         try std.testing.expectEqualStrings("{\"title\":\"txn\"}", raw);
 
         const current = try db.searchRequestAtCurrentIdentityGeneration(.{});
-        var resolved = try DB.internal_impl.resolveDocSetForIdsNoLockAtGenerationAlloc(&db, alloc, &.{"doc:txn_reopen"}, current.identity_read_generation);
+        var resolved = try db.internalResolveDocSetForIdsNoLockAtGenerationAlloc(alloc, &.{"doc:txn_reopen"}, current.identity_read_generation);
         defer resolved.deinit(alloc);
         try std.testing.expect(resolved.containsOrdinal(1));
 
@@ -44174,8 +44381,7 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
 
     // Finish the implicit bulk publish, but hold the deferred executor wake so
     // the test can prove the replay catch-up itself publishes fresh visibility.
-    try DB.ha_replication_impl.enforceDBWriteGate(&db);
-    try DB.write_path_impl.finishDenseAutoBulkIngestSessionWithOptionsAfterGate(&db, .{ .compact = false }, false);
+    try db.finishDenseAutoBulkIngestSessionWithOptionsAndNotifyExecutor(.{ .compact = false }, false);
     hook_ctx = .{};
 
     flushDeferredExternalBulkExecutorNotification(db.async_context, db.executor);
@@ -47064,66 +47270,6 @@ test "db persists byte range across reopen" {
     }
 }
 
-fn cacheBlockHitsForBench(stats: anytype) u64 {
-    var hits: u64 = 0;
-    if (@hasField(@TypeOf(stats), "run_table_block")) {
-        hits += stats.run_table_block.hits;
-    }
-    if (@hasField(@TypeOf(stats), "run_table_physical_block")) {
-        hits += stats.run_table_physical_block.hits;
-    }
-    return hits;
-}
-
-fn normalizedBenchSearchEffort(effort: ?f32) f32 {
-    const value = effort orelse return 0.5;
-    if (std.math.isNan(value)) return 0.5;
-    if (value < 0) return 0;
-    if (value > 1) return 1;
-    return value;
-}
-
-fn estimateBenchDenseLeafCount(stats: hbc_mod.IndexStats) u32 {
-    if (stats.active_count == 0) return 0;
-    const leaf_size = @max(stats.leaf_size, 1);
-    const estimated = (stats.active_count + leaf_size - 1) / leaf_size;
-    return @intCast(@min(estimated, @as(u64, std.math.maxInt(u32))));
-}
-
-fn resolveBenchSearchWidth(k: u32, effort: f32, stats: hbc_mod.IndexStats) u32 {
-    const min_width = @max(k, @as(u32, 64));
-    const legacy_max_width = @max(min_width * 20, @as(u32, 4096));
-    const legacy_balanced_width = min_width + @as(u32, @intFromFloat(@as(f32, @floatFromInt(legacy_max_width - min_width)) * 0.5));
-    const estimated_leaf_count = estimateBenchDenseLeafCount(stats);
-    const max_width = if (estimated_leaf_count > 0)
-        @max(min_width, @max(estimated_leaf_count, if (stats.node_count > 0 and stats.node_count <= std.math.maxInt(u32)) @as(u32, @intCast(stats.node_count)) else estimated_leaf_count))
-    else if (stats.node_count > legacy_max_width and stats.node_count <= std.math.maxInt(u32))
-        @as(u32, @intCast(stats.node_count))
-    else
-        legacy_max_width;
-    const balanced_cap = if (estimated_leaf_count > 0) @max(min_width, estimated_leaf_count) else max_width;
-    const leaf_balanced_width = min_width + @as(u32, @intFromFloat(@as(f32, @floatFromInt(balanced_cap - min_width)) * 0.5));
-    const balanced_width = @min(legacy_balanced_width, leaf_balanced_width);
-
-    if (effort <= 0.5) {
-        if (balanced_width <= min_width) return min_width;
-        const ratio = effort / 0.5;
-        return min_width + @as(u32, @intFromFloat(@as(f32, @floatFromInt(balanced_width - min_width)) * ratio));
-    }
-
-    if (max_width <= balanced_width) return max_width;
-    const ratio = (effort - 0.5) / 0.5;
-    const width = balanced_width + @as(u32, @intFromFloat(@as(f32, @floatFromInt(max_width - balanced_width)) * ratio));
-    return @min(width, max_width);
-}
-
-fn resolveBenchSearchEpsilon(effort: f32) f32 {
-    if (effort < 0.5) {
-        return 1.0 + (effort * 12.0);
-    }
-    return 7.0 + ((effort - 0.5) * 186.0);
-}
-
 test "db dense lsm cache profile benchmark" {
     if (!profileBenchTestsEnabled()) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -47267,14 +47413,14 @@ test "db dense lsm cache profile benchmark" {
             @intCast(profiled_entry.index.metadata.active_count)
         else
             req.dense.?.k;
-        const effort = normalizedBenchSearchEffort(req.search_effort);
+        const effort = db_query_search.resolvedSearchEffort(req.search_effort);
 
         const hbc_search_start = monotonicTimeNs();
         var dense_results = try profiled_entry.index.searchWithRequest(.{
             .query = req.dense.?.vector,
             .k = effective_k,
-            .search_width = resolveBenchSearchWidth(req.dense.?.k, effort, profiled_entry.index.stats()),
-            .epsilon = resolveBenchSearchEpsilon(effort),
+            .search_width = db_query_search.resolveSearchWidth(req.dense.?.k, effort, profiled_entry.index.stats()),
+            .epsilon = db_query_search.resolveSearchEpsilon(effort),
             .filter_prefix = req.filter_prefix,
             .distance_over = req.distance_over,
             .distance_under = req.distance_under,
@@ -47320,8 +47466,7 @@ test "db dense lsm cache profile benchmark" {
 
             const stored_data = if (req.include_stored and !(chunk_backed and group_chunk_parents)) blk: {
                 const load_start = monotonicTimeNs();
-                const loaded = try DB.search_runtime_impl.projectOwnedStoredBytesForSearch(
-                    &db,
+                const loaded = try db.searchRuntimeProjectOwnedStoredBytesForSearch(
                     alloc,
                     req,
                     doc_key,
@@ -47663,7 +47808,7 @@ test "db rebuild dense indexes deletes corrupt stored embedding artifacts" {
         .config_json = "{\"field\":\"embedding\",\"dims\":2}",
     });
 
-    const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, "doc:a", "dv_v1");
+    const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
     defer alloc.free(artifact_key);
     try db.core.store.put(artifact_key, "bad-artifact");
 
@@ -47685,7 +47830,7 @@ test "db dense artifact rebuild write cleanup tolerates artifact-backed empty ve
         .vector = &.{},
     });
 
-    DB.derived_async_impl.freeDenseArtifactRebuildWrites(alloc, &writes);
+    DB.derivedAsyncFreeDenseArtifactRebuildWrites(alloc, &writes);
     try std.testing.expectEqual(@as(usize, 0), writes.items.len);
 }
 
@@ -47713,20 +47858,20 @@ test "db rw lock allows search and scan while shared read lock is held" {
 
     var held = SharedReadLockHold{ .db = &db };
     const held_thread = try std.Thread.spawn(.{}, SharedReadLockHold.run, .{&held});
-    try std.testing.expect(waitForAtomicFlag(&held.acquired, 1, 10_000));
+    try std.testing.expect(db_internal.waitForAtomicU8(&held.acquired, 1, 10_000));
 
     var search_probe = ConcurrentReadProbe{ .db = &db };
     const search_thread = try std.Thread.spawn(.{}, ConcurrentReadProbe.runSearch, .{&search_probe});
 
-    try std.testing.expect(waitForAtomicFlag(&search_probe.started, 1, 10_000));
-    try std.testing.expect(waitForAtomicFlag(&search_probe.done, 1, 10_000));
+    try std.testing.expect(db_internal.waitForAtomicU8(&search_probe.started, 1, 10_000));
+    try std.testing.expect(db_internal.waitForAtomicU8(&search_probe.done, 1, 10_000));
     try std.testing.expectEqual(@as(u8, 0), search_probe.failed.load(.monotonic));
     search_thread.join();
 
     var scan_probe = ConcurrentReadProbe{ .db = &db };
     const scan_thread = try std.Thread.spawn(.{}, ConcurrentReadProbe.runScan, .{&scan_probe});
-    try std.testing.expect(waitForAtomicFlag(&scan_probe.started, 1, 10_000));
-    try std.testing.expect(waitForAtomicFlag(&scan_probe.done, 1, 10_000));
+    try std.testing.expect(db_internal.waitForAtomicU8(&scan_probe.started, 1, 10_000));
+    try std.testing.expect(db_internal.waitForAtomicU8(&scan_probe.done, 1, 10_000));
     try std.testing.expectEqual(@as(u8, 0), scan_probe.failed.load(.monotonic));
     scan_thread.join();
 
@@ -47752,12 +47897,12 @@ test "db rw lock keeps batch writes blocked behind shared read lock" {
 
     var held = SharedReadLockHold{ .db = &db };
     const held_thread = try std.Thread.spawn(.{}, SharedReadLockHold.run, .{&held});
-    try std.testing.expect(waitForAtomicFlag(&held.acquired, 1, 10_000));
+    try std.testing.expect(db_internal.waitForAtomicU8(&held.acquired, 1, 10_000));
 
     var write_probe = ConcurrentWriteProbe{ .db = &db };
     const write_thread = try std.Thread.spawn(.{}, ConcurrentWriteProbe.runBatch, .{&write_probe});
 
-    try std.testing.expect(waitForAtomicFlag(&write_probe.started, 1, 10_000));
+    try std.testing.expect(db_internal.waitForAtomicU8(&write_probe.started, 1, 10_000));
 
     var still_blocked = true;
     var attempts: usize = 0;
@@ -48189,16 +48334,16 @@ test "relational column filter pushdown declines stale identity generations" {
     });
     const current_generation = db.core.nextDerivedSequence();
 
-    const stale = try DB.search_runtime_impl.resolveRelationalFilterQueryDocSetAlloc(&db, alloc, runtime_schema, .{
+    const stale = try db.searchRuntimeResolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, .{
         .term = .{ .field = "status", .term = "active" },
     }, active_generation);
     try std.testing.expect(stale == null);
 
-    var current = (try DB.search_runtime_impl.resolveRelationalFilterQueryDocSetAlloc(&db, alloc, runtime_schema, .{
+    var current = (try db.searchRuntimeResolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, .{
         .term = .{ .field = "status", .term = "archived" },
     }, current_generation)) orelse return error.TestExpectedEqual;
     defer current.deinit(alloc);
-    const ids = (try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &current, current_generation)) orelse return error.TestExpectedEqual;
+    const ids = (try db.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &current, current_generation)) orelse return error.TestExpectedEqual;
     defer {
         for (ids) |id| alloc.free(@constCast(id));
         alloc.free(ids);
@@ -48340,11 +48485,11 @@ test "relational rows query uses indexed candidates and authoritative base rows"
         .field = "status",
         .values_json = "[\"closed\"]",
     }};
-    var in_set = (try DB.relational_rows_impl.resolveRelationalRowsQueryCandidateSetAlloc(&db, alloc, runtime_schema, .{
+    var in_set = (try db.resolveRelationalRowsQueryCandidateSetAlloc(alloc, runtime_schema, .{
         .in_predicates = in_predicates[0..],
     }, null)) orelse return error.TestExpectedEqual;
     defer in_set.deinit(alloc);
-    const in_ids = (try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &in_set, null)) orelse return error.TestExpectedEqual;
+    const in_ids = (try db.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &in_set, null)) orelse return error.TestExpectedEqual;
     defer {
         for (in_ids) |id| alloc.free(@constCast(id));
         alloc.free(in_ids);
@@ -48413,7 +48558,7 @@ test "relational rows query planner orders candidate sets by estimated cardinali
 
     var small = try doc_set.cloneDocKeysAlloc(alloc, &.{"row:small"});
     var medium = try doc_set.fromOrdinalsAlloc(alloc, &.{ 1, 2, 3 });
-    var planned = [_]DB.RelationalRowsPlannedCandidateSet{
+    var planned = [_]relational_rows.PlannedCandidateSet{
         .{
             .set = .all,
             .estimated_cardinality = null,
@@ -48439,7 +48584,7 @@ test "relational rows query planner orders candidate sets by estimated cardinali
     small = .none;
     defer for (&planned) |*item| item.deinit(alloc);
 
-    std.sort.pdq(DB.RelationalRowsPlannedCandidateSet, &planned, {}, DB.relationalRowsPlannedCandidateSetLessThan);
+    std.sort.pdq(relational_rows.PlannedCandidateSet, &planned, {}, relational_rows.plannedCandidateSetLessThan);
 
     try std.testing.expectEqual(@as(usize, 2), planned[0].ordinal);
     try std.testing.expectEqual(@as(usize, 3), planned[1].ordinal);
@@ -50866,11 +51011,11 @@ test "relational expression partial predicates maintain indexes and unique owner
         .op = .eq,
         .rhs = active_expression_rhs[0..],
     }};
-    try std.testing.expect(!(try DB.search_runtime_impl.relationalColumnIndexUsableForQuery(&db, alloc, runtime_schema.relational_columns[1], .{
+    try std.testing.expect(!(try db.searchRuntimeRelationalColumnIndexUsableForQuery(alloc, runtime_schema.relational_columns[1], .{
         .predicates = &.{},
         .expressions = &.{},
     })));
-    try std.testing.expect(try DB.search_runtime_impl.relationalColumnIndexUsableForQuery(&db, alloc, runtime_schema.relational_columns[1], .{
+    try std.testing.expect(try db.searchRuntimeRelationalColumnIndexUsableForQuery(alloc, runtime_schema.relational_columns[1], .{
         .predicates = &.{},
         .expressions = active_expression_predicates[0..],
     }));
@@ -50888,7 +51033,7 @@ test "relational expression partial predicates maintain indexes and unique owner
             .value_json = "\"ACTIVE\"",
         },
     };
-    try std.testing.expect(try DB.search_runtime_impl.relationalColumnIndexUsableForQuery(&db, alloc, runtime_schema.relational_columns[1], .{
+    try std.testing.expect(try db.searchRuntimeRelationalColumnIndexUsableForQuery(alloc, runtime_schema.relational_columns[1], .{
         .predicates = semantic_index_predicates[0..],
         .expressions = &.{},
     }));
@@ -51740,7 +51885,7 @@ test "relational rows mutation source plans across injected owner ranges" {
     };
     var row_keys: [row_jsons.len][]u8 = undefined;
     for (row_jsons, 0..) |row_json, i| {
-        row_keys[i] = try DB.relationalRowsPhysicalPrimaryKeyFromRowJsonAlloc(alloc, runtime_schema, row_json);
+        row_keys[i] = try relational_rows.physicalPrimaryKeyFromRowJsonAlloc(alloc, runtime_schema, row_json);
     }
     defer {
         for (row_keys) |key| alloc.free(key);
@@ -51834,10 +51979,10 @@ test "relational rows mutation source stages primary key identity rewrites" {
     try db.setSchema(runtime_schema);
 
     const old_json = "{\"id\":\"old\",\"status\":\"ready\",\"rank\":1}";
-    const old_key = try DB.relationalRowsPhysicalPrimaryKeyFromRowJsonAlloc(alloc, runtime_schema, old_json);
+    const old_key = try relational_rows.physicalPrimaryKeyFromRowJsonAlloc(alloc, runtime_schema, old_json);
     defer alloc.free(old_key);
     const new_json = "{\"id\":\"new\",\"status\":\"ready\",\"rank\":1}";
-    const new_key = try DB.relationalRowsPhysicalPrimaryKeyFromRowJsonAlloc(alloc, runtime_schema, new_json);
+    const new_key = try relational_rows.physicalPrimaryKeyFromRowJsonAlloc(alloc, runtime_schema, new_json);
     defer alloc.free(new_key);
 
     try db.batch(.{
@@ -54217,10 +54362,10 @@ test "relational joined mutation source stages primary key identity rewrites" {
     defer schema_mod.freeSchema(alloc, source_schema);
 
     const old_json = "{\"id\":\"t1\",\"source_id\":\"s1\",\"status\":\"ready\",\"quantity\":1}";
-    const old_key = try DB.relationalRowsPhysicalPrimaryKeyFromRowJsonAlloc(alloc, target_schema, old_json);
+    const old_key = try relational_rows.physicalPrimaryKeyFromRowJsonAlloc(alloc, target_schema, old_json);
     defer alloc.free(old_key);
     const new_json = "{\"id\":\"t2\",\"source_id\":\"s1\",\"status\":\"ready\",\"quantity\":1}";
-    const new_key = try DB.relationalRowsPhysicalPrimaryKeyFromRowJsonAlloc(alloc, target_schema, new_json);
+    const new_key = try relational_rows.physicalPrimaryKeyFromRowJsonAlloc(alloc, target_schema, new_json);
     defer alloc.free(new_key);
     try db.batch(.{
         .writes = &.{.{ .key = old_key, .value = old_json }},
@@ -54741,11 +54886,11 @@ test "relational indexed array_any filters use array element indexes" {
     try std.testing.expectEqual(@as(usize, 1), indexed_hot_ids.len);
     try std.testing.expectEqualStrings("row:a", indexed_hot_ids[0]);
 
-    var direct_resolved = (try DB.search_runtime_impl.resolveRelationalFilterQueryDocSetAlloc(&db, alloc, runtime_schema, .{
+    var direct_resolved = (try db.searchRuntimeResolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, .{
         .array_any = .{ .field = "tags", .value = parsed_hot.value },
     }, null)) orelse return error.TestExpectedEqual;
     defer direct_resolved.deinit(alloc);
-    const direct_ids = (try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &direct_resolved, null)) orelse return error.TestExpectedEqual;
+    const direct_ids = (try db.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &direct_resolved, null)) orelse return error.TestExpectedEqual;
     defer {
         for (direct_ids) |id| alloc.free(@constCast(id));
         alloc.free(direct_ids);
@@ -54831,11 +54976,11 @@ test "relational indexed json_contains filters use json value indexes" {
     try std.testing.expectEqual(@as(usize, 1), indexed_ids.len);
     try std.testing.expectEqualStrings("row:a", indexed_ids[0]);
 
-    var direct_resolved = (try DB.search_runtime_impl.resolveRelationalFilterQueryDocSetAlloc(&db, alloc, runtime_schema, .{
+    var direct_resolved = (try db.searchRuntimeResolveRelationalFilterQueryDocSetAlloc(alloc, runtime_schema, .{
         .json_contains = .{ .field = "attrs", .value = wanted.value },
     }, null)) orelse return error.TestExpectedEqual;
     defer direct_resolved.deinit(alloc);
-    const direct_ids = (try DB.internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(&db, alloc, &direct_resolved, null)) orelse return error.TestExpectedEqual;
+    const direct_ids = (try db.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &direct_resolved, null)) orelse return error.TestExpectedEqual;
     defer {
         for (direct_ids) |id| alloc.free(@constCast(id));
         alloc.free(direct_ids);
@@ -55162,7 +55307,7 @@ test "relational derived replay reads base row keyspace" {
         .documents = &docs,
     };
     var replay_ctx = ReplayApplyContext{ .db = &db };
-    try std.testing.expect(try DB.derived_async_impl.applyDerivedBatchToIndexReplay(&replay_ctx, batch, .{
+    try std.testing.expect(try DB.derivedAsyncApplyDerivedBatchToIndexReplay(&replay_ctx, batch, .{
         .name = "ft_replay_relational",
         .kind = .full_text,
     }));

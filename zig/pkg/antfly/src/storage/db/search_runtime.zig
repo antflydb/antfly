@@ -376,7 +376,6 @@ fn cloneGraphMetricBuildPageStatusesFromGraph(
 pub fn Impl(comptime DB: type) type {
     return struct {
         const Self = @This();
-        const internal_impl = db_internal.Impl(DB);
 
         pub fn search(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.SearchResult {
             return try Self.searchWithExecutionContext(self, alloc, req, .{});
@@ -498,13 +497,13 @@ pub fn Impl(comptime DB: type) type {
             hits: []const types.SearchHit,
         ) !doc_set.ResolvedDocSet {
             if (try resolvedDocSetFromSearchHitOrdinalsAlloc(alloc, hits)) |resolved| {
-                internal_impl.recordResolvedDocSet(self, &resolved, false);
+                self.internalRecordResolvedDocSet(&resolved, false);
                 return resolved;
             }
             var doc_ids = try alloc.alloc([]const u8, hits.len);
             defer alloc.free(doc_ids);
             for (hits, 0..) |hit, i| doc_ids[i] = hit.id;
-            return try internal_impl.resolveDocSetForIdsNoLockAtGenerationAlloc(self, alloc, doc_ids, req.identity_read_generation);
+            return try self.internalResolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids, req.identity_read_generation);
         }
 
         pub fn resolveGraphNodesToDocSet(
@@ -516,7 +515,7 @@ pub fn Impl(comptime DB: type) type {
             var doc_ids = try alloc.alloc([]const u8, nodes.len);
             defer alloc.free(doc_ids);
             for (nodes, 0..) |node, i| doc_ids[i] = node.key;
-            return try internal_impl.resolveDocSetForIdsNoLockAtGenerationAlloc(self, alloc, doc_ids, req.identity_read_generation);
+            return try self.internalResolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids, req.identity_read_generation);
         }
 
         pub fn liveFilterDocSet(
@@ -525,7 +524,7 @@ pub fn Impl(comptime DB: type) type {
             set: *const doc_set.ResolvedDocSet,
             generation: ?u64,
         ) !doc_set.ResolvedDocSet {
-            if (try internal_impl.allDocsVisibleAtGeneration(self, generation)) {
+            if (try self.internalAllDocsVisibleAtGeneration(generation)) {
                 return try doc_set.cloneAlloc(alloc, set);
             }
             return try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, set, generation);
@@ -545,7 +544,7 @@ pub fn Impl(comptime DB: type) type {
                 vector_ids,
             );
             errdefer alloc.free(ordinals);
-            const all_visible = try internal_impl.allDocsVisibleSummaryFast(self, generation);
+            const all_visible = try self.internalAllDocsVisibleSummaryFast(generation);
             if (all_visible) return ordinals;
 
             var txn = try self.core.store.beginProbeTxn();
@@ -570,7 +569,7 @@ pub fn Impl(comptime DB: type) type {
         ) !?doc_set.DocOrdinal {
             self.core.lockApplyShared();
             defer self.core.unlockApplyShared();
-            return try internal_impl.lookupLiveDocOrdinalNoLock(self, alloc, doc_id, generation);
+            return try self.internalLookupLiveDocOrdinalNoLock(alloc, doc_id, generation);
         }
 
         pub fn loadChunkFieldValue(self: *DB, alloc: Allocator, doc_key: []const u8) !?std.json.Value {
@@ -2606,6 +2605,9 @@ pub fn Impl(comptime DB: type) type {
                 if (!matcher.matches(value)) continue;
                 try doc_ids.append(alloc, value.doc_key);
             }
+            if (doc_ids.items.len == 0 and (column.index_where.len != 0 or column.index_where_expressions.len != 0)) {
+                return try Self.scanRelationalBaseRowsFilterDocSetAlloc(self, alloc, column, generation, matcher);
+            }
             return try Self.resolveDocIdsToDocSet(self, alloc, doc_ids.items, generation);
         }
 
@@ -3563,7 +3565,7 @@ pub fn Impl(comptime DB: type) type {
             const relational_row = Self.hasRelationalBaseRows(self) and
                 !Self.isMetadataKey(self, key) and
                 !internal_keys.isInternalPhysicalTableDataKey(key);
-            const store_key = try Self.encodeBaseDocumentLookupKeyAlloc(self, alloc, key);
+            const store_key = try encodeBaseDocumentLookupKeyAlloc(self, alloc, key);
             defer alloc.free(store_key);
             var txn = try self.core.store.beginProbeTxn();
             defer txn.abort();
@@ -3610,7 +3612,7 @@ pub fn Impl(comptime DB: type) type {
             for (keys, 0..) |key, i| {
                 try pending.append(alloc, .{
                     .original_index = i,
-                    .store_key = try Self.encodeBaseDocumentLookupKeyAlloc(self, alloc, key),
+                    .store_key = try encodeBaseDocumentLookupKeyAlloc(self, alloc, key),
                     .relational_row = relational_base_rows and !Self.isMetadataKey(self, key) and !internal_keys.isInternalPhysicalTableDataKey(key),
                 });
             }
@@ -3684,7 +3686,7 @@ pub fn Impl(comptime DB: type) type {
             set: *const doc_set.ResolvedDocSet,
             generation: ?u64,
         ) !?[]const []const u8 {
-            return try internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(self, alloc, set, generation);
+            return try self.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, set, generation);
         }
 
         pub fn resolveDocIdsToDocSet(
@@ -3693,7 +3695,7 @@ pub fn Impl(comptime DB: type) type {
             doc_ids: []const []const u8,
             generation: ?u64,
         ) !doc_set.ResolvedDocSet {
-            return try internal_impl.resolveDocSetForIdsNoLockAtGenerationAlloc(self, alloc, doc_ids, generation);
+            return try self.internalResolveDocSetForIdsNoLockAtGenerationAlloc(alloc, doc_ids, generation);
         }
 
         pub fn resolvedDocFilterForIdsAlloc(
@@ -3703,11 +3705,11 @@ pub fn Impl(comptime DB: type) type {
             exclude_doc_ids: []const []const u8,
             generation: ?u64,
         ) !doc_set.ResolvedDocFilter {
-            return try internal_impl.resolvedDocFilterForIdsAlloc(self, include_positive, include_doc_ids, exclude_doc_ids, generation);
+            return try self.internalResolvedDocFilterForIdsAlloc(include_positive, include_doc_ids, exclude_doc_ids, generation);
         }
 
         pub fn recordUnsupportedDocSetFilterShape(self: *DB) void {
-            internal_impl.recordUnsupportedDocSetFilterShape(self);
+            self.internalRecordUnsupportedDocSetFilterShape();
         }
 
         pub fn resolveRelationalFilterDocSet(
@@ -3722,11 +3724,11 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn allDocsVisible(self: *DB, generation: ?u64) !bool {
-            return try internal_impl.allDocsVisibleAtGeneration(self, generation);
+            return try self.internalAllDocsVisibleAtGeneration(generation);
         }
 
         pub fn allDocsVisibleFast(self: *DB, generation: ?u64) !bool {
-            return try internal_impl.allDocsVisibleSummaryFast(self, generation);
+            return try self.internalAllDocsVisibleSummaryFast(generation);
         }
 
         pub fn denseIndex(self: *DB, index_name: ?[]const u8) ?*index_manager_mod.IndexManager.DenseIndex {
@@ -3765,7 +3767,7 @@ pub fn Impl(comptime DB: type) type {
             doc_id: []const u8,
             generation: ?u64,
         ) !?doc_set.DocOrdinal {
-            return try internal_impl.lookupLiveDocOrdinalNoLock(self, alloc, doc_id, generation);
+            return try self.internalLookupLiveDocOrdinalNoLock(alloc, doc_id, generation);
         }
 
         pub fn lookupLiveDocOrdinalsNoLock(
@@ -3774,7 +3776,7 @@ pub fn Impl(comptime DB: type) type {
             doc_ids: []const []const u8,
             generation: ?u64,
         ) ![]?doc_set.DocOrdinal {
-            return try internal_impl.lookupLiveDocOrdinalsNoLock(self, alloc, doc_ids, generation);
+            return try self.internalLookupLiveDocOrdinalsNoLock(alloc, doc_ids, generation);
         }
 
         pub fn sparseDocNumsForOrdinals(
@@ -3890,7 +3892,7 @@ pub fn Impl(comptime DB: type) type {
             req: types.SearchRequest,
             hits: []types.SearchHit,
         ) !void {
-            try internal_impl.annotateSearchHitOrdinalsNoLock(self, alloc, req, hits);
+            try self.internalAnnotateSearchHitOrdinalsNoLock(alloc, req, hits);
         }
 
         fn encodeBaseDocumentLookupKeyAlloc(self: *DB, alloc: Allocator, key: []const u8) ![]u8 {

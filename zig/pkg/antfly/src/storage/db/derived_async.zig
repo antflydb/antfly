@@ -48,7 +48,6 @@ const promotion_runtime_mod = @import("promotion_runtime.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const resolution_runtime_mod = @import("resolution_runtime.zig");
 const types = @import("types.zig");
-const write_path = @import("write_path.zig");
 
 const Allocator = std.mem.Allocator;
 const AtomicU64 = platform.atomic.Value(u64);
@@ -57,8 +56,8 @@ fn replayCollectorTimeNs() u64 {
     return platform.time.monotonicNs();
 }
 
-const containsStoreWriteKey = write_path.containsStoreWriteKey;
-const filterChangedGraphMaterializationBatch = write_path.filterChangedGraphMaterializationBatch;
+const containsStoreWriteKey = db_internal.containsStoreWriteKey;
+const filterChangedGraphMaterializationBatch = db_internal.filterChangedGraphMaterializationBatch;
 const graphArtifactContentType = db_internal.graphArtifactContentType;
 const profileDelta = db_internal.profileDelta;
 const readEnvUsize = db_internal.readEnvUsize;
@@ -94,7 +93,7 @@ pub fn logReplayCatchUpProfile(index_ref: index_manager_mod.ManagedIndexRef, app
     );
 }
 
-pub fn logDerivedWorkerProfile(index_ref: index_manager_mod.ManagedIndexRef, batch: derived_types.DerivedBatch, profile: write_path.BatchProfile) void {
+pub fn logDerivedWorkerProfile(index_ref: index_manager_mod.ManagedIndexRef, batch: derived_types.DerivedBatch, profile: anytype) void {
     std.log.info(
         "antfly_bench_derived_worker index={s} kind={s} sequence={d} documents={d} deletes={d} overwritten={d} dense_embeddings={d} sparse_embeddings={d} graph_writes={d} graph_deletes={d} total_ms={d} full_text_apply_ms={d} dense_apply_ms={d} dense_delete_ms={d} dense_doc_index_ms={d} dense_embedding_apply_ms={d} sparse_apply_ms={d} graph_apply_ms={d} index_sync_ms={d}",
         .{
@@ -2276,6 +2275,22 @@ pub fn densePostingIdleMaxBoundaryReassignmentsPerIndex() usize {
     );
 }
 
+pub const DenseArtifactRebuildResumeHook = *const fn (ctx: *anyopaque, last_key: []const u8) anyerror!void;
+
+pub const DenseArtifactRebuildTarget = struct {
+    dense_index_idx: usize,
+    resume_from: ?[]u8 = null,
+    artifact_target_count: u64 = 0,
+    force_reset: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        if (self.resume_from) |buf| alloc.free(buf);
+        self.* = .{
+            .dense_index_idx = 0,
+        };
+    }
+};
+
 pub fn Impl(comptime DB: type) type {
     return struct {
         const Self = @This();
@@ -2286,21 +2301,6 @@ pub fn Impl(comptime DB: type) type {
         const ManagedSyncTargets = db_internal.ManagedSyncTargets;
         const ReplayApplyContext = db_internal.ReplayApplyContext(DB);
         const ReplayApplyContextBatch = db_internal.ReplayApplyContextBatch(DB);
-        pub const DenseArtifactRebuildResumeHook = *const fn (ctx: *anyopaque, last_key: []const u8) anyerror!void;
-
-        pub const DenseArtifactRebuildTarget = struct {
-            dense_index_idx: usize,
-            resume_from: ?[]u8 = null,
-            artifact_target_count: u64 = 0,
-            force_reset: bool = false,
-
-            pub fn deinit(self: *@This(), alloc: Allocator) void {
-                if (self.resume_from) |buf| alloc.free(buf);
-                self.* = .{
-                    .dense_index_idx = 0,
-                };
-            }
-        };
 
         const DenseArtifactRebuildPlan = struct {
             targets: []DenseArtifactRebuildTarget = &.{},

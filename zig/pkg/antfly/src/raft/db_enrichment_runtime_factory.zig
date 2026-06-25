@@ -15,7 +15,7 @@
 const std = @import("std");
 const db_enrichment_executor = @import("db_enrichment_executor.zig");
 const fs_paths = @import("../common/fs_paths.zig");
-const db_mod = @import("../storage/db/db.zig");
+const db_mod = @import("../storage/db/mod.zig");
 
 pub const GroupDbPathResolver = struct {
     ptr: *anyopaque,

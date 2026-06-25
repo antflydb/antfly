@@ -60,6 +60,8 @@ pub const http_internal_group_join_routes = @import("http_internal_group_join_ro
 pub const http_internal_group_write_routes = @import("http_internal_group_write_routes.zig");
 pub const http_server = @import("http_server.zig");
 pub const http_client = @import("http_client.zig");
+pub const pgwire = @import("pgwire.zig");
+pub const pgwire_runtime = @import("pgwire_runtime.zig");
 pub const httpx_handler = @import("httpx_handler.zig");
 pub const openapi_contract = @import("openapi_contract.zig");
 pub const protocol_adapters = @import("protocol_adapters.zig");
@@ -105,6 +107,8 @@ test {
     try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "getNamespaceTableIndex"));
     try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "createNamespaceTableIndex"));
     try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "dropNamespaceTableIndex"));
+    _ = pgwire;
+    _ = pgwire_runtime;
     _ = protocol_adapters;
 }
 

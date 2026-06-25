@@ -319,32 +319,6 @@ pub fn logOpenProfile(path: []const u8, open_mode: anytype, start_index_workers:
     );
 }
 
-const PrimaryStoreOpenPlan = union(enum) {
-    lmdb: struct {
-        map_size: usize,
-        no_sync: bool,
-        read_only: bool,
-    },
-    mem: mem_backend_mod.Options,
-    lsm_memory: lsm_backend_mod.Options,
-    lsm: lsm_backend_mod.Options,
-};
-
-fn primaryStoreOpenPlan(opts: db_config.CoreOpenOptions) PrimaryStoreOpenPlan {
-    return switch (opts.primary_backend) {
-        .lmdb => .{
-            .lmdb = .{
-                .map_size = opts.map_size,
-                .no_sync = opts.no_sync,
-                .read_only = opts.read_only,
-            },
-        },
-        .mem => |mem_opts| .{ .mem = mem_opts },
-        .lsm_memory => |lsm_opts| .{ .lsm_memory = db_config.mergedLsmOptions(opts.storage, opts.lsm_cache, opts.resource_manager, opts.no_sync, lsm_opts) },
-        .lsm => |lsm_opts| .{ .lsm = db_config.mergedLsmOptions(opts.storage, opts.lsm_cache, opts.resource_manager, opts.no_sync, lsm_opts) },
-    };
-}
-
 pub fn openModeRequiresReadOnlyBackends(open_mode: anytype) bool {
     return open_mode == .query_readonly or open_mode == .status_only;
 }
@@ -398,71 +372,6 @@ pub fn installIndexLsmReadRuntime(index_backends: anytype, runtime: *background_
     installLsmReadRuntime(&index_backends.dense_lsm_options, runtime);
     installLsmReadRuntime(&index_backends.sparse_lsm_options, runtime);
     installLsmReadRuntime(&index_backends.graph_reverse_lsm_options, runtime);
-}
-
-pub fn openPrimaryStore(alloc: std.mem.Allocator, path: []const u8, opts: db_config.CoreOpenOptions) !db_core.OpenedPrimaryStore {
-    if (opts.primary_runtime_store) |runtime_store| {
-        return .{
-            .store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store),
-        };
-    }
-
-    const zpath = try alloc.dupeZ(u8, path);
-    defer alloc.free(zpath);
-
-    return switch (primaryStoreOpenPlan(opts)) {
-        .lmdb => |lmdb_opts| .{
-            .store = try docstore_mod.DocStore.open(alloc, zpath, .{
-                .map_size = lmdb_opts.map_size,
-                .no_sync = lmdb_opts.no_sync,
-                .read_only = lmdb_opts.read_only,
-            }),
-        },
-        .mem => |mem_opts| mem_blk: {
-            const backend = try alloc.create(mem_backend_mod.Backend);
-            errdefer alloc.destroy(backend);
-            backend.* = mem_backend_mod.Backend.init(alloc, mem_opts);
-            errdefer backend.close();
-
-            var runtime_store = try backend.runtimeStore(alloc, .{ .name = "docs" });
-            errdefer runtime_store.deinit();
-
-            break :mem_blk .{
-                .store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store),
-                .owner = .{ .mem = backend },
-            };
-        },
-        .lsm_memory => |lsm_opts| lsm_mem_blk: {
-            var handle = try lsm_backend_mod.BackendHandle.init(alloc, lsm_opts);
-            errdefer handle.close();
-
-            var runtime_store = try handle.backend.runtimeStore(alloc, .{ .name = "docs" });
-            errdefer runtime_store.deinit();
-
-            break :lsm_mem_blk .{
-                .store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store),
-                .owner = .{ .lsm = .{
-                    .handle = handle,
-                    .split_options = null,
-                } },
-            };
-        },
-        .lsm => |lsm_opts| lsm_blk: {
-            var handle = try lsm_backend_mod.BackendHandle.open(alloc, path, lsm_opts);
-            errdefer handle.close();
-
-            var runtime_store = try handle.backend.runtimeStore(alloc, .{ .name = "docs" });
-            errdefer runtime_store.deinit();
-
-            break :lsm_blk .{
-                .store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store),
-                .owner = .{ .lsm = .{
-                    .handle = handle,
-                    .split_options = db_config.splitLsmOptions(opts.primary_backend, opts.storage, opts.lsm_cache),
-                } },
-            };
-        },
-    };
 }
 
 pub fn indexStatusKeyAlloc(alloc: std.mem.Allocator, index_name: []const u8) ![]u8 {
@@ -855,7 +764,7 @@ pub fn Impl(comptime DB: type) type {
                     effective_index_backends,
                 );
                 const open_primary_started_ns = monotonicTimeNs();
-                const opened_primary = try openPrimaryStore(alloc, path, core_opts);
+                const opened_primary = try db_internal.openPrimaryStore(alloc, path, core_opts);
                 profile.primary_store_ns = elapsedSince(open_primary_started_ns);
 
                 const core_resources_started_ns = monotonicTimeNs();
@@ -1755,7 +1664,7 @@ pub fn Impl(comptime DB: type) type {
 
         /// Persist a human curation decision for one review-band mention and enqueue
         /// the document for ordinary replay-driven resolution/promotion.
-        pub fn recordReviewDecision(
+        pub fn recordReviewDecisionAfterGate(
             self: *DB,
             doc_key: []const u8,
             source_artifact: []const u8,
@@ -1765,8 +1674,6 @@ pub fn Impl(comptime DB: type) type {
             table: []const u8,
             key: []const u8,
         ) !u64 {
-            if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-            try ha_replication.enforceWriteGateOptional(self.ha_write_gate);
             try self.executor.failIfUnhealthy();
 
             self.core.lockApply();
@@ -2427,6 +2334,17 @@ pub fn Impl(comptime DB: type) type {
             }
 
             self.core.lockApplyShared();
+            defer self.core.unlockApplyShared();
+
+            return try Self.statsLocked(self, alloc);
+        }
+
+        pub fn tryRuntimeStatusStatsConsistent(self: *DB, alloc: Allocator) !?types.DBStats {
+            if (self.open_mode == .status_only) {
+                return try Self.statusOnlyStats(self, alloc);
+            }
+
+            if (!self.core.tryLockApplyShared()) return null;
             defer self.core.unlockApplyShared();
 
             return try Self.statsLocked(self, alloc);
@@ -3508,13 +3426,27 @@ pub fn Impl(comptime DB: type) type {
             if (!self.core.tryLockApplyExclusive()) return false;
             defer self.core.unlockApply();
 
+            if (self.core.index_manager.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+                if (delay_ns == 0 and try self.core.index_manager.runLsmMaintenanceStepBestEffort()) return true;
+            }
+            if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
+                if (delay_ns == 0 and try self.core.primary_store_owner.runLsmMaintenanceStepBestEffort()) return true;
+            }
+
             const primary_score = self.core.primary_store_owner.lsmMaintenanceDebtHint();
+            const index_score = self.core.index_manager.lsmMaintenanceDebtHint();
+            if (index_score > primary_score) {
+                if (try self.core.index_manager.runLsmMaintenanceStepBestEffort()) return true;
+            }
             if (primary_score > 0) {
                 if (try self.core.primary_store_owner.runLsmMaintenanceStepBestEffort()) return true;
             }
-            if (try self.core.index_manager.runLsmMaintenanceStepBestEffort()) return true;
-            if (primary_score > 0) {
+            if (index_score > 0) {
+                if (try self.core.index_manager.runLsmMaintenanceStepBestEffort()) return true;
+            }
+            if (primary_score > 0 or index_score > 0) {
                 self.core.primary_store_owner.refreshLsmMaintenanceDebtHint();
+                self.core.index_manager.refreshLsmMaintenanceDebtHint();
             }
             return false;
         }

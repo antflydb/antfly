@@ -16,7 +16,6 @@ const std = @import("std");
 const platform = @import("antfly_platform");
 const fs_paths = @import("../../common/fs_paths.zig");
 const docstore_mod = @import("../docstore.zig");
-const ha_replication = @import("ha_replication.zig");
 const internal_keys = @import("../internal_keys.zig");
 const lsm_backend_mod = @import("../lsm_backend/mod.zig");
 const shard_mod = @import("../shard.zig");
@@ -25,7 +24,6 @@ const db_config = @import("config.zig");
 const db_core = @import("core.zig");
 const db_internal = @import("internal.zig");
 const doc_identity = @import("doc_identity.zig");
-const lifecycle = @import("lifecycle.zig");
 const mapper = @import("document_mapper.zig");
 const apply_state = @import("derived/apply_state.zig");
 const range_state_mod = @import("range_state.zig");
@@ -35,6 +33,14 @@ const index_manager_mod = @import("catalog/index_manager.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+
+pub const ShadowState = struct {
+    manager: *index_manager_mod.IndexManager,
+    base_path: []u8,
+    indexes_path: []u8,
+    range_start: []u8,
+    range_end: []u8,
+};
 
 const putLeakyJsonStringField = db_internal.putLeakyJsonStringField;
 const putLeakyJsonU64Field = db_internal.putLeakyJsonU64Field;
@@ -863,9 +869,7 @@ pub fn Impl(comptime DB: type) type {
     return struct {
         const Self = @This();
 
-        pub fn updateRange(self: *DB, byte_range: types.ByteRange) !void {
-            if (lifecycle.openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-            try ha_replication.enforceWriteGateOptional(self.ha_write_gate);
+        pub fn updateRangeAfterGate(self: *DB, byte_range: types.ByteRange) !void {
             self.core.lockApply();
             defer self.core.unlockApply();
             try self.core.updateRange(byte_range);
@@ -1582,7 +1586,7 @@ pub fn Impl(comptime DB: type) type {
 
         pub fn restoreSnapshotStoreTo(alloc: Allocator, snapshot_root: []const u8, path: []const u8, opts: anytype, restore_identity: ?RestoreIdentity) !void {
             if (restore_identity) |identity| try beginRestoreImport(alloc, path, snapshot_root, identity);
-            var opened_primary = try lifecycle.openPrimaryStore(alloc, path, .{
+            var opened_primary = try db_internal.openPrimaryStore(alloc, path, .{
                 .map_size = opts.map_size,
                 .no_sync = opts.no_sync,
                 .primary_backend = opts.primary_backend,

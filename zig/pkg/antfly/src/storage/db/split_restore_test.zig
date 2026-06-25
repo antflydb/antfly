@@ -15,7 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const db_mod = @import("db.zig");
+const db_mod = @import("mod.zig");
 const db_config = @import("config.zig");
 const docstore_mod = @import("../docstore.zig");
 const doc_identity = @import("doc_identity.zig");
@@ -83,12 +83,6 @@ fn waitForAppliedSequenceAdvance(
     }
     if (applied <= previous) return error.Timeout;
     return applied;
-}
-
-fn waitForDerivedReplayTarget(db: *DB) !void {
-    const sequence = db.core.nextDerivedSequence();
-    if (sequence == 0) return;
-    try db.executor.waitForAll(sequence);
 }
 
 test "db split state and split deltas are exposed through public api" {
@@ -1815,7 +1809,7 @@ test "db split cutover preserves enrichment resume and fencing across reopen" {
             .sync_level = .write,
         });
         try parent.enrichment_runtime.?.waitForApplied(1);
-        try waitForDerivedReplayTarget(&parent);
+        try parent.runDerivedUntil(parent.core.nextDerivedSequence());
 
         try parent.split(parent.getRange(), "doc:m", "", std.mem.span(child_path), true);
         try parent.finalizeSplit(.{ .start = "", .end = "doc:m" });
@@ -1946,7 +1940,7 @@ test "db split cutover preserves enrichment resume and fencing across reopen wit
             .sync_level = .write,
         });
         try parent.enrichment_runtime.?.waitForApplied(1);
-        try waitForDerivedReplayTarget(&parent);
+        try parent.runDerivedUntil(parent.core.nextDerivedSequence());
 
         try parent.split(parent.getRange(), "doc:m", "", std.mem.span(child_path), true);
         try parent.finalizeSplit(.{ .start = "", .end = "doc:m" });

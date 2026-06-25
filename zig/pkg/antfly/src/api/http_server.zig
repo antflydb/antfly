@@ -4662,6 +4662,7 @@ pub const ApiHttpServer = struct {
     const PublicSqlResponse = struct {
         kind: []const u8,
         session_id: u64,
+        statement_kind: []const u8,
         noop: bool,
         applied: tables_api.AppliedRelationalSqlDdlRecord,
     };
@@ -6295,6 +6296,7 @@ pub const ApiHttpServer = struct {
         return try jsonResponse(self.alloc, PublicSqlResponse{
             .kind = "ddl",
             .session_id = session_id,
+            .statement_kind = "ddl",
             .noop = applied.noop,
             .applied = applied,
         });
@@ -7365,7 +7367,7 @@ pub const ApiHttpServer = struct {
             }
             return try jsonResponse(self.alloc, public_status);
         }
-        if (req.method == .POST and std.mem.eql(u8, uri_parts.path, routes.Routes.sql)) {
+        if (req.method == .POST and std.mem.eql(u8, raw_path, routes.Routes.db_v1_sql)) {
             return try self.handlePublicSql(req.body, authenticated_identity);
         }
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.cluster)) {
@@ -19206,7 +19208,7 @@ test "explicit catalog routes declare qualified namespace and table permissions"
     const alloc = std.testing.allocator;
 
     {
-        const required = requiredPermissionForRequest(.POST, "/sql").?;
+        const required = requiredPermissionForRequest(.POST, stripApiPrefix(routes.Routes.db_v1_sql)).?;
         try std.testing.expectEqual(usermgr.ResourceType.database, required.resource_type);
         try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
         const resource = try required.resourceNameAlloc(alloc);
@@ -20729,7 +20731,7 @@ pub fn buildLocalSchemaUpdateStatus(alloc: std.mem.Allocator, table_name: []cons
 }
 
 pub fn stripApiPrefix(path: []const u8) []const u8 {
-    const prefix = "/db/v1";
+    const prefix = routes.Routes.db_v1_prefix;
     if (std.mem.startsWith(u8, path, prefix)) {
         const rest = path[prefix.len..];
         // "/db/v1" alone or "/db/v1/" → "/"

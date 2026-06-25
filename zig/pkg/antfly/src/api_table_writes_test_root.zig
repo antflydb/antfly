@@ -13,7 +13,23 @@
 // limitations.
 
 const table_writes = @import("api/table_writes.zig");
+const table_writes_bulk_ingest = @import("api/table_writes/bulk_ingest.zig");
+const table_writes_cache = @import("api/table_writes/cache.zig");
+const table_writes_core = @import("api/table_writes/core.zig");
+const table_writes_index_config = @import("api/table_writes/index_config.zig");
+const table_writes_integrity = @import("api/table_writes/integrity.zig");
+const table_writes_integrity_types = @import("api/table_writes/integrity_types.zig");
+const table_writes_managed_db = @import("api/table_writes/managed_db.zig");
+const table_writes_schema_jobs = @import("api/table_writes/schema_jobs.zig");
 
 test {
     _ = table_writes;
+    _ = table_writes_bulk_ingest;
+    _ = table_writes_cache;
+    _ = table_writes_core;
+    _ = table_writes_index_config;
+    _ = table_writes_integrity;
+    _ = table_writes_integrity_types;
+    _ = table_writes_managed_db;
+    _ = table_writes_schema_jobs;
 }

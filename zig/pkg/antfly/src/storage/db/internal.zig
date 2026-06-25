@@ -18,6 +18,8 @@ const platform = @import("antfly_platform");
 
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
+const db_config = @import("config.zig");
+const db_core = @import("core.zig");
 const derived_executor_mod = @import("derived/derived_executor.zig");
 const doc_identity = @import("doc_identity.zig");
 const docstore_mod = @import("../docstore.zig");
@@ -26,7 +28,9 @@ const enrichment_runtime_mod = @import("enrichment/enrichment_runtime.zig");
 const ha_replication = @import("ha_replication.zig");
 const internal_keys = @import("../internal_keys.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
+const lsm_backend_mod = @import("../lsm_backend/mod.zig");
 const mapper = @import("document_mapper.zig");
+const mem_backend_mod = @import("../mem_backend.zig");
 const promotion_runtime_mod = @import("promotion_runtime.zig");
 const relational_store_mod = @import("relational_store.zig");
 const resolution_runtime_mod = @import("resolution_runtime.zig");
@@ -75,11 +79,102 @@ pub fn threadedIo() if (builtin.os.tag == .freestanding) void else std.Io.Thread
     return std.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
+const PrimaryStoreOpenPlan = union(enum) {
+    lmdb: struct {
+        map_size: usize,
+        no_sync: bool,
+        read_only: bool,
+    },
+    mem: mem_backend_mod.Options,
+    lsm_memory: lsm_backend_mod.Options,
+    lsm: lsm_backend_mod.Options,
+};
+
+fn primaryStoreOpenPlan(opts: db_config.CoreOpenOptions) PrimaryStoreOpenPlan {
+    return switch (opts.primary_backend) {
+        .lmdb => .{
+            .lmdb = .{
+                .map_size = opts.map_size,
+                .no_sync = opts.no_sync,
+                .read_only = opts.read_only,
+            },
+        },
+        .mem => |mem_opts| .{ .mem = mem_opts },
+        .lsm_memory => |lsm_opts| .{ .lsm_memory = db_config.mergedLsmOptions(opts.storage, opts.lsm_cache, opts.resource_manager, opts.no_sync, lsm_opts) },
+        .lsm => |lsm_opts| .{ .lsm = db_config.mergedLsmOptions(opts.storage, opts.lsm_cache, opts.resource_manager, opts.no_sync, lsm_opts) },
+    };
+}
+
+pub fn openPrimaryStore(alloc: Allocator, path: []const u8, opts: db_config.CoreOpenOptions) !db_core.OpenedPrimaryStore {
+    if (opts.primary_runtime_store) |runtime_store| {
+        return .{
+            .store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store),
+        };
+    }
+
+    const zpath = try alloc.dupeZ(u8, path);
+    defer alloc.free(zpath);
+
+    return switch (primaryStoreOpenPlan(opts)) {
+        .lmdb => |lmdb_opts| .{
+            .store = try docstore_mod.DocStore.open(alloc, zpath, .{
+                .map_size = lmdb_opts.map_size,
+                .no_sync = lmdb_opts.no_sync,
+                .read_only = lmdb_opts.read_only,
+            }),
+        },
+        .mem => |mem_opts| mem_blk: {
+            const backend = try alloc.create(mem_backend_mod.Backend);
+            errdefer alloc.destroy(backend);
+            backend.* = mem_backend_mod.Backend.init(alloc, mem_opts);
+            errdefer backend.close();
+
+            var runtime_store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+            errdefer runtime_store.deinit();
+
+            break :mem_blk .{
+                .store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store),
+                .owner = .{ .mem = backend },
+            };
+        },
+        .lsm_memory => |lsm_opts| lsm_mem_blk: {
+            var handle = try lsm_backend_mod.BackendHandle.init(alloc, lsm_opts);
+            errdefer handle.close();
+
+            var runtime_store = try handle.backend.runtimeStore(alloc, .{ .name = "docs" });
+            errdefer runtime_store.deinit();
+
+            break :lsm_mem_blk .{
+                .store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store),
+                .owner = .{ .lsm = .{
+                    .handle = handle,
+                    .split_options = null,
+                } },
+            };
+        },
+        .lsm => |lsm_opts| lsm_blk: {
+            var handle = try lsm_backend_mod.BackendHandle.open(alloc, path, lsm_opts);
+            errdefer handle.close();
+
+            var runtime_store = try handle.backend.runtimeStore(alloc, .{ .name = "docs" });
+            errdefer runtime_store.deinit();
+
+            break :lsm_blk .{
+                .store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store),
+                .owner = .{ .lsm = .{
+                    .handle = handle,
+                    .split_options = db_config.splitLsmOptions(opts.primary_backend, opts.storage, opts.lsm_cache),
+                } },
+            };
+        },
+    };
+}
+
 pub fn spinOrYield() void {
     if (builtin.os.tag == .freestanding) {
         std.atomic.spinLoopHint();
     } else {
-        std.Thread.yield() catch {};
+        platform.time.yieldBriefly();
     }
 }
 
@@ -97,6 +192,15 @@ pub fn yieldToBackground() void {
         spinOrYield();
     }
     sleepPollInterval();
+}
+
+pub fn waitForAtomicU8(flag: *const std.atomic.Value(u8), expected: u8, max_attempts: usize) bool {
+    var attempts: usize = 0;
+    while (attempts < max_attempts) : (attempts += 1) {
+        if (flag.load(.monotonic) == expected) return true;
+        spinOrYield();
+    }
+    return flag.load(.monotonic) == expected;
 }
 
 pub const QueryVisibilityChange = enum {
@@ -192,6 +296,71 @@ pub fn isSplitMetadataKey(key: []const u8) bool {
 
 pub fn makeTimestampKey(alloc: Allocator, key: []const u8) ![]u8 {
     return try internal_keys.ttlKeyAlloc(alloc, key);
+}
+
+pub fn containsStoreWriteKey(list: []const docstore_mod.KVPair, key: []const u8) bool {
+    for (list) |item| {
+        if (std.mem.eql(u8, item.key, key)) return true;
+    }
+    return false;
+}
+
+pub const BorrowedGraphMaterializationBatch = struct {
+    writes: []docstore_mod.KVPair = &.{},
+    deletes: []const []const u8 = &.{},
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        if (self.writes.len > 0) alloc.free(self.writes);
+        if (self.deletes.len > 0) alloc.free(self.deletes);
+        self.* = .{};
+    }
+};
+
+pub fn filterChangedGraphMaterializationBatch(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    writes: []const docstore_mod.KVPair,
+    deletes: []const []const u8,
+) !BorrowedGraphMaterializationBatch {
+    var changed_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    errdefer changed_writes.deinit(alloc);
+    for (writes) |write| {
+        if (try storeValueDiffers(alloc, store, write.key, write.value)) {
+            try changed_writes.append(alloc, write);
+        }
+    }
+
+    var changed_deletes = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer changed_deletes.deinit(alloc);
+    for (deletes) |key| {
+        if (containsStoreWriteKey(writes, key)) continue;
+        if (try storeContainsKey(alloc, store, key)) {
+            try changed_deletes.append(alloc, key);
+        }
+    }
+
+    return .{
+        .writes = try changed_writes.toOwnedSlice(alloc),
+        .deletes = try changed_deletes.toOwnedSlice(alloc),
+    };
+}
+
+fn storeValueDiffers(alloc: Allocator, store: *docstore_mod.DocStore, key: []const u8, value: []const u8) !bool {
+    const existing = store.get(alloc, key) catch |err| switch (err) {
+        error.NotFound => return true,
+        else => return err,
+    };
+    defer alloc.free(existing);
+    return !std.mem.eql(u8, existing, value);
+}
+
+fn storeContainsKey(alloc: Allocator, store: *docstore_mod.DocStore, key: []const u8) !bool {
+    const existing = store.get(alloc, key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    alloc.free(existing);
+    return true;
 }
 
 pub fn ttlTimestampNsFromDocumentValue(

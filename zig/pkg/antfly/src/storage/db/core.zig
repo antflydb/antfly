@@ -738,6 +738,11 @@ pub const DBCore = struct {
         });
     }
 
+    pub fn putArtifactPresenceMarker(self: *DBCore) !void {
+        self.artifact_cleanup_maybe.store(true, .release);
+        try self.store.put(internal_keys.artifact_presence_key[0..], "1");
+    }
+
     pub fn collectAndDeleteEnrichmentArtifactsForDocContext(
         self: *DBCore,
         alloc: Allocator,

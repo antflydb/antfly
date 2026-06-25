@@ -19,6 +19,7 @@ const transition_state = @import("transition_state.zig");
 const metadata_storage = @import("storage/mod.zig");
 const metadata_http_server = @import("http_server.zig");
 const public_api_http_server = @import("../api/http_server.zig");
+const public_api_http_routes = @import("../api/http_routes.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
 const api_table_reads = @import("../api/table_reads.zig");
 const api_table_router = @import("../api/table_router.zig");
@@ -338,9 +339,9 @@ const MetadataAdminMux = struct {
     }
 
     fn isPublicApiRequest(uri: []const u8) bool {
-        return std.mem.eql(u8, uri, "/db/v1") or
-            std.mem.startsWith(u8, uri, "/db/v1/") or
-            std.mem.startsWith(u8, uri, "/db/v1?");
+        return std.mem.eql(u8, uri, public_api_http_routes.Routes.db_v1_prefix) or
+            std.mem.startsWith(u8, uri, public_api_http_routes.Routes.db_v1_prefix ++ "/") or
+            std.mem.startsWith(u8, uri, public_api_http_routes.Routes.db_v1_prefix ++ "?");
     }
 };
 
@@ -1022,6 +1023,7 @@ test "metadata admin mux routes public db v1 requests through public api server"
     try std.testing.expect(server.owned_public_http_server.?.cfg.auth_enabled);
     try std.testing.expectEqualStrings("shared-secret", server.owned_public_http_server.?.cfg.trusted_principal_secret.?);
     try std.testing.expect(MetadataAdminMux.isPublicApiRequest("/db/v1/status"));
+    try std.testing.expect(MetadataAdminMux.isPublicApiRequest("/db/v1/sql"));
 
     var response = try server.owned_admin_mux.?.executor().execute(std.testing.allocator, .{
         .method = .GET,
@@ -1029,4 +1031,13 @@ test "metadata admin mux routes public db v1 requests through public api server"
     });
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 401), response.status);
+
+    var sql_response = try server.owned_admin_mux.?.executor().execute(std.testing.allocator, .{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT 1;\"}",
+    });
+    defer sql_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 401), sql_response.status);
 }

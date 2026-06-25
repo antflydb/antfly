@@ -19,14 +19,12 @@ const schema_mod = @import("../schema.zig");
 const search_mod = @import("../../search/search.zig");
 const docstore_mod = @import("../docstore.zig");
 const doc_set = @import("doc_set.zig");
-const db_internal = @import("internal.zig");
 const db_query_projection = @import("query/projection.zig");
 const internal_keys = @import("../internal_keys.zig");
 const mapper = @import("document_mapper.zig");
 const platform_clock = @import("../../platform/clock.zig");
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const relational_store_mod = @import("relational_store.zig");
-const search_runtime = @import("search_runtime.zig");
 const transactions_mod = @import("../transactions.zig");
 const transform_mod = @import("transform.zig");
 const ttl_mod = @import("../ttl.zig");
@@ -10261,9 +10259,6 @@ fn cteNameExists(
 
 pub fn Impl(comptime DB: type) type {
     return struct {
-        const internal_impl = db_internal.Impl(DB);
-        const search_runtime_impl = search_runtime.Impl(DB);
-
         const RelationalRowsQueryCandidate = QueryCandidate;
         const RelationalRowsMutationSourceCandidate = MutationSourceCandidate;
         const RelationalRowsMutationSourcePlan = MutationSourcePlan;
@@ -11477,7 +11472,7 @@ pub fn Impl(comptime DB: type) type {
             defer if (candidate_set) |*set| set.deinit(alloc);
 
             if (candidate_set) |*set| {
-                const maybe_doc_ids = try internal_impl.docIdsForResolvedDocSetNoLockAtGenerationAlloc(self, alloc, set, generation);
+                const maybe_doc_ids = try self.searchRuntimeResolveDocSetDocIds(alloc, set, generation);
                 if (maybe_doc_ids) |doc_ids| {
                     defer {
                         for (doc_ids) |doc_id| alloc.free(@constCast(doc_id));
@@ -11583,7 +11578,7 @@ pub fn Impl(comptime DB: type) type {
             req: types.RelationalRowsQueryRequest,
         ) ![]u8 {
             if (req.json_extract.len == 0 and req.array_length.len == 0 and req.coalesce.len == 0 and req.field_aliases.len == 0 and req.expressions.len == 0) {
-                return try search_runtime_impl.projectLookupStoredBytes(self, alloc, doc_key, row_json, .{
+                return try self.searchRuntimeProjectLookupStoredBytes(alloc, doc_key, row_json, .{
                     .fields = req.select,
                     .include_all_fields = req.select_all,
                 });
@@ -11692,7 +11687,7 @@ pub fn Impl(comptime DB: type) type {
             var current: ?doc_set.ResolvedDocSet = null;
             errdefer if (current) |*set| set.deinit(alloc);
             for (planned_sets.items) |*planned| {
-                try search_runtime_impl.combineRelationalFilterSetAlloc(self, alloc, &current, &planned.set, generation, .intersect);
+                try self.searchRuntimeCombineRelationalFilterSetAlloc(alloc, &current, &planned.set, generation, .intersect);
                 if (current != null and current.?.estimatedCardinality() != null and current.?.estimatedCardinality().? == 0) break;
             }
             return current;
@@ -11712,7 +11707,7 @@ pub fn Impl(comptime DB: type) type {
             for (groups) |group| {
                 var branch = (try @This().resolveRelationalRowsPredicateGroupCandidateSetAlloc(self, alloc, runtime_schema, group.predicates, generation)) orelse return null;
                 defer branch.deinit(alloc);
-                try search_runtime_impl.combineRelationalFilterSetAlloc(self, alloc, &current, &branch, generation, .union_set);
+                try self.searchRuntimeCombineRelationalFilterSetAlloc(alloc, &current, &branch, generation, .union_set);
             }
             return current;
         }
@@ -11734,7 +11729,7 @@ pub fn Impl(comptime DB: type) type {
                 var child = (try @This().resolveRelationalRowsPredicateDocSetWithPredicatesAlloc(self, alloc, runtime_schema, predicate, implications, generation)) orelse continue;
                 defer child.deinit(alloc);
                 matched_index = true;
-                try search_runtime_impl.combineRelationalFilterSetAlloc(self, alloc, &current, &child, generation, .intersect);
+                try self.searchRuntimeCombineRelationalFilterSetAlloc(alloc, &current, &child, generation, .intersect);
             }
             if (!matched_index) return null;
             return current;
@@ -11794,7 +11789,7 @@ pub fn Impl(comptime DB: type) type {
                 else => return err,
             };
             defer alloc.free(owner);
-            return try internal_impl.resolveDocSetForIdsNoLockAtGenerationAlloc(self, alloc, &.{owner}, generation);
+            return try self.searchRuntimeResolveDocIdsToDocSet(alloc, &.{owner}, generation);
         }
 
         pub fn resolveRelationalRowsPredicateDocSetAlloc(
@@ -11822,7 +11817,7 @@ pub fn Impl(comptime DB: type) type {
             defer parsed.deinit();
 
             const query = (try predicateSearchQuery(column, predicate, parsed.value)) orelse return null;
-            return try search_runtime_impl.resolveRelationalFilterQueryDocSetWithImplicationsAlloc(self, alloc, runtime_schema, query, implications, generation);
+            return try self.searchRuntimeResolveRelationalFilterQueryDocSetWithImplicationsAlloc(alloc, runtime_schema, query, implications, generation);
         }
 
         pub fn resolveRelationalRowsArrayAnyDocSetAlloc(
@@ -11845,7 +11840,7 @@ pub fn Impl(comptime DB: type) type {
         ) !?doc_set.ResolvedDocSet {
             var parsed = std.json.parseFromSlice(std.json.Value, alloc, predicate.value_json, .{}) catch return error.InvalidQueryRequest;
             defer parsed.deinit();
-            return try search_runtime_impl.resolveRelationalFilterQueryDocSetWithImplicationsAlloc(self, alloc, runtime_schema, .{
+            return try self.searchRuntimeResolveRelationalFilterQueryDocSetWithImplicationsAlloc(alloc, runtime_schema, .{
                 .array_any = .{ .field = predicate.field, .value = parsed.value },
             }, implications, generation);
         }
@@ -11858,7 +11853,7 @@ pub fn Impl(comptime DB: type) type {
             implications: PredicateImplications,
             generation: ?u64,
         ) !?doc_set.ResolvedDocSet {
-            if (!search_runtime_impl.relationalFilterGenerationCanUseCurrentRows(self, generation)) return null;
+            if (!self.searchRuntimeRelationalFilterGenerationCanUseCurrentRows(generation)) return null;
             const column = columnForField(runtime_schema, predicate.field) orelse return null;
             if (column.field_type != .array) return null;
             var parsed = std.json.parseFromSlice(std.json.Value, alloc, predicate.value_json, .{}) catch return error.InvalidQueryRequest;
@@ -11871,7 +11866,7 @@ pub fn Impl(comptime DB: type) type {
                 doc_ids.deinit(alloc);
             }
 
-            if ((try search_runtime_impl.relationalColumnIndexUsableForQuery(self, alloc, column, implications)) and parsed.value.array.items.len > 0) {
+            if ((try self.searchRuntimeRelationalColumnIndexUsableForQuery(alloc, column, implications)) and parsed.value.array.items.len > 0) {
                 const element_key = try relational_store_mod.arrayElementIndexKeyForValueAlloc(alloc, parsed.value.array.items[0]);
                 defer alloc.free(element_key);
                 const indexed_doc_ids = try relational_store_mod.scanArrayElementDocKeysAlloc(alloc, self.core.store, column.path, element_key, "", "");
@@ -11912,7 +11907,7 @@ pub fn Impl(comptime DB: type) type {
             generation: ?u64,
             doc_key_range: ?types.RelationalRowsDocKeyRange,
         ) !?doc_set.ResolvedDocSet {
-            if (!search_runtime_impl.relationalFilterGenerationCanUseCurrentRows(self, generation)) return null;
+            if (!self.searchRuntimeRelationalFilterGenerationCanUseCurrentRows(generation)) return null;
             const column = columnForField(runtime_schema, predicate.field) orelse return null;
             if (column.field_type != .array) return null;
             var parsed = std.json.parseFromSlice(std.json.Value, alloc, predicate.value_json, .{}) catch return error.InvalidQueryRequest;
@@ -11925,7 +11920,7 @@ pub fn Impl(comptime DB: type) type {
                 doc_ids.deinit(alloc);
             }
 
-            if (try search_runtime_impl.relationalColumnIndexUsableForQuery(self, alloc, column, implications)) {
+            if (try self.searchRuntimeRelationalColumnIndexUsableForQuery(alloc, column, implications)) {
                 const lower_doc_key = if (doc_key_range) |range| range.start else "";
                 const upper_doc_key = if (doc_key_range) |range| range.end else "";
                 const array_key = try relational_store_mod.arrayValueIndexKeyForValueAlloc(alloc, parsed.value);
@@ -11993,7 +11988,7 @@ pub fn Impl(comptime DB: type) type {
                 var child = (try @This().resolveRelationalRowsPredicateDocSetWithPredicatesAlloc(self, alloc, runtime_schema, equality, implications, generation)) orelse continue;
                 defer child.deinit(alloc);
                 resolved_any = true;
-                try search_runtime_impl.combineRelationalFilterSetAlloc(self, alloc, &current, &child, generation, .union_set);
+                try self.searchRuntimeCombineRelationalFilterSetAlloc(alloc, &current, &child, generation, .union_set);
                 if (current != null and current.?.estimatedCardinality() == null) return current;
             }
             if (!resolved_any) return null;
@@ -12020,7 +12015,7 @@ pub fn Impl(comptime DB: type) type {
         ) !?doc_set.ResolvedDocSet {
             var parsed = std.json.parseFromSlice(std.json.Value, alloc, predicate.value_json, .{}) catch return error.InvalidQueryRequest;
             defer parsed.deinit();
-            return try search_runtime_impl.resolveRelationalFilterQueryDocSetWithImplicationsAlloc(self, alloc, runtime_schema, .{
+            return try self.searchRuntimeResolveRelationalFilterQueryDocSetWithImplicationsAlloc(alloc, runtime_schema, .{
                 .json_contains = .{ .field = predicate.field, .value = parsed.value },
             }, implications, generation);
         }
@@ -12034,7 +12029,7 @@ pub fn Impl(comptime DB: type) type {
             generation: ?u64,
             doc_key_range: ?types.RelationalRowsDocKeyRange,
         ) !?doc_set.ResolvedDocSet {
-            if (!search_runtime_impl.relationalFilterGenerationCanUseCurrentRows(self, generation)) return null;
+            if (!self.searchRuntimeRelationalFilterGenerationCanUseCurrentRows(generation)) return null;
             const column = columnForField(runtime_schema, predicate.field) orelse return null;
             if (column.field_type != .json) return null;
             var parsed = std.json.parseFromSlice(std.json.Value, alloc, predicate.value_json, .{}) catch return error.InvalidQueryRequest;
@@ -12048,7 +12043,7 @@ pub fn Impl(comptime DB: type) type {
 
             const lower_doc_key = if (doc_key_range) |range| range.start else "";
             const upper_doc_key = if (doc_key_range) |range| range.end else "";
-            if ((try search_runtime_impl.relationalColumnIndexUsableForQuery(self, alloc, column, implications)) and jsonPathValueCanUseLeafIndex(parsed.value)) {
+            if ((try self.searchRuntimeRelationalColumnIndexUsableForQuery(alloc, column, implications)) and jsonPathValueCanUseLeafIndex(parsed.value)) {
                 const indexed_doc_ids = try relational_store_mod.scanJsonPathValueDocKeysAlloc(alloc, self.core.store, column.path, predicate.path, parsed.value, lower_doc_key, upper_doc_key);
                 defer relational_store_mod.freeDocKeys(alloc, indexed_doc_ids);
                 for (indexed_doc_ids) |doc_id| {
@@ -12084,7 +12079,7 @@ pub fn Impl(comptime DB: type) type {
             generation: ?u64,
             doc_key_range: ?types.RelationalRowsDocKeyRange,
         ) !?doc_set.ResolvedDocSet {
-            if (!search_runtime_impl.relationalFilterGenerationCanUseCurrentRows(self, generation)) return null;
+            if (!self.searchRuntimeRelationalFilterGenerationCanUseCurrentRows(generation)) return null;
             const column = columnForField(runtime_schema, predicate.field) orelse return null;
             if (column.field_type != .json) return null;
 
@@ -12094,7 +12089,7 @@ pub fn Impl(comptime DB: type) type {
                 doc_ids.deinit(alloc);
             }
 
-            if (try search_runtime_impl.relationalColumnIndexUsableForQuery(self, alloc, column, implications)) {
+            if (try self.searchRuntimeRelationalColumnIndexUsableForQuery(alloc, column, implications)) {
                 const lower_doc_key = if (doc_key_range) |range| range.start else "";
                 const upper_doc_key = if (doc_key_range) |range| range.end else "";
                 const indexed_doc_ids = try relational_store_mod.scanJsonPathDocKeysAlloc(alloc, self.core.store, column.path, predicate.path, lower_doc_key, upper_doc_key);

@@ -72,6 +72,42 @@ pub const Stats = struct {
     last_result: index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult = .{},
 };
 
+pub fn expectPlannedAutoIdleDecision(
+    index_manager: *index_manager_mod.IndexManager,
+    options: index_manager_mod.IndexManager.GraphMetricPlannedAutoIdleOptions,
+    should_run_planned: bool,
+    active_builds: usize,
+    eligible_queued: usize,
+    deferred_queued: usize,
+    ineligible_queued: usize,
+) !void {
+    const decision = try index_manager.graphMetricPlannedAutoIdleDecision(options);
+    try std.testing.expectEqual(should_run_planned, decision.shouldRunPlanned());
+    try std.testing.expectEqual(active_builds, decision.active_builds);
+    try std.testing.expectEqual(eligible_queued, decision.eligible_queued);
+    try std.testing.expectEqual(deferred_queued, decision.deferred_queued);
+    try std.testing.expectEqual(ineligible_queued, decision.ineligible_queued);
+}
+
+pub fn expectDegreeCanaryDecision(
+    index_manager: *index_manager_mod.IndexManager,
+    options: index_manager_mod.IndexManager.GraphMetricDegreeCanaryOptions,
+    should_run_planned: bool,
+    active_degree_builds: usize,
+    eligible_queued_degree: usize,
+    blocked_active_non_degree: usize,
+    blocked_queued_non_degree: usize,
+) !void {
+    const decision = try index_manager.graphMetricDegreeCanaryDecision(options);
+    try std.testing.expectEqual(should_run_planned, decision.shouldRunPlanned());
+    try std.testing.expectEqual(active_degree_builds, decision.active_degree_builds);
+    try std.testing.expectEqual(eligible_queued_degree, decision.eligible_queued_degree);
+    try std.testing.expectEqual(blocked_active_non_degree, decision.blocked_active_non_degree);
+    try std.testing.expectEqual(blocked_queued_non_degree, decision.blocked_queued_non_degree);
+    try std.testing.expectEqual(@as(usize, 0), decision.failed_pages);
+    try std.testing.expect(!decision.truncated_pages);
+}
+
 pub const MaintenanceBoundary = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -635,22 +671,27 @@ pub fn runtimeOwnerId(config: Config) []const u8 {
     return if (config.owner_id.len != 0) config.owner_id else config.runtime_id;
 }
 
-pub fn workerIdentityHash(config: Config) u64 {
-    if (config.role == .coordinator) return 0;
-    if (config.planned_options.worker_ids.len == 0) return identityHash(config.planned_options.worker_id);
+pub fn workerSetIdentityHash(worker_ids: []const []const u8) u64 {
+    if (worker_ids.len == 0) return 0;
     var xor_hash: u64 = 0;
     var sum_hash: u64 = 0;
-    for (config.planned_options.worker_ids) |worker_id| {
+    for (worker_ids) |worker_id| {
         const item_hash = identityHash(worker_id);
         xor_hash ^= item_hash;
         sum_hash +%= item_hash;
     }
     const fingerprint_words = [_]u64{
-        @intCast(config.planned_options.worker_ids.len),
+        @intCast(worker_ids.len),
         xor_hash,
         sum_hash,
     };
     return std.hash.Wyhash.hash(0, std.mem.asBytes(&fingerprint_words));
+}
+
+pub fn workerIdentityHash(config: Config) u64 {
+    if (config.role == .coordinator) return 0;
+    if (config.planned_options.worker_ids.len == 0) return identityHash(config.planned_options.worker_id);
+    return workerSetIdentityHash(config.planned_options.worker_ids);
 }
 
 pub fn runtimeLeaseKeyAlloc(alloc: Allocator, config: Config) ![]u8 {

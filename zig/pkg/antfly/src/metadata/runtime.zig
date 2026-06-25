@@ -21,6 +21,7 @@ const raft_engine = @import("raft_engine");
 const platform = @import("antfly_platform");
 const tracing = @import("../tracing/mod.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
+const metadata_table_manager = @import("table_manager.zig");
 const platform_time = @import("../platform/time.zig");
 
 const setup_io_thread_stack_size = 1 * 1024 * 1024;
@@ -59,6 +60,8 @@ const CliConfig = struct {
     raft_port: ?u16 = null,
     api_host: ?[]const u8 = null,
     api_port: ?u16 = null,
+    pgwire_host: ?[]const u8 = null,
+    pgwire_port: ?u16 = null,
     cluster_json: ?[]const u8 = null,
     join: bool = false,
     health_enabled: ?bool = null,
@@ -549,6 +552,7 @@ pub const Server = struct {
 
         try self.server.svc.raft.submitBatch(updates.items);
         _ = try self.server.svc.syncPending();
+        try self.bootstrapPublicApiPrerequisites(local_node_id);
     }
 
     pub fn bootstrapLocal(self: *Server, metadata_group_id: u64, local_node_id: u64) !void {
@@ -572,6 +576,36 @@ pub const Server = struct {
             .local_node_id = local_node_id,
             .bootstrap_mode = .persisted,
         });
+        try self.server.runRound();
+        self.refreshMetadataRaftStorageDiagnostics();
+        try self.bootstrapPublicApiPrerequisites(local_node_id);
+    }
+
+    fn bootstrapPublicApiPrerequisites(self: *Server, local_node_id: u64) !void {
+        const default_database_id = metadata_table_manager.deriveDatabaseId(metadata_table_manager.default_database_name);
+        try self.server.svc.upsertDatabase(.{
+            .database_id = default_database_id,
+            .name = metadata_table_manager.default_database_name,
+        });
+        try self.server.svc.upsertNamespace(.{
+            .namespace_id = metadata_table_manager.deriveNamespaceId(default_database_id, metadata_table_manager.default_namespace_name),
+            .database_id = default_database_id,
+            .name = metadata_table_manager.default_namespace_name,
+        });
+        try self.server.svc.registerNode(.{
+            .node_id = local_node_id,
+            .role = "metadata",
+        });
+        try self.server.svc.upsertStore(.{
+            .store_id = local_node_id,
+            .node_id = local_node_id,
+            .role = "data",
+            .live = true,
+            .capacity_bytes = 1024 * 1024 * 1024,
+            .available_bytes = 1024 * 1024 * 1024,
+        });
+        _ = try self.server.svc.syncPending();
+        try self.server.runRound();
     }
 
     pub fn runRound(self: *Server) !void {
@@ -815,6 +849,15 @@ pub fn runFromIterator(
     if (synced_extension_packages > 0) {
         std.log.info("metadata synced extension package store path={s} packages={d}", .{ resolved.extension_package_store_dir, synced_extension_packages });
     }
+    var pgwire_server = try antfly.public_api.pgwire_runtime.startOptional(alloc, .{
+        .bind_host = cli.pgwire_host,
+        .default_bind_host = admin_listener.bind_host,
+        .bind_port = cli.pgwire_port,
+        .auth_enabled = effective_auth_enabled,
+        .auth_error_message = "metadata pgwire listener does not support auth yet; disable public API auth/trusted principal or omit --pgwire-port",
+        .api_server = server.server.owned_public_http_server,
+    });
+    defer if (pgwire_server) |*pgwire| pgwire.deinit();
 
     const base_uri = try server.baseUri(alloc);
     defer alloc.free(base_uri);
@@ -895,6 +938,14 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
         }
         if (std.mem.eql(u8, arg, "--api-port")) {
             cfg.api_port = try std.fmt.parseInt(u16, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--pgwire-host")) {
+            cfg.pgwire_host = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--pgwire-port")) {
+            cfg.pgwire_port = try std.fmt.parseInt(u16, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--cluster")) {
@@ -1292,6 +1343,8 @@ fn printUsage(argv0: []const u8) void {
         \\  --raft-port <port>             Metadata raft bind port (default: 0)
         \\  --api-host <host>              Metadata admin API bind host (default: raft host)
         \\  --api-port <port>              Metadata admin API bind port (default: 0)
+        \\  --pgwire-host <host>           Pgwire bind host (default: --api-host)
+        \\  --pgwire-port <port>           Enable unauthenticated pgwire TCP listener on this port
         \\  --cluster <json>               Metadata raft peer URLs, e.g. {{"1":"http://127.0.0.1:9017"}}
         \\  --join                         Join an existing metadata cluster (not yet supported)
         \\  --health <true|false>          Enable health/metrics server (default: true)

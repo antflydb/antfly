@@ -13346,20 +13346,7 @@ fn isTransientTextPersistentOpenError(err: anyerror) bool {
 fn sleepBeforeTextPersistentOpenRetry(attempt: usize) void {
     const capped = @min(attempt, 5);
     const delay_ns: u64 = (@as(u64, 5) << @intCast(capped)) * std.time.ns_per_ms;
-    if (comptime builtin.os.tag != .freestanding) {
-        var req = std.posix.timespec{
-            .sec = @intCast(delay_ns / std.time.ns_per_s),
-            .nsec = @intCast(delay_ns % std.time.ns_per_s),
-        };
-        while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
-            .SUCCESS => return,
-            .INTR => continue,
-            else => return,
-        };
-    } else {
-        const spins = 64 * (capped + 1);
-        for (0..spins) |_| std.atomic.spinLoopHint();
-    }
+    platform.time.sleepNs(delay_ns);
 }
 
 fn appendSchemaFieldAnalyzers(
@@ -14681,7 +14668,7 @@ fn saveRuntimeSchemaJsonForIndexManagerTest(alloc: Allocator, store: *docstore_m
     try schema_mod.saveSchema(store, alloc, runtime_schema);
 }
 
-fn storeHasDocFactScalarKeyContaining(alloc: Allocator, store: *docstore_mod.DocStore, needle: []const u8) !bool {
+pub fn storeHasDocFactScalarKeyContaining(alloc: Allocator, store: *docstore_mod.DocStore, needle: []const u8) !bool {
     return (try countDocFactScalarKeysContaining(alloc, store, needle)) > 0;
 }
 
@@ -14975,7 +14962,7 @@ test "dense metadata lookups read legacy textual rows" {
     try batch.commit();
 }
 
-fn deterministicDenseVectorId(doc_key: []const u8) u64 {
+pub fn deterministicDenseVectorId(doc_key: []const u8) u64 {
     const id = std.hash.XxHash64.hash(0, doc_key);
     return if (id == 0) 1 else id;
 }
@@ -18759,15 +18746,19 @@ test "dense artifact preload batches sorted reads through getManySorted" {
     try std.testing.expectEqualSlices(f32, &[_]f32{ 1, 2 }, out_vectors[1].?);
 }
 
-fn stressEnvUsize(name: [*:0]const u8, default_value: usize) usize {
+pub fn stressEnvUsize(name: [*:0]const u8, default_value: usize) usize {
     const raw = getenv(name) orelse return default_value;
     return std.fmt.parseInt(usize, std.mem.span(raw), 10) catch default_value;
 }
 
-fn fillStressDenseVector(vector: []f32, doc_index: usize) void {
+pub fn stressDenseValue(doc_index: usize, dim_index: usize) f32 {
+    const raw = (doc_index * 131 + dim_index * 17) % 2048;
+    return @as(f32, @floatFromInt(raw)) / 1024.0 - 1.0;
+}
+
+pub fn fillStressDenseVector(vector: []f32, doc_index: usize) void {
     for (vector, 0..) |*slot, dim_index| {
-        const raw = (doc_index * 131 + dim_index * 17) % 2048;
-        slot.* = @as(f32, @floatFromInt(raw)) / 1024.0 - 1.0;
+        slot.* = stressDenseValue(doc_index, dim_index);
     }
 }
 

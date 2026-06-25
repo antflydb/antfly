@@ -301,6 +301,14 @@ pub fn artifactPublicIdAlloc(alloc: Allocator, artifact_ref: types.ArtifactRef) 
     return try out.toOwnedSlice(alloc);
 }
 
+pub fn chunkArtifactPublicIdAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const u8, chunk_id: u32) ![]u8 {
+    const internal_key = try internal_keys.chunkArtifactKeyAlloc(alloc, doc_key, artifact_name, chunk_id);
+    defer alloc.free(internal_key);
+    var artifact_ref = (try decodeArtifactRefAlloc(alloc, internal_key)) orelse return error.InvalidInternalUserKey;
+    defer artifact_ref.deinit(alloc);
+    return try artifactPublicIdAlloc(alloc, artifact_ref);
+}
+
 pub fn decodeArtifactPublicIdAlloc(alloc: Allocator, artifact_id: []const u8) !?types.ArtifactRef {
     if (!std.mem.startsWith(u8, artifact_id, public_id_prefix)) return null;
 
@@ -500,6 +508,9 @@ test "artifact public id round trips chunk artifact refs" {
 
     const public_id = try artifactPublicIdAlloc(alloc, artifact_ref);
     defer alloc.free(public_id);
+    const constructed_public_id = try chunkArtifactPublicIdAlloc(alloc, "doc:\x00a", "body_chunks_v1", 7);
+    defer alloc.free(constructed_public_id);
+    try std.testing.expectEqualStrings(public_id, constructed_public_id);
 
     var decoded = (try decodeArtifactPublicIdAlloc(alloc, public_id)).?;
     defer decoded.deinit(alloc);

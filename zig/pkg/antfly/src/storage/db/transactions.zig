@@ -26,16 +26,13 @@ const relational_store_mod = @import("relational_store.zig");
 const schema_mod = @import("../schema.zig");
 const transactions_mod = @import("../transactions.zig");
 const types = @import("types.zig");
-const write_path = @import("write_path.zig");
 
 const Allocator = std.mem.Allocator;
 const row_claim_intent_key_prefix = relational_rows.row_claim_intent_key_prefix;
 
 pub fn Impl(comptime DB: type) type {
     return struct {
-        const relational_integrity_impl = relational_integrity.Impl(DB);
-        const write_path_impl = write_path.Impl(DB);
-        const ForeignKeyActionScheduleRecord = relational_integrity_impl.ForeignKeyActionScheduleRecord;
+        const ForeignKeyActionScheduleRecord = relational_integrity.ForeignKeyActionScheduleRecord;
 
         pub fn beginTransaction(self: *DB, timestamp_ns: u64) !transactions_mod.TxnId {
             const txn_id = makeTxnId(self);
@@ -101,7 +98,7 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) !void {
-            var effective_ops = try write_path_impl.coalesceKeyValueRequest(self, types.TransactionWrite, req.writes, req.deletes, req.transforms);
+            var effective_ops = try self.coalesceKeyValueRequest(types.TransactionWrite, req.writes, req.deletes, req.transforms);
             defer effective_ops.deinit(self.alloc);
             try validateForeignKeyConstraintTimingOverrides(self, req.foreign_key_constraint_timing_overrides);
             if (req.foreign_key_externalized_parent_checks.len > 0) {
@@ -411,7 +408,7 @@ pub fn Impl(comptime DB: type) type {
             owned_values: *std.ArrayListUnmanaged([]u8),
             checks: []const types.ForeignKeyParentCheck,
         ) !void {
-            try relational_integrity_impl.appendForeignKeyExternalizedParentCheckIntents(self, txn_id, intents, owned_keys, owned_values, checks);
+            try self.appendForeignKeyExternalizedParentCheckIntents(txn_id, intents, owned_keys, owned_values, checks);
         }
 
         fn appendForeignKeyConstraintTimingOverrideIntents(
@@ -422,7 +419,7 @@ pub fn Impl(comptime DB: type) type {
             owned_values: *std.ArrayListUnmanaged([]u8),
             overrides: []const types.ForeignKeyConstraintTimingOverride,
         ) !void {
-            try relational_integrity_impl.appendForeignKeyConstraintTimingOverrideIntents(self, txn_id, intents, owned_keys, owned_values, overrides);
+            try self.appendForeignKeyConstraintTimingOverrideIntents(txn_id, intents, owned_keys, owned_values, overrides);
         }
 
         fn validateUniqueConstraintMutations(
@@ -430,7 +427,7 @@ pub fn Impl(comptime DB: type) type {
             unique_writes: []const types.UniqueConstraintMutation,
             unique_deletes: []const types.UniqueConstraintMutation,
         ) !void {
-            try relational_integrity_impl.validateUniqueConstraintMutations(self, unique_writes, unique_deletes);
+            try self.validateUniqueConstraintMutations(unique_writes, unique_deletes);
         }
 
         const findUniqueConstraintMutation = relational_integrity.findUniqueConstraintMutation;
@@ -443,7 +440,7 @@ pub fn Impl(comptime DB: type) type {
             unique_writes: []const types.UniqueConstraintMutation,
             unique_deletes: []const types.UniqueConstraintMutation,
         ) !void {
-            try relational_integrity_impl.appendUniqueConstraintMutationIntents(self, intents, owned_keys, owned_values, unique_writes, unique_deletes);
+            try self.appendUniqueConstraintMutationIntents(intents, owned_keys, owned_values, unique_writes, unique_deletes);
         }
 
         fn appendForeignKeyRefMutationIntents(
@@ -453,7 +450,7 @@ pub fn Impl(comptime DB: type) type {
             ref_writes: []const types.ForeignKeyRefMutation,
             ref_deletes: []const types.ForeignKeyRefMutation,
         ) !void {
-            try relational_integrity_impl.appendForeignKeyRefMutationIntents(self, intents, owned_keys, ref_writes, ref_deletes);
+            try self.appendForeignKeyRefMutationIntents(intents, owned_keys, ref_writes, ref_deletes);
         }
 
         fn applyForeignKeyParentDeleteActions(
@@ -463,7 +460,7 @@ pub fn Impl(comptime DB: type) type {
             owned_values: *std.ArrayListUnmanaged([]u8),
             checks: []const types.ForeignKeyParentDeleteCheck,
         ) !void {
-            try relational_integrity_impl.applyForeignKeyParentDeleteActions(self, intents, owned_keys, owned_values, checks);
+            try self.applyForeignKeyParentDeleteActions(intents, owned_keys, owned_values, checks);
         }
 
         fn applyForeignKeySetNullChildActions(
@@ -473,7 +470,7 @@ pub fn Impl(comptime DB: type) type {
             owned_values: *std.ArrayListUnmanaged([]u8),
             actions: []const types.ForeignKeySetNullChildAction,
         ) !void {
-            try relational_integrity_impl.applyForeignKeySetNullChildActions(self, intents, owned_keys, owned_values, actions);
+            try self.applyForeignKeySetNullChildActions(intents, owned_keys, owned_values, actions);
         }
 
         fn applyForeignKeyCascadeChildActions(
@@ -483,7 +480,7 @@ pub fn Impl(comptime DB: type) type {
             owned_values: *std.ArrayListUnmanaged([]u8),
             actions: []const types.ForeignKeyCascadeChildAction,
         ) !void {
-            try relational_integrity_impl.applyForeignKeyCascadeChildActions(self, intents, owned_keys, owned_values, actions);
+            try self.applyForeignKeyCascadeChildActions(intents, owned_keys, owned_values, actions);
         }
 
         fn appendForeignKeyConflictIntents(
@@ -495,7 +492,7 @@ pub fn Impl(comptime DB: type) type {
             conflict_checks: []const types.ForeignKeyConflictCheck,
             ref_writes: []const types.ForeignKeyRefMutation,
         ) !void {
-            try relational_integrity_impl.appendForeignKeyConflictIntents(self, intents, owned_keys, writes, parent_delete_checks, conflict_checks, ref_writes);
+            try self.appendForeignKeyConflictIntents(intents, owned_keys, writes, parent_delete_checks, conflict_checks, ref_writes);
         }
 
         fn validateForeignKeyParentChecks(
@@ -506,14 +503,14 @@ pub fn Impl(comptime DB: type) type {
             unique_writes: []const types.UniqueConstraintMutation,
             unique_deletes: []const types.UniqueConstraintMutation,
         ) !void {
-            try relational_integrity_impl.validateForeignKeyParentChecks(self, checks, writes, deletes, unique_writes, unique_deletes);
+            try self.validateForeignKeyParentChecks(checks, writes, deletes, unique_writes, unique_deletes);
         }
 
         fn validateForeignKeyReferenceShapes(
             self: *DB,
             writes: []const types.TransactionWrite,
         ) !void {
-            try relational_integrity_impl.validateForeignKeyReferenceShapes(self, writes);
+            try self.validateForeignKeyReferenceShapes(writes);
         }
 
         fn validateExternalizedForeignKeyParentChecks(
@@ -522,14 +519,14 @@ pub fn Impl(comptime DB: type) type {
             constraint_timing_overrides: []const types.ForeignKeyConstraintTimingOverride,
             writes: []const types.TransactionWrite,
         ) !void {
-            try relational_integrity_impl.validateExternalizedForeignKeyParentChecks(self, checks, constraint_timing_overrides, writes);
+            try self.validateExternalizedForeignKeyParentChecks(checks, constraint_timing_overrides, writes);
         }
 
         fn validateForeignKeyConstraintTimingOverrides(
             self: *DB,
             overrides: []const types.ForeignKeyConstraintTimingOverride,
         ) !void {
-            try relational_integrity_impl.validateForeignKeyConstraintTimingOverrides(self, overrides);
+            try self.validateForeignKeyConstraintTimingOverrides(overrides);
         }
 
         fn validateForeignKeyParentDeleteChecks(
@@ -541,11 +538,11 @@ pub fn Impl(comptime DB: type) type {
             ref_writes: []const types.ForeignKeyRefMutation,
             ref_deletes: []const types.ForeignKeyRefMutation,
         ) !void {
-            try relational_integrity_impl.validateForeignKeyParentDeleteChecks(self, checks, constraint_timing_overrides, writes, deletes, ref_writes, ref_deletes);
+            try self.validateForeignKeyParentDeleteChecks(checks, constraint_timing_overrides, writes, deletes, ref_writes, ref_deletes);
         }
 
         fn validateForeignKeyRefMutations(self: *DB, mutations: []const types.ForeignKeyRefMutation) !void {
-            try relational_integrity_impl.validateForeignKeyRefMutations(self, mutations);
+            try self.validateForeignKeyRefMutations(mutations);
         }
 
         fn isForeignKeyExternalDocKey(key: []const u8) bool {
@@ -947,7 +944,7 @@ pub fn Impl(comptime DB: type) type {
             owned_keys: *std.ArrayListUnmanaged([]u8),
             owned_values: *std.ArrayListUnmanaged([]u8),
         ) !void {
-            return try relational_rows.Impl(DB).appendSystemVersionedHistoryForTransactionMutations(self, mutations, rewrites, commit_version, writes, owned_keys, owned_values, isUserRowMutationKey);
+            return try self.appendSystemVersionedHistoryForTransactionMutations(mutations, rewrites, commit_version, writes, owned_keys, owned_values, isUserRowMutationKey);
         }
 
         fn failIfIdentityOrdinalExhaustedForNewUpserts(self: *DB, doc_ids: []const []const u8) !void {
@@ -994,15 +991,15 @@ pub fn Impl(comptime DB: type) type {
         }
 
         fn foreignKeyActionJobCanonicalAction(action: []const u8) ?[]const u8 {
-            return relational_integrity_impl.foreignKeyActionJobCanonicalAction(action);
+            return DB.foreignKeyActionJobCanonicalAction(action);
         }
 
         fn foreignKeyActionScheduleKeyAlloc(alloc: Allocator, schedule_id: []const u8) ![]u8 {
-            return try relational_integrity_impl.foreignKeyActionScheduleKeyAlloc(alloc, schedule_id);
+            return try DB.foreignKeyActionScheduleKeyAlloc(alloc, schedule_id);
         }
 
         fn validateForeignKeyActionLineage(cascade_depth: u32, cascade_max_depth: u32) !void {
-            try relational_integrity_impl.validateForeignKeyActionLineage(cascade_depth, cascade_max_depth);
+            try DB.validateForeignKeyActionLineage(cascade_depth, cascade_max_depth);
         }
 
         fn validateForeignKeyActionJobIdentity(
@@ -1014,7 +1011,7 @@ pub fn Impl(comptime DB: type) type {
             parent_key: []const u8,
             updated_parent_key: ?[]const u8,
         ) !void {
-            try relational_integrity_impl.validateForeignKeyActionJobIdentity(job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
+            try DB.validateForeignKeyActionJobIdentity(job_id, action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
         }
 
         fn validateForeignKeyActionScheduleMatches(
@@ -1026,7 +1023,7 @@ pub fn Impl(comptime DB: type) type {
             parent_key: []const u8,
             updated_parent_key: ?[]const u8,
         ) !void {
-            try relational_integrity_impl.validateForeignKeyActionScheduleMatches(existing, action_job_id, action, constraint_name, parent_table, parent_key, updated_parent_key);
+            try DB.validateForeignKeyActionScheduleMatches(existing, action_job_id, action, constraint_name, parent_table, parent_key, updated_parent_key);
         }
     };
 }
@@ -1068,8 +1065,7 @@ pub fn reclaimExpiredRowClaimIntentsForRows(
     row_keys: []const []const u8,
     now_ns: u64,
 ) !usize {
-    const DB = @TypeOf(self.*);
-    return try relational_rows.Impl(DB).reclaimExpiredRowClaimIntentsForRows(self, claiming_txn_id, row_keys, now_ns);
+    return try self.reclaimExpiredRowClaimIntentsForRows(claiming_txn_id, row_keys, now_ns);
 }
 
 pub fn reclaimExpiredRowClaimIntentsForMutationKeys(
@@ -1080,8 +1076,7 @@ pub fn reclaimExpiredRowClaimIntentsForMutationKeys(
     now_ns: u64,
     comptime already_locked: bool,
 ) !usize {
-    const DB = @TypeOf(self.*);
-    return try relational_rows.Impl(DB).reclaimExpiredRowClaimIntentsForMutationKeys(self, writes, deletes, exclude_txn_id, now_ns, already_locked, isUserRowMutationKey);
+    return try self.reclaimExpiredRowClaimIntentsForMutationKeys(writes, deletes, exclude_txn_id, now_ns, already_locked, isUserRowMutationKey);
 }
 
 pub fn reclaimExpiredRowClaimIntentsForIdentityRewrites(
@@ -1091,8 +1086,7 @@ pub fn reclaimExpiredRowClaimIntentsForIdentityRewrites(
     now_ns: u64,
     comptime already_locked: bool,
 ) !usize {
-    const DB = @TypeOf(self.*);
-    return try relational_rows.Impl(DB).reclaimExpiredRowClaimIntentsForIdentityRewrites(self, rewrites, exclude_txn_id, now_ns, already_locked, isUserRowMutationKey);
+    return try self.reclaimExpiredRowClaimIntentsForIdentityRewrites(rewrites, exclude_txn_id, now_ns, already_locked, isUserRowMutationKey);
 }
 
 pub fn appendRowClaimPredicatesForMutationKeys(
@@ -1131,8 +1125,7 @@ pub fn appendSystemVersionedHistoryForBatch(
     owned_keys: *std.ArrayListUnmanaged([]u8),
     owned_values: *std.ArrayListUnmanaged([]u8),
 ) !void {
-    const DB = @TypeOf(self.*);
-    return try relational_rows.Impl(DB).appendSystemVersionedHistoryForBatch(self, req, sequence, timestamp_ns, writes, owned_keys, owned_values, isUserRowMutationKey);
+    return try self.appendSystemVersionedHistoryForBatch(req, sequence, timestamp_ns, writes, owned_keys, owned_values, isUserRowMutationKey);
 }
 
 fn shouldWriteTimestamp(key: []const u8) bool {

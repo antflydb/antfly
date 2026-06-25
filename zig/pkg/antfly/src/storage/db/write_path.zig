@@ -64,6 +64,9 @@ const types = @import("types.zig");
 const Allocator = std.mem.Allocator;
 const AtomicU64 = platform.atomic.Value(u64);
 const ManagedSyncTargets = db_internal.ManagedSyncTargets;
+const BorrowedGraphMaterializationBatch = db_internal.BorrowedGraphMaterializationBatch;
+const containsStoreWriteKey = db_internal.containsStoreWriteKey;
+const filterChangedGraphMaterializationBatch = db_internal.filterChangedGraphMaterializationBatch;
 
 pub const BatchProfile = struct {
     total_ns: u64 = 0,
@@ -234,6 +237,7 @@ pub const BatchExecutionOptions = struct {
     wait_for_sync_level: bool = true,
     force_generated_artifact_names: []const []const u8 = &.{},
     document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
+    admission_prechecked: bool = false,
     bypass_ha_write_gate: bool = false,
     ha_applied_lsn_marker: ?u64 = null,
     suppress_derived_replay_append: bool = false,
@@ -2480,13 +2484,6 @@ pub fn appendUniqueOwnedKey(alloc: Allocator, list: *std.ArrayListUnmanaged([]u8
     try list.append(alloc, try alloc.dupe(u8, key));
 }
 
-pub fn containsStoreWriteKey(list: []const docstore_mod.KVPair, key: []const u8) bool {
-    for (list) |item| {
-        if (std.mem.eql(u8, item.key, key)) return true;
-    }
-    return false;
-}
-
 pub fn containsOwnedKey(list: []const []u8, key: []const u8) bool {
     for (list) |existing| {
         if (std.mem.eql(u8, existing, key)) return true;
@@ -2724,64 +2721,6 @@ pub fn containsBatchWriteKey(list: []const types.BatchWrite, key: []const u8) bo
         if (std.mem.eql(u8, item.key, key)) return true;
     }
     return false;
-}
-
-pub const BorrowedGraphMaterializationBatch = struct {
-    writes: []docstore_mod.KVPair = &.{},
-    deletes: []const []const u8 = &.{},
-
-    pub fn deinit(self: *@This(), alloc: Allocator) void {
-        if (self.writes.len > 0) alloc.free(self.writes);
-        if (self.deletes.len > 0) alloc.free(self.deletes);
-        self.* = .{};
-    }
-};
-
-pub fn filterChangedGraphMaterializationBatch(
-    alloc: Allocator,
-    store: *docstore_mod.DocStore,
-    writes: []const docstore_mod.KVPair,
-    deletes: []const []const u8,
-) !BorrowedGraphMaterializationBatch {
-    var changed_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
-    errdefer changed_writes.deinit(alloc);
-    for (writes) |write| {
-        if (try storeValueDiffers(alloc, store, write.key, write.value)) {
-            try changed_writes.append(alloc, write);
-        }
-    }
-
-    var changed_deletes = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer changed_deletes.deinit(alloc);
-    for (deletes) |key| {
-        if (containsStoreWriteKey(writes, key)) continue;
-        if (try storeContainsKey(alloc, store, key)) {
-            try changed_deletes.append(alloc, key);
-        }
-    }
-
-    return .{
-        .writes = try changed_writes.toOwnedSlice(alloc),
-        .deletes = try changed_deletes.toOwnedSlice(alloc),
-    };
-}
-
-fn storeValueDiffers(alloc: Allocator, store: *docstore_mod.DocStore, key: []const u8, value: []const u8) !bool {
-    const existing = store.get(alloc, key) catch |err| switch (err) {
-        error.NotFound => return true,
-        else => return err,
-    };
-    defer alloc.free(existing);
-    return !std.mem.eql(u8, existing, value);
-}
-
-fn storeContainsKey(alloc: Allocator, store: *docstore_mod.DocStore, key: []const u8) !bool {
-    const existing = store.get(alloc, key) catch |err| switch (err) {
-        error.NotFound => return false,
-        else => return err,
-    };
-    alloc.free(existing);
-    return true;
 }
 
 pub const GraphArtifactClear = struct {
@@ -4281,53 +4220,54 @@ pub fn CoalescedKeyValueRequest(comptime T: type) type {
     };
 }
 
+const BulkIngestCoalescerStats = struct {
+    active_session: std.atomic.Value(u8) = .init(0),
+    staged_keys: AtomicU64 = .init(0),
+    stage_batches: AtomicU64 = .init(0),
+    stage_writes: AtomicU64 = .init(0),
+    stage_deletes: AtomicU64 = .init(0),
+    stage_transforms: AtomicU64 = .init(0),
+    flush_calls: AtomicU64 = .init(0),
+    flushed_keys: AtomicU64 = .init(0),
+
+    pub fn snapshot(self: *const @This()) types.BulkCoalescingStats {
+        return .{
+            .active_session = self.active_session.load(.monotonic) != 0,
+            .staged_keys = self.staged_keys.load(.monotonic),
+            .stage_batches = self.stage_batches.load(.monotonic),
+            .stage_writes = self.stage_writes.load(.monotonic),
+            .stage_deletes = self.stage_deletes.load(.monotonic),
+            .stage_transforms = self.stage_transforms.load(.monotonic),
+            .flush_calls = self.flush_calls.load(.monotonic),
+            .flushed_keys = self.flushed_keys.load(.monotonic),
+        };
+    }
+};
+
+const BulkIngestCoalescerEntry = struct {
+    key: []u8,
+    value: ?[]u8 = null,
+    kind: enum { write, delete },
+};
+
+const BulkIngestRequestView = struct {
+    writes: []types.BatchWrite = &.{},
+    deletes: [][]const u8 = &.{},
+
+    fn deinit(self: @This(), alloc: Allocator) void {
+        if (self.writes.len > 0) alloc.free(self.writes);
+        if (self.deletes.len > 0) alloc.free(self.deletes);
+    }
+};
+
 pub fn BulkIngestCoalescer(comptime DB: type) type {
     return struct {
         const Self = @This();
-        const Stats = struct {
-            active_session: std.atomic.Value(u8) = .init(0),
-            staged_keys: AtomicU64 = .init(0),
-            stage_batches: AtomicU64 = .init(0),
-            stage_writes: AtomicU64 = .init(0),
-            stage_deletes: AtomicU64 = .init(0),
-            stage_transforms: AtomicU64 = .init(0),
-            flush_calls: AtomicU64 = .init(0),
-            flushed_keys: AtomicU64 = .init(0),
-
-            pub fn snapshot(self: *const @This()) types.BulkCoalescingStats {
-                return .{
-                    .active_session = self.active_session.load(.monotonic) != 0,
-                    .staged_keys = self.staged_keys.load(.monotonic),
-                    .stage_batches = self.stage_batches.load(.monotonic),
-                    .stage_writes = self.stage_writes.load(.monotonic),
-                    .stage_deletes = self.stage_deletes.load(.monotonic),
-                    .stage_transforms = self.stage_transforms.load(.monotonic),
-                    .flush_calls = self.flush_calls.load(.monotonic),
-                    .flushed_keys = self.flushed_keys.load(.monotonic),
-                };
-            }
-        };
-
-        const Entry = struct {
-            key: []u8,
-            value: ?[]u8 = null,
-            kind: enum { write, delete },
-        };
-
-        pub const RequestView = struct {
-            writes: []types.BatchWrite = &.{},
-            deletes: [][]const u8 = &.{},
-
-            pub fn deinit(self: @This(), alloc: Allocator) void {
-                if (self.writes.len > 0) alloc.free(self.writes);
-                if (self.deletes.len > 0) alloc.free(self.deletes);
-            }
-        };
 
         active: bool = false,
-        entries: std.ArrayListUnmanaged(Entry) = .empty,
+        entries: std.ArrayListUnmanaged(BulkIngestCoalescerEntry) = .empty,
         positions: std.StringHashMapUnmanaged(usize) = .empty,
-        stats: Stats = .{},
+        stats: BulkIngestCoalescerStats = .{},
 
         pub fn begin(self: *Self) void {
             self.active = true;
@@ -4361,8 +4301,8 @@ pub fn BulkIngestCoalescer(comptime DB: type) type {
             return self.entries.items.len > 0;
         }
 
-        pub fn snapshotRequestView(self: *const Self, alloc: Allocator) !RequestView {
-            var result = RequestView{};
+        pub fn snapshotRequestView(self: *const Self, alloc: Allocator) !BulkIngestRequestView {
+            var result = BulkIngestRequestView{};
             errdefer result.deinit(alloc);
 
             var write_count: usize = 0;
@@ -5150,31 +5090,37 @@ pub fn Impl(comptime DB: type) type {
             };
         }
 
-        pub fn batch(self: *DB, req: types.BatchRequest) anyerror!void {
+        pub fn batchAfterGate(self: *DB, req: types.BatchRequest) anyerror!void {
             if (DB.WritePathCallbacks.bench_metrics_enabled()) {
                 var profile = DB.WritePathCallbacks.Profile{};
-                try DB.WritePathCallbacks.batch_internal(self, req, &profile, .{});
+                try DB.WritePathCallbacks.batch_internal(self, req, &profile, .{ .admission_prechecked = true });
                 DB.WritePathCallbacks.log_batch_profile(req, profile);
             } else {
-                try DB.WritePathCallbacks.batch_internal(self, req, null, .{});
+                try DB.WritePathCallbacks.batch_internal(self, req, null, .{ .admission_prechecked = true });
             }
         }
 
-        pub fn batchProfiled(self: *DB, req: types.BatchRequest, profile: *DB.WritePathCallbacks.Profile) anyerror!void {
-            try DB.WritePathCallbacks.batch_internal(self, req, profile, .{});
+        pub fn batchProfiledAfterGate(self: *DB, req: types.BatchRequest, profile: *DB.WritePathCallbacks.Profile) anyerror!void {
+            try DB.WritePathCallbacks.batch_internal(self, req, profile, .{ .admission_prechecked = true });
         }
 
-        pub fn batchWithDocumentArtifactChildRangeDispatcher(
+        pub fn batchWithDocumentArtifactChildRangeDispatcherAfterGate(
             self: *DB,
             req: types.BatchRequest,
             dispatcher: DocumentArtifactChildRangeDispatcher,
         ) anyerror!void {
             if (DB.WritePathCallbacks.bench_metrics_enabled()) {
                 var profile = DB.WritePathCallbacks.Profile{};
-                try DB.WritePathCallbacks.batch_internal(self, req, &profile, .{ .document_child_range_dispatcher = dispatcher });
+                try DB.WritePathCallbacks.batch_internal(self, req, &profile, .{
+                    .document_child_range_dispatcher = dispatcher,
+                    .admission_prechecked = true,
+                });
                 DB.WritePathCallbacks.log_batch_profile(req, profile);
             } else {
-                try DB.WritePathCallbacks.batch_internal(self, req, null, .{ .document_child_range_dispatcher = dispatcher });
+                try DB.WritePathCallbacks.batch_internal(self, req, null, .{
+                    .document_child_range_dispatcher = dispatcher,
+                    .admission_prechecked = true,
+                });
             }
         }
 
@@ -5355,6 +5301,7 @@ pub fn Impl(comptime DB: type) type {
                 .sync_level = .write,
             }, null, .{
                 .force_generated_artifact_names = &force_artifacts,
+                .admission_prechecked = true,
             });
             const sequence = self.core.nextDerivedSequence();
             try self.runEnrichmentUntil(sequence);
@@ -5880,8 +5827,10 @@ pub fn Impl(comptime DB: type) type {
         }
 
         pub fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*DB.WritePathCallbacks.Profile, opts: DB.WritePathCallbacks.Options) anyerror!void {
-            if (DB.WritePathCallbacks.open_mode_requires_read_only_backends(self.open_mode)) return error.ReadOnly;
-            if (!opts.bypass_ha_write_gate) try DB.WritePathCallbacks.enforce_ha_write_gate(self);
+            if (!opts.admission_prechecked) {
+                if (DB.WritePathCallbacks.open_mode_requires_read_only_backends(self.open_mode)) return error.ReadOnly;
+                if (!opts.bypass_ha_write_gate) try DB.WritePathCallbacks.enforce_ha_write_gate(self);
+            }
             if (!opts.bypass_ha_write_gate) try DB.WritePathCallbacks.preflight_ha_batch_sync_commit(self);
             const total_start_ns = DB.WritePathCallbacks.monotonic_time_ns();
             defer {
@@ -6648,8 +6597,11 @@ pub fn Impl(comptime DB: type) type {
             }
         }
 
-        pub fn batchWithoutRangeValidation(self: *DB, req: types.BatchRequest) anyerror!void {
-            try DB.WritePathCallbacks.batch_internal(self, req, null, .{ .validate_range_ownership = false });
+        pub fn batchWithoutRangeValidationAfterGate(self: *DB, req: types.BatchRequest) anyerror!void {
+            try DB.WritePathCallbacks.batch_internal(self, req, null, .{
+                .validate_range_ownership = false,
+                .admission_prechecked = true,
+            });
         }
 
         pub fn batchReplicatedApply(self: *DB, req: types.BatchRequest) anyerror!void {
@@ -7082,7 +7034,10 @@ pub fn Impl(comptime DB: type) type {
                 .writes = view.writes,
                 .deletes = view.deletes,
                 .sync_level = sync_level,
-            }, profile, .{ .store_batch_options = .{ .mode = .bulk_ingest } });
+            }, profile, .{
+                .store_batch_options = .{ .mode = .bulk_ingest },
+                .admission_prechecked = true,
+            });
 
             self.core.lockApply();
             defer self.core.unlockApply();

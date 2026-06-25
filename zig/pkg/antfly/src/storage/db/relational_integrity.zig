@@ -350,6 +350,126 @@ fn jsonObjectString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     };
 }
 
+pub const ForeignKeyIntegrityProgressRecord = struct {
+    version: u32 = 1,
+    phase: []const u8 = "child_range",
+    mode: []const u8,
+    constraint_name: ?[]const u8 = null,
+    lower_doc_key: []const u8,
+    upper_doc_key: []const u8,
+    completed: bool = true,
+    valid: bool,
+    updated_at_ns: u64,
+    report: relational_store_mod.ForeignKeyIntegrityReport,
+};
+
+pub const ForeignKeyIntegrityClaimRecord = struct {
+    version: u32 = 1,
+    claim_key: []const u8,
+    worker_id: []const u8,
+    group_id: u64,
+    phase: []const u8 = "child_range",
+    planned_action: []const u8,
+    constraint_name: ?[]const u8 = null,
+    lower_doc_key: []const u8,
+    upper_doc_key: []const u8,
+    claimed_at_ns: u64,
+    lease_until_ns: u64,
+    attempts: u32 = 1,
+};
+
+pub const ForeignKeyIntegrityJobRecord = struct {
+    version: u32 = 1,
+    job_id: []const u8,
+    table_name: []const u8,
+    action: []const u8,
+    worker_id: []const u8,
+    constraint_name: ?[]const u8 = null,
+    lower_doc_key: []const u8,
+    upper_doc_key: []const u8,
+    lease_ms: u64,
+    max_work_units: usize,
+    status: []const u8,
+    created_at_ns: u64,
+    updated_at_ns: u64,
+    attempts: u32 = 0,
+    completed: bool = false,
+    valid: ?bool = null,
+    last_report: relational_store_mod.ForeignKeyIntegrityReport = .{},
+    aggregate_report: relational_store_mod.ForeignKeyIntegrityReport = .{},
+    violation_samples_json: []const u8 = "[]",
+    violation_sample_count: usize = 0,
+    violations_truncated: bool = false,
+    diagnostic_passes: u64 = 0,
+    violating_passes: u64 = 0,
+    first_violation_at_ns: ?u64 = null,
+    last_violation_at_ns: ?u64 = null,
+};
+
+pub const ForeignKeyActionJobRecord = struct {
+    version: u32 = 1,
+    job_id: []const u8,
+    action: []const u8,
+    worker_id: []const u8,
+    constraint_name: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+    updated_parent_key: ?[]const u8 = null,
+    page_limit: usize,
+    status: []const u8,
+    created_at_ns: u64,
+    updated_at_ns: u64,
+    claimed_at_ns: u64,
+    lease_until_ns: u64,
+    attempts: u32 = 0,
+    completed: bool = false,
+    applied_children: u64 = 0,
+    failure_count: u64 = 0,
+    first_failed_at_ns: ?u64 = null,
+    last_failed_at_ns: ?u64 = null,
+    requeue_count: u64 = 0,
+    last_requeued_at_ns: ?u64 = null,
+    cascade_depth: u32,
+    cascade_max_depth: u32,
+    next_child_table: ?[]const u8 = null,
+    next_child_key: ?[]const u8 = null,
+    last_error: ?[]const u8 = null,
+};
+
+pub const ForeignKeyActionScheduleRecord = struct {
+    version: u32 = 1,
+    schedule_id: []const u8,
+    action_job_id: []const u8,
+    action: []const u8,
+    worker_id: []const u8,
+    constraint_name: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+    updated_parent_key: ?[]const u8 = null,
+    page_limit: usize,
+    status: []const u8,
+    created_at_ns: u64,
+    updated_at_ns: u64,
+    completed: bool = false,
+    scheduled_groups: u64 = 0,
+    cascade_depth: u32,
+    cascade_max_depth: u32,
+    requeue_count: u64 = 0,
+    last_requeued_at_ns: ?u64 = null,
+    last_error: ?[]const u8 = null,
+};
+
+pub const UniqueConstraintIntegrityProgressRecord = struct {
+    version: u32 = 1,
+    mode: []const u8,
+    lower_doc_key: []const u8,
+    upper_doc_key: []const u8,
+    completed: bool = true,
+    valid: bool,
+    updated_at_ns: u64,
+    report: relational_store_mod.UniqueConstraintIntegrityReport,
+};
+
 pub fn Impl(comptime DB: type) type {
     return struct {
         const Self = @This();
@@ -374,6 +494,10 @@ pub fn Impl(comptime DB: type) type {
             report: ForeignKeyIntegrityReport,
         ) void {
             self.foreign_key_stats.recordIntegrityReport(mode, report);
+        }
+
+        fn shouldSkipIntegrityProgressWrite(self: *DB) bool {
+            return DB.LifecycleCallbacks.open_mode_requires_read_only_backends(self.open_mode);
         }
 
         pub fn validateForeignKeyRefsInRange(
@@ -409,7 +533,6 @@ pub fn Impl(comptime DB: type) type {
             lower_doc_key: []const u8,
             upper_doc_key: []const u8,
         ) !ForeignKeyIntegrityReport {
-            if (openModeRequiresReadOnlyBackends(self)) return error.ReadOnly;
             self.core.lockApply();
             defer self.core.unlockApply();
             return try self.relationalIntegrityReconcileForeignKeyRefsInRangeLocked(constraint_name, lower_doc_key, upper_doc_key, .repair);
@@ -459,7 +582,6 @@ pub fn Impl(comptime DB: type) type {
             lower_doc_key: []const u8,
             upper_doc_key: []const u8,
         ) !UniqueConstraintIntegrityReport {
-            if (openModeRequiresReadOnlyBackends(self)) return error.ReadOnly;
             self.core.lockApply();
             defer self.core.unlockApply();
             return try self.relationalIntegrityReconcileUniqueConstraintRowsInRangeLocked(lower_doc_key, upper_doc_key, .repair);
@@ -493,7 +615,6 @@ pub fn Impl(comptime DB: type) type {
             parent_table: []const u8,
             parent_key: []const u8,
         ) !ForeignKeyIntegrityReport {
-            if (openModeRequiresReadOnlyBackends(self)) return error.ReadOnly;
             self.core.lockApply();
             defer self.core.unlockApply();
             return try self.relationalIntegrityReconcileForeignKeyRefOwnerForParentLocked(constraint_name, parent_table, parent_key, .repair);
@@ -530,7 +651,6 @@ pub fn Impl(comptime DB: type) type {
             start_parent_key: []const u8,
             end_parent_key: []const u8,
         ) !ForeignKeyIntegrityReport {
-            if (openModeRequiresReadOnlyBackends(self)) return error.ReadOnly;
             self.core.lockApply();
             defer self.core.unlockApply();
             return try self.relationalIntegrityReconcileForeignKeyRefOwnerRangeLocked(constraint_name, parent_table, start_parent_key, end_parent_key, .repair);
@@ -1866,19 +1986,6 @@ pub fn Impl(comptime DB: type) type {
             return foreign_key.parent_columns.len == 1 and std.mem.eql(u8, foreign_key.parent_columns[0], "_id");
         }
 
-        pub const ForeignKeyIntegrityProgressRecord = struct {
-            version: u32 = 1,
-            phase: []const u8 = "child_range",
-            mode: []const u8,
-            constraint_name: ?[]const u8 = null,
-            lower_doc_key: []const u8,
-            upper_doc_key: []const u8,
-            completed: bool = true,
-            valid: bool,
-            updated_at_ns: u64,
-            report: relational_store_mod.ForeignKeyIntegrityReport,
-        };
-
         pub fn freeForeignKeyIntegrityProgressRecord(self: *DB, record: ForeignKeyIntegrityProgressRecord) void {
             if (record.phase.len > 0) self.alloc.free(record.phase);
             if (record.mode.len > 0) self.alloc.free(record.mode);
@@ -1891,21 +1998,6 @@ pub fn Impl(comptime DB: type) type {
             for (records) |record| self.freeForeignKeyIntegrityProgressRecord(record);
             if (records.len > 0) self.alloc.free(records);
         }
-
-        pub const ForeignKeyIntegrityClaimRecord = struct {
-            version: u32 = 1,
-            claim_key: []const u8,
-            worker_id: []const u8,
-            group_id: u64,
-            phase: []const u8 = "child_range",
-            planned_action: []const u8,
-            constraint_name: ?[]const u8 = null,
-            lower_doc_key: []const u8,
-            upper_doc_key: []const u8,
-            claimed_at_ns: u64,
-            lease_until_ns: u64,
-            attempts: u32 = 1,
-        };
 
         pub fn freeForeignKeyIntegrityClaimRecord(self: *DB, record: ForeignKeyIntegrityClaimRecord) void {
             if (record.claim_key.len > 0) self.alloc.free(record.claim_key);
@@ -1921,34 +2013,6 @@ pub fn Impl(comptime DB: type) type {
             for (records) |record| self.freeForeignKeyIntegrityClaimRecord(record);
             if (records.len > 0) self.alloc.free(records);
         }
-
-        pub const ForeignKeyIntegrityJobRecord = struct {
-            version: u32 = 1,
-            job_id: []const u8,
-            table_name: []const u8,
-            action: []const u8,
-            worker_id: []const u8,
-            constraint_name: ?[]const u8 = null,
-            lower_doc_key: []const u8,
-            upper_doc_key: []const u8,
-            lease_ms: u64,
-            max_work_units: usize,
-            status: []const u8,
-            created_at_ns: u64,
-            updated_at_ns: u64,
-            attempts: u32 = 0,
-            completed: bool = false,
-            valid: ?bool = null,
-            last_report: relational_store_mod.ForeignKeyIntegrityReport = .{},
-            aggregate_report: relational_store_mod.ForeignKeyIntegrityReport = .{},
-            violation_samples_json: []const u8 = "[]",
-            violation_sample_count: usize = 0,
-            violations_truncated: bool = false,
-            diagnostic_passes: u64 = 0,
-            violating_passes: u64 = 0,
-            first_violation_at_ns: ?u64 = null,
-            last_violation_at_ns: ?u64 = null,
-        };
 
         pub fn freeForeignKeyIntegrityJobRecord(self: *DB, record: ForeignKeyIntegrityJobRecord) void {
             if (record.job_id.len > 0) self.alloc.free(record.job_id);
@@ -1966,36 +2030,6 @@ pub fn Impl(comptime DB: type) type {
             for (records) |record| self.freeForeignKeyIntegrityJobRecord(record);
             if (records.len > 0) self.alloc.free(records);
         }
-
-        pub const ForeignKeyActionJobRecord = struct {
-            version: u32 = 1,
-            job_id: []const u8,
-            action: []const u8,
-            worker_id: []const u8,
-            constraint_name: []const u8,
-            parent_table: []const u8,
-            parent_key: []const u8,
-            updated_parent_key: ?[]const u8 = null,
-            page_limit: usize,
-            status: []const u8,
-            created_at_ns: u64,
-            updated_at_ns: u64,
-            claimed_at_ns: u64,
-            lease_until_ns: u64,
-            attempts: u32 = 0,
-            completed: bool = false,
-            applied_children: u64 = 0,
-            failure_count: u64 = 0,
-            first_failed_at_ns: ?u64 = null,
-            last_failed_at_ns: ?u64 = null,
-            requeue_count: u64 = 0,
-            last_requeued_at_ns: ?u64 = null,
-            cascade_depth: u32,
-            cascade_max_depth: u32,
-            next_child_table: ?[]const u8 = null,
-            next_child_key: ?[]const u8 = null,
-            last_error: ?[]const u8 = null,
-        };
 
         pub fn freeForeignKeyActionJobRecord(self: *DB, record: ForeignKeyActionJobRecord) void {
             if (record.job_id.len > 0) self.alloc.free(record.job_id);
@@ -2016,29 +2050,6 @@ pub fn Impl(comptime DB: type) type {
             if (records.len > 0) self.alloc.free(records);
         }
 
-        pub const ForeignKeyActionScheduleRecord = struct {
-            version: u32 = 1,
-            schedule_id: []const u8,
-            action_job_id: []const u8,
-            action: []const u8,
-            worker_id: []const u8,
-            constraint_name: []const u8,
-            parent_table: []const u8,
-            parent_key: []const u8,
-            updated_parent_key: ?[]const u8 = null,
-            page_limit: usize,
-            status: []const u8,
-            created_at_ns: u64,
-            updated_at_ns: u64,
-            completed: bool = false,
-            scheduled_groups: u64 = 0,
-            cascade_depth: u32,
-            cascade_max_depth: u32,
-            requeue_count: u64 = 0,
-            last_requeued_at_ns: ?u64 = null,
-            last_error: ?[]const u8 = null,
-        };
-
         pub fn freeForeignKeyActionScheduleRecord(self: *DB, record: ForeignKeyActionScheduleRecord) void {
             if (record.schedule_id.len > 0) self.alloc.free(record.schedule_id);
             if (record.action_job_id.len > 0) self.alloc.free(record.action_job_id);
@@ -2056,17 +2067,6 @@ pub fn Impl(comptime DB: type) type {
             for (records) |record| self.freeForeignKeyActionScheduleRecord(record);
             if (records.len > 0) self.alloc.free(records);
         }
-
-        pub const UniqueConstraintIntegrityProgressRecord = struct {
-            version: u32 = 1,
-            mode: []const u8,
-            lower_doc_key: []const u8,
-            upper_doc_key: []const u8,
-            completed: bool = true,
-            valid: bool,
-            updated_at_ns: u64,
-            report: relational_store_mod.UniqueConstraintIntegrityReport,
-        };
 
         pub fn freeUniqueConstraintIntegrityProgressRecord(self: *DB, record: UniqueConstraintIntegrityProgressRecord) void {
             if (record.mode.len > 0) self.alloc.free(record.mode);
@@ -2432,7 +2432,7 @@ pub fn Impl(comptime DB: type) type {
             report: relational_store_mod.ForeignKeyIntegrityReport,
         ) !void {
             self.relationalIntegrityRecordForeignKeyIntegrityReport(mode, report);
-            if (openModeRequiresReadOnlyBackends(self)) return;
+            if (shouldSkipIntegrityProgressWrite(self)) return;
             const key = try foreignKeyIntegrityProgressKeyAlloc(alloc, phase, mode, constraint_name, lower_doc_key, upper_doc_key);
             defer alloc.free(key);
             const payload = try std.json.Stringify.valueAlloc(alloc, ForeignKeyIntegrityProgressRecord{
@@ -2457,7 +2457,7 @@ pub fn Impl(comptime DB: type) type {
             upper_doc_key: []const u8,
             report: relational_store_mod.UniqueConstraintIntegrityReport,
         ) !void {
-            if (openModeRequiresReadOnlyBackends(self)) return;
+            if (shouldSkipIntegrityProgressWrite(self)) return;
             const key = try uniqueConstraintIntegrityProgressKeyAlloc(alloc, mode, lower_doc_key, upper_doc_key);
             defer alloc.free(key);
             const payload = try std.json.Stringify.valueAlloc(alloc, UniqueConstraintIntegrityProgressRecord{
@@ -2511,7 +2511,6 @@ pub fn Impl(comptime DB: type) type {
             lease_ms: u64,
             now_ns: u64,
         ) !ForeignKeyIntegrityClaimRecord {
-            if (openModeRequiresReadOnlyBackends(self)) return error.ReadOnly;
             if (claim_key.len == 0 or worker_id.len == 0 or phase.len == 0 or planned_action.len == 0) return error.InvalidForeignKeyIntegrityClaim;
             self.core.lockApply();
             defer self.core.unlockApply();
@@ -2595,7 +2594,6 @@ pub fn Impl(comptime DB: type) type {
             status: []const u8,
             now_ns: u64,
         ) !ForeignKeyIntegrityJobRecord {
-            if (openModeRequiresReadOnlyBackends(self)) return error.ReadOnly;
             if (job_id.len == 0 or table_name.len == 0 or action.len == 0 or worker_id.len == 0 or status.len == 0) return error.InvalidForeignKeyIntegrityJob;
             self.core.lockApply();
             defer self.core.unlockApply();
@@ -2732,7 +2730,6 @@ pub fn Impl(comptime DB: type) type {
             violations_truncated: ?bool,
             now_ns: u64,
         ) !ForeignKeyIntegrityJobRecord {
-            if (openModeRequiresReadOnlyBackends(self)) return error.ReadOnly;
             if (job_id.len == 0 or status.len == 0) return error.InvalidForeignKeyIntegrityJob;
             self.core.lockApply();
             defer self.core.unlockApply();
@@ -2866,7 +2863,6 @@ pub fn Impl(comptime DB: type) type {
             violations_truncated: bool,
             now_ns: u64,
         ) !ForeignKeyIntegrityJobRecord {
-            if (openModeRequiresReadOnlyBackends(self)) return error.ReadOnly;
             if (job_id.len == 0) return error.InvalidForeignKeyIntegrityJob;
             self.core.lockApply();
             defer self.core.unlockApply();
@@ -3057,7 +3053,6 @@ pub fn Impl(comptime DB: type) type {
             cascade_max_depth: u32,
             now_ns: u64,
         ) !ForeignKeyActionJobRecord {
-            if (openModeRequiresReadOnlyBackends(self)) return error.ReadOnly;
             if (page_limit == 0) return error.InvalidForeignKeyActionJob;
             const canonical_action = foreignKeyActionJobCanonicalAction(action) orelse return error.InvalidForeignKeyActionJob;
             try validateForeignKeyActionLineage(cascade_depth, cascade_max_depth);
@@ -3199,7 +3194,6 @@ pub fn Impl(comptime DB: type) type {
             page_limit: usize,
             now_ns: u64,
         ) !ForeignKeyActionJobRecord {
-            if (openModeRequiresReadOnlyBackends(self)) return error.ReadOnly;
             if (page_limit == 0) return error.InvalidForeignKeyActionJob;
             const canonical_action = foreignKeyActionJobCanonicalAction(action) orelse return error.InvalidForeignKeyActionJob;
             try validateForeignKeyActionJobIdentity(job_id, canonical_action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
@@ -3349,7 +3343,6 @@ pub fn Impl(comptime DB: type) type {
             page_limit: usize,
             now_ns: u64,
         ) !ForeignKeyActionScheduleRecord {
-            if (openModeRequiresReadOnlyBackends(self)) return error.ReadOnly;
             if (schedule_id.len == 0 or action_job_id.len == 0 or page_limit == 0) return error.InvalidForeignKeyActionJob;
             const canonical_action = foreignKeyActionJobCanonicalAction(action) orelse return error.InvalidForeignKeyActionJob;
             try validateForeignKeyActionJobIdentity(action_job_id, canonical_action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
@@ -3462,7 +3455,6 @@ pub fn Impl(comptime DB: type) type {
             page_limit: usize,
             now_ns: u64,
         ) !ForeignKeyActionScheduleRecord {
-            if (openModeRequiresReadOnlyBackends(self)) return error.ReadOnly;
             if (schedule_id.len == 0 or action_job_id.len == 0 or page_limit == 0) return error.InvalidForeignKeyActionJob;
             const canonical_action = foreignKeyActionJobCanonicalAction(action) orelse return error.InvalidForeignKeyActionJob;
             try validateForeignKeyActionJobIdentity(action_job_id, canonical_action, worker_id, constraint_name, parent_table, parent_key, updated_parent_key);
@@ -3526,7 +3518,6 @@ pub fn Impl(comptime DB: type) type {
             scheduled_groups: u64,
             now_ns: u64,
         ) !ForeignKeyActionScheduleRecord {
-            if (openModeRequiresReadOnlyBackends(self)) return error.ReadOnly;
             if (schedule_id.len == 0) return error.InvalidForeignKeyActionJob;
             self.core.lockApply();
             defer self.core.unlockApply();
@@ -3952,7 +3943,6 @@ pub fn Impl(comptime DB: type) type {
             cascade_max_depth: u32,
             now_ns: u64,
         ) !ForeignKeyActionJobRecord {
-            if (openModeRequiresReadOnlyBackends(self)) return error.ReadOnly;
             if (page_limit == 0 or lease_ms == 0) return error.InvalidForeignKeyActionJob;
             const canonical_action = foreignKeyActionJobCanonicalAction(action) orelse return error.InvalidForeignKeyActionJob;
             try validateForeignKeyActionLineage(cascade_depth, cascade_max_depth);
@@ -4066,7 +4056,6 @@ pub fn Impl(comptime DB: type) type {
             last_error: ?[]const u8,
             now_ns: u64,
         ) !ForeignKeyActionJobRecord {
-            if (openModeRequiresReadOnlyBackends(self)) return error.ReadOnly;
             try validateForeignKeyActionJobPageFinish(applied_count, complete, next_child_table, next_child_key, last_error);
             self.core.lockApply();
             defer self.core.unlockApply();
@@ -4662,10 +4651,6 @@ pub fn Impl(comptime DB: type) type {
                 .validate, .dry_run => report.valid(),
                 .repair => report.duplicate_unique_rows == 0,
             };
-        }
-
-        fn openModeRequiresReadOnlyBackends(self: *DB) bool {
-            return self.open_mode == .query_readonly or self.open_mode == .status_only;
         }
     };
 }

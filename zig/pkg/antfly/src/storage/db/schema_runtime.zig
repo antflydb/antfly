@@ -14,11 +14,8 @@
 
 const std = @import("std");
 
-const apply_state = @import("derived/apply_state.zig");
 const db_internal = @import("internal.zig");
 const derived_types = @import("derived/derived_types.zig");
-const ha_replication = @import("ha_replication.zig");
-const lifecycle_mod = @import("lifecycle.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const docstore_mod = @import("../docstore.zig");
 const internal_keys = @import("../internal_keys.zig");
@@ -71,7 +68,6 @@ pub const SchemaRewriteJobDrainOptions = struct {
 pub fn Impl(comptime DB: type) type {
     return struct {
         const Self = @This();
-        const relational_rows_impl = relational_rows.Impl(DB);
 
         fn currentTimeNs() u64 {
             return db_internal.currentTimeNs();
@@ -89,7 +85,7 @@ pub fn Impl(comptime DB: type) type {
             row: std.json.Value,
             expression: schema_mod.RelationalRowsExpression,
         ) ![]u8 {
-            return try relational_rows_impl.relationalRowsExpressionValueJsonAlloc(alloc, row, expression);
+            return try relational_rows.expressionValueJsonAlloc(alloc, row, expression, currentTimeNs());
         }
 
         fn relationalRowsGeneratedColumnValueJsonAlloc(
@@ -97,7 +93,7 @@ pub fn Impl(comptime DB: type) type {
             row: std.json.Value,
             generated: schema_mod.RelationalGeneratedValue,
         ) ![]u8 {
-            return try relational_rows_impl.schemaRuntimeRelationalRowsGeneratedColumnValueJsonAlloc(alloc, row, generated);
+            return try relational_rows.generatedColumnValueJsonAlloc(alloc, row, generated, currentTimeNs());
         }
 
         fn recordForeignKeyIntegrityProgressLocked(
@@ -112,29 +108,24 @@ pub fn Impl(comptime DB: type) type {
             try self.relationalIntegrityRecordForeignKeyIntegrityProgressLocked(alloc, mode, constraint_name, lower_doc_key, upper_doc_key, report);
         }
 
-        pub fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
-            try ha_replication.enforceWriteGateOptional(self.ha_write_gate);
-            try Self.preflightMetadataSyncCommit(self);
+        pub fn setSchemaAfterGate(self: *DB, table_schema: schema_mod.TableSchema) !void {
             try Self.validateRuntimeSchemaFeatureLevel(table_schema);
             try self.core.setSchema(table_schema);
             Self.refreshRuntimeSideEffects(self);
-            try Self.mirrorSchemaMetadataCommit(self, table_schema);
+            try DB.SchemaRuntimeCallbacks.mirror_ha_schema_metadata_commit(self, table_schema);
         }
 
         /// Apply table metadata schema JSON to the DB runtime and all schema-derived
         /// local artifacts. This is the single production entry point for table
         /// schema application so write-cache reconciliation, metadata provisioning,
         /// and crash recovery keep algebraic sidecars in the same lifecycle state.
-        pub fn applyTableSchemaJson(
+        pub fn applyTableSchemaJsonAfterGate(
             self: *DB,
             alloc: Allocator,
             schema_json: []const u8,
             options: ApplyTableSchemaOptions,
         ) !void {
             if (schema_json.len == 0) return;
-            if (self.open_mode == .query_readonly or self.open_mode == .status_only) return error.ReadOnly;
-            try ha_replication.enforceWriteGateOptional(self.ha_write_gate);
-            try Self.preflightMetadataSyncCommit(self);
 
             var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
             defer parsed_schema.deinit(alloc);
@@ -152,9 +143,9 @@ pub fn Impl(comptime DB: type) type {
             try Self.migrateRelationalRowsForSchemaTransitionLocked(self, alloc, runtime_schema);
             try Self.migrateRelationalConstraintsForSchemaTransitionLocked(self, alloc, runtime_schema);
             if (options.persist_local_schema_json) {
-                try Self.setSchemaWithLocalSchemaJson(self, runtime_schema, schema_json);
+                try Self.setSchemaWithLocalSchemaJsonAfterGate(self, runtime_schema, schema_json);
             } else {
-                try Self.setSchema(self, runtime_schema);
+                try Self.setSchemaAfterGate(self, runtime_schema);
             }
             if (options.reload_algebraic_schema_configs) {
                 try Self.completePendingAlgebraicSchemaRebuilds(self);
@@ -165,9 +156,8 @@ pub fn Impl(comptime DB: type) type {
         /// already applied the runtime schema. This remains a structural mutation:
         /// config swaps, sidecar clears, and rebuild replay are serialized with
         /// normal apply work just like `applyTableSchemaJson`.
-        pub fn reloadAlgebraicSchemaConfigs(self: *DB, schema_json: []const u8) !void {
+        pub fn reloadAlgebraicSchemaConfigsAfterGate(self: *DB, schema_json: []const u8) !void {
             if (schema_json.len == 0) return;
-            if (self.open_mode == .query_readonly or self.open_mode == .status_only) return error.ReadOnly;
 
             self.core.lockApply();
             defer self.core.unlockApply();
@@ -183,7 +173,7 @@ pub fn Impl(comptime DB: type) type {
             try self.core.index_manager.completePendingAlgebraicSchemaRebuilds(self.core.store);
         }
 
-        pub fn setSchemaWithLocalSchemaJson(self: *DB, table_schema: schema_mod.TableSchema, schema_json: []const u8) !void {
+        pub fn setSchemaWithLocalSchemaJsonAfterGate(self: *DB, table_schema: schema_mod.TableSchema, schema_json: []const u8) !void {
             try Self.validateRuntimeSchemaFeatureLevel(table_schema);
             const metadata_puts = [_]schema_mod.SchemaMetadataPut{.{
                 .key = local_schema_json_key,
@@ -191,10 +181,10 @@ pub fn Impl(comptime DB: type) type {
             }};
             try self.core.setSchemaWithMetadata(table_schema, metadata_puts[0..]);
             Self.refreshRuntimeSideEffects(self);
-            try Self.mirrorSchemaMetadataCommit(self, table_schema);
+            try DB.SchemaRuntimeCallbacks.mirror_ha_schema_metadata_commit(self, table_schema);
         }
 
-        pub fn setSchemaWithLocalLiteSqlTableRecordJson(
+        pub fn setSchemaWithLocalLiteSqlTableRecordJsonAfterGate(
             self: *DB,
             table_schema: schema_mod.TableSchema,
             schema_json: []const u8,
@@ -213,23 +203,14 @@ pub fn Impl(comptime DB: type) type {
             };
             try self.core.setSchemaWithMetadata(table_schema, metadata_puts[0..]);
             Self.refreshRuntimeSideEffects(self);
-            try Self.mirrorSchemaMetadataCommit(self, table_schema);
-        }
-
-        pub fn setSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
-            try self.applyTableSchemaJson(alloc, schema_json, .{});
+            try DB.SchemaRuntimeCallbacks.mirror_ha_schema_metadata_commit(self, table_schema);
         }
 
         pub fn getSchemaJson(self: *DB, alloc: Allocator) !?[]u8 {
             return try self.core.getStoreValue(alloc, local_schema_json_key);
         }
 
-        pub fn applyLiteSqlTableRecord(self: *DB, alloc: Allocator, table: metadata_table_manager.TableRecord) !void {
-            if (table.schema_json.len == 0) return error.InvalidSchemaUpdateRequest;
-            if (self.open_mode == .query_readonly or self.open_mode == .status_only) return error.ReadOnly;
-            try ha_replication.enforceWriteGateOptional(self.ha_write_gate);
-            try Self.preflightMetadataSyncCommit(self);
-
+        pub fn applyLiteSqlTableRecordAfterGate(self: *DB, alloc: Allocator, table: metadata_table_manager.TableRecord) !void {
             const table_record_json = try std.json.Stringify.valueAlloc(alloc, table, .{});
             defer alloc.free(table_record_json);
 
@@ -246,7 +227,7 @@ pub fn Impl(comptime DB: type) type {
             try Self.stageAlgebraicSchemaConfigsPending(self, table.schema_json);
             try Self.migrateRelationalRowsForSchemaTransitionLocked(self, alloc, runtime_schema);
             try Self.migrateRelationalConstraintsForSchemaTransitionLocked(self, alloc, runtime_schema);
-            try Self.setSchemaWithLocalLiteSqlTableRecordJson(self, runtime_schema, table.schema_json, table_record_json);
+            try Self.setSchemaWithLocalLiteSqlTableRecordJsonAfterGate(self, runtime_schema, table.schema_json, table_record_json);
             try Self.completePendingAlgebraicSchemaRebuilds(self);
         }
 
@@ -548,10 +529,7 @@ pub fn Impl(comptime DB: type) type {
             var apply_locked = true;
             errdefer if (apply_locked) self.core.unlockApply();
             const applied = try self.core.addIndex(cfg);
-            try lifecycle_mod.saveIndexStatusSnapshots(self.alloc, self.core.store, self.core.index_manager, &[_]apply_state.AppliedSequenceUpdate{.{
-                .index_name = cfg.name,
-                .sequence = applied,
-            }});
+            try DB.SchemaRuntimeCallbacks.save_index_status_snapshot(self, cfg.name, applied);
             if (cfg.kind == .algebraic) {
                 DB.SchemaRuntimeCallbacks.hydrate_algebraic_observation_status_for_index_best_effort(self, cfg.name);
             }
@@ -1024,7 +1002,6 @@ pub fn Impl(comptime DB: type) type {
             alloc: Allocator,
             job: metadata_table_manager.SchemaRewriteJobRecord,
         ) !SchemaRewriteJobExecutionResult {
-            if (self.open_mode == .query_readonly or self.open_mode == .status_only) return error.ReadOnly;
             const validate_constraints = std.mem.eql(u8, job.action, "validate") and std.mem.eql(u8, job.reason, "constraints");
             const rewrite_rows = std.mem.eql(u8, job.action, "rewrite") and std.mem.eql(u8, job.reason, "row_images");
             if (!validate_constraints and !rewrite_rows) return error.InvalidSchemaRewriteJob;
@@ -1331,16 +1308,6 @@ pub fn Impl(comptime DB: type) type {
                 ctx.relational_base_rows = relational_base_rows;
                 ctx.relational_columns = relational_columns;
             }
-        }
-
-        fn preflightMetadataSyncCommit(self: *DB) !void {
-            const resources = self.core.batchExecutionResources();
-            try ha_replication.preflightMirrorSyncCommit(resources.log_mutex, self.ha_async_metadata_mirror);
-        }
-
-        fn mirrorSchemaMetadataCommit(self: *DB, table_schema: schema_mod.TableSchema) !void {
-            const resources = self.core.batchExecutionResources();
-            try ha_replication.mirrorSchemaMetadataCommit(self.alloc, resources.log_mutex, self.ha_async_metadata_mirror, table_schema);
         }
     };
 }

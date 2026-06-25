@@ -23,6 +23,8 @@ const usermgr_openapi = @import("antfly_usermgr_openapi");
 const fs_paths = @import("../common/fs_paths.zig");
 const platform_time = @import("../platform/time.zig");
 const platform = @import("antfly_platform");
+const catalog_resources = @import("../api/catalog_resources.zig");
+const sql_adapter = @import("../sql/mod.zig");
 
 const AntflyApiHandler = antfly.public_api.httpx_handler.AntflyApiHandler;
 const http_common = antfly.common.http;
@@ -43,6 +45,8 @@ const CliConfig = struct {
     config_path: ?[]const u8 = null,
     bind_host: ?[]const u8 = null,
     bind_port: ?u16 = null,
+    pgwire_host: ?[]const u8 = null,
+    pgwire_port: ?u16 = null,
     health_enabled: ?bool = null,
     health_port: ?u16 = null,
     tick_ms: ?u64 = null,
@@ -206,6 +210,7 @@ const LocalSwarmMetadata = struct {
         };
         errdefer self.deinit();
         try self.loadPersistedCatalog();
+        try self.manager.ensureDefaultCatalog();
         return self;
     }
 
@@ -242,6 +247,7 @@ const LocalSwarmMetadata = struct {
                 .update_schema = updateSchema,
                 .create_index = createIndex,
                 .drop_index = dropIndex,
+                .apply_relational_sql_ddl_plan_with_session = applyRelationalSqlDdlPlanWithSession,
                 .put_artifact_enrichment = putArtifactEnrichment,
                 .delete_artifact_enrichment = deleteArtifactEnrichment,
                 .wait_table_lifecycle = waitTableLifecycle,
@@ -287,8 +293,18 @@ const LocalSwarmMetadata = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
+        return try self.catalogAdminSnapshotLocked();
+    }
+
+    fn catalogAdminSnapshotLocked(self: *LocalSwarmMetadata) !antfly.metadata_api.AdminSnapshot {
         const tables = try self.manager.listTables(self.alloc);
         errdefer self.manager.freeTables(self.alloc, tables);
+        const databases = try self.manager.listDatabases(self.alloc);
+        errdefer self.manager.freeDatabases(self.alloc, databases);
+        const namespaces = try self.manager.listNamespaces(self.alloc);
+        errdefer self.manager.freeNamespaces(self.alloc, namespaces);
+        const tablespaces = try self.manager.listTablespaces(self.alloc);
+        errdefer self.manager.freeTablespaces(self.alloc, tablespaces);
         const ranges = try self.manager.listRanges(self.alloc);
         errdefer self.manager.freeRanges(self.alloc, ranges);
         const extension_packages = try self.extension_catalog.listPackages(self.alloc);
@@ -343,6 +359,9 @@ const LocalSwarmMetadata = struct {
                 .projected_placement_intents = placement_intents.len,
                 .metrics = .{},
             },
+            .databases = databases,
+            .namespaces = namespaces,
+            .tablespaces = tablespaces,
             .tables = tables,
             .ranges = ranges,
             .stores = stores,
@@ -358,6 +377,9 @@ const LocalSwarmMetadata = struct {
 
     fn catalogFreeAdminSnapshot(ptr: *anyopaque, snapshot: *antfly.metadata_api.AdminSnapshot) void {
         const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        self.manager.freeDatabases(self.alloc, snapshot.databases);
+        self.manager.freeNamespaces(self.alloc, snapshot.namespaces);
+        self.manager.freeTablespaces(self.alloc, snapshot.tablespaces);
         self.manager.freeTables(self.alloc, snapshot.tables);
         self.manager.freeRanges(self.alloc, snapshot.ranges);
         for (snapshot.stores) |store| antfly.metadata.table_manager.freeStore(self.alloc, store);
@@ -466,6 +488,115 @@ const LocalSwarmMetadata = struct {
         try self.manager.upsertTable(updated);
         self.epoch +|= 1;
         try self.persistLocked();
+    }
+
+    fn applyRelationalSqlDdlPlanWithSession(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        plan: *sql_adapter.LoweredDdlPlan,
+        session: catalog_resources.SqlCatalogSession,
+    ) !antfly.public_api.tables.AppliedRelationalSqlDdlRecord {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+
+        var target = try antfly.public_api.tables.relationalSqlDdlTargetForPlanWithSessionAlloc(alloc, plan.*, session);
+        defer target.deinit(alloc);
+
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        var snapshot = try self.catalogAdminSnapshotLocked();
+        defer catalogFreeAdminSnapshot(ptr, &snapshot);
+
+        if (target.createsTable()) {
+            try antfly.public_api.tables.validateRelationalSqlDdlNamespace(&snapshot, target);
+            if (antfly.public_api.tables.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) != null) return error.TableAlreadyExists;
+
+            const base_table = antfly.public_api.tables.deriveRelationalSqlDdlTargetTableRecord(target);
+            var applied = try antfly.public_api.tables.applyRelationalSqlDdlPlanToTableRecordWithSessionAlloc(alloc, &base_table, plan, session);
+            errdefer applied.deinit(alloc);
+            applied.created_table = true;
+            try antfly.public_api.tables.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, applied.table);
+
+            const ranges = try antfly.public_api.tables.deriveInitialRanges(alloc, applied.table);
+            defer {
+                for (ranges) |record| antfly.metadata.table_manager.freeRange(alloc, record);
+                alloc.free(ranges);
+            }
+
+            try self.manager.upsertTable(applied.table);
+            for (ranges) |range| try self.manager.upsertRange(range);
+            self.epoch +|= 1;
+            try self.persistLocked();
+            return applied;
+        }
+
+        const table = antfly.public_api.tables.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse {
+            if (target.dropsTable() and target.if_exists) {
+                return try antfly.public_api.tables.missingQualifiedDropTableIfExistsNoopAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+            }
+            return error.TableNotFound;
+        };
+
+        if (target.dropsTable()) {
+            var cascade_updates: []antfly.metadata.TableRecord = &.{};
+            defer {
+                for (cascade_updates) |record| antfly.metadata.table_manager.freeTable(alloc, record);
+                if (cascade_updates.len > 0) alloc.free(cascade_updates);
+            }
+            if (target.cascade) {
+                cascade_updates = try relationalDropTableCascadeReferenceUpdatesAlloc(alloc, &snapshot, table.*);
+            } else {
+                try antfly.public_api.tables.validateRelationalTableDropAllowed(alloc, &snapshot, table.*);
+            }
+            const dropped = try antfly.metadata.table_manager.cloneTable(alloc, table.*);
+            errdefer antfly.metadata.table_manager.freeTable(alloc, dropped);
+
+            for (cascade_updates) |updated| try self.manager.upsertTable(updated);
+            _ = self.manager.removeTableTopology(table.table_id);
+            self.epoch +|= 1;
+            try self.persistLocked();
+            return .{
+                .table = dropped,
+                .dropped_table = true,
+            };
+        }
+
+        var applied = try antfly.public_api.tables.applyRelationalSqlDdlPlanToTableRecordWithSessionAlloc(alloc, table, plan, session);
+        errdefer applied.deinit(alloc);
+        try antfly.public_api.tables.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, applied.table);
+
+        try self.manager.upsertTable(applied.table);
+        self.epoch +|= 1;
+        try self.persistLocked();
+        return applied;
+    }
+
+    fn relationalDropTableCascadeReferenceUpdatesAlloc(
+        alloc: std.mem.Allocator,
+        snapshot: *const antfly.metadata_api.AdminSnapshot,
+        target_table: antfly.metadata.TableRecord,
+    ) ![]antfly.metadata.TableRecord {
+        var updates: std.ArrayListUnmanaged(antfly.metadata.TableRecord) = .empty;
+        errdefer {
+            for (updates.items) |record| antfly.metadata.table_manager.freeTable(alloc, record);
+            updates.deinit(alloc);
+        }
+
+        for (snapshot.tables) |candidate_table| {
+            if (candidate_table.table_id == target_table.table_id) continue;
+            const next_schema_json = (try antfly.public_api.tables.schemaWithoutForeignKeysReferencingTableAlloc(
+                alloc,
+                candidate_table.schema_json,
+                target_table.name,
+            )) orelse continue;
+            defer alloc.free(next_schema_json);
+
+            const updated = try antfly.public_api.tables.applySchemaUpdateRecord(alloc, &candidate_table, next_schema_json);
+            errdefer antfly.metadata.table_manager.freeTable(alloc, updated);
+            try updates.append(alloc, updated);
+        }
+
+        return try updates.toOwnedSlice(alloc);
     }
 
     fn putArtifactEnrichment(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) !void {
@@ -732,6 +863,19 @@ const LocalSwarmMetadata = struct {
         var it = self.manager.tables.valueIterator();
         while (it.next()) |table| {
             if (std.mem.eql(u8, table.name, table_name)) return table;
+        }
+        return null;
+    }
+
+    fn findTableByQualifiedNameLocked(
+        self: *LocalSwarmMetadata,
+        database_name: []const u8,
+        namespace_name: []const u8,
+        table_name: []const u8,
+    ) ?*const antfly.metadata.TableRecord {
+        var it = self.manager.tables.valueIterator();
+        while (it.next()) |table| {
+            if (antfly.public_api.tables.tableCatalogIdentityMatches(table.*, database_name, namespace_name, table_name)) return table;
         }
         return null;
     }
@@ -1055,6 +1199,15 @@ pub fn runFromIterator(
     };
 
     const api_server = &data_server.http_server.?;
+    var pgwire_server = try antfly.public_api.pgwire_runtime.startOptional(alloc, .{
+        .bind_host = cli.pgwire_host,
+        .default_bind_host = public_listener.bind_host,
+        .bind_port = cli.pgwire_port,
+        .auth_enabled = auth_enabled,
+        .auth_error_message = "swarm pgwire listener does not support auth yet; disable --auth or omit --pgwire-port",
+        .api_server = api_server,
+    });
+    defer if (pgwire_server) |*server| server.deinit();
 
     // ---------------------------------------------------------------
     // Unified httpx.Server — all routes on a single port
@@ -2080,6 +2233,14 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.bind_port = try std.fmt.parseInt(u16, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--pgwire-host")) {
+            cfg.pgwire_host = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--pgwire-port")) {
+            cfg.pgwire_port = try std.fmt.parseInt(u16, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--health-port")) {
             cfg.health_port = try std.fmt.parseInt(u16, args.next() orelse return error.InvalidArguments, 10);
             continue;
@@ -2808,6 +2969,8 @@ fn printUsage() void {
         \\  --config <path>                       JSON common config file
         \\  --host <host>                         Public API host (default: 127.0.0.1)
         \\  --port <port>                         Public API port (default: 8080)
+        \\  --pgwire-host <host>                  Pgwire bind host (default: --host)
+        \\  --pgwire-port <port>                  Enable unauthenticated pgwire TCP listener on this port
         \\  --id <node-id>                        Local node id (default: 1)
         \\  --health <true|false>                 Enable health/metrics server (default: true)
         \\  --health-port <port>                  Dedicated health/metrics port on --host (default: 4200)
@@ -4117,6 +4280,55 @@ test "swarm runtime resolves explicit extension package store path" {
     const resolved = try resolvePaths(alloc, .{ .extension_package_store_dir = "/opt/antfly/extensions" }, null);
     defer resolved.deinit(alloc);
     try std.testing.expectEqualStrings("/opt/antfly/extensions", resolved.extension_package_store_dir);
+}
+
+test "swarm local metadata drop table cascade removes child foreign keys" {
+    const alloc = std.testing.allocator;
+    var tables = [_]antfly.metadata.TableRecord{
+        .{
+            .table_id = 8,
+            .name = "customers",
+            .schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+            ,
+            .placement_role = "data",
+        },
+        .{
+            .table_id = 7,
+            .name = "orders",
+            .schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"account_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["id"]},"on_delete":"restrict","validation_state":"enforced"},{"name":"orders_account_id_fkey","columns":["account_id"],"references":{"table":"accounts","columns":["id"]},"on_delete":"restrict","validation_state":"enforced"}]}
+            ,
+            .placement_role = "data",
+        },
+        .{
+            .table_id = 9,
+            .name = "accounts",
+            .schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+            ,
+            .placement_role = "data",
+        },
+    };
+    const snapshot = antfly.metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = &tables,
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
+    };
+
+    const updates = try LocalSwarmMetadata.relationalDropTableCascadeReferenceUpdatesAlloc(alloc, &snapshot, tables[0]);
+    defer {
+        for (updates) |record| antfly.metadata.table_manager.freeTable(alloc, record);
+        alloc.free(updates);
+    }
+    try std.testing.expectEqual(@as(usize, 1), updates.len);
+    try std.testing.expectEqualStrings("orders", updates[0].name);
+    try std.testing.expect(std.mem.indexOf(u8, updates[0].schema_json, "orders_customer_id_fkey") == null);
+    try std.testing.expect(std.mem.indexOf(u8, updates[0].schema_json, "orders_account_id_fkey") != null);
 }
 
 test "swarm runtime resolves extension package store env before local default" {

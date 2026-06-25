@@ -309,6 +309,19 @@ pub fn primaryKeyTupleValueAlloc(alloc: Allocator, row_value: []const u8, primar
     return try requiredConstraintColumnsTupleValueAlloc(alloc, row_value, primary_key.columns);
 }
 
+pub fn bytesTupleValueAlloc(alloc: Allocator, values: []const []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    for (values) |value| {
+        var component = std.ArrayListUnmanaged(u8).empty;
+        defer component.deinit(alloc);
+        try component.append(alloc, @intFromEnum(typed_dv.ValueType.bytes_val));
+        try component.appendSlice(alloc, value);
+        try internal_keys.appendEncodedComponent(&out, alloc, component.items);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
 pub const WriteParticipant = struct {
     const PendingForeignKeyParentCheck = struct {
         foreign_key: schema_mod.ForeignKey,
@@ -7985,6 +7998,35 @@ test "relational unique constraints encode ast expression tuple components" {
 
     try std.testing.expectEqualSlices(u8, old_tuple, new_tuple);
     try std.testing.expect(!std.mem.eql(u8, old_tuple, other_tuple));
+}
+
+test "relational bytes tuple helper matches row unique tuple encoding" {
+    const alloc = std.testing.allocator;
+
+    const row = try relational_row_codec.serialize(alloc, &.{
+        .{
+            .path = "email",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "ada@example.test" },
+        },
+        .{
+            .path = "tenant",
+            .value_type = .bytes_val,
+            .value = .{ .bytes_val = "tenant:1" },
+        },
+    });
+    defer alloc.free(row);
+    const constraint = schema_mod.UniqueConstraint{
+        .name = "users_email_tenant_key",
+        .columns = &.{ "email", "tenant" },
+    };
+
+    const from_row = (try uniqueConstraintTupleValueAlloc(alloc, row, constraint)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(from_row);
+    const from_values = try bytesTupleValueAlloc(alloc, &.{ "ada@example.test", "tenant:1" });
+    defer alloc.free(from_values);
+
+    try std.testing.expectEqualSlices(u8, from_row, from_values);
 }
 
 test "relational foreign key reference extraction implements match simple for composite nullable components" {
