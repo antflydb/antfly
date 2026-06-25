@@ -47,8 +47,10 @@ now have an AST-to-plan conversion path with parity coverage against the
 existing token-based lowerer, including typed `PREPARE name(type, ...) AS ...`
 parameter lists. Session catalog commands now have generated AST-to-plan parity
 for the generated-covered `SET`, `RESET`, `SHOW`, and `DISCARD ALL` forms.
-Transaction boundary commands now have generated AST-to-plan parity for
-generated-covered `BEGIN`, `COMMIT`, and `ROLLBACK` adapter-noop boundaries.
+Transaction boundary commands now dispatch through generated AST-to-plan
+lowering for generated-covered `BEGIN`, `COMMIT`, and `ROLLBACK`
+adapter-noop boundaries, including retained statement/command source-span and
+command-kind validation.
 Simple DDL has generated-parser corpus coverage but still falls back to the
 existing parser when the seed grammar does not yet cover the shape; generated
 simple DDL ASTs now carry structured object, option, and behavior fields for

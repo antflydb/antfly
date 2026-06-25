@@ -3019,9 +3019,28 @@ pub fn sessionCatalogPlanFromGeneratedAstAlloc(
     };
 }
 
-pub fn transactionBoundaryPlanFromGeneratedAst(ast: generated_parser.GeneratedSqlTransactionAst) LoweredDdlPlan {
-    _ = ast;
+pub fn transactionBoundaryPlanFromGeneratedAst(
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlTransactionAst,
+) !LoweredDdlPlan {
+    try validateGeneratedTransactionAstSpans(tokens, ast);
     return .{ .adapter_noop = .{ .reason = .transaction_control } };
+}
+
+fn validateGeneratedTransactionAstSpans(
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlTransactionAst,
+) !void {
+    _ = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    if (tokens[0].source_start != ast.command_span.start or tokens[0].source_end != ast.command_span.end) {
+        return error.UnsupportedSqlShape;
+    }
+    const expected: token_mod.TokenKeyword = switch (ast.kind) {
+        .begin => .begin,
+        .commit => .commit,
+        .rollback => .rollback,
+    };
+    if (!tokens[0].matchesKeywordTag(expected)) return error.UnsupportedSqlShape;
 }
 
 pub fn sessionDdlPlanFromGeneratedAstAlloc(
@@ -9577,6 +9596,7 @@ pub fn lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(
             switch (generated_ast) {
                 .session => |session_ast| return try sessionDdlPlanFromGeneratedAstAlloc(alloc, tokens, session_ast),
                 .prepared => |prepared_ast| return .{ .prepared_statement = try preparedStatementPlanFromGeneratedAstAlloc(alloc, tokens, prepared_ast) },
+                .transaction => |transaction_ast| return try transactionBoundaryPlanFromGeneratedAst(tokens, transaction_ast),
                 .ddl, .extension_index => |ddl_ast| {
                     if (generatedDdlUsesRuntimeBoundary(tokens, ddl_ast)) {
                         return try ddlPlanFromGeneratedAstAlloc(alloc, tokens, ddl_ast, options);
@@ -9588,7 +9608,7 @@ pub fn lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(
                         return try catalogDdlPlanFromGeneratedUnsupportedAstAlloc(alloc, tokens, &state.pos, unsupported_ast, boundary, options);
                     }
                 },
-                .transaction, .dml, .read => {},
+                .dml, .read => {},
             }
         }
     }
@@ -13403,6 +13423,45 @@ test "sql adapter generated transaction AST lowers to transaction boundary plans
             else => return error.TestUnexpectedResult,
         }
     }
+
+    var malformed_span = try tokenized.ParsedSql.initAlloc(alloc, "BEGIN;");
+    defer malformed_span.deinit(alloc);
+    const malformed_span_raw = malformed_span.generated_statement orelse return error.TestUnexpectedResult;
+    var malformed_span_ast = switch (malformed_span_raw.ast orelse return error.TestUnexpectedResult) {
+        .transaction => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    malformed_span_ast.statement_span.start += 1;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        transactionBoundaryPlanFromGeneratedAst(malformed_span.items(), malformed_span_ast),
+    );
+
+    var malformed_command = try tokenized.ParsedSql.initAlloc(alloc, "COMMIT;");
+    defer malformed_command.deinit(alloc);
+    const malformed_command_raw = malformed_command.generated_statement orelse return error.TestUnexpectedResult;
+    var malformed_command_ast = switch (malformed_command_raw.ast orelse return error.TestUnexpectedResult) {
+        .transaction => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    malformed_command_ast.command_span.end += 1;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        transactionBoundaryPlanFromGeneratedAst(malformed_command.items(), malformed_command_ast),
+    );
+
+    var mismatched_kind = try tokenized.ParsedSql.initAlloc(alloc, "ROLLBACK;");
+    defer mismatched_kind.deinit(alloc);
+    const mismatched_kind_raw = mismatched_kind.generated_statement orelse return error.TestUnexpectedResult;
+    var mismatched_kind_ast = switch (mismatched_kind_raw.ast orelse return error.TestUnexpectedResult) {
+        .transaction => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    mismatched_kind_ast.kind = .commit;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        transactionBoundaryPlanFromGeneratedAst(mismatched_kind.items(), mismatched_kind_ast),
+    );
 }
 
 test "sql adapter generated simple DDL AST lowers to catalog plans" {
@@ -14399,7 +14458,7 @@ fn generatedTransactionBoundaryPlanForTestAlloc(alloc: std.mem.Allocator, sql: [
         .transaction => |ast| ast,
         else => return error.UnsupportedSqlShape,
     };
-    return transactionBoundaryPlanFromGeneratedAst(transaction_ast);
+    return try transactionBoundaryPlanFromGeneratedAst(parsed.items(), transaction_ast);
 }
 
 fn generatedSimpleDdlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !LoweredDdlPlan {
