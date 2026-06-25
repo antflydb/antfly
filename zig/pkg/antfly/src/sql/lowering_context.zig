@@ -1507,6 +1507,101 @@ fn generatedGraphSourceItemMatchesAntflyItem(
         std.meta.eql(graph_item.argument_tokens, antfly_item.argument_tokens);
 }
 
+fn generatedAntflyArgumentNameMatches(
+    tokens: []const tokenized.Token,
+    argument: generated_parser.GeneratedSqlNamedArgumentAst,
+    names: []const []const u8,
+) bool {
+    if (argument.name_tokens.end != argument.name_tokens.start + 1) return false;
+    const name = tokens[argument.name_tokens.start].text;
+    for (names) |expected| {
+        if (std.ascii.eqlIgnoreCase(name, expected)) return true;
+    }
+    return false;
+}
+
+fn generatedAntflyArgumentValueByNames(
+    tokens: []const tokenized.Token,
+    item: generated_parser.GeneratedSqlAntflyTableFunctionAst,
+    names: []const []const u8,
+) !?generated_parser.GeneratedSqlTokenRange {
+    var value: ?generated_parser.GeneratedSqlTokenRange = null;
+    for (item.argument_items) |argument| {
+        if (!generatedAntflyArgumentNameMatches(tokens, argument, names)) continue;
+        if (value != null) return error.UnsupportedSqlShape;
+        value = argument.value_tokens;
+    }
+    return value;
+}
+
+fn generatedOptionalTokenRangeEquals(
+    left: ?generated_parser.GeneratedSqlTokenRange,
+    right: ?generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (left == null and right == null) return true;
+    if (left == null or right == null) return false;
+    return std.meta.eql(left.?, right.?);
+}
+
+fn validateGeneratedGraphSemanticValue(
+    actual: ?generated_parser.GeneratedSqlTokenRange,
+    expected: ?generated_parser.GeneratedSqlTokenRange,
+) !void {
+    if (!generatedOptionalTokenRangeEquals(actual, expected)) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedGraphRequiredValue(
+    value: ?generated_parser.GeneratedSqlTokenRange,
+) !void {
+    if (value == null) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedGraphRequiredEitherValue(
+    left: ?generated_parser.GeneratedSqlTokenRange,
+    right: ?generated_parser.GeneratedSqlTokenRange,
+) !void {
+    if (left == null and right == null) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedGraphSourceSemanticMetadata(
+    tokens: []const tokenized.Token,
+    graph_item: generated_parser.GeneratedSqlGraphTableFunctionAst,
+    antfly_item: generated_parser.GeneratedSqlAntflyTableFunctionAst,
+) !void {
+    if (graph_item.argument_count != antfly_item.argument_count) return error.UnsupportedSqlShape;
+    try validateGeneratedGraphSemanticValue(graph_item.table_name_value_tokens, try generatedAntflyArgumentValueByNames(tokens, antfly_item, &.{ "table_name", "table" }));
+    try validateGeneratedGraphSemanticValue(graph_item.index_value_tokens, try generatedAntflyArgumentValueByNames(tokens, antfly_item, &.{ "index", "graph_index" }));
+    try validateGeneratedGraphSemanticValue(graph_item.start_value_tokens, try generatedAntflyArgumentValueByNames(tokens, antfly_item, &.{ "start", "start_node" }));
+    try validateGeneratedGraphSemanticValue(graph_item.start_result_ref_value_tokens, try generatedAntflyArgumentValueByNames(tokens, antfly_item, &.{ "start_result_ref", "result_ref" }));
+    try validateGeneratedGraphSemanticValue(graph_item.target_value_tokens, try generatedAntflyArgumentValueByNames(tokens, antfly_item, &.{ "target", "target_node" }));
+    try validateGeneratedGraphSemanticValue(graph_item.target_result_ref_value_tokens, try generatedAntflyArgumentValueByNames(tokens, antfly_item, &.{"target_result_ref"}));
+    try validateGeneratedGraphSemanticValue(graph_item.pattern_value_tokens, try generatedAntflyArgumentValueByNames(tokens, antfly_item, &.{"pattern"}));
+    try validateGeneratedGraphSemanticValue(graph_item.return_value_tokens, try generatedAntflyArgumentValueByNames(tokens, antfly_item, &.{ "return", "return_aliases" }));
+    try validateGeneratedGraphSemanticValue(graph_item.metric_value_tokens, try generatedAntflyArgumentValueByNames(tokens, antfly_item, &.{ "metric", "graph_metric" }));
+    try validateGeneratedGraphSemanticValue(graph_item.query_value_tokens, try generatedAntflyArgumentValueByNames(tokens, antfly_item, &.{ "query", "text" }));
+
+    switch (graph_item.kind) {
+        .traverse, .neighbors => {
+            try validateGeneratedGraphRequiredValue(graph_item.index_value_tokens);
+            try validateGeneratedGraphRequiredEitherValue(graph_item.start_value_tokens, graph_item.start_result_ref_value_tokens);
+        },
+        .shortest_path, .k_shortest_paths => {
+            try validateGeneratedGraphRequiredValue(graph_item.index_value_tokens);
+            try validateGeneratedGraphRequiredEitherValue(graph_item.start_value_tokens, graph_item.start_result_ref_value_tokens);
+            try validateGeneratedGraphRequiredEitherValue(graph_item.target_value_tokens, graph_item.target_result_ref_value_tokens);
+        },
+        .match => {
+            try validateGeneratedGraphRequiredValue(graph_item.index_value_tokens);
+            try validateGeneratedGraphRequiredEitherValue(graph_item.start_value_tokens, graph_item.start_result_ref_value_tokens);
+            try validateGeneratedGraphRequiredValue(graph_item.pattern_value_tokens);
+        },
+        .metric, .metric_rerank => {
+            try validateGeneratedGraphRequiredValue(graph_item.index_value_tokens);
+            try validateGeneratedGraphRequiredValue(graph_item.metric_value_tokens);
+        },
+    }
+}
+
 fn validateGeneratedGraphSourceMetadata(
     tokens: []const tokenized.Token,
     read_ast: generated_parser.GeneratedSqlReadAst,
@@ -1541,13 +1636,14 @@ fn validateGeneratedGraphSourceMetadata(
     for (read_ast.source_graph_function_items) |item| {
         if (item.tokens.start < previous_end) return error.UnsupportedSqlShape;
         try validateGeneratedGraphSourceItemMetadata(tokens, read_ast, item);
-        var found_matching_antfly_item = false;
+        var matching_antfly_item: ?generated_parser.GeneratedSqlAntflyTableFunctionAst = null;
         for (read_ast.source_antfly_function_items) |antfly_item| {
             if (!generatedGraphSourceItemMatchesAntflyItem(item, antfly_item)) continue;
-            found_matching_antfly_item = true;
+            matching_antfly_item = antfly_item;
             break;
         }
-        if (!found_matching_antfly_item) return error.UnsupportedSqlShape;
+        const antfly_item = matching_antfly_item orelse return error.UnsupportedSqlShape;
+        try validateGeneratedGraphSourceSemanticMetadata(tokens, item, antfly_item);
         previous_end = item.tokens.end;
     }
 }
@@ -4394,6 +4490,24 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         else => return error.UnsupportedSqlShape,
     };
     malformed_graph_source_read_ast.source_graph_function_count += 1;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_graph_source_parsed_sql, malformed_graph_source_read_ast),
+    );
+    malformed_graph_source_read_ast = switch (malformed_graph_source_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_graph_source_read_ast.source_graph_function_items[0].pattern_value_tokens = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_graph_source_parsed_sql, malformed_graph_source_read_ast),
+    );
+    malformed_graph_source_read_ast = switch (malformed_graph_source_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_graph_source_read_ast.source_graph_function_items[0].index_value_tokens = malformed_graph_source_read_ast.source_graph_function_items[0].table_name_value_tokens;
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_graph_source_parsed_sql, malformed_graph_source_read_ast),

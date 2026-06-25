@@ -734,6 +734,17 @@ pub const GeneratedSqlGraphTableFunctionAst = struct {
     name_tokens: GeneratedSqlTokenRange,
     argument_tokens: GeneratedSqlTokenRange,
     kind: GeneratedSqlGraphTableFunctionKind,
+    argument_count: usize = 0,
+    table_name_value_tokens: ?GeneratedSqlTokenRange = null,
+    index_value_tokens: ?GeneratedSqlTokenRange = null,
+    start_value_tokens: ?GeneratedSqlTokenRange = null,
+    start_result_ref_value_tokens: ?GeneratedSqlTokenRange = null,
+    target_value_tokens: ?GeneratedSqlTokenRange = null,
+    target_result_ref_value_tokens: ?GeneratedSqlTokenRange = null,
+    pattern_value_tokens: ?GeneratedSqlTokenRange = null,
+    return_value_tokens: ?GeneratedSqlTokenRange = null,
+    metric_value_tokens: ?GeneratedSqlTokenRange = null,
+    query_value_tokens: ?GeneratedSqlTokenRange = null,
 };
 
 pub const GeneratedSqlNamedArgumentAst = struct {
@@ -4212,7 +4223,7 @@ fn buildGeneratedReadGraphSourceAst(
 ) !void {
     ast.source_antfly_function_items = try buildGeneratedAntflyTableFunctionItemsAst(alloc, tokens, source_tokens);
     ast.source_antfly_function_count = ast.source_antfly_function_items.len;
-    ast.source_graph_function_items = try buildGeneratedGraphTableFunctionItemsAst(alloc, ast.source_antfly_function_items);
+    ast.source_graph_function_items = try buildGeneratedGraphTableFunctionItemsAst(alloc, tokens, ast.source_antfly_function_items);
     ast.source_graph_function_count = ast.source_graph_function_items.len;
     if (ast.source_graph_function_items.len == 0) return;
 
@@ -4351,21 +4362,55 @@ fn appendGeneratedNamedArgumentItemAst(
 
 fn buildGeneratedGraphTableFunctionItemsAst(
     alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
     antfly_items: []const GeneratedSqlAntflyTableFunctionAst,
 ) ![]GeneratedSqlGraphTableFunctionAst {
     var items: std.ArrayListUnmanaged(GeneratedSqlGraphTableFunctionAst) = .empty;
     errdefer items.deinit(alloc);
     for (antfly_items) |item| {
         const kind = generatedGraphTableFunctionKindFromAntfly(item.kind) orelse continue;
-        try items.append(alloc, .{
-            .tokens = item.tokens,
-            .name_tokens = item.name_tokens,
-            .argument_tokens = item.argument_tokens,
-            .kind = kind,
-        });
+        try items.append(alloc, buildGeneratedGraphTableFunctionItemAst(tokens, item, kind));
     }
     if (items.items.len == 0) return &.{};
     return try items.toOwnedSlice(alloc);
+}
+
+fn buildGeneratedGraphTableFunctionItemAst(
+    tokens: []const token_mod.Token,
+    item: GeneratedSqlAntflyTableFunctionAst,
+    kind: GeneratedSqlGraphTableFunctionKind,
+) GeneratedSqlGraphTableFunctionAst {
+    return .{
+        .tokens = item.tokens,
+        .name_tokens = item.name_tokens,
+        .argument_tokens = item.argument_tokens,
+        .kind = kind,
+        .argument_count = item.argument_count,
+        .table_name_value_tokens = generatedNamedArgumentValueByNames(tokens, item, &.{ "table_name", "table" }),
+        .index_value_tokens = generatedNamedArgumentValueByNames(tokens, item, &.{ "index", "graph_index" }),
+        .start_value_tokens = generatedNamedArgumentValueByNames(tokens, item, &.{ "start", "start_node" }),
+        .start_result_ref_value_tokens = generatedNamedArgumentValueByNames(tokens, item, &.{ "start_result_ref", "result_ref" }),
+        .target_value_tokens = generatedNamedArgumentValueByNames(tokens, item, &.{ "target", "target_node" }),
+        .target_result_ref_value_tokens = generatedNamedArgumentValueByNames(tokens, item, &.{"target_result_ref"}),
+        .pattern_value_tokens = generatedNamedArgumentValueByNames(tokens, item, &.{"pattern"}),
+        .return_value_tokens = generatedNamedArgumentValueByNames(tokens, item, &.{ "return", "return_aliases" }),
+        .metric_value_tokens = generatedNamedArgumentValueByNames(tokens, item, &.{ "metric", "graph_metric" }),
+        .query_value_tokens = generatedNamedArgumentValueByNames(tokens, item, &.{ "query", "text" }),
+    };
+}
+
+fn generatedNamedArgumentValueByNames(
+    tokens: []const token_mod.Token,
+    item: GeneratedSqlAntflyTableFunctionAst,
+    names: []const []const u8,
+) ?GeneratedSqlTokenRange {
+    for (item.argument_items) |argument| {
+        if (argument.name_tokens.end != argument.name_tokens.start + 1) continue;
+        for (names) |name| {
+            if (std.ascii.eqlIgnoreCase(tokens[argument.name_tokens.start].text, name)) return argument.value_tokens;
+        }
+    }
+    return null;
 }
 
 fn buildReadJoinAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, source_tokens: GeneratedSqlTokenRange, ast: *GeneratedSqlReadAst) !void {
@@ -7175,6 +7220,7 @@ test "generated SQL parser facade builds read AST spans" {
             try std.testing.expectEqual(@as(usize, 1), read.source_graph_function_items.len);
             try std.testing.expectEqual(GeneratedSqlGraphTableFunctionKind.match, read.source_graph_function_kind.?);
             try std.testing.expectEqual(GeneratedSqlGraphTableFunctionKind.match, read.source_graph_function_items[0].kind);
+            try std.testing.expectEqual(@as(usize, 5), read.source_graph_function_items[0].argument_count);
             try std.testing.expect(std.meta.eql(read.source_graph_function_tokens.?, read.source_graph_function_items[0].tokens));
             try std.testing.expectEqualStrings(
                 "antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b')",
@@ -7187,6 +7233,26 @@ test "generated SQL parser facade builds read AST spans" {
             try std.testing.expectEqualStrings(
                 "table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b'",
                 tokenRangeText(graph_source_read_sql, graph_source_tokens.items, read.source_graph_function_argument_tokens.?),
+            );
+            try std.testing.expectEqualStrings(
+                "'docs'",
+                tokenRangeText(graph_source_read_sql, graph_source_tokens.items, read.source_graph_function_items[0].table_name_value_tokens.?),
+            );
+            try std.testing.expectEqualStrings(
+                "'docs_edge_graph'",
+                tokenRangeText(graph_source_read_sql, graph_source_tokens.items, read.source_graph_function_items[0].index_value_tokens.?),
+            );
+            try std.testing.expectEqualStrings(
+                "'doc:root'",
+                tokenRangeText(graph_source_read_sql, graph_source_tokens.items, read.source_graph_function_items[0].start_value_tokens.?),
+            );
+            try std.testing.expectEqualStrings(
+                "'(a)-[:cites]->(b)'",
+                tokenRangeText(graph_source_read_sql, graph_source_tokens.items, read.source_graph_function_items[0].pattern_value_tokens.?),
+            );
+            try std.testing.expectEqualStrings(
+                "'b'",
+                tokenRangeText(graph_source_read_sql, graph_source_tokens.items, read.source_graph_function_items[0].return_value_tokens.?),
             );
         },
         else => return error.TestUnexpectedResult,
@@ -7242,6 +7308,8 @@ test "generated SQL parser facade builds read AST spans" {
             try std.testing.expectEqual(@as(usize, 4), read.source_antfly_function_items[1].argument_count);
             try std.testing.expectEqual(GeneratedSqlGraphTableFunctionKind.match, read.source_graph_function_items[0].kind);
             try std.testing.expectEqual(GeneratedSqlGraphTableFunctionKind.metric, read.source_graph_function_items[1].kind);
+            try std.testing.expectEqual(@as(usize, 5), read.source_graph_function_items[0].argument_count);
+            try std.testing.expectEqual(@as(usize, 4), read.source_graph_function_items[1].argument_count);
             try std.testing.expect(std.meta.eql(read.source_graph_function_tokens.?, read.source_graph_function_items[0].tokens));
             try std.testing.expectEqualStrings(
                 "antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b')",
@@ -7250,6 +7318,14 @@ test "generated SQL parser facade builds read AST spans" {
             try std.testing.expectEqualStrings(
                 "antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 5)",
                 tokenRangeText(joined_graph_source_read_sql, joined_graph_source_tokens.items, read.source_graph_function_items[1].tokens),
+            );
+            try std.testing.expectEqualStrings(
+                "'docs_edge_graph'",
+                tokenRangeText(joined_graph_source_read_sql, joined_graph_source_tokens.items, read.source_graph_function_items[1].index_value_tokens.?),
+            );
+            try std.testing.expectEqualStrings(
+                "'pagerank'",
+                tokenRangeText(joined_graph_source_read_sql, joined_graph_source_tokens.items, read.source_graph_function_items[1].metric_value_tokens.?),
             );
         },
         else => return error.TestUnexpectedResult,

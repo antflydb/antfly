@@ -359,8 +359,10 @@ such as `antfly.full_text_search`, `antfly.semantic_search`,
 read sources with named `=`/`=>` arguments, retained source/name/argument token
 ranges, owned named-argument item/name/operator/value ranges, list-based
 Antfly function kind metadata across joined sources, graph function subset
-metadata, and fail-closed range validation in the generated read lowering
-boundary. The generated parser now also treats graph DDL as a distinct graph
+metadata, graph-specific semantic argument payloads for table/index selectors,
+start/target selectors, pattern returns, metric names, and query text, and
+fail-closed semantic/range validation in the generated read lowering boundary.
+The generated parser now also treats graph DDL as a distinct graph
 statement family and `ParsedSql` retains those generated raw and AST nodes.
 Seed and rich `CREATE GRAPH INDEX`, `CREATE GRAPH METRIC`, and
 `ALTER GRAPH INDEX ... ADD METRIC` statements now have graph-specific generated
@@ -901,10 +903,13 @@ Unsupported DDL remains on the existing parser until
    grammar coverage, named-argument coverage, source/name/argument AST ranges,
    owned named-argument item/name/operator/value ranges, list-based Antfly
    function kind metadata across joined sources, graph function subset metadata,
-   and fail-closed generated-read validation.
+   graph-specific semantic argument payloads for table/index selectors,
+   start/target selectors, pattern returns, metric names, and query text, and
+   fail-closed generated-read validation that rejects corrupted or missing
+   required graph payloads before typed lowering.
    Broader graph traversal, graph metric query planning, and graph DSL cutover
-   still require graph-specific semantic AST payloads and unsupported-shape
-   diagnostics beyond the current table-function source metadata.
+   still require direct generated graph-query planning beyond retained semantic
+   payload validation and broader unsupported-shape diagnostics.
 
 ## Generator Performance
 
@@ -1020,7 +1025,8 @@ variants for:
   metric DDL;
   canonical `antfly.*` table-function reads are represented on generated read
   ASTs as source-level Antfly function item metadata, with graph function items
-  retained as a subset rather than as standalone graph statements
+  retained as a subset carrying graph-specific semantic argument payloads rather
+  than as standalone graph statements
 - unsupported statement, including generated AST payloads for seed `ANALYZE`,
   `COPY`, `VACUUM`, `REINDEX`, `CLUSTER`, `COMMENT`, `GRANT`, `REVOKE`,
   `LISTEN`, `NOTIFY`, `LOCK`, `CALL`, `CHECKPOINT`, `LOAD`, `REFRESH`,

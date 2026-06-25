@@ -4634,7 +4634,63 @@ pub const ApiHttpServer = struct {
         database: ?[]const u8 = null,
         namespace: ?[]const u8 = null,
         read_only: ?bool = null,
+        params: []const sql_adapter.SqlValue = &.{},
     };
+
+    const PublicSqlJsonRequest = struct {
+        sql: []const u8,
+        session_id: ?u64 = null,
+        database: ?[]const u8 = null,
+        namespace: ?[]const u8 = null,
+        read_only: ?bool = null,
+        params: ?[]const std.json.Value = null,
+    };
+
+    pub const OwnedPublicSqlParams = struct {
+        values: []sql_adapter.SqlValue = &.{},
+
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            for (self.values) |value| freePublicSqlParam(alloc, value);
+            if (self.values.len > 0) alloc.free(self.values);
+            self.* = .{};
+        }
+    };
+
+    pub fn publicSqlParamsFromJsonAlloc(alloc: std.mem.Allocator, params: ?[]const std.json.Value) !OwnedPublicSqlParams {
+        const items = params orelse return .{};
+        if (items.len == 0) return .{};
+        const values = try alloc.alloc(sql_adapter.SqlValue, items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (values[0..initialized]) |value| freePublicSqlParam(alloc, value);
+            alloc.free(values);
+        }
+        for (items, 0..) |item, i| {
+            values[i] = try publicSqlParamFromJsonAlloc(alloc, item);
+            initialized += 1;
+        }
+        return .{ .values = values };
+    }
+
+    pub fn freePublicSqlParam(alloc: std.mem.Allocator, value: sql_adapter.SqlValue) void {
+        switch (value) {
+            .string => |text| alloc.free(@constCast(text)),
+            .json => |json| alloc.free(@constCast(json)),
+            .null, .bool, .integer, .float => {},
+        }
+    }
+
+    fn publicSqlParamFromJsonAlloc(alloc: std.mem.Allocator, value: std.json.Value) !sql_adapter.SqlValue {
+        return switch (value) {
+            .null => .null,
+            .bool => |flag| .{ .bool = flag },
+            .integer => |number| .{ .integer = number },
+            .float => |number| .{ .float = number },
+            .number_string => |number| .{ .json = try alloc.dupe(u8, number) },
+            .string => |text| .{ .string = try alloc.dupe(u8, text) },
+            .array, .object => .{ .json = try std.json.Stringify.valueAlloc(alloc, value, .{}) },
+        };
+    }
 
     const PublicSqlResponse = struct {
         kind: []const u8,
@@ -5517,7 +5573,7 @@ pub const ApiHttpServer = struct {
         return .{ .batch = batch };
     }
 
-    fn handlePublicSqlWrite(self: *ApiHttpServer, parsed_sql: *const sql_adapter.ParsedSql, session: *sql_adapter.OwnedSqlCatalogSession, authenticated_identity: ?AuthenticatedIdentity) !PublicSqlResultOrResponse {
+    fn handlePublicSqlWrite(self: *ApiHttpServer, parsed_sql: *const sql_adapter.ParsedSql, params: []const sql_adapter.SqlValue, session: *sql_adapter.OwnedSqlCatalogSession, authenticated_identity: ?AuthenticatedIdentity) !PublicSqlResultOrResponse {
         const statement_start_ns = platform_time.monotonicNs();
         const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session());
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
@@ -5559,7 +5615,7 @@ pub const ApiHttpServer = struct {
             self.alloc,
             parsed_sql,
             schema,
-            &.{},
+            params,
             .{
                 .unique_resolver = unique_resolver_ctx.resolver(),
                 .row_claim = row_claim,
@@ -5719,7 +5775,7 @@ pub const ApiHttpServer = struct {
         } };
     }
 
-    fn handlePublicSqlRead(self: *ApiHttpServer, parsed_sql: *const sql_adapter.ParsedSql, session: *sql_adapter.OwnedSqlCatalogSession, authenticated_identity: ?AuthenticatedIdentity) !PublicSqlResultOrResponse {
+    fn handlePublicSqlRead(self: *ApiHttpServer, parsed_sql: *const sql_adapter.ParsedSql, params: []const sql_adapter.SqlValue, session: *sql_adapter.OwnedSqlCatalogSession, authenticated_identity: ?AuthenticatedIdentity) !PublicSqlResultOrResponse {
         const statement_start_ns = platform_time.monotonicNs();
         const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session());
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
@@ -5754,7 +5810,7 @@ pub const ApiHttpServer = struct {
             self.alloc,
             parsed_sql,
             schema,
-            &.{},
+            params,
             self.catalogSource(),
             session.session(),
             function_bindings,
@@ -5823,6 +5879,7 @@ pub const ApiHttpServer = struct {
     fn describePublicSqlReadColumnsAlloc(
         self: *ApiHttpServer,
         parsed_sql: *const sql_adapter.ParsedSql,
+        params: []const sql_adapter.SqlValue,
         session: *sql_adapter.OwnedSqlCatalogSession,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !PublicSqlDescribeResultOrResponse {
@@ -5859,7 +5916,7 @@ pub const ApiHttpServer = struct {
             self.alloc,
             parsed_sql,
             schema,
-            &.{},
+            params,
             self.catalogSource(),
             session.session(),
             function_bindings,
@@ -6385,12 +6442,21 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicSql(self: *ApiHttpServer, body: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
-        var parsed = std.json.parseFromSlice(PublicSqlRequest, self.alloc, body, .{
+        var parsed = std.json.parseFromSlice(PublicSqlJsonRequest, self.alloc, body, .{
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
         }) catch return try textResponse(self.alloc, 400, "invalid sql request");
         defer parsed.deinit();
-        return try self.handlePublicSqlRequest(parsed.value, authenticated_identity);
+        var params = publicSqlParamsFromJsonAlloc(self.alloc, parsed.value.params) catch return try textResponse(self.alloc, 400, "invalid sql request");
+        defer params.deinit(self.alloc);
+        return try self.handlePublicSqlRequest(.{
+            .sql = parsed.value.sql,
+            .session_id = parsed.value.session_id,
+            .database = parsed.value.database,
+            .namespace = parsed.value.namespace,
+            .read_only = parsed.value.read_only,
+            .params = params.values,
+        }, authenticated_identity);
     }
 
     pub fn handlePublicSqlRequest(self: *ApiHttpServer, request: PublicSqlRequest, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
@@ -6778,7 +6844,7 @@ pub const ApiHttpServer = struct {
             return outcome;
         }
         if (parsed_sql.writeStatementKind() != null) {
-            var outcome = try self.handlePublicSqlWrite(&parsed_sql, &session, authenticated_identity);
+            var outcome = try self.handlePublicSqlWrite(&parsed_sql, request.params, &session, authenticated_identity);
             errdefer outcome.deinit(self.alloc);
             switch (outcome) {
                 .response => self.markPublicSqlTransactionFailedIfActive(&session),
@@ -6792,7 +6858,7 @@ pub const ApiHttpServer = struct {
             return outcome;
         }
         if (parsed_sql.readStatementKind() != null) {
-            var outcome = try self.handlePublicSqlRead(&parsed_sql, &session, authenticated_identity);
+            var outcome = try self.handlePublicSqlRead(&parsed_sql, request.params, &session, authenticated_identity);
             errdefer outcome.deinit(self.alloc);
             switch (outcome) {
                 .response => self.markPublicSqlTransactionFailedIfActive(&session),
@@ -6874,7 +6940,7 @@ pub const ApiHttpServer = struct {
             return .{ .result = result };
         }
         if (parsed_sql.readStatementKind() != null) {
-            var outcome = try self.describePublicSqlReadColumnsAlloc(&parsed_sql, &session, authenticated_identity);
+            var outcome = try self.describePublicSqlReadColumnsAlloc(&parsed_sql, request.params, &session, authenticated_identity);
             errdefer outcome.deinit(self.alloc);
             try self.savePublicSqlSession(session);
             switch (outcome) {
