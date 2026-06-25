@@ -22,7 +22,6 @@ const mapper = @import("document_mapper.zig");
 const db_internal = @import("internal.zig");
 const relational_store_mod = @import("relational_store.zig");
 const relational_rows = @import("relational_rows.zig");
-const schema_runtime = @import("schema_runtime.zig");
 const types = @import("types.zig");
 const platform_clock = @import("../../platform/clock.zig");
 const temporal_typed_dv = @import("../../section/typed_doc_values.zig");
@@ -85,6 +84,21 @@ fn findUniqueConstraintByName(unique_constraints: []const schema_mod.UniqueConst
         if (std.mem.eql(u8, constraint.name, name)) return constraint;
     }
     return null;
+}
+
+fn uniqueOwnerConstraintsAlloc(alloc: Allocator, runtime_schema: schema_mod.TableSchema) ![]schema_mod.UniqueConstraint {
+    const extra: usize = if (runtime_schema.primary_key != null) 1 else 0;
+    const constraints = try alloc.alloc(schema_mod.UniqueConstraint, runtime_schema.unique_constraints.len + extra);
+    var index: usize = 0;
+    if (runtime_schema.primary_key) |primary_key| {
+        constraints[index] = relational_store_mod.primaryKeyAsUniqueConstraint(primary_key);
+        index += 1;
+    }
+    for (runtime_schema.unique_constraints) |constraint| {
+        constraints[index] = constraint;
+        index += 1;
+    }
+    return constraints;
 }
 
 pub fn isForeignKeyActionScheduleMetadataKey(key: []const u8) bool {
@@ -881,7 +895,7 @@ pub fn Impl(comptime DB: type) type {
         ) !UniqueConstraintIntegrityReport {
             const runtime_schema = self.core.schema orelse return .{};
             if (runtime_schema.storage_mode != .relational or (runtime_schema.primary_key == null and runtime_schema.unique_constraints.len == 0)) return .{};
-            const owner_constraints = try schema_runtime.uniqueOwnerConstraintsAlloc(self.alloc, runtime_schema);
+            const owner_constraints = try uniqueOwnerConstraintsAlloc(self.alloc, runtime_schema);
             defer self.alloc.free(owner_constraints);
             const report = try relational_store_mod.reconcileUniqueConstraintRowsInRange(
                 self.alloc,
@@ -905,7 +919,7 @@ pub fn Impl(comptime DB: type) type {
             if (unique_writes.len == 0 and unique_deletes.len == 0) return;
             const runtime_schema = self.core.schema orelse return error.UniqueConstraintViolation;
             if (runtime_schema.storage_mode != .relational) return error.UniqueConstraintViolation;
-            const owner_constraints = try schema_runtime.uniqueOwnerConstraintsAlloc(self.alloc, runtime_schema);
+            const owner_constraints = try uniqueOwnerConstraintsAlloc(self.alloc, runtime_schema);
             defer self.alloc.free(owner_constraints);
             for (unique_writes) |mutation| {
                 const constraint = try Self.validateUniqueConstraintMutation(self, owner_constraints, mutation);
