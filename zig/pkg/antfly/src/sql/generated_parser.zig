@@ -175,6 +175,7 @@ pub const GeneratedSqlUnsupportedKind = enum {
     cluster,
     comment,
     copy,
+    alter_aggregate,
     alter_index,
     alter_conversion,
     alter_default_privileges,
@@ -182,6 +183,7 @@ pub const GeneratedSqlUnsupportedKind = enum {
     alter_foreign_table,
     alter_foreign_data_wrapper,
     alter_materialized_view,
+    alter_operator,
     alter_operator_class,
     alter_operator_family,
     alter_policy,
@@ -272,6 +274,7 @@ pub const GeneratedSqlUnsupportedReason = enum {
     cluster_not_planned_by_generated_parser,
     comment_not_planned_by_generated_parser,
     copy_not_planned_by_generated_parser,
+    alter_aggregate_not_planned_by_generated_parser,
     alter_index_not_planned_by_generated_parser,
     alter_conversion_not_planned_by_generated_parser,
     alter_default_privileges_not_planned_by_generated_parser,
@@ -279,6 +282,7 @@ pub const GeneratedSqlUnsupportedReason = enum {
     alter_foreign_table_not_planned_by_generated_parser,
     alter_foreign_data_wrapper_not_planned_by_generated_parser,
     alter_materialized_view_not_planned_by_generated_parser,
+    alter_operator_not_planned_by_generated_parser,
     alter_operator_class_not_planned_by_generated_parser,
     alter_operator_family_not_planned_by_generated_parser,
     alter_policy_not_planned_by_generated_parser,
@@ -1873,6 +1877,7 @@ pub const simple_graph_corpus = [_]GeneratedSqlCorpusCase{
 };
 
 pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
+    .{ .sql = "ALTER AGGREGATE first_value_text(text) OWNER TO app_role", .kind = .unsupported },
     .{ .sql = "ALTER INDEX usage_status_idx RENAME TO usage_status_idx_v2", .kind = .unsupported },
     .{ .sql = "ALTER CONVERSION usage_conv RENAME TO usage_conv_v2", .kind = .unsupported },
     .{ .sql = "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO readonly", .kind = .unsupported },
@@ -1880,6 +1885,7 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "ALTER FOREIGN TABLE foreign_usage_records RENAME TO foreign_usage_archive", .kind = .unsupported },
     .{ .sql = "ALTER FOREIGN DATA WRAPPER usage_fdw OPTIONS (ADD host 'localhost')", .kind = .unsupported },
     .{ .sql = "ALTER MATERIALIZED VIEW usage_summary RENAME TO usage_summary_v2", .kind = .unsupported },
+    .{ .sql = "ALTER OPERATOR === (text, text) OWNER TO app_role", .kind = .unsupported },
     .{ .sql = "ALTER OPERATOR CLASS usage_ops USING btree RENAME TO usage_ops_v2", .kind = .unsupported },
     .{ .sql = "ALTER OPERATOR FAMILY usage_family USING btree RENAME TO usage_family_v2", .kind = .unsupported },
     .{ .sql = "ALTER RULE usage_insert ON usage_records RENAME TO usage_insert_v2", .kind = .unsupported },
@@ -2186,7 +2192,8 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.policy)) return .{ .ddl = .create_policy };
         if (second.matchesKeywordTag(.function)) return .{ .ddl = .create_function };
         if (second.matchesKeywordTag(.procedure)) return .{ .ddl = .create_procedure };
-        if (second.matchesKeywordTag(.role)) return .{ .ddl = .create_role };
+        if (second.matchesKeyword("user") and tokens.len > 2 and tokens[2].matchesKeyword("mapping")) return .{ .unsupported = .create_user_mapping };
+        if (isGeneratedRoleAliasKeyword(second)) return .{ .ddl = .create_role };
         if (second.matchesKeywordTag(.collation)) return .{ .ddl = .create_collation };
         if (second.matchesKeywordTag(.operator)) {
             if (tokens.len > 2 and tokens[2].matchesKeyword("class")) return .{ .unsupported = .create_operator_class };
@@ -2219,7 +2226,6 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         }
         if (second.matchesKeyword("transform")) return .{ .unsupported = .create_transform };
         if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .create_trigger };
-        if (second.matchesKeyword("user") and tokens.len > 2 and tokens[2].matchesKeyword("mapping")) return .{ .unsupported = .create_user_mapping };
         if (second.matchesKeywordTag(.extension)) return .{ .extension_index = .create_extension };
     }
     if (first.matchesKeywordTag(.alter) and tokens.len > 2 and tokens[1].matchesKeywordTag(.graph) and tokens[2].matchesKeywordTag(.index)) {
@@ -2254,13 +2260,17 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     }
     if (first.matchesKeywordTag(.alter) and tokens.len > 1) {
         const second = tokens[1];
+        if (second.matchesKeywordTag(.aggregate)) return .{ .unsupported = .alter_aggregate };
         if (second.matchesKeyword("conversion")) return .{ .unsupported = .alter_conversion };
         if (second.matchesKeywordTag(.default) and tokens.len > 2 and tokens[2].matchesKeywordTag(.privileges)) return .{ .unsupported = .alter_default_privileges };
         if (second.matchesKeyword("event") and tokens.len > 2 and tokens[2].matchesKeywordTag(.trigger)) return .{ .unsupported = .alter_event_trigger };
         if (second.matchesKeywordTag(.index)) return .{ .unsupported = .alter_index };
         if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .unsupported = .alter_materialized_view };
-        if (second.matchesKeywordTag(.operator) and tokens.len > 2 and tokens[2].matchesKeyword("class")) return .{ .unsupported = .alter_operator_class };
-        if (second.matchesKeywordTag(.operator) and tokens.len > 2 and tokens[2].matchesKeyword("family")) return .{ .unsupported = .alter_operator_family };
+        if (second.matchesKeywordTag(.operator)) {
+            if (tokens.len > 2 and tokens[2].matchesKeyword("class")) return .{ .unsupported = .alter_operator_class };
+            if (tokens.len > 2 and tokens[2].matchesKeyword("family")) return .{ .unsupported = .alter_operator_family };
+            return .{ .unsupported = .alter_operator };
+        }
         if (second.matchesKeywordTag(.policy)) return .{ .ddl = .alter_policy };
         if (second.matchesKeywordTag(.publication)) return .{ .ddl = .alter_publication };
         if (second.matchesKeywordTag(.rule)) return .{ .unsupported = .alter_rule };
@@ -2277,7 +2287,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         }
         if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .alter_trigger };
         if (second.matchesKeyword("user") and tokens.len > 2 and tokens[2].matchesKeyword("mapping")) return .{ .unsupported = .alter_user_mapping };
-        if (second.matchesKeywordTag(.role)) return .{ .ddl = .alter_role };
+        if (isGeneratedRoleAliasKeyword(second)) return .{ .ddl = .alter_role };
         if (second.matchesKeywordTag(.collation)) return .{ .ddl = .alter_collation };
     }
     if (first.matchesKeywordTag(.drop) and tokens.len > 1) {
@@ -2305,7 +2315,8 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .ddl = .drop_materialized_view };
         if (second.matchesKeywordTag(.policy)) return .{ .ddl = .drop_policy };
         if (second.matchesKeywordTag(.rule)) return .{ .unsupported = .drop_rule };
-        if (second.matchesKeywordTag(.role)) return .{ .ddl = .drop_role };
+        if (second.matchesKeyword("user") and tokens.len > 2 and tokens[2].matchesKeyword("mapping")) return .{ .unsupported = .drop_user_mapping };
+        if (isGeneratedRoleAliasKeyword(second)) return .{ .ddl = .drop_role };
         if (second.matchesKeywordTag(.collation)) return .{ .ddl = .drop_collation };
         if (second.matchesKeywordTag(.operator)) {
             if (tokens.len > 2 and tokens[2].matchesKeyword("class")) return .{ .unsupported = .drop_operator_class };
@@ -2326,7 +2337,6 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         }
         if (second.matchesKeyword("transform")) return .{ .unsupported = .drop_transform };
         if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .drop_trigger };
-        if (second.matchesKeyword("user") and tokens.len > 2 and tokens[2].matchesKeyword("mapping")) return .{ .unsupported = .drop_user_mapping };
     }
     if (first.matchesKeywordTag(.insert)) {
         for (tokens) |token| {
@@ -2377,6 +2387,12 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.unlisten)) return .{ .unsupported = .unlisten };
     if (first.matchesKeywordTag(.vacuum)) return .{ .unsupported = .vacuum };
     return .other;
+}
+
+fn isGeneratedRoleAliasKeyword(token: token_mod.Token) bool {
+    return token.matchesKeywordTag(.role) or
+        token.matchesKeyword("user") or
+        token.matchesKeywordTag(.group);
 }
 
 fn classifyReadKind(tokens: []const token_mod.Token) GeneratedSqlReadKind {
@@ -2495,6 +2511,7 @@ fn buildUnsupportedAst(
             .cluster => .cluster_not_planned_by_generated_parser,
             .comment => .comment_not_planned_by_generated_parser,
             .copy => .copy_not_planned_by_generated_parser,
+            .alter_aggregate => .alter_aggregate_not_planned_by_generated_parser,
             .alter_index => .alter_index_not_planned_by_generated_parser,
             .alter_conversion => .alter_conversion_not_planned_by_generated_parser,
             .alter_default_privileges => .alter_default_privileges_not_planned_by_generated_parser,
@@ -2502,6 +2519,7 @@ fn buildUnsupportedAst(
             .alter_foreign_table => .alter_foreign_table_not_planned_by_generated_parser,
             .alter_foreign_data_wrapper => .alter_foreign_data_wrapper_not_planned_by_generated_parser,
             .alter_materialized_view => .alter_materialized_view_not_planned_by_generated_parser,
+            .alter_operator => .alter_operator_not_planned_by_generated_parser,
             .alter_operator_class => .alter_operator_class_not_planned_by_generated_parser,
             .alter_operator_family => .alter_operator_family_not_planned_by_generated_parser,
             .alter_policy => .alter_policy_not_planned_by_generated_parser,
@@ -2899,7 +2917,7 @@ fn buildDdlAst(
             }
         },
         .create_role => {
-            if (end > 2 and tokens[1].matchesKeywordTag(.role)) {
+            if (end > 2 and isGeneratedRoleAliasKeyword(tokens[1])) {
                 ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 2, end);
                 if (ast.object_name_tokens) |role_range| {
                     if (role_range.end < end) ast.alter_table_operation_tokens = .{ .start = role_range.end, .end = end };
@@ -3067,7 +3085,7 @@ fn buildDdlAst(
             }
         },
         .alter_role => {
-            if (end > 2 and tokens[1].matchesKeywordTag(.role)) {
+            if (end > 2 and isGeneratedRoleAliasKeyword(tokens[1])) {
                 ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 2, end);
                 if (ast.object_name_tokens) |role_range| {
                     if (role_range.end < end) ast.alter_table_operation_tokens = .{ .start = role_range.end, .end = end };
@@ -6559,13 +6577,21 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_function }, (try parseSqlAlloc(alloc, "DROP FUNCTION IF EXISTS audit_changes(text) CASCADE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_procedure }, (try parseSqlAlloc(alloc, "DROP PROCEDURE rotate_usage()")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_role }, (try parseSqlAlloc(alloc, "CREATE ROLE app_writer")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_role }, (try parseSqlAlloc(alloc, "CREATE USER app_writer")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_role }, (try parseSqlAlloc(alloc, "CREATE GROUP app_readers")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_role }, (try parseSqlAlloc(alloc, "ALTER ROLE app_writer RESET statement_timeout")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_role }, (try parseSqlAlloc(alloc, "ALTER USER app_writer RESET statement_timeout")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_role }, (try parseSqlAlloc(alloc, "ALTER GROUP app_readers RESET statement_timeout")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_role }, (try parseSqlAlloc(alloc, "DROP ROLE IF EXISTS app_writer")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_role }, (try parseSqlAlloc(alloc, "DROP USER IF EXISTS app_writer")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_role }, (try parseSqlAlloc(alloc, "DROP GROUP IF EXISTS app_readers")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_collation }, (try parseSqlAlloc(alloc, "CREATE COLLATION case_insensitive (provider = icu, locale = 'und-u-ks-level2')")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_collation }, (try parseSqlAlloc(alloc, "ALTER COLLATION case_insensitive RENAME TO ci_text")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_collation }, (try parseSqlAlloc(alloc, "DROP COLLATION IF EXISTS ci_text")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_operator }, (try parseSqlAlloc(alloc, "CREATE OPERATOR === (FUNCTION = text_eq, LEFTARG = text, RIGHTARG = text)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_operator }, (try parseSqlAlloc(alloc, "DROP OPERATOR === (text, text)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_aggregate }, (try parseSqlAlloc(alloc, "ALTER AGGREGATE first_value_text(text) OWNER TO app_role")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_operator }, (try parseSqlAlloc(alloc, "ALTER OPERATOR === (text, text) OWNER TO app_role")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_operator_class }, (try parseSqlAlloc(alloc, "ALTER OPERATOR CLASS usage_ops USING btree RENAME TO usage_ops_v2")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_operator_family }, (try parseSqlAlloc(alloc, "ALTER OPERATOR FAMILY usage_family USING btree RENAME TO usage_family_v2")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_operator_class }, (try parseSqlAlloc(alloc, "CREATE OPERATOR CLASS usage_ops DEFAULT FOR TYPE text USING btree AS OPERATOR 1 < (text, text)")).statement);
@@ -10193,6 +10219,12 @@ test "generated SQL parser facade builds extended read AST spans" {
         subject_tokens: GeneratedSqlTokenRange,
     }{
         .{
+            .sql = "ALTER AGGREGATE first_value_text(text) OWNER TO app_role",
+            .kind = .alter_aggregate,
+            .reason = .alter_aggregate_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 9 },
+        },
+        .{
             .sql = "ALTER CONVERSION usage_conv RENAME TO usage_conv_v2",
             .kind = .alter_conversion,
             .reason = .alter_conversion_not_planned_by_generated_parser,
@@ -10233,6 +10265,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .kind = .alter_materialized_view,
             .reason = .alter_materialized_view_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 7 },
+        },
+        .{
+            .sql = "ALTER OPERATOR === (text, text) OWNER TO app_role",
+            .kind = .alter_operator,
+            .reason = .alter_operator_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 13 },
         },
         .{
             .sql = "ALTER OPERATOR CLASS usage_ops USING btree RENAME TO usage_ops_v2",

@@ -3577,10 +3577,10 @@ pub fn build(b: *std.Build) void {
         "storage.db.db.test.db full-text",
         "storage.db.db.test.db dense ",
         "storage.db.db.test.db sparse ",
-        "storage.db.db.test.db graph ",
         "storage.db.db.test.db search ",
         "storage.db.db.test.db document _edges",
         "storage.db.db.test.db document _embeddings",
+        "storage.db.graph_runtime.test.",
         "storage.db.search_runtime.test.db search runtime indexing ",
         "storage.db.search_runtime.test.db search runtime graph composition ",
         "storage.db.search_runtime.test.db search runtime text schema ",
@@ -5877,6 +5877,16 @@ pub fn build(b: *std.Build) void {
         "storage.db.search_runtime.test.",
     };
     _ = addFilteredTestStep(b, db_test_mod, "db-search-runtime-test", "Run focused storage/db search runtime tests", &db_search_runtime_default_filters, .{});
+
+    const db_graph_runtime_default_filters = [_][]const u8{
+        "storage.db.graph_runtime.test.",
+    };
+    _ = addFilteredTestStep(b, db_test_mod, "db-graph-runtime-test", "Run focused storage/db graph runtime tests", &db_graph_runtime_default_filters, .{});
+
+    const db_resolution_runtime_default_filters = [_][]const u8{
+        "storage.db.resolution_runtime.test.db resolution runtime ",
+    };
+    _ = addFilteredTestStep(b, db_test_mod, "db-resolution-runtime-test", "Run focused storage/db resolution workflow tests", &db_resolution_runtime_default_filters, .{});
 
     const db_derived_async_default_filters = [_][]const u8{
         "storage.db.derived_async.test.",

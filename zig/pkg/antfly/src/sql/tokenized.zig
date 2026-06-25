@@ -1546,6 +1546,7 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .vacuum,
         => true,
         .explain,
+        .alter_aggregate,
         .alter_index,
         .alter_conversion,
         .alter_default_privileges,
@@ -1553,6 +1554,7 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .alter_foreign_data_wrapper,
         .alter_foreign_table,
         .alter_materialized_view,
+        .alter_operator,
         .alter_operator_class,
         .alter_operator_family,
         .alter_policy,
@@ -2216,6 +2218,11 @@ test "sql adapter parsed sql owns typed statement variants" {
         reason: generated_parser.GeneratedSqlUnsupportedReason,
     }{
         .{
+            .sql = "ALTER AGGREGATE first_value_text(text) OWNER TO app_role",
+            .kind = .alter_aggregate,
+            .reason = .alter_aggregate_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "ALTER CONVERSION usage_conv RENAME TO usage_conv_v2",
             .kind = .alter_conversion,
             .reason = .alter_conversion_not_planned_by_generated_parser,
@@ -2244,6 +2251,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "ALTER MATERIALIZED VIEW usage_summary RENAME TO usage_summary_v2",
             .kind = .alter_materialized_view,
             .reason = .alter_materialized_view_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "ALTER OPERATOR === (text, text) OWNER TO app_role",
+            .kind = .alter_operator,
+            .reason = .alter_operator_not_planned_by_generated_parser,
         },
         .{
             .sql = "ALTER OPERATOR CLASS usage_ops USING btree RENAME TO usage_ops_v2",
@@ -2774,6 +2786,28 @@ test "sql adapter parsed sql owns typed statement variants" {
         else => return error.TestUnexpectedResult,
     }
 
+    var create_user = try ParsedSql.initAlloc(alloc, "CREATE USER app_writer");
+    defer create_user.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, create_user.generatedStatementKind().?);
+    switch (create_user.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_role, ddl_ast.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl_ast.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var create_group = try ParsedSql.initAlloc(alloc, "CREATE GROUP app_readers");
+    defer create_group.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, create_group.generatedStatementKind().?);
+    switch (create_group.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_role, ddl_ast.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl_ast.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     var alter_role = try ParsedSql.initAlloc(alloc, "ALTER ROLE app_writer IN DATABASE appdb SET app.tenant_id = current_setting('app.tenant_id')");
     defer alter_role.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, alter_role.generatedStatementKind().?);
@@ -2790,6 +2824,30 @@ test "sql adapter parsed sql owns typed statement variants" {
         else => return error.TestUnexpectedResult,
     }
 
+    var alter_user = try ParsedSql.initAlloc(alloc, "ALTER USER app_writer RESET statement_timeout");
+    defer alter_user.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, alter_user.generatedStatementKind().?);
+    switch (alter_user.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_role, ddl_ast.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 5 }, ddl_ast.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var alter_group = try ParsedSql.initAlloc(alloc, "ALTER GROUP app_readers RESET statement_timeout");
+    defer alter_group.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, alter_group.generatedStatementKind().?);
+    switch (alter_group.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_role, ddl_ast.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 5 }, ddl_ast.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     var drop_role = try ParsedSql.initAlloc(alloc, "DROP ROLE IF EXISTS app_writer");
     defer drop_role.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, drop_role.generatedStatementKind().?);
@@ -2803,6 +2861,30 @@ test "sql adapter parsed sql owns typed statement variants" {
     }
     switch (drop_role.statement) {
         .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_user = try ParsedSql.initAlloc(alloc, "DROP USER IF EXISTS app_writer");
+    defer drop_user.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, drop_user.generatedStatementKind().?);
+    switch (drop_user.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.drop_role, ddl_ast.kind);
+            try std.testing.expect(ddl_ast.if_exists);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl_ast.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_group = try ParsedSql.initAlloc(alloc, "DROP GROUP IF EXISTS app_readers");
+    defer drop_group.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, drop_group.generatedStatementKind().?);
+    switch (drop_group.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.drop_role, ddl_ast.kind);
+            try std.testing.expect(ddl_ast.if_exists);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl_ast.object_name_tokens.?);
+        },
         else => return error.TestUnexpectedResult,
     }
 

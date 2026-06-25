@@ -186,7 +186,7 @@ create_routine_statement:
   ;
 
 create_role_statement:
-    CREATE ROLE identifier_name diagnostic_tail_opt
+    CREATE role_keyword identifier_name diagnostic_tail_opt
   ;
 
 create_type_system_statement:
@@ -303,7 +303,7 @@ alter_policy_statement:
   ;
 
 alter_role_statement:
-    ALTER ROLE identifier_name alter_role_database_opt diagnostic_tail
+    ALTER role_keyword identifier_name alter_role_database_opt diagnostic_tail
   ;
 
 alter_role_database_opt:
@@ -313,6 +313,8 @@ alter_role_database_opt:
 
 alter_type_system_statement:
     ALTER COLLATION identifier_name RENAME TO identifier_name
+  | ALTER OPERATOR diagnostic_tail
+  | ALTER AGGREGATE diagnostic_tail
   ;
 
 alter_table_relation_prefix_opt:
@@ -338,11 +340,16 @@ drop_statement:
   | DROP SUBSCRIPTION if_exists_opt qualified_name
   | DROP POLICY if_exists_opt identifier_name ON qualified_name drop_behavior_opt
   | DROP routine_kind if_exists_opt qualified_name LPAREN routine_type_list_opt RPAREN drop_behavior_opt
-  | DROP ROLE if_exists_opt identifier_name drop_behavior_opt
+  | DROP role_keyword if_exists_opt identifier_name drop_behavior_opt
   | DROP COLLATION if_exists_opt identifier_name
   | DROP OPERATOR diagnostic_tail
   | DROP AGGREGATE identifier_name diagnostic_tail
   | DROP CAST diagnostic_tail
+  ;
+
+role_keyword:
+    ROLE
+  | GROUP
   ;
 
 refresh_materialized_view_statement:

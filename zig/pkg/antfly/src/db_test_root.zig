@@ -21,6 +21,7 @@ test {
     _ = @import("storage/db/relational_integrity.zig");
     _ = @import("storage/db/relational_rows.zig");
     _ = @import("storage/db/search_runtime.zig");
+    _ = @import("storage/db/graph_runtime.zig");
     _ = @import("storage/db/db_sim_test.zig");
     _ = @import("storage/db/promotion_runtime.zig");
     _ = @import("storage/db/resolution_runtime.zig");

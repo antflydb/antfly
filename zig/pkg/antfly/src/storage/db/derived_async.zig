@@ -7048,3 +7048,8 @@ test "db derived async dense artifact rebuild dense artifact rebuild waits for r
     try std.testing.expectEqual(appended_sequence, replay_debt[0].target_sequence);
     try std.testing.expect(replay_debt[0].catch_up_required);
 }
+
+test "db derived async dense startup catch-up defaults keep more than one cache entry" {
+    try std.testing.expect(denseCatchUpStartupCacheNodes() > 1);
+    try std.testing.expect(denseCatchUpStartupCacheVectors() > 1);
+}

@@ -19977,3 +19977,102 @@ test "relational rows query across ranges merges ordered windows globally" {
         },
     }));
 }
+
+test "db relational rows table point reads use only the relational base store" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"},"attrs":{"type":"json"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "row:base",
+            .value =
+            \\{"title":"base row","amount":12.5,"attrs":{"tier":"gold"}}
+            ,
+        }},
+    });
+
+    const relational_key = try relational_store_mod.rowKeyAlloc(alloc, "row:base");
+    defer alloc.free(relational_key);
+    const raw_row = try db.core.store.get(alloc, relational_key);
+    defer alloc.free(raw_row);
+    try std.testing.expect(mapper.isRelationalRowValue(raw_row));
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:base");
+    defer alloc.free(primary_key);
+    const maybe_primary = db.core.store.get(alloc, primary_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (maybe_primary) |primary_value| {
+        defer alloc.free(primary_value);
+        return error.TestExpectedEqual;
+    }
+    try db.core.store.put(primary_key, "{\"title\":\"stale primary\",\"amount\":999}");
+
+    const doc = (try db.get(alloc, "row:base")).?;
+    defer alloc.free(doc);
+    try std.testing.expect(std.mem.indexOf(u8, doc, "\"title\":\"base row\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, doc, "stale primary") == null);
+    try std.testing.expect(std.mem.indexOf(u8, doc, "\"amount\":12.5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, doc, "\"attrs\":{\"tier\":\"gold\"}") != null);
+
+    const median = try db.findMedianKey(alloc);
+    defer alloc.free(median);
+    try std.testing.expectEqualStrings("row:base", median);
+
+    var scan_result = try db.scan(alloc, "row:", "row:\xff", .{
+        .include_documents = true,
+        .fields = &.{"title"},
+        .include_all_fields = false,
+    });
+    defer scan_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), scan_result.hashes.len);
+    try std.testing.expectEqualStrings("row:base", scan_result.hashes[0].id);
+    try std.testing.expectEqual(@as(usize, 1), scan_result.documents.len);
+    try std.testing.expectEqualStrings("row:base", scan_result.documents[0].id);
+    try std.testing.expect(std.mem.indexOf(u8, scan_result.documents[0].json, "\"title\":\"base row\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scan_result.documents[0].json, "stale primary") == null);
+    try std.testing.expect(std.mem.indexOf(u8, scan_result.documents[0].json, "\"amount\"") == null);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "row:base",
+            .value =
+            \\{"title":"updated row","amount":99.25,"attrs":{"tier":"platinum"}}
+            ,
+        }},
+    });
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
+
+    const updated_doc = (try db.get(alloc, "row:base")).?;
+    defer alloc.free(updated_doc);
+    try std.testing.expect(std.mem.indexOf(u8, updated_doc, "\"title\":\"updated row\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated_doc, "stale primary") == null);
+
+    try db.batch(.{
+        .deletes = &.{"row:base"},
+    });
+    try std.testing.expect((try relational_store_mod.getRawAlloc(alloc, db.core.store, "row:base")) == null);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
+    try std.testing.expect((try db.get(alloc, "row:base")) == null);
+}

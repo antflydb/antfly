@@ -439,7 +439,7 @@ pub fn parseDdlPlanAlloc(
         if (cursor.peekKeyword("function") or cursor.peekKeyword("procedure")) {
             return .{ .function_catalog = .{ .create = try parseCreateRoutinePlanTailAlloc(alloc, tokens, pos, false) } };
         }
-        if (cursor.peekKeyword("role")) {
+        if (isRoleAliasKeywordAt(tokens, pos.*)) {
             return .{ .authorization_catalog = .{ .create_role = try parseCreateRolePlanTailAlloc(alloc, tokens, pos) } };
         }
         if (cursor.peekKeyword("policy")) {
@@ -496,7 +496,7 @@ pub fn parseDdlPlanAlloc(
         if (cursor.peekKeyword("subscription")) return .{ .logical_replication = .{ .subscription = .{ .alter = try parseAlterSubscriptionPlanTailAlloc(alloc, tokens, pos) } } };
         if (cursor.peekKeyword("collation")) return .{ .type_system_catalog = .{ .collation = .{ .rename = try parseRenameCollationPlanTailAlloc(alloc, tokens, pos) } } };
         if (cursor.peekKeyword("view")) return .{ .view_catalog = .{ .rename = try parseRenameViewPlanTailAlloc(alloc, tokens, pos) } };
-        if (cursor.peekKeyword("role")) return .{ .authorization_catalog = .{ .alter_role = try parseAlterRolePlanTailAlloc(alloc, tokens, pos) } };
+        if (isRoleAliasKeywordAt(tokens, pos.*)) return .{ .authorization_catalog = .{ .alter_role = try parseAlterRolePlanTailAlloc(alloc, tokens, pos) } };
         if (cursor.peekKeyword("policy")) return .{ .row_security_catalog = .{ .alter_policy = try parseAlterRowSecurityPolicyPlanTailAllocWithOptions(alloc, tokens, pos, options.row_security_policy_options) } };
         if (cursor.peekKeyword("table")) {
             const checkpoint = pos.*;
@@ -535,7 +535,7 @@ pub fn parseDdlPlanAlloc(
         if (cursor.peekKeyword("aggregate")) return .{ .type_system_catalog = .{ .aggregate = .{ .drop = try parseDropAggregatePlanTailAlloc(alloc, tokens, pos) } } };
         if (cursor.peekKeyword("cast")) return .{ .type_system_catalog = .{ .cast = .{ .drop = try parseDropCastPlanTailAlloc(alloc, tokens, pos) } } };
         if (cursor.peekKeyword("function") or cursor.peekKeyword("procedure")) return .{ .function_catalog = .{ .drop = try parseDropRoutinePlanTailAlloc(alloc, tokens, pos) } };
-        if (cursor.peekKeyword("role")) return .{ .authorization_catalog = .{ .drop_role = try parseDropRolePlanTailAlloc(alloc, tokens, pos) } };
+        if (isRoleAliasKeywordAt(tokens, pos.*)) return .{ .authorization_catalog = .{ .drop_role = try parseDropRolePlanTailAlloc(alloc, tokens, pos) } };
         if (cursor.peekKeyword("policy")) return .{ .row_security_catalog = .{ .drop_policy = try parseDropRowSecurityPolicyPlanTailAlloc(alloc, tokens, pos) } };
         if (cursor.peekKeyword("table")) return .{ .drop_table = try parseDropTablePlanTailAlloc(alloc, tokens, pos) };
         if (cursor.peekKeyword("trigger")) return .{ .alter_table = try parseDropUpdatePolicyTriggerPlanTailAlloc(alloc, tokens, pos) };
@@ -3479,17 +3479,21 @@ fn validateGeneratedRoleDdlAst(tokens: []const grammar.Token, ast: generated_par
     if (object_name_tokens.start >= object_name_tokens.end or object_name_tokens.end > end) return error.UnsupportedSqlShape;
     switch (ast.kind) {
         .create_role => {
-            if (end < 3 or !tokens[0].matchesKeyword("create") or !tokens[1].matchesKeywordTag(.role)) return error.UnsupportedSqlShape;
+            if (end < 3 or !tokens[0].matchesKeyword("create") or !grammar.isRoleAliasKeywordToken(tokens[1])) return error.UnsupportedSqlShape;
         },
         .alter_role => {
-            if (end < 5 or !tokens[0].matchesKeyword("alter") or !tokens[1].matchesKeywordTag(.role)) return error.UnsupportedSqlShape;
+            if (end < 5 or !tokens[0].matchesKeyword("alter") or !grammar.isRoleAliasKeywordToken(tokens[1])) return error.UnsupportedSqlShape;
             if (ast.alter_table_operation_tokens == null) return error.UnsupportedSqlShape;
         },
         .drop_role => {
-            if (end < 3 or !tokens[0].matchesKeyword("drop") or !tokens[1].matchesKeywordTag(.role)) return error.UnsupportedSqlShape;
+            if (end < 3 or !tokens[0].matchesKeyword("drop") or !grammar.isRoleAliasKeywordToken(tokens[1])) return error.UnsupportedSqlShape;
         },
         else => return error.UnsupportedSqlShape,
     }
+}
+
+fn isRoleAliasKeywordAt(tokens: []const grammar.Token, index: usize) bool {
+    return index < tokens.len and grammar.isRoleAliasKeywordToken(tokens[index]);
 }
 
 fn typeSystemCatalogPlanFromGeneratedDdlAstAlloc(
@@ -10217,6 +10221,7 @@ fn generatedUnsupportedExpectedReason(kind: generated_parser.GeneratedSqlUnsuppo
         .cluster => .cluster_not_planned_by_generated_parser,
         .comment => .comment_not_planned_by_generated_parser,
         .copy => .copy_not_planned_by_generated_parser,
+        .alter_aggregate => .alter_aggregate_not_planned_by_generated_parser,
         .alter_index => .alter_index_not_planned_by_generated_parser,
         .alter_conversion => .alter_conversion_not_planned_by_generated_parser,
         .alter_default_privileges => .alter_default_privileges_not_planned_by_generated_parser,
@@ -10224,6 +10229,7 @@ fn generatedUnsupportedExpectedReason(kind: generated_parser.GeneratedSqlUnsuppo
         .alter_foreign_table => .alter_foreign_table_not_planned_by_generated_parser,
         .alter_foreign_data_wrapper => .alter_foreign_data_wrapper_not_planned_by_generated_parser,
         .alter_materialized_view => .alter_materialized_view_not_planned_by_generated_parser,
+        .alter_operator => .alter_operator_not_planned_by_generated_parser,
         .alter_operator_class => .alter_operator_class_not_planned_by_generated_parser,
         .alter_operator_family => .alter_operator_family_not_planned_by_generated_parser,
         .alter_policy => .alter_policy_not_planned_by_generated_parser,
@@ -13552,6 +13558,26 @@ test "sql adapter ddl plan lowers authorization catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
+    var create_user = try lowerDdlPlanForTestAlloc(alloc, "CREATE USER app_writer;");
+    defer create_user.deinit(alloc);
+    switch (create_user) {
+        .authorization_catalog => |plan| switch (plan) {
+            .create_role => |create| try std.testing.expectEqualStrings("app_writer", create.role_name),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var create_group = try lowerDdlPlanForTestAlloc(alloc, "CREATE GROUP app_readers;");
+    defer create_group.deinit(alloc);
+    switch (create_group) {
+        .authorization_catalog => |plan| switch (plan) {
+            .create_role => |create| try std.testing.expectEqualStrings("app_readers", create.role_name),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     var alter_role = try lowerDdlPlanForTestAlloc(alloc, "ALTER ROLE app_writer IN DATABASE appdb SET app.tenant_id = current_setting('app.tenant_id');");
     defer alter_role.deinit(alloc);
     switch (alter_role) {
@@ -13588,12 +13614,66 @@ test "sql adapter ddl plan lowers authorization catalog ddl plans" {
         else => return error.TestUnexpectedResult,
     }
 
+    var reset_user = try lowerDdlPlanForTestAlloc(alloc, "ALTER USER app_writer RESET statement_timeout;");
+    defer reset_user.deinit(alloc);
+    switch (reset_user) {
+        .authorization_catalog => |plan| switch (plan) {
+            .alter_role => |alter| {
+                try std.testing.expectEqualStrings("app_writer", alter.role_name);
+                try std.testing.expectEqual(AlterRolePlan.Operation.reset, alter.operation);
+                try std.testing.expectEqualStrings("statement_timeout", alter.setting_name);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var reset_group = try lowerDdlPlanForTestAlloc(alloc, "ALTER GROUP app_readers RESET statement_timeout;");
+    defer reset_group.deinit(alloc);
+    switch (reset_group) {
+        .authorization_catalog => |plan| switch (plan) {
+            .alter_role => |alter| {
+                try std.testing.expectEqualStrings("app_readers", alter.role_name);
+                try std.testing.expectEqual(AlterRolePlan.Operation.reset, alter.operation);
+                try std.testing.expectEqualStrings("statement_timeout", alter.setting_name);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     var drop_role = try lowerDdlPlanForTestAlloc(alloc, "DROP ROLE IF EXISTS app_writer;");
     defer drop_role.deinit(alloc);
     switch (drop_role) {
         .authorization_catalog => |plan| switch (plan) {
             .drop_role => |drop| {
                 try std.testing.expectEqualStrings("app_writer", drop.role_name);
+                try std.testing.expect(drop.if_exists);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_user = try lowerDdlPlanForTestAlloc(alloc, "DROP USER IF EXISTS app_writer;");
+    defer drop_user.deinit(alloc);
+    switch (drop_user) {
+        .authorization_catalog => |plan| switch (plan) {
+            .drop_role => |drop| {
+                try std.testing.expectEqualStrings("app_writer", drop.role_name);
+                try std.testing.expect(drop.if_exists);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_group = try lowerDdlPlanForTestAlloc(alloc, "DROP GROUP IF EXISTS app_readers;");
+    defer drop_group.deinit(alloc);
+    switch (drop_group) {
+        .authorization_catalog => |plan| switch (plan) {
+            .drop_role => |drop| {
+                try std.testing.expectEqualStrings("app_readers", drop.role_name);
                 try std.testing.expect(drop.if_exists);
             },
             else => return error.TestUnexpectedResult,

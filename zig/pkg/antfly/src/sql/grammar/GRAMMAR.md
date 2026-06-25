@@ -381,9 +381,10 @@ such as `ALTER INDEX`, `ALTER SYSTEM`, `CREATE/DROP ACCESS METHOD`,
 `CHECKPOINT`, `LOAD`, `REFRESH`, `SECURITY LABEL`, and `UNLISTEN`, plus
 simple cursor and transaction-control statements such as `CLOSE`, `DECLARE`,
 `FETCH`, `MOVE`, `SAVEPOINT`, and `RELEASE`, plus common PostgreSQL extension
-catalog families for conversions, event triggers, extended statistics, operator
-class/family objects, and text-search configuration/dictionary/parser/template
-objects, plus simple `EXPLAIN` forms with stable reason metadata. Generated
+catalog families for conversions, event triggers, extended statistics,
+operator/aggregate ALTER forms, operator class/family objects, and text-search
+configuration/dictionary/parser/template objects, plus simple `EXPLAIN` forms
+with stable reason metadata. Generated
 unsupported AST heads that Antfly already plans through typed catalog/control
 planners now route to the parsed DDL family explicitly; generated `EXPLAIN`
 routes to the parsed explain family explicitly; and unsupported heads without
@@ -396,7 +397,7 @@ entry points that Antfly does not type yet, including
 trigger and rewrite-rule DDL, including `ALTER TRIGGER` and `ALTER RULE`;
 foreign-server DDL; access-method DDL; ownership maintenance statements; and
 `ALTER INDEX`/`ALTER SYSTEM`. PostgreSQL conversion, event-trigger, extended
-statistics, operator class/family, and text-search
+statistics, operator/aggregate ALTER forms, operator class/family, and text-search
 configuration/dictionary/parser/template DDL now share the same generated
 unsupported AST and reason coverage. These common unsupported
 PostgreSQL dump/admin shapes now have stable unsupported AST reasons instead of
@@ -424,11 +425,12 @@ before delegating to the typed authorization catalog planner. Legacy-supported
 type-system catalog operations use validated generated DDL AST nodes for
 `CREATE/ALTER/DROP COLLATION`, `CREATE/DROP OPERATOR`,
 `CREATE/DROP AGGREGATE`, and `CREATE/DROP CAST`, while
+`ALTER OPERATOR`, `ALTER AGGREGATE`, and
 `CREATE/ALTER/DROP OPERATOR CLASS/FAMILY` remain explicit unsupported
-generated AST nodes with stable reasons. Supported type-system DDL fails
-closed if generated kind, span, object name, signature tail, or `IF EXISTS`
-metadata is corrupted before delegating to the typed type-system catalog
-planner. Notification channel
+generated AST nodes with stable reasons. Supported type-system DDL fails closed
+if generated kind, span, object name, signature tail, or `IF EXISTS` metadata is
+corrupted before delegating to the typed type-system catalog planner.
+Notification channel
 commands also use the validated unsupported boundary for `LISTEN`, `NOTIFY`,
 and `UNLISTEN` before delegating to typed notification catalog planning.
 Authorization and utility commands use it for `GRANT`, `REVOKE`, `COMMENT`,
@@ -1092,7 +1094,7 @@ Generated grammar work needs evidence at multiple levels:
   transaction-control commands `SAVEPOINT`/`RELEASE`, PostgreSQL foreign-data
   declarations for foreign data wrappers, foreign tables, servers, and user
   mappings, plus language, rule, trigger, conversion, event-trigger, extended
-  statistics, operator class/family, and text-search
+  statistics, operator/aggregate ALTER forms, operator class/family, and text-search
   configuration/dictionary/parser/template DDL, and bare, simple, optioned,
   and `EXPLAIN ANALYZE` forms now produce generated unsupported AST nodes with
   stable reason metadata and subject ranges where available.
@@ -1128,7 +1130,9 @@ Generated grammar work needs evidence at multiple levels:
   `CREATE OR REPLACE FUNCTION`, `CREATE PROCEDURE`, `DROP FUNCTION`, and
   `DROP PROCEDURE`,
   generated role authorization DDL for `CREATE ROLE`, `ALTER ROLE`, and
-  `DROP ROLE`,
+  `DROP ROLE`, including PostgreSQL-compatible `USER` and `GROUP` aliases
+  where they lower to the same authorization catalog role plans while
+  preserving `USER MAPPING` as an explicit unsupported boundary,
   generated type-system catalog DDL for `CREATE/ALTER/DROP COLLATION`,
   `CREATE/DROP OPERATOR`, `CREATE/DROP AGGREGATE`, and `CREATE/DROP CAST`,
   `DROP INDEX`, generated domain catalog DDL for `CREATE DOMAIN`,

@@ -5815,7 +5815,7 @@ pub fn parseCreateRoleCatalogTailAlloc(
     pos: *usize,
 ) !CreateRoleSyntax {
     const cursor = parser.Cursor.init(tokens, pos);
-    try cursor.expectKeyword("role");
+    try expectRoleAliasKeyword(cursor);
     const role_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
     var role_transferred = false;
     errdefer if (!role_transferred) alloc.free(role_name);
@@ -5830,7 +5830,7 @@ pub fn parseAlterRoleCatalogTailAlloc(
     pos: *usize,
 ) !AlterRoleSyntax {
     const cursor = parser.Cursor.init(tokens, pos);
-    try cursor.expectKeyword("role");
+    try expectRoleAliasKeyword(cursor);
     const role_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
     var role_transferred = false;
     errdefer if (!role_transferred) alloc.free(role_name);
@@ -5895,7 +5895,7 @@ pub fn parseDropRoleCatalogTailAlloc(
     pos: *usize,
 ) !DropRoleSyntax {
     const cursor = parser.Cursor.init(tokens, pos);
-    try cursor.expectKeyword("role");
+    try expectRoleAliasKeyword(cursor);
     var if_exists = false;
     if (cursor.matchKeyword("if")) {
         try cursor.expectKeyword("exists");
@@ -5907,6 +5907,22 @@ pub fn parseDropRoleCatalogTailAlloc(
     try adapterNoopStatementEnd(cursor);
     role_transferred = true;
     return .{ .role_name = role_name, .if_exists = if_exists };
+}
+
+pub fn isRoleAliasKeywordToken(token: Token) bool {
+    return token.matchesKeywordTag(.role) or
+        token.matchesKeyword("user") or
+        token.matchesKeywordTag(.group);
+}
+
+fn expectRoleAliasKeyword(cursor: parser.Cursor) !void {
+    if (cursor.matchKeyword("role") or
+        cursor.matchKeyword("user") or
+        cursor.matchKeyword("group"))
+    {
+        return;
+    }
+    return error.UnsupportedSqlShape;
 }
 
 pub fn parsePrivilegeChangeTailAlloc(
@@ -10721,6 +10737,22 @@ test "sql adapter grammar parses authorization catalog tails" {
     try std.testing.expectEqual(create_role_tokens.items.len, create_role_pos);
     try std.testing.expectEqualStrings("app_writer", create_role.role_name);
 
+    var create_user_tokens = try lexer.tokenizeAlloc(alloc, "USER app_writer;");
+    defer lexer.freeTokens(alloc, &create_user_tokens);
+    var create_user_pos: usize = 0;
+    var create_user = try parseCreateRoleCatalogTailAlloc(alloc, create_user_tokens.items, &create_user_pos);
+    defer create_user.deinit(alloc);
+    try std.testing.expectEqual(create_user_tokens.items.len, create_user_pos);
+    try std.testing.expectEqualStrings("app_writer", create_user.role_name);
+
+    var create_group_tokens = try lexer.tokenizeAlloc(alloc, "GROUP app_readers;");
+    defer lexer.freeTokens(alloc, &create_group_tokens);
+    var create_group_pos: usize = 0;
+    var create_group = try parseCreateRoleCatalogTailAlloc(alloc, create_group_tokens.items, &create_group_pos);
+    defer create_group.deinit(alloc);
+    try std.testing.expectEqual(create_group_tokens.items.len, create_group_pos);
+    try std.testing.expectEqualStrings("app_readers", create_group.role_name);
+
     var alter_role_tokens = try lexer.tokenizeAlloc(alloc, "ROLE app_writer SET app.tenant_id = 'acme';");
     defer lexer.freeTokens(alloc, &alter_role_tokens);
     var alter_role_pos: usize = 0;
@@ -10732,6 +10764,26 @@ test "sql adapter grammar parses authorization catalog tails" {
     try std.testing.expectEqual(ddl_plan.AlterRolePlan.SettingKind.app, alter_role.setting_kind);
     try std.testing.expectEqualStrings("app.tenant_id", alter_role.setting_name);
     try expectAlterRoleLiteralSettingValue("acme", alter_role.setting_value);
+
+    var alter_user_tokens = try lexer.tokenizeAlloc(alloc, "USER app_writer RESET statement_timeout;");
+    defer lexer.freeTokens(alloc, &alter_user_tokens);
+    var alter_user_pos: usize = 0;
+    var alter_user = try parseAlterRoleCatalogTailAlloc(alloc, alter_user_tokens.items, &alter_user_pos);
+    defer alter_user.deinit(alloc);
+    try std.testing.expectEqual(alter_user_tokens.items.len, alter_user_pos);
+    try std.testing.expectEqualStrings("app_writer", alter_user.role_name);
+    try std.testing.expectEqual(ddl_plan.AlterRolePlan.Operation.reset, alter_user.operation);
+    try std.testing.expectEqualStrings("statement_timeout", alter_user.setting_name);
+
+    var alter_group_tokens = try lexer.tokenizeAlloc(alloc, "GROUP app_readers RESET statement_timeout;");
+    defer lexer.freeTokens(alloc, &alter_group_tokens);
+    var alter_group_pos: usize = 0;
+    var alter_group = try parseAlterRoleCatalogTailAlloc(alloc, alter_group_tokens.items, &alter_group_pos);
+    defer alter_group.deinit(alloc);
+    try std.testing.expectEqual(alter_group_tokens.items.len, alter_group_pos);
+    try std.testing.expectEqualStrings("app_readers", alter_group.role_name);
+    try std.testing.expectEqual(ddl_plan.AlterRolePlan.Operation.reset, alter_group.operation);
+    try std.testing.expectEqualStrings("statement_timeout", alter_group.setting_name);
 
     var scoped_alter_role_tokens = try lexer.tokenizeAlloc(alloc, "ROLE app_writer IN DATABASE appdb SET app.tenant_id = 'acme';");
     defer lexer.freeTokens(alloc, &scoped_alter_role_tokens);
@@ -10812,6 +10864,24 @@ test "sql adapter grammar parses authorization catalog tails" {
     try std.testing.expectEqual(drop_role_tokens.items.len, drop_role_pos);
     try std.testing.expectEqualStrings("app_writer", drop_role.role_name);
     try std.testing.expect(drop_role.if_exists);
+
+    var drop_user_tokens = try lexer.tokenizeAlloc(alloc, "USER IF EXISTS app_writer;");
+    defer lexer.freeTokens(alloc, &drop_user_tokens);
+    var drop_user_pos: usize = 0;
+    var drop_user = try parseDropRoleCatalogTailAlloc(alloc, drop_user_tokens.items, &drop_user_pos);
+    defer drop_user.deinit(alloc);
+    try std.testing.expectEqual(drop_user_tokens.items.len, drop_user_pos);
+    try std.testing.expectEqualStrings("app_writer", drop_user.role_name);
+    try std.testing.expect(drop_user.if_exists);
+
+    var drop_group_tokens = try lexer.tokenizeAlloc(alloc, "GROUP IF EXISTS app_readers;");
+    defer lexer.freeTokens(alloc, &drop_group_tokens);
+    var drop_group_pos: usize = 0;
+    var drop_group = try parseDropRoleCatalogTailAlloc(alloc, drop_group_tokens.items, &drop_group_pos);
+    defer drop_group.deinit(alloc);
+    try std.testing.expectEqual(drop_group_tokens.items.len, drop_group_pos);
+    try std.testing.expectEqualStrings("app_readers", drop_group.role_name);
+    try std.testing.expect(drop_group.if_exists);
 
     var grant_tokens = try lexer.tokenizeAlloc(alloc, "SELECT, INSERT ON TABLE usage_records TO app_writer;");
     defer lexer.freeTokens(alloc, &grant_tokens);
