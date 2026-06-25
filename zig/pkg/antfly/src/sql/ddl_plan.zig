@@ -3433,7 +3433,10 @@ fn validateGeneratedRoutineDdlAst(tokens: []const grammar.Token, ast: generated_
             var routine_index: usize = 1;
             if (tokens[routine_index].matchesKeyword("or")) {
                 if (routine_index + 2 >= end or !tokens[routine_index + 1].matchesKeyword("replace")) return error.UnsupportedSqlShape;
+                if (!ast.replace_existing) return error.UnsupportedSqlShape;
                 routine_index += 2;
+            } else if (ast.replace_existing) {
+                return error.UnsupportedSqlShape;
             }
             const expected: token_mod.TokenKeyword = switch (ast.kind) {
                 .create_function => .function,
@@ -3441,6 +3444,10 @@ fn validateGeneratedRoutineDdlAst(tokens: []const grammar.Token, ast: generated_
                 else => unreachable,
             };
             if (routine_index >= end or !tokens[routine_index].matchesKeywordTag(expected)) return error.UnsupportedSqlShape;
+            if (object_name_tokens.start != routine_index + 1) return error.UnsupportedSqlShape;
+            const signature_tail = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+            if (signature_tail.start != object_name_tokens.end or signature_tail.end != end or signature_tail.start >= end) return error.UnsupportedSqlShape;
+            if (tokens[signature_tail.start].kind != .lparen) return error.UnsupportedSqlShape;
         },
         .drop_function, .drop_procedure => {
             if (end < 4 or !tokens[0].matchesKeyword("drop")) return error.UnsupportedSqlShape;
@@ -3450,6 +3457,15 @@ fn validateGeneratedRoutineDdlAst(tokens: []const grammar.Token, ast: generated_
                 else => unreachable,
             };
             if (!tokens[1].matchesKeywordTag(expected)) return error.UnsupportedSqlShape;
+            var name_index: usize = 2;
+            const if_exists = consumeGeneratedPlanIfExists(tokens, &name_index, end);
+            if (if_exists != ast.if_exists) return error.UnsupportedSqlShape;
+            if (object_name_tokens.start != name_index) return error.UnsupportedSqlShape;
+            const signature_tail = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+            if (signature_tail.start != object_name_tokens.end or signature_tail.end != end or signature_tail.start >= end) return error.UnsupportedSqlShape;
+            if (tokens[signature_tail.start].kind != .lparen) return error.UnsupportedSqlShape;
+            const has_cascade = generatedRangeHasKeyword(tokens, .{ .start = signature_tail.start, .end = end }, "cascade");
+            if (has_cascade != ast.cascade) return error.UnsupportedSqlShape;
         },
         else => return error.UnsupportedSqlShape,
     }
@@ -13545,6 +13561,80 @@ test "sql adapter ddl plan lowers routine catalog ddl plans" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var malformed_create_routine_name = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CREATE FUNCTION generated_audit() RETURNS trigger LANGUAGE plpgsql;",
+    );
+    defer malformed_create_routine_name.deinit(alloc);
+    if (malformed_create_routine_name.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_function, ddl.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
+                    ddl.object_name_tokens = .{ .start = 1, .end = 2 };
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_create_routine_name));
+
+    var malformed_create_routine_tail = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CREATE PROCEDURE generated_rotate() LANGUAGE plpgsql;",
+    );
+    defer malformed_create_routine_tail.deinit(alloc);
+    if (malformed_create_routine_tail.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_procedure, ddl.kind);
+                    ddl.alter_table_operation_tokens = .{ .start = 2, .end = malformed_create_routine_tail.items().len - 1 };
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_create_routine_tail));
+
+    var malformed_drop_routine_signature = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DROP FUNCTION IF EXISTS generated_audit(text) CASCADE;",
+    );
+    defer malformed_drop_routine_signature.deinit(alloc);
+    if (malformed_drop_routine_signature.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.drop_function, ddl.kind);
+                    ddl.alter_table_operation_tokens = .{ .start = 4, .end = malformed_drop_routine_signature.items().len - 1 };
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_drop_routine_signature));
+
+    var malformed_drop_routine_cascade = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DROP PROCEDURE IF EXISTS generated_rotate(text) CASCADE;",
+    );
+    defer malformed_drop_routine_cascade.deinit(alloc);
+    if (malformed_drop_routine_cascade.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.drop_procedure, ddl.kind);
+                    try std.testing.expect(ddl.cascade);
+                    ddl.cascade = false;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_drop_routine_cascade));
 
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT audit_support SUPPORT audit_support;"));
     var create_procedure_arg = try lowerDdlPlanForTestAlloc(alloc, "CREATE PROCEDURE rotate_usage_perform_arg() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(1); END$$;");

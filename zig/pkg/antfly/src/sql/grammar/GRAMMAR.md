@@ -417,7 +417,10 @@ catalog operations use validated generated DDL AST nodes for `CREATE FUNCTION`,
 `CREATE OR REPLACE FUNCTION`, `CREATE PROCEDURE`, `DROP FUNCTION`, and
 `DROP PROCEDURE`, and fail closed if generated kind, span, routine name,
 signature tail, replace, `IF EXISTS`, or cascade metadata is corrupted before
-delegating to the typed routine catalog planner. Legacy-supported role
+delegating to the typed routine catalog planner; routine validation also
+requires the generated routine-name range to start after the exact
+`FUNCTION`/`PROCEDURE` header and the signature/option tail to begin at the
+recorded routine-name boundary. Legacy-supported role
 authorization operations use validated generated DDL AST nodes for
 `CREATE ROLE`, `ALTER ROLE`, and `DROP ROLE`, and fail closed if generated
 kind, span, role name, operation tail, or `IF EXISTS` metadata is corrupted
