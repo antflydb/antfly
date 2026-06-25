@@ -3235,23 +3235,42 @@ fn generatedAlterTableUsesRuntimeBoundary(tokens: []const grammar.Token, ast: ge
     const end = generatedStatementEnd(tokens, ast.statement_span) orelse return false;
     const operation_range = ast.alter_table_operation_tokens orelse return false;
     if (!generatedRangeWithinStatement(operation_range, end) or operation_range.start >= operation_range.end) return false;
-    if (generatedRangeHasKind(tokens, operation_range, .comma)) return false;
-    const first = tokens[operation_range.start];
+    var depth: usize = 0;
+    var segment_start = operation_range.start;
+    var index = operation_range.start;
+    while (index <= operation_range.end) : (index += 1) {
+        if (index == operation_range.end or (depth == 0 and tokens[index].kind == .comma)) {
+            if (segment_start == index) return false;
+            if (!generatedAlterTableOperationSegmentUsesRuntimeBoundary(tokens, segment_start, index)) return false;
+            segment_start = index + 1;
+            continue;
+        }
+        switch (tokens[index].kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth == 0) return false;
+                depth -= 1;
+            },
+            else => {},
+        }
+    }
+    return depth == 0 and segment_start == operation_range.end + 1;
+}
+
+fn generatedAlterTableOperationSegmentUsesRuntimeBoundary(tokens: []const grammar.Token, start: usize, end: usize) bool {
+    if (start >= end or end > tokens.len) return false;
+    const first = tokens[start];
     if (first.matchesKeywordTag(.add)) {
-        return operation_range.start + 1 < operation_range.end and
-            tokens[operation_range.start + 1].matchesKeywordTag(.column);
+        return start + 1 < end and tokens[start + 1].matchesKeywordTag(.column);
     }
     if (first.matchesKeywordTag(.drop)) {
-        return operation_range.start + 1 < operation_range.end and
-            tokens[operation_range.start + 1].matchesKeywordTag(.column);
+        return start + 1 < end and tokens[start + 1].matchesKeywordTag(.column);
     }
     if (first.matchesKeywordTag(.rename)) {
-        return operation_range.start + 1 < operation_range.end and
-            tokens[operation_range.start + 1].matchesKeywordTag(.column);
+        return start + 1 < end and tokens[start + 1].matchesKeywordTag(.column);
     }
     if (first.matchesKeywordTag(.validate)) {
-        return operation_range.start + 1 < operation_range.end and
-            tokens[operation_range.start + 1].matchesKeywordTag(.constraint);
+        return start + 1 < end and tokens[start + 1].matchesKeywordTag(.constraint);
     }
     return false;
 }
@@ -13012,6 +13031,30 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
             switch (plan.operations[0]) {
                 .drop_column => |operation| {
                     try std.testing.expectEqualStrings("status", operation.name);
+                    try std.testing.expect(operation.if_exists);
+                    try std.testing.expectEqual(DropDependencyMode.restrict, operation.dependency_mode);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var runtime_multi_alter_table = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN notes text, DROP COLUMN IF EXISTS old_status RESTRICT;");
+    defer runtime_multi_alter_table.deinit(alloc);
+    var runtime_multi_alter_table_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_multi_alter_table);
+    defer runtime_multi_alter_table_plan.deinit(alloc);
+    switch (runtime_multi_alter_table_plan) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("generated_usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 2), plan.operations.len);
+            switch (plan.operations[0]) {
+                .add_column => |operation| try std.testing.expectEqualStrings("notes", operation.column.name),
+                else => return error.TestUnexpectedResult,
+            }
+            switch (plan.operations[1]) {
+                .drop_column => |operation| {
+                    try std.testing.expectEqualStrings("old_status", operation.name);
                     try std.testing.expect(operation.if_exists);
                     try std.testing.expectEqual(DropDependencyMode.restrict, operation.dependency_mode);
                 },
