@@ -54,10 +54,13 @@ pub const GeneratedSqlDdlKind = enum {
     create_database,
     create_schema,
     create_table,
+    create_view,
     create_index,
     create_extension,
     alter_table,
+    alter_view,
     drop_table,
+    drop_view,
     drop_index,
     drop_schema,
     drop_database,
@@ -844,6 +847,7 @@ pub const GeneratedSqlDdlAst = struct {
     if_exists: bool = false,
     cascade: bool = false,
     force: bool = false,
+    replace_existing: bool = false,
 };
 
 pub const GeneratedSqlReadAst = struct {
@@ -1516,14 +1520,18 @@ pub const simple_ddl_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CREATE UNLOGGED TABLE IF NOT EXISTS usage_ingest_records (id uuid PRIMARY KEY, payload jsonb)", .kind = .ddl },
     .{ .sql = "SELECT account_id, total INTO public.usage_archive FROM usage_records WHERE total > 10", .kind = .ddl },
     .{ .sql = "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT account_id FROM usage_records WITH NO DATA", .kind = .ddl },
+    .{ .sql = "CREATE VIEW active_usage AS SELECT id, status FROM usage_records", .kind = .ddl },
+    .{ .sql = "CREATE OR REPLACE VIEW IF NOT EXISTS active_usage AS SELECT id, status FROM usage_records", .kind = .ddl },
     .{ .sql = "ALTER TABLE usage_records ADD COLUMN status text", .kind = .ddl },
     .{ .sql = "ALTER TABLE IF EXISTS ONLY usage_records DROP COLUMN IF EXISTS status RESTRICT", .kind = .ddl },
+    .{ .sql = "ALTER VIEW active_usage RENAME TO active_usage_v2", .kind = .ddl },
     .{ .sql = "CREATE INDEX usage_records_status_idx ON usage_records (status)", .kind = .extension_index },
     .{ .sql = "CREATE INDEX IF NOT EXISTS usage_records_status_idx ON usage_records (status)", .kind = .extension_index },
     .{ .sql = "CREATE UNIQUE INDEX usage_records_status_active_idx ON usage_records (status) INCLUDE (tenant_id, amount) WHERE deleted_at IS NULL", .kind = .extension_index },
     .{ .sql = "CREATE EXTENSION vector", .kind = .extension_index },
     .{ .sql = "DROP TABLE usage_records", .kind = .ddl },
     .{ .sql = "DROP TABLE IF EXISTS usage_records", .kind = .ddl },
+    .{ .sql = "DROP VIEW IF EXISTS active_usage CASCADE", .kind = .ddl },
     .{ .sql = "DROP INDEX usage_records_status_idx", .kind = .extension_index },
     .{ .sql = "DROP EXTENSION vector", .kind = .extension_index },
     .{ .sql = "DROP SCHEMA analytics CASCADE", .kind = .ddl },
@@ -1918,9 +1926,11 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (generatedCreateTableAsTargetRange(tokens, 0, statementTokenEnd(tokens)) != null) return .{ .ddl = .relation_population };
         if (generatedCreateTableTargetRange(tokens, 0, statementTokenEnd(tokens)) != null) return .{ .ddl = .create_table };
         const second = tokens[1];
+        if (second.matchesKeywordTag(.@"or") and tokens.len > 3 and tokens[2].matchesKeywordTag(.replace) and tokens[3].matchesKeywordTag(.view)) return .{ .ddl = .create_view };
         if (second.matchesKeywordTag(.database)) return .{ .ddl = .create_database };
         if (second.matchesKeywordTag(.schema)) return .{ .ddl = .create_schema };
         if (second.matchesKeywordTag(.table)) return .{ .ddl = .create_table };
+        if (second.matchesKeywordTag(.view)) return .{ .ddl = .create_view };
         if (second.matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
         if (second.matchesKeywordTag(.unique) and tokens.len > 2 and tokens[2].matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
         if (second.matchesKeywordTag(.foreign) and tokens.len > 2 and tokens[2].matchesKeywordTag(.table)) return .{ .unsupported = .create_foreign_table };
@@ -1946,6 +1956,9 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.alter) and tokens.len > 1 and tokens[1].matchesKeywordTag(.table)) {
         return .{ .ddl = .alter_table };
     }
+    if (first.matchesKeywordTag(.alter) and tokens.len > 1 and tokens[1].matchesKeywordTag(.view)) {
+        return .{ .ddl = .alter_view };
+    }
     if (first.matchesKeywordTag(.alter) and tokens.len > 1) {
         const second = tokens[1];
         if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .unsupported = .alter_materialized_view };
@@ -1959,6 +1972,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.drop) and tokens.len > 1) {
         const second = tokens[1];
         if (second.matchesKeywordTag(.table)) return .{ .ddl = .drop_table };
+        if (second.matchesKeywordTag(.view)) return .{ .ddl = .drop_view };
         if (second.matchesKeywordTag(.index)) return .{ .extension_index = .drop_index };
         if (second.matchesKeywordTag(.schema)) return .{ .ddl = .drop_schema };
         if (second.matchesKeywordTag(.database)) return .{ .ddl = .drop_database };
@@ -2400,6 +2414,16 @@ fn buildDdlAst(
             ast.if_not_exists = consumeGeneratedIfNotExists(tokens, &index, end);
             ast.object_name_tokens = generatedQualifiedNameRange(tokens, index, end);
         },
+        .create_view => {
+            index = 1;
+            if (index + 2 < end and tokens[index].matchesKeywordTag(.@"or") and tokens[index + 1].matchesKeywordTag(.replace)) {
+                ast.replace_existing = true;
+                index += 2;
+            }
+            if (index < end and tokens[index].matchesKeywordTag(.view)) index += 1;
+            ast.if_not_exists = consumeGeneratedIfNotExists(tokens, &index, end);
+            ast.object_name_tokens = generatedQualifiedNameRange(tokens, index, end);
+        },
         .create_index => {
             if (tokens.len > 2 and tokens[1].matchesKeywordTag(.unique) and tokens[2].matchesKeywordTag(.index)) {
                 ast.unique = true;
@@ -2459,6 +2483,16 @@ fn buildDdlAst(
                 }
             }
         },
+        .alter_view => {
+            if (end > 2 and tokens[1].matchesKeywordTag(.view)) {
+                index = 2;
+                ast.object_name_tokens = generatedQualifiedNameRange(tokens, index, end);
+                if (ast.object_name_tokens) |view_range| {
+                    index = view_range.end;
+                    if (index < end) ast.alter_table_operation_tokens = .{ .start = index, .end = end };
+                }
+            }
+        },
         .drop_database => {
             ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
             ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
@@ -2467,6 +2501,11 @@ fn buildDdlAst(
         .drop_table => {
             ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
             ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
+            ast.cascade = findKeyword(tokens, index + 1, end, .cascade) != null;
+        },
+        .drop_view => {
+            ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
+            ast.object_name_tokens = generatedQualifiedNameRange(tokens, index, end);
             ast.cascade = findKeyword(tokens, index + 1, end, .cascade) != null;
         },
         .drop_index => {
@@ -5706,6 +5745,9 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_table }, (try parseSqlAlloc(alloc, "CREATE TABLE usage_records (id text)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_table }, (try parseSqlAlloc(alloc, "CREATE TEMP TABLE usage_session_records (id uuid)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_table }, (try parseSqlAlloc(alloc, "CREATE UNLOGGED TABLE IF NOT EXISTS usage_ingest_records (id uuid)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_view }, (try parseSqlAlloc(alloc, "CREATE VIEW active_usage AS SELECT id FROM usage_records")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_view }, (try parseSqlAlloc(alloc, "ALTER VIEW active_usage RENAME TO active_usage_v2")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_view }, (try parseSqlAlloc(alloc, "DROP VIEW active_usage")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .relation_population }, (try parseSqlAlloc(alloc, "SELECT account_id, total INTO usage_archive FROM usage_records WHERE total > 10")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .relation_population }, (try parseSqlAlloc(alloc, "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT account_id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_schema }, (try parseSqlAlloc(alloc, "DROP SCHEMA analytics CASCADE")).statement);
@@ -5830,6 +5872,18 @@ test "generated SQL parser facade builds control AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const create_view_sql = "CREATE OR REPLACE VIEW IF NOT EXISTS active_usage AS SELECT id, status FROM usage_records";
+    const create_view_result = try parseSqlAlloc(alloc, create_view_sql);
+    switch (create_view_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.create_view, ddl.kind);
+            try std.testing.expect(ddl.replace_existing);
+            try std.testing.expect(ddl.if_not_exists);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, ddl.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const extension_sql = "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public VERSION '1.3'";
     const extension_result = try parseSqlAlloc(alloc, extension_sql);
     switch (extension_result.ast.?) {
@@ -5914,6 +5968,17 @@ test "generated SQL parser facade builds control AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const alter_view_sql = "ALTER VIEW active_usage RENAME TO active_usage_v2";
+    const alter_view_result = try parseSqlAlloc(alloc, alter_view_sql);
+    switch (alter_view_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.alter_view, ddl.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 6 }, ddl.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const drop_index_sql = "DROP INDEX IF EXISTS usage_status_idx";
     const drop_index_result = try parseSqlAlloc(alloc, drop_index_sql);
     switch (drop_index_result.ast.?) {
@@ -5930,6 +5995,18 @@ test "generated SQL parser facade builds control AST spans" {
     switch (drop_table_result.ast.?) {
         .ddl => |ddl| {
             try std.testing.expectEqual(GeneratedSqlDdlKind.drop_table, ddl.kind);
+            try std.testing.expect(ddl.if_exists);
+            try std.testing.expect(ddl.cascade);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const drop_view_sql = "DROP VIEW IF EXISTS active_usage CASCADE";
+    const drop_view_result = try parseSqlAlloc(alloc, drop_view_sql);
+    switch (drop_view_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.drop_view, ddl.kind);
             try std.testing.expect(ddl.if_exists);
             try std.testing.expect(ddl.cascade);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl.object_name_tokens.?);

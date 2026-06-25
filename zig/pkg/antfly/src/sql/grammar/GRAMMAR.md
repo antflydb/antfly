@@ -67,6 +67,10 @@ Generated AST-to-plan parity also covers seed `CREATE TABLE`, `DROP TABLE`, `CRE
 forms using the same parser options as the existing lowerer. Generated
 `CREATE TABLE` classification now includes `TEMP`/`TEMPORARY` and `UNLOGGED`
 relation-lifetime prefixes with retained target-name spans.
+Plain view catalog DDL heads, including `CREATE VIEW`, `CREATE OR REPLACE VIEW`,
+`ALTER VIEW ... RENAME TO`, and `DROP VIEW`, now parse through generated DDL
+ASTs and use a generated runtime boundary before delegating to the existing
+typed view catalog planner.
 Generated
 `CREATE INDEX` ASTs also retain
 `UNIQUE`, method, element-list, covering-index `INCLUDE (...)`, options, and
@@ -77,11 +81,11 @@ PostgreSQL-style relation population heads, including `SELECT ... INTO` and
 now parse and classify through the generated DDL family with retained target
 name spans before delegating to the existing relation-population planner.
 Incomplete covered DDL clause-boundary shapes for `CREATE TABLE`, lifetime
-prefixed `CREATE [TEMP|TEMPORARY|UNLOGGED] TABLE`, `CREATE INDEX`,
-`ALTER TABLE`, and `DROP TABLE` now fail closed through the generated parser
-instead of falling back to the legacy DDL classifier, while rich DDL syntax
-that is not yet generated-covered still falls back to the existing typed DDL
-parser.
+prefixed `CREATE [TEMP|TEMPORARY|UNLOGGED] TABLE`, `CREATE VIEW`,
+`CREATE INDEX`, `ALTER TABLE`, `ALTER VIEW`, `DROP TABLE`, and `DROP VIEW` now
+fail closed through the generated parser instead of falling back to the legacy
+DDL classifier, while rich DDL syntax that is not yet generated-covered still
+falls back to the existing typed DDL parser.
 Simple DML now has generated-parser corpus
 coverage, retained generated raw and AST nodes for covered write statements,
 structured generated DML ranges for target tables, sources, assignments,

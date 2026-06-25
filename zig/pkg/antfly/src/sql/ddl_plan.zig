@@ -3266,6 +3266,10 @@ pub fn ddlPlanFromGeneratedAstAlloc(
             }
             break :blk .{ .create_table = try parseCreateTablePlanAlloc(alloc, tail, &pos, options.column_definition_options) };
         },
+        .create_view,
+        .alter_view,
+        .drop_view,
+        => try viewCatalogPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options),
         .create_index => .{ .create_index = try createIndexPlanFromGeneratedAstAlloc(alloc, tokens, ast, options.create_index_options) },
         .alter_table => if (generatedAlterTableUsesRowSecurityRuntimeBoundary(tokens, ast))
             .{ .row_security_catalog = .{ .alter_table = try rowSecurityAlterTablePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } }
@@ -3281,8 +3285,11 @@ fn generatedDdlUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated
     return switch (ast.kind) {
         .create_database,
         .create_schema,
+        .create_view,
         .create_extension,
+        .alter_view,
         .drop_table,
+        .drop_view,
         .drop_index,
         .drop_schema,
         .drop_database,
@@ -3306,6 +3313,107 @@ fn generatedCreateTableMayUseIdentityAllocator(tokens: []const grammar.Token, as
     const end = generatedStatementEnd(tokens, ast.statement_span) orelse return false;
     return generatedRangeContainsText(tokens, .{ .start = 0, .end = end }, "serial") or
         generatedRangeContainsText(tokens, .{ .start = 0, .end = end }, "bigserial");
+}
+
+fn viewCatalogPlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+    options: DdlPlanParserOptions,
+) !LoweredDdlPlan {
+    try validateGeneratedViewDdlAst(tokens, ast);
+    var pos: usize = 0;
+    var plan = try parseDdlPlanAlloc(alloc, tokens, &pos, options);
+    errdefer plan.deinit(alloc);
+    if (pos != tokens.len) return error.UnsupportedSqlShape;
+    switch (ast.kind) {
+        .create_view => switch (plan) {
+            .view_catalog => |catalog| switch (catalog) {
+                .create => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .alter_view => switch (plan) {
+            .view_catalog => |catalog| switch (catalog) {
+                .rename => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .drop_view => switch (plan) {
+            .view_catalog => |catalog| switch (catalog) {
+                .drop => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+    return plan;
+}
+
+fn validateGeneratedViewDdlAst(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) !void {
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    const object_name = ast.object_name_tokens orelse return error.UnsupportedSqlShape;
+    if (object_name.start >= object_name.end or object_name.end > end) return error.UnsupportedSqlShape;
+    switch (ast.kind) {
+        .create_view => {
+            if (end < 4 or !tokens[0].matchesKeyword("create")) return error.UnsupportedSqlShape;
+            var view_index: usize = 1;
+            if (view_index + 2 < end and tokens[view_index].matchesKeyword("or") and tokens[view_index + 1].matchesKeyword("replace")) {
+                if (!ast.replace_existing) return error.UnsupportedSqlShape;
+                view_index += 2;
+            } else if (ast.replace_existing) {
+                return error.UnsupportedSqlShape;
+            }
+            if (view_index >= end or !tokens[view_index].matchesKeyword("view")) return error.UnsupportedSqlShape;
+            var name_index = view_index + 1;
+            const if_not_exists = consumeGeneratedPlanIfNotExists(tokens, &name_index, end);
+            if (if_not_exists != ast.if_not_exists) return error.UnsupportedSqlShape;
+            if (object_name.start != name_index) return error.UnsupportedSqlShape;
+        },
+        .alter_view => {
+            if (end < 6 or !tokens[0].matchesKeyword("alter") or !tokens[1].matchesKeyword("view")) return error.UnsupportedSqlShape;
+            if (object_name.start != 2) return error.UnsupportedSqlShape;
+            const operation = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+            if (operation.start != object_name.end or operation.end != end) return error.UnsupportedSqlShape;
+            if (operation.start >= end or !tokens[operation.start].matchesKeyword("rename")) return error.UnsupportedSqlShape;
+        },
+        .drop_view => {
+            if (end < 3 or !tokens[0].matchesKeyword("drop") or !tokens[1].matchesKeyword("view")) return error.UnsupportedSqlShape;
+            var name_index: usize = 2;
+            const if_exists = consumeGeneratedPlanIfExists(tokens, &name_index, end);
+            if (if_exists != ast.if_exists) return error.UnsupportedSqlShape;
+            if (object_name.start != name_index) return error.UnsupportedSqlShape;
+            const has_cascade = generatedRangeHasKeyword(tokens, .{ .start = object_name.end, .end = end }, "cascade");
+            if (has_cascade != ast.cascade) return error.UnsupportedSqlShape;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
+fn consumeGeneratedPlanIfNotExists(tokens: []const grammar.Token, index: *usize, end: usize) bool {
+    if (index.* + 2 < end and
+        tokens[index.*].matchesKeyword("if") and
+        tokens[index.* + 1].matchesKeyword("not") and
+        tokens[index.* + 2].matchesKeyword("exists"))
+    {
+        index.* += 3;
+        return true;
+    }
+    return false;
+}
+
+fn consumeGeneratedPlanIfExists(tokens: []const grammar.Token, index: *usize, end: usize) bool {
+    if (index.* + 1 < end and
+        tokens[index.*].matchesKeyword("if") and
+        tokens[index.* + 1].matchesKeyword("exists"))
+    {
+        index.* += 2;
+        return true;
+    }
+    return false;
 }
 
 fn generatedCreateIndexUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) bool {
@@ -3927,14 +4035,18 @@ fn validateGeneratedDdlAstSpans(
         .create_database,
         .create_schema,
         .create_table,
+        .create_view,
         .create_index,
         .create_extension,
         .create_graph_index,
         .create_graph_metric,
         => .create,
         .relation_population => unreachable,
-        .alter_table => .alter,
+        .alter_table,
+        .alter_view,
+        => .alter,
         .drop_table,
+        .drop_view,
         .drop_index,
         .drop_schema,
         .drop_database,
@@ -15019,6 +15131,98 @@ test "sql adapter generated materialized view unsupported AST lowers to catalog 
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &unsupported_alter_sql));
+}
+
+test "sql adapter generated view DDL AST lowers to catalog plans" {
+    const alloc = std.testing.allocator;
+
+    var create_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CREATE OR REPLACE VIEW IF NOT EXISTS users_v AS SELECT id AS user_id FROM users;",
+    );
+    defer create_sql.deinit(alloc);
+    var create_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &create_sql);
+    defer create_plan.deinit(alloc);
+    switch (create_plan) {
+        .view_catalog => |catalog| switch (catalog) {
+            .create => |create| {
+                try std.testing.expectEqualStrings("users_v", create.view_name);
+                try std.testing.expectEqualStrings("users", create.source_table_name);
+                try std.testing.expectEqualStrings("user_id", create.output_fields[0]);
+                try std.testing.expect(create.replace_existing);
+                try std.testing.expect(create.if_not_exists);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var rename_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "ALTER VIEW users_v RENAME TO users_active_v;",
+    );
+    defer rename_sql.deinit(alloc);
+    var rename_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &rename_sql);
+    defer rename_plan.deinit(alloc);
+    switch (rename_plan) {
+        .view_catalog => |catalog| switch (catalog) {
+            .rename => |rename| {
+                try std.testing.expectEqualStrings("users_v", rename.view_name);
+                try std.testing.expectEqualStrings("users_active_v", rename.new_view_name);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DROP VIEW IF EXISTS users_v CASCADE;",
+    );
+    defer drop_sql.deinit(alloc);
+    var drop_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &drop_sql);
+    defer drop_plan.deinit(alloc);
+    switch (drop_plan) {
+        .view_catalog => |catalog| switch (catalog) {
+            .drop => |drop| {
+                try std.testing.expectEqualStrings("users_v", drop.view_name);
+                try std.testing.expect(drop.if_exists);
+                try std.testing.expect(drop.cascade);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var malformed_replace = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CREATE OR REPLACE VIEW users_v AS SELECT id AS user_id FROM users;",
+    );
+    defer malformed_replace.deinit(alloc);
+    if (malformed_replace.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.replace_existing = false,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_replace));
+
+    var malformed_operation = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "ALTER VIEW users_v RENAME TO users_active_v;",
+    );
+    defer malformed_operation.deinit(alloc);
+    if (malformed_operation.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.alter_table_operation_tokens = .{ .start = 2, .end = malformed_operation.items().len },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_operation));
 }
 
 test "sql adapter generated row policy unsupported AST lowers to catalog plans" {

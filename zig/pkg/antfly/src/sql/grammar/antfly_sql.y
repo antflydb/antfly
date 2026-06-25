@@ -36,7 +36,7 @@
 %token CREATE COPY DATA DATABASE DEALLOCATE DECLARE DEFAULT DELETE DESC DISCARD DISTINCT DO DROP EXECUTE
 %token ELSE END ESCAPE EXPLAIN EXISTS EXTENSION EXTRACT FALSE FETCH FILTER FIRST FOLLOWING FOR FOREIGN FROM FULL GRANT GRAPH GROUP HAVING IDENTITY IF ILIKE INCLUDE IN INDEX INNER INSERT INTERVAL INTO IS
 %token ISNULL JOIN KEY LABEL LAST LATERAL LEFT LIKE LIMIT LISTEN LOAD LOCK LOCKED MATCHED MATERIALIZED MERGE METRIC MOVE NO NOT NULL NOTIFY NOTNULL NOWAIT NULLS OF ON OR ORDER OUTER OVER PARTITION POLICY PRECEDING PREPARE PRIMARY PUBLIC PUBLICATION
-%token NEXT NOTHING OFFSET ONLY QUERY RANGE RECURSIVE REFRESH REINDEX RELEASE RESET RESTART RESTRICT RETURNING REVOKE RIGHT ROLLBACK ROW ROWS RULE SAVEPOINT SCHEMA SECURITY SELECT SERVER SET SHARE SHOW SKIP SOME SUBSCRIPTION TABLE TEMP TEMPORARY TIMESTAMP TIMESTAMPTZ TO TRUNCATE
+%token NEXT NOTHING OFFSET ONLY QUERY RANGE RECURSIVE REFRESH REINDEX RELEASE RENAME REPLACE RESET RESTART RESTRICT RETURNING REVOKE RIGHT ROLLBACK ROW ROWS RULE SAVEPOINT SCHEMA SECURITY SELECT SERVER SET SHARE SHOW SKIP SOME SUBSCRIPTION TABLE TEMP TEMPORARY TIMESTAMP TIMESTAMPTZ TO TRUNCATE
 %token SYMMETRIC THEN TRUE TRIGGER UNION UNIQUE UNKNOWN UNLISTEN UNLOGGED UPDATE USING VACUUM VALUES VIEW WHEN WHERE WINDOW WITH WITHIN
 %token EXCEPT INTERSECT UNBOUNDED
 %token BASE_WEIGHT FIELD FRESHNESS GRAPH_METRIC KEY KIND METRIC METRIC_FRESHNESS MISSING_SCORE NAME SOURCE SOURCES TYPE WEIGHT
@@ -87,9 +87,11 @@ ddl_statement:
     create_database_statement
   | create_schema_statement
   | create_table_statement
+  | create_view_statement
   | create_index_statement
   | create_extension_statement
   | alter_table_statement
+  | alter_view_statement
   | drop_statement
   | relation_population_statement
   ;
@@ -109,6 +111,20 @@ create_table_statement:
 create_table_body:
     LPAREN column_definition_list RPAREN
   | AS read_statement create_table_as_data_opt
+  ;
+
+create_view_statement:
+    CREATE create_view_replace_opt VIEW if_not_exists_opt qualified_name view_column_list_opt AS read_statement
+  ;
+
+create_view_replace_opt:
+    /* empty */
+  | OR REPLACE
+  ;
+
+view_column_list_opt:
+    /* empty */
+  | LPAREN identifier_list RPAREN
   ;
 
 relation_population_statement:
@@ -156,6 +172,10 @@ alter_table_statement:
     ALTER TABLE alter_table_relation_prefix_opt qualified_name diagnostic_tail_opt
   ;
 
+alter_view_statement:
+    ALTER VIEW qualified_name RENAME TO qualified_name
+  ;
+
 alter_table_relation_prefix_opt:
     /* empty */
   | IF EXISTS
@@ -169,6 +189,7 @@ drop_statement:
   | DROP SCHEMA if_exists_opt qualified_name drop_behavior_opt
   | DROP DATABASE if_exists_opt qualified_name drop_database_force_opt
   | DROP EXTENSION if_exists_opt qualified_name drop_behavior_opt
+  | DROP VIEW if_exists_opt qualified_name drop_behavior_opt
   ;
 
 drop_database_force_opt:
@@ -1058,6 +1079,8 @@ identifier_name:
   | NOTIFY
   | REFRESH
   | RELEASE
+  | RENAME
+  | REPLACE
   | REVOKE
   | SAVEPOINT
   | SECURITY
@@ -1191,6 +1214,8 @@ diagnostic_token:
   | PUBLICATION
   | REFRESH
   | RELEASE
+  | RENAME
+  | REPLACE
   | RESTRICT
   | REVOKE
   | ROW
