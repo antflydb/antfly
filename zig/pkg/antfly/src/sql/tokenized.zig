@@ -1064,7 +1064,6 @@ fn generatedSqlAggregateFunctionName(token: Token) bool {
 
 fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUnsupportedKind) bool {
     return switch (kind) {
-        .alter_policy,
         .alter_publication,
         .alter_subscription,
         .analyze,
@@ -1073,12 +1072,10 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .cluster,
         .comment,
         .copy,
-        .create_policy,
         .create_publication,
         .create_subscription,
         .create_trigger,
         .declare,
-        .drop_policy,
         .drop_publication,
         .drop_subscription,
         .drop_trigger,
@@ -1097,17 +1094,20 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .explain,
         .alter_foreign_table,
         .alter_materialized_view,
+        .alter_policy,
         .alter_rule,
         .alter_server,
         .alter_trigger,
         .checkpoint,
         .create_foreign_table,
         .create_materialized_view,
+        .create_policy,
         .create_rule,
         .create_server,
         .do_block,
         .drop_foreign_table,
         .drop_materialized_view,
+        .drop_policy,
         .drop_rule,
         .drop_server,
         .load,
@@ -1452,6 +1452,11 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE SUBSCRIPTION usage_sub CONNECTION"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER SUBSCRIPTION usage_sub"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP SUBSCRIPTION IF EXISTS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE POLICY"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE POLICY usage_policy ON"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER POLICY usage_policy ON"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP POLICY IF EXISTS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP POLICY IF EXISTS usage_policy ON"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT DISTINCT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT DISTINCT ON ("));
@@ -1723,11 +1728,6 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .alter_materialized_view_not_planned_by_generated_parser,
         },
         .{
-            .sql = "ALTER POLICY usage_policy ON usage_records RENAME TO usage_policy_v2",
-            .kind = .alter_policy,
-            .reason = .alter_policy_not_planned_by_generated_parser,
-        },
-        .{
             .sql = "ALTER RULE usage_insert ON usage_records RENAME TO usage_insert_v2",
             .kind = .alter_rule,
             .reason = .alter_rule_not_planned_by_generated_parser,
@@ -1776,11 +1776,6 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "CREATE FOREIGN TABLE foreign_usage_records (id text) SERVER usage_fdw",
             .kind = .create_foreign_table,
             .reason = .create_foreign_table_not_planned_by_generated_parser,
-        },
-        .{
-            .sql = "CREATE POLICY usage_policy ON usage_records USING (tenant_id = current_user)",
-            .kind = .create_policy,
-            .reason = .create_policy_not_planned_by_generated_parser,
         },
         .{
             .sql = "CREATE RULE usage_insert AS ON INSERT TO usage_records DO ALSO NOTIFY usage_events",
@@ -1881,11 +1876,6 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "SECURITY LABEL ON TABLE usage_records IS 'internal'",
             .kind = .security_label,
             .reason = .security_label_not_planned_by_generated_parser,
-        },
-        .{
-            .sql = "DROP POLICY IF EXISTS usage_policy ON usage_records",
-            .kind = .drop_policy,
-            .reason = .drop_policy_not_planned_by_generated_parser,
         },
         .{
             .sql = "DROP RULE IF EXISTS usage_insert ON usage_records",
@@ -2358,6 +2348,58 @@ test "sql adapter parsed sql owns typed statement variants" {
         else => return error.TestUnexpectedResult,
     }
     switch (drop_subscription.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var create_policy = try ParsedSql.initAlloc(alloc, "CREATE POLICY usage_policy ON usage_records USING (tenant_id = current_user)");
+    defer create_policy.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, create_policy.generatedStatementKind().?);
+    switch (create_policy.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_policy, ddl_ast.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl_ast.index_table_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 11 }, ddl_ast.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (create_policy.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var alter_policy = try ParsedSql.initAlloc(alloc, "ALTER POLICY usage_policy ON usage_records WITH CHECK (status = 'ready')");
+    defer alter_policy.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, alter_policy.generatedStatementKind().?);
+    switch (alter_policy.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.alter_policy, ddl_ast.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl_ast.index_table_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 12 }, ddl_ast.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (alter_policy.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_policy = try ParsedSql.initAlloc(alloc, "DROP POLICY IF EXISTS usage_policy ON usage_records CASCADE");
+    defer drop_policy.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, drop_policy.generatedStatementKind().?);
+    switch (drop_policy.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.drop_policy, ddl_ast.kind);
+            try std.testing.expect(ddl_ast.if_exists);
+            try std.testing.expect(ddl_ast.cascade);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 7 }, ddl_ast.index_table_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (drop_policy.statement) {
         .ddl => {},
         else => return error.TestUnexpectedResult,
     }

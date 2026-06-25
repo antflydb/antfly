@@ -13,7 +13,6 @@
 // limitations.
 
 const std = @import("std");
-const http_common = @import("../raft/transport/http_common.zig");
 const http_server = @import("http_server.zig");
 const platform_clock = @import("../platform/clock.zig");
 const sql_adapter = @import("../sql/mod.zig");
@@ -503,79 +502,72 @@ const Connection = struct {
     }
 
     fn executeAndEncodeOne(self: *Connection, sql: []const u8, send_ready_on_error: bool) !bool {
-        var response = self.executeSql(sql) catch |err| {
+        var outcome = self.executeSql(sql) catch |err| {
             std.log.warn("pgwire sql execution failed err={}", .{err});
             try self.sendError("XX000", "internal sql execution error");
             if (send_ready_on_error) try self.sendReadyForQuery();
             return false;
         };
-        defer response.deinit(self.api_server.alloc);
-
-        if (response.status < 200 or response.status >= 300) {
-            try self.sendError(pgwire_module.sqlstateForHttpStatus(response.status), response.body);
-            if (send_ready_on_error) try self.sendReadyForQuery();
-            return false;
+        switch (outcome) {
+            .response => |*response| {
+                defer response.deinit(self.api_server.alloc);
+                try self.sendError(pgwire_module.sqlstateForHttpStatus(response.status), response.body);
+                if (send_ready_on_error) try self.sendReadyForQuery();
+                return false;
+            },
+            .result => |*result| {
+                defer result.deinit(self.api_server.alloc);
+                try self.encodeSqlResult(sql, result);
+                return true;
+            },
         }
-        try self.encodeSqlResponse(sql, response.body);
-        return true;
     }
 
-    fn executeSql(self: *Connection, sql: []const u8) !http_common.HttpResponse {
-        var body: std.Io.Writer.Allocating = .init(self.alloc);
-        defer body.deinit();
-        const writer = &body.writer;
-        try writer.print("{{\"sql\":{f}", .{std.json.fmt(sql, .{})});
-        if (self.session_id) |id| try writer.print(",\"session_id\":{d}", .{id});
-        if (self.database) |database| try writer.print(",\"database\":{f}", .{std.json.fmt(database, .{})});
-        if (self.namespace) |namespace| try writer.print(",\"namespace\":{f}", .{std.json.fmt(namespace, .{})});
-        try writer.writeAll(",\"read_only\":false");
-        try writer.writeByte('}');
-        return try self.api_server.handlePublicSql(body.written(), null);
+    fn executeSql(self: *Connection, sql: []const u8) !http_server.ApiHttpServer.PublicSqlResultOrResponse {
+        return try self.api_server.handlePublicSqlRequestResult(.{
+            .sql = sql,
+            .session_id = self.session_id,
+            .database = self.database,
+            .namespace = self.namespace,
+            .read_only = false,
+        }, null);
     }
 
-    fn encodeSqlResponse(self: *Connection, sql: []const u8, body: []const u8) !void {
-        var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, body, .{ .allocate = .alloc_always }) catch {
-            try self.sendError("XX000", "invalid sql response");
-            return;
-        };
-        defer parsed.deinit();
-        if (parsed.value != .object) {
-            try self.sendError("XX000", "invalid sql response");
-            return;
-        }
-        if (pgwire_module.jsonU64(parsed.value.object.get("session_id"))) |id| self.session_id = id;
-        const kind = pgwire_module.jsonString(parsed.value.object.get("kind")) orelse "ok";
-        const statement_kind = pgwire_module.jsonString(parsed.value.object.get("statement_kind")) orelse kind;
-        if (std.mem.eql(u8, kind, "ddl")) {
-            try self.sendCommandComplete(pgwire_module.commandTagForDdlSql(self.alloc, sql) orelse pgwire_module.commandTagForDdlResponse(parsed.value));
-            return;
-        }
-        if (std.mem.eql(u8, kind, "read")) {
-            const result = parsed.value.object.get("result");
-            const rows = pgwire_module.responseRows(result) orelse &.{};
-            const columns = try pgwire_module.responseColumnNamesAlloc(self.alloc, result);
-            defer if (columns) |names| self.alloc.free(names);
-            const tag = try pgwire_module.commandTagForRows(self.alloc, "SELECT", rows.len);
-            defer self.alloc.free(tag);
-            try self.sendRows(rows, columns, tag);
-            return;
-        }
-        if (std.mem.eql(u8, kind, "write")) {
-            const result = parsed.value.object.get("result");
-            if (pgwire_module.responseReturningRows(result)) |rows| {
-                const columns = try pgwire_module.responseColumnNamesAlloc(self.alloc, result);
+    fn encodeSqlResult(self: *Connection, sql: []const u8, result: *const http_server.ApiHttpServer.PublicSqlResult) !void {
+        self.session_id = result.session_id;
+        switch (result.result) {
+            .ddl => |applied| try self.sendCommandComplete(pgwire_module.commandTagForDdlSql(self.alloc, sql) orelse pgwire_module.commandTagForDdlApplied(applied)),
+            .read => |read| {
+                const rows = pgwire_module.readResultRows(read);
+                const tag = try pgwire_module.commandTagForRows(self.alloc, "SELECT", rows.len);
+                defer self.alloc.free(tag);
+                const columns = try pgwire_module.readResultColumnNamesAlloc(self.alloc, read);
                 defer if (columns) |names| self.alloc.free(names);
-                const tag = try pgwire_module.commandTagForRows(self.alloc, statement_kind, rows.len);
-                defer self.alloc.free(tag);
-                try self.sendRows(rows, columns, tag);
-            } else {
-                const tag = try pgwire_module.commandTagForWrite(self.alloc, statement_kind, result);
-                defer self.alloc.free(tag);
-                try self.sendCommandComplete(tag);
-            }
-            return;
+                try self.sendJsonRows(rows, columns, tag);
+            },
+            .rows_batch => |rows_batch| {
+                if (rows_batch.returning_rows.len > 0) {
+                    const tag = try pgwire_module.commandTagForRows(self.alloc, result.statement_kind, rows_batch.returning_rows.len);
+                    defer self.alloc.free(tag);
+                    try self.sendJsonRows(rows_batch.returning_rows, null, tag);
+                } else {
+                    const tag = try pgwire_module.commandTagForRowsBatch(self.alloc, result.statement_kind, rows_batch);
+                    defer self.alloc.free(tag);
+                    try self.sendCommandComplete(tag);
+                }
+            },
+            .mutation_source => |mutation_source| {
+                if (mutation_source.returning_rows.len > 0) {
+                    const tag = try pgwire_module.commandTagForRows(self.alloc, result.statement_kind, mutation_source.returning_rows.len);
+                    defer self.alloc.free(tag);
+                    try self.sendJsonRows(mutation_source.returning_rows, null, tag);
+                } else {
+                    const tag = try pgwire_module.commandTagForMutationSource(self.alloc, result.statement_kind, mutation_source);
+                    defer self.alloc.free(tag);
+                    try self.sendCommandComplete(tag);
+                }
+            },
         }
-        try self.sendCommandComplete(statement_kind);
     }
 
     fn sendRows(
@@ -622,14 +614,76 @@ const Connection = struct {
         try self.sendCommandComplete(tag);
     }
 
+    fn sendJsonRows(
+        self: *Connection,
+        rows: []const []const u8,
+        schema_columns: ?[]const []const u8,
+        tag: []const u8,
+    ) !void {
+        if (schema_columns) |columns| {
+            var row_description: std.Io.Writer.Allocating = .init(self.alloc);
+            defer row_description.deinit();
+            try row_description.writer.writeInt(i16, @intCast(columns.len), .big);
+            for (columns) |column| try pgwire_module.appendTextColumnDescription(&row_description.writer, column);
+            try self.sendMessage('T', row_description.written());
+            for (rows) |row_json| {
+                var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, row_json, .{ .allocate = .alloc_always });
+                defer parsed.deinit();
+                try self.sendDataRowForColumnNames(parsed.value, columns);
+            }
+            try self.sendCommandComplete(tag);
+            return;
+        }
+
+        var row_description: std.Io.Writer.Allocating = .init(self.alloc);
+        defer row_description.deinit();
+        if (rows.len == 0) {
+            try row_description.writer.writeInt(i16, 0, .big);
+            try self.sendMessage('T', row_description.written());
+            try self.sendCommandComplete(tag);
+            return;
+        }
+
+        var first_row = try std.json.parseFromSlice(std.json.Value, self.alloc, rows[0], .{ .allocate = .alloc_always });
+        defer first_row.deinit();
+        if (first_row.value != .object) {
+            try row_description.writer.writeInt(i16, 0, .big);
+            try self.sendMessage('T', row_description.written());
+            try self.sendCommandComplete(tag);
+            return;
+        }
+
+        const first_row_columns = first_row.value.object;
+        const columns = try self.alloc.alloc([]const u8, first_row_columns.count());
+        defer self.alloc.free(columns);
+        var column_it = first_row_columns.iterator();
+        var column_index: usize = 0;
+        while (column_it.next()) |entry| : (column_index += 1) columns[column_index] = entry.key_ptr.*;
+
+        try row_description.writer.writeInt(i16, @intCast(columns.len), .big);
+        for (columns) |column| try pgwire_module.appendTextColumnDescription(&row_description.writer, column);
+        try self.sendMessage('T', row_description.written());
+        try self.sendDataRowForColumnNames(first_row.value, columns);
+        for (rows[1..]) |row_json| {
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, row_json, .{ .allocate = .alloc_always });
+            defer parsed.deinit();
+            try self.sendDataRowForColumnNames(parsed.value, columns);
+        }
+        try self.sendCommandComplete(tag);
+    }
+
     fn sendDataRowsForColumnNames(self: *Connection, rows: []const std.json.Value, columns: []const []const u8) !void {
         for (rows) |row| {
-            var data: std.Io.Writer.Allocating = .init(self.alloc);
-            defer data.deinit();
-            try data.writer.writeInt(i16, @intCast(columns.len), .big);
-            for (columns) |column| try self.appendDataValue(&data.writer, row, column);
-            try self.sendMessage('D', data.written());
+            try self.sendDataRowForColumnNames(row, columns);
         }
+    }
+
+    fn sendDataRowForColumnNames(self: *Connection, row: std.json.Value, columns: []const []const u8) !void {
+        var data: std.Io.Writer.Allocating = .init(self.alloc);
+        defer data.deinit();
+        try data.writer.writeInt(i16, @intCast(columns.len), .big);
+        for (columns) |column| try self.appendDataValue(&data.writer, row, column);
+        try self.sendMessage('D', data.written());
     }
 
     fn appendDataValue(self: *Connection, writer: *std.Io.Writer, row: std.json.Value, column: []const u8) !void {
@@ -907,36 +961,24 @@ fn appendSqlLiteral(writer: *std.Io.Writer, value: ?[]const u8) !void {
     try writer.writeByte('\'');
 }
 
-fn responseRows(result: ?std.json.Value) ?[]const std.json.Value {
-    const value = result orelse return null;
-    if (value != .object) return null;
-    const rows = value.object.get("rows") orelse return null;
-    if (rows != .array) return null;
-    return rows.array.items;
+fn readResultRows(read: anytype) []const []const u8 {
+    return switch (read.result) {
+        .query => |query| query.rows,
+        .document_query => |query| query.rows,
+        .set_operation => |query| query.rows,
+        .recursive_cte => |query| query.rows,
+        .aggregate => |aggregate| aggregate.rows,
+        .window => |window| window.rows,
+        .join => |join| join.rows,
+        .lateral => |lateral| lateral.rows,
+    };
 }
 
-fn responseReturningRows(result: ?std.json.Value) ?[]const std.json.Value {
-    const value = result orelse return null;
-    if (value != .object) return null;
-    const rows = value.object.get("returning") orelse return null;
-    if (rows != .array) return null;
-    return rows.array.items;
-}
-
-fn responseColumnNamesAlloc(alloc: std.mem.Allocator, result: ?std.json.Value) !?[]const []const u8 {
-    const value = result orelse return null;
-    if (value != .object) return null;
-    const result_schema = value.object.get("result_schema") orelse return null;
-    if (result_schema != .array or result_schema.array.items.len == 0) return null;
-    var names: std.ArrayListUnmanaged([]const u8) = .empty;
-    errdefer names.deinit(alloc);
-    for (result_schema.array.items) |item| {
-        if (item != .object) continue;
-        const name = jsonString(item.object.get("display_name")) orelse jsonString(item.object.get("name")) orelse continue;
-        try names.append(alloc, name);
-    }
-    if (names.items.len == 0) return null;
-    return try names.toOwnedSlice(alloc);
+fn readResultColumnNamesAlloc(alloc: std.mem.Allocator, read: anytype) !?[]const []const u8 {
+    if (read.columns.len == 0) return null;
+    const names = try alloc.alloc([]const u8, read.columns.len);
+    for (read.columns, 0..) |column, i| names[i] = column.name;
+    return names;
 }
 
 fn commandTagForDdlSql(alloc: std.mem.Allocator, sql: []const u8) ?[]const u8 {
@@ -1024,49 +1066,18 @@ fn ddlObjectModifier(token: sql_adapter.Token) bool {
         token.matchesKeyword("unlogged");
 }
 
-fn jsonString(value: ?std.json.Value) ?[]const u8 {
-    const raw = value orelse return null;
-    if (raw != .string) return null;
-    return raw.string;
-}
-
-fn jsonU64(value: ?std.json.Value) ?u64 {
-    const raw = value orelse return null;
-    return switch (raw) {
-        .integer => |v| if (v >= 0) @intCast(v) else null,
-        .float => |v| if (v >= 0 and @floor(v) == v) @intFromFloat(v) else null,
-        else => null,
-    };
-}
-
-fn jsonBool(value: ?std.json.Value) bool {
-    const raw = value orelse return false;
-    if (raw != .bool) return false;
-    return raw.bool;
-}
-
-fn jsonCount(value: ?std.json.Value, field: []const u8) ?u64 {
-    const raw = value orelse return null;
-    if (raw != .object) return null;
-    return jsonU64(raw.object.get(field));
-}
-
-fn commandTagForDdlResponse(response: std.json.Value) []const u8 {
-    if (response != .object) return "DDL";
-    const applied = response.object.get("applied") orelse return "DDL";
-    if (applied != .object) return "DDL";
-    const object = applied.object;
-    if (jsonBool(object.get("created_table"))) return "CREATE TABLE";
-    if (jsonBool(object.get("dropped_table"))) return "DROP TABLE";
-    if (jsonBool(object.get("created_database"))) return "CREATE DATABASE";
-    if (jsonBool(object.get("dropped_database"))) return "DROP DATABASE";
-    if (jsonBool(object.get("created_namespace"))) return "CREATE SCHEMA";
-    if (jsonBool(object.get("renamed_namespace"))) return "ALTER SCHEMA";
-    if (jsonBool(object.get("dropped_namespace"))) return "DROP SCHEMA";
-    if (jsonBool(object.get("created_tablespace"))) return "CREATE TABLESPACE";
-    if (jsonBool(object.get("renamed_tablespace"))) return "ALTER TABLESPACE";
-    if (jsonBool(object.get("dropped_tablespace"))) return "DROP TABLESPACE";
-    if (jsonBool(response.object.get("noop"))) return "DDL";
+fn commandTagForDdlApplied(applied: anytype) []const u8 {
+    if (applied.created_table) return "CREATE TABLE";
+    if (applied.dropped_table) return "DROP TABLE";
+    if (applied.created_database) return "CREATE DATABASE";
+    if (applied.dropped_database) return "DROP DATABASE";
+    if (applied.created_namespace) return "CREATE SCHEMA";
+    if (applied.renamed_namespace) return "ALTER SCHEMA";
+    if (applied.dropped_namespace) return "DROP SCHEMA";
+    if (applied.created_tablespace) return "CREATE TABLESPACE";
+    if (applied.renamed_tablespace) return "ALTER TABLESPACE";
+    if (applied.dropped_tablespace) return "DROP TABLESPACE";
+    if (applied.noop) return "DDL";
     return "ALTER TABLE";
 }
 
@@ -1074,10 +1085,14 @@ fn commandTagForRows(alloc: std.mem.Allocator, statement_kind: []const u8, row_c
     return try std.fmt.allocPrint(alloc, "{s} {d}", .{ commandVerb(statement_kind), row_count });
 }
 
-fn commandTagForWrite(alloc: std.mem.Allocator, statement_kind: []const u8, result: ?std.json.Value) ![]u8 {
-    const verb = commandVerb(statement_kind);
-    const count = jsonCount(result, "inserted") orelse jsonCount(result, "deleted") orelse jsonCount(result, "transformed") orelse jsonCount(result, "matched") orelse jsonCount(result, "staged") orelse 0;
-    return try std.fmt.allocPrint(alloc, "{s} {d}", .{ verb, count });
+fn commandTagForRowsBatch(alloc: std.mem.Allocator, statement_kind: []const u8, result: anytype) ![]u8 {
+    const count = result.inserted + result.deleted + result.transformed;
+    return try std.fmt.allocPrint(alloc, "{s} {d}", .{ commandVerb(statement_kind), count });
+}
+
+fn commandTagForMutationSource(alloc: std.mem.Allocator, statement_kind: []const u8, result: anytype) ![]u8 {
+    const count = result.staged;
+    return try std.fmt.allocPrint(alloc, "{s} {d}", .{ commandVerb(statement_kind), count });
 }
 
 fn commandVerb(statement_kind: []const u8) []const u8 {

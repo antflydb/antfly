@@ -322,8 +322,6 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
         pub fn rowSecurityPolicyOptions(ptr: *ParserType) ddl_plan.RowSecurityPolicyOptions {
             return .{
                 .function_bindings = ptr.function_bindings,
-                .context_hooks = Accessors.selectParserContextHooks(ptr),
-                .boolean_hooks = Accessors.booleanRowExpressionParserHooks(ptr),
             };
         }
 

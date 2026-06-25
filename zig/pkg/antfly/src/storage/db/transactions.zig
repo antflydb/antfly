@@ -13,21 +13,25 @@
 // limitations.
 
 const std = @import("std");
+const platform = @import("antfly_platform");
 
 const db_internal = @import("internal.zig");
 const doc_identity = @import("doc_identity.zig");
 const docstore_mod = @import("../docstore.zig");
 const internal_keys = @import("../internal_keys.zig");
+const mapper = @import("document_mapper.zig");
 const platform_clock = @import("../../platform/clock.zig");
 const platform_time = @import("../../platform/time.zig");
 const relational_integrity = @import("relational_integrity.zig");
 const relational_rows = @import("relational_rows.zig");
 const relational_store_mod = @import("relational_store.zig");
+const schema_api_mod = @import("../../schema/mod.zig");
 const schema_mod = @import("../schema.zig");
 const transactions_mod = @import("../transactions.zig");
 const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
+const TxnResolverRecorder = @import("test_support.zig").TxnResolverRecorder;
 const row_claim_intent_key_prefix = relational_rows.row_claim_intent_key_prefix;
 
 pub fn Impl(comptime DB: type) type {
@@ -1140,4 +1144,1373 @@ fn encodeTimestampValue(alloc: Allocator, timestamp_ns: u64) ![]u8 {
     const buf = try alloc.alloc(u8, 8);
     std.mem.writeInt(u64, buf[0..8], timestamp_ns, .little);
     return buf;
+}
+
+test "db transactions local lifecycle exposes committed and deleted documents" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const begin_ts: u64 = 1_700_000_000_000_000_000;
+    const commit_ts: u64 = begin_ts + 1;
+    const txn_id = try db.beginTransaction(begin_ts);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(txn_id));
+
+    try db.writeIntents(txn_id, &.{
+        .{ .key = "doc:txn", .value = "{\"title\":\"alpha\"}" },
+    }, &.{});
+
+    try db.commitTransaction(txn_id, commit_ts);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(txn_id));
+    try std.testing.expectEqual(commit_ts, try db.getCommitVersion(txn_id));
+
+    const raw = (try db.get(alloc, "doc:txn")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", raw);
+    try std.testing.expectEqual(commit_ts, try db.getTimestamp(alloc, "doc:txn"));
+
+    {
+        const stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.state_rows);
+        try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.live_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_identity_state);
+    }
+
+    const delete_txn = try db.beginTransaction(commit_ts + 1);
+    try db.writeIntents(delete_txn, &.{
+        .{ .key = "doc:txn", .value = null },
+    }, &.{});
+    try db.commitTransaction(delete_txn, commit_ts + 2);
+    try std.testing.expect((try db.get(alloc, "doc:txn")) == null);
+
+    {
+        const stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.state_rows);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.live_ordinals);
+        try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.tombstone_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_identity_state);
+    }
+}
+
+test "db transactions relational commit writes relational base rows" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const begin_ts: u64 = 1_700_000_000_000_100_000;
+    const commit_ts: u64 = begin_ts + 1;
+    const txn_id = try db.beginTransaction(begin_ts);
+    try db.writeIntents(txn_id, &.{
+        .{ .key = "row:txn", .value = "{\"title\":\"txn row\",\"amount\":12.5}" },
+    }, &.{});
+    try db.commitTransaction(txn_id, commit_ts);
+
+    const raw = (try db.get(alloc, "row:txn")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"title\":\"txn row\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"amount\":12.5") != null);
+    try std.testing.expectEqual(commit_ts, try db.getTimestamp(alloc, "row:txn"));
+
+    const relational_key = try relational_store_mod.rowKeyAlloc(alloc, "row:txn");
+    defer alloc.free(relational_key);
+    const raw_row = try db.core.store.get(alloc, relational_key);
+    defer alloc.free(raw_row);
+    try std.testing.expect(mapper.isRelationalRowValue(raw_row));
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:txn");
+    defer alloc.free(primary_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
+
+    const delete_txn = try db.beginTransaction(commit_ts + 1);
+    try db.writeIntents(delete_txn, &.{
+        .{ .key = "row:txn", .value = null },
+    }, &.{});
+    try db.commitTransaction(delete_txn, commit_ts + 2);
+    try std.testing.expect((try db.get(alloc, "row:txn")) == null);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, relational_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
+    try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(alloc, "row:txn"));
+}
+
+test "db transactions durable foreign key action schedules are atomic" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const txn_id = try db.beginTransaction(31_000);
+    try db.writeTransaction(txn_id, .{
+        .foreign_key_action_schedules = &.{.{
+            .schedule_id = "fk-action-schedule:orders:customers:customer:txn",
+            .action_job_id = "fk-action:orders:customers:customer:txn",
+            .action = "SET NULL",
+            .worker_id = "worker:txn",
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:txn",
+            .page_limit = 128,
+            .cascade_depth = 2,
+            .cascade_max_depth = 8,
+        }},
+    });
+
+    try std.testing.expect((try db.loadForeignKeyActionScheduleRecord("fk-action-schedule:orders:customers:customer:txn")) == null);
+    try db.commitTransaction(txn_id, 31_001);
+
+    const loaded = (try db.loadForeignKeyActionScheduleRecord("fk-action-schedule:orders:customers:customer:txn")) orelse return error.TestExpectedEqual;
+    defer db.freeForeignKeyActionScheduleRecord(loaded);
+    try std.testing.expectEqualStrings("fk-action:orders:customers:customer:txn", loaded.action_job_id);
+    try std.testing.expectEqualStrings("set_null", loaded.action);
+    try std.testing.expectEqualStrings("worker:txn", loaded.worker_id);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", loaded.constraint_name);
+    try std.testing.expectEqualStrings("customers", loaded.parent_table);
+    try std.testing.expectEqualStrings("customer:txn", loaded.parent_key);
+    try std.testing.expectEqual(@as(usize, 128), loaded.page_limit);
+    try std.testing.expectEqual(@as(u32, 2), loaded.cascade_depth);
+    try std.testing.expectEqual(@as(u32, 8), loaded.cascade_max_depth);
+    try std.testing.expectEqualStrings("pending", loaded.status);
+    try std.testing.expect(!loaded.completed);
+
+    const retry_txn = try db.beginTransaction(31_010);
+    try db.writeTransaction(retry_txn, .{
+        .foreign_key_action_schedules = &.{.{
+            .schedule_id = "fk-action-schedule:orders:customers:customer:txn",
+            .action_job_id = "fk-action:orders:customers:customer:txn",
+            .action = "set-null",
+            .worker_id = "worker:txn",
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:txn",
+            .page_limit = 128,
+            .cascade_depth = 2,
+            .cascade_max_depth = 8,
+        }},
+    });
+    try db.commitTransaction(retry_txn, 31_011);
+
+    const conflicting_txn = try db.beginTransaction(31_020);
+    try std.testing.expectError(error.InvalidForeignKeyActionJob, db.writeTransaction(conflicting_txn, .{
+        .foreign_key_action_schedules = &.{.{
+            .schedule_id = "fk-action-schedule:orders:customers:customer:txn",
+            .action_job_id = "fk-action:orders:customers:customer:other",
+            .action = "cascade",
+            .worker_id = "worker:txn",
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:txn",
+            .page_limit = 128,
+            .cascade_depth = 2,
+            .cascade_max_depth = 8,
+        }},
+    }));
+
+    const generated_job = try db.scheduleForeignKeyActionJobWithUpdatedParentKeyAndCascadeLineageAt(
+        "fk-action:generated-lineage",
+        "cascade",
+        "worker:txn",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:lineage",
+        null,
+        128,
+        3,
+        9,
+        31_030,
+    );
+    defer db.freeForeignKeyActionJobRecord(generated_job);
+    try std.testing.expectEqual(@as(u32, 3), generated_job.cascade_depth);
+    try std.testing.expectEqual(@as(u32, 9), generated_job.cascade_max_depth);
+
+    const generated_schedule = try db.scheduleForeignKeyActionScheduleAt(
+        "fk-action-schedule:generated-lineage",
+        "fk-action:generated-lineage",
+        "cascade",
+        "worker:txn",
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:lineage",
+        128,
+        31_031,
+    );
+    defer db.freeForeignKeyActionScheduleRecord(generated_schedule);
+    try std.testing.expectEqual(@as(u32, 0), generated_schedule.cascade_depth);
+    try std.testing.expectEqual(@as(u32, 64), generated_schedule.cascade_max_depth);
+}
+
+test "db transactions unique constraint mutations enforce owner handoff" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]}]}
+    ;
+    var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const ada_value = try relational_store_mod.bytesTupleValueAlloc(alloc, &.{"ada@example.com"});
+    defer alloc.free(ada_value);
+
+    const owner_write_txn = try db.beginTransaction(41_000);
+    try db.writeTransaction(owner_write_txn, .{
+        .unique_constraint_writes = &.{.{
+            .constraint_name = "users_email_key",
+            .encoded_value = ada_value,
+            .owner_key = "user:1",
+        }},
+    });
+    try db.commitTransaction(owner_write_txn, 41_001);
+
+    const unique_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_email_key", ada_value);
+    defer alloc.free(unique_key);
+    const owner = try db.core.store.get(alloc, unique_key);
+    defer alloc.free(owner);
+    try std.testing.expectEqualStrings("user:1", owner);
+
+    const conflicting_owner_txn = try db.beginTransaction(41_100);
+    try std.testing.expectError(error.UniqueConstraintViolation, db.writeTransaction(conflicting_owner_txn, .{
+        .unique_constraint_writes = &.{.{
+            .constraint_name = "users_email_key",
+            .encoded_value = ada_value,
+            .owner_key = "user:2",
+        }},
+    }));
+    try db.abortTransaction(conflicting_owner_txn, 41_101);
+
+    const wrong_delete_txn = try db.beginTransaction(41_200);
+    try std.testing.expectError(error.UniqueConstraintViolation, db.writeTransaction(wrong_delete_txn, .{
+        .unique_constraint_deletes = &.{.{
+            .constraint_name = "users_email_key",
+            .encoded_value = ada_value,
+            .owner_key = "user:2",
+        }},
+    }));
+    try db.abortTransaction(wrong_delete_txn, 41_201);
+
+    const handoff_txn = try db.beginTransaction(41_300);
+    try db.writeTransaction(handoff_txn, .{
+        .unique_constraint_deletes = &.{.{
+            .constraint_name = "users_email_key",
+            .encoded_value = ada_value,
+            .owner_key = "user:1",
+        }},
+        .unique_constraint_writes = &.{.{
+            .constraint_name = "users_email_key",
+            .encoded_value = ada_value,
+            .owner_key = "user:2",
+        }},
+    });
+    try db.commitTransaction(handoff_txn, 41_301);
+
+    const handed_off_owner = try db.core.store.get(alloc, unique_key);
+    defer alloc.free(handed_off_owner);
+    try std.testing.expectEqualStrings("user:2", handed_off_owner);
+
+    const delete_txn = try db.beginTransaction(41_400);
+    try db.writeTransaction(delete_txn, .{
+        .unique_constraint_deletes = &.{.{
+            .constraint_name = "users_email_key",
+            .encoded_value = ada_value,
+            .owner_key = "user:2",
+        }},
+    });
+    try db.commitTransaction(delete_txn, 41_401);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, unique_key));
+}
+
+test "db transactions intent writes reject new documents at ordinal exhaustion" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:existing_txn", .value = "{\"name\":\"existing\"}" }},
+        .sync_level = .write,
+    });
+
+    var value: [4]u8 = undefined;
+    std.mem.writeInt(u32, &value, std.math.maxInt(doc_identity.DocOrdinal), .big);
+    try db.core.store.put(internal_keys.identity_next_ordinal_key[0..], &value);
+
+    const existing_txn = try db.beginTransaction(11_000);
+    try db.writeIntents(existing_txn, &.{
+        .{ .key = "doc:existing_txn", .value = "{\"name\":\"updated\"}" },
+    }, &.{});
+    try db.commitTransaction(existing_txn, 11_001);
+
+    const existing = (try db.get(alloc, "doc:existing_txn")) orelse return error.TestExpectedEqual;
+    defer alloc.free(existing);
+    try std.testing.expectEqualStrings("{\"name\":\"updated\"}", existing);
+
+    const direct_txn = try db.beginTransaction(12_000);
+    try std.testing.expectError(error.DocOrdinalExhausted, db.writeIntents(direct_txn, &.{
+        .{ .key = "doc:new_direct_txn", .value = "{\"name\":\"new\"}" },
+    }, &.{}));
+    try db.abortTransaction(direct_txn, 12_001);
+    try std.testing.expect((try db.get(alloc, "doc:new_direct_txn")) == null);
+
+    const request_txn = try db.beginTransaction(13_000);
+    try std.testing.expectError(error.DocOrdinalExhausted, db.writeTransaction(request_txn, .{
+        .writes = &.{.{ .key = "doc:new_request_txn", .value = "{\"name\":\"new\"}" }},
+    }));
+    try db.abortTransaction(request_txn, 13_001);
+    try std.testing.expect((try db.get(alloc, "doc:new_request_txn")) == null);
+}
+
+test "db transactions created identity rows remain visible after reopen" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const txn_id = try db.beginTransaction(21_000);
+        try db.writeTransaction(txn_id, .{
+            .writes = &.{.{ .key = "doc:txn_reopen", .value = "{\"title\":\"txn\"}" }},
+        });
+        try db.commitTransaction(txn_id, 21_001);
+    }
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const raw = (try db.get(alloc, "doc:txn_reopen")) orelse return error.TestExpectedEqual;
+        defer alloc.free(raw);
+        try std.testing.expectEqualStrings("{\"title\":\"txn\"}", raw);
+
+        const current = try db.searchRequestAtCurrentIdentityGeneration(.{});
+        var resolved = try db.internalResolveDocSetForIdsNoLockAtGenerationAlloc(alloc, &.{"doc:txn_reopen"}, current.identity_read_generation);
+        defer resolved.deinit(alloc);
+        try std.testing.expect(resolved.containsOrdinal(1));
+
+        const stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.state_rows);
+        try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.live_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_identity_state);
+    }
+}
+
+test "db transactions abort leaves no visible document" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const txn_id = try db.beginTransaction(1_700_000_000_000_000_000);
+    try db.writeIntents(txn_id, &.{
+        .{ .key = "doc:txn_abort", .value = "{\"title\":\"alpha\"}" },
+    }, &.{});
+    try db.abortTransaction(txn_id, 1_700_000_000_000_000_001);
+
+    try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, try db.getTransactionStatus(txn_id));
+    try std.testing.expect((try db.get(alloc, "doc:txn_abort")) == null);
+}
+
+test "db transactions resolve transforms against pending same-transaction writes" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const txn_id = try db.beginTransaction(9_000);
+    try db.writeTransaction(txn_id, .{
+        .writes = &.{
+            .{ .key = "doc:txn_transform", .value = "{\"count\":1}" },
+        },
+        .transforms = &.{
+            .{
+                .key = "doc:txn_transform",
+                .operations = &.{
+                    .{ .op = .inc, .path = "count", .value_json = "4" },
+                },
+            },
+        },
+    });
+    try db.commitTransaction(txn_id, 9_001);
+
+    const raw = (try db.get(alloc, "doc:txn_transform")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const count_value = parsed.value.object.get("count").?;
+    switch (count_value) {
+        .integer => |value| try std.testing.expectEqual(@as(i64, 5), value),
+        .float => |value| try std.testing.expectEqual(@as(f64, 5), value),
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "db transactions relational transforms read base rows and honor abort" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"count":{"type":"numeric"}},"required":["title","count"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "row:txn_transform", .value = "{\"title\":\"base row\",\"count\":1}" }},
+    });
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:txn_transform");
+    defer alloc.free(primary_key);
+    try db.core.store.put(primary_key, "{\"title\":\"stale primary\",\"count\":999}");
+
+    const txn_id = try db.beginTransaction(11_000);
+    try db.writeTransaction(txn_id, .{
+        .transforms = &.{.{
+            .key = "row:txn_transform",
+            .operations = &.{.{ .op = .inc, .path = "count", .value_json = "4" }},
+        }},
+    });
+    try db.commitTransaction(txn_id, 11_001);
+
+    const raw = (try db.get(alloc, "row:txn_transform")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"title\":\"base row\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"count\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "stale primary") == null);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
+
+    const abort_txn = try db.beginTransaction(12_000);
+    try db.writeTransaction(abort_txn, .{
+        .transforms = &.{.{
+            .key = "row:txn_transform",
+            .operations = &.{.{ .op = .inc, .path = "count", .value_json = "100" }},
+        }},
+    });
+    try db.abortTransaction(abort_txn, 12_001);
+
+    const after_abort = (try db.get(alloc, "row:txn_transform")) orelse return error.TestExpectedEqual;
+    defer alloc.free(after_abort);
+    try std.testing.expect(std.mem.indexOf(u8, after_abort, "\"count\":5") != null);
+}
+
+test "db transactions write request enforces version predicates" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:pred", .value = "{\"title\":\"v1\"}" }},
+        .timestamp_ns = 5_000,
+    });
+
+    const txn_id = try db.beginTransaction(6_000);
+    try std.testing.expectError(transactions_mod.TxnError.VersionConflict, db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "doc:pred", .value = "{\"title\":\"v2\"}" }},
+        .predicates = &.{.{ .key = "doc:pred", .expected_version = 0 }},
+    }));
+
+    try db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "doc:pred", .value = "{\"title\":\"v2\"}" }},
+        .predicates = &.{.{ .key = "doc:pred", .expected_version = 5_000 }},
+    });
+    try db.commitTransaction(txn_id, 6_001);
+
+    const raw = (try db.get(alloc, "doc:pred")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expectEqualStrings("{\"title\":\"v2\"}", raw);
+}
+
+test "db transactions write request detects concurrent intent conflicts" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const txn1 = try db.beginTransaction(1_000);
+    const txn2 = try db.beginTransaction(1_001);
+
+    try db.writeTransaction(txn1, .{
+        .writes = &.{.{ .key = "doc:shared", .value = "{\"title\":\"from1\"}" }},
+    });
+
+    try std.testing.expectError(transactions_mod.TxnError.IntentConflict, db.writeTransaction(txn2, .{
+        .writes = &.{.{ .key = "doc:shared", .value = "{\"title\":\"from2\"}" }},
+    }));
+}
+
+test "db transactions row claims block transactional and direct mutations until resolution" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"base\"}" }},
+        .timestamp_ns = 1_000,
+    });
+
+    const claim_txn = try db.beginTransaction(2_000);
+    try std.testing.expectError(error.InvalidQueryRequest, db.claimRowsForTransaction(claim_txn, &.{"doc:claim"}, .{
+        .mode = .for_update,
+        .txn_id = claim_txn,
+    }));
+    try std.testing.expectError(error.InvalidQueryRequest, db.claimRowsForTransaction(claim_txn, &.{"doc:claim"}, .{
+        .mode = .for_update,
+        .owner_id = "session:claim",
+        .lease_ms = 0,
+        .txn_id = claim_txn,
+    }));
+    try db.claimRowsForTransaction(claim_txn, &.{"doc:claim"}, .{
+        .mode = .for_update,
+        .owner_id = "session:claim",
+        .txn_id = claim_txn,
+    });
+
+    const writer_txn = try db.beginTransaction(2_001);
+    try std.testing.expectError(transactions_mod.TxnError.IntentConflict, db.writeTransaction(writer_txn, .{
+        .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"blocked\"}" }},
+    }));
+    try std.testing.expectError(transactions_mod.TxnError.IntentConflict, db.batch(.{
+        .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"direct\"}" }},
+        .timestamp_ns = 2_002,
+    }));
+
+    try db.commitTransaction(claim_txn, 2_010);
+    try db.writeTransaction(writer_txn, .{
+        .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"updated\"}" }},
+    });
+    try db.commitTransaction(writer_txn, 2_011);
+
+    const raw = (try db.get(alloc, "doc:claim")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expectEqualStrings("{\"title\":\"updated\"}", raw);
+}
+
+test "db transactions row claim lease expiry aborts stale owner and lets next claimer proceed" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"base\"}" }},
+        .timestamp_ns = 1_000,
+    });
+
+    const stale_txn = try db.beginTransaction(2_000);
+    try db.claimRowsForTransaction(stale_txn, &.{"doc:claim"}, .{
+        .mode = .for_update,
+        .owner_id = "session:stale",
+        .lease_ms = 1,
+        .txn_id = stale_txn,
+    });
+    platform.time.sleepNs(10 * std.time.ns_per_ms);
+
+    const next_txn = try db.beginTransaction(2_001);
+    try db.claimRowsForTransaction(next_txn, &.{"doc:claim"}, .{
+        .mode = .for_update,
+        .owner_id = "session:next",
+        .txn_id = next_txn,
+    });
+
+    try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, try db.getTransactionStatus(stale_txn));
+    try std.testing.expectError(transactions_mod.TxnError.DecisionConflict, db.writeTransaction(stale_txn, .{
+        .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"stale\"}" }},
+    }));
+
+    const blocked_txn = try db.beginTransaction(2_002);
+    try std.testing.expectError(transactions_mod.TxnError.IntentConflict, db.writeTransaction(blocked_txn, .{
+        .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"blocked\"}" }},
+    }));
+
+    try db.commitTransaction(next_txn, 2_010);
+    try db.writeTransaction(blocked_txn, .{
+        .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"updated\"}" }},
+    });
+    try db.commitTransaction(blocked_txn, 2_011);
+
+    const raw = (try db.get(alloc, "doc:claim")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expectEqualStrings("{\"title\":\"updated\"}", raw);
+}
+
+test "db transactions row claim lease expiry lets direct mutation reclaim stale owner" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"base\"}" }},
+        .timestamp_ns = 1_000,
+    });
+
+    const stale_txn = try db.beginTransaction(2_000);
+    try db.claimRowsForTransaction(stale_txn, &.{"doc:claim"}, .{
+        .mode = .for_update,
+        .owner_id = "session:stale",
+        .lease_ms = 1,
+        .txn_id = stale_txn,
+    });
+    platform.time.sleepNs(10 * std.time.ns_per_ms);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"direct\"}" }},
+        .timestamp_ns = 2_010,
+    });
+
+    try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, try db.getTransactionStatus(stale_txn));
+    try std.testing.expectError(transactions_mod.TxnError.DecisionConflict, db.writeTransaction(stale_txn, .{
+        .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"stale\"}" }},
+    }));
+
+    const raw = (try db.get(alloc, "doc:claim")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expectEqualStrings("{\"title\":\"direct\"}", raw);
+}
+
+test "db transactions row claim search skip locked returns claimed subset" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:locked", .value = "{\"title\":\"locked\"}" },
+            .{ .key = "doc:free", .value = "{\"title\":\"free\"}" },
+        },
+        .timestamp_ns = 1_000,
+    });
+
+    const locker_txn = try db.beginTransaction(2_000);
+    try db.claimRowsForTransaction(locker_txn, &.{"doc:locked"}, .{
+        .mode = .for_update,
+        .owner_id = "session:locker",
+        .txn_id = locker_txn,
+    });
+
+    const search_txn = try db.beginTransaction(2_001);
+    var claimed = try db.search(alloc, .{
+        .row_claim = .{
+            .mode = .for_update,
+            .skip_locked = true,
+            .owner_id = "session:search",
+            .txn_id = search_txn,
+        },
+        .limit = 10,
+    });
+    defer claimed.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), claimed.total_hits);
+    try std.testing.expectEqualStrings("doc:free", claimed.hits[0].id);
+
+    const blocked_txn = try db.beginTransaction(2_002);
+    try std.testing.expectError(transactions_mod.TxnError.IntentConflict, db.writeTransaction(blocked_txn, .{
+        .writes = &.{.{ .key = "doc:free", .value = "{\"title\":\"blocked\"}" }},
+    }));
+}
+
+test "db transactions committed transaction exposes commit timestamp for later predicates" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:txn_pred", .value = "{\"title\":\"base\"}" }},
+        .timestamp_ns = 5_000,
+    });
+
+    const txn_id = try db.beginTransaction(6_000);
+    try db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "doc:txn_pred", .value = "{\"title\":\"txn\"}" }},
+        .predicates = &.{.{ .key = "doc:txn_pred", .expected_version = 5_000 }},
+    });
+    try db.commitTransaction(txn_id, 7_000);
+
+    try std.testing.expectEqual(@as(u64, 7_000), try db.getTimestamp(alloc, "doc:txn_pred"));
+
+    try std.testing.expectError(transactions_mod.TxnError.VersionConflict, db.batch(.{
+        .writes = &.{.{ .key = "doc:txn_pred", .value = "{\"title\":\"stale\"}" }},
+        .predicates = &.{.{ .key = "doc:txn_pred", .expected_version = 6_000 }},
+        .timestamp_ns = 8_000,
+    }));
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:txn_pred", .value = "{\"title\":\"fresh\"}" }},
+        .predicates = &.{.{ .key = "doc:txn_pred", .expected_version = 7_000 }},
+        .timestamp_ns = 8_001,
+    });
+
+    const raw = (try db.get(alloc, "doc:txn_pred")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expectEqualStrings("{\"title\":\"fresh\"}", raw);
+    try std.testing.expectEqual(@as(u64, 8_001), try db.getTimestamp(alloc, "doc:txn_pred"));
+}
+
+test "db transactions aborted transaction preserves prior committed state and version" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:txn_abort_preserve", .value = "{\"title\":\"base\"}" }},
+        .timestamp_ns = 9_000,
+    });
+
+    const txn_id = try db.beginTransaction(9_100);
+    try db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "doc:txn_abort_preserve", .value = "{\"title\":\"txn\"}" }},
+        .predicates = &.{.{ .key = "doc:txn_abort_preserve", .expected_version = 9_000 }},
+    });
+    try db.abortTransaction(txn_id, 9_200);
+
+    const raw = (try db.get(alloc, "doc:txn_abort_preserve")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expectEqualStrings("{\"title\":\"base\"}", raw);
+    try std.testing.expectEqual(@as(u64, 9_000), try db.getTimestamp(alloc, "doc:txn_abort_preserve"));
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:txn_abort_preserve", .value = "{\"title\":\"next\"}" }},
+        .predicates = &.{.{ .key = "doc:txn_abort_preserve", .expected_version = 9_000 }},
+        .timestamp_ns = 9_300,
+    });
+
+    const updated = (try db.get(alloc, "doc:txn_abort_preserve")) orelse return error.TestExpectedEqual;
+    defer alloc.free(updated);
+    try std.testing.expectEqualStrings("{\"title\":\"next\"}", updated);
+    try std.testing.expectEqual(@as(u64, 9_300), try db.getTimestamp(alloc, "doc:txn_abort_preserve"));
+}
+
+test "db transactions explicit resolveTransactionIntents applies participant-style commit version" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const txn_id = try db.beginTransaction(12_000);
+    try db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "doc:participant", .value = "{\"title\":\"replicated\"}" }},
+    });
+
+    try db.resolveTransactionIntents(txn_id, .committed, 15_000);
+
+    try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(txn_id));
+    try std.testing.expectEqual(@as(u64, 15_000), try db.getCommitVersion(txn_id));
+    try std.testing.expectEqual(@as(u64, 15_000), try db.getTimestamp(alloc, "doc:participant"));
+
+    const raw = (try db.get(alloc, "doc:participant")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expectEqualStrings("{\"title\":\"replicated\"}", raw);
+}
+
+test "db transactions recoverTransactions auto-aborts stale pending intents" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const txn_id = try db.beginTransaction(1_000);
+    try db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "doc:recover_pending", .value = "{\"title\":\"pending\"}" }},
+    });
+
+    const stats = try db.recoverTransactions(2_000, 3_000);
+    try std.testing.expectEqual(@as(u64, 1), stats.auto_aborted);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, try db.getTransactionStatus(txn_id));
+
+    const raw = try db.get(alloc, "doc:recover_pending");
+    defer if (raw) |bytes| alloc.free(bytes);
+    try std.testing.expect(raw == null);
+}
+
+test "db transactions participant recovery preserves finalized transaction until all participants resolve" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const txn_id = try db.beginTransactionWithParticipants(1_000, &.{ "local", "remote" });
+    try db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "doc:participant_hold", .value = "{\"title\":\"value\"}" }},
+    });
+    try db.resolveTransactionIntents(txn_id, .committed, 2_000);
+    try db.markTransactionParticipantResolved(txn_id, "local");
+
+    const unresolved_initial = try db.getUnresolvedTransactionParticipants(alloc, txn_id);
+    defer transactions_mod.freeParticipantList(alloc, unresolved_initial);
+    try std.testing.expectEqual(@as(usize, 1), unresolved_initial.len);
+    try std.testing.expectEqualStrings("remote", unresolved_initial[0]);
+
+    const stats = try db.recoverTransactions(3_000, 4_000);
+    try std.testing.expectEqual(@as(u64, 1), stats.deferred_unresolved);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(txn_id));
+
+    try db.markTransactionParticipantResolved(txn_id, "remote");
+    const unresolved_final = try db.getUnresolvedTransactionParticipants(alloc, txn_id);
+    defer transactions_mod.freeParticipantList(alloc, unresolved_final);
+    try std.testing.expectEqual(@as(usize, 0), unresolved_final.len);
+
+    const cleaned = try db.recoverTransactions(3_000, 4_000);
+    try std.testing.expectEqual(@as(u64, 1), cleaned.cleaned_records);
+    try std.testing.expectError(transactions_mod.TxnError.TxnNotFound, db.getTransactionStatus(txn_id));
+}
+
+test "db transactions recovery runtime resolves participants and unblocks cleanup" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var recorder = TxnResolverRecorder{};
+    const txn_id = blk: {
+        var setup_db = try DB.open(alloc, std.mem.span(path), .{});
+        defer setup_db.close();
+
+        const txn_id = try setup_db.beginTransactionWithParticipants(1_000, &.{ "local", "remote" });
+        try setup_db.writeTransaction(txn_id, .{
+            .writes = &.{.{ .key = "doc:participant_runtime", .value = "{\"title\":\"value\"}" }},
+        });
+        try setup_db.resolveTransactionIntents(txn_id, .committed, 2_000);
+        try setup_db.markTransactionParticipantResolved(txn_id, "local");
+        break :blk txn_id;
+    };
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .transaction_recovery = .{
+            .enabled = true,
+            .interval_ms = 10,
+            .cutoff_ns = 1,
+            .resolver_ctx = &recorder,
+            .resolve_participant_fn = TxnResolverRecorder.resolve,
+        },
+    });
+    defer db.close();
+    try std.testing.expect(db.transaction_recovery_identity_context != null);
+    try std.testing.expect(db.transaction_runtime.?.config.resolution_extra_hooks.build != null);
+
+    var cleared = false;
+    var attempts: usize = 0;
+    while (attempts < 500) : (attempts += 1) {
+        const status = db.getTransactionStatus(txn_id);
+        if (status) |_| {} else |err| {
+            if (err == transactions_mod.TxnError.TxnNotFound) {
+                cleared = true;
+                break;
+            }
+            return err;
+        }
+        platform.time.sleepNs(10 * std.time.ns_per_ms);
+    }
+    if (!cleared) return error.TransactionRecoveryCleanupTimeout;
+
+    var stats = try db.stats(alloc);
+    var stats_ready = stats.transaction_recovery.runs > 0 and
+        stats.transaction_recovery.notification_attempts > 0 and
+        stats.transaction_recovery.notification_successes > 0 and
+        stats.transaction_recovery.cleaned_records > 0;
+    var resolver_called = false;
+    platform.sync.lockYielding(&recorder.mutex);
+    resolver_called = recorder.calls > 0;
+    recorder.mutex.unlock();
+
+    attempts = 0;
+    while ((!stats_ready or !resolver_called) and attempts < 500) : (attempts += 1) {
+        types.freeDBStats(alloc, stats);
+        platform.time.sleepNs(10 * std.time.ns_per_ms);
+        stats = try db.stats(alloc);
+        stats_ready = stats.transaction_recovery.runs > 0 and
+            stats.transaction_recovery.notification_attempts > 0 and
+            stats.transaction_recovery.notification_successes > 0 and
+            stats.transaction_recovery.cleaned_records > 0;
+        platform.sync.lockYielding(&recorder.mutex);
+        resolver_called = recorder.calls > 0;
+        recorder.mutex.unlock();
+    }
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expect(stats.transaction_recovery.enabled);
+    if (!stats_ready) return error.TransactionRecoveryStatsTimeout;
+    try std.testing.expectError(transactions_mod.TxnError.TxnNotFound, db.getTransactionStatus(txn_id));
+    if (!resolver_called) return error.TransactionRecoveryResolverTimeout;
+}
+
+test "db transactions recovery runtime appends identity rows for committed orphaned intents" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const txn_id = blk: {
+        var setup_db = try DB.open(alloc, std.mem.span(path), .{});
+        defer setup_db.close();
+
+        const txn_id = try setup_db.beginTransaction(1_000);
+        try setup_db.writeTransaction(txn_id, .{
+            .writes = &.{.{ .key = "doc:recovered_orphan", .value = "{\"title\":\"recovered\"}" }},
+        });
+
+        const record_key = blk_key: {
+            const prefix = "\x00\x00__txn_records__:";
+            var key: [prefix.len + @sizeOf(transactions_mod.TxnId)]u8 = undefined;
+            @memcpy(key[0..prefix.len], prefix);
+            @memcpy(key[prefix.len..], &txn_id);
+            break :blk_key key;
+        };
+        var record_value: [33]u8 = undefined;
+        record_value[0] = @intFromEnum(transactions_mod.TxnStatus.committed);
+        std.mem.writeInt(u64, record_value[1..9], 1_000, .little);
+        std.mem.writeInt(u64, record_value[9..17], 2_000, .little);
+        std.mem.writeInt(u64, record_value[17..25], 1_000, .little);
+        std.mem.writeInt(u64, record_value[25..33], 2_000, .little);
+        try setup_db.core.store.put(record_key[0..], record_value[0..]);
+        break :blk txn_id;
+    };
+
+    var recorder = TxnResolverRecorder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .transaction_recovery = .{
+            .enabled = true,
+            .interval_ms = 10,
+            .cutoff_ns = 1,
+            .resolver_ctx = &recorder,
+            .resolve_participant_fn = TxnResolverRecorder.resolve,
+        },
+    });
+    defer db.close();
+
+    var cleaned = false;
+    var attempts: usize = 0;
+    while (attempts < 500) : (attempts += 1) {
+        const status = db.getTransactionStatus(txn_id);
+        if (status) |_| {} else |err| {
+            if (err == transactions_mod.TxnError.TxnNotFound) {
+                cleaned = true;
+                break;
+            }
+            return err;
+        }
+        platform.time.sleepNs(10 * std.time.ns_per_ms);
+    }
+    if (!cleaned) return error.TransactionRecoveryCleanupTimeout;
+
+    const raw = (try db.get(alloc, "doc:recovered_orphan")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expectEqualStrings("{\"title\":\"recovered\"}", raw);
+
+    const stats = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.state_rows);
+    try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.live_ordinals);
+    try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_ordinals);
+    try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_identity_state);
+}
+
+test "db transactions relational recovery resolves orphaned intents into base rows" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const commit_ts: u64 = 2_000;
+    const txn_id = blk: {
+        var setup_db = try DB.open(alloc, std.mem.span(path), .{});
+        defer setup_db.close();
+
+        const schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+        ;
+        var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        try setup_db.setSchema(runtime_schema);
+
+        const txn_id = try setup_db.beginTransaction(1_000);
+        try setup_db.writeTransaction(txn_id, .{
+            .writes = &.{.{ .key = "row:recovered_orphan", .value = "{\"title\":\"recovered row\",\"amount\":14.5}" }},
+        });
+
+        const record_key = blk_key: {
+            const prefix = "\x00\x00__txn_records__:";
+            var key: [prefix.len + @sizeOf(transactions_mod.TxnId)]u8 = undefined;
+            @memcpy(key[0..prefix.len], prefix);
+            @memcpy(key[prefix.len..], &txn_id);
+            break :blk_key key;
+        };
+        var record_value: [33]u8 = undefined;
+        record_value[0] = @intFromEnum(transactions_mod.TxnStatus.committed);
+        std.mem.writeInt(u64, record_value[1..9], 1_000, .little);
+        std.mem.writeInt(u64, record_value[9..17], commit_ts, .little);
+        std.mem.writeInt(u64, record_value[17..25], 1_000, .little);
+        std.mem.writeInt(u64, record_value[25..33], commit_ts, .little);
+        try setup_db.core.store.put(record_key[0..], record_value[0..]);
+        break :blk txn_id;
+    };
+
+    var recorder = TxnResolverRecorder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .transaction_recovery = .{
+            .enabled = true,
+            .interval_ms = 10,
+            .cutoff_ns = 1,
+            .resolver_ctx = &recorder,
+            .resolve_participant_fn = TxnResolverRecorder.resolve,
+        },
+    });
+    defer db.close();
+
+    var cleaned = false;
+    var attempts: usize = 0;
+    while (attempts < 500) : (attempts += 1) {
+        const status = db.getTransactionStatus(txn_id);
+        if (status) |_| {} else |err| {
+            if (err == transactions_mod.TxnError.TxnNotFound) {
+                cleaned = true;
+                break;
+            }
+            return err;
+        }
+        platform.time.sleepNs(10 * std.time.ns_per_ms);
+    }
+    if (!cleaned) return error.TransactionRecoveryCleanupTimeout;
+
+    const raw = (try db.get(alloc, "row:recovered_orphan")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"title\":\"recovered row\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"amount\":14.5") != null);
+    try std.testing.expectEqual(commit_ts, try db.getTimestamp(alloc, "row:recovered_orphan"));
+
+    const relational_key = try relational_store_mod.rowKeyAlloc(alloc, "row:recovered_orphan");
+    defer alloc.free(relational_key);
+    const raw_row = try db.core.store.get(alloc, relational_key);
+    defer alloc.free(raw_row);
+    try std.testing.expect(mapper.isRelationalRowValue(raw_row));
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:recovered_orphan");
+    defer alloc.free(primary_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
+
+    const stats = try db.diagnosticStats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.state_rows);
+    try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.live_ordinals);
+    try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_ordinals);
+    try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_identity_state);
+}
+
+test "db transactions one-shot relational recovery resolves orphaned intents into base rows" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const commit_ts: u64 = 2_000;
+    const txn_id = try db.beginTransaction(1_000);
+    try db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "row:one_shot_recovered", .value = "{\"title\":\"one shot\",\"amount\":21.5}" }},
+    });
+
+    const record_key = blk_key: {
+        const prefix = "\x00\x00__txn_records__:";
+        var key: [prefix.len + @sizeOf(transactions_mod.TxnId)]u8 = undefined;
+        @memcpy(key[0..prefix.len], prefix);
+        @memcpy(key[prefix.len..], &txn_id);
+        break :blk_key key;
+    };
+    var record_value: [33]u8 = undefined;
+    record_value[0] = @intFromEnum(transactions_mod.TxnStatus.committed);
+    std.mem.writeInt(u64, record_value[1..9], 1_000, .little);
+    std.mem.writeInt(u64, record_value[9..17], commit_ts, .little);
+    std.mem.writeInt(u64, record_value[17..25], 1_000, .little);
+    std.mem.writeInt(u64, record_value[25..33], commit_ts, .little);
+    try db.core.store.put(record_key[0..], record_value[0..]);
+
+    var recorder = TxnResolverRecorder{};
+    const stats = try db.runTransactionRecoveryOnce(.{
+        .enabled = true,
+        .cutoff_ns = 1,
+        .resolver_ctx = &recorder,
+        .resolve_participant_fn = TxnResolverRecorder.resolve,
+    });
+    try std.testing.expect(stats.resolved_finalized >= 1);
+
+    const raw = (try db.get(alloc, "row:one_shot_recovered")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"title\":\"one shot\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"amount\":21.5") != null);
+    try std.testing.expectEqual(commit_ts, try db.getTimestamp(alloc, "row:one_shot_recovered"));
+
+    const relational_key = try relational_store_mod.rowKeyAlloc(alloc, "row:one_shot_recovered");
+    defer alloc.free(relational_key);
+    const raw_row = try db.core.store.get(alloc, relational_key);
+    defer alloc.free(raw_row);
+    try std.testing.expect(mapper.isRelationalRowValue(raw_row));
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:one_shot_recovered");
+    defer alloc.free(primary_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
+}
+
+test "db transactions batch enforces optimistic version predicates" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:cas", .value = "{\"title\":\"v1\"}" }},
+        .timestamp_ns = 10_000,
+    });
+
+    try std.testing.expectError(transactions_mod.TxnError.VersionConflict, db.batch(.{
+        .writes = &.{.{ .key = "doc:cas", .value = "{\"title\":\"v2\"}" }},
+        .predicates = &.{.{ .key = "doc:cas", .expected_version = 0 }},
+        .timestamp_ns = 11_000,
+    }));
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:cas", .value = "{\"title\":\"v2\"}" }},
+        .predicates = &.{.{ .key = "doc:cas", .expected_version = 10_000 }},
+        .timestamp_ns = 11_000,
+    });
+
+    const raw = (try db.get(alloc, "doc:cas")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expectEqualStrings("{\"title\":\"v2\"}", raw);
+    try std.testing.expectEqual(@as(u64, 11_000), try db.getTimestamp(alloc, "doc:cas"));
 }

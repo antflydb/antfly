@@ -102,6 +102,12 @@ generated DDL boundary with retained view-name and population/refresh-tail
 metadata before delegating to the existing typed materialized-view catalog
 planner. `ALTER MATERIALIZED VIEW` remains an unsupported generated diagnostic
 until Antfly has a typed plan for that operation family.
+Row-security policy catalog DDL heads, including `CREATE POLICY`,
+`ALTER POLICY`, and `DROP POLICY`, now use the generated DDL boundary with
+retained policy-name, target-table, operation-tail, `IF EXISTS`, and
+drop-behavior metadata before delegating to the existing typed row-security
+catalog planner, including routine-backed policy predicates that require
+parser-context function bindings.
 Generated
 `CREATE INDEX` ASTs also retain
 `UNIQUE`, method, element-list, covering-index `INCLUDE (...)`, options, and
@@ -116,10 +122,11 @@ prefixed `CREATE [TEMP|TEMPORARY|UNLOGGED] TABLE`, `CREATE VIEW`,
 `CREATE DOMAIN`, `CREATE SEQUENCE`, `CREATE TYPE`, `CREATE TABLESPACE`,
 `CREATE PUBLICATION`, `CREATE SUBSCRIPTION`, `CREATE MATERIALIZED VIEW`,
 `CREATE INDEX`, `ALTER TABLE`, `ALTER SCHEMA`, `ALTER TABLESPACE`,
-`ALTER PUBLICATION`, `ALTER SUBSCRIPTION`, `ALTER VIEW`, `ALTER DOMAIN`,
-`ALTER SEQUENCE`, `ALTER TYPE`, `DROP TABLE`, `DROP VIEW`, `DROP DOMAIN`,
-`DROP SEQUENCE`, `DROP TYPE`, `DROP TABLESPACE`, `DROP PUBLICATION`,
-`DROP SUBSCRIPTION`, `DROP MATERIALIZED VIEW`, and
+`CREATE POLICY`, `ALTER PUBLICATION`, `ALTER SUBSCRIPTION`, `ALTER POLICY`,
+`ALTER VIEW`, `ALTER DOMAIN`, `ALTER SEQUENCE`, `ALTER TYPE`, `DROP TABLE`,
+`DROP VIEW`, `DROP DOMAIN`, `DROP SEQUENCE`, `DROP TYPE`, `DROP TABLESPACE`,
+`DROP PUBLICATION`, `DROP SUBSCRIPTION`, `DROP POLICY`,
+`DROP MATERIALIZED VIEW`, and
 `REFRESH MATERIALIZED VIEW` now fail closed through the generated parser
 instead of falling back to the legacy DDL classifier, while rich DDL syntax
 that is not yet generated-covered still falls back to the existing typed DDL
@@ -361,17 +368,19 @@ Unsupported generated diagnostics also cover PostgreSQL materialized-view DDL
 entry points that Antfly does not type yet, including
 `ALTER MATERIALIZED VIEW`; procedural blocks with `DO`; foreign-table DDL;
 trigger and rewrite-rule DDL, including `ALTER TRIGGER` and `ALTER RULE`;
-row-security policy DDL; and foreign-server DDL. These common unsupported
+and foreign-server DDL. These common unsupported
 PostgreSQL dump/admin shapes now have stable unsupported AST reasons instead of
 generic parser fallback. Legacy-supported materialized-view catalog operations
 now use generated DDL AST nodes as a validated boundary before delegating to the
 typed materialized-view catalog planner: `CREATE MATERIALIZED VIEW`,
 `DROP MATERIALIZED VIEW`, and `REFRESH MATERIALIZED VIEW` fail closed if
 generated kind, span, object name, tail, cascade flag, or command keywords are
-corrupted. Legacy-supported row-security policy catalog operations use the same
-validated generated unsupported boundary for
+corrupted. Legacy-supported row-security policy catalog operations use
+validated generated DDL AST nodes for
 `CREATE POLICY`, `ALTER POLICY`, and `DROP POLICY`, including routine-backed
-policy predicates that require parser-context function bindings, before
+policy predicates that require parser-context function bindings, and fail
+closed if generated kind, span, policy name, target table, tail, `IF EXISTS`,
+or cascade metadata is corrupted before
 delegating to the typed row-security catalog planner. Notification channel
 commands also use the validated unsupported boundary for `LISTEN`, `NOTIFY`,
 and `UNLISTEN` before delegating to typed notification catalog planning.
@@ -946,7 +955,8 @@ variants for:
 - DDL statement, including generated AST payloads for command spans, object
   names, catalog option fields, drop behavior, and generated AST-to-plan parity
   for database and schema catalog plans plus seed `CREATE TABLE`, `ALTER TABLE`,
-  `DROP TABLE`, and `DROP INDEX` plans
+  `DROP TABLE`, `DROP INDEX`, materialized-view catalog, logical-replication
+  catalog, and row-security policy catalog plans
 - DML statement, including generated AST payloads for command spans, target
   tables, source/body ranges, predicates, conflict clauses, returning clauses,
   values lists, default-values inserts, truncate options, generated-first
@@ -1051,6 +1061,8 @@ Generated grammar work needs evidence at multiple levels:
   `CREATE`/`ALTER`/`DROP SUBSCRIPTION`,
   generated materialized-view catalog DDL for `CREATE MATERIALIZED VIEW`,
   `DROP MATERIALIZED VIEW`, and `REFRESH MATERIALIZED VIEW`,
+  generated row-security policy catalog DDL for `CREATE POLICY`,
+  `ALTER POLICY`, and `DROP POLICY`,
   `DROP INDEX`, generated domain catalog DDL for `CREATE DOMAIN`,
   `ALTER DOMAIN`, and `DROP DOMAIN`, generated sequence catalog DDL for
   `CREATE SEQUENCE`, `ALTER SEQUENCE`, and `DROP SEQUENCE`, generated

@@ -3634,25 +3634,20 @@ pub fn build(b: *std.Build) void {
 
     const lib_db_txn_tests = b.addTest(.{
         .root_module = lib_test_mod,
+        // Keep DB refactor targets module/category scoped: move tests into
+        // owning modules and name them with stable prefixes instead of adding
+        // individual test titles here.
         .filters = &.{
+            "storage.db.transactions.test.",
+            "storage.db.relational_integrity.test.db relational integrity transaction ",
+            "storage.db.relational_integrity.test.db relational integrity constraints ",
+            "storage.db.write_path.test.db write path ",
             "storage.db.db.test.db writes and reads timestamp",
             "storage.db.maintenance.ttl_runtime.test.",
-            "storage.db.db.test.db exposes local transaction lifecycle",
-            "storage.db.db.test.db relational foreign keys",
-            "storage.db.db.test.db relational unique constraints enforce committed scalar values",
-            "storage.db.db.test.db relational composite primary keys enforce identity and back foreign keys",
-            "storage.db.db.test.db unique constraint integrity repair rebuilds backing rows",
-            "storage.db.db.test.db transaction unique constraint mutations enforce owner handoff",
-            "storage.db.db.test.db transaction ",
-            "storage.db.db.test.db foreign key ref children page by child cursor",
-            "storage.db.db.test.db explicit resolveTransactionIntents",
-            "storage.db.db.test.db recoverTransactions",
-            "storage.db.db.test.db participant recovery",
-            "storage.db.db.test.db batch enforces optimistic version predicates",
         },
     });
     const run_lib_db_txn_tests = b.addRunArtifact(lib_db_txn_tests);
-    const lib_db_txn_step = b.step("lib-db-txn-test", "Run root-module DB TTL/transaction tests");
+    const lib_db_txn_step = b.step("lib-db-txn-test", "Run focused DB write/TTL/transaction tests");
     lib_db_txn_step.dependOn(&run_lib_db_txn_tests.step);
 
     const lib_metadata_tests = b.addTest(.{
@@ -5932,6 +5927,17 @@ pub fn build(b: *std.Build) void {
     const run_db_schema_tests = b.addRunArtifact(db_schema_tests);
     const db_schema_test_step = b.step("db-schema-test", "Run focused storage/db schema validation tests");
     db_schema_test_step.dependOn(&run_db_schema_tests.step);
+
+    const db_write_path_default_filters = [_][]const u8{
+        "storage.db.write_path.test.",
+    };
+    const db_write_path_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = selectTestFilters(b, &db_write_path_default_filters),
+    });
+    const run_db_write_path_tests = b.addRunArtifact(db_write_path_tests);
+    const db_write_path_test_step = b.step("db-write-path-test", "Run focused storage/db write-path tests");
+    db_write_path_test_step.dependOn(&run_db_write_path_tests.step);
 
     const db_foreign_key_tests = b.addTest(.{
         .root_module = db_test_mod,

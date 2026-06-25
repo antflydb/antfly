@@ -3066,6 +3066,862 @@ fn chunkCacheTupleKeyAlloc(alloc: Allocator, components: []const []const u8) ![]
     return try out.toOwnedSlice(alloc);
 }
 
+test "db write path transform resolves transforms against pending same-batch writes" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:coalesce", .value = "{\"count\":1,\"tags\":[\"db\"]}" },
+        },
+        .transforms = &.{
+            .{
+                .key = "doc:coalesce",
+                .operations = &.{
+                    .{ .op = .inc, .path = "count", .value_json = "2" },
+                    .{ .op = .add_to_set, .path = "tags", .value_json = "\"zig\"" },
+                },
+            },
+        },
+    });
+
+    const raw = (try db.get(alloc, "doc:coalesce")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const count_value = parsed.value.object.get("count").?;
+    switch (count_value) {
+        .integer => |value| try std.testing.expectEqual(@as(i64, 3), value),
+        .float => |value| try std.testing.expectEqual(@as(f64, 3), value),
+        else => return error.TestExpectedEqual,
+    }
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("tags").?.array.items.len);
+}
+
+test "db write path transform relational batch transforms read and rewrite base rows only" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"count":{"type":"numeric"},"active":{"type":"boolean"},"attrs":{"type":"json"}},"required":["title","count"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "row:transform",
+            .value = "{\"title\":\"base row\",\"count\":1,\"active\":true,\"attrs\":{\"tier\":\"gold\"}}",
+        }},
+    });
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:transform");
+    defer alloc.free(primary_key);
+    try db.core.store.put(primary_key, "{\"title\":\"stale primary\",\"count\":999,\"active\":false}");
+
+    try db.batch(.{
+        .transforms = &.{.{
+            .key = "row:transform",
+            .operations = &.{
+                .{ .op = .inc, .path = "count", .value_json = "4" },
+                .{ .op = .set, .path = "active", .value_json = "false" },
+                .{ .op = .set, .path = "attrs", .value_json = "{\"tier\":\"platinum\"}" },
+            },
+        }},
+    });
+
+    const raw = (try db.get(alloc, "row:transform")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"title\":\"base row\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"count\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"active\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"attrs\":{\"tier\":\"platinum\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "stale primary") == null);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, primary_key));
+}
+
+test "db write path transform keeps delete when same-batch transform targets deleted key" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:delete_transform", .value = "{\"status\":\"old\"}" },
+        },
+    });
+
+    try db.batch(.{
+        .deletes = &.{"doc:delete_transform"},
+        .transforms = &.{
+            .{
+                .key = "doc:delete_transform",
+                .operations = &.{
+                    .{ .op = .set, .path = "status", .value_json = "\"new\"" },
+                },
+            },
+        },
+    });
+
+    try std.testing.expect((try db.get(alloc, "doc:delete_transform")) == null);
+}
+
+test "db write path transform relational batch keeps delete when same-batch transform targets deleted key" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"text"}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "row:delete_transform", .value = "{\"title\":\"delete me\",\"status\":\"old\"}" }},
+    });
+
+    try db.batch(.{
+        .deletes = &.{"row:delete_transform"},
+        .transforms = &.{.{
+            .key = "row:delete_transform",
+            .operations = &.{.{ .op = .set, .path = "status", .value_json = "\"new\"" }},
+        }},
+    });
+
+    try std.testing.expect((try db.get(alloc, "row:delete_transform")) == null);
+    try std.testing.expect((try relational_store_mod.getRawAlloc(alloc, db.core.store, "row:delete_transform")) == null);
+}
+
+test "db write path bulk ingest write commits document writes before finish" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.beginBulkIngestSession();
+    errdefer db.abortBulkIngestSession();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:bulk_stage", .value = "{\"count\":1}" },
+        },
+        .sync_level = .write,
+    });
+
+    const visible_before_finish = (try db.get(alloc, "doc:bulk_stage")) orelse return error.TestExpectedEqual;
+    alloc.free(visible_before_finish);
+
+    try db.finishBulkIngestSessionWithOptions(.{ .compact = false });
+
+    const raw = (try db.get(alloc, "doc:bulk_stage")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+}
+
+test "db write path bulk ingest primary lsm writes use direct sorted ingest batch mode" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .lsm = .{
+            .flush_threshold = 1,
+            .bulk_ingest_flush_threshold_multiplier = 4,
+        } },
+    });
+    defer db.close();
+
+    try db.beginBulkIngestSession();
+    errdefer db.abortBulkIngestSession();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:bulk_lsm_a", .value = "{\"count\":1}" },
+            .{ .key = "doc:bulk_lsm_b", .value = "{\"count\":2}" },
+            .{ .key = "doc:bulk_lsm_c", .value = "{\"count\":3}" },
+            .{ .key = "doc:bulk_lsm_d", .value = "{\"count\":4}" },
+        },
+        .sync_level = .write,
+    });
+
+    const stats = db.snapshotPrimaryLsmWriteStatsForTest() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 0), stats.flushes);
+    try std.testing.expect(stats.sorted_ingest_runs > 0);
+
+    const visible_before_finish = (try db.get(alloc, "doc:bulk_lsm_d")) orelse return error.TestExpectedEqual;
+    alloc.free(visible_before_finish);
+
+    try db.finishBulkIngestSessionWithOptions(.{ .compact = false });
+}
+
+test "db write path bulk ingest resolves transforms across direct write batches" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.beginBulkIngestSession();
+    errdefer db.abortBulkIngestSession();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:bulk_transform", .value = "{\"count\":1}" },
+        },
+        .sync_level = .write,
+    });
+    try db.batch(.{
+        .transforms = &.{
+            .{
+                .key = "doc:bulk_transform",
+                .operations = &.{
+                    .{ .op = .inc, .path = "count", .value_json = "2" },
+                },
+            },
+        },
+        .sync_level = .write,
+    });
+
+    try db.finishBulkIngestSessionWithOptions(.{ .compact = false });
+
+    const raw = (try db.get(alloc, "doc:bulk_transform")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const count_value = parsed.value.object.get("count").?;
+    switch (count_value) {
+        .integer => |value| try std.testing.expectEqual(@as(i64, 3), value),
+        .float => |value| try std.testing.expectEqual(@as(f64, 3), value),
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "db write path bulk ingest applies pure-doc work at requested sync level" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.beginBulkIngestSession();
+    errdefer db.abortBulkIngestSession();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:bulk_sync", .value = "{\"count\":1}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.batch(.{
+        .transforms = &.{
+            .{
+                .key = "doc:bulk_sync",
+                .operations = &.{
+                    .{ .op = .inc, .path = "count", .value_json = "2" },
+                },
+            },
+        },
+        .sync_level = .write,
+    });
+
+    const raw = (try db.get(alloc, "doc:bulk_sync")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const count_value = parsed.value.object.get("count").?;
+    switch (count_value) {
+        .integer => |value| try std.testing.expectEqual(@as(i64, 3), value),
+        .float => |value| try std.testing.expectEqual(@as(f64, 3), value),
+        else => return error.TestExpectedEqual,
+    }
+
+    try db.finishBulkIngestSessionWithOptions(.{ .compact = false });
+}
+
+test "db write path bulk ingest keeps direct writes visible before timestamped batch" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.beginBulkIngestSession();
+    errdefer db.abortBulkIngestSession();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:staged_before_timestamp", .value = "{\"count\":1}" },
+        },
+        .sync_level = .write,
+    });
+    const visible_before_timestamp = (try db.get(alloc, "doc:staged_before_timestamp")) orelse return error.TestExpectedEqual;
+    alloc.free(visible_before_timestamp);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:timestamped", .value = "{\"count\":2}" },
+        },
+        .timestamp_ns = 1234,
+        .sync_level = .write,
+    });
+
+    const staged = (try db.get(alloc, "doc:staged_before_timestamp")) orelse return error.TestExpectedEqual;
+    defer alloc.free(staged);
+    const timestamped = (try db.get(alloc, "doc:timestamped")) orelse return error.TestExpectedEqual;
+    defer alloc.free(timestamped);
+
+    try db.finishBulkIngestSessionWithOptions(.{ .compact = false });
+}
+
+test "db write path bulk ingest keeps direct writes visible before predicate batch" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:pred_target", .value = "{\"count\":1}" },
+        },
+        .timestamp_ns = 5_000,
+        .sync_level = .write,
+    });
+
+    try db.beginBulkIngestSession();
+    errdefer db.abortBulkIngestSession();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:staged_before_predicate", .value = "{\"count\":1}" },
+        },
+        .sync_level = .write,
+    });
+    const visible_before_predicate = (try db.get(alloc, "doc:staged_before_predicate")) orelse return error.TestExpectedEqual;
+    alloc.free(visible_before_predicate);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:pred_target", .value = "{\"count\":2}" },
+        },
+        .predicates = &.{
+            .{ .key = "doc:pred_target", .expected_version = 5_000 },
+        },
+        .sync_level = .write,
+    });
+
+    const staged = (try db.get(alloc, "doc:staged_before_predicate")) orelse return error.TestExpectedEqual;
+    defer alloc.free(staged);
+    const pred_target = (try db.get(alloc, "doc:pred_target")) orelse return error.TestExpectedEqual;
+    defer alloc.free(pred_target);
+
+    try db.finishBulkIngestSessionWithOptions(.{ .compact = false });
+}
+
+test "db write path bulk ingest keeps direct writes visible before graph batch" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "gr_v1",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+
+    try db.beginBulkIngestSession();
+    errdefer db.abortBulkIngestSession();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:staged_before_graph", .value = "{\"count\":1}" },
+        },
+        .sync_level = .write,
+    });
+    const visible_before_graph = (try db.get(alloc, "doc:staged_before_graph")) orelse return error.TestExpectedEqual;
+    alloc.free(visible_before_graph);
+
+    try db.batch(.{
+        .graph_writes = &.{
+            .{ .index_name = "gr_v1", .source = "doc:a", .target = "doc:b", .edge_type = "links", .weight = 1.0 },
+        },
+        .sync_level = .write,
+    });
+
+    const staged = (try db.get(alloc, "doc:staged_before_graph")) orelse return error.TestExpectedEqual;
+    defer alloc.free(staged);
+
+    try db.finishBulkIngestSessionWithOptions(.{ .compact = false });
+}
+
+test "db write path bulk ingest query_readonly reopen serves empty dense search instead of index-not-found" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var writer = try DB.open(alloc, std.mem.span(path), .{});
+    defer writer.close();
+
+    try writer.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+
+    try writer.beginBulkIngestSession();
+    errdefer writer.abortBulkIngestSession();
+
+    try writer.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_embeddings\":{\"dense_idx\":[0,1,0]}}" },
+        },
+        .sync_level = .write,
+    });
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .query_readonly,
+    });
+    defer reopened.close();
+
+    var result = try reopened.search(alloc, .{
+        .index_name = "dense_idx",
+        .query = .{ .dense_knn = .{
+            .vector = &.{ 1.0, 0.0, 0.0 },
+            .k = 2,
+        } },
+        .limit = 2,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), result.hits.len);
+}
+
+test "db write path bulk ingest query_readonly reopen does not backfill pending external dense artifacts" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var writer = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+        });
+        defer writer.close();
+
+        try writer.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+
+        try writer.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_embeddings\":{\"dense_idx\":[0,1,0]}}" },
+            },
+            .sync_level = .write,
+        });
+
+        const writer_stats = try writer.stats(alloc);
+        defer types.freeDBStats(alloc, writer_stats);
+        try std.testing.expectEqual(@as(u64, 0), writer_stats.indexes[0].doc_count);
+        try std.testing.expect(writer_stats.indexes[0].replay_target_sequence > writer_stats.indexes[0].replay_applied_sequence);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .query_readonly,
+    });
+    defer reopened.close();
+
+    const reopened_stats = try reopened.stats(alloc);
+    defer types.freeDBStats(alloc, reopened_stats);
+    try std.testing.expectEqual(@as(u64, 0), reopened_stats.indexes[0].doc_count);
+    try std.testing.expect(reopened_stats.indexes[0].replay_target_sequence > reopened_stats.indexes[0].replay_applied_sequence);
+}
+
+test "db write path bulk ingest dense auto finish wakes weak-sync replay and publishes visibility after catch-up" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+
+    const HookCtx = struct {
+        publish_calls: u64 = 0,
+        invalidate_calls: u64 = 0,
+
+        fn onChange(ptr: *anyopaque, _: []const u8, _: u64, _: ?*DB, change: db_internal.QueryVisibilityChange) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            switch (change) {
+                .publish, .publish_consistent => self.publish_calls += 1,
+                .invalidate => self.invalidate_calls += 1,
+            }
+        }
+    };
+    var hook_ctx = HookCtx{};
+    db.setQueryVisibilityHook(.{
+        .ptr = &hook_ctx,
+        .table_name = "docs",
+        .group_id = 7001,
+        .db = &db,
+        .on_change = HookCtx.onChange,
+    });
+
+    try db.beginDenseAutoBulkIngestSession();
+    errdefer db.abortDenseAutoBulkIngestSession();
+
+    inline for (.{ "write", "propose", "write", "propose" }, 0..) |level, i| {
+        const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
+        defer alloc.free(key);
+        const value = try std.fmt.allocPrint(
+            alloc,
+            "{{\"_embeddings\":{{\"dense_idx\":[{d}.0,0.0,0.0]}}}}",
+            .{i + 1},
+        );
+        defer alloc.free(value);
+        try db.batch(.{
+            .writes = &.{.{ .key = key, .value = value }},
+            .sync_level = types.parsePublicSyncLevelText(level).?,
+        });
+    }
+
+    // Finish the implicit bulk publish, but hold the deferred executor wake so
+    // the test can prove the replay catch-up itself publishes fresh visibility.
+    try db.finishDenseAutoBulkIngestSessionWithOptionsAndNotifyExecutor(.{ .compact = false }, false);
+    hook_ctx = .{};
+
+    db_internal.flushDeferredExternalBulkExecutorNotification(db.async_context, db.executor);
+    try db.executor.waitForAll(4);
+
+    try std.testing.expect(hook_ctx.publish_calls > 0);
+    try std.testing.expectEqual(@as(u64, 0), hook_ctx.invalidate_calls);
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 4), stats.indexes[0].replay_applied_sequence);
+    try std.testing.expectEqual(@as(u64, 4), stats.indexes[0].replay_target_sequence);
+}
+
+test "db write path bulk ingest dense auto finish wakes current replay target if deferred wake is absent" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+
+    try db.beginDenseAutoBulkIngestSession();
+    errdefer db.abortDenseAutoBulkIngestSession();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"_embeddings\":{\"dense_idx\":[1.0,0.0,0.0]}}" },
+        },
+        .sync_level = .write,
+    });
+
+    const target_sequence = db.core.nextDerivedSequence();
+    try std.testing.expect(target_sequence > 0);
+    db.async_context.deferred_external_bulk_notify_sequence.store(0, .release);
+
+    try db.finishDenseAutoBulkIngestSessionWithOptions(.{ .compact = false });
+    try db.executor.waitForAll(target_sequence);
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(target_sequence, stats.indexes[0].replay_applied_sequence);
+    try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].doc_count);
+}
+
+test "db write path bulk ingest dense auto replays packed external embedding strings" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+
+    try db.beginDenseAutoBulkIngestSession();
+    errdefer db.abortDenseAutoBulkIngestSession();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"_embeddings\":{\"dense_idx\":\"AACAPwAAAAAAAAAA\"}}" },
+            .{ .key = "doc:b", .value = "{\"_embeddings\":{\"dense_idx\":\"AAAAAAAAAAAAAIA/\"}}" },
+        },
+        .sync_level = .write,
+    });
+
+    const target_sequence = db.core.nextDerivedSequence();
+    try db.finishDenseAutoBulkIngestSessionWithOptions(.{ .compact = false });
+    try db.executor.waitForAll(target_sequence);
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, 2), stats.indexes[0].doc_count);
+}
+
+test "db write path bulk ingest full_text sync defers text merge work until finish" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .text_merge = .{
+            .enabled = true,
+            .idle_interval_ms = 10_000,
+            .error_interval_ms = 10_000,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    try db.beginBulkIngestSession();
+    errdefer db.abortBulkIngestSession();
+
+    for (0..12) |i| {
+        const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
+        defer alloc.free(key);
+        const value = try std.fmt.allocPrint(alloc, "{{\"body\":\"common token {d}\"}}", .{i});
+        defer alloc.free(value);
+
+        try db.batch(.{
+            .writes = &.{.{ .key = key, .value = value }},
+            .sync_level = .full_text,
+        });
+    }
+
+    const before = db.pendingWorkStats().text_merge;
+    try std.testing.expect(before.pending_segments > 0);
+    try std.testing.expect(db.async_context.text_merge_deferred.load(.acquire));
+
+    const runtime = db.text_merge_runtime orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!(try runtime.runOnce()));
+
+    try db.finishBulkIngestSessionWithOptions(.{ .compact = false });
+    try std.testing.expect(!db.async_context.text_merge_deferred.load(.acquire));
+
+    try db.runUntilIdle();
+
+    const after = db.pendingWorkStats().text_merge;
+    try std.testing.expect(after.pending_segments <= before.pending_segments);
+}
+
+test "db write path bulk ingest finish publishes primary store before external dense leaf splits" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "vec",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":2,"metric":"l2_squared","external":true,"leaf_size":4,"branching_factor":8,"use_quantization":false,"max_cached_vectors":2}
+        ,
+    });
+
+    {
+        try db.beginBulkIngestSession();
+        errdefer db.abortBulkIngestSession();
+
+        for (0..24) |i| {
+            const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
+            defer alloc.free(key);
+            const value = try std.fmt.allocPrint(
+                alloc,
+                "{{\"title\":\"dense {d}\",\"_embeddings\":{{\"vec\":[{d}.0,0.0]}}}}",
+                .{ i, i },
+            );
+            defer alloc.free(value);
+
+            try db.batch(.{
+                .writes = &.{.{ .key = key, .value = value }},
+                .sync_level = .write,
+            });
+        }
+
+        try db.finishBulkIngestSessionWithOptions(.{ .compact = false });
+    }
+    try db.runUntilIdle();
+
+    var result = try db.search(alloc, .{
+        .index_name = "vec",
+        .dense = .{ .vector = &.{ 23.0, 0.0 }, .k = 1 },
+    });
+    defer result.deinit();
+    try std.testing.expect(result.total_hits > 0);
+}
+
 test "db chunk cache keys preserve embedded separators" {
     const alloc = std.testing.allocator;
 

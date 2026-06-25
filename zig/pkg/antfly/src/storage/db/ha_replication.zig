@@ -17,17 +17,25 @@ const platform = @import("antfly_platform");
 
 const ha_commit_gate_mod = @import("../ha/commit_gate.zig");
 const ha_effects_mod = @import("../ha/effects.zig");
+const ha_fencing_mod = @import("../ha/fencing.zig");
 const ha_primary_mod = @import("../ha/primary.zig");
 const ha_session_mod = @import("../ha/session.zig");
 const ha_standby_mod = @import("../ha/standby.zig");
 const ha_write_gate_mod = @import("../ha/write_gate.zig");
 const docstore_mod = @import("../docstore.zig");
+const change_journal_mod = @import("derived/change_journal.zig");
 const internal_keys = @import("../internal_keys.zig");
 const ha_replication_record_mod = @import("../ha/replication_record.zig");
+const replay_stream_mod = @import("derived/replay_stream.zig");
 const schema_mod = @import("../schema.zig");
+const transactions_mod = @import("../transactions.zig");
 const types = @import("types.zig");
+const write_path = @import("write_path.zig");
 
 const Allocator = std.mem.Allocator;
+const BatchProfile = write_path.BatchProfile;
+const DocumentArtifactChildRangeDispatch = write_path.DocumentArtifactChildRangeDispatch;
+const DocumentArtifactChildRangeDispatcher = write_path.DocumentArtifactChildRangeDispatcher;
 
 pub const AsyncEffectMirror = struct {
     primary: *ha_primary_mod.Primary,
@@ -164,6 +172,1476 @@ pub fn readAppliedReplicationLsn(alloc: Allocator, store: *docstore_mod.DocStore
     defer alloc.free(raw);
     if (raw.len != applied_lsn_value_len) return error.CorruptHAAppliedReplicationLsn;
     return std.mem.readInt(u64, raw[0..applied_lsn_value_len], .little);
+}
+
+test "storage.ha db mirrors appended derived replay records into HA stream" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 200,
+        .shard_id = 3,
+        .table_id = 9,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+
+    var last_lsn = std.atomic.Value(u64).init(0);
+    var failures = std.atomic.Value(u64).init(0);
+    const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "graph_v1", "mentions", "doc:b");
+    defer alloc.free(artifact_key);
+    {
+        var db = try DB.open(alloc, std.mem.span(db_path), .{
+            .ha_async_effect_mirror = .{
+                .primary = &primary,
+                .last_lsn = &last_lsn,
+                .failure_count = &failures,
+            },
+        });
+        defer db.close();
+
+        const changed_artifact_keys = [_][]const u8{artifact_key};
+        const sequence = try db.derivedAsyncAppendDerivedBatchRecord(.{
+            .changed_artifact_keys = changed_artifact_keys[0..],
+        });
+        try std.testing.expectEqual(@as(u64, 1), sequence);
+    }
+
+    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), failures.load(.acquire));
+
+    var entry = (try primary.log.entryAt(alloc, 1)) orelse return error.TestExpectedEqual;
+    defer entry.deinit(alloc);
+    try std.testing.expectEqual(@as(@TypeOf(entry.record.kind), .derived_effect), entry.record.kind);
+    try std.testing.expectEqual(@as(u64, 200), entry.record.cluster_id);
+    try std.testing.expectEqual(@as(u64, 3), entry.record.shard_id);
+    try std.testing.expectEqual(@as(u64, 9), entry.record.table_id);
+
+    var decoded = try ha_effects_mod.decodeDerivedChangeRecord(alloc, entry.record);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u64, 1), decoded.record.sequence);
+    try std.testing.expectEqualStrings(artifact_key, decoded.record.changed_artifact_keys[0]);
+    try std.testing.expectEqual(change_journal_mod.TargetHint.graph, decoded.record.target_hints[0]);
+}
+
+test "storage.ha db mirrors committed batch mutations into HA stream for standby apply" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var primary_db_path_buf: [256]u8 = undefined;
+    const primary_db_path = tempPath(&primary_db_path_buf);
+    defer cleanupTempDir(primary_db_path);
+    var standby_db_path_buf: [256]u8 = undefined;
+    const standby_db_path = tempPath(&standby_db_path_buf);
+    defer cleanupTempDir(standby_db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+    var standby_log_path_buf: [256]u8 = undefined;
+    const standby_log_path = tempPath(&standby_log_path_buf);
+    defer cleanupTempDir(standby_log_path);
+    var standby_progress_path_buf: [256]u8 = undefined;
+    const standby_progress_path = tempPath(&standby_progress_path_buf);
+    defer cleanupTempDir(standby_progress_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 250,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+
+    var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, .{
+        .cluster_id = 250,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer standby.close();
+
+    var last_lsn = std.atomic.Value(u64).init(0);
+    var failures = std.atomic.Value(u64).init(0);
+    {
+        var db = try DB.open(alloc, std.mem.span(primary_db_path), .{
+            .ha_async_batch_mirror = .{
+                .primary = &primary,
+                .last_lsn = &last_lsn,
+                .failure_count = &failures,
+            },
+            .start_index_workers = false,
+        });
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+            .deletes = &.{"doc:old"},
+            .timestamp_ns = 123,
+            .sync_level = .write,
+        });
+    }
+
+    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), failures.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+
+    var entry = (try primary.log.entryAt(alloc, 1)) orelse return error.TestExpectedEqual;
+    defer entry.deinit(alloc);
+    try std.testing.expectEqual(@as(@TypeOf(entry.record.kind), .batch_mutation), entry.record.kind);
+    try std.testing.expectEqual(@as(u64, 250), entry.record.cluster_id);
+    try std.testing.expectEqual(@as(u64, 4), entry.record.shard_id);
+    try std.testing.expectEqual(@as(u64, 10), entry.record.table_id);
+
+    var decoded = try ha_effects_mod.decodeBatchMutationRequest(alloc, entry.record);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), decoded.value.request.writes.len);
+    try std.testing.expectEqualStrings("doc:a", decoded.value.request.writes[0].key);
+    try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", decoded.value.request.writes[0].value);
+    try std.testing.expectEqual(@as(usize, 1), decoded.value.request.deletes.len);
+    try std.testing.expectEqualStrings("doc:old", decoded.value.request.deletes[0]);
+    try std.testing.expectEqual(@as(u64, 123), decoded.value.request.timestamp_ns);
+
+    var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
+        .ha_write_gate = .{ .standby = &standby },
+        .ha_async_batch_mirror = .{
+            .primary = &primary,
+            .last_lsn = &last_lsn,
+            .failure_count = &failures,
+        },
+    });
+    defer standby_db.close();
+
+    try standby_db.batchReplicatedApply(decoded.value.request);
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+    var found = (try standby_db.lookup(alloc, "doc:a", .{})) orelse return error.TestExpectedEqual;
+    defer found.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", found.json);
+}
+
+test "storage.ha db evaluates sync commit gate for mirrored batch mutations" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 253,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+
+    var last_lsn = std.atomic.Value(u64).init(0);
+    var gate_lsn = std.atomic.Value(u64).init(0);
+    var gate_action = std.atomic.Value(u8).init(255);
+    var degraded = std.atomic.Value(u64).init(0);
+    const standby_names = [_][]const u8{"standby-a"};
+    {
+        var db = try DB.open(alloc, std.mem.span(db_path), .{
+            .ha_async_batch_mirror = .{
+                .primary = &primary,
+                .last_lsn = &last_lsn,
+                .sync_policy = .{
+                    .mode = .remote_write,
+                    .standby_names = &standby_names,
+                    .failure_policy = .degrade_to_async,
+                },
+                .last_gate_lsn = &gate_lsn,
+                .last_gate_action = &gate_action,
+                .sync_degraded_count = &degraded,
+            },
+            .start_index_workers = false,
+        });
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:sync", .value = "{\"title\":\"sync\"}" }},
+            .sync_level = .write,
+        });
+    }
+
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
+    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.acknowledge_degraded), gate_action.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), degraded.load(.acquire));
+}
+
+test "storage.ha db block sync policy waits for standby acknowledgement" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 255,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+
+    const SyncWait = struct {
+        calls: u64 = 0,
+
+        fn wait(ctx: *anyopaque, primary_arg: *ha_primary_mod.Primary, target_lsn: u64, policy: ha_primary_mod.SyncPolicy) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            try std.testing.expectEqual(ha_primary_mod.DurabilityMode.remote_write, policy.mode);
+            try primary_arg.standbyStatusUpdate("standby-a", primary_arg.identity.timeline_id, target_lsn, 0);
+        }
+    };
+
+    var wait_state = SyncWait{};
+    var last_lsn = std.atomic.Value(u64).init(0);
+    var gate_lsn = std.atomic.Value(u64).init(0);
+    var gate_action = std.atomic.Value(u8).init(255);
+    var waits = std.atomic.Value(u64).init(0);
+    const standby_names = [_][]const u8{"standby-a"};
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .ha_async_batch_mirror = .{
+            .primary = &primary,
+            .last_lsn = &last_lsn,
+            .sync_policy = .{
+                .mode = .remote_write,
+                .standby_names = &standby_names,
+                .failure_policy = .block,
+            },
+            .sync_wait_ctx = &wait_state,
+            .sync_wait_fn = SyncWait.wait,
+            .last_gate_lsn = &gate_lsn,
+            .last_gate_action = &gate_action,
+            .sync_wait_count = &waits,
+        },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:block", .value = "{\"title\":\"block\"}" }},
+        .sync_level = .write,
+    });
+    try std.testing.expectEqual(@as(u64, 1), wait_state.calls);
+    try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
+    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
+    var found = (try db.lookup(alloc, "doc:block", .{})) orelse return error.TestExpectedEqual;
+    defer found.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"title\":\"block\"}", found.json);
+}
+
+test "storage.ha db session sync wait satisfies remote apply through standby DB apply" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var primary_db_path_buf: [256]u8 = undefined;
+    const primary_db_path = tempPath(&primary_db_path_buf);
+    defer cleanupTempDir(primary_db_path);
+    var standby_db_path_buf: [256]u8 = undefined;
+    const standby_db_path = tempPath(&standby_db_path_buf);
+    defer cleanupTempDir(standby_db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+    var standby_log_path_buf: [256]u8 = undefined;
+    const standby_log_path = tempPath(&standby_log_path_buf);
+    defer cleanupTempDir(standby_log_path);
+    var standby_progress_path_buf: [256]u8 = undefined;
+    const standby_progress_path = tempPath(&standby_progress_path_buf);
+    defer cleanupTempDir(standby_progress_path);
+
+    const identity = ha_standby_mod.Identity{
+        .cluster_id = 257,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, identity, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+
+    var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, identity, .{});
+    defer standby.close();
+
+    var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
+        .ha_write_gate = .{ .standby = &standby },
+        .start_index_workers = false,
+    });
+    defer standby_db.close();
+
+    var wait_state = SessionSyncWait{
+        .alloc = alloc,
+        .slot_name = "standby-a",
+        .standby = &standby,
+        .apply_ctx = &standby_db,
+        .apply_fn = DB.applyHAReplicationRecordCallback,
+    };
+    var last_lsn = std.atomic.Value(u64).init(0);
+    var gate_lsn = std.atomic.Value(u64).init(0);
+    var gate_action = std.atomic.Value(u8).init(255);
+    var waits = std.atomic.Value(u64).init(0);
+    const standby_names = [_][]const u8{"standby-a"};
+    var primary_db = try DB.open(alloc, std.mem.span(primary_db_path), .{
+        .ha_async_batch_mirror = .{
+            .primary = &primary,
+            .last_lsn = &last_lsn,
+            .sync_policy = .{
+                .mode = .remote_apply,
+                .standby_names = &standby_names,
+                .failure_policy = .block,
+            },
+            .sync_wait_ctx = &wait_state,
+            .sync_wait_fn = SessionSyncWait.wait,
+            .last_gate_lsn = &gate_lsn,
+            .last_gate_action = &gate_action,
+            .sync_wait_count = &waits,
+        },
+        .start_index_workers = false,
+    });
+    defer primary_db.close();
+
+    try primary_db.batch(.{
+        .writes = &.{.{ .key = "doc:remote-apply", .value = "{\"title\":\"remote-apply\"}" }},
+        .sync_level = .write,
+    });
+
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
+    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
+    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
+    try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
+    try std.testing.expectEqual(@as(u64, 1), try standby_db.haAppliedReplicationLsn());
+
+    var found = (try standby_db.lookup(alloc, "doc:remote-apply", .{})) orelse return error.TestExpectedEqual;
+    defer found.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"title\":\"remote-apply\"}", found.json);
+}
+
+test "storage.ha db session sync wait remote write acknowledges durable receive despite apply failure" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var primary_db_path_buf: [256]u8 = undefined;
+    const primary_db_path = tempPath(&primary_db_path_buf);
+    defer cleanupTempDir(primary_db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+    var standby_log_path_buf: [256]u8 = undefined;
+    const standby_log_path = tempPath(&standby_log_path_buf);
+    defer cleanupTempDir(standby_log_path);
+    var standby_progress_path_buf: [256]u8 = undefined;
+    const standby_progress_path = tempPath(&standby_progress_path_buf);
+    defer cleanupTempDir(standby_progress_path);
+
+    const identity = ha_standby_mod.Identity{
+        .cluster_id = 258,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, identity, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+
+    var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, identity, .{});
+    defer standby.close();
+
+    const ApplyFailure = struct {
+        calls: u64 = 0,
+
+        fn apply(ctx: *anyopaque, _: ha_replication_record_mod.RecordView) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return error.IntentionalApplyFailure;
+        }
+    };
+
+    var apply_failure = ApplyFailure{};
+    var wait_state = SessionSyncWait{
+        .alloc = alloc,
+        .slot_name = "standby-a",
+        .standby = &standby,
+        .apply_ctx = &apply_failure,
+        .apply_fn = ApplyFailure.apply,
+    };
+    var last_lsn = std.atomic.Value(u64).init(0);
+    var gate_lsn = std.atomic.Value(u64).init(0);
+    var gate_action = std.atomic.Value(u8).init(255);
+    var waits = std.atomic.Value(u64).init(0);
+    const standby_names = [_][]const u8{"standby-a"};
+    var primary_db = try DB.open(alloc, std.mem.span(primary_db_path), .{
+        .ha_async_batch_mirror = .{
+            .primary = &primary,
+            .last_lsn = &last_lsn,
+            .sync_policy = .{
+                .mode = .remote_write,
+                .standby_names = &standby_names,
+                .failure_policy = .block,
+            },
+            .sync_wait_ctx = &wait_state,
+            .sync_wait_fn = SessionSyncWait.wait,
+            .last_gate_lsn = &gate_lsn,
+            .last_gate_action = &gate_action,
+            .sync_wait_count = &waits,
+        },
+        .start_index_workers = false,
+    });
+    defer primary_db.close();
+
+    try primary_db.batch(.{
+        .writes = &.{.{ .key = "doc:remote-write", .value = "{\"title\":\"remote-write\"}" }},
+        .sync_level = .write,
+    });
+
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
+    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), apply_failure.calls);
+    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
+    try std.testing.expectEqual(@as(u64, 0), slot.applied_lsn);
+    try std.testing.expectEqualStrings("IntentionalApplyFailure", slot.last_error.?);
+
+    var found = (try primary_db.lookup(alloc, "doc:remote-write", .{})) orelse return error.TestExpectedEqual;
+    defer found.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"title\":\"remote-write\"}", found.json);
+}
+
+test "storage.ha db primary progress sync wait observes reported remote apply ack" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 259,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+
+    const RemoteAck = struct {
+        calls: usize = 0,
+
+        fn poll(ctx: *anyopaque, primary_arg: *ha_primary_mod.Primary, target_lsn: u64, policy: ha_primary_mod.SyncPolicy, round: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            try std.testing.expectEqual(ha_primary_mod.DurabilityMode.remote_apply, policy.mode);
+            try std.testing.expectEqual(self.calls - 1, round);
+            if (self.calls == 1) {
+                try primary_arg.standbyStatusUpdate("standby-a", primary_arg.identity.timeline_id, target_lsn, 0);
+            } else {
+                try primary_arg.standbyStatusUpdate("standby-a", primary_arg.identity.timeline_id, target_lsn, target_lsn);
+            }
+        }
+    };
+
+    var remote_ack = RemoteAck{};
+    var wait_state = PrimaryProgressSyncWait{
+        .max_rounds = 3,
+        .poll_ctx = &remote_ack,
+        .poll_fn = RemoteAck.poll,
+    };
+    var gate_lsn = std.atomic.Value(u64).init(0);
+    var gate_action = std.atomic.Value(u8).init(255);
+    var waits = std.atomic.Value(u64).init(0);
+    const standby_names = [_][]const u8{"standby-a"};
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .ha_async_batch_mirror = .{
+            .primary = &primary,
+            .sync_policy = .{
+                .mode = .remote_apply,
+                .standby_names = &standby_names,
+                .failure_policy = .block,
+            },
+            .sync_wait_ctx = &wait_state,
+            .sync_wait_fn = PrimaryProgressSyncWait.wait,
+            .last_gate_lsn = &gate_lsn,
+            .last_gate_action = &gate_action,
+            .sync_wait_count = &waits,
+        },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:progress-wait", .value = "{\"title\":\"progress-wait\"}" }},
+        .sync_level = .write,
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), remote_ack.calls);
+    try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
+    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.acknowledge), gate_action.load(.acquire));
+    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 1), slot.received_lsn);
+    try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
+}
+
+test "storage.ha db primary progress sync wait returns would block without reported ack" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 260,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+
+    var wait_state = PrimaryProgressSyncWait{ .max_rounds = 1 };
+    var gate_lsn = std.atomic.Value(u64).init(0);
+    var gate_action = std.atomic.Value(u8).init(255);
+    var waits = std.atomic.Value(u64).init(0);
+    const standby_names = [_][]const u8{"standby-a"};
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .ha_async_batch_mirror = .{
+            .primary = &primary,
+            .sync_policy = .{
+                .mode = .remote_write,
+                .standby_names = &standby_names,
+                .failure_policy = .block,
+            },
+            .sync_wait_ctx = &wait_state,
+            .sync_wait_fn = PrimaryProgressSyncWait.wait,
+            .last_gate_lsn = &gate_lsn,
+            .last_gate_action = &gate_action,
+            .sync_wait_count = &waits,
+        },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    try std.testing.expectError(error.HASyncCommitWouldBlock, db.batch(.{
+        .writes = &.{.{ .key = "doc:progress-timeout", .value = "{\"title\":\"progress-timeout\"}" }},
+        .sync_level = .write,
+    }));
+
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+    try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
+    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.wait_for_standby), gate_action.load(.acquire));
+    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 0), slot.received_lsn);
+}
+
+test "storage.ha db primary progress sync wait survives primary restart before ack" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    const identity = ha_primary_mod.Identity{
+        .cluster_id = 261,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+    const standby_names = [_][]const u8{"standby-a"};
+    const policy = ha_primary_mod.SyncPolicy{
+        .mode = .remote_apply,
+        .standby_names = &standby_names,
+        .failure_policy = .block,
+    };
+
+    var target_lsn: u64 = 0;
+    {
+        var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, identity, .{});
+        defer primary.close();
+        try primary.createSlot("standby-a", 0);
+
+        var wait_state = PrimaryProgressSyncWait{ .max_rounds = 1 };
+        var gate_lsn = std.atomic.Value(u64).init(0);
+        var gate_action = std.atomic.Value(u8).init(255);
+        var waits = std.atomic.Value(u64).init(0);
+        var db = try DB.open(alloc, std.mem.span(db_path), .{
+            .ha_async_batch_mirror = .{
+                .primary = &primary,
+                .sync_policy = policy,
+                .sync_wait_ctx = &wait_state,
+                .sync_wait_fn = PrimaryProgressSyncWait.wait,
+                .last_gate_lsn = &gate_lsn,
+                .last_gate_action = &gate_action,
+                .sync_wait_count = &waits,
+            },
+            .start_index_workers = false,
+        });
+        defer db.close();
+
+        try std.testing.expectError(error.HASyncCommitWouldBlock, db.batch(.{
+            .writes = &.{.{ .key = "doc:restart-before-ack", .value = "{\"title\":\"restart-before-ack\"}" }},
+            .sync_level = .write,
+        }));
+        target_lsn = primary.lastLsn();
+        try std.testing.expectEqual(@as(u64, 1), target_lsn);
+        try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
+        try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.wait_for_standby), gate_action.load(.acquire));
+
+        const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(@as(u64, 0), slot.received_lsn);
+        try std.testing.expectEqual(@as(u64, 0), slot.applied_lsn);
+    }
+
+    {
+        var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, identity, .{});
+        defer primary.close();
+        try std.testing.expectEqual(target_lsn, primary.lastLsn());
+
+        var wait_state = PrimaryProgressSyncWait{ .max_rounds = 1 };
+        try std.testing.expectError(
+            error.HASyncCommitWouldBlock,
+            PrimaryProgressSyncWait.wait(&wait_state, &primary, target_lsn, policy),
+        );
+
+        try primary.standbyStatusUpdate("standby-a", identity.timeline_id, target_lsn, target_lsn);
+        try PrimaryProgressSyncWait.wait(&wait_state, &primary, target_lsn, policy);
+
+        const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(target_lsn, slot.received_lsn);
+        try std.testing.expectEqual(target_lsn, slot.applied_lsn);
+    }
+}
+
+test "storage.ha db block sync policy surfaces wait provider errors" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 256,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+
+    const SyncWait = struct {
+        calls: u64 = 0,
+
+        fn timeout(ctx: *anyopaque, _: *ha_primary_mod.Primary, _: u64, _: ha_primary_mod.SyncPolicy) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            return error.HASyncCommitWaitTimeout;
+        }
+    };
+
+    var wait_state = SyncWait{};
+    var gate_lsn = std.atomic.Value(u64).init(0);
+    var gate_action = std.atomic.Value(u8).init(255);
+    var waits = std.atomic.Value(u64).init(0);
+    const standby_names = [_][]const u8{"standby-a"};
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .ha_async_batch_mirror = .{
+            .primary = &primary,
+            .sync_policy = .{
+                .mode = .remote_apply,
+                .standby_names = &standby_names,
+                .failure_policy = .block,
+            },
+            .sync_wait_ctx = &wait_state,
+            .sync_wait_fn = SyncWait.timeout,
+            .last_gate_lsn = &gate_lsn,
+            .last_gate_action = &gate_action,
+            .sync_wait_count = &waits,
+        },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    try std.testing.expectError(error.HASyncCommitWaitTimeout, db.batch(.{
+        .writes = &.{.{ .key = "doc:timeout", .value = "{\"title\":\"timeout\"}" }},
+        .sync_level = .write,
+    }));
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+    try std.testing.expectEqual(@as(u64, 1), wait_state.calls);
+    try std.testing.expectEqual(@as(u64, 1), waits.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
+    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.wait_for_standby), gate_action.load(.acquire));
+}
+
+test "storage.ha db fail-closed sync policy rejects before local batch commit" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 254,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+    try primary.createSlot("standby-a", 0);
+
+    var gate_lsn = std.atomic.Value(u64).init(0);
+    var gate_action = std.atomic.Value(u8).init(255);
+    var rejected = std.atomic.Value(u64).init(0);
+    const standby_names = [_][]const u8{"standby-a"};
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .ha_async_batch_mirror = .{
+            .primary = &primary,
+            .sync_policy = .{
+                .mode = .remote_write,
+                .standby_names = &standby_names,
+                .failure_policy = .fail_closed,
+            },
+            .last_gate_lsn = &gate_lsn,
+            .last_gate_action = &gate_action,
+            .sync_reject_count = &rejected,
+        },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    try std.testing.expectError(error.SyncPolicyUnsatisfied, db.batch(.{
+        .writes = &.{.{ .key = "doc:rejected", .value = "{\"title\":\"rejected\"}" }},
+        .sync_level = .write,
+    }));
+    try std.testing.expectEqual(@as(u64, 0), primary.lastLsn());
+    try std.testing.expectEqual(@as(u64, 1), gate_lsn.load(.acquire));
+    try std.testing.expectEqual(@intFromEnum(ha_commit_gate_mod.Action.reject), gate_action.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), rejected.load(.acquire));
+    try std.testing.expect((try db.lookup(alloc, "doc:rejected", .{})) == null);
+}
+
+test "storage.ha db mirrors and applies schema metadata mutation records" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var primary_db_path_buf: [256]u8 = undefined;
+    const primary_db_path = tempPath(&primary_db_path_buf);
+    defer cleanupTempDir(primary_db_path);
+    var standby_db_path_buf: [256]u8 = undefined;
+    const standby_db_path = tempPath(&standby_db_path_buf);
+    defer cleanupTempDir(standby_db_path);
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+    var standby_log_path_buf: [256]u8 = undefined;
+    const standby_log_path = tempPath(&standby_log_path_buf);
+    defer cleanupTempDir(standby_log_path);
+    var standby_progress_path_buf: [256]u8 = undefined;
+    const standby_progress_path = tempPath(&standby_progress_path_buf);
+    defer cleanupTempDir(standby_progress_path);
+
+    const identity = ha_standby_mod.Identity{
+        .cluster_id = 252,
+        .shard_id = 5,
+        .table_id = 11,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, identity, .{});
+    defer primary.close();
+    var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, identity, .{});
+    defer standby.close();
+
+    var last_lsn = std.atomic.Value(u64).init(0);
+    var failures = std.atomic.Value(u64).init(0);
+    {
+        var db = try DB.open(alloc, std.mem.span(primary_db_path), .{
+            .ha_async_metadata_mirror = .{
+                .primary = &primary,
+                .last_lsn = &last_lsn,
+                .failure_count = &failures,
+            },
+            .start_index_workers = false,
+        });
+        defer db.close();
+
+        try db.setSchema(.{
+            .version = 12,
+            .default_type = "doc",
+            .ttl_duration_ns = 456,
+            .ttl_field = "expires_at",
+        });
+    }
+
+    try std.testing.expectEqual(@as(u64, 1), last_lsn.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), failures.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+
+    var entry = (try primary.log.entryAt(alloc, 1)) orelse return error.TestExpectedEqual;
+    defer entry.deinit(alloc);
+    try std.testing.expectEqual(@as(@TypeOf(entry.record.kind), .metadata_mutation), entry.record.kind);
+    try std.testing.expectEqual(@as(u64, 252), entry.record.cluster_id);
+    try std.testing.expectEqual(@as(u64, 5), entry.record.shard_id);
+    try std.testing.expectEqual(@as(u64, 11), entry.record.table_id);
+
+    var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
+        .ha_write_gate = .{ .standby = &standby },
+        .start_index_workers = false,
+    });
+    defer standby_db.close();
+
+    try std.testing.expectError(error.HAReadOnlyStandby, standby_db.setSchema(.{ .version = 99 }));
+    try standby_db.applyHAReplicationRecord(entry.record);
+    try std.testing.expectEqual(@as(u64, 1), try standby_db.haAppliedReplicationLsn());
+
+    const replicated_schema = (try schema_mod.loadSchema(standby_db.core.store, alloc)).?;
+    defer schema_mod.freeSchema(alloc, replicated_schema);
+    try std.testing.expectEqual(@as(u32, 12), replicated_schema.version);
+    try std.testing.expectEqualStrings("doc", replicated_schema.default_type);
+    try std.testing.expectEqual(@as(u64, 456), replicated_schema.ttl_duration_ns);
+    try std.testing.expectEqualStrings("expires_at", replicated_schema.ttl_field);
+
+    try standby_db.applyHAReplicationRecord(entry.record);
+    try std.testing.expectEqual(@as(u64, 1), try standby_db.haAppliedReplicationLsn());
+}
+
+test "storage.ha db applies batch mutation records through replication session callback" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var standby_db_path_buf: [256]u8 = undefined;
+    const standby_db_path = tempPath(&standby_db_path_buf);
+    defer cleanupTempDir(standby_db_path);
+    var primary_log_path_buf: [256]u8 = undefined;
+    const primary_log_path = tempPath(&primary_log_path_buf);
+    defer cleanupTempDir(primary_log_path);
+    var primary_slots_path_buf: [256]u8 = undefined;
+    const primary_slots_path = tempPath(&primary_slots_path_buf);
+    defer cleanupTempDir(primary_slots_path);
+    var standby_log_path_buf: [256]u8 = undefined;
+    const standby_log_path = tempPath(&standby_log_path_buf);
+    defer cleanupTempDir(standby_log_path);
+    var standby_progress_path_buf: [256]u8 = undefined;
+    const standby_progress_path = tempPath(&standby_progress_path_buf);
+    defer cleanupTempDir(standby_progress_path);
+
+    const identity = ha_standby_mod.Identity{
+        .cluster_id = 251,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+    var primary = try ha_primary_mod.Primary.open(alloc, primary_log_path, primary_slots_path, identity, .{});
+    defer primary.close();
+    var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, identity, .{});
+    defer standby.close();
+    try primary.createSlot("standby-a", 0);
+
+    _ = try ha_effects_mod.appendBatchMutationRequest(alloc, &primary, .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"replicated-session\"}" }},
+        .sync_level = .full_index,
+    }, .{});
+    _ = try primary.append(.{
+        .kind = .backup_start,
+        .payload_codec = .json,
+        .payload = "{\"manifest_id\":\"base-session\"}",
+    });
+    _ = try ha_effects_mod.appendDerivedChangeRecord(alloc, &primary, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:a"},
+        .target_hints = &.{.full_text},
+    }, .{});
+
+    var standby_db = try DB.open(alloc, std.mem.span(standby_db_path), .{
+        .ha_write_gate = .{ .standby = &standby },
+        .start_index_workers = false,
+    });
+    defer standby_db.close();
+
+    const result = try ha_session_mod.replicateAvailable(
+        alloc,
+        &primary,
+        "standby-a",
+        &standby,
+        &standby_db,
+        DB.applyHAReplicationRecordCallback,
+    );
+    try std.testing.expectEqual(@as(usize, 3), result.received_count);
+    try std.testing.expectEqual(@as(usize, 3), result.applied_count);
+    try std.testing.expectEqual(@as(u64, 3), result.progress.received_lsn);
+    try std.testing.expectEqual(@as(u64, 3), result.progress.applied_lsn);
+
+    const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 3), slot.received_lsn);
+    try std.testing.expectEqual(@as(u64, 3), slot.applied_lsn);
+    try std.testing.expectEqual(@as(u64, 3), try standby_db.haAppliedReplicationLsn());
+
+    var found = (try standby_db.lookup(alloc, "doc:a", .{})) orelse return error.TestExpectedEqual;
+    defer found.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"title\":\"replicated-session\"}", found.json);
+
+    const replay_entries = try replay_stream_mod.iterateFrom(alloc, standby_db.core.store, 1);
+    defer {
+        for (replay_entries) |*entry| entry.deinit(alloc);
+        alloc.free(replay_entries);
+    }
+    try std.testing.expectEqual(@as(usize, 2), replay_entries.len);
+    try std.testing.expectEqual(@as(u64, 1), replay_entries[0].sequence);
+    try std.testing.expectEqual(@as(u64, 2), replay_entries[1].sequence);
+
+    var replicated_effect_record = try change_journal_mod.decodeRecord(alloc, replay_entries[1].payload);
+    defer replicated_effect_record.deinit();
+    try std.testing.expectEqual(@as(u64, 2), replicated_effect_record.record.sequence);
+    try std.testing.expectEqualStrings("doc:a", replicated_effect_record.record.changed_doc_keys[0]);
+    try std.testing.expectEqual(@as(usize, 1), replicated_effect_record.record.target_hints.len);
+    try std.testing.expectEqual(change_journal_mod.TargetHint.full_text, replicated_effect_record.record.target_hints[0]);
+
+    var duplicate_batch = (try primary.log.entryAt(alloc, 1)) orelse return error.TestExpectedEqual;
+    defer duplicate_batch.deinit(alloc);
+    try standby_db.applyHAReplicationRecord(duplicate_batch.record);
+    var duplicate_derived = (try primary.log.entryAt(alloc, 3)) orelse return error.TestExpectedEqual;
+    defer duplicate_derived.deinit(alloc);
+    try standby_db.applyHAReplicationRecord(duplicate_derived.record);
+    try std.testing.expectEqual(@as(u64, 3), try standby_db.haAppliedReplicationLsn());
+
+    const replay_after_duplicates = try replay_stream_mod.iterateFrom(alloc, standby_db.core.store, 1);
+    defer {
+        for (replay_after_duplicates) |*entry| entry.deinit(alloc);
+        alloc.free(replay_after_duplicates);
+    }
+    try std.testing.expectEqual(@as(usize, 2), replay_after_duplicates.len);
+}
+
+test "storage.ha db persists applied replication marker across reopen" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var primary_log_path_buf: [256]u8 = undefined;
+    const primary_log_path = tempPath(&primary_log_path_buf);
+    defer cleanupTempDir(primary_log_path);
+    var primary_slots_path_buf: [256]u8 = undefined;
+    const primary_slots_path = tempPath(&primary_slots_path_buf);
+    defer cleanupTempDir(primary_slots_path);
+
+    const identity = ha_standby_mod.Identity{
+        .cluster_id = 252,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+    var primary = try ha_primary_mod.Primary.open(alloc, primary_log_path, primary_slots_path, identity, .{});
+    defer primary.close();
+
+    _ = try ha_effects_mod.appendBatchMutationRequest(alloc, &primary, .{
+        .writes = &.{.{ .key = "doc:persisted-marker", .value = "{\"title\":\"persisted\"}" }},
+        .sync_level = .write,
+    }, .{});
+    var entry = (try primary.log.entryAt(alloc, 1)) orelse return error.TestExpectedEqual;
+    defer entry.deinit(alloc);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(db_path), .{ .start_index_workers = false });
+        defer db.close();
+        try db.applyHAReplicationRecord(entry.record);
+        try std.testing.expectEqual(@as(u64, 1), try db.haAppliedReplicationLsn());
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(db_path), .{ .start_index_workers = false });
+    defer reopened.close();
+    try std.testing.expectEqual(@as(u64, 1), try reopened.haAppliedReplicationLsn());
+    try reopened.applyHAReplicationRecord(entry.record);
+    try std.testing.expectEqual(@as(u64, 1), try reopened.haAppliedReplicationLsn());
+
+    const replay_entries = try replay_stream_mod.iterateFrom(alloc, reopened.core.store, 1);
+    defer {
+        for (replay_entries) |*replay_entry| replay_entry.deinit(alloc);
+        alloc.free(replay_entries);
+    }
+    try std.testing.expectEqual(@as(usize, 1), replay_entries.len);
+    try std.testing.expectEqual(@as(u64, 1), replay_entries[0].sequence);
+}
+
+test "storage.ha db applies timeline switch as durable replication boundary" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+
+    const switch_record = ha_replication_record_mod.RecordView{
+        .kind = .timeline_switch,
+        .payload_codec = .json,
+        .cluster_id = 252,
+        .shard_id = 4,
+        .table_id = 10,
+        .timeline_id = 2,
+        .epoch = 2,
+        .lsn = 7,
+        .previous_lsn = 6,
+        .payload =
+        \\{"parent_timeline_id":1,"new_timeline_id":2,"parent_epoch":1,"new_epoch":2,"required_lsn":6,"forced":false,"data_loss_possible":false}
+        ,
+    };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(db_path), .{ .start_index_workers = false });
+        defer db.close();
+        try db.applyHAReplicationRecord(switch_record);
+        try std.testing.expectEqual(@as(u64, 7), try db.haAppliedReplicationLsn());
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(db_path), .{ .start_index_workers = false });
+    defer reopened.close();
+    try std.testing.expectEqual(@as(u64, 7), try reopened.haAppliedReplicationLsn());
+    try reopened.applyHAReplicationRecord(switch_record);
+    try std.testing.expectEqual(@as(u64, 7), try reopened.haAppliedReplicationLsn());
+}
+
+test "storage.ha db write gate rejects client writes on standby but allows replicated apply" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var standby_log_path_buf: [256]u8 = undefined;
+    const standby_log_path = tempPath(&standby_log_path_buf);
+    defer cleanupTempDir(standby_log_path);
+    var standby_progress_path_buf: [256]u8 = undefined;
+    const standby_progress_path = tempPath(&standby_progress_path_buf);
+    defer cleanupTempDir(standby_progress_path);
+
+    var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, .{
+        .cluster_id = 300,
+        .shard_id = 0,
+        .table_id = 0,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer standby.close();
+
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .ha_write_gate = .{ .standby = &standby },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    const NoopDocumentArtifactChildRangeDispatcher = struct {
+        fn apply(_: *anyopaque, _: Allocator, _: DocumentArtifactChildRangeDispatch) anyerror!void {}
+    };
+    var noop_dispatcher_state: u8 = 0;
+    const noop_dispatcher = DocumentArtifactChildRangeDispatcher{
+        .ptr = &noop_dispatcher_state,
+        .apply = NoopDocumentArtifactChildRangeDispatcher.apply,
+    };
+    var blocked_profile = BatchProfile{};
+
+    try std.testing.expectError(error.HAReadOnlyStandby, db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"client\"}" }},
+    }));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.batchProfiled(.{
+        .writes = &.{.{ .key = "doc:profiled", .value = "{\"title\":\"client\"}" }},
+    }, &blocked_profile));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.batchWithDocumentArtifactChildRangeDispatcher(.{
+        .writes = &.{.{ .key = "doc:dispatch", .value = "{\"title\":\"client\"}" }},
+    }, noop_dispatcher));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.batchWithoutRangeValidation(.{
+        .writes = &.{.{ .key = "doc:norange", .value = "{\"title\":\"client\"}" }},
+    }));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.applyDocumentArtifactChildRangeBatch(.{}));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.beginBulkIngestSession());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.beginDenseAutoBulkIngestSession());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.beginPrimaryStoreAutoBulkIngestSession());
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        db.finishBulkIngestSessionWithOptions(.{}),
+    );
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        db.finishDenseAutoBulkIngestSessionWithOptions(.{}),
+    );
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        db.rollDenseAutoBulkIngestSessionWithOptions(.{}),
+    );
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(.{}),
+    );
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        db.rollPrimaryStoreAutoBulkIngestSessionWithOptions(.{}),
+    );
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        db.updateRange(.{ .start = "doc:a", .end = "doc:z" }),
+    );
+    try std.testing.expectError(error.HAReadOnlyStandby, db.setSplitState(null));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.clearSplitState());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.setSplitDeltaFinalSeq(1));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.clearSplitDeltaEntries());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.createShadowIndexManager("doc:m", "doc:z"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.closeShadowIndexManager());
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        db.split(.{ .start = "doc:a", .end = "doc:z" }, "doc:m", "dest1", "dest2", true),
+    );
+    try std.testing.expectError(error.HAReadOnlyStandby, db.finalizeSplit(.{ .start = "doc:a", .end = "doc:m" }));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.snapshot("blocked"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.sync(false));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.syncIndexes(false));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.repairRestoreRuntimeStateStepIfNeeded(alloc));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runGraphMetricMaintenanceForIdle());
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        db.refreshGraphMetric(alloc, "graph_idx", "manual_degree"),
+    );
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runGraphMetricPlannedMaintenanceForIdle(.{}));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runGraphMetricServiceMaintenanceJsonAlloc(alloc, "{}"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.rebuildGraphMetric(alloc, "graph_idx", "manual_degree"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.deleteGraphMetricMaterialization(alloc, "graph_idx", "manual_degree"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.pauseGraphMetricMaintenance(alloc, "graph_idx", "manual_degree"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.resumeGraphMetricMaintenance(alloc, "graph_idx", "manual_degree"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "manual_degree", 1));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runGraphMetricPlannedWorkerPageStep("graph_idx", "manual_degree", "worker-a"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runGraphMetricPlannedCoordinatorStep("graph_idx", "manual_degree"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.failGraphMetricPlannedBuild(alloc, "graph_idx", "manual_degree", error.TestExpectedError));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runGraphMetricPlannedDrain(alloc, "graph_idx", "manual_degree", 1, .{ .worker_ids = &.{"worker-a"} }));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runGraphMetricPlannedCoordinatorSweep(.{}));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runGraphMetricPlannedWorkerSweep(.{ .worker_id = "worker-a" }));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runLsmMaintenanceStep());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.retryQuarantinedIndexLoads(true));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runUntilIdle());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.evaluateAlgebraicAdaptiveCandidates());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.compactTextIndexes());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.deleteIndex("missing"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.deleteEnrichment(.asset, "missing"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.removeResolver("missing"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.rewriteEntityEdges(alloc, "missing", "a", "b"));
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        db.rebuildRelationalSecondaryIndexInRange("missing", 0, "doc:a", "doc:z"),
+    );
+    try std.testing.expectError(error.HAReadOnlyStandby, db.repairForeignKeyRefsInRange("doc:a", "doc:z"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.repairForeignKeyRefsInRangeForConstraint("fk_parent", "doc:a", "doc:z"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.repairUniqueConstraintRowsInRange("doc:a", "doc:z"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.repairForeignKeyRefOwnerForParent("fk_parent", "parent", "p1"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.repairForeignKeyRefOwnerRange("fk_parent", "parent", "p1", "p9"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.claimForeignKeyIntegrityWorkUnit("claim-a", "worker-a", 1, "scan", "repair", null, "doc:a", "doc:z", 1000));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.upsertForeignKeyIntegrityJobRecord("job-a", "child", "repair", "worker-a", null, "doc:a", "doc:z", 1000, 10, "running"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.completeForeignKeyIntegrityJobRecord("job-a", "complete", true, .{}));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.updateForeignKeyIntegrityJobDiagnostics("job-a", "[]", 0, false));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.scheduleForeignKeyActionJob("action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.requeueForeignKeyActionJob("action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.scheduleForeignKeyActionSchedule("schedule-a", "action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.markForeignKeyActionScheduleSeeded("schedule-a", 1));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.claimForeignKeyActionJobPage("action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16, 1000));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.finishClaimedForeignKeyActionJobPage(@as(DB.ForeignKeyActionJobRecord, undefined), 0, false, null, null, null));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.claimAndRunForeignKeyIntegrityWorkUnit("claim-a", "worker-a", 1, "scan", .repair, null, "doc:a", "doc:z", 1000));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.catchUpPendingDerivedReplay());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.derivedAsyncAppendDerivedBatchRecord(.{}));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.rebuildDenseIndexesForTargetCoverage(alloc));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.rebuildSparseIndexesForTargetCoverage(alloc));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.rebuildGraphIndexesForTargetCoverage(alloc));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runDensePostingMaintenanceForIdle());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.runDensePostingMaintenanceForIdleBestEffort());
+    try std.testing.expectError(error.HAReadOnlyStandby, db.rebuildDenseIndexesFromStoredEmbeddingArtifacts(alloc));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.replayGeneratedEnrichmentsFromStoredDocs(alloc));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.ensureGroupCreatedAtMillis(alloc, 42, 1234));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.mutateRelationalRowsFromSource(alloc, .{}, .{ .kind = .update }));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.stagePlannedRelationalRowsMutationSourceAlloc(alloc, .{}, .{ .kind = .update }, 0, &.{}));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.mutateRelationalRowsJoinedSourceAlloc(alloc, .{}, .{ .kind = .update }));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.stagePlannedRelationalRowsJoinedMutationSourceAlloc(alloc, .{}, .{ .kind = .update }, 0, &.{}));
+    const blocked_txn: transactions_mod.TxnId = .{ 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42 };
+    try std.testing.expectError(error.HAReadOnlyStandby, db.beginTransaction(1));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.beginTransactionWithId(blocked_txn, 1));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.beginTransactionWithParticipants(1, &.{"remote"}));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.beginTransactionWithIdAndParticipants(blocked_txn, 1, &.{"remote"}));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.writeIntents(blocked_txn, &.{}, &.{}));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.writeTransaction(blocked_txn, .{}));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.claimRowsForTransaction(blocked_txn, &.{"row:a"}, .{}));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.commitTransaction(blocked_txn, 2));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.resolveTransactionIntents(blocked_txn, .committed, 3));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.abortTransaction(blocked_txn, 4));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.markTransactionParticipantResolved(blocked_txn, "remote"));
+    try std.testing.expectError(error.HAReadOnlyStandby, db.recoverTransactions(5, 6));
+    try std.testing.expectError(
+        error.HAReadOnlyStandby,
+        db.reassignIdentityNamespaceForInternalTransition(.{ .table_id = 300, .shard_id = 1, .range_id = 1 }),
+    );
+
+    try db.batchReplicatedApply(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"replicated\"}" }},
+    });
+    var found = (try db.lookup(alloc, "doc:a", .{})) orelse return error.TestExpectedEqual;
+    defer found.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"title\":\"replicated\"}", found.json);
+}
+
+test "storage.ha db write gate rejects fenced former primary writes" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var primary_log_path_buf: [256]u8 = undefined;
+    const primary_log_path = tempPath(&primary_log_path_buf);
+    defer cleanupTempDir(primary_log_path);
+    var primary_slots_path_buf: [256]u8 = undefined;
+    const primary_slots_path = tempPath(&primary_slots_path_buf);
+    defer cleanupTempDir(primary_slots_path);
+    var fence_path_buf: [256]u8 = undefined;
+    const fence_path = tempPath(&fence_path_buf);
+    defer cleanupTempDir(fence_path);
+
+    const identity = ha_primary_mod.Identity{
+        .cluster_id = 301,
+        .shard_id = 0,
+        .table_id = 0,
+        .timeline_id = 1,
+        .epoch = 1,
+    };
+    var primary = try ha_primary_mod.Primary.open(alloc, primary_log_path, primary_slots_path, identity, .{});
+    defer primary.close();
+    _ = try primary.append(.{ .payload = "before-fence" });
+
+    var fence_store = try ha_fencing_mod.Store.open(alloc, fence_path, .{});
+    defer fence_store.close();
+    const receipt = try fence_store.acquirePromotionFence(.{
+        .identity = identity,
+        .old_primary_id = "primary-a",
+        .promoted_node_id = "standby-a",
+        .new_timeline_id = 2,
+        .new_epoch = 2,
+        .required_lsn = 1,
+        .observed_lsn = 1,
+        .reason = "db-write-gate-test",
+    });
+    defer ha_fencing_mod.freeReceipt(alloc, receipt);
+
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .ha_write_gate = .{ .fenced_primary = .{
+            .primary = &primary,
+            .fence_store = &fence_store,
+            .node_id = "primary-a",
+        } },
+        .start_index_workers = false,
+    });
+    defer db.close();
+
+    try std.testing.expectError(error.HAFencedPrimary, db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"blocked\"}" }},
+    }));
+
+    const gate = db.ha_write_gate orelse return error.TestExpectedEqual;
+    switch (gate) {
+        .fenced_primary => |fenced| {
+            const decision = try ha_write_gate_mod.evaluateFencedPrimary(fenced, .{});
+            try std.testing.expectEqual(ha_write_gate_mod.Action.reject_fenced_primary, decision.action);
+        },
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "storage.ha db standby role suppresses mutating background runtimes" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    var standby_log_path_buf: [256]u8 = undefined;
+    const standby_log_path = tempPath(&standby_log_path_buf);
+    defer cleanupTempDir(standby_log_path);
+    var standby_progress_path_buf: [256]u8 = undefined;
+    const standby_progress_path = tempPath(&standby_progress_path_buf);
+    defer cleanupTempDir(standby_progress_path);
+
+    var standby = try ha_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, .{
+        .cluster_id = 301,
+        .shard_id = 0,
+        .table_id = 0,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer standby.close();
+
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .ha_write_gate = .{ .standby = &standby },
+        .start_index_workers = true,
+        .start_optional_runtimes = true,
+        .enrichment = .{ .enable_without_producers = true },
+        .ttl_cleanup = .{ .enabled = true },
+        .transaction_recovery = .{ .enabled = true },
+        .text_merge = .{ .enabled = true },
+        .sparse_compaction = .{ .enabled = true },
+    });
+    defer db.close();
+
+    try std.testing.expect(!db.start_index_workers);
+    try std.testing.expect(!db.executor.hasWorkers());
+    try std.testing.expect(db.enrichment_runtime == null);
+    try std.testing.expect(db.resolution_runtime == null);
+    try std.testing.expect(db.promotion_runtime == null);
+    try std.testing.expect(db.ttl_runtime == null);
+    try std.testing.expect(db.transaction_runtime == null);
+    try std.testing.expect(db.text_merge_runtime == null);
+    try std.testing.expect(db.sparse_compaction_runtime == null);
 }
 
 pub fn Impl(comptime DB: type) type {

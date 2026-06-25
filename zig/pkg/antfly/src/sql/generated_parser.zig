@@ -6021,6 +6021,9 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_subscription }, (try parseSqlAlloc(alloc, "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=db' PUBLICATION usage_pub")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_subscription }, (try parseSqlAlloc(alloc, "ALTER SUBSCRIPTION usage_sub DISABLE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_subscription }, (try parseSqlAlloc(alloc, "DROP SUBSCRIPTION IF EXISTS usage_sub")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_policy }, (try parseSqlAlloc(alloc, "CREATE POLICY usage_policy ON usage_records USING (tenant_id = current_user)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_policy }, (try parseSqlAlloc(alloc, "ALTER POLICY usage_policy ON usage_records RENAME TO usage_policy_v2")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_policy }, (try parseSqlAlloc(alloc, "DROP POLICY IF EXISTS usage_policy ON usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .relation_population }, (try parseSqlAlloc(alloc, "SELECT account_id, total INTO usage_archive FROM usage_records WHERE total > 10")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .relation_population }, (try parseSqlAlloc(alloc, "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT account_id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_schema }, (try parseSqlAlloc(alloc, "ALTER SCHEMA analytics RENAME TO reporting")).statement);
@@ -6230,6 +6233,43 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlDdlKind.create_subscription, ddl.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 7 }, ddl.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const create_policy_sql = "CREATE POLICY usage_policy ON usage_records USING (tenant_id = current_user)";
+    const create_policy_result = try parseSqlAlloc(alloc, create_policy_sql);
+    switch (create_policy_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.create_policy, ddl.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl.index_table_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 11 }, ddl.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const alter_policy_sql = "ALTER POLICY usage_policy ON usage_records WITH CHECK (status = 'ready')";
+    const alter_policy_result = try parseSqlAlloc(alloc, alter_policy_sql);
+    switch (alter_policy_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.alter_policy, ddl.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl.index_table_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 12 }, ddl.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const drop_policy_sql = "DROP POLICY IF EXISTS usage_policy ON usage_records CASCADE";
+    const drop_policy_result = try parseSqlAlloc(alloc, drop_policy_sql);
+    switch (drop_policy_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.drop_policy, ddl.kind);
+            try std.testing.expect(ddl.if_exists);
+            try std.testing.expect(ddl.cascade);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, ddl.index_table_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -9367,12 +9407,6 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 7 },
         },
         .{
-            .sql = "ALTER POLICY usage_policy ON usage_records RENAME TO usage_policy_v2",
-            .kind = .alter_policy,
-            .reason = .alter_policy_not_planned_by_generated_parser,
-            .subject_tokens = .{ .start = 1, .end = 8 },
-        },
-        .{
             .sql = "ALTER RULE usage_insert ON usage_records RENAME TO usage_insert_v2",
             .kind = .alter_rule,
             .reason = .alter_rule_not_planned_by_generated_parser,
@@ -9413,12 +9447,6 @@ test "generated SQL parser facade builds extended read AST spans" {
             .kind = .create_foreign_table,
             .reason = .create_foreign_table_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 10 },
-        },
-        .{
-            .sql = "CREATE POLICY usage_policy ON usage_records USING (tenant_id = current_user)",
-            .kind = .create_policy,
-            .reason = .create_policy_not_planned_by_generated_parser,
-            .subject_tokens = .{ .start = 1, .end = 11 },
         },
         .{
             .sql = "CREATE RULE usage_insert AS ON INSERT TO usage_records DO ALSO NOTIFY usage_events",
@@ -9496,12 +9524,6 @@ test "generated SQL parser facade builds extended read AST spans" {
             .sql = "SECURITY LABEL ON TABLE usage_records IS 'internal'",
             .kind = .security_label,
             .reason = .security_label_not_planned_by_generated_parser,
-            .subject_tokens = .{ .start = 1, .end = 7 },
-        },
-        .{
-            .sql = "DROP POLICY IF EXISTS usage_policy ON usage_records",
-            .kind = .drop_policy,
-            .reason = .drop_policy_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 7 },
         },
         .{

@@ -251,6 +251,19 @@ def test_pgwire_extended_query_binds_text_parameters(pgwire_server):
     assert [message["values"] for message in select_messages if message["type"] == "row"] == [["row:extended", "ready"]]
 
 
+def test_pgwire_empty_select_preserves_row_description(pgwire_server):
+    table = _table_name("pgwire_empty")
+
+    with socket.create_connection((pgwire_server.host, pgwire_server.pgwire_port), timeout=5) as sock:
+        _pgwire_startup(sock)
+        _pgwire_simple_query(sock, f"CREATE TABLE {table} (id text PRIMARY KEY, status text, amount int);")
+        messages = _pgwire_simple_query(sock, f"SELECT id, status, amount FROM {table} WHERE id = 'missing';")
+
+    assert [message["columns"] for message in messages if message["type"] == "columns"] == [["id", "status", "amount"]]
+    assert [message["tag"] for message in messages if message["type"] == "command"] == ["SELECT 0"]
+    assert [message["values"] for message in messages if message["type"] == "row"] == []
+
+
 def test_metadata_pgwire_simple_query_uses_public_api_sql(metadata_pgwire_server):
     table = _table_name("metadata_pgwire")
 
@@ -288,6 +301,7 @@ def _pgwire_simple_query(sock: socket.socket, sql: str) -> list[dict[str, Any]]:
         tag, payload = _pgwire_read_message(sock)
         if tag == b"T":
             columns = _pgwire_row_description(payload)
+            messages.append({"type": "columns", "columns": columns})
         elif tag == b"D":
             messages.append({"type": "row", "values": _pgwire_data_row(payload)})
         elif tag == b"C":
@@ -328,6 +342,7 @@ def _pgwire_extended_query(sock: socket.socket, sql: str, params: list[str | Non
         tag, payload = _pgwire_read_message(sock)
         if tag == b"T":
             columns = _pgwire_row_description(payload)
+            messages.append({"type": "columns", "columns": columns})
         elif tag == b"D":
             messages.append({"type": "row", "values": _pgwire_data_row(payload)})
         elif tag == b"C":

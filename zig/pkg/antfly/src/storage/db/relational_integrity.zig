@@ -7252,6 +7252,621 @@ test "db foreign key ref owner range validation repairs stale parent-key span ro
     try std.testing.expectEqual(@as(u64, 1), untouched_high.stale_ref_rows);
 }
 
+test "db relational integrity constraints relational foreign key on update stays restrictive when delete cascades" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"ref_email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]}],"foreign_keys":[{"name":"users_ref_email_fkey","columns":["ref_email"],"references":{"table":"row","columns":["email"]},"on_delete":"cascade","on_update":"no_action"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+    try std.testing.expectEqual(schema_mod.ForeignKeyAction.cascade, runtime_schema.foreign_keys[0].on_delete);
+    try std.testing.expectEqual(schema_mod.ForeignKeyAction.no_action, runtime_schema.foreign_keys[0].on_update);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"parent@example.com\"}" },
+            .{ .key = "user:child", .value = "{\"id\":\"user:child\",\"ref_email\":\"parent@example.com\"}" },
+        },
+    });
+
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .writes = &.{.{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"updated@example.com\"}" }},
+    }));
+
+    try db.batch(.{ .deletes = &.{"user:parent"} });
+    try std.testing.expect((try db.get(alloc, "user:parent")) == null);
+    try std.testing.expect((try db.get(alloc, "user:child")) == null);
+}
+
+test "db relational integrity constraints relational foreign key on update set null rewrites local unique children" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"ref_email":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]}],"foreign_keys":[{"name":"users_ref_email_fkey","columns":["ref_email"],"references":{"table":"row","columns":["email"]},"on_update":"set_null"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+    try std.testing.expectEqual(schema_mod.ForeignKeyAction.set_null, runtime_schema.foreign_keys[0].on_update);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"parent@example.com\",\"status\":\"active\"}" },
+            .{ .key = "user:child", .value = "{\"id\":\"user:child\",\"ref_email\":\"parent@example.com\",\"status\":\"open\"}" },
+        },
+    });
+    const old_parent_raw = (try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:parent")) orelse return error.TestExpectedEqual;
+    defer alloc.free(old_parent_raw);
+    const old_parent_key = (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, old_parent_raw, runtime_schema.unique_constraints[0])) orelse return error.TestExpectedEqual;
+    defer alloc.free(old_parent_key);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"updated@example.com\",\"status\":\"active\"}" }},
+    });
+
+    const child_after = (try db.get(alloc, "user:child")) orelse return error.TestExpectedEqual;
+    defer alloc.free(child_after);
+    try std.testing.expectEqualStrings("{\"id\":\"user:child\",\"status\":\"open\"}", child_after);
+
+    const old_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "users_ref_email_fkey", "row", "parent@example.com", "row", "user:child");
+    defer alloc.free(old_ref);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, old_ref));
+
+    const report = try db.validateForeignKeyRefsInRange("", "");
+    try std.testing.expect(report.valid());
+    try std.testing.expectEqual(@as(u64, 0), report.referenced_child_rows);
+    try std.testing.expectEqual(@as(u64, 0), report.scanned_ref_rows);
+}
+
+test "db relational integrity constraints relational foreign key on update cascade rewrites local unique children" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"ref_email":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]}],"foreign_keys":[{"name":"users_ref_email_fkey","columns":["ref_email"],"references":{"table":"row","columns":["email"]},"on_update":"cascade"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+    try std.testing.expectEqual(schema_mod.ForeignKeyAction.cascade, runtime_schema.foreign_keys[0].on_update);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"parent@example.com\",\"status\":\"active\"}" },
+            .{ .key = "user:child", .value = "{\"id\":\"user:child\",\"ref_email\":\"parent@example.com\",\"status\":\"open\"}" },
+        },
+    });
+    const old_parent_raw = (try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:parent")) orelse return error.TestExpectedEqual;
+    defer alloc.free(old_parent_raw);
+    const old_parent_key = (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, old_parent_raw, runtime_schema.unique_constraints[0])) orelse return error.TestExpectedEqual;
+    defer alloc.free(old_parent_key);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"updated@example.com\",\"status\":\"active\"}" }},
+    });
+
+    const child_after = (try db.get(alloc, "user:child")) orelse return error.TestExpectedEqual;
+    defer alloc.free(child_after);
+    try std.testing.expectEqualStrings("{\"id\":\"user:child\",\"ref_email\":\"updated@example.com\",\"status\":\"open\"}", child_after);
+
+    const old_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "users_ref_email_fkey", "row", old_parent_key, "row", "user:child");
+    defer alloc.free(old_ref);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, old_ref));
+    const new_parent_raw = (try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:parent")) orelse return error.TestExpectedEqual;
+    defer alloc.free(new_parent_raw);
+    const new_parent_key = (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, new_parent_raw, runtime_schema.unique_constraints[0])) orelse return error.TestExpectedEqual;
+    defer alloc.free(new_parent_key);
+    const new_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "users_ref_email_fkey", "row", new_parent_key, "row", "user:child");
+    defer alloc.free(new_ref);
+    const new_ref_value = try db.core.store.get(alloc, new_ref);
+    alloc.free(new_ref_value);
+
+    const report = try db.validateForeignKeyRefsInRange("", "");
+    try std.testing.expect(report.valid());
+    try std.testing.expectEqual(@as(u64, 1), report.referenced_child_rows);
+    try std.testing.expectEqual(@as(u64, 1), report.scanned_ref_rows);
+}
+
+test "db relational integrity constraints deferred no action foreign key update validates final transaction state" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"ref_email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]}],"foreign_keys":[{"name":"users_ref_email_fkey","columns":["ref_email"],"references":{"table":"row","columns":["email"]},"on_update":"no_action","timing":"deferred"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"old@example.com\"}" },
+            .{ .key = "user:child", .value = "{\"id\":\"user:child\",\"ref_email\":\"old@example.com\"}" },
+        },
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"new@example.com\"}" },
+            .{ .key = "user:child", .value = "{\"id\":\"user:child\",\"ref_email\":\"new@example.com\"}" },
+        },
+    });
+
+    const parent = (try db.get(alloc, "user:parent")) orelse return error.TestExpectedEqual;
+    defer alloc.free(parent);
+    try std.testing.expectEqualStrings("{\"id\":\"user:parent\",\"email\":\"new@example.com\"}", parent);
+
+    const child = (try db.get(alloc, "user:child")) orelse return error.TestExpectedEqual;
+    defer alloc.free(child);
+    try std.testing.expectEqualStrings("{\"id\":\"user:child\",\"ref_email\":\"new@example.com\"}", child);
+
+    const report = try db.validateForeignKeyRefsInRange("", "");
+    try std.testing.expect(report.valid());
+}
+
+test "db relational integrity constraints deferred restrict foreign key update remains immediate" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"ref_email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]}],"foreign_keys":[{"name":"users_ref_email_fkey","columns":["ref_email"],"references":{"table":"row","columns":["email"]},"on_update":"restrict","timing":"deferred"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"old@example.com\"}" },
+            .{ .key = "user:child", .value = "{\"id\":\"user:child\",\"ref_email\":\"old@example.com\"}" },
+        },
+    });
+
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .writes = &.{
+            .{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"new@example.com\"}" },
+            .{ .key = "user:child", .value = "{\"id\":\"user:child\",\"ref_email\":\"new@example.com\"}" },
+        },
+    }));
+}
+
+test "db relational integrity constraints deferred no action foreign key delete validates final transaction state" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"row","columns":["_id"]},"on_delete":"no_action","timing":"deferred"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "customer:delete", .value = "{\"id\":\"customer:delete\"}" },
+            .{ .key = "order:delete", .value = "{\"id\":\"order:delete\",\"customer_id\":\"customer:delete\"}" },
+        },
+    });
+
+    const txn = try db.beginTransaction(31_000);
+    try db.writeTransaction(txn, .{
+        .deletes = &.{"customer:delete"},
+    });
+    try db.writeTransaction(txn, .{
+        .writes = &.{.{ .key = "order:delete", .value = "{\"id\":\"order:delete\"}" }},
+    });
+    try db.commitTransaction(txn, 31_001);
+
+    try std.testing.expect((try db.get(alloc, "customer:delete")) == null);
+    const child = (try db.get(alloc, "order:delete")) orelse return error.TestExpectedEqual;
+    defer alloc.free(child);
+    try std.testing.expectEqualStrings("{\"id\":\"order:delete\"}", child);
+
+    const report = try db.validateForeignKeyRefsInRange("", "");
+    try std.testing.expect(report.valid());
+}
+
+test "db relational integrity constraints deferred restrict foreign key delete remains restrictive" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"row","columns":["_id"]},"on_delete":"restrict","timing":"deferred"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "customer:delete", .value = "{\"id\":\"customer:delete\"}" },
+            .{ .key = "order:delete", .value = "{\"id\":\"order:delete\",\"customer_id\":\"customer:delete\"}" },
+        },
+    });
+
+    const txn = try db.beginTransaction(31_100);
+    try db.writeTransaction(txn, .{
+        .deletes = &.{"customer:delete"},
+    });
+    try std.testing.expectError(error.ForeignKeyViolation, db.commitTransaction(txn, 31_101));
+    try db.abortTransaction(txn, 31_101);
+}
+
+test "db relational integrity constraints relational unique constraints enforce committed scalar values" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"email":{"type":"keyword"},"handle":{"type":"keyword"},"age":{"type":"numeric"},"slug":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]},{"name":"users_age_key","columns":["age"]},{"name":"users_tenant_handle_key","columns":["tenant_id","handle"]},{"name":"users_active_slug_key","columns":["slug"],"where":{"all":[{"field":"status","op":"eq","value":"active"}]}},{"name":"users_lower_email_key","expressions":[{"op":"lower","field":"email"}]}]}
+    ;
+    var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:1", .value = "{\"id\":\"user:1\",\"email\":\"a@example.com\",\"age\":30}" },
+            .{ .key = "user:tenant-a", .value = "{\"id\":\"user:tenant-a\",\"tenant_id\":\"tenant:a\",\"handle\":\"sam\"}" },
+            .{ .key = "user:tenant-b", .value = "{\"id\":\"user:tenant-b\",\"tenant_id\":\"tenant:b\",\"handle\":\"sam\"}" },
+            .{ .key = "user:partial-a", .value = "{\"id\":\"user:partial-a\",\"tenant_id\":\"tenant:a\"}" },
+            .{ .key = "user:partial-b", .value = "{\"id\":\"user:partial-b\",\"tenant_id\":\"tenant:a\"}" },
+            .{ .key = "user:null-a", .value = "{\"id\":\"user:null-a\"}" },
+            .{ .key = "user:null-b", .value = "{\"id\":\"user:null-b\"}" },
+            .{ .key = "user:inactive-a", .value = "{\"id\":\"user:inactive-a\",\"slug\":\"sam\",\"status\":\"inactive\"}" },
+            .{ .key = "user:inactive-b", .value = "{\"id\":\"user:inactive-b\",\"slug\":\"sam\",\"status\":\"inactive\"}" },
+            .{ .key = "user:active-a", .value = "{\"id\":\"user:active-a\",\"slug\":\"sam\",\"status\":\"active\"}" },
+        },
+    });
+
+    try std.testing.expectError(error.UniqueConstraintViolation, db.batch(.{
+        .writes = &.{.{ .key = "user:2", .value = "{\"id\":\"user:2\",\"email\":\"a@example.com\",\"age\":31}" }},
+    }));
+    try std.testing.expectError(error.UniqueConstraintViolation, db.batch(.{
+        .writes = &.{.{ .key = "user:2-case", .value = "{\"id\":\"user:2-case\",\"email\":\"A@EXAMPLE.COM\",\"age\":41}" }},
+    }));
+    try std.testing.expectError(error.UniqueConstraintViolation, db.batch(.{
+        .writes = &.{.{ .key = "user:3", .value = "{\"id\":\"user:3\",\"email\":\"b@example.com\",\"age\":30}" }},
+    }));
+    try std.testing.expectError(error.UniqueConstraintViolation, db.batch(.{
+        .writes = &.{.{ .key = "user:tenant-a-dup", .value = "{\"id\":\"user:tenant-a-dup\",\"tenant_id\":\"tenant:a\",\"handle\":\"sam\"}" }},
+    }));
+    try std.testing.expectError(error.UniqueConstraintViolation, db.batch(.{
+        .writes = &.{.{ .key = "user:active-b", .value = "{\"id\":\"user:active-b\",\"slug\":\"sam\",\"status\":\"active\"}" }},
+    }));
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "user:1", .value = "{\"id\":\"user:1\",\"email\":\"b@example.com\",\"age\":32}" }},
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "user:2", .value = "{\"id\":\"user:2\",\"email\":\"a@example.com\",\"age\":30}" }},
+    });
+
+    try db.batch(.{
+        .deletes = &.{"user:2"},
+    });
+    const deleted_user_2_row = try relational_store_mod.getRawAlloc(alloc, db.core.store, "user:2");
+    defer if (deleted_user_2_row) |row| alloc.free(row);
+    try std.testing.expect(deleted_user_2_row == null);
+    const reusable_email_value = try relational_store_mod.bytesTupleValueAlloc(alloc, &.{"a@example.com"});
+    defer alloc.free(reusable_email_value);
+    const reusable_email_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_email_key", reusable_email_value);
+    defer alloc.free(reusable_email_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, reusable_email_key));
+    try db.batch(.{
+        .writes = &.{.{ .key = "user:3", .value = "{\"id\":\"user:3\",\"email\":\"a@example.com\",\"age\":30}" }},
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "user:tenant-a", .value = "{\"id\":\"user:tenant-a\",\"tenant_id\":\"tenant:a\",\"handle\":\"alex\"}" }},
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "user:tenant-a-dup", .value = "{\"id\":\"user:tenant-a-dup\",\"tenant_id\":\"tenant:a\",\"handle\":\"sam\"}" }},
+    });
+    try db.batch(.{
+        .deletes = &.{"user:tenant-a-dup"},
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "user:tenant-a-reuse", .value = "{\"id\":\"user:tenant-a-reuse\",\"tenant_id\":\"tenant:a\",\"handle\":\"sam\"}" }},
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "user:active-a", .value = "{\"id\":\"user:active-a\",\"slug\":\"sam\",\"status\":\"inactive\"}" }},
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "user:active-b", .value = "{\"id\":\"user:active-b\",\"slug\":\"sam\",\"status\":\"active\"}" }},
+    });
+
+    const txn_id = try db.beginTransaction(20_000);
+    try db.writeIntents(txn_id, &.{
+        .{ .key = "user:txn", .value = "{\"id\":\"user:txn\",\"email\":\"a@example.com\",\"age\":40}" },
+    }, &.{});
+    try std.testing.expectError(error.UniqueConstraintViolation, db.commitTransaction(txn_id, 20_001));
+    try db.abortTransaction(txn_id, 20_002);
+}
+
+test "db relational integrity constraints relational composite primary keys enforce identity and back foreign keys" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"order_id":{"type":"keyword"},"parent_order_id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["tenant_id","order_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","order_id"]},"foreign_keys":[{"name":"orders_parent_fkey","columns":["tenant_id","parent_order_id"],"references":{"table":"row","columns":["tenant_id","order_id"]},"on_delete":"restrict","on_update":"restrict","match":"full"}]}
+    ;
+    var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "order:parent", .value = "{\"tenant_id\":\"tenant:a\",\"order_id\":\"parent\",\"status\":\"open\"}" },
+            .{ .key = "order:child", .value = "{\"tenant_id\":\"tenant:a\",\"order_id\":\"child\",\"parent_order_id\":\"parent\",\"status\":\"open\"}" },
+        },
+    });
+
+    const parent_row_key = try internal_keys.relationalRowKeyAlloc(alloc, "order:parent");
+    defer alloc.free(parent_row_key);
+    const parent_row = try db.core.store.get(alloc, parent_row_key);
+    defer alloc.free(parent_row);
+    const parent_tuple = try relational_store_mod.primaryKeyTupleValueAlloc(alloc, parent_row, runtime_schema.primary_key.?);
+    defer alloc.free(parent_tuple);
+    const parent_owner_key = try internal_keys.relationalUniqueKeyAlloc(alloc, relational_store_mod.primary_key_constraint_name, parent_tuple);
+    defer alloc.free(parent_owner_key);
+    const parent_owner = try db.core.store.get(alloc, parent_owner_key);
+    defer alloc.free(parent_owner);
+    try std.testing.expectEqualStrings("order:parent", parent_owner);
+
+    try db.core.store.delete(parent_owner_key);
+    const missing_owner_report = try db.validateUniqueConstraintRowsInRange("", "");
+    try std.testing.expect(!missing_owner_report.valid());
+    try std.testing.expectEqual(@as(u64, 1), missing_owner_report.missing_unique_rows);
+    const repair_owner_report = try db.repairUniqueConstraintRowsInRange("", "");
+    try std.testing.expectEqual(@as(u64, 1), repair_owner_report.repaired_unique_rows);
+    const validate_repaired_owner_report = try db.validateUniqueConstraintRowsInRange("", "");
+    try std.testing.expect(validate_repaired_owner_report.valid());
+    const repaired_parent_owner = try db.core.store.get(alloc, parent_owner_key);
+    defer alloc.free(repaired_parent_owner);
+    try std.testing.expectEqualStrings("order:parent", repaired_parent_owner);
+
+    try std.testing.expectError(error.UniqueConstraintViolation, db.batch(.{
+        .writes = &.{.{ .key = "order:duplicate", .value = "{\"tenant_id\":\"tenant:a\",\"order_id\":\"parent\",\"status\":\"duplicate\"}" }},
+    }));
+    try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{
+        .writes = &.{.{ .key = "order:missing-key", .value = "{\"tenant_id\":\"tenant:a\",\"status\":\"missing\"}" }},
+    }));
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .writes = &.{.{ .key = "order:missing-parent", .value = "{\"tenant_id\":\"tenant:a\",\"order_id\":\"missing-parent\",\"parent_order_id\":\"absent\"}" }},
+    }));
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .deletes = &.{"order:parent"},
+    }));
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .writes = &.{.{ .key = "order:parent", .value = "{\"tenant_id\":\"tenant:a\",\"order_id\":\"parent-renamed\",\"status\":\"renamed\"}" }},
+    }));
+
+    const report = try db.validateForeignKeyRefsInRange("", "");
+    try std.testing.expect(report.valid());
+}
+
+test "db relational integrity constraints unique constraint integrity repair rebuilds backing rows" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]}]}
+    ;
+    var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{ .writes = &.{
+        .{ .key = "user:ada", .value = "{\"id\":\"user:ada\",\"email\":\"ada@example.test\"}" },
+        .{ .key = "user:grace", .value = "{\"id\":\"user:grace\",\"email\":\"grace@example.test\"}" },
+    } });
+
+    const ada_value = try relational_store_mod.bytesTupleValueAlloc(alloc, &.{"ada@example.test"});
+    defer alloc.free(ada_value);
+    const grace_value = try relational_store_mod.bytesTupleValueAlloc(alloc, &.{"grace@example.test"});
+    defer alloc.free(grace_value);
+    const stale_value = try relational_store_mod.bytesTupleValueAlloc(alloc, &.{"stale@example.test"});
+    defer alloc.free(stale_value);
+    const ada_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_email_key", ada_value);
+    defer alloc.free(ada_key);
+    const grace_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_email_key", grace_value);
+    defer alloc.free(grace_key);
+    const stale_key = try internal_keys.relationalUniqueKeyAlloc(alloc, "users_email_key", stale_value);
+    defer alloc.free(stale_key);
+
+    try db.core.store.putBatch(&.{
+        .{ .key = grace_key, .value = "user:wrong" },
+        .{ .key = stale_key, .value = "user:ghost" },
+    }, &.{ada_key});
+
+    const validate = try db.validateUniqueConstraintRowsInRange("", "");
+    try std.testing.expect(!validate.valid());
+    try std.testing.expectEqual(@as(u64, 2), validate.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 2), validate.expected_unique_rows);
+    try std.testing.expectEqual(@as(u64, 1), validate.missing_unique_rows);
+    try std.testing.expectEqual(@as(u64, 2), validate.stale_unique_rows);
+
+    const dry_run = try db.dryRunRepairUniqueConstraintRowsInRange("", "");
+    try std.testing.expect(!dry_run.valid());
+    try std.testing.expectEqual(@as(u64, 2), dry_run.repaired_unique_rows);
+    try std.testing.expectEqual(@as(u64, 1), dry_run.deleted_stale_unique_rows);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, ada_key));
+
+    const repair = try db.repairUniqueConstraintRowsInRange("", "");
+    try std.testing.expect(!repair.valid());
+    try std.testing.expectEqual(@as(u64, 2), repair.repaired_unique_rows);
+    try std.testing.expectEqual(@as(u64, 1), repair.deleted_stale_unique_rows);
+    const repair_progress = (try db.loadUniqueConstraintIntegrityProgressRecord(.repair, "", "")) orelse return error.TestUnexpectedResult;
+    defer db.freeUniqueConstraintIntegrityProgressRecord(repair_progress);
+    try std.testing.expectEqualStrings("repair", repair_progress.mode);
+    try std.testing.expect(repair_progress.completed);
+    try std.testing.expect(repair_progress.valid);
+    try std.testing.expectEqual(@as(u64, 2), repair_progress.report.repaired_unique_rows);
+    try std.testing.expectEqual(@as(u64, 1), repair_progress.report.deleted_stale_unique_rows);
+
+    const after = try db.validateUniqueConstraintRowsInRange("", "");
+    try std.testing.expect(after.valid());
+    try std.testing.expectEqual(@as(u64, 2), after.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 2), after.scanned_unique_rows);
+    const validate_progress = (try db.loadUniqueConstraintIntegrityProgressRecord(.validate, "", "")) orelse return error.TestUnexpectedResult;
+    defer db.freeUniqueConstraintIntegrityProgressRecord(validate_progress);
+    try std.testing.expectEqualStrings("validate", validate_progress.mode);
+    try std.testing.expect(validate_progress.completed);
+    try std.testing.expect(validate_progress.valid);
+    try std.testing.expectEqual(@as(u64, 2), validate_progress.report.scanned_unique_rows);
+    const dry_run_progress = (try db.loadUniqueConstraintIntegrityProgressRecord(.dry_run, "", "")) orelse return error.TestUnexpectedResult;
+    defer db.freeUniqueConstraintIntegrityProgressRecord(dry_run_progress);
+    try std.testing.expectEqualStrings("dry_run", dry_run_progress.mode);
+    try std.testing.expect(!dry_run_progress.valid);
+    try std.testing.expectEqual(@as(u64, 2), dry_run_progress.report.repaired_unique_rows);
+    const all_progress = try db.listUniqueConstraintIntegrityProgressRecords();
+    defer db.freeUniqueConstraintIntegrityProgressRecords(all_progress);
+    try std.testing.expectEqual(@as(usize, 3), all_progress.len);
+    const ada_owner = try db.core.store.get(alloc, ada_key);
+    defer alloc.free(ada_owner);
+    try std.testing.expectEqualStrings("user:ada", ada_owner);
+    const grace_owner = try db.core.store.get(alloc, grace_key);
+    defer alloc.free(grace_owner);
+    try std.testing.expectEqualStrings("user:grace", grace_owner);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, stale_key));
+}
+
 test "db relational foreign keys enforce parent existence and restrict deletes" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
@@ -7839,6 +8454,1699 @@ test "db relational foreign keys reject partial match full composite references"
         .writes = &.{.{ .key = "user:partial", .value = "{\"id\":\"user:partial\",\"tenant_id\":\"tenant:1\"}" }},
     }));
     try db.abortTransaction(partial_txn, 14_945);
+}
+
+test "db relational integrity transaction externalized foreign key parent checks still maintain refs" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const local_txn = try db.beginTransaction(14_000);
+    try db.writeTransaction(local_txn, .{
+        .writes = &.{.{ .key = "order:local", .value = "{\"id\":\"order:local\",\"customer_id\":\"customer:missing\"}" }},
+    });
+    try std.testing.expectError(error.ForeignKeyViolation, db.commitTransaction(local_txn, 14_001));
+    try db.abortTransaction(local_txn, 14_002);
+
+    const routed_txn = try db.beginTransaction(14_500);
+    try db.writeTransaction(routed_txn, .{
+        .writes = &.{.{ .key = "order:routed", .value = "{\"id\":\"order:routed\",\"customer_id\":\"customer:routed\"}" }},
+        .foreign_key_externalized_parent_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .child_table = "row",
+            .child_key = "order:routed",
+            .parent_table = "customers",
+            .parent_key = "customer:routed",
+            .timing = .immediate,
+        }},
+    });
+    try db.commitTransaction(routed_txn, 14_501);
+
+    const row = (try db.get(alloc, "order:routed")) orelse return error.TestExpectedEqual;
+    defer alloc.free(row);
+    try std.testing.expectEqualStrings("{\"id\":\"order:routed\",\"customer_id\":\"customer:routed\"}", row);
+
+    const ref_key = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "orders_customer_id_fkey", "customers", "customer:routed", "row", "order:routed");
+    defer alloc.free(ref_key);
+    const ref_value = try db.core.store.get(alloc, ref_key);
+    defer alloc.free(ref_value);
+    try std.testing.expectEqualStrings("", ref_value);
+}
+
+test "db relational integrity transaction externalized foreign key proof records require local fk schema" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schemaless_txn = try db.beginTransaction(14_600);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(schemaless_txn, .{
+        .writes = &.{.{ .key = "order:schemaless-proof", .value = "{\"customer_id\":\"customer:proof\"}" }},
+        .foreign_key_externalized_parent_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .child_table = "row",
+            .child_key = "order:schemaless-proof",
+            .parent_table = "customers",
+            .parent_key = "customer:proof",
+        }},
+    }));
+    try db.abortTransaction(schemaless_txn, 14_601);
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"customer_id":{"type":"keyword"}},"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const no_fk_txn = try db.beginTransaction(14_610);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(no_fk_txn, .{
+        .writes = &.{.{ .key = "order:no-fk-proof", .value = "{\"customer_id\":\"customer:proof\"}" }},
+        .foreign_key_externalized_parent_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .child_table = "row",
+            .child_key = "order:no-fk-proof",
+            .parent_table = "customers",
+            .parent_key = "customer:proof",
+        }},
+    }));
+    try db.abortTransaction(no_fk_txn, 14_611);
+}
+
+test "db relational integrity transaction deferred foreign keys validate at local transaction commit and reject externalized checks" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"row","columns":["_id"]},"on_delete":"restrict","timing":"deferred"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const missing_txn = try db.beginTransaction(14_750);
+    try db.writeTransaction(missing_txn, .{
+        .writes = &.{.{ .key = "aa-order:missing", .value = "{\"id\":\"aa-order:missing\",\"customer_id\":\"zz-customer:missing\"}" }},
+    });
+    try std.testing.expectError(error.ForeignKeyViolation, db.commitTransaction(missing_txn, 14_751));
+    try db.abortTransaction(missing_txn, 14_752);
+
+    const ordered_txn = try db.beginTransaction(14_800);
+    try db.writeTransaction(ordered_txn, .{
+        .writes = &.{
+            .{ .key = "aa-order:deferred", .value = "{\"id\":\"aa-order:deferred\",\"customer_id\":\"zz-customer:deferred\"}" },
+            .{ .key = "zz-customer:deferred", .value = "{\"id\":\"zz-customer:deferred\"}" },
+        },
+    });
+    try db.commitTransaction(ordered_txn, 14_801);
+
+    const child = (try db.get(alloc, "aa-order:deferred")) orelse return error.TestExpectedEqual;
+    defer alloc.free(child);
+    try std.testing.expectEqualStrings("{\"id\":\"aa-order:deferred\",\"customer_id\":\"zz-customer:deferred\"}", child);
+
+    const missing_second_write_txn = try db.beginTransaction(14_850);
+    try db.writeTransaction(missing_second_write_txn, .{
+        .writes = &.{.{ .key = "aa-order:externalized", .value = "{\"id\":\"aa-order:externalized\",\"customer_id\":\"zz-customer:externalized\"}" }},
+    });
+    try std.testing.expectError(error.ForeignKeyViolation, db.commitTransaction(missing_second_write_txn, 14_851));
+    try db.abortTransaction(missing_second_write_txn, 14_852);
+
+    const partial_exact_externalized_txn = try db.beginTransaction(14_875);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(partial_exact_externalized_txn, .{
+        .writes = &.{
+            .{ .key = "aa-order:partial-externalized-a", .value = "{\"id\":\"aa-order:partial-externalized-a\",\"customer_id\":\"zz-customer:partial-externalized-a\"}" },
+            .{ .key = "aa-order:partial-externalized-b", .value = "{\"id\":\"aa-order:partial-externalized-b\",\"customer_id\":\"zz-customer:partial-externalized-b\"}" },
+        },
+        .foreign_key_externalized_parent_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .child_table = "row",
+            .child_key = "aa-order:partial-externalized-a",
+            .parent_table = "row",
+            .parent_key = "zz-customer:partial-externalized-a",
+            .timing = .deferred,
+        }},
+    }));
+    try db.abortTransaction(partial_exact_externalized_txn, 14_876);
+
+    const exact_externalized_txn = try db.beginTransaction(14_900);
+    try db.writeTransaction(exact_externalized_txn, .{
+        .writes = &.{.{ .key = "aa-order:exact-externalized", .value = "{\"id\":\"aa-order:exact-externalized\",\"customer_id\":\"zz-customer:exact-externalized\"}" }},
+        .foreign_key_externalized_parent_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .child_table = "row",
+            .child_key = "aa-order:exact-externalized",
+            .parent_table = "row",
+            .parent_key = "zz-customer:exact-externalized",
+            .timing = .deferred,
+        }},
+    });
+    try db.commitTransaction(exact_externalized_txn, 14_901);
+
+    const exact_child = (try db.get(alloc, "aa-order:exact-externalized")) orelse return error.TestExpectedEqual;
+    defer alloc.free(exact_child);
+    try std.testing.expectEqualStrings("{\"id\":\"aa-order:exact-externalized\",\"customer_id\":\"zz-customer:exact-externalized\"}", exact_child);
+
+    const forced_immediate_without_proof_txn = try db.beginTransaction(14_925);
+    try db.writeTransaction(forced_immediate_without_proof_txn, .{
+        .writes = &.{.{ .key = "aa-order:forced-immediate-legacy", .value = "{\"id\":\"aa-order:forced-immediate-legacy\",\"customer_id\":\"zz-customer:forced-immediate-legacy\"}" }},
+        .foreign_key_constraint_timing_overrides = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .timing = .immediate,
+        }},
+    });
+    try std.testing.expectError(error.ForeignKeyViolation, db.commitTransaction(forced_immediate_without_proof_txn, 14_926));
+    try db.abortTransaction(forced_immediate_without_proof_txn, 14_927);
+
+    const forced_immediate_exact_txn = try db.beginTransaction(14_950);
+    try db.writeTransaction(forced_immediate_exact_txn, .{
+        .writes = &.{.{ .key = "aa-order:forced-immediate-exact", .value = "{\"id\":\"aa-order:forced-immediate-exact\",\"customer_id\":\"zz-customer:forced-immediate-exact\"}" }},
+        .foreign_key_externalized_parent_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .child_table = "row",
+            .child_key = "aa-order:forced-immediate-exact",
+            .parent_table = "row",
+            .parent_key = "zz-customer:forced-immediate-exact",
+            .timing = .immediate,
+        }},
+        .foreign_key_constraint_timing_overrides = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .timing = .immediate,
+        }},
+    });
+    try db.commitTransaction(forced_immediate_exact_txn, 14_951);
+
+    const forced_immediate_exact_child = (try db.get(alloc, "aa-order:forced-immediate-exact")) orelse return error.TestExpectedEqual;
+    defer alloc.free(forced_immediate_exact_child);
+    try std.testing.expectEqualStrings("{\"id\":\"aa-order:forced-immediate-exact\",\"customer_id\":\"zz-customer:forced-immediate-exact\"}", forced_immediate_exact_child);
+}
+
+test "db relational integrity transaction mixed immediate and deferred foreign keys require per-constraint proofs" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"deferred_customer_id":{"type":"keyword"},"immediate_customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_deferred_customer_id_fkey","columns":["deferred_customer_id"],"references":{"table":"row","columns":["_id"]},"on_delete":"restrict","timing":"deferred"},{"name":"orders_immediate_customer_id_fkey","columns":["immediate_customer_id"],"references":{"table":"row","columns":["_id"]},"on_delete":"restrict","timing":"immediate"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const partial_proof_txn = try db.beginTransaction(14_970);
+    try db.writeTransaction(partial_proof_txn, .{
+        .writes = &.{.{ .key = "aa-order:mixed-partial-proof", .value = "{\"id\":\"aa-order:mixed-partial-proof\",\"deferred_customer_id\":\"zz-customer:deferred-proof\",\"immediate_customer_id\":\"zz-customer:immediate-missing\"}" }},
+        .foreign_key_externalized_parent_checks = &.{.{
+            .constraint_name = "orders_deferred_customer_id_fkey",
+            .child_table = "row",
+            .child_key = "aa-order:mixed-partial-proof",
+            .parent_table = "row",
+            .parent_key = "zz-customer:deferred-proof",
+            .timing = .deferred,
+        }},
+    });
+    try std.testing.expectError(error.ForeignKeyViolation, db.commitTransaction(partial_proof_txn, 14_971));
+    try db.abortTransaction(partial_proof_txn, 14_971);
+
+    const mixed_exact_txn = try db.beginTransaction(14_980);
+    try db.writeTransaction(mixed_exact_txn, .{
+        .writes = &.{
+            .{ .key = "aa-order:mixed-exact", .value = "{\"id\":\"aa-order:mixed-exact\",\"deferred_customer_id\":\"zz-customer:deferred-proof\",\"immediate_customer_id\":\"zz-customer:immediate-present\"}" },
+            .{ .key = "zz-customer:immediate-present", .value = "{\"id\":\"zz-customer:immediate-present\"}" },
+        },
+        .foreign_key_externalized_parent_checks = &.{.{
+            .constraint_name = "orders_deferred_customer_id_fkey",
+            .child_table = "row",
+            .child_key = "aa-order:mixed-exact",
+            .parent_table = "row",
+            .parent_key = "zz-customer:deferred-proof",
+            .timing = .deferred,
+        }},
+    });
+    try db.commitTransaction(mixed_exact_txn, 14_981);
+
+    const child = (try db.get(alloc, "aa-order:mixed-exact")) orelse return error.TestExpectedEqual;
+    defer alloc.free(child);
+    try std.testing.expectEqualStrings("{\"id\":\"aa-order:mixed-exact\",\"deferred_customer_id\":\"zz-customer:deferred-proof\",\"immediate_customer_id\":\"zz-customer:immediate-present\"}", child);
+}
+
+test "db relational integrity transaction foreign key timing override survives intent resolution" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"manager_email":{"type":"keyword"}},"additionalProperties":false}}},"unique_constraints":[{"name":"row_email_key","columns":["email"]}],"foreign_keys":[{"name":"row_manager_email_fkey","columns":["manager_email"],"references":{"table":"row","columns":["email"]},"on_update":"no_action","timing":"deferred"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "aa-parent:deferred", .value = "{\"id\":\"aa-parent:deferred\",\"email\":\"old-a\"}" },
+            .{ .key = "zz-child:deferred", .value = "{\"id\":\"zz-child:deferred\",\"manager_email\":\"old-a\"}" },
+            .{ .key = "aa-parent:forced", .value = "{\"id\":\"aa-parent:forced\",\"email\":\"old-b\"}" },
+            .{ .key = "zz-child:forced", .value = "{\"id\":\"zz-child:forced\",\"manager_email\":\"old-b\"}" },
+        },
+        .timestamp_ns = 15_000,
+    });
+
+    const deferred_txn = try db.beginTransaction(15_100);
+    try db.writeTransaction(deferred_txn, .{
+        .writes = &.{
+            .{ .key = "aa-parent:deferred", .value = "{\"id\":\"aa-parent:deferred\",\"email\":\"new-a\"}" },
+            .{ .key = "zz-child:deferred", .value = "{\"id\":\"zz-child:deferred\",\"manager_email\":\"new-a\"}" },
+        },
+    });
+    try db.resolveTransactionIntents(deferred_txn, .committed, 15_101);
+
+    const deferred_child = (try db.get(alloc, "zz-child:deferred")) orelse return error.TestExpectedEqual;
+    defer alloc.free(deferred_child);
+    try std.testing.expectEqualStrings("{\"id\":\"zz-child:deferred\",\"manager_email\":\"new-a\"}", deferred_child);
+
+    const forced_txn = try db.beginTransaction(15_200);
+    try db.writeTransaction(forced_txn, .{
+        .writes = &.{
+            .{ .key = "aa-parent:forced", .value = "{\"id\":\"aa-parent:forced\",\"email\":\"new-b\"}" },
+            .{ .key = "zz-child:forced", .value = "{\"id\":\"zz-child:forced\",\"manager_email\":\"new-b\"}" },
+        },
+        .foreign_key_constraint_timing_overrides = &.{.{
+            .constraint_name = "row_manager_email_fkey",
+            .timing = .immediate,
+        }},
+    });
+    try std.testing.expectError(error.ForeignKeyViolation, db.resolveTransactionIntents(forced_txn, .committed, 15_201));
+    try db.abortTransaction(forced_txn, 15_202);
+
+    const forced_parent = (try db.get(alloc, "aa-parent:forced")) orelse return error.TestExpectedEqual;
+    defer alloc.free(forced_parent);
+    try std.testing.expectEqualStrings("{\"id\":\"aa-parent:forced\",\"email\":\"old-b\"}", forced_parent);
+}
+
+test "db relational integrity transaction deferrable initially immediate foreign key can be deferred by transaction override" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"manager_email":{"type":"keyword"}},"additionalProperties":false}}},"unique_constraints":[{"name":"row_email_key","columns":["email"]}],"foreign_keys":[{"name":"row_manager_email_fkey","columns":["manager_email"],"references":{"table":"row","columns":["email"]},"on_update":"no_action","timing":"immediate","deferrable":true}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "aa-parent:initially-immediate", .value = "{\"id\":\"aa-parent:initially-immediate\",\"email\":\"old-a\"}" },
+            .{ .key = "zz-child:initially-immediate", .value = "{\"id\":\"zz-child:initially-immediate\",\"manager_email\":\"old-a\"}" },
+        },
+        .timestamp_ns = 15_300,
+    });
+
+    const deferred_txn = try db.beginTransaction(15_310);
+    try db.writeTransaction(deferred_txn, .{
+        .writes = &.{
+            .{ .key = "aa-parent:initially-immediate", .value = "{\"id\":\"aa-parent:initially-immediate\",\"email\":\"new-a\"}" },
+            .{ .key = "zz-child:initially-immediate", .value = "{\"id\":\"zz-child:initially-immediate\",\"manager_email\":\"new-a\"}" },
+        },
+        .foreign_key_constraint_timing_overrides = &.{.{
+            .constraint_name = "row_manager_email_fkey",
+            .timing = .deferred,
+        }},
+    });
+    try db.resolveTransactionIntents(deferred_txn, .committed, 15_311);
+
+    const child = (try db.get(alloc, "zz-child:initially-immediate")) orelse return error.TestExpectedEqual;
+    defer alloc.free(child);
+    try std.testing.expectEqualStrings("{\"id\":\"zz-child:initially-immediate\",\"manager_email\":\"new-a\"}", child);
+
+    const non_deferrable_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"manager_email":{"type":"keyword"}},"additionalProperties":false}}},"unique_constraints":[{"name":"row_email_key","columns":["email"]}],"foreign_keys":[{"name":"row_manager_email_fkey","columns":["manager_email"],"references":{"table":"row","columns":["email"]},"on_update":"no_action","timing":"immediate"}]}
+    ;
+    var path_buf_2: [256]u8 = undefined;
+    const path_2 = tempPath(&path_buf_2);
+    defer cleanupTempDir(path_2);
+    var non_deferrable_db = try DB.open(alloc, std.mem.span(path_2), .{});
+    defer non_deferrable_db.close();
+    var non_deferrable_parsed = try table_schema_api.parseValidatedTableSchema(alloc, non_deferrable_schema_json);
+    defer non_deferrable_parsed.deinit(alloc);
+    const non_deferrable_runtime = try table_schema_api.deriveRuntimeTableSchema(alloc, non_deferrable_parsed);
+    defer schema_mod.freeSchema(alloc, non_deferrable_runtime);
+    try non_deferrable_db.setSchema(non_deferrable_runtime);
+    const rejected_txn = try non_deferrable_db.beginTransaction(15_320);
+    try std.testing.expectError(error.ForeignKeyViolation, non_deferrable_db.writeTransaction(rejected_txn, .{
+        .foreign_key_constraint_timing_overrides = &.{.{
+            .constraint_name = "row_manager_email_fkey",
+            .timing = .deferred,
+        }},
+    }));
+    try non_deferrable_db.abortTransaction(rejected_txn, 15_321);
+}
+
+test "db relational integrity transaction deferred foreign keys preserve exact externalized unique parent proofs through commit" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"handle":{"type":"keyword"},"ref_email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]},{"name":"users_handle_key","columns":["handle"]}],"foreign_keys":[{"name":"users_ref_email_fkey","columns":["ref_email"],"references":{"table":"row","columns":["email"]},"on_delete":"restrict","timing":"deferred"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const child_row = try mapper.buildRelationalRowValueAlloc(alloc, "{\"id\":\"user:child\",\"ref_email\":\"proof@example.test\"}", runtime_schema.relational_columns);
+    defer alloc.free(child_row);
+    const encoded_parent = (try relational_store_mod.foreignKeyReferenceValueAlloc(alloc, child_row, runtime_schema.foreign_keys[0])) orelse return error.TestExpectedEqual;
+    defer alloc.free(encoded_parent);
+
+    const missing_constraint_txn = try db.beginTransaction(14_920);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(missing_constraint_txn, .{
+        .writes = &.{.{ .key = "user:missing-constraint", .value = "{\"id\":\"user:missing-constraint\",\"ref_email\":\"proof@example.test\"}" }},
+        .foreign_key_externalized_parent_checks = &.{.{
+            .constraint_name = "users_ref_email_fkey",
+            .child_table = "row",
+            .child_key = "user:missing-constraint",
+            .parent_table = "row",
+            .parent_key = encoded_parent,
+            .timing = .deferred,
+        }},
+    }));
+    try db.abortTransaction(missing_constraint_txn, 14_921);
+
+    const wrong_constraint_txn = try db.beginTransaction(14_930);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(wrong_constraint_txn, .{
+        .writes = &.{.{ .key = "user:wrong-constraint", .value = "{\"id\":\"user:wrong-constraint\",\"ref_email\":\"proof@example.test\"}" }},
+        .foreign_key_externalized_parent_checks = &.{.{
+            .constraint_name = "users_ref_email_fkey",
+            .child_table = "row",
+            .child_key = "user:wrong-constraint",
+            .parent_table = "row",
+            .parent_key = encoded_parent,
+            .parent_constraint_name = "users_handle_key",
+            .timing = .deferred,
+        }},
+    }));
+    try db.abortTransaction(wrong_constraint_txn, 14_931);
+
+    const exact_txn = try db.beginTransaction(14_940);
+    try db.writeTransaction(exact_txn, .{
+        .writes = &.{.{ .key = "user:exact-unique", .value = "{\"id\":\"user:exact-unique\",\"ref_email\":\"proof@example.test\"}" }},
+        .foreign_key_externalized_parent_checks = &.{.{
+            .constraint_name = "users_ref_email_fkey",
+            .child_table = "row",
+            .child_key = "user:exact-unique",
+            .parent_table = "row",
+            .parent_key = encoded_parent,
+            .parent_constraint_name = "users_email_key",
+            .timing = .deferred,
+        }},
+    });
+    try db.commitTransaction(exact_txn, 14_941);
+
+    const child = (try db.get(alloc, "user:exact-unique")) orelse return error.TestExpectedEqual;
+    defer alloc.free(child);
+    try std.testing.expectEqualStrings("{\"id\":\"user:exact-unique\",\"ref_email\":\"proof@example.test\"}", child);
+}
+
+test "db relational integrity transaction deferred foreign keys require named cross-table unique parent proofs" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_email_fkey","columns":["customer_email"],"references":{"table":"customers","columns":["email"]},"on_delete":"restrict","timing":"deferred"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const child_row = try mapper.buildRelationalRowValueAlloc(alloc, "{\"id\":\"order:child\",\"customer_email\":\"ada@example.test\"}", runtime_schema.relational_columns);
+    defer alloc.free(child_row);
+    const encoded_parent = (try relational_store_mod.foreignKeyReferenceValueAlloc(alloc, child_row, runtime_schema.foreign_keys[0])) orelse return error.TestExpectedEqual;
+    defer alloc.free(encoded_parent);
+
+    const empty_constraint_txn = try db.beginTransaction(14_950);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(empty_constraint_txn, .{
+        .writes = &.{.{ .key = "order:empty-proof", .value = "{\"id\":\"order:empty-proof\",\"customer_email\":\"ada@example.test\"}" }},
+        .foreign_key_externalized_parent_checks = &.{.{
+            .constraint_name = "orders_customer_email_fkey",
+            .child_table = "row",
+            .child_key = "order:empty-proof",
+            .parent_table = "customers",
+            .parent_key = encoded_parent,
+            .parent_constraint_name = "",
+            .timing = .deferred,
+        }},
+    }));
+    try db.abortTransaction(empty_constraint_txn, 14_951);
+
+    const named_constraint_txn = try db.beginTransaction(14_960);
+    try db.writeTransaction(named_constraint_txn, .{
+        .writes = &.{.{ .key = "order:named-proof", .value = "{\"id\":\"order:named-proof\",\"customer_email\":\"ada@example.test\"}" }},
+        .foreign_key_externalized_parent_checks = &.{.{
+            .constraint_name = "orders_customer_email_fkey",
+            .child_table = "row",
+            .child_key = "order:named-proof",
+            .parent_table = "customers",
+            .parent_key = encoded_parent,
+            .parent_constraint_name = "customers_email_key",
+            .timing = .deferred,
+        }},
+    });
+    try db.commitTransaction(named_constraint_txn, 14_961);
+
+    const child = (try db.get(alloc, "order:named-proof")) orelse return error.TestExpectedEqual;
+    defer alloc.free(child);
+    try std.testing.expectEqualStrings("{\"id\":\"order:named-proof\",\"customer_email\":\"ada@example.test\"}", child);
+}
+
+test "db relational integrity transaction foreign key parent checks validate final prepared state" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schemaless_txn = try db.beginTransaction(15_000);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(schemaless_txn, .{
+        .foreign_key_parent_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .child_table = "orders",
+            .child_key = "order:schemaless",
+            .parent_table = "customers",
+            .parent_key = "customer:schemaless",
+        }},
+    }));
+    try db.abortTransaction(schemaless_txn, 15_001);
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"customers","enforce_types":true,"document_schemas":{"customers":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const internal_parent_key = try internal_keys.documentKeyAlloc(alloc, "customer:internal");
+    defer alloc.free(internal_parent_key);
+    const internal_parent_txn = try db.beginTransaction(15_250);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(internal_parent_txn, .{
+        .foreign_key_parent_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .child_table = "orders",
+            .child_key = "order:internal-parent",
+            .parent_table = "customers",
+            .parent_key = internal_parent_key,
+        }},
+    }));
+    try db.abortTransaction(internal_parent_txn, 15_251);
+
+    const internal_child_key = try internal_keys.documentKeyAlloc(alloc, "order:internal");
+    defer alloc.free(internal_child_key);
+    const internal_child_txn = try db.beginTransaction(15_500);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(internal_child_txn, .{
+        .foreign_key_parent_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .child_table = "orders",
+            .child_key = internal_child_key,
+            .parent_table = "customers",
+            .parent_key = "customer:internal-child",
+        }},
+    }));
+    try db.abortTransaction(internal_child_txn, 15_501);
+
+    const metadata_parent_txn = try db.beginTransaction(15_750);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(metadata_parent_txn, .{
+        .foreign_key_parent_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .child_table = "orders",
+            .child_key = "order:metadata-parent",
+            .parent_table = "customers",
+            .parent_key = "\x00\x00__metadata__:fk-parent",
+        }},
+    }));
+    try db.abortTransaction(metadata_parent_txn, 15_751);
+
+    const missing_txn = try db.beginTransaction(16_000);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(missing_txn, .{
+        .foreign_key_parent_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .child_table = "orders",
+            .child_key = "order:missing",
+            .parent_table = "customers",
+            .parent_key = "customer:missing",
+        }},
+    }));
+    try db.abortTransaction(missing_txn, 16_001);
+
+    const wrong_table_txn = try db.beginTransaction(16_500);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(wrong_table_txn, .{
+        .writes = &.{.{ .key = "customer:wrong-table", .value = "{\"id\":\"customer:wrong-table\",\"name\":\"Ada\"}" }},
+        .foreign_key_parent_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .child_table = "orders",
+            .child_key = "order:wrong-table",
+            .parent_table = "accounts",
+            .parent_key = "customer:wrong-table",
+        }},
+    }));
+    try db.abortTransaction(wrong_table_txn, 16_501);
+
+    const create_txn = try db.beginTransaction(17_000);
+    try db.writeTransaction(create_txn, .{
+        .writes = &.{.{ .key = "customer:1", .value = "{\"id\":\"customer:1\",\"name\":\"Ada\"}" }},
+        .foreign_key_parent_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .child_table = "orders",
+            .child_key = "order:1",
+            .parent_table = "customers",
+            .parent_key = "customer:1",
+        }},
+    });
+    try db.commitTransaction(create_txn, 17_001);
+
+    const parent = (try db.get(alloc, "customer:1")) orelse return error.TestExpectedEqual;
+    defer alloc.free(parent);
+    try std.testing.expectEqualStrings("{\"id\":\"customer:1\",\"name\":\"Ada\"}", parent);
+
+    const delete_txn = try db.beginTransaction(18_000);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(delete_txn, .{
+        .deletes = &.{"customer:1"},
+        .foreign_key_parent_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .child_table = "orders",
+            .child_key = "order:2",
+            .parent_table = "customers",
+            .parent_key = "customer:1",
+        }},
+    }));
+    try db.abortTransaction(delete_txn, 18_001);
+}
+
+test "db relational integrity transaction foreign key parent checks validate unique tuple state" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"customers","enforce_types":true,"document_schemas":{"customers":{"schema":{"type":"object","properties":{"email":{"type":"keyword"},"name":{"type":"keyword"}},"additionalProperties":false}}},"unique_constraints":[{"name":"customers_email_key","columns":["email"]}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const parent_row = try mapper.buildRelationalRowValueAlloc(alloc, "{\"email\":\"ada@example.test\",\"name\":\"Ada\"}", runtime_schema.relational_columns);
+    defer alloc.free(parent_row);
+    const encoded_parent = try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, parent_row, runtime_schema.unique_constraints[0]);
+    defer if (encoded_parent) |value| alloc.free(value);
+    const parent_key = encoded_parent orelse return error.TestExpectedEqual;
+
+    const missing_txn = try db.beginTransaction(18_100);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(missing_txn, .{
+        .foreign_key_parent_checks = &.{.{
+            .constraint_name = "orders_customer_email_fkey",
+            .child_table = "orders",
+            .child_key = "order:missing-unique",
+            .parent_table = "customers",
+            .parent_key = parent_key,
+            .parent_constraint_name = "customers_email_key",
+        }},
+    }));
+    try db.abortTransaction(missing_txn, 18_101);
+
+    const wrong_table_txn = try db.beginTransaction(18_150);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(wrong_table_txn, .{
+        .foreign_key_parent_checks = &.{.{
+            .constraint_name = "orders_customer_email_fkey",
+            .child_table = "orders",
+            .child_key = "order:wrong-parent-table",
+            .parent_table = "accounts",
+            .parent_key = parent_key,
+            .parent_constraint_name = "customers_email_key",
+        }},
+        .unique_constraint_writes = &.{.{
+            .constraint_name = "customers_email_key",
+            .encoded_value = parent_key,
+            .owner_key = "customer:ada",
+        }},
+    }));
+    try db.abortTransaction(wrong_table_txn, 18_151);
+
+    const create_txn = try db.beginTransaction(18_200);
+    try db.writeTransaction(create_txn, .{
+        .foreign_key_parent_checks = &.{.{
+            .constraint_name = "orders_customer_email_fkey",
+            .child_table = "orders",
+            .child_key = "order:staged-unique",
+            .parent_table = "customers",
+            .parent_key = parent_key,
+            .parent_constraint_name = "customers_email_key",
+        }},
+        .unique_constraint_writes = &.{.{
+            .constraint_name = "customers_email_key",
+            .encoded_value = parent_key,
+            .owner_key = "customer:ada",
+        }},
+    });
+    try db.commitTransaction(create_txn, 18_201);
+
+    const delete_txn = try db.beginTransaction(18_300);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(delete_txn, .{
+        .foreign_key_parent_checks = &.{.{
+            .constraint_name = "orders_customer_email_fkey",
+            .child_table = "orders",
+            .child_key = "order:deleted-unique",
+            .parent_table = "customers",
+            .parent_key = parent_key,
+            .parent_constraint_name = "customers_email_key",
+        }},
+        .unique_constraint_deletes = &.{.{
+            .constraint_name = "customers_email_key",
+            .encoded_value = parent_key,
+            .owner_key = "customer:ada",
+        }},
+    }));
+    try db.abortTransaction(delete_txn, 18_301);
+}
+
+test "db relational integrity transaction foreign key parent delete checks support unique tuple keys" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"email":{"type":"keyword"},"ref_email":{"type":"keyword"},"name":{"type":"keyword"}},"additionalProperties":false}}},"foreign_keys":[{"name":"users_ref_email_fkey","columns":["ref_email"],"references":{"table":"row","columns":["email"]},"on_delete":"restrict"}],"unique_constraints":[{"name":"users_email_key","columns":["email"]}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:parent", .value = "{\"email\":\"ada@example.test\",\"name\":\"Ada\"}" },
+            .{ .key = "user:child", .value = "{\"ref_email\":\"ada@example.test\",\"name\":\"Child\"}" },
+        },
+    });
+
+    const parent_row = try mapper.buildRelationalRowValueAlloc(alloc, "{\"email\":\"ada@example.test\",\"name\":\"Ada\"}", runtime_schema.relational_columns);
+    defer alloc.free(parent_row);
+    const parent_tuple = (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, parent_row, runtime_schema.unique_constraints[0])) orelse return error.TestExpectedEqual;
+    defer alloc.free(parent_tuple);
+
+    const blocked_txn = try db.beginTransaction(18_400);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(blocked_txn, .{
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "users_ref_email_fkey",
+            .parent_table = "row",
+            .parent_key = parent_tuple,
+        }},
+    }));
+    try db.abortTransaction(blocked_txn, 18_401);
+
+    const allowed_txn = try db.beginTransaction(18_450);
+    try db.writeTransaction(allowed_txn, .{
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "users_ref_email_fkey",
+            .parent_table = "row",
+            .parent_key = parent_tuple,
+        }},
+        .foreign_key_ref_deletes = &.{.{
+            .constraint_name = "users_ref_email_fkey",
+            .parent_table = "row",
+            .parent_key = parent_tuple,
+            .child_table = "row",
+            .child_key = "user:child",
+        }},
+    });
+    try db.commitTransaction(allowed_txn, 18_451);
+}
+
+test "db relational integrity transaction foreign key parent update checks use update action semantics" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"ref_email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"users_email_key","columns":["email"]}],"foreign_keys":[{"name":"users_ref_email_fkey","columns":["ref_email"],"references":{"table":"row","columns":["email"]},"on_delete":"set_null","on_update":"restrict"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"ada@example.test\"}" },
+            .{ .key = "user:child", .value = "{\"id\":\"user:child\",\"ref_email\":\"ada@example.test\"}" },
+        },
+    });
+
+    const parent_row = try mapper.buildRelationalRowValueAlloc(alloc, "{\"id\":\"user:parent\",\"email\":\"ada@example.test\"}", runtime_schema.relational_columns);
+    defer alloc.free(parent_row);
+    const encoded_parent = (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, parent_row, runtime_schema.unique_constraints[0])) orelse return error.TestExpectedEqual;
+    defer alloc.free(encoded_parent);
+
+    const update_check_txn = try db.beginTransaction(18_475);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(update_check_txn, .{
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "users_ref_email_fkey",
+            .parent_table = "row",
+            .parent_key = encoded_parent,
+            .operation = .update,
+        }},
+    }));
+    try db.abortTransaction(update_check_txn, 18_476);
+
+    const child = (try db.get(alloc, "user:child")) orelse return error.TestExpectedEqual;
+    defer alloc.free(child);
+    try std.testing.expectEqualStrings("{\"id\":\"user:child\",\"ref_email\":\"ada@example.test\"}", child);
+}
+
+test "db relational integrity transaction batch relational identity rewrite uses foreign key update semantics" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const restrict_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"kind":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"foreign_keys":[{"name":"orders_customer_fkey","columns":["customer_id"],"references":{"table":"row","columns":["id"]},"on_delete":"set_null","on_update":"restrict"}]}
+    ;
+    var restrict_parsed = try table_schema_api.parseValidatedTableSchema(alloc, restrict_schema_json);
+    defer restrict_parsed.deinit(alloc);
+    const restrict_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, restrict_parsed);
+    defer schema_mod.freeSchema(alloc, restrict_schema);
+    try db.setSchema(restrict_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "customer:old", .value = "{\"id\":\"customer:old\",\"kind\":\"customer\"}" },
+            .{ .key = "order:1", .value = "{\"id\":\"order:1\",\"customer_id\":\"customer:old\",\"kind\":\"order\"}" },
+        },
+    });
+
+    try std.testing.expectError(error.ForeignKeyViolation, db.batch(.{
+        .relational_identity_rewrites = &.{.{
+            .old_key = "customer:old",
+            .new_key = "customer:new",
+            .value = "{\"id\":\"customer:new\",\"kind\":\"customer\"}",
+        }},
+    }));
+
+    const restrict_child = (try db.get(alloc, "order:1")) orelse return error.TestExpectedEqual;
+    defer alloc.free(restrict_child);
+    try std.testing.expect(std.mem.indexOf(u8, restrict_child, "\"customer_id\":\"customer:old\"") != null);
+
+    const set_null_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"kind":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"foreign_keys":[{"name":"orders_customer_fkey","columns":["customer_id"],"references":{"table":"row","columns":["id"]},"on_delete":"restrict","on_update":"set_null"}]}
+    ;
+    var path_buf_set_null: [256]u8 = undefined;
+    const path_set_null = tempPath(&path_buf_set_null);
+    defer cleanupTempDir(path_set_null);
+    var set_null_db = try DB.open(alloc, std.mem.span(path_set_null), .{});
+    defer set_null_db.close();
+    var set_null_parsed = try table_schema_api.parseValidatedTableSchema(alloc, set_null_schema_json);
+    defer set_null_parsed.deinit(alloc);
+    const set_null_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, set_null_parsed);
+    defer schema_mod.freeSchema(alloc, set_null_schema);
+    try set_null_db.setSchema(set_null_schema);
+
+    try set_null_db.batch(.{
+        .writes = &.{
+            .{ .key = "customer:old", .value = "{\"id\":\"customer:old\",\"kind\":\"customer\"}" },
+            .{ .key = "order:1", .value = "{\"id\":\"order:1\",\"customer_id\":\"customer:old\",\"kind\":\"order\"}" },
+        },
+    });
+    try set_null_db.batch(.{
+        .relational_identity_rewrites = &.{.{
+            .old_key = "customer:old",
+            .new_key = "customer:new",
+            .value = "{\"id\":\"customer:new\",\"kind\":\"customer\"}",
+        }},
+    });
+
+    const set_null_child = (try set_null_db.get(alloc, "order:1")) orelse return error.TestExpectedEqual;
+    defer alloc.free(set_null_child);
+    try std.testing.expect(std.mem.indexOf(u8, set_null_child, "\"customer_id\"") == null);
+    const set_null_parent = (try set_null_db.get(alloc, "customer:new")) orelse return error.TestExpectedEqual;
+    defer alloc.free(set_null_parent);
+    try std.testing.expect(std.mem.indexOf(u8, set_null_parent, "\"id\":\"customer:new\"") != null);
+}
+
+test "db relational integrity transaction relational identity rewrite uses foreign key update semantics" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"kind":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"foreign_keys":[{"name":"orders_customer_fkey","columns":["customer_id"],"references":{"table":"row","columns":["id"]},"on_delete":"restrict","on_update":"set_null"}]}
+    ;
+    var parsed = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "customer:old", .value = "{\"id\":\"customer:old\",\"kind\":\"customer\"}" },
+            .{ .key = "order:1", .value = "{\"id\":\"order:1\",\"customer_id\":\"customer:old\",\"kind\":\"order\"}" },
+        },
+    });
+
+    const txn = try db.beginTransaction(18_462);
+    try db.writeTransaction(txn, .{
+        .relational_identity_rewrites = &.{.{
+            .old_key = "customer:old",
+            .new_key = "customer:new",
+            .value = "{\"id\":\"customer:new\",\"kind\":\"customer\"}",
+        }},
+    });
+    try db.commitTransaction(txn, 18_463);
+
+    const child = (try db.get(alloc, "order:1")) orelse return error.TestExpectedEqual;
+    defer alloc.free(child);
+    try std.testing.expect(std.mem.indexOf(u8, child, "\"customer_id\"") == null);
+    const parent = (try db.get(alloc, "customer:new")) orelse return error.TestExpectedEqual;
+    defer alloc.free(parent);
+    try std.testing.expect(std.mem.indexOf(u8, parent, "\"id\":\"customer:new\"") != null);
+    try std.testing.expect((try db.get(alloc, "customer:old")) == null);
+}
+
+test "db relational integrity transaction foreign key parent delete checks support cross-table unique tuple keys" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"customer_email":{"type":"keyword"},"status":{"type":"keyword"}},"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_email_fkey","columns":["customer_email"],"references":{"table":"customers","columns":["email"]},"on_delete":"restrict"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const child_row = try mapper.buildRelationalRowValueAlloc(alloc, "{\"customer_email\":\"ada@example.test\",\"status\":\"open\"}", runtime_schema.relational_columns);
+    defer alloc.free(child_row);
+    const parent_tuple = (try relational_store_mod.foreignKeyReferenceValueAlloc(alloc, child_row, runtime_schema.foreign_keys[0])) orelse return error.TestExpectedEqual;
+    defer alloc.free(parent_tuple);
+
+    const ref_txn = try db.beginTransaction(18_470);
+    try db.writeTransaction(ref_txn, .{
+        .foreign_key_ref_writes = &.{.{
+            .constraint_name = "orders_customer_email_fkey",
+            .parent_table = "customers",
+            .parent_key = parent_tuple,
+            .child_table = "row",
+            .child_key = "order:child",
+        }},
+    });
+    try db.commitTransaction(ref_txn, 18_471);
+
+    const blocked_txn = try db.beginTransaction(18_480);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(blocked_txn, .{
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "orders_customer_email_fkey",
+            .parent_table = "customers",
+            .parent_key = parent_tuple,
+        }},
+    }));
+    try db.abortTransaction(blocked_txn, 18_481);
+
+    const allowed_txn = try db.beginTransaction(18_490);
+    try db.writeTransaction(allowed_txn, .{
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "orders_customer_email_fkey",
+            .parent_table = "customers",
+            .parent_key = parent_tuple,
+        }},
+        .foreign_key_ref_deletes = &.{.{
+            .constraint_name = "orders_customer_email_fkey",
+            .parent_table = "customers",
+            .parent_key = parent_tuple,
+            .child_table = "row",
+            .child_key = "order:child",
+        }},
+    });
+    try db.commitTransaction(allowed_txn, 18_491);
+}
+
+test "db relational integrity transaction foreign key parent delete checks honor deferred timing" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","timing":"deferred"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const ref_txn = try db.beginTransaction(18_495);
+    try db.writeTransaction(ref_txn, .{
+        .foreign_key_ref_writes = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:deferred-delete",
+            .child_table = "row",
+            .child_key = "order:deferred-delete",
+        }},
+    });
+    try db.commitTransaction(ref_txn, 18_496);
+
+    const timing_mismatch_txn = try db.beginTransaction(18_497);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(timing_mismatch_txn, .{
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:deferred-delete",
+        }},
+    }));
+    try db.abortTransaction(timing_mismatch_txn, 18_498);
+
+    const blocked_txn = try db.beginTransaction(18_499);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(blocked_txn, .{
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:deferred-delete",
+            .timing = .deferred,
+        }},
+    }));
+    try db.abortTransaction(blocked_txn, 18_500);
+
+    const allowed_txn = try db.beginTransaction(18_501);
+    try db.writeTransaction(allowed_txn, .{
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:deferred-delete",
+            .timing = .deferred,
+        }},
+        .foreign_key_ref_deletes = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:deferred-delete",
+            .child_table = "row",
+            .child_key = "order:deferred-delete",
+        }},
+    });
+    try db.commitTransaction(allowed_txn, 18_502);
+}
+
+test "db relational integrity transaction foreign key parent delete checks validate child references" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const internal_delete_parent_key = try internal_keys.documentKeyAlloc(alloc, "customer:internal-delete");
+    defer alloc.free(internal_delete_parent_key);
+    const internal_delete_txn = try db.beginTransaction(18_500);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(internal_delete_txn, .{
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = internal_delete_parent_key,
+        }},
+    }));
+    try db.abortTransaction(internal_delete_txn, 18_501);
+
+    const metadata_delete_txn = try db.beginTransaction(18_750);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(metadata_delete_txn, .{
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "\x00\x00__metadata__:fk-delete-parent",
+        }},
+    }));
+    try db.abortTransaction(metadata_delete_txn, 18_751);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "customer:1", .value = "{\"id\":\"customer:1\"}" },
+            .{ .key = "customer:2", .value = "{\"id\":\"customer:2\"}" },
+            .{ .key = "customer:3", .value = "{\"id\":\"customer:3\"}" },
+            .{ .key = "customer:rewrite-target", .value = "{\"id\":\"customer:rewrite-target\"}" },
+            .{ .key = "order:1", .value = "{\"id\":\"order:1\",\"customer_id\":\"customer:1\"}" },
+        },
+    });
+
+    const blocked_existing_txn = try db.beginTransaction(19_000);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(blocked_existing_txn, .{
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:1",
+        }},
+    }));
+    try db.abortTransaction(blocked_existing_txn, 19_001);
+
+    const blocked_write_txn = try db.beginTransaction(20_000);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(blocked_write_txn, .{
+        .writes = &.{.{ .key = "order:2", .value = "{\"id\":\"order:2\",\"customer_id\":\"customer:1\"}" }},
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:1",
+        }},
+    }));
+    try db.abortTransaction(blocked_write_txn, 20_001);
+
+    const misplaced_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(
+        alloc,
+        "orders_customer_id_fkey",
+        "customers",
+        "customer:misplaced",
+        "other_child_table",
+        "other:child",
+    );
+    defer alloc.free(misplaced_ref);
+    try db.core.store.putBatch(&.{.{ .key = misplaced_ref, .value = "" }}, &.{});
+    const ignores_misplaced_ref_txn = try db.beginTransaction(20_250);
+    try db.writeTransaction(ignores_misplaced_ref_txn, .{
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:misplaced",
+        }},
+    });
+    try db.abortTransaction(ignores_misplaced_ref_txn, 20_251);
+
+    const allowed_child_rewrite_txn = try db.beginTransaction(20_500);
+    try db.writeTransaction(allowed_child_rewrite_txn, .{
+        .writes = &.{.{ .key = "order:1", .value = "{\"id\":\"order:1\",\"customer_id\":\"customer:rewrite-target\"}" }},
+        .deletes = &.{"customer:1"},
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:1",
+        }},
+    });
+    try db.commitTransaction(allowed_child_rewrite_txn, 20_501);
+
+    try std.testing.expect((try db.get(alloc, "customer:1")) == null);
+    const rewritten_child = (try db.get(alloc, "order:1")) orelse return error.TestExpectedEqual;
+    defer alloc.free(rewritten_child);
+    try std.testing.expectEqualStrings("{\"id\":\"order:1\",\"customer_id\":\"customer:rewrite-target\"}", rewritten_child);
+
+    const old_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "orders_customer_id_fkey", "customers", "customer:1", "row", "order:1");
+    defer alloc.free(old_ref);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, old_ref));
+    const rewritten_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "orders_customer_id_fkey", "customers", "customer:rewrite-target", "row", "order:1");
+    defer alloc.free(rewritten_ref);
+    const rewritten_ref_value = try db.core.store.get(alloc, rewritten_ref);
+    defer alloc.free(rewritten_ref_value);
+    try std.testing.expectEqualStrings("", rewritten_ref_value);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "customer:delete-target", .value = "{\"id\":\"customer:delete-target\"}" },
+            .{ .key = "order:delete-target", .value = "{\"id\":\"order:delete-target\",\"customer_id\":\"customer:delete-target\"}" },
+        },
+    });
+    const allowed_child_delete_txn = try db.beginTransaction(21_000);
+    try db.writeTransaction(allowed_child_delete_txn, .{
+        .deletes = &.{"order:delete-target"},
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:delete-target",
+        }},
+    });
+    try db.commitTransaction(allowed_child_delete_txn, 21_001);
+
+    try std.testing.expect((try db.get(alloc, "order:delete-target")) == null);
+
+    const pending_child_txn = try db.beginTransaction(22_000);
+    try db.writeTransaction(pending_child_txn, .{
+        .writes = &.{.{ .key = "order:pending", .value = "{\"id\":\"order:pending\",\"customer_id\":\"customer:2\"}" }},
+    });
+    const blocked_parent_delete_txn = try db.beginTransaction(22_100);
+    try std.testing.expectError(error.IntentConflict, db.writeTransaction(blocked_parent_delete_txn, .{
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:2",
+        }},
+    }));
+    try db.abortTransaction(blocked_parent_delete_txn, 22_101);
+    try db.abortTransaction(pending_child_txn, 22_102);
+
+    const pending_parent_delete_txn = try db.beginTransaction(23_000);
+    try db.writeTransaction(pending_parent_delete_txn, .{
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:3",
+        }},
+    });
+    const blocked_child_txn = try db.beginTransaction(23_100);
+    try std.testing.expectError(error.IntentConflict, db.writeTransaction(blocked_child_txn, .{
+        .writes = &.{.{ .key = "order:blocked", .value = "{\"id\":\"order:blocked\",\"customer_id\":\"customer:3\"}" }},
+    }));
+    try db.abortTransaction(blocked_child_txn, 23_101);
+    try db.abortTransaction(pending_parent_delete_txn, 23_102);
+}
+
+test "db relational integrity transaction foreign key parent delete checks plan set null actions" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"set_null"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "customer:set-null", .value = "{\"id\":\"customer:set-null\"}" },
+            .{ .key = "order:set-null", .value = "{\"id\":\"order:set-null\",\"customer_id\":\"customer:set-null\",\"status\":\"open\"}" },
+        },
+    });
+
+    const set_null_txn = try db.beginTransaction(25_000);
+    try db.writeTransaction(set_null_txn, .{
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:set-null",
+        }},
+    });
+    try db.commitTransaction(set_null_txn, 25_001);
+
+    const child = (try db.get(alloc, "order:set-null")) orelse return error.TestExpectedEqual;
+    defer alloc.free(child);
+    try std.testing.expectEqualStrings("{\"id\":\"order:set-null\",\"status\":\"open\"}", child);
+
+    const old_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "orders_customer_id_fkey", "customers", "customer:set-null", "row", "order:set-null");
+    defer alloc.free(old_ref);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, old_ref));
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "customer:direct-set-null", .value = "{\"id\":\"customer:direct-set-null\"}" },
+            .{ .key = "order:direct-set-null", .value = "{\"id\":\"order:direct-set-null\",\"customer_id\":\"customer:direct-set-null\",\"status\":\"open\"}" },
+        },
+    });
+    const direct_set_null_txn = try db.beginTransaction(26_000);
+    try db.writeTransaction(direct_set_null_txn, .{
+        .foreign_key_set_null_children = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:direct-set-null",
+            .child_key = "order:direct-set-null",
+        }},
+    });
+    try db.commitTransaction(direct_set_null_txn, 26_001);
+
+    const direct_child = (try db.get(alloc, "order:direct-set-null")) orelse return error.TestExpectedEqual;
+    defer alloc.free(direct_child);
+    try std.testing.expectEqualStrings("{\"id\":\"order:direct-set-null\",\"status\":\"open\"}", direct_child);
+
+    const direct_old_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "orders_customer_id_fkey", "customers", "customer:direct-set-null", "row", "order:direct-set-null");
+    defer alloc.free(direct_old_ref);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, direct_old_ref));
+}
+
+test "db relational integrity transaction foreign key cascade child actions delete exact children" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"cascade"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "customer:cascade-action", .value = "{\"id\":\"customer:cascade-action\"}" },
+            .{ .key = "order:cascade-action", .value = "{\"id\":\"order:cascade-action\",\"customer_id\":\"customer:cascade-action\",\"status\":\"open\"}" },
+        },
+    });
+
+    const cascade_txn = try db.beginTransaction(27_000);
+    try db.writeTransaction(cascade_txn, .{
+        .foreign_key_cascade_children = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:cascade-action",
+            .child_key = "order:cascade-action",
+        }},
+    });
+    try db.commitTransaction(cascade_txn, 27_001);
+
+    try std.testing.expect((try db.get(alloc, "order:cascade-action")) == null);
+    const old_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "orders_customer_id_fkey", "customers", "customer:cascade-action", "row", "order:cascade-action");
+    defer alloc.free(old_ref);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, old_ref));
+}
+
+test "db relational integrity transaction foreign key set-null child actions support unique tuple parent keys" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"ref_email":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"users_ref_email_fkey","columns":["ref_email"],"references":{"table":"row","columns":["email"]},"on_delete":"set_null"}],"unique_constraints":[{"name":"users_email_key","columns":["email"]}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"ada@example.test\"}" },
+            .{ .key = "user:child", .value = "{\"id\":\"user:child\",\"ref_email\":\"ada@example.test\",\"status\":\"open\"}" },
+        },
+    });
+
+    const parent_row = try mapper.buildRelationalRowValueAlloc(alloc, "{\"id\":\"user:parent\",\"email\":\"ada@example.test\"}", runtime_schema.relational_columns);
+    defer alloc.free(parent_row);
+    const encoded_parent = (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, parent_row, runtime_schema.unique_constraints[0])) orelse return error.TestExpectedEqual;
+    defer alloc.free(encoded_parent);
+
+    const set_null_txn = try db.beginTransaction(28_000);
+    try db.writeTransaction(set_null_txn, .{
+        .foreign_key_set_null_children = &.{.{
+            .constraint_name = "users_ref_email_fkey",
+            .parent_table = "row",
+            .parent_key = encoded_parent,
+            .child_key = "user:child",
+        }},
+    });
+    try db.commitTransaction(set_null_txn, 28_001);
+
+    const child = (try db.get(alloc, "user:child")) orelse return error.TestExpectedEqual;
+    defer alloc.free(child);
+    try std.testing.expectEqualStrings("{\"id\":\"user:child\",\"status\":\"open\"}", child);
+
+    const old_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "users_ref_email_fkey", "row", encoded_parent, "row", "user:child");
+    defer alloc.free(old_ref);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, old_ref));
+}
+
+test "db relational integrity transaction foreign key cascade child actions support unique tuple parent keys" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"ref_email":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"users_ref_email_fkey","columns":["ref_email"],"references":{"table":"row","columns":["email"]},"on_delete":"cascade"}],"unique_constraints":[{"name":"users_email_key","columns":["email"]}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "user:parent", .value = "{\"id\":\"user:parent\",\"email\":\"ada@example.test\"}" },
+            .{ .key = "user:child", .value = "{\"id\":\"user:child\",\"ref_email\":\"ada@example.test\",\"status\":\"open\"}" },
+        },
+    });
+
+    const parent_row = try mapper.buildRelationalRowValueAlloc(alloc, "{\"id\":\"user:parent\",\"email\":\"ada@example.test\"}", runtime_schema.relational_columns);
+    defer alloc.free(parent_row);
+    const encoded_parent = (try relational_store_mod.uniqueConstraintTupleValueAlloc(alloc, parent_row, runtime_schema.unique_constraints[0])) orelse return error.TestExpectedEqual;
+    defer alloc.free(encoded_parent);
+
+    const cascade_txn = try db.beginTransaction(29_000);
+    try db.writeTransaction(cascade_txn, .{
+        .foreign_key_cascade_children = &.{.{
+            .constraint_name = "users_ref_email_fkey",
+            .parent_table = "row",
+            .parent_key = encoded_parent,
+            .child_key = "user:child",
+        }},
+    });
+    try db.commitTransaction(cascade_txn, 29_001);
+
+    try std.testing.expect((try db.get(alloc, "user:child")) == null);
+    const old_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "users_ref_email_fkey", "row", encoded_parent, "row", "user:child");
+    defer alloc.free(old_ref);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, old_ref));
+}
+
+test "db relational integrity transaction foreign key ref mutations support routed owner participants" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict"}]}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const owner_write_txn = try db.beginTransaction(24_000);
+    try db.writeTransaction(owner_write_txn, .{
+        .foreign_key_ref_writes = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:routed",
+            .child_table = "row",
+            .child_key = "order:routed",
+        }},
+    });
+    try db.commitTransaction(owner_write_txn, 24_001);
+
+    const routed_ref = try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "orders_customer_id_fkey", "customers", "customer:routed", "row", "order:routed");
+    defer alloc.free(routed_ref);
+    const routed_ref_value = try db.core.store.get(alloc, routed_ref);
+    defer alloc.free(routed_ref_value);
+    try std.testing.expectEqualStrings("", routed_ref_value);
+
+    const blocked_delete_txn = try db.beginTransaction(24_500);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(blocked_delete_txn, .{
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:routed",
+        }},
+    }));
+    try db.abortTransaction(blocked_delete_txn, 24_501);
+
+    const owner_delete_txn = try db.beginTransaction(25_000);
+    try db.writeTransaction(owner_delete_txn, .{
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:routed",
+        }},
+        .foreign_key_ref_deletes = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:routed",
+            .child_table = "row",
+            .child_key = "order:routed",
+        }},
+    });
+    try db.commitTransaction(owner_delete_txn, 25_001);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, routed_ref));
+
+    const staged_ref_txn = try db.beginTransaction(26_000);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(staged_ref_txn, .{
+        .foreign_key_parent_delete_checks = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:staged",
+        }},
+        .foreign_key_ref_writes = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:staged",
+            .child_table = "row",
+            .child_key = "order:staged",
+        }},
+    }));
+    try db.abortTransaction(staged_ref_txn, 26_001);
+
+    const wrong_child_table_txn = try db.beginTransaction(27_000);
+    try std.testing.expectError(error.ForeignKeyViolation, db.writeTransaction(wrong_child_table_txn, .{
+        .foreign_key_ref_writes = &.{.{
+            .constraint_name = "orders_customer_id_fkey",
+            .parent_table = "customers",
+            .parent_key = "customer:wrong-child-table",
+            .child_table = "other",
+            .child_key = "order:wrong-child-table",
+        }},
+    }));
+    try db.abortTransaction(wrong_child_table_txn, 27_001);
 }
 
 test "db relational temporal primary keys enforce without-overlaps intervals" {
