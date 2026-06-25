@@ -4487,6 +4487,13 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn applyRelationalSqlDdlWithSession(self: *ApiHttpServer, sql: []const u8, session: *sql_adapter.OwnedSqlCatalogSession) !tables_api.AppliedRelationalSqlDdlRecord {
+        var parsed_sql = try sql_adapter.ParsedSql.initAlloc(self.alloc, sql);
+        defer parsed_sql.deinit(self.alloc);
+        return try self.applyRelationalParsedSqlDdlWithSession(&parsed_sql, session);
+    }
+
+    pub fn applyRelationalParsedSqlDdlWithSession(self: *ApiHttpServer, parsed_sql: *const sql_adapter.ParsedSql, session: *sql_adapter.OwnedSqlCatalogSession) !tables_api.AppliedRelationalSqlDdlRecord {
+        const sql = parsed_sql.sql();
         const statement_start_ns = platform_time.monotonicNs();
         const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session());
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
@@ -4495,12 +4502,10 @@ pub const ApiHttpServer = struct {
         const function_bindings: sql_adapter.SqlFunctionBindings = .{
             .routine_expressions = routine_bindings,
         };
-        var parsed_sql = try sql_adapter.ParsedSql.initAlloc(self.alloc, sql);
-        defer parsed_sql.deinit(self.alloc);
-        var plan = sql_adapter.lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(self.alloc, &parsed_sql, function_bindings) catch |err| switch (err) {
+        var plan = sql_adapter.lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(self.alloc, parsed_sql, function_bindings) catch |err| switch (err) {
             error.UnsupportedSqlShape => {
                 if (try self.publicSqlReadOnlyActive(session)) return error.SqlReadOnlyTransaction;
-                if (try self.applySqlRoutineTriggerDdlParsedSqlAlloc(&parsed_sql, statement_timeout_ns, statement_start_ns)) |applied| return applied;
+                if (try self.applySqlRoutineTriggerDdlParsedSqlAlloc(parsed_sql, statement_timeout_ns, statement_start_ns)) |applied| return applied;
                 return err;
             },
             else => return err,
@@ -4512,7 +4517,7 @@ pub const ApiHttpServer = struct {
         }
         switch (plan) {
             .adapter_noop => |noop| {
-                if (noop.reason == .transaction_control and parsedSqlTransactionBoundaryClearsLocalSession(&parsed_sql)) {
+                if (noop.reason == .transaction_control and parsedSqlTransactionBoundaryClearsLocalSession(parsed_sql)) {
                     try session.clearTransactionLocalState(self.alloc);
                     var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
                     applied.noop = true;
@@ -4606,7 +4611,7 @@ pub const ApiHttpServer = struct {
         try self.rejectUnsupportedDocumentSqlViewMapping(plan, session.session());
 
         if (loweredDdlPlanMayDropTrigger(plan)) {
-            if (try self.applyCatalogedSqlRoutineTriggerDropDdlParsedSqlAlloc(&parsed_sql, statement_timeout_ns, statement_start_ns)) |applied| return applied;
+            if (try self.applyCatalogedSqlRoutineTriggerDropDdlParsedSqlAlloc(parsed_sql, statement_timeout_ns, statement_start_ns)) |applied| return applied;
         }
 
         if (self.cfg.user_manager) |manager| {
@@ -4768,101 +4773,6 @@ pub const ApiHttpServer = struct {
         try writer.writeAll(result_body);
         try writer.writeByte('}');
         return try out.toOwnedSlice();
-    }
-
-    fn sqlObjectIdentifierTailAlloc(alloc: std.mem.Allocator, identifier: []const u8) ![]const u8 {
-        return try sql_adapter.normalizeSqlObjectIdentifierAlloc(alloc, identifier);
-    }
-
-    fn publicSqlWithFinalStatementIndex(tokens: []const sql_adapter.Token, start: usize, end: usize) ?usize {
-        if (start >= end or start >= tokens.len) return null;
-        if (!tokens[start].matchesKeywordTag(.with)) return start;
-
-        var index = start + 1;
-        if (index < end and tokens[index].matchesKeywordTag(.recursive)) index += 1;
-        while (true) {
-            if (index >= end or tokens[index].kind != .identifier) return null;
-            index += 1;
-            if (index < end and tokens[index].kind == .lparen) {
-                index = (publicSqlFindMatchingRParenIndex(tokens, index, end) orelse return null) + 1;
-            }
-            if (index >= end or !tokens[index].matchesKeywordTag(.as)) return null;
-            index += 1;
-            if (index < end and tokens[index].matchesKeywordTag(.not)) {
-                if (index + 1 < end and tokens[index + 1].matchesKeywordTag(.materialized)) index += 2;
-            } else if (index < end and tokens[index].matchesKeywordTag(.materialized)) {
-                index += 1;
-            }
-            if (index >= end or tokens[index].kind != .lparen) return null;
-            index = (publicSqlFindMatchingRParenIndex(tokens, index, end) orelse return null) + 1;
-            if (index < end and tokens[index].kind == .comma) {
-                index += 1;
-                continue;
-            }
-            break;
-        }
-        if (index >= end or tokens[index].kind != .identifier) return null;
-        return index;
-    }
-
-    fn publicSqlFindMatchingRParenIndex(tokens: []const sql_adapter.Token, lparen_index: usize, end: usize) ?usize {
-        if (lparen_index >= end or tokens[lparen_index].kind != .lparen) return null;
-        var depth: usize = 1;
-        var index = lparen_index + 1;
-        while (index < end) : (index += 1) {
-            switch (tokens[index].kind) {
-                .lparen => depth += 1,
-                .rparen => {
-                    depth -= 1;
-                    if (depth == 0) return index;
-                },
-                else => {},
-            }
-        }
-        return null;
-    }
-
-    fn publicSqlWriteTargetTableNameAlloc(self: *ApiHttpServer, parsed_sql: *const sql_adapter.ParsedSql) ![]const u8 {
-        const statement_kind = parsed_sql.writeStatementKind() orelse return error.UnsupportedSqlShape;
-        const tokens = parsed_sql.items();
-        const raw = parsed_sql.statement.raw();
-        if (raw.token_start >= raw.token_end or raw.token_start >= tokens.len) return error.UnsupportedSqlShape;
-        var pos = publicSqlWithFinalStatementIndex(tokens, raw.token_start, raw.token_end) orelse return error.UnsupportedSqlShape;
-        switch (statement_kind) {
-            .insert, .insert_source => {
-                if (!tokens[pos].matchesKeywordTag(.insert)) return error.UnsupportedSqlShape;
-                pos += 1;
-                if (pos >= raw.token_end or !tokens[pos].matchesKeywordTag(.into)) return error.UnsupportedSqlShape;
-                pos += 1;
-                if (pos < raw.token_end and tokens[pos].matchesKeywordTag(.only)) pos += 1;
-            },
-            .update, .update_source, .update_joined_source => {
-                if (!tokens[pos].matchesKeywordTag(.update)) return error.UnsupportedSqlShape;
-                pos += 1;
-                if (pos < raw.token_end and tokens[pos].matchesKeywordTag(.only)) pos += 1;
-            },
-            .delete, .delete_source, .delete_joined_source => {
-                if (!tokens[pos].matchesKeywordTag(.delete)) return error.UnsupportedSqlShape;
-                pos += 1;
-                if (pos >= raw.token_end or !tokens[pos].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
-                pos += 1;
-                if (pos < raw.token_end and tokens[pos].matchesKeywordTag(.only)) pos += 1;
-            },
-            .truncate => {
-                if (!tokens[pos].matchesKeywordTag(.truncate)) return error.UnsupportedSqlShape;
-                pos += 1;
-                if (pos < raw.token_end and tokens[pos].matchesKeywordTag(.table)) pos += 1;
-                if (pos < raw.token_end and tokens[pos].matchesKeywordTag(.only)) pos += 1;
-            },
-            .merge => {
-                if (!tokens[pos].matchesKeywordTag(.merge)) return error.UnsupportedSqlShape;
-                pos += 1;
-                if (pos < raw.token_end and tokens[pos].matchesKeywordTag(.into)) pos += 1;
-                if (pos < raw.token_end and tokens[pos].matchesKeywordTag(.only)) pos += 1;
-            },
-        }
-        if (pos >= raw.token_end or tokens[pos].kind != .identifier) return error.UnsupportedSqlShape;
-        return try sqlObjectIdentifierTailAlloc(self.alloc, tokens[pos].text);
     }
 
     fn applyLoweredPublicSqlRowsBatch(
@@ -5538,7 +5448,7 @@ pub const ApiHttpServer = struct {
         return .{ .batch = batch };
     }
 
-    fn handlePublicSqlWrite(self: *ApiHttpServer, sql: []const u8, session: *sql_adapter.OwnedSqlCatalogSession, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
+    fn handlePublicSqlWrite(self: *ApiHttpServer, parsed_sql: *const sql_adapter.ParsedSql, session: *sql_adapter.OwnedSqlCatalogSession, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
         const statement_start_ns = platform_time.monotonicNs();
         const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session());
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
@@ -5546,17 +5456,12 @@ pub const ApiHttpServer = struct {
             return try textResponse(self.alloc, 400, "cannot execute write statement in a read-only transaction");
         }
 
-        var parsed_sql = sql_adapter.ParsedSql.initAlloc(self.alloc, sql) catch |err| switch (err) {
-            error.UnsupportedSqlShape => return try textResponse(self.alloc, 501, "unsupported sql statement"),
-            else => return err,
-        };
-        defer parsed_sql.deinit(self.alloc);
         const statement_kind = parsed_sql.writeStatementKind() orelse return try textResponse(self.alloc, 501, "unsupported sql statement");
         switch (statement_kind) {
             .insert, .insert_source, .update, .update_source, .update_joined_source, .delete, .delete_source, .delete_joined_source, .truncate, .merge => {},
         }
 
-        const target_table = self.publicSqlWriteTargetTableNameAlloc(&parsed_sql) catch |err| switch (err) {
+        const target_table = sql_adapter.writeTargetTableNameFromParsedSqlAlloc(self.alloc, parsed_sql) catch |err| switch (err) {
             error.UnsupportedSqlShape => return try textResponse(self.alloc, 501, "unsupported sql statement"),
             else => return err,
         };
@@ -5583,7 +5488,7 @@ pub const ApiHttpServer = struct {
         defer if (row_claim) |claim| if (claim.owner_id.len > 0) self.alloc.free(claim.owner_id);
         var lowered = sql_adapter.lowerWritePlanWithCatalogParsedSqlAlloc(
             self.alloc,
-            &parsed_sql,
+            parsed_sql,
             schema,
             &.{},
             .{
@@ -5758,19 +5663,14 @@ pub const ApiHttpServer = struct {
         return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
     }
 
-    fn handlePublicSqlRead(self: *ApiHttpServer, sql: []const u8, session: *sql_adapter.OwnedSqlCatalogSession, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
+    fn handlePublicSqlRead(self: *ApiHttpServer, parsed_sql: *const sql_adapter.ParsedSql, session: *sql_adapter.OwnedSqlCatalogSession, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
         const statement_start_ns = platform_time.monotonicNs();
         const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session());
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
 
-        var parsed_sql = sql_adapter.ParsedSql.initAlloc(self.alloc, sql) catch |err| switch (err) {
-            error.UnsupportedSqlShape => return try textResponse(self.alloc, 501, "unsupported sql statement"),
-            else => return err,
-        };
-        defer parsed_sql.deinit(self.alloc);
         const statement_kind = parsed_sql.readStatementKind() orelse return try textResponse(self.alloc, 501, "unsupported sql statement");
-        if (try self.handlePublicSqlQueryFunctionRead(&parsed_sql, session, authenticated_identity, statement_kind)) |response| return response;
-        var table_names = (sql_adapter.readSourceTableNamesFromParsedSqlAlloc(self.alloc, &parsed_sql) catch |err| switch (err) {
+        if (try self.handlePublicSqlQueryFunctionRead(parsed_sql, session, authenticated_identity, statement_kind)) |response| return response;
+        var table_names = (sql_adapter.readSourceTableNamesFromParsedSqlAlloc(self.alloc, parsed_sql) catch |err| switch (err) {
             error.UnsupportedSqlShape => return try textResponse(self.alloc, 501, "unsupported sql statement"),
             else => return err,
         }) orelse return try textResponse(self.alloc, 501, "unsupported sql statement");
@@ -5796,7 +5696,7 @@ pub const ApiHttpServer = struct {
 
         var lowered = sql_adapter_runtime.lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(
             self.alloc,
-            &parsed_sql,
+            parsed_sql,
             schema,
             &.{},
             self.catalogSource(),
@@ -6262,19 +6162,19 @@ pub const ApiHttpServer = struct {
         };
         defer parsed_sql.deinit(self.alloc);
         if (parsed_sql.writeStatementKind() != null) {
-            var response = try self.handlePublicSqlWrite(parsed.value.sql, &session, authenticated_identity);
+            var response = try self.handlePublicSqlWrite(&parsed_sql, &session, authenticated_identity);
             errdefer response.deinit(self.alloc);
             try self.savePublicSqlSession(session);
             return response;
         }
         if (parsed_sql.readStatementKind() != null) {
-            var response = try self.handlePublicSqlRead(parsed.value.sql, &session, authenticated_identity);
+            var response = try self.handlePublicSqlRead(&parsed_sql, &session, authenticated_identity);
             errdefer response.deinit(self.alloc);
             try self.savePublicSqlSession(session);
             return response;
         }
 
-        var applied = self.applyRelationalSqlDdlWithSession(parsed.value.sql, &session) catch |err| switch (err) {
+        var applied = self.applyRelationalParsedSqlDdlWithSession(&parsed_sql, &session) catch |err| switch (err) {
             error.DocumentSqlViewMappingUnsupported => return try textResponse(self.alloc, 400, "document_sql_view_mapping_unsupported"),
             error.SqlReadOnlyTransaction => return try textResponse(self.alloc, 400, "cannot execute statement in a read-only transaction"),
             error.UnsupportedSqlShape => return try textResponse(self.alloc, 501, "unsupported sql statement"),

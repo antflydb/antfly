@@ -1208,6 +1208,73 @@ pub fn joinedWriteSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, p
     return try joinedWriteSourceTableNamesFromTokensAlloc(alloc, parsed_sql.items());
 }
 
+pub fn writeTargetTableNameFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed_sql: *const tokenized.ParsedSql) ![]const u8 {
+    const statement_kind = parsed_sql.writeStatementKind() orelse return error.UnsupportedSqlShape;
+    const tokens = parsed_sql.items();
+    const raw = parsed_sql.statement.raw();
+    if (raw.token_start >= raw.token_end or raw.token_end > tokens.len) return error.UnsupportedSqlShape;
+    const statement_tokens = tokens[raw.token_start..raw.token_end];
+    var pos = writeFinalStatementIndex(statement_tokens) orelse return error.UnsupportedSqlShape;
+    switch (statement_kind) {
+        .insert, .insert_source => {
+            if (!consumeKeyword(statement_tokens, &pos, .insert)) return error.UnsupportedSqlShape;
+            if (!consumeKeyword(statement_tokens, &pos, .into)) return error.UnsupportedSqlShape;
+            _ = consumeKeyword(statement_tokens, &pos, .only);
+        },
+        .update, .update_source, .update_joined_source => {
+            if (!consumeKeyword(statement_tokens, &pos, .update)) return error.UnsupportedSqlShape;
+            _ = consumeKeyword(statement_tokens, &pos, .only);
+        },
+        .delete, .delete_source, .delete_joined_source => {
+            if (!consumeKeyword(statement_tokens, &pos, .delete)) return error.UnsupportedSqlShape;
+            if (!consumeKeyword(statement_tokens, &pos, .from)) return error.UnsupportedSqlShape;
+            _ = consumeKeyword(statement_tokens, &pos, .only);
+        },
+        .truncate => {
+            if (!consumeKeyword(statement_tokens, &pos, .truncate)) return error.UnsupportedSqlShape;
+            _ = consumeKeyword(statement_tokens, &pos, .table);
+            _ = consumeKeyword(statement_tokens, &pos, .only);
+        },
+        .merge => {
+            if (!consumeKeyword(statement_tokens, &pos, .merge)) return error.UnsupportedSqlShape;
+            _ = consumeKeyword(statement_tokens, &pos, .into);
+            _ = consumeKeyword(statement_tokens, &pos, .only);
+        },
+    }
+    if (pos >= statement_tokens.len or statement_tokens[pos].kind != .identifier) return error.UnsupportedSqlShape;
+    return try normalizeSqlObjectIdentifierAlloc(alloc, statement_tokens[pos].text);
+}
+
+fn writeFinalStatementIndex(tokens: []const Token) ?usize {
+    if (tokens.len == 0 or tokens[0].kind != .identifier) return null;
+    if (!tokens[0].matchesKeywordTag(.with)) return 0;
+
+    var index: usize = 1;
+    _ = consumeKeyword(tokens, &index, .recursive);
+    while (true) {
+        if (index >= tokens.len or tokens[index].kind != .identifier) return null;
+        index += 1;
+        if (index < tokens.len and tokens[index].kind == .lparen) {
+            index = (findMatchingRParenIndex(tokens, index) orelse return null) + 1;
+        }
+        if (!consumeKeyword(tokens, &index, .as)) return null;
+        if (consumeKeyword(tokens, &index, .not)) {
+            if (!consumeKeyword(tokens, &index, .materialized)) return null;
+        } else {
+            _ = consumeKeyword(tokens, &index, .materialized);
+        }
+        if (index >= tokens.len or tokens[index].kind != .lparen) return null;
+        index = (findMatchingRParenIndex(tokens, index) orelse return null) + 1;
+        if (index < tokens.len and tokens[index].kind == .comma) {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    if (index >= tokens.len or tokens[index].kind != .identifier) return null;
+    return index;
+}
+
 fn joinedWriteSourceTableNamesFromTokensAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?InsertSourceTableNames {
     if (tokens.len == 0 or tokens[0].kind != .identifier) return null;
     if (tokens[0].matchesKeywordTag(.with)) return try joinedWriteSourceTableNamesFromWithAlloc(alloc, tokens);
@@ -1998,6 +2065,34 @@ test "sql adapter binder resolves catalog prebind table names from shared tokens
     defer joined_write.deinit(alloc);
     try std.testing.expectEqualStrings("usage_records", joined_write.target);
     try std.testing.expectEqualStrings("incoming_usage", joined_write.source);
+}
+
+test "sql adapter binder resolves write target tables from parsed statements" {
+    const alloc = std.testing.allocator;
+
+    const cases = [_]struct {
+        sql: []const u8,
+        target: []const u8,
+    }{
+        .{ .sql = "INSERT INTO usage_records (id) VALUES ('u1')", .target = "usage_records" },
+        .{ .sql = "WITH source_rows AS (SELECT id FROM incoming_usage) INSERT INTO public.usage_records (id) SELECT id FROM source_rows", .target = "usage_records" },
+        .{ .sql = "UPDATE ONLY usage_records SET status = 'done' WHERE id = 'u1'", .target = "usage_records" },
+        .{ .sql = "DELETE FROM usage_records WHERE id = 'u1'", .target = "usage_records" },
+        .{ .sql = "TRUNCATE TABLE ONLY public.usage_records", .target = "usage_records" },
+        .{ .sql = "MERGE INTO public.usage_records USING incoming_usage ON usage_records.id = incoming_usage.id WHEN MATCHED THEN UPDATE SET status = incoming_usage.status", .target = "usage_records" },
+    };
+
+    for (cases) |case| {
+        var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, case.sql);
+        defer parsed_sql.deinit(alloc);
+        const target = try writeTargetTableNameFromParsedSqlAlloc(alloc, &parsed_sql);
+        defer alloc.free(target);
+        try std.testing.expectEqualStrings(case.target, target);
+    }
+
+    var read_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records");
+    defer read_sql.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedSqlShape, writeTargetTableNameFromParsedSqlAlloc(alloc, &read_sql));
 }
 
 test "sql adapter binder source table helpers validate parsed statement family" {

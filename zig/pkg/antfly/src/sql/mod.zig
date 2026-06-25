@@ -2587,6 +2587,7 @@ pub const rewriteExpressionFieldsToSource = plan.rewriteExpressionFieldsToSource
 pub const relationPopulationPlanFromSyntaxAlloc = plan.relationPopulationPlanFromSyntaxAlloc;
 pub const matchArrayTransformUpdateOp = grammar.matchArrayTransformUpdateOp;
 pub const readSourceTableNamesFromParsedSqlAlloc = binder.readSourceTableNamesFromParsedSqlAlloc;
+pub const writeTargetTableNameFromParsedSqlAlloc = binder.writeTargetTableNameFromParsedSqlAlloc;
 pub const ReadPlanCatalogLoweringHooks = binder.ReadPlanCatalogLoweringHooks;
 pub const WritePlanCatalogLoweringHooks = binder.WritePlanCatalogLoweringHooks;
 pub const bindReadPlanCatalogStatementAlloc = binder.bindReadPlanCatalogStatementAlloc;

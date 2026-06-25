@@ -228,6 +228,81 @@ fn validateGeneratedExpressionListForClause(
     }
 }
 
+fn validateGeneratedAggregateFunctionForSpec(
+    tokens: []const Token,
+    function_start: usize,
+    argument_start: usize,
+    argument_end: usize,
+    within_group_start: ?usize,
+    within_group_order_start: ?usize,
+    within_group_order_end: ?usize,
+    within_group_end: ?usize,
+    filter_start: ?usize,
+    filter_predicate_start: ?usize,
+    filter_predicate_end: ?usize,
+    filter_end: ?usize,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    const expression = generated_expression_ast orelse return;
+    if (expression.kind != .function_call) return error.UnsupportedSqlShape;
+    const function_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
+    if (function_tokens.start != function_start or function_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    if (expression.function_name_tokens == null or expression.function_name_tokens.?.start != function_start) return error.UnsupportedSqlShape;
+    if (expression.function_name_tokens.?.end >= function_tokens.end) return error.UnsupportedSqlShape;
+
+    if (argument_start < argument_end) {
+        if (expression.argument_tokens == null) return error.UnsupportedSqlShape;
+        if (expression.argument_tokens.?.start != argument_start or expression.argument_tokens.?.end != argument_end) return error.UnsupportedSqlShape;
+        const value_start = if (expression.argument_distinct_tokens) |distinct_tokens| blk: {
+            if (distinct_tokens.start != argument_start or distinct_tokens.end != argument_start + 1) return error.UnsupportedSqlShape;
+            if (!tokens[distinct_tokens.start].matchesKeywordTag(.distinct)) return error.UnsupportedSqlShape;
+            break :blk distinct_tokens.end;
+        } else argument_start;
+        if (expression.argument_value_tokens == null) return error.UnsupportedSqlShape;
+        const value_tokens = expression.argument_value_tokens.?;
+        if (value_tokens.start != value_start or value_tokens.end > argument_end or value_tokens.start >= value_tokens.end) return error.UnsupportedSqlShape;
+        if (expression.argument_order_tokens) |order_tokens| {
+            if (value_tokens.end + 2 > argument_end or value_tokens.end >= tokens.len) return error.UnsupportedSqlShape;
+            if (!tokens[value_tokens.end].matchesKeywordTag(.order) or !tokens[value_tokens.end + 1].matchesKeywordTag(.by)) return error.UnsupportedSqlShape;
+            if (order_tokens.start != value_tokens.end + 2 or order_tokens.end != argument_end) return error.UnsupportedSqlShape;
+            try validateGeneratedOrderListForClause(tokens, order_tokens, expression.argument_order_items);
+        } else if (value_tokens.end != argument_end) {
+            return error.UnsupportedSqlShape;
+        }
+        try validateGeneratedExpressionListForClause(tokens, value_tokens, expression.argument_items);
+    } else {
+        if (expression.argument_tokens != null or expression.argument_distinct_tokens != null or expression.argument_value_tokens != null or expression.argument_order_tokens != null) return error.UnsupportedSqlShape;
+        if (expression.argument_items.count != 0 or expression.argument_order_items.count != 0) return error.UnsupportedSqlShape;
+    }
+
+    if (within_group_start) |start| {
+        const end = within_group_end orelse return error.UnsupportedSqlShape;
+        const order_start = within_group_order_start orelse return error.UnsupportedSqlShape;
+        const order_end = within_group_order_end orelse return error.UnsupportedSqlShape;
+        if (expression.within_group_tokens == null or expression.within_group_order_tokens == null) return error.UnsupportedSqlShape;
+        if (expression.within_group_tokens.?.start != start or expression.within_group_tokens.?.end != end) return error.UnsupportedSqlShape;
+        if (expression.within_group_order_tokens.?.start != order_start or expression.within_group_order_tokens.?.end != order_end) return error.UnsupportedSqlShape;
+        try validateGeneratedOrderListForClause(tokens, expression.within_group_order_tokens.?, expression.within_group_order_items);
+    } else {
+        if (within_group_end != null or within_group_order_start != null or within_group_order_end != null) return error.UnsupportedSqlShape;
+        if (expression.within_group_tokens != null or expression.within_group_order_tokens != null) return error.UnsupportedSqlShape;
+        if (expression.within_group_order_items.count != 0) return error.UnsupportedSqlShape;
+    }
+
+    if (filter_start) |start| {
+        const end = filter_end orelse return error.UnsupportedSqlShape;
+        const predicate_start = filter_predicate_start orelse return error.UnsupportedSqlShape;
+        const predicate_end = filter_predicate_end orelse return error.UnsupportedSqlShape;
+        if (expression.filter_tokens == null or expression.filter_predicate_tokens == null or expression.filter_expression == null) return error.UnsupportedSqlShape;
+        if (expression.filter_tokens.?.start != start or expression.filter_tokens.?.end != end) return error.UnsupportedSqlShape;
+        if (expression.filter_predicate_tokens.?.start != predicate_start or expression.filter_predicate_tokens.?.end != predicate_end) return error.UnsupportedSqlShape;
+        if (!generatedTokenRangeEqual(expression.filter_expression.?.tokens orelse return error.UnsupportedSqlShape, expression.filter_predicate_tokens.?)) return error.UnsupportedSqlShape;
+    } else {
+        if (filter_end != null or filter_predicate_start != null or filter_predicate_end != null) return error.UnsupportedSqlShape;
+        if (expression.filter_tokens != null or expression.filter_predicate_tokens != null or expression.filter_expression != null) return error.UnsupportedSqlShape;
+    }
+}
+
 fn validateGeneratedProjectionListForClause(
     tokens: []const Token,
     range: generated_parser.GeneratedSqlTokenRange,
@@ -832,6 +907,7 @@ pub const AggregateOutputFieldParserOptions = struct {
 
 pub const AggregateSpecParserOptions = struct {
     function_bindings: SqlFunctionBindings = .{},
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
     order_expression_hooks: OrderExpressionParserOptions,
     aggregate_input: AggregateInputExpressionParserOptions,
     expression_alternatives: ExpressionWhereConditionAlternativesParserOptions,
@@ -8696,9 +8772,11 @@ pub fn parseAggregateSpecAlloc(
     defer_row_expression_field_validation: bool,
     options: AggregateSpecParserOptions,
 ) !db_mod.types.RelationalRowsAggregateSpec {
+    const function_start = pos.*;
     const function_name = parser.matchToken(tokens, pos, .identifier) orelse return error.UnsupportedSqlShape;
     const op = aggregateOpForName(function_name.text) orelse return error.UnsupportedSqlShape;
     try parser.expectToken(tokens, pos, .lparen);
+    const argument_start = pos.*;
     const distinct = parser.matchKeyword(tokens, pos, "distinct");
     var field: ?[]const u8 = null;
     var field_transferred = false;
@@ -8719,17 +8797,25 @@ pub fn parseAggregateSpecAlloc(
         freeOrderBy(alloc, array_order_by.items);
         array_order_by.deinit(alloc);
     }
+    var argument_end: usize = undefined;
+    var within_group_start: ?usize = null;
+    var within_group_order_start: ?usize = null;
+    var within_group_order_end: ?usize = null;
+    var within_group_end: ?usize = null;
     if (isSqlPercentileAggregateOp(op)) {
         if (distinct) return error.UnsupportedSqlShape;
         const percentile_argument = try parseAggregatePercentileArgumentAlloc(alloc, tokens, pos, params);
         percentile = percentile_argument.percentile;
         percentiles = percentile_argument.percentiles;
+        argument_end = pos.*;
         try parser.expectToken(tokens, pos, .rparen);
+        within_group_start = pos.*;
         try parser.expectKeyword(tokens, pos, "within");
         try parser.expectKeyword(tokens, pos, "group");
         try parser.expectToken(tokens, pos, .lparen);
         try parser.expectKeyword(tokens, pos, "order");
         try parser.expectKeyword(tokens, pos, "by");
+        within_group_order_start = pos.*;
         var order = try parseOrderExpressionAlloc(
             alloc,
             tokens,
@@ -8761,15 +8847,20 @@ pub fn parseAggregateSpecAlloc(
         } else {
             return error.UnsupportedSqlShape;
         }
+        within_group_order_end = pos.*;
         try parser.expectToken(tokens, pos, .rparen);
+        within_group_end = pos.*;
     } else if (op == .mode) {
         if (distinct) return error.UnsupportedSqlShape;
+        argument_end = pos.*;
         try parser.expectToken(tokens, pos, .rparen);
+        within_group_start = pos.*;
         try parser.expectKeyword(tokens, pos, "within");
         try parser.expectKeyword(tokens, pos, "group");
         try parser.expectToken(tokens, pos, .lparen);
         try parser.expectKeyword(tokens, pos, "order");
         try parser.expectKeyword(tokens, pos, "by");
+        within_group_order_start = pos.*;
         var order = try parseOrderExpressionAlloc(
             alloc,
             tokens,
@@ -8801,7 +8892,9 @@ pub fn parseAggregateSpecAlloc(
         } else {
             return error.UnsupportedSqlShape;
         }
+        within_group_order_end = pos.*;
         try parser.expectToken(tokens, pos, .rparen);
+        within_group_end = pos.*;
     } else if (op == .count and parser.matchToken(tokens, pos, .star) != null) {
         if (distinct) return error.UnsupportedSqlShape;
         field = null;
@@ -8883,7 +8976,12 @@ pub fn parseAggregateSpecAlloc(
             options.order_expression_hooks,
         );
     }
-    if (!isSqlPercentileAggregateOp(op) and op != .mode) try parser.expectToken(tokens, pos, .rparen);
+    if (!isSqlPercentileAggregateOp(op) and op != .mode) {
+        argument_end = pos.*;
+        try parser.expectToken(tokens, pos, .rparen);
+    }
+    const filter_start = if (parser.peekKeyword(tokens, pos.*, "filter")) pos.* else null;
+    const filter_predicate_start = if (filter_start != null) pos.* + 3 else null;
     const filter = try parseAggregateFilterAlloc(
         alloc,
         tokens,
@@ -8901,6 +8999,23 @@ pub fn parseAggregateSpecAlloc(
     );
     var filter_transferred = false;
     errdefer if (!filter_transferred) freeAggregateFilter(alloc, filter);
+    const filter_end = if (filter_start != null) pos.* else null;
+    const filter_predicate_end = if (filter_start != null) pos.* - 1 else null;
+    try validateGeneratedAggregateFunctionForSpec(
+        tokens,
+        function_start,
+        argument_start,
+        argument_end,
+        within_group_start,
+        within_group_order_start,
+        within_group_order_end,
+        within_group_end,
+        filter_start,
+        filter_predicate_start,
+        filter_predicate_end,
+        filter_end,
+        options.generated_expression_ast,
+    );
     const explicit_alias = try grammar.parseOptionalProjectionAliasAlloc(alloc, tokens, pos);
     defer if (explicit_alias) |alias| alloc.free(alias);
     const name = try aggregateAliasOrDefaultAlloc(alloc, explicit_alias, op, field);
@@ -11513,6 +11628,7 @@ pub fn parseAggregateSelectListAlloc(
     returning_expression_qualifiers: []const []const u8,
     defer_row_expression_field_validation: bool,
     field_source: db_mod.types.RelationalRowsExpressionFieldSource,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
     aggregate_spec_options: AggregateSpecParserOptions,
     select_item_options: SelectItemParserOptions,
 ) !plan_mod.AggregateSelectList {
@@ -11536,6 +11652,11 @@ pub fn parseAggregateSelectListAlloc(
 
     while (true) {
         if (nextIsAggregateFunction(tokens, pos.*)) {
+            const item_start = pos.*;
+            const generated_expression = try generatedProjectionExpressionAtItemStart(item_start, generated_read_ast);
+            if (generated_expression == null and generated_read_ast != null) return error.UnsupportedSqlShape;
+            var spec_options = aggregate_spec_options;
+            spec_options.generated_expression_ast = generated_expression;
             const parsed_spec = try parseAggregateSpecAlloc(
                 alloc,
                 tokens,
@@ -11546,7 +11667,7 @@ pub fn parseAggregateSelectListAlloc(
                 field_expression_qualifiers,
                 returning_expression_qualifiers,
                 defer_row_expression_field_validation,
-                aggregate_spec_options,
+                spec_options,
             );
             var parsed_spec_transferred = false;
             errdefer if (!parsed_spec_transferred) plan_mod.freeAggregateSpec(alloc, parsed_spec);
@@ -16491,6 +16612,7 @@ pub fn parseAggregateAlloc(
         select_context.returning_expression_qualifiers,
         select_context.defer_row_expression_field_validation,
         options.field_source,
+        options.generated_read_ast,
         options.aggregate_spec_options,
         options.select_item_options,
     );
@@ -29140,6 +29262,32 @@ test "sql adapter lower expr lowers bounded array aggregate specs" {
     try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.aggregations[0].filter_predicates.len);
     try std.testing.expectEqualStrings("amount", lowered.aggregate.aggregations[0].filter_predicates[0].field);
 
+    var malformed_argument_range = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT customer, ARRAY_AGG(DISTINCT status ORDER BY amount DESC) FILTER (WHERE amount > 10) AS statuses FROM usage_records GROUP BY customer",
+    );
+    defer malformed_argument_range.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionFunctionArgumentRange(&malformed_argument_range);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
+        alloc,
+        &malformed_argument_range,
+        schema,
+        &.{},
+    ));
+
+    var malformed_filter_range = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT customer, ARRAY_AGG(DISTINCT status ORDER BY amount DESC) FILTER (WHERE amount > 10) AS statuses FROM usage_records GROUP BY customer",
+    );
+    defer malformed_filter_range.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionFunctionFilterRange(&malformed_filter_range);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
+        alloc,
+        &malformed_filter_range,
+        schema,
+        &.{},
+    ));
+
     var json_lowered = try lowerAggregateForLowerExprTestAlloc(
         alloc,
         "SELECT customer, ARRAY_AGG(metadata) AS metadata_values FROM usage_records GROUP BY customer",
@@ -29204,6 +29352,19 @@ test "sql adapter lower expr lowers exact percentile continuous aggregates" {
     try std.testing.expectEqualStrings("amount", lowered.aggregate.aggregations[2].field.?);
     try std.testing.expectEqual(@as(f64, 0.75), lowered.aggregate.aggregations[2].percentile.?);
     try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.aggregate.aggregations[2].percentile_order);
+
+    var malformed_within_group_order = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT customer, percentile_cont(0.5) WITHIN GROUP (ORDER BY amount) AS median_amount FROM usage_records GROUP BY customer",
+    );
+    defer malformed_within_group_order.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionFunctionWithinGroupOrderExpressionItem(&malformed_within_group_order);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
+        alloc,
+        &malformed_within_group_order,
+        schema,
+        &.{},
+    ));
 
     var explicit_nulls = try lowerAggregateForLowerExprTestAlloc(
         alloc,
@@ -29659,6 +29820,68 @@ fn corruptGeneratedReadFirstProjectionWindowOrderExpressionItem(parsed_sql: *tok
                     for (read.projection_items.expressions) |*expression| {
                         if (expression.over_order_items.items.len == 0 or expression.over_order_items.expression_items.len == 0) continue;
                         expression.over_order_items.expression_items[0] = read.projection_items.items[0];
+                        return;
+                    }
+                    return error.TestUnexpectedResult;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadFirstProjectionFunctionArgumentRange(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |*read| {
+                    const source_tokens = read.source_tokens orelse return error.TestUnexpectedResult;
+                    for (read.projection_items.expressions) |*expression| {
+                        if (expression.argument_tokens != null) {
+                            expression.argument_tokens = source_tokens;
+                            return;
+                        }
+                    }
+                    return error.TestUnexpectedResult;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadFirstProjectionFunctionFilterRange(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |*read| {
+                    const source_tokens = read.source_tokens orelse return error.TestUnexpectedResult;
+                    for (read.projection_items.expressions) |*expression| {
+                        if (expression.filter_tokens != null) {
+                            expression.filter_tokens = source_tokens;
+                            return;
+                        }
+                    }
+                    return error.TestUnexpectedResult;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadFirstProjectionFunctionWithinGroupOrderExpressionItem(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |*read| {
+                    if (read.projection_items.items.len == 0) return error.TestUnexpectedResult;
+                    for (read.projection_items.expressions) |*expression| {
+                        if (expression.within_group_order_items.items.len == 0 or expression.within_group_order_items.expression_items.len == 0) continue;
+                        expression.within_group_order_items.expression_items[0] = read.projection_items.items[0];
                         return;
                     }
                     return error.TestUnexpectedResult;

@@ -630,6 +630,10 @@ Unsupported DDL remains on the existing parser until
    `OVER` span, named-window reference or inline definition, partition list,
    order list, and frame expression spans before the typed window-spec lowerer
    accepts the consumed projection expression.
+   Generated aggregate projection functions now validate retained function
+   name, argument, `DISTINCT`, ordered-argument, `WITHIN GROUP`, and `FILTER`
+   predicate spans before the typed aggregate lowerer accepts supported
+   aggregate specs.
    Generated read validation
    rejects pagination payloads that are missing required expressions, attach
    expressions to `LIMIT ALL`, place expression spans outside their owning
@@ -646,7 +650,8 @@ Unsupported DDL remains on the existing parser until
    validated left-associative generated join nodes, expression AST
    planning/lowering beyond the current recursive
    predicate/operator/subquery-tail metadata and structural checks, broader function
-   coverage, broader boolean expression-tree coverage, quantified and `EXISTS`
+   coverage outside the currently validated aggregate and window projection
+   surfaces, broader boolean expression-tree coverage, quantified and `EXISTS`
    subquery planning/lowering, remaining specialized expression operators, richer
    inline window-expression semantic planning beyond current generated `OVER`
    clause span validation,
