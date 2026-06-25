@@ -464,7 +464,9 @@ Unsupported DDL remains on the existing parser until
    and validate them through the shared generated read-AST contract before typed
    write-plan lowering, so `INSERT ... SELECT`, relation-source mutation paths,
    and `MERGE ... USING` wrappers do not depend only on lightweight range
-   payload checks.
+   payload checks. Insert-source retained generated child-read metadata now
+   also validates `SELECT`, `FROM`, `WHERE`, and set-operation keyword layout
+   before the child read is reparsed.
    Recursive DML CTE prefixes now reparse each recorded generated CTE body as a
    child read and validate that child through the shared generated read-AST
    contract before dispatching to typed recursive write-plan lowering; selector-based
