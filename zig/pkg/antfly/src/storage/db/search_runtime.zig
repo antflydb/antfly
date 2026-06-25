@@ -12274,3 +12274,524 @@ test "db search runtime identity non chunked search paths apply broad live doc f
     try std.testing.expectEqual(@as(u32, 0), text_live.total_hits);
     try std.testing.expectEqual(@as(usize, 0), text_live.hits.len);
 }
+
+test "db search runtime preflight validates live lane bindings" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try std.testing.expectError(error.IndexNotFound, db.preflightSearchRequest(alloc, .{
+        .full_text = .{ .match_all = {} },
+        .index_name = "missing_ft",
+    }, 0));
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    var text_summary = try db.preflightSearchRequest(alloc, .{
+        .full_text = .{ .match_all = {} },
+    }, 0);
+    defer text_summary.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), text_summary.result_refs.len);
+    try std.testing.expectEqualStrings("$full_text_results", text_summary.result_refs[0]);
+    try std.testing.expectEqual(@as(u32, 1), text_summary.shard_count);
+    try std.testing.expectEqual(@as(u32, 0), text_summary.remote_shard_count);
+    try std.testing.expectEqual(@as(usize, 1), text_summary.text_indexes.len);
+    try std.testing.expectEqualStrings("ft_v1", text_summary.text_indexes[0].name);
+    try std.testing.expectEqual(@as(u64, 0), text_summary.text_indexes[0].doc_count);
+    try std.testing.expect(!text_summary.text_indexes[0].chunk_backed);
+    try std.testing.expect(!text_summary.text_indexes[0].group_chunk_parents);
+    var provider_summary = try db.planningStatsProvider().collectSearchRequestStats(alloc, .{
+        .full_text = .{ .match_all = {} },
+    }, 0);
+    defer provider_summary.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), provider_summary.result_refs.len);
+    try std.testing.expectEqualStrings("$full_text_results", provider_summary.result_refs[0]);
+    try std.testing.expectEqual(@as(usize, 1), provider_summary.text_indexes.len);
+    try std.testing.expectEqualStrings("ft_v1", provider_summary.text_indexes[0].name);
+
+    try db.addIndex(.{
+        .name = "ft_title_v1",
+        .kind = .full_text,
+        .config_json = "{\"analysis_config\":{\"field_analyzers\":{\"title\":\"standard\"}}}",
+    });
+    try std.testing.expectError(error.InvalidArgument, db.preflightSearchRequest(alloc, .{
+        .index_name = "ft_title_v1",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+    }, 0));
+    try std.testing.expectError(error.InvalidArgument, db.preflightSearchRequest(alloc, .{
+        .index_name = "ft_title_v1",
+        .full_text = .{ .bool_query = .{
+            .must = &.{.{ .match = .{ .field = "title", .text = "alpha" } }},
+            .should = &.{.{ .match = .{ .field = "body", .text = "beta" } }},
+        } },
+    }, 0));
+    try std.testing.expectError(error.InvalidArgument, db.preflightSearchRequest(alloc, .{
+        .index_name = "ft_title_v1",
+        .query = .{ .match = .{ .field = "body", .text = "alpha" } },
+    }, 0));
+    try std.testing.expectError(error.InvalidArgument, db.preflightSearchRequest(alloc, .{
+        .index_name = "ft_title_v1",
+        .full_text = .{ .match_all = {} },
+        .filter_query_json = "{\"term\":{\"body\":\"published\"}}",
+    }, 0));
+    try std.testing.expectError(error.InvalidArgument, db.preflightSearchRequest(alloc, .{
+        .index_name = "ft_title_v1",
+        .full_text = .{ .match_all = {} },
+        .exclusion_query_json = "{\"bool\":{\"must_not\":[{\"term\":{\"body\":\"draft\"}}]}}",
+    }, 0));
+    var titled_text_summary = try db.preflightSearchRequest(alloc, .{
+        .index_name = "ft_title_v1",
+        .full_text = .{ .match = .{ .field = "title", .text = "alpha" } },
+    }, 0);
+    defer titled_text_summary.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), titled_text_summary.result_refs.len);
+    try std.testing.expectEqualStrings("$full_text_results", titled_text_summary.result_refs[0]);
+    try std.testing.expectEqual(@as(usize, 1), titled_text_summary.text_query_stats.len);
+    try std.testing.expectEqualStrings("title", titled_text_summary.text_query_stats[0].field);
+    try std.testing.expectEqual(@as(u32, 0), titled_text_summary.text_query_stats[0].global_doc_count);
+    try std.testing.expectEqual(@as(usize, 1), titled_text_summary.text_query_stats[0].term_doc_freqs.len);
+    try std.testing.expectEqualStrings("alpha", titled_text_summary.text_query_stats[0].term_doc_freqs[0].term);
+    try std.testing.expectEqual(@as(u32, 0), titled_text_summary.text_query_stats[0].term_doc_freqs[0].doc_freq);
+    var filtered_text_summary = try db.preflightSearchRequest(alloc, .{
+        .index_name = "ft_title_v1",
+        .full_text = .{ .match_all = {} },
+        .filter_query_json = "{\"term\":{\"title\":\"published\"}}",
+        .exclusion_query_json = "{\"bool\":{\"must_not\":[{\"match\":{\"title\":\"draft\"}}]}}",
+    }, 0);
+    defer filtered_text_summary.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), filtered_text_summary.text_query_stats.len);
+    try std.testing.expectEqualStrings("title", filtered_text_summary.text_query_stats[0].field);
+    try std.testing.expectEqual(@as(usize, 2), filtered_text_summary.text_query_stats[0].term_doc_freqs.len);
+    var saw_published = false;
+    var saw_draft = false;
+    for (filtered_text_summary.text_query_stats[0].term_doc_freqs) |term| {
+        if (std.mem.eql(u8, term.term, "published")) saw_published = true;
+        if (std.mem.eql(u8, term.term, "draft")) saw_draft = true;
+    }
+    try std.testing.expect(saw_published);
+    try std.testing.expect(saw_draft);
+    var all_text_summary = try db.preflightSearchRequest(alloc, .{
+        .index_name = "ft_title_v1",
+        .query = .{ .match = .{ .field = "_all", .text = "alpha" } },
+    }, 0);
+    defer all_text_summary.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), all_text_summary.result_refs.len);
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3}",
+    });
+    try std.testing.expectError(error.InvalidArgument, db.preflightSearchRequest(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = &.{ 1.0, 2.0 }, .k = 10 },
+    }, 0));
+    var dense_summary = try db.preflightSearchRequest(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = &.{ 1.0, 2.0, 3.0 }, .k = 10 },
+    }, 0);
+    defer dense_summary.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), dense_summary.result_refs.len);
+    try std.testing.expectEqualStrings("$embeddings_results", dense_summary.result_refs[0]);
+    try std.testing.expectEqual(@as(u32, 1), dense_summary.shard_count);
+    try std.testing.expectEqual(@as(u32, 1), dense_summary.dense_query_count);
+    try std.testing.expectEqual(@as(u64, 10), dense_summary.dense_effective_k_total);
+    try std.testing.expect(dense_summary.dense_search_width_total >= dense_summary.dense_effective_k_total);
+    try std.testing.expect(dense_summary.dense_search_width_max >= 64);
+    try std.testing.expect(dense_summary.dense_epsilon_max >= 1.0);
+    try std.testing.expectEqual(@as(usize, 1), dense_summary.embedding_indexes.len);
+    try std.testing.expectEqualStrings("dv_v1", dense_summary.embedding_indexes[0].name);
+    try std.testing.expectEqual(@as(u32, 3), dense_summary.embedding_indexes[0].dims);
+    try std.testing.expect(!dense_summary.embedding_indexes[0].sparse);
+
+    var structured_summary = try db.preflightSearchRequest(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .doc_id = .{ .ids = &.{ "doc:a", "doc:b" } } },
+        .filter_ids = &.{ 1, 2, 3 },
+        .exclude_ids = &.{4},
+        .filter_query_json = "{\"bool\":{\"must\":[{\"numeric_range\":{\"field\":\"score\",\"min\":1}},{\"doc_id\":[\"doc:c\"]}]}}",
+        .exclusion_query_json = "{\"bool\":{\"must_not\":[{\"term_range\":{\"field\":\"tag\",\"min\":\"a\",\"max\":\"m\"}},{\"ip_range\":{\"field\":\"ip\",\"cidr\":\"10.0.0.0/8\"}}]}}",
+    }, 0);
+    defer structured_summary.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), structured_summary.doc_id_value_count);
+    try std.testing.expectEqual(@as(u32, 3), structured_summary.filter_id_count);
+    try std.testing.expectEqual(@as(u32, 1), structured_summary.exclude_id_count);
+    try std.testing.expectEqual(@as(u32, 1), structured_summary.numeric_range_clause_count);
+    try std.testing.expectEqual(@as(u32, 1), structured_summary.term_range_clause_count);
+    try std.testing.expectEqual(@as(u32, 1), structured_summary.ip_range_clause_count);
+    try std.testing.expectEqual(@as(?u32, 1), structured_summary.positive_id_result_upper_bound);
+    try std.testing.expectEqual(@as(?u64, 0), structured_summary.structured_filter_doc_count_estimate);
+    try std.testing.expect(structured_summary.structured_filter_count_exact);
+    try std.testing.expectEqual(@as(?u32, 0), structured_summary.result_doc_upper_bound);
+    try std.testing.expectEqual(@as(?u32, 0), structured_summary.result_doc_estimate);
+    if (structured_summary.selectivity_upper_bound_ratio) |ratio| {
+        try std.testing.expectApproxEqAbs(@as(f32, 0.0), ratio, 0.0001);
+    }
+
+    var cost_summary = try db.preflightSearchRequest(alloc, .{
+        .limit = 6,
+        .offset = 2,
+        .include_stored = true,
+        .aggregations_json = "{}",
+        .reranker = .{
+            .provider = .antfly,
+            .field = "body",
+            .top_n = 4,
+        },
+    }, 0);
+    defer cost_summary.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 8), cost_summary.shard_result_window);
+    try std.testing.expectEqual(@as(u64, 8), cost_summary.shard_result_window_total);
+    try std.testing.expectEqual(@as(u64, 8), cost_summary.stored_projection_doc_upper_bound_total);
+    try std.testing.expectEqual(@as(u32, 4), cost_summary.rerank_doc_upper_bound);
+    try std.testing.expect(cost_summary.aggregation_may_scan_full_results);
+    try std.testing.expectEqual(@as(?u32, null), cost_summary.positive_id_result_upper_bound);
+    try std.testing.expectEqual(@as(?u32, null), cost_summary.result_doc_estimate);
+    try std.testing.expectEqual(@as(?u32, null), cost_summary.result_doc_upper_bound);
+    try std.testing.expectEqual(@as(?u64, null), cost_summary.effective_stored_projection_doc_estimate_total);
+    try std.testing.expectEqual(@as(u64, 8), cost_summary.effective_stored_projection_doc_upper_bound_total);
+    try std.testing.expectEqual(@as(?u32, null), cost_summary.effective_rerank_doc_estimate);
+    try std.testing.expectEqual(@as(u32, 4), cost_summary.effective_rerank_doc_upper_bound);
+    try std.testing.expectEqual(@as(?u32, null), cost_summary.aggregation_second_pass_doc_estimate);
+    try std.testing.expectEqual(@as(?u32, null), cost_summary.aggregation_second_pass_doc_upper_bound);
+
+    try std.testing.expectError(error.IndexNotFound, db.preflightSearchRequest(alloc, .{
+        .index_name = "missing_sparse",
+        .sparse = .{ .indices = &.{1}, .values = &.{1.0}, .k = 10 },
+    }, 0));
+
+    try db.addIndex(.{
+        .name = "graph_v1",
+        .kind = .graph,
+        .config_json = "{\"edge_types\":[{\"name\":\"parent\",\"topology\":\"tree\"}]}",
+    });
+    try std.testing.expectError(error.InvalidArgument, db.preflightSearchRequest(alloc, .{
+        .graph_queries = &.{
+            .{
+                .name = "related",
+                .query = .{
+                    .query_type = .neighbors,
+                    .index_name = "graph_v1",
+                    .start_nodes = .{ .keys = &.{"doc:a"} },
+                    .params = .{ .edge_types = &.{"missing"}, .max_depth = 1 },
+                },
+            },
+        },
+    }, 0));
+    try std.testing.expectError(error.InvalidArgument, db.preflightSearchRequest(alloc, .{
+        .graph_queries = &.{
+            .{
+                .name = "path_missing_target",
+                .query = .{
+                    .query_type = .shortest_path,
+                    .index_name = "graph_v1",
+                    .start_nodes = .{ .keys = &.{"doc:a"} },
+                },
+            },
+        },
+    }, 0));
+    try std.testing.expectError(error.InvalidArgument, db.preflightSearchRequest(alloc, .{
+        .graph_queries = &.{
+            .{
+                .name = "k_zero",
+                .query = .{
+                    .query_type = .k_shortest_paths,
+                    .index_name = "graph_v1",
+                    .start_nodes = .{ .keys = &.{"doc:a"} },
+                    .target_nodes = .{ .keys = &.{"doc:b"} },
+                    .k = 0,
+                },
+            },
+        },
+    }, 0));
+    try std.testing.expectError(error.InvalidArgument, db.preflightSearchRequest(alloc, .{
+        .graph_queries = &.{
+            .{
+                .name = "pattern_with_target",
+                .query = .{
+                    .query_type = .pattern,
+                    .index_name = "graph_v1",
+                    .start_nodes = .{ .keys = &.{"doc:a"} },
+                    .target_nodes = .{ .keys = &.{"doc:b"} },
+                    .pattern = &.{
+                        .{
+                            .alias = "src",
+                            .edge = .{},
+                        },
+                    },
+                },
+            },
+        },
+    }, 0));
+    try std.testing.expectError(error.InvalidArgument, db.preflightSearchRequest(alloc, .{
+        .graph_queries = &.{
+            .{
+                .name = "pattern_missing_type",
+                .query = .{
+                    .query_type = .pattern,
+                    .index_name = "graph_v1",
+                    .start_nodes = .{ .keys = &.{"doc:a"} },
+                    .pattern = &.{
+                        .{
+                            .alias = "src",
+                            .edge = .{},
+                        },
+                        .{
+                            .alias = "dst",
+                            .edge = .{ .types = &.{"missing"} },
+                        },
+                    },
+                },
+            },
+        },
+    }, 0));
+    var graph_summary = try db.preflightSearchRequest(alloc, .{
+        .graph_queries = &.{
+            .{
+                .name = "related",
+                .query = .{
+                    .query_type = .neighbors,
+                    .index_name = "graph_v1",
+                    .start_nodes = .{ .keys = &.{"doc:a"} },
+                    .params = .{ .edge_types = &.{"parent"}, .max_depth = 1 },
+                },
+            },
+            .{
+                .name = "pattern_related",
+                .query = .{
+                    .query_type = .pattern,
+                    .index_name = "graph_v1",
+                    .start_nodes = .{ .keys = &.{"doc:a"} },
+                    .pattern = &.{
+                        .{
+                            .alias = "src",
+                            .edge = .{},
+                        },
+                        .{
+                            .alias = "dst",
+                            .edge = .{ .types = &.{"parent"} },
+                        },
+                    },
+                    .return_aliases = &.{ "src", "dst" },
+                },
+            },
+        },
+    }, 0);
+    defer graph_summary.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), graph_summary.graph_query_order.len);
+    try std.testing.expectEqualStrings("related", graph_summary.graph_query_order[0]);
+    try std.testing.expectEqualStrings("pattern_related", graph_summary.graph_query_order[1]);
+    try std.testing.expectEqual(@as(usize, 1), graph_summary.graph_indexes.len);
+    try std.testing.expectEqualStrings("graph_v1", graph_summary.graph_indexes[0].name);
+    try std.testing.expectEqual(@as(u64, 0), graph_summary.graph_indexes[0].edge_count);
+    try std.testing.expectEqual(@as(u64, 0), graph_summary.graph_indexes[0].node_count);
+}
+
+test "db search runtime preflight surfaces structured filter probe counts when count is budget limited" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    for (0..5) |i| {
+        const doc_id = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
+        defer alloc.free(doc_id);
+        const doc_key = try internal_keys.documentKeyAlloc(alloc, doc_id);
+        defer alloc.free(doc_key);
+        const lat = 37.70 + (@as(f64, @floatFromInt(i)) * 0.02);
+        const lon = -122.50 + (@as(f64, @floatFromInt(i)) * 0.02);
+        const json = try std.fmt.allocPrint(alloc, "{{\"published\":true,\"score\":{d},\"location\":{{\"lat\":{d},\"lon\":{d}}}}}", .{ i, lat, lon });
+        defer alloc.free(json);
+        try db.core.store.put(doc_key, json);
+    }
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    var summary = try db.preflightSearchRequest(alloc, .{
+        .index_name = "ft_v1",
+        .filter_query_json = "{\"bool_field\":{\"field\":\"published\",\"value\":true}}",
+    }, 3);
+    defer summary.deinit(alloc);
+
+    try std.testing.expectEqual(@as(?u64, 3), summary.structured_filter_count_budget_limit);
+    try std.testing.expectEqual(@as(?u64, 5), summary.structured_filter_doc_count_sample_estimate);
+    try std.testing.expectEqual(@as(u32, 3), summary.structured_filter_count_sample_size);
+    try std.testing.expectEqual(@as(?u32, 5), summary.result_doc_estimate);
+    if (summary.selectivity_sample_ratio) |ratio| {
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), ratio, 0.0001);
+    }
+    try std.testing.expect(summary.structured_filter_doc_count_lower_bound != null or summary.structured_filter_doc_count_estimate != null);
+
+    var geo_summary = try db.preflightSearchRequest(alloc, .{
+        .index_name = "ft_v1",
+        .filter_query_json = "{\"geo_bbox\":{\"field\":\"location\",\"min_lat\":37.69,\"min_lon\":-122.51,\"max_lat\":37.75,\"max_lon\":-122.45}}",
+    }, 2);
+    defer geo_summary.deinit(alloc);
+
+    try std.testing.expectEqual(@as(?u64, 2), geo_summary.structured_filter_count_budget_limit);
+    try std.testing.expect(geo_summary.structured_filter_doc_count_sample_estimate != null);
+    try std.testing.expectEqual(@as(u32, 2), geo_summary.structured_filter_count_sample_size);
+    try std.testing.expect(geo_summary.structured_filter_doc_count_lower_bound != null or geo_summary.structured_filter_doc_count_estimate != null);
+}
+
+test "db search runtime graph helpers expose edges neighbors and shortest path" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "citations",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+    try db.addIndex(.{
+        .name = "citations_alg",
+        .kind = .graph,
+        .config_json = "{\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}}}",
+    });
+
+    try db.batch(.{
+        .graph_writes = &.{
+            .{ .index_name = "citations", .source = "a", .target = "b", .edge_type = "cites", .weight = 1.0 },
+            .{ .index_name = "citations", .source = "a", .target = "c", .edge_type = "cites", .weight = 2.0 },
+            .{ .index_name = "citations", .source = "b", .target = "d", .edge_type = "cites", .weight = 3.0 },
+            .{ .index_name = "citations_alg", .source = "a", .target = "b", .edge_type = "cites", .weight = 1.0 },
+            .{ .index_name = "citations_alg", .source = "a", .target = "c", .edge_type = "cites", .weight = 2.0 },
+            .{ .index_name = "citations_alg", .source = "b", .target = "d", .edge_type = "cites", .weight = 3.0 },
+        },
+        .sync_level = .full_index,
+    });
+
+    const edges = try db.getEdges(alloc, "citations", "a", "", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 2), edges.len);
+
+    const neighbors = try db.getNeighbors(alloc, "citations", "a", "cites", .out);
+    defer traversal_mod.freeOwnedResults(alloc, neighbors);
+    try std.testing.expectEqual(@as(usize, 2), neighbors.len);
+
+    const traversed = try db.traverseEdges(alloc, "citations", "a", .{
+        .direction = .out,
+        .edge_types = &.{"cites"},
+        .max_depth = 2,
+    });
+    defer traversal_mod.freeOwnedResults(alloc, traversed);
+    try std.testing.expectEqual(@as(usize, 3), traversed.len);
+
+    const shortest = (try db.findShortestPath(alloc, "citations", "a", "d", &.{"cites"}, .out, .min_hops, 8, 0, 0)).?;
+    defer paths_mod.freePath(alloc, shortest);
+    try std.testing.expectEqual(@as(u32, 2), shortest.length);
+    try std.testing.expectEqual(@as(usize, 3), shortest.nodes.len);
+    try std.testing.expectEqualStrings("a", shortest.nodes[0]);
+    try std.testing.expectEqualStrings("d", shortest.nodes[2]);
+
+    const algebraic_shortest = (try db.findShortestPath(alloc, "citations_alg", "a", "d", &.{"cites"}, .out, .min_hops, 8, 0, 0)).?;
+    defer paths_mod.freePath(alloc, algebraic_shortest);
+    try std.testing.expectEqual(@as(u32, 2), algebraic_shortest.length);
+    try std.testing.expectEqual(@as(usize, 3), algebraic_shortest.nodes.len);
+    try std.testing.expectEqualStrings("a", algebraic_shortest.nodes[0]);
+    try std.testing.expectEqualStrings("b", algebraic_shortest.nodes[1]);
+    try std.testing.expectEqualStrings("d", algebraic_shortest.nodes[2]);
+    try std.testing.expectEqual(@as(usize, 2), algebraic_shortest.edges.len);
+    try std.testing.expectEqualStrings("cites", algebraic_shortest.edges[0].edge_type);
+
+    const algebraic_k_one = try db.findKShortestPaths(alloc, "citations_alg", "a", "d", 1, &.{"cites"}, .out, .min_hops, 8, 0, 0);
+    defer paths_mod.freePaths(alloc, algebraic_k_one);
+    try std.testing.expectEqual(@as(usize, 1), algebraic_k_one.len);
+    try std.testing.expectEqual(@as(u32, 2), algebraic_k_one[0].length);
+    try std.testing.expectEqualStrings("d", algebraic_k_one[0].nodes[2]);
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    var found_alg_stats = false;
+    for (stats.indexes) |item| {
+        if (!std.mem.eql(u8, item.name, "citations_alg")) continue;
+        found_alg_stats = true;
+        try std.testing.expect(item.algebraic_graph_traversal_attempt_count > 0);
+        try std.testing.expect(item.algebraic_graph_traversal_proven_count > 0);
+        try std.testing.expect(item.algebraic_graph_traversal_result_node_count > 0);
+    }
+    try std.testing.expect(found_alg_stats);
+}
+
+test "db search runtime graph helpers algebraic shortest path applies exact min-hop edge weight filters" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "citations_alg",
+        .kind = .graph,
+        .config_json = "{\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}}}",
+    });
+
+    try db.batch(.{
+        .graph_writes = &.{
+            .{ .index_name = "citations_alg", .source = "a", .target = "b", .edge_type = "cites", .weight = 0.5 },
+            .{ .index_name = "citations_alg", .source = "b", .target = "d", .edge_type = "cites", .weight = 2.0 },
+            .{ .index_name = "citations_alg", .source = "a", .target = "c", .edge_type = "cites", .weight = 2.0 },
+            .{ .index_name = "citations_alg", .source = "c", .target = "e", .edge_type = "cites", .weight = 2.0 },
+            .{ .index_name = "citations_alg", .source = "e", .target = "d", .edge_type = "cites", .weight = 2.0 },
+            .{ .index_name = "citations_alg", .source = "c", .target = "d", .edge_type = "cites", .weight = 5.0 },
+        },
+        .sync_level = .full_index,
+    });
+
+    const shortest = (try db.findShortestPath(alloc, "citations_alg", "a", "d", &.{"cites"}, .out, .min_hops, 4, 1.0, 3.0)).?;
+    defer paths_mod.freePath(alloc, shortest);
+    try std.testing.expectEqual(@as(u32, 3), shortest.length);
+    try std.testing.expectEqual(@as(usize, 4), shortest.nodes.len);
+    try std.testing.expectEqualStrings("a", shortest.nodes[0]);
+    try std.testing.expectEqualStrings("c", shortest.nodes[1]);
+    try std.testing.expectEqualStrings("e", shortest.nodes[2]);
+    try std.testing.expectEqualStrings("d", shortest.nodes[3]);
+
+    const algebraic_k_one = try db.findKShortestPaths(alloc, "citations_alg", "a", "d", 1, &.{"cites"}, .out, .min_hops, 4, 1.0, 3.0);
+    defer paths_mod.freePaths(alloc, algebraic_k_one);
+    try std.testing.expectEqual(@as(usize, 1), algebraic_k_one.len);
+    try std.testing.expectEqual(@as(u32, 3), algebraic_k_one[0].length);
+    try std.testing.expectEqualStrings("c", algebraic_k_one[0].nodes[1]);
+    try std.testing.expectEqualStrings("d", algebraic_k_one[0].nodes[3]);
+}
