@@ -978,6 +978,12 @@ pub const CreateIndexPlan = struct {
 };
 
 pub const CreateIndexOptions = struct {
+    schema: runtime_schema.TableSchema = .{},
+    params: []const value_mod.SqlValue = &.{},
+    function_bindings: lower_expr.SqlFunctionBindings = .{},
+    field_expression_qualifiers: []const []const u8 = &.{},
+    returning_expression_qualifiers: []const []const u8 = &.{},
+    defer_row_expression_field_validation: bool = false,
     context_hooks: lower_expr.SelectParserContextHooks,
     case_expression_hooks: lower_expr.CaseExpressionParserHooks,
 };
@@ -3223,12 +3229,7 @@ fn generatedCreateIndexUsesRuntimeBoundary(tokens: []const grammar.Token, ast: g
 
 fn generatedCreateIndexWhereUsesRuntimeBoundary(tokens: []const grammar.Token, range: generated_parser.GeneratedSqlTokenRange) bool {
     if (range.end > tokens.len or range.start > range.end) return false;
-    if (range.end - range.start != 3) return false;
-    if (tokens[range.start].kind != .identifier) return false;
-    const op = tokens[range.start + 1];
-    if (op.kind == .eq or op.kind == .neq) return true;
-    if (op.matchesKeywordTag(.is) and tokens[range.start + 2].matchesKeywordTag(.null)) return true;
-    return false;
+    return range.start < range.end;
 }
 
 fn generatedAlterTableUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) bool {
@@ -3697,11 +3698,21 @@ fn createIndexPlanFromGeneratedAstAlloc(
     }
     if (index != end) return error.UnsupportedSqlShape;
 
-    var pos: usize = index_keyword;
-    var plan = try parseCreateIndexPlanAlloc(alloc, tokens, &pos, ast.unique, options);
+    var state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens,
+        .pos = index_keyword,
+        .schema = options.schema,
+        .params = options.params,
+        .function_bindings = options.function_bindings,
+        .field_expression_qualifiers = options.field_expression_qualifiers,
+        .returning_expression_qualifiers = options.returning_expression_qualifiers,
+        .defer_row_expression_field_validation = options.defer_row_expression_field_validation,
+    };
+    var plan = try parseCreateIndexPlanAlloc(alloc, tokens, &state.pos, ast.unique, parser_context.ParserState.ContextAccessors.createIndexOptions(&state));
     errdefer plan.deinit(alloc);
     if (plan.unique != ast.unique) return error.UnsupportedSqlShape;
-    if (!generatedStatementConsumedThrough(tokens, end, pos)) return error.UnsupportedSqlShape;
+    if (!generatedStatementConsumedThrough(tokens, end, state.pos)) return error.UnsupportedSqlShape;
     return plan;
 }
 
@@ -13003,6 +13014,23 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
             try std.testing.expectEqual(@as(usize, 1), plan.where.len);
             try std.testing.expectEqualStrings("status", plan.where[0].field);
             try std.testing.expectEqual(@as(usize, 0), plan.where_expressions.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var runtime_expression_partial_index = try tokenized.ParsedSql.initAlloc(alloc, "CREATE UNIQUE INDEX generated_usage_active_tenant_email_key ON generated_usage_records (email) WHERE concat_ws(':', tenant_id, status) = 't1:active';");
+    defer runtime_expression_partial_index.deinit(alloc);
+    var runtime_expression_partial_index_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_expression_partial_index);
+    defer runtime_expression_partial_index_plan.deinit(alloc);
+    switch (runtime_expression_partial_index_plan) {
+        .create_index => |plan| {
+            try std.testing.expectEqualStrings("generated_usage_active_tenant_email_key", plan.index_name);
+            try std.testing.expectEqualStrings("generated_usage_records", plan.table_name);
+            try std.testing.expect(plan.unique);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqual(@as(usize, 0), plan.where.len);
+            try std.testing.expectEqual(@as(usize, 1), plan.where_expressions.len);
+            try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.concat_ws, plan.where_expressions[0].lhs.kind);
         },
         else => return error.TestUnexpectedResult,
     }

@@ -302,6 +302,12 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
 
         pub fn createIndexOptions(ptr: *ParserType) ddl_plan.CreateIndexOptions {
             return .{
+                .schema = ptr.schema,
+                .params = ptr.params,
+                .function_bindings = ptr.function_bindings,
+                .field_expression_qualifiers = ptr.field_expression_qualifiers,
+                .returning_expression_qualifiers = ptr.returning_expression_qualifiers,
+                .defer_row_expression_field_validation = ptr.defer_row_expression_field_validation,
                 .context_hooks = Accessors.selectParserContextHooks(ptr),
                 .case_expression_hooks = Accessors.caseExpressionParserHooks(ptr),
             };
