@@ -319,6 +319,16 @@ source test that proves the same schema job is reachable through catalog
 routing, group-local DB opening, and vtable dispatch belongs with the source
 boundary until `sources.zig` or `managed_db.zig` owns that path.
 
+Each extraction chunk should leave behind an explicit test-placement audit:
+
+- Name the production owner that moved.
+- Move the focused implementation tests and narrow fixtures with that owner.
+- Keep integration or facade tests only when they still prove a real boundary.
+- Import the new test owner from the stable focused test root or facade so the
+  existing `zig build` target still runs it.
+- Run the focused read/write test targets and mention any intentionally deferred
+  boundary tests in the change summary.
+
 In other words, the refactor should not leave a shadow test suite behind in the
 old facade files. The facade test surface should shrink as implementation leaves
 it. What remains there should be intentionally named boundary coverage: public

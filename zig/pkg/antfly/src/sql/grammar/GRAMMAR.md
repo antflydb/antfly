@@ -626,6 +626,10 @@ Unsupported DDL remains on the existing parser until
    Generated named `WINDOW` clauses now validate top-level window item,
    name/definition, partition list, order list, and frame expression spans
    before the typed window lowerer accepts a consumed `WINDOW` tail.
+   Generated inline window `OVER` expressions now validate the generated
+   `OVER` span, named-window reference or inline definition, partition list,
+   order list, and frame expression spans before the typed window-spec lowerer
+   accepts the consumed projection expression.
    Generated read validation
    rejects pagination payloads that are missing required expressions, attach
    expressions to `LIMIT ALL`, place expression spans outside their owning
@@ -645,7 +649,7 @@ Unsupported DDL remains on the existing parser until
    coverage, broader boolean expression-tree coverage, quantified and `EXISTS`
    subquery planning/lowering, remaining specialized expression operators, richer
    inline window-expression semantic planning beyond current generated `OVER`
-   clause metadata,
+   clause span validation,
    recursive full CTE body planning beyond the current body
    clause/list/expression/join/window and pagination metadata, direct
    generated read-plan lowering, and
