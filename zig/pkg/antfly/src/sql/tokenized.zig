@@ -323,6 +323,7 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
     if (tokens[raw_statement.token_end - 1].kind == .eq or tokens[raw_statement.token_end - 1].kind == .comma) return false;
     if (tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .to) or tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .as)) return false;
     if (isGeneratedGraphDdlHead(tokens, raw_statement)) return false;
+    if (isGeneratedCatalogDdlHead(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedDdlBoundary(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedDmlBoundary(tokens, raw_statement)) return false;
 
@@ -351,6 +352,15 @@ fn isGeneratedGraphDdlHead(tokens: []const Token, raw_statement: RawSqlStatement
     if (start + 1 >= raw_statement.token_end or raw_statement.token_end > tokens.len) return false;
     return (tokenMatchesKeyword(tokens[start], .create) or tokenMatchesKeyword(tokens[start], .alter)) and
         tokenMatchesKeyword(tokens[start + 1], .graph);
+}
+
+fn isGeneratedCatalogDdlHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
+    const start = raw_statement.token_start;
+    if (start + 1 >= raw_statement.token_end or raw_statement.token_end > tokens.len) return false;
+    if (!tokenMatchesKeyword(tokens[start], .create) and !tokenMatchesKeyword(tokens[start], .drop)) return false;
+    return tokenMatchesKeyword(tokens[start + 1], .database) or
+        tokenMatchesKeyword(tokens[start + 1], .schema) or
+        tokenMatchesKeyword(tokens[start + 1], .extension);
 }
 
 fn isIncompleteGeneratedDdlBoundary(tokens: []const Token, raw_statement: RawSqlStatement) bool {
@@ -834,6 +844,12 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE INDEX usage_status_idx ON"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records ADD"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP TABLE IF EXISTS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE DATABASE tenant_ops WITH OWNER app"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE SCHEMA analytics AUTHORIZATION app_user"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE EXTENSION vector FROM unpackaged"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP DATABASE tenant_ops WITH (OWNER)"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP SCHEMA analytics, reporting"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP EXTENSION vector, postgis"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE GRAPH INDEX docs_edge_graph ON"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER GRAPH INDEX docs_edge_graph ADD"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "INSERT INTO usage_records VALUES"));
@@ -847,6 +863,14 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     defer complex_ddl.deinit(alloc);
     try std.testing.expect(complex_ddl.generated_statement == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .ddl), std.meta.activeTag(complex_ddl.statement));
+
+    var generated_catalog_ddl = try ParsedSql.initAlloc(alloc, "CREATE DATABASE tenant_ops");
+    defer generated_catalog_ddl.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.extension_index, generated_catalog_ddl.generatedStatementKind().?);
+    switch (generated_catalog_ddl.generated_statement.?.ast.?) {
+        .extension_index => |ddl_ast| try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_database, ddl_ast.kind),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "sql adapter parsed sql builds non-contiguous child statements from parent tokens" {

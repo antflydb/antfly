@@ -53,8 +53,11 @@ Simple DDL has generated-parser corpus coverage but still falls back to the
 existing parser when the seed grammar does not yet cover the shape; generated
 simple DDL ASTs now carry structured object, option, and behavior fields for
 database, schema, and extension create/drop catalog plans and lower those
-catalog plans directly from generated AST ranges, plus generated AST-to-plan
-parity for seed `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, and `DROP INDEX`
+catalog plans directly from generated AST ranges. `CREATE`/`DROP`
+database/schema/extension statement heads now require generated parser success
+at the `ParsedSql` boundary, so malformed generated-owned catalog DDL fails
+closed instead of probing the legacy DDL classifier. Generated AST-to-plan
+parity also covers seed `CREATE TABLE`, `DROP TABLE`, `CREATE INDEX`, and `DROP INDEX`
 forms using the same parser options as the existing lowerer. Generated
 `CREATE INDEX` ASTs also retain
 `UNIQUE`, method, element-list, covering-index `INCLUDE (...)`, options, and
@@ -359,8 +362,9 @@ Suggested migration order:
    metric declarations, and extension declarations. Simple database, schema,
    table, index, and extension DDL now has generated-parser corpus coverage
    when it matches the seed grammar. Database, schema, and extension create/drop
-catalog DDL now has structured generated AST payloads and direct generated
-AST-to-plan lowering, generated table/index drops validate generated object,
+catalog DDL now has structured generated AST payloads, direct generated
+AST-to-plan lowering, and strict generated parsing at the parsed-statement
+boundary, generated table/index drops validate generated object,
 `IF EXISTS`, and dependency-behavior ranges before typed planning, and generated
 create-index metadata covers basic
 PostgreSQL-style unique, covering, partial, method, element-list, and option
@@ -898,7 +902,9 @@ Generated grammar work needs evidence at multiple levels:
   have generated AST-to-plan parity tests for their generated-covered forms;
   simple catalog DDL also has generated
   field-level checks for object names, option flags, version strings, drop
-  behavior, ALTER TABLE operation tails, and fail-closed unsupported clauses.
+  behavior, ALTER TABLE operation tails, fail-closed unsupported clauses, and
+  malformed database/schema/extension catalog DDL heads that no longer fall
+  back to legacy DDL probing.
   Simple DML has generated field-level checks for update and truncate body
   ranges, direct generated AST-to-plan parity for truncate mutation-source
   plans, direct resolver-free generated AST-to-plan coverage for supported
