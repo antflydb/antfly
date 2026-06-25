@@ -139,8 +139,9 @@ join operator/type, left input, right input, `ON` predicate ranges, and
 `USING` column-list ranges, explicit generated join-tree root/depth metadata
 for left-associative generated join nodes, plus simple top-level
 comparison expression metadata for covered `WHERE`, `HAVING`, and join
-predicates. Generated top-level read validation now verifies clause keyword
-layout and generated payload consistency for projection, `DISTINCT`,
+predicates. Generated top-level read validation now verifies statement/command
+source spans, clause keyword layout, and generated payload consistency for
+projection, `DISTINCT`,
 source, `WHERE`, `GROUP BY`, `HAVING`, `WINDOW`, `ORDER BY`, pagination,
 and set-operation tails before dispatching to read-family lowerers. Normal
 function-call argument
