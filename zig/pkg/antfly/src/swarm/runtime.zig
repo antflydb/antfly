@@ -1736,21 +1736,26 @@ fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
         inner: *Inner,
 
         pub fn post(self: *const @This(), comptime path: []const u8, handler_fn: httpx.Handler) !void {
-            try self.inner.post(prefix ++ path, handler_fn);
+            try self.inner.post(prefixedRoutePath(prefix, path), handler_fn);
         }
 
         pub fn get(self: *const @This(), comptime path: []const u8, handler_fn: httpx.Handler) !void {
-            try self.inner.get(prefix ++ path, handler_fn);
+            try self.inner.get(prefixedRoutePath(prefix, path), handler_fn);
         }
 
         pub fn put(self: *const @This(), comptime path: []const u8, handler_fn: httpx.Handler) !void {
-            try self.inner.put(prefix ++ path, handler_fn);
+            try self.inner.put(prefixedRoutePath(prefix, path), handler_fn);
         }
 
         pub fn delete(self: *const @This(), comptime path: []const u8, handler_fn: httpx.Handler) !void {
-            try self.inner.delete(prefix ++ path, handler_fn);
+            try self.inner.delete(prefixedRoutePath(prefix, path), handler_fn);
         }
     };
+}
+
+fn prefixedRoutePath(comptime prefix: []const u8, comptime path: []const u8) []const u8 {
+    if (std.mem.eql(u8, path, prefix) or std.mem.startsWith(u8, path, prefix ++ "/")) return path;
+    return prefix ++ path;
 }
 
 fn healthzHandler(ctx: *httpx.Context) anyerror!httpx.Response {
@@ -3115,6 +3120,19 @@ const RecordingServer = struct {
 test "swarm runtime module compiles" {
     _ = run;
     _ = runFromIterator;
+}
+
+test "swarm runtime registers public SQL route under db api prefix once" {
+    var server = RecordingServer{ .allocator = std.testing.allocator };
+    defer server.deinit();
+
+    var handler: AntflyApiHandler = undefined;
+    const public_router = metadata_openapi.server.ServerRouter(AntflyApiHandler).init(&handler);
+    var public_prefixed = PrefixedServer("/db/v1", RecordingServer){ .inner = &server };
+    try public_router.register(&public_prefixed);
+
+    try std.testing.expect(server.hasRoute(.post, "/db/v1/sql"));
+    try std.testing.expect(!server.hasRoute(.post, "/db/v1/db/v1/sql"));
 }
 
 test "swarm runtime local generator accepts media url data uris" {

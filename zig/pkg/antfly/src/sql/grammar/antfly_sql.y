@@ -88,6 +88,7 @@ ddl_statement:
   | create_schema_statement
   | create_table_statement
   | create_view_statement
+  | create_materialized_view_statement
   | create_domain_statement
   | create_sequence_statement
   | create_type_statement
@@ -106,6 +107,7 @@ ddl_statement:
   | alter_publication_statement
   | alter_subscription_statement
   | drop_statement
+  | refresh_materialized_view_statement
   | relation_population_statement
   ;
 
@@ -128,6 +130,10 @@ create_table_body:
 
 create_view_statement:
     CREATE create_view_replace_opt VIEW if_not_exists_opt qualified_name view_column_list_opt AS read_statement
+  ;
+
+create_materialized_view_statement:
+    CREATE MATERIALIZED VIEW if_not_exists_opt qualified_name diagnostic_tail
   ;
 
 create_view_replace_opt:
@@ -255,12 +261,17 @@ drop_statement:
   | DROP DATABASE if_exists_opt qualified_name drop_database_force_opt
   | DROP EXTENSION if_exists_opt qualified_name drop_behavior_opt
   | DROP VIEW if_exists_opt qualified_name drop_behavior_opt
+  | DROP MATERIALIZED VIEW if_exists_opt qualified_name drop_behavior_opt
   | DROP DOMAIN if_exists_opt qualified_name drop_behavior_opt
   | DROP SEQUENCE if_exists_opt qualified_name drop_behavior_opt
   | DROP TYPE if_exists_opt qualified_name drop_behavior_opt
   | DROP TABLESPACE if_exists_opt qualified_name
   | DROP PUBLICATION if_exists_opt qualified_name
   | DROP SUBSCRIPTION if_exists_opt qualified_name
+  ;
+
+refresh_materialized_view_statement:
+    REFRESH MATERIALIZED VIEW diagnostic_tail
   ;
 
 drop_database_force_opt:
@@ -388,7 +399,6 @@ unsupported_statement:
   | EXPLAIN explain_options_opt explain_subject_opt
   | DO diagnostic_tail_opt
   | CREATE FOREIGN TABLE diagnostic_tail_opt
-  | CREATE MATERIALIZED VIEW diagnostic_tail_opt
   | CREATE POLICY diagnostic_tail_opt
   | CREATE RULE diagnostic_tail_opt
   | CREATE SERVER diagnostic_tail_opt
@@ -400,7 +410,6 @@ unsupported_statement:
   | ALTER SERVER diagnostic_tail_opt
   | ALTER TRIGGER diagnostic_tail_opt
   | DROP FOREIGN TABLE diagnostic_tail_opt
-  | DROP MATERIALIZED VIEW diagnostic_tail_opt
   | DROP POLICY diagnostic_tail_opt
   | DROP RULE diagnostic_tail_opt
   | DROP SERVER diagnostic_tail_opt
@@ -419,7 +428,6 @@ unsupported_statement:
   | LOCK diagnostic_tail_opt
   | MOVE diagnostic_tail_opt
   | NOTIFY diagnostic_tail_opt
-  | REFRESH diagnostic_tail_opt
   | VACUUM diagnostic_tail_opt
   | REINDEX diagnostic_tail_opt
   | RELEASE diagnostic_tail_opt

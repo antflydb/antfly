@@ -55,6 +55,7 @@ pub const GeneratedSqlDdlKind = enum {
     create_schema,
     create_table,
     create_view,
+    create_materialized_view,
     create_domain,
     create_sequence,
     create_enum_type,
@@ -74,6 +75,7 @@ pub const GeneratedSqlDdlKind = enum {
     alter_subscription,
     drop_table,
     drop_view,
+    drop_materialized_view,
     drop_domain,
     drop_sequence,
     drop_enum_type,
@@ -84,6 +86,7 @@ pub const GeneratedSqlDdlKind = enum {
     drop_schema,
     drop_database,
     drop_extension,
+    refresh_materialized_view,
     relation_population,
     create_graph_index,
     create_graph_metric,
@@ -1541,11 +1544,16 @@ pub const simple_ddl_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT account_id FROM usage_records WITH NO DATA", .kind = .ddl },
     .{ .sql = "CREATE VIEW active_usage AS SELECT id, status FROM usage_records", .kind = .ddl },
     .{ .sql = "CREATE OR REPLACE VIEW IF NOT EXISTS active_usage AS SELECT id, status FROM usage_records", .kind = .ddl },
+    .{ .sql = "CREATE MATERIALIZED VIEW usage_summary AS SELECT status, count(*) FROM usage_records GROUP BY status", .kind = .ddl },
     .{ .sql = "CREATE DOMAIN positive_amount AS numeric CHECK (VALUE > 0)", .kind = .ddl },
+    .{ .sql = "CREATE PUBLICATION usage_pub FOR TABLE usage_records", .kind = .ddl },
+    .{ .sql = "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=example dbname=usage' PUBLICATION usage_pub", .kind = .ddl },
     .{ .sql = "ALTER TABLE usage_records ADD COLUMN status text", .kind = .ddl },
     .{ .sql = "ALTER TABLE IF EXISTS ONLY usage_records DROP COLUMN IF EXISTS status RESTRICT", .kind = .ddl },
     .{ .sql = "ALTER VIEW active_usage RENAME TO active_usage_v2", .kind = .ddl },
     .{ .sql = "ALTER DOMAIN positive_amount SET NOT NULL", .kind = .ddl },
+    .{ .sql = "ALTER PUBLICATION usage_pub ADD TABLE usage_records", .kind = .ddl },
+    .{ .sql = "ALTER SUBSCRIPTION usage_sub DISABLE", .kind = .ddl },
     .{ .sql = "CREATE INDEX usage_records_status_idx ON usage_records (status)", .kind = .extension_index },
     .{ .sql = "CREATE INDEX IF NOT EXISTS usage_records_status_idx ON usage_records (status)", .kind = .extension_index },
     .{ .sql = "CREATE UNIQUE INDEX usage_records_status_active_idx ON usage_records (status) INCLUDE (tenant_id, amount) WHERE deleted_at IS NULL", .kind = .extension_index },
@@ -1553,7 +1561,11 @@ pub const simple_ddl_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "DROP TABLE usage_records", .kind = .ddl },
     .{ .sql = "DROP TABLE IF EXISTS usage_records", .kind = .ddl },
     .{ .sql = "DROP VIEW IF EXISTS active_usage CASCADE", .kind = .ddl },
+    .{ .sql = "DROP MATERIALIZED VIEW IF EXISTS usage_summary CASCADE", .kind = .ddl },
     .{ .sql = "DROP DOMAIN IF EXISTS positive_amount CASCADE", .kind = .ddl },
+    .{ .sql = "DROP PUBLICATION IF EXISTS usage_pub", .kind = .ddl },
+    .{ .sql = "DROP SUBSCRIPTION IF EXISTS usage_sub", .kind = .ddl },
+    .{ .sql = "REFRESH MATERIALIZED VIEW usage_summary", .kind = .ddl },
     .{ .sql = "DROP INDEX usage_records_status_idx", .kind = .extension_index },
     .{ .sql = "DROP EXTENSION vector", .kind = .extension_index },
     .{ .sql = "DROP SCHEMA analytics CASCADE", .kind = .ddl },
@@ -1707,10 +1719,8 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "ALTER FOREIGN TABLE foreign_usage_records RENAME TO foreign_usage_archive", .kind = .unsupported },
     .{ .sql = "ALTER MATERIALIZED VIEW usage_summary RENAME TO usage_summary_v2", .kind = .unsupported },
     .{ .sql = "ALTER POLICY usage_policy ON usage_records RENAME TO usage_policy_v2", .kind = .unsupported },
-    .{ .sql = "ALTER PUBLICATION usage_pub ADD TABLE usage_records", .kind = .unsupported },
     .{ .sql = "ALTER RULE usage_insert ON usage_records RENAME TO usage_insert_v2", .kind = .unsupported },
     .{ .sql = "ALTER SERVER usage_server VERSION '15'", .kind = .unsupported },
-    .{ .sql = "ALTER SUBSCRIPTION usage_sub DISABLE", .kind = .unsupported },
     .{ .sql = "ALTER TRIGGER usage_audit ON usage_records RENAME TO usage_audit_v2", .kind = .unsupported },
     .{ .sql = "ANALYZE", .kind = .unsupported },
     .{ .sql = "CALL refresh_usage_records()", .kind = .unsupported },
@@ -1720,12 +1730,9 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "COMMENT ON TABLE usage_records IS 'billing rows'", .kind = .unsupported },
     .{ .sql = "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)", .kind = .unsupported },
     .{ .sql = "CREATE FOREIGN TABLE foreign_usage_records (id text) SERVER usage_fdw", .kind = .unsupported },
-    .{ .sql = "CREATE MATERIALIZED VIEW usage_summary AS SELECT status, count(*) FROM usage_records GROUP BY status", .kind = .unsupported },
     .{ .sql = "CREATE POLICY usage_policy ON usage_records USING (tenant_id = current_user)", .kind = .unsupported },
-    .{ .sql = "CREATE PUBLICATION usage_pub FOR TABLE usage_records", .kind = .unsupported },
     .{ .sql = "CREATE RULE usage_insert AS ON INSERT TO usage_records DO ALSO NOTIFY usage_events", .kind = .unsupported },
     .{ .sql = "CREATE SERVER usage_server FOREIGN DATA WRAPPER postgres_fdw", .kind = .unsupported },
-    .{ .sql = "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=example dbname=usage' PUBLICATION usage_pub", .kind = .unsupported },
     .{ .sql = "CREATE TRIGGER usage_audit BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage()", .kind = .unsupported },
     .{ .sql = "DECLARE usage_cursor NO SCROLL CURSOR FOR SELECT id FROM usage_records", .kind = .unsupported },
     .{ .sql = "DO 'BEGIN NULL; END'", .kind = .unsupported },
@@ -1745,19 +1752,15 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "LOCK TABLE usage_records IN SHARE MODE", .kind = .unsupported },
     .{ .sql = "MOVE FROM usage_cursor", .kind = .unsupported },
     .{ .sql = "NOTIFY usage_events, 'changed'", .kind = .unsupported },
-    .{ .sql = "REFRESH MATERIALIZED VIEW usage_summary", .kind = .unsupported },
     .{ .sql = "VACUUM (FULL, VERBOSE, ANALYZE) public.usage_records", .kind = .unsupported },
     .{ .sql = "REINDEX INDEX CONCURRENTLY public.usage_status_idx", .kind = .unsupported },
     .{ .sql = "RELEASE SAVEPOINT usage_batch", .kind = .unsupported },
     .{ .sql = "REVOKE SELECT ON TABLE usage_records FROM readonly", .kind = .unsupported },
     .{ .sql = "SAVEPOINT usage_batch", .kind = .unsupported },
     .{ .sql = "SECURITY LABEL ON TABLE usage_records IS 'internal'", .kind = .unsupported },
-    .{ .sql = "DROP MATERIALIZED VIEW IF EXISTS usage_summary CASCADE", .kind = .unsupported },
     .{ .sql = "DROP POLICY IF EXISTS usage_policy ON usage_records", .kind = .unsupported },
-    .{ .sql = "DROP PUBLICATION IF EXISTS usage_pub", .kind = .unsupported },
     .{ .sql = "DROP RULE IF EXISTS usage_insert ON usage_records", .kind = .unsupported },
     .{ .sql = "DROP SERVER IF EXISTS usage_server CASCADE", .kind = .unsupported },
-    .{ .sql = "DROP SUBSCRIPTION IF EXISTS usage_sub", .kind = .unsupported },
     .{ .sql = "DROP TRIGGER IF EXISTS usage_audit ON usage_records", .kind = .unsupported },
     .{ .sql = "UNLISTEN *", .kind = .unsupported },
 };
@@ -1953,6 +1956,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.schema)) return .{ .ddl = .create_schema };
         if (second.matchesKeywordTag(.table)) return .{ .ddl = .create_table };
         if (second.matchesKeywordTag(.view)) return .{ .ddl = .create_view };
+        if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .ddl = .create_materialized_view };
         if (second.matchesKeywordTag(.domain)) return .{ .ddl = .create_domain };
         if (second.matchesKeywordTag(.sequence)) return .{ .ddl = .create_sequence };
         if (second.matchesKeywordTag(.type)) return .{ .ddl = .create_enum_type };
@@ -1966,7 +1970,6 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
             if (tokens[2].matchesKeywordTag(.index)) return .{ .graph = .create_index };
             if (tokens[2].matchesKeywordTag(.metric)) return .{ .graph = .create_metric };
         }
-        if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .unsupported = .create_materialized_view };
         if (second.matchesKeywordTag(.policy)) return .{ .unsupported = .create_policy };
         if (second.matchesKeywordTag(.rule)) return .{ .unsupported = .create_rule };
         if (second.matchesKeywordTag(.server)) return .{ .unsupported = .create_server };
@@ -2025,7 +2028,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.database)) return .{ .ddl = .drop_database };
         if (second.matchesKeywordTag(.extension)) return .{ .extension_index = .drop_extension };
         if (second.matchesKeywordTag(.foreign) and tokens.len > 2 and tokens[2].matchesKeywordTag(.table)) return .{ .unsupported = .drop_foreign_table };
-        if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .unsupported = .drop_materialized_view };
+        if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .ddl = .drop_materialized_view };
         if (second.matchesKeywordTag(.policy)) return .{ .unsupported = .drop_policy };
         if (second.matchesKeywordTag(.rule)) return .{ .unsupported = .drop_rule };
         if (second.matchesKeywordTag(.server)) return .{ .unsupported = .drop_server };
@@ -2068,7 +2071,9 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (first.matchesKeywordTag(.lock)) return .{ .unsupported = .lock };
     if (first.matchesKeywordTag(.move)) return .{ .unsupported = .move };
     if (first.matchesKeywordTag(.notify)) return .{ .unsupported = .notify };
-    if (first.matchesKeywordTag(.refresh)) return .{ .unsupported = .refresh };
+    if (first.matchesKeywordTag(.refresh) and tokens.len > 2 and tokens[1].matchesKeywordTag(.materialized) and tokens[2].matchesKeywordTag(.view)) {
+        return .{ .ddl = .refresh_materialized_view };
+    }
     if (first.matchesKeywordTag(.reindex)) return .{ .unsupported = .reindex };
     if (first.matchesKeywordTag(.release)) return .{ .unsupported = .release };
     if (first.matchesKeywordTag(.revoke)) return .{ .unsupported = .revoke };
@@ -2469,6 +2474,16 @@ fn buildDdlAst(
             ast.if_not_exists = consumeGeneratedIfNotExists(tokens, &index, end);
             ast.object_name_tokens = generatedQualifiedNameRange(tokens, index, end);
         },
+        .create_materialized_view => {
+            if (end > 3 and tokens[1].matchesKeywordTag(.materialized) and tokens[2].matchesKeywordTag(.view)) {
+                index = 3;
+                ast.if_not_exists = consumeGeneratedIfNotExists(tokens, &index, end);
+                ast.object_name_tokens = generatedQualifiedNameRange(tokens, index, end);
+                if (ast.object_name_tokens) |view_range| {
+                    if (view_range.end < end) ast.alter_table_operation_tokens = .{ .start = view_range.end, .end = end };
+                }
+            }
+        },
         .create_domain => {
             if (end > 2 and tokens[1].matchesKeywordTag(.domain)) {
                 ast.object_name_tokens = generatedQualifiedNameRange(tokens, 2, end);
@@ -2658,6 +2673,12 @@ fn buildDdlAst(
             ast.object_name_tokens = generatedQualifiedNameRange(tokens, index, end);
             ast.cascade = findKeyword(tokens, index + 1, end, .cascade) != null;
         },
+        .drop_materialized_view => {
+            index = 3;
+            ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
+            ast.object_name_tokens = generatedQualifiedNameRange(tokens, index, end);
+            ast.cascade = findKeyword(tokens, index + 1, end, .cascade) != null;
+        },
         .drop_domain => {
             ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
             ast.object_name_tokens = generatedQualifiedNameRange(tokens, index, end);
@@ -2699,6 +2720,16 @@ fn buildDdlAst(
             ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
             ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
             ast.cascade = findKeyword(tokens, index + 1, end, .cascade) != null;
+        },
+        .refresh_materialized_view => {
+            if (end > 3 and tokens[1].matchesKeywordTag(.materialized) and tokens[2].matchesKeywordTag(.view)) {
+                index = 3;
+                if (index < end and tokens[index].matchesKeyword("concurrently")) index += 1;
+                ast.object_name_tokens = generatedQualifiedNameRange(tokens, index, end);
+                if (ast.object_name_tokens) |view_range| {
+                    if (view_range.end < end) ast.alter_table_operation_tokens = .{ .start = view_range.end, .end = end };
+                }
+            }
         },
         .relation_population => {
             if (tokens.len > 0 and tokens[0].matchesKeywordTag(.select)) {
@@ -5923,8 +5954,11 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_table }, (try parseSqlAlloc(alloc, "CREATE TEMP TABLE usage_session_records (id uuid)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_table }, (try parseSqlAlloc(alloc, "CREATE UNLOGGED TABLE IF NOT EXISTS usage_ingest_records (id uuid)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_view }, (try parseSqlAlloc(alloc, "CREATE VIEW active_usage AS SELECT id FROM usage_records")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_materialized_view }, (try parseSqlAlloc(alloc, "CREATE MATERIALIZED VIEW usage_summary AS SELECT status FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_view }, (try parseSqlAlloc(alloc, "ALTER VIEW active_usage RENAME TO active_usage_v2")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_view }, (try parseSqlAlloc(alloc, "DROP VIEW active_usage")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_materialized_view }, (try parseSqlAlloc(alloc, "DROP MATERIALIZED VIEW usage_summary")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .refresh_materialized_view }, (try parseSqlAlloc(alloc, "REFRESH MATERIALIZED VIEW usage_summary")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_domain }, (try parseSqlAlloc(alloc, "CREATE DOMAIN positive_amount AS numeric")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_domain }, (try parseSqlAlloc(alloc, "ALTER DOMAIN positive_amount SET NOT NULL")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_domain }, (try parseSqlAlloc(alloc, "DROP DOMAIN positive_amount")).statement);
@@ -5975,7 +6009,6 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .cluster }, (try parseSqlAlloc(alloc, "CLUSTER usage_records USING usage_status_idx")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .comment }, (try parseSqlAlloc(alloc, "COMMENT ON TABLE usage_records IS 'billing rows'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .copy }, (try parseSqlAlloc(alloc, "COPY usage_records FROM STDIN")).statement);
-    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_materialized_view }, (try parseSqlAlloc(alloc, "CREATE MATERIALIZED VIEW usage_summary AS SELECT status FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .declare }, (try parseSqlAlloc(alloc, "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .explain }, (try parseSqlAlloc(alloc, "EXPLAIN SELECT id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .fetch }, (try parseSqlAlloc(alloc, "FETCH FROM usage_cursor")).statement);
@@ -5985,14 +6018,12 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .lock }, (try parseSqlAlloc(alloc, "LOCK TABLE usage_records IN SHARE MODE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .move }, (try parseSqlAlloc(alloc, "MOVE FROM usage_cursor")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .notify }, (try parseSqlAlloc(alloc, "NOTIFY usage_events, 'changed'")).statement);
-    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .refresh }, (try parseSqlAlloc(alloc, "REFRESH MATERIALIZED VIEW usage_summary")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .vacuum }, (try parseSqlAlloc(alloc, "VACUUM FULL usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .reindex }, (try parseSqlAlloc(alloc, "REINDEX INDEX usage_records_status_idx")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .release }, (try parseSqlAlloc(alloc, "RELEASE SAVEPOINT usage_batch")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .revoke }, (try parseSqlAlloc(alloc, "REVOKE SELECT ON TABLE usage_records FROM readonly")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .savepoint }, (try parseSqlAlloc(alloc, "SAVEPOINT usage_batch")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .security_label }, (try parseSqlAlloc(alloc, "SECURITY LABEL ON TABLE usage_records IS 'internal'")).statement);
-    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .drop_materialized_view }, (try parseSqlAlloc(alloc, "DROP MATERIALIZED VIEW usage_summary")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .unlisten }, (try parseSqlAlloc(alloc, "UNLISTEN *")).statement);
 }
 
@@ -6076,6 +6107,18 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expect(ddl.replace_existing);
             try std.testing.expect(ddl.if_not_exists);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, ddl.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const create_materialized_view_sql = "CREATE MATERIALIZED VIEW IF NOT EXISTS usage_summary AS SELECT status FROM usage_records WITH NO DATA";
+    const create_materialized_view_result = try parseSqlAlloc(alloc, create_materialized_view_sql);
+    switch (create_materialized_view_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.create_materialized_view, ddl.kind);
+            try std.testing.expect(ddl.if_not_exists);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 15 }, ddl.alter_table_operation_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -6351,6 +6394,29 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expect(ddl.if_exists);
             try std.testing.expect(ddl.cascade);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const drop_materialized_view_sql = "DROP MATERIALIZED VIEW IF EXISTS usage_summary CASCADE";
+    const drop_materialized_view_result = try parseSqlAlloc(alloc, drop_materialized_view_sql);
+    switch (drop_materialized_view_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.drop_materialized_view, ddl.kind);
+            try std.testing.expect(ddl.if_exists);
+            try std.testing.expect(ddl.cascade);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, ddl.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const refresh_materialized_view_sql = "REFRESH MATERIALIZED VIEW CONCURRENTLY usage_summary WITH NO DATA";
+    const refresh_materialized_view_result = try parseSqlAlloc(alloc, refresh_materialized_view_sql);
+    switch (refresh_materialized_view_result.ast.?) {
+        .ddl => |ddl| {
+            try std.testing.expectEqual(GeneratedSqlDdlKind.refresh_materialized_view, ddl.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 8 }, ddl.alter_table_operation_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -9305,12 +9371,6 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 10 },
         },
         .{
-            .sql = "CREATE MATERIALIZED VIEW usage_summary AS SELECT status FROM usage_records",
-            .kind = .create_materialized_view,
-            .reason = .create_materialized_view_not_planned_by_generated_parser,
-            .subject_tokens = .{ .start = 1, .end = 9 },
-        },
-        .{
             .sql = "CREATE POLICY usage_policy ON usage_records USING (tenant_id = current_user)",
             .kind = .create_policy,
             .reason = .create_policy_not_planned_by_generated_parser,
@@ -9383,12 +9443,6 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 4 },
         },
         .{
-            .sql = "REFRESH MATERIALIZED VIEW usage_summary",
-            .kind = .refresh,
-            .reason = .refresh_not_planned_by_generated_parser,
-            .subject_tokens = .{ .start = 1, .end = 4 },
-        },
-        .{
             .sql = "REVOKE SELECT ON TABLE usage_records FROM readonly",
             .kind = .revoke,
             .reason = .revoke_not_planned_by_generated_parser,
@@ -9398,12 +9452,6 @@ test "generated SQL parser facade builds extended read AST spans" {
             .sql = "SECURITY LABEL ON TABLE usage_records IS 'internal'",
             .kind = .security_label,
             .reason = .security_label_not_planned_by_generated_parser,
-            .subject_tokens = .{ .start = 1, .end = 7 },
-        },
-        .{
-            .sql = "DROP MATERIALIZED VIEW IF EXISTS usage_summary CASCADE",
-            .kind = .drop_materialized_view,
-            .reason = .drop_materialized_view_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 7 },
         },
         .{

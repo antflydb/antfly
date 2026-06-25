@@ -30,8 +30,10 @@ const catalog_resources = @import("../api/catalog_resources.zig");
 const http_route_helpers = @import("../api/http_route_helpers.zig");
 const indexes_api = @import("../api/indexes.zig");
 const tables_api = @import("../api/tables.zig");
+const catalog_jobs = @import("../api/catalog_jobs.zig");
 const foreign_mod = @import("../foreign/mod.zig");
 const platform_time = @import("../platform/time.zig");
+const sql_adapter = @import("../sql/mod.zig");
 const routes = @import("http_routes.zig");
 const service = @import("service.zig");
 
@@ -146,6 +148,7 @@ pub const AdminSource = struct {
         drop_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void = null,
         update_schema: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void = null,
         apply_relational_sql_ddl: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, sql: []const u8) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
+        apply_relational_sql_ddl_plan_with_session: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: *sql_adapter.LoweredDdlPlan, session: catalog_resources.SqlCatalogSession) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
         create_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) anyerror!void = null,
         drop_index: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) anyerror!void = null,
         put_artifact_enrichment: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8, enrichment_json: []const u8) anyerror!void = null,
@@ -222,6 +225,16 @@ pub const AdminSource = struct {
     pub fn applyRelationalSqlDdl(self: AdminSource, alloc: std.mem.Allocator, sql: []const u8) !tables_api.AppliedRelationalSqlDdlRecord {
         const fn_ptr = self.vtable.apply_relational_sql_ddl orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, sql);
+    }
+
+    pub fn applyRelationalSqlDdlPlanWithSession(
+        self: AdminSource,
+        alloc: std.mem.Allocator,
+        plan: *sql_adapter.LoweredDdlPlan,
+        session: catalog_resources.SqlCatalogSession,
+    ) !tables_api.AppliedRelationalSqlDdlRecord {
+        const fn_ptr = self.vtable.apply_relational_sql_ddl_plan_with_session orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, plan, session);
     }
 
     pub fn updateForeignKeyValidationState(
@@ -413,6 +426,7 @@ pub const AdminSource = struct {
                 .drop_table = metadataServiceDropTable,
                 .update_schema = metadataServiceUpdateSchema,
                 .apply_relational_sql_ddl = metadataServiceApplyRelationalSqlDdl,
+                .apply_relational_sql_ddl_plan_with_session = metadataServiceApplyRelationalSqlDdlPlanWithSession,
                 .create_index = metadataServiceCreateIndex,
                 .drop_index = metadataServiceDropIndex,
                 .put_artifact_enrichment = metadataServicePutArtifactEnrichment,
@@ -459,6 +473,7 @@ pub const AdminSource = struct {
                 .drop_table = metadataHttpServiceDropTable,
                 .update_schema = metadataHttpServiceUpdateSchema,
                 .apply_relational_sql_ddl = metadataHttpServiceApplyRelationalSqlDdl,
+                .apply_relational_sql_ddl_plan_with_session = metadataHttpServiceApplyRelationalSqlDdlPlanWithSession,
                 .create_index = metadataHttpServiceCreateIndex,
                 .drop_index = metadataHttpServiceDropIndex,
                 .put_artifact_enrichment = metadataHttpServicePutArtifactEnrichment,
@@ -580,6 +595,19 @@ pub const AdminSource = struct {
     fn metadataServiceApplyRelationalSqlDdl(ptr: *anyopaque, alloc: std.mem.Allocator, sql: []const u8) !tables_api.AppliedRelationalSqlDdlRecord {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
         var applied = try applyRelationalSqlDdlOnMetadataService(svc, alloc, sql);
+        errdefer applied.deinit(alloc);
+        try flushMetadataServiceMutation(svc);
+        return applied;
+    }
+
+    fn metadataServiceApplyRelationalSqlDdlPlanWithSession(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        plan: *sql_adapter.LoweredDdlPlan,
+        session: catalog_resources.SqlCatalogSession,
+    ) !tables_api.AppliedRelationalSqlDdlRecord {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        var applied = try applyRelationalSqlDdlPlanOnMetadataServiceWithSession(svc, alloc, plan, session);
         errdefer applied.deinit(alloc);
         try flushMetadataServiceMutation(svc);
         return applied;
@@ -933,6 +961,19 @@ pub const AdminSource = struct {
     fn metadataHttpServiceApplyRelationalSqlDdl(ptr: *anyopaque, alloc: std.mem.Allocator, sql: []const u8) !tables_api.AppliedRelationalSqlDdlRecord {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         var applied = try applyRelationalSqlDdlOnMetadataService(svc, alloc, sql);
+        errdefer applied.deinit(alloc);
+        try flushMetadataHttpServiceMutation(svc);
+        return applied;
+    }
+
+    fn metadataHttpServiceApplyRelationalSqlDdlPlanWithSession(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        plan: *sql_adapter.LoweredDdlPlan,
+        session: catalog_resources.SqlCatalogSession,
+    ) !tables_api.AppliedRelationalSqlDdlRecord {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        var applied = try applyRelationalSqlDdlPlanOnMetadataServiceWithSession(svc, alloc, plan, session);
         errdefer applied.deinit(alloc);
         try flushMetadataHttpServiceMutation(svc);
         return applied;
@@ -2219,25 +2260,49 @@ fn applyRelationalSqlDdlOnMetadataServiceWithSession(
     sql: []const u8,
     session: catalog_resources.SqlCatalogSession,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
-    if (try extension_domain.sql_adapter.executeRelationalSqlDdlOnService(service_impl, alloc, sql)) |applied| {
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    var plan = try sql_adapter.lowerDdlPlanParsedSqlAlloc(alloc, &parsed_sql);
+    defer plan.deinit(alloc);
+    return try applyRelationalSqlDdlPlanOnMetadataServiceWithSession(service_impl, alloc, &plan, session);
+}
+
+fn applyRelationalSqlDdlPlanOnMetadataServiceWithSession(
+    service_impl: anytype,
+    alloc: std.mem.Allocator,
+    plan: *sql_adapter.LoweredDdlPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !tables_api.AppliedRelationalSqlDdlRecord {
+    if (try extension_domain.sql_adapter.executeRelationalSqlDdlPlanOnService(service_impl, alloc, plan.*)) |applied| {
         return applied;
     }
 
     var snapshot = try service_impl.adminSnapshot();
     defer service_impl.freeAdminSnapshot(&snapshot);
 
-    if (try tables_api.applyRelationalCatalogDdlOnServiceWithSessionAlloc(alloc, service_impl, &snapshot, sql, session)) |applied| {
+    if (try tables_api.applyRelationalCatalogDdlPlanOnServiceWithSessionAlloc(alloc, service_impl, &snapshot, plan.*, session)) |applied| {
+        try catalog_jobs.scheduleSchemaRewriteJobsForAppliedDdlOnService(service_impl, alloc, applied);
         return applied;
     }
 
-    var target = try tables_api.relationalSqlDdlTargetWithSessionAlloc(alloc, sql, session);
+    if (try tables_api.applyUntargetedRelationalDerivedIndexDdlOnServiceWithSessionAlloc(alloc, service_impl, &snapshot, plan, session)) |applied| {
+        return applied;
+    }
+
+    var target = try tables_api.relationalSqlDdlTargetForPlanWithSessionAlloc(alloc, plan.*, session);
     defer target.deinit(alloc);
 
     if (target.createsTable()) {
         try tables_api.validateRelationalSqlDdlNamespace(&snapshot, target);
         if (tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) != null) return error.TableAlreadyExists;
         const base_table = tables_api.deriveRelationalSqlDdlTargetTableRecord(target);
-        var applied = try tables_api.applyRelationalSqlDdlToTableRecordWithSessionAlloc(alloc, &base_table, sql, session);
+        var policy_table: ?metadata_table_manager.TableRecord = null;
+        defer if (policy_table) |record| metadata_table_manager.freeTable(alloc, record);
+        const resolved_table = if (tables_api.effectiveTablespaceForTarget(&snapshot, target.database_name, target.namespace_name, null)) |tablespace| blk: {
+            policy_table = try tables_api.applyTablespacePlacementPolicyAlloc(alloc, base_table, tablespace);
+            break :blk policy_table.?;
+        } else base_table;
+        var applied = try tables_api.applyRelationalSqlDdlPlanToTableRecordWithSessionAlloc(alloc, &resolved_table, plan, session);
         errdefer applied.deinit(alloc);
         applied.created_table = true;
         try tables_api.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, applied.table);
@@ -2250,6 +2315,7 @@ fn applyRelationalSqlDdlOnMetadataServiceWithSession(
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
         _ = try workflow.createTableWithRanges(service_impl, applied.table, ranges);
+        try catalog_jobs.scheduleSchemaRewriteJobsForAppliedDdlOnService(service_impl, alloc, applied);
         return applied;
     }
 
@@ -2276,10 +2342,15 @@ fn applyRelationalSqlDdlOnMetadataServiceWithSession(
         };
     }
 
-    var applied = try tables_api.applyRelationalSqlDdlToTableRecordWithSessionAlloc(alloc, table, sql, session);
+    if (try tables_api.applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(alloc, service_impl, table, target, plan.*)) |derived_applied| {
+        return derived_applied;
+    }
+
+    var applied = try tables_api.applyRelationalSqlDdlPlanToTableRecordWithSessionAlloc(alloc, table, plan, session);
     errdefer applied.deinit(alloc);
     try tables_api.validateRelationalForeignKeyCatalogReferences(alloc, &snapshot, applied.table);
     try service_impl.upsertTable(applied.table);
+    try catalog_jobs.scheduleSchemaRewriteJobsForAppliedDdlOnService(service_impl, alloc, applied);
     return applied;
 }
 
@@ -3496,6 +3567,328 @@ test "metadata catalog validation treats missing drop table if exists as ddl noo
     try std.testing.expect(!applied.created_table);
     try std.testing.expect(!applied.dropped_table);
     try std.testing.expectEqualStrings("missing_usage", applied.table.name);
+}
+
+test "metadata catalog applies untargeted graph metric SQL DDL through shared derived index path" {
+    const alloc = std.testing.allocator;
+    const docs_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"body":{"type":"text"},"edge_type":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const FakeService = struct {
+        table: metadata_table_manager.TableRecord = .{
+            .table_id = 81,
+            .name = "docs",
+            .database_name = catalog_resources.default_database_name,
+            .namespace_name = catalog_resources.default_namespace_name,
+            .schema_json = docs_schema_json,
+            .indexes_json = "{}",
+            .replication_sources_json = "[]",
+            .placement_role = "data",
+        },
+        table_owned: bool = false,
+        upsert_table_count: usize = 0,
+
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            if (self.table_owned) metadata_table_manager.freeTable(allocator, self.table);
+            self.* = undefined;
+        }
+
+        fn tableSlice(self: *@This()) []metadata_table_manager.TableRecord {
+            return @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1];
+        }
+
+        pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = self.tableSlice(),
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        pub fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+
+        pub fn upsertTable(self: *@This(), record: metadata_table_manager.TableRecord) !void {
+            const cloned = try metadata_table_manager.cloneTable(std.testing.allocator, record);
+            if (self.table_owned) metadata_table_manager.freeTable(std.testing.allocator, self.table);
+            self.table = cloned;
+            self.table_owned = true;
+            self.upsert_table_count += 1;
+        }
+
+        pub fn listProjectedTables(self: *@This(), allocator: std.mem.Allocator) ![]metadata_table_manager.TableRecord {
+            const out = try allocator.alloc(metadata_table_manager.TableRecord, 1);
+            errdefer allocator.free(out);
+            out[0] = try metadata_table_manager.cloneTable(allocator, self.table);
+            return out;
+        }
+
+        pub fn freeProjectedTables(_: *@This(), allocator: std.mem.Allocator, records: []metadata_table_manager.TableRecord) void {
+            for (records) |record| metadata_table_manager.freeTable(allocator, record);
+            allocator.free(records);
+        }
+
+        pub fn listProjectedRanges(_: *@This(), allocator: std.mem.Allocator) ![]metadata_table_manager.RangeRecord {
+            return try allocator.alloc(metadata_table_manager.RangeRecord, 0);
+        }
+
+        pub fn freeProjectedRanges(_: *@This(), allocator: std.mem.Allocator, records: []metadata_table_manager.RangeRecord) void {
+            allocator.free(records);
+        }
+
+        pub fn listProjectedPlacementIntents(_: *@This(), allocator: std.mem.Allocator) ![]raft_reconciler.PlacementIntent {
+            return try allocator.alloc(raft_reconciler.PlacementIntent, 0);
+        }
+
+        pub fn freeProjectedPlacementIntents(_: *@This(), allocator: std.mem.Allocator, intents: []raft_reconciler.PlacementIntent) void {
+            allocator.free(intents);
+        }
+
+        pub fn listProjectedSplitTransitions(_: *@This(), allocator: std.mem.Allocator) ![]metadata_transition_state.SplitTransitionRecord {
+            return try allocator.alloc(metadata_transition_state.SplitTransitionRecord, 0);
+        }
+
+        pub fn freeProjectedSplitTransitions(_: *@This(), allocator: std.mem.Allocator, records: []metadata_transition_state.SplitTransitionRecord) void {
+            allocator.free(records);
+        }
+
+        pub fn listProjectedMergeTransitions(_: *@This(), allocator: std.mem.Allocator) ![]metadata_transition_state.MergeTransitionRecord {
+            return try allocator.alloc(metadata_transition_state.MergeTransitionRecord, 0);
+        }
+
+        pub fn freeProjectedMergeTransitions(_: *@This(), allocator: std.mem.Allocator, records: []metadata_transition_state.MergeTransitionRecord) void {
+            allocator.free(records);
+        }
+
+        pub fn observeSplitTransition(_: *@This(), _: u64) !?metadata_transition_state.SplitObservation {
+            return null;
+        }
+
+        pub fn observeMergeTransition(_: *@This(), _: u64) !?metadata_transition_state.MergeObservation {
+            return null;
+        }
+
+        pub fn applyReconciliationPlan(self: *@This(), plan: *const metadata_reconciler.ReconciliationPlan) !void {
+            for (plan.table_upserts) |record| try self.upsertTable(record);
+            if (plan.table_removals.len != 0) return error.TestUnexpectedResult;
+        }
+
+        pub fn proposeTransitionCommand(_: *@This(), _: anytype) !void {}
+    };
+
+    var fake = FakeService{};
+    defer fake.deinit(alloc);
+
+    var graph = try applyRelationalSqlDdlOnMetadataService(
+        &fake,
+        alloc,
+        "CREATE GRAPH INDEX docs_edge_graph ON docs EDGE (id -> body) TYPE edge_type WITH (edge_policy = 'all');",
+    );
+    defer graph.deinit(alloc);
+    try std.testing.expect(graph.requires_rebuild);
+    try std.testing.expectEqual(@as(usize, 1), fake.upsert_table_count);
+    try std.testing.expect(std.mem.indexOf(u8, fake.table.indexes_json, "\"docs_edge_graph\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.table.indexes_json, "\"type\":\"graph\"") != null);
+
+    var metric = try applyRelationalSqlDdlOnMetadataService(
+        &fake,
+        alloc,
+        "ALTER GRAPH INDEX docs_edge_graph ADD METRIC docs_pagerank USING pagerank WITH (max_iterations = 40);",
+    );
+    defer metric.deinit(alloc);
+    try std.testing.expect(metric.requires_rebuild);
+    try std.testing.expectEqual(@as(usize, 2), fake.upsert_table_count);
+    try std.testing.expect(std.mem.indexOf(u8, fake.table.indexes_json, "\"docs_pagerank\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.table.indexes_json, "\"type\":\"graph_metric\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.table.indexes_json, "\"graph_index\":\"docs_edge_graph\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.table.indexes_json, "\"algorithm\":\"pagerank\"") != null);
+}
+
+test "metadata catalog applies SQL ALTER COLUMN USING through typed schema rewrite jobs" {
+    const alloc = std.testing.allocator;
+    const initial_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const FakeService = struct {
+        table: metadata_table_manager.TableRecord = .{
+            .table_id = 88,
+            .name = "audit_log",
+            .database_name = catalog_resources.default_database_name,
+            .namespace_name = catalog_resources.default_namespace_name,
+            .schema_json = initial_schema_json,
+            .indexes_json = "{}",
+            .replication_sources_json = "[]",
+            .placement_role = "data",
+        },
+        table_owned: bool = false,
+        ranges: [2]metadata_table_manager.RangeRecord = .{
+            .{ .group_id = 9901, .range_id = 9911, .table_id = 88, .start_key = "", .end_key = "n" },
+            .{ .group_id = 9902, .range_id = 9912, .table_id = 88, .start_key = "n", .end_key = null },
+        },
+        jobs: std.ArrayListUnmanaged(metadata_table_manager.SchemaRewriteJobRecord) = .empty,
+        upsert_table_count: usize = 0,
+
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            if (self.table_owned) metadata_table_manager.freeTable(allocator, self.table);
+            for (self.jobs.items) |record| metadata_table_manager.freeSchemaRewriteJob(allocator, record);
+            self.jobs.deinit(allocator);
+            self.* = undefined;
+        }
+
+        fn tableSlice(self: *@This()) []metadata_table_manager.TableRecord {
+            return @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1];
+        }
+
+        pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = self.tableSlice(),
+                .ranges = self.ranges[0..],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        pub fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+
+        pub fn upsertTable(self: *@This(), record: metadata_table_manager.TableRecord) !void {
+            const cloned = try metadata_table_manager.cloneTable(std.testing.allocator, record);
+            if (self.table_owned) metadata_table_manager.freeTable(std.testing.allocator, self.table);
+            self.table = cloned;
+            self.table_owned = true;
+            self.upsert_table_count += 1;
+        }
+
+        pub fn upsertSchemaRewriteJob(self: *@This(), record: metadata_table_manager.SchemaRewriteJobRecord) !void {
+            const owned = try metadata_table_manager.cloneSchemaRewriteJob(std.testing.allocator, record);
+            errdefer metadata_table_manager.freeSchemaRewriteJob(std.testing.allocator, owned);
+            for (self.jobs.items) |*existing| {
+                if (existing.job_id != record.job_id) continue;
+                metadata_table_manager.freeSchemaRewriteJob(std.testing.allocator, existing.*);
+                existing.* = owned;
+                return;
+            }
+            try self.jobs.append(std.testing.allocator, owned);
+        }
+
+        pub fn listProjectedTables(self: *@This(), allocator: std.mem.Allocator) ![]metadata_table_manager.TableRecord {
+            const out = try allocator.alloc(metadata_table_manager.TableRecord, 1);
+            errdefer allocator.free(out);
+            out[0] = try metadata_table_manager.cloneTable(allocator, self.table);
+            return out;
+        }
+
+        pub fn freeProjectedTables(_: *@This(), allocator: std.mem.Allocator, records: []metadata_table_manager.TableRecord) void {
+            for (records) |record| metadata_table_manager.freeTable(allocator, record);
+            allocator.free(records);
+        }
+
+        pub fn listProjectedRanges(self: *@This(), allocator: std.mem.Allocator) ![]metadata_table_manager.RangeRecord {
+            const out = try allocator.alloc(metadata_table_manager.RangeRecord, self.ranges.len);
+            errdefer allocator.free(out);
+            for (self.ranges, 0..) |record, i| out[i] = try metadata_table_manager.cloneRange(allocator, record);
+            return out;
+        }
+
+        pub fn freeProjectedRanges(_: *@This(), allocator: std.mem.Allocator, records: []metadata_table_manager.RangeRecord) void {
+            for (records) |record| metadata_table_manager.freeRange(allocator, record);
+            allocator.free(records);
+        }
+
+        pub fn listProjectedPlacementIntents(_: *@This(), allocator: std.mem.Allocator) ![]raft_reconciler.PlacementIntent {
+            return try allocator.alloc(raft_reconciler.PlacementIntent, 0);
+        }
+
+        pub fn freeProjectedPlacementIntents(_: *@This(), allocator: std.mem.Allocator, intents: []raft_reconciler.PlacementIntent) void {
+            allocator.free(intents);
+        }
+
+        pub fn listProjectedSplitTransitions(_: *@This(), allocator: std.mem.Allocator) ![]metadata_transition_state.SplitTransitionRecord {
+            return try allocator.alloc(metadata_transition_state.SplitTransitionRecord, 0);
+        }
+
+        pub fn freeProjectedSplitTransitions(_: *@This(), allocator: std.mem.Allocator, records: []metadata_transition_state.SplitTransitionRecord) void {
+            allocator.free(records);
+        }
+
+        pub fn listProjectedMergeTransitions(_: *@This(), allocator: std.mem.Allocator) ![]metadata_transition_state.MergeTransitionRecord {
+            return try allocator.alloc(metadata_transition_state.MergeTransitionRecord, 0);
+        }
+
+        pub fn freeProjectedMergeTransitions(_: *@This(), allocator: std.mem.Allocator, records: []metadata_transition_state.MergeTransitionRecord) void {
+            allocator.free(records);
+        }
+
+        pub fn observeSplitTransition(_: *@This(), _: u64) !?metadata_transition_state.SplitObservation {
+            return null;
+        }
+
+        pub fn observeMergeTransition(_: *@This(), _: u64) !?metadata_transition_state.MergeObservation {
+            return null;
+        }
+
+        pub fn applyReconciliationPlan(self: *@This(), plan: *const metadata_reconciler.ReconciliationPlan) !void {
+            for (plan.table_upserts) |record| try self.upsertTable(record);
+        }
+
+        pub fn proposeTransitionCommand(_: *@This(), _: anytype) !void {}
+    };
+
+    var service_fake = FakeService{};
+    defer service_fake.deinit(alloc);
+
+    var applied = try applyRelationalSqlDdlOnMetadataService(
+        &service_fake,
+        alloc,
+        "ALTER TABLE audit_log ALTER COLUMN amount TYPE numeric USING amount + 1;",
+    );
+    defer applied.deinit(alloc);
+
+    try std.testing.expect(applied.rewrite_required);
+    try std.testing.expectEqual(@as(usize, 1), service_fake.upsert_table_count);
+    try std.testing.expectEqual(@as(usize, 4), service_fake.jobs.items.len);
+
+    var rewrite_count: usize = 0;
+    var validate_count: usize = 0;
+    var first_rewrite: ?*const metadata_table_manager.SchemaRewriteJobRecord = null;
+    var second_rewrite: ?*const metadata_table_manager.SchemaRewriteJobRecord = null;
+    for (service_fake.jobs.items) |*job| {
+        if (std.mem.eql(u8, job.action, "rewrite") and std.mem.eql(u8, job.reason, "row_images")) {
+            rewrite_count += 1;
+            if (job.group_id == 9901) first_rewrite = job;
+            if (job.group_id == 9902) second_rewrite = job;
+        } else if (std.mem.eql(u8, job.action, "validate") and std.mem.eql(u8, job.reason, "constraints")) {
+            validate_count += 1;
+            try std.testing.expect(job.expression == null);
+            try std.testing.expectEqualStrings("", job.target_column);
+        } else {
+            return error.TestUnexpectedResult;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), rewrite_count);
+    try std.testing.expectEqual(@as(usize, 2), validate_count);
+
+    const first = first_rewrite orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 88), first.table_id);
+    try std.testing.expectEqual(@as(u64, 9901), first.group_id);
+    try std.testing.expectEqualStrings("", first.start_row_key);
+    try std.testing.expectEqualStrings("n", first.end_row_key.?);
+    try std.testing.expectEqualStrings("amount", first.target_column);
+    const expression = first.expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(storage_schema.RelationalRowsExpressionKind.add, expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), expression.operands.len);
+    try std.testing.expectEqualStrings("amount", expression.operands[0].field);
+    try std.testing.expectEqualStrings("1", expression.operands[1].value_json);
+
+    const second = second_rewrite orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 9902), second.group_id);
+    try std.testing.expectEqualStrings("n", second.start_row_key);
+    try std.testing.expect(second.end_row_key == null);
 }
 
 fn findRangeForKey(ranges: []const metadata_table_manager.RangeRecord, table_id: u64, key: []const u8) ?u64 {

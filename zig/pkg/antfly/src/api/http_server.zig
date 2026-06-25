@@ -1406,7 +1406,7 @@ fn applyRelationalSqlDdlPlanOnServiceWithSession(
         return applied;
     }
 
-    if (try applyUntargetedRelationalDerivedIndexDdlOnServiceWithSessionAlloc(alloc, svc, &snapshot, plan, session)) |applied| {
+    if (try tables_api.applyUntargetedRelationalDerivedIndexDdlOnServiceWithSessionAlloc(alloc, svc, &snapshot, plan, session)) |applied| {
         try svc.runRound();
         return applied;
     }
@@ -1461,7 +1461,7 @@ fn applyRelationalSqlDdlPlanOnServiceWithSession(
         try svc.runRound();
         return dropped;
     }
-    if (try applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(alloc, svc, table, target, plan.*)) |derived_applied| {
+    if (try tables_api.applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(alloc, svc, table, target, plan.*)) |derived_applied| {
         try svc.runRound();
         return derived_applied;
     }
@@ -1471,99 +1471,6 @@ fn applyRelationalSqlDdlPlanOnServiceWithSession(
     try catalog_jobs.scheduleSchemaRewriteJobsForAppliedDdlOnService(svc, alloc, applied);
     try svc.runRound();
     return applied;
-}
-
-fn applyUntargetedRelationalDerivedIndexDdlOnServiceWithSessionAlloc(
-    alloc: std.mem.Allocator,
-    svc: anytype,
-    snapshot: *const metadata_api.AdminSnapshot,
-    plan: *sql_adapter.LoweredDdlPlan,
-    session: catalog_resources.SqlCatalogSession,
-) !?tables_api.AppliedRelationalSqlDdlRecord {
-    const create_index = switch (plan.*) {
-        .create_index => |value| value,
-        else => return null,
-    };
-    if (create_index.table_name.len != 0) return null;
-    const index_json = create_index.derived_index_config_json orelse return null;
-    const graph_index_name = try graphMetricGraphIndexNameFromConfigAlloc(alloc, index_json) orelse return null;
-    defer alloc.free(graph_index_name);
-    const table = (try findTableContainingIndexConfigAlloc(alloc, snapshot, graph_index_name)) orelse return error.TableNotFound;
-
-    var applied = try tables_api.applyRelationalSqlDdlPlanToTableRecordWithSessionAlloc(
-        alloc,
-        table,
-        plan,
-        session,
-    );
-    errdefer applied.deinit(alloc);
-    try svc.upsertTable(applied.table);
-    return applied;
-}
-
-fn graphMetricGraphIndexNameFromConfigAlloc(
-    alloc: std.mem.Allocator,
-    index_json: []const u8,
-) !?[]const u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidTableIndexMetadata;
-    const type_value = parsed.value.object.get("type") orelse return null;
-    if (type_value != .string or !std.mem.eql(u8, type_value.string, "graph_metric")) return null;
-    const graph_index_value = parsed.value.object.get("graph_index") orelse return error.InvalidTableIndexMetadata;
-    if (graph_index_value != .string) return error.InvalidTableIndexMetadata;
-    return try alloc.dupe(u8, graph_index_value.string);
-}
-
-fn findTableContainingIndexConfigAlloc(
-    alloc: std.mem.Allocator,
-    snapshot: *const metadata_api.AdminSnapshot,
-    index_name: []const u8,
-) !?*const metadata_table_manager.TableRecord {
-    var match: ?*const metadata_table_manager.TableRecord = null;
-    for (snapshot.tables) |*table| {
-        if (try indexes_api.hasIndexConfig(alloc, table.indexes_json, index_name)) {
-            if (match != null) return error.InvalidTableIndexMetadata;
-            match = table;
-        }
-    }
-    return match;
-}
-
-fn applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(
-    alloc: std.mem.Allocator,
-    svc: anytype,
-    table: *const metadata_table_manager.TableRecord,
-    target: tables_api.RelationalSqlDdlTarget,
-    plan: sql_adapter.LoweredDdlPlan,
-) !?tables_api.AppliedRelationalSqlDdlRecord {
-    _ = target;
-    const create_index = switch (plan) {
-        .create_index => |value| value,
-        else => return null,
-    };
-    const index_json = create_index.derived_index_config_json orelse return null;
-    if (try indexes_api.hasIndexConfig(alloc, table.indexes_json, create_index.index_name)) {
-        if (!create_index.if_not_exists) return error.InvalidTableIndexMetadata;
-        return .{
-            .table = try metadata_table_manager.cloneTable(alloc, table.*),
-            .noop = true,
-        };
-    }
-
-    try tables_api.validateDerivedIndexFieldRefsForSchemaAlloc(alloc, index_json, table.schema_json);
-    const expanded_index_json = try tables_api.expandSchemaDerivedAlgebraicIndexAlloc(alloc, table.name, index_json, table.schema_json);
-    defer alloc.free(expanded_index_json);
-
-    var updated_record = table.*;
-    updated_record.indexes_json = try indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, create_index.index_name, expanded_index_json);
-    defer alloc.free(updated_record.indexes_json);
-    try svc.upsertTable(updated_record);
-
-    return .{
-        .table = try metadata_table_manager.cloneTable(alloc, updated_record),
-        .requires_rebuild = true,
-    };
 }
 
 const SchemaRewriteWakeJob = struct {
@@ -1895,7 +1802,7 @@ test "api http server applies SQL derived index DDL to catalog index metadata" {
         catalog_resources.SqlCatalogSession.default(),
     );
     defer full_text_target.deinit(alloc);
-    var full_text = (try applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(
+    var full_text = (try tables_api.applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(
         alloc,
         &service,
         &service.table,
@@ -1917,7 +1824,7 @@ test "api http server applies SQL derived index DDL to catalog index metadata" {
         catalog_resources.SqlCatalogSession.default(),
     );
     defer vector_target.deinit(alloc);
-    var vector = (try applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(
+    var vector = (try tables_api.applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(
         alloc,
         &service,
         &service.table,
@@ -1940,7 +1847,7 @@ test "api http server applies SQL derived index DDL to catalog index metadata" {
         catalog_resources.SqlCatalogSession.default(),
     );
     defer aknn_target.deinit(alloc);
-    var aknn = (try applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(
+    var aknn = (try tables_api.applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(
         alloc,
         &service,
         &service.table,
@@ -1965,7 +1872,7 @@ test "api http server applies SQL derived index DDL to catalog index metadata" {
         catalog_resources.SqlCatalogSession.default(),
     );
     defer noop_target.deinit(alloc);
-    var noop = (try applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(
+    var noop = (try tables_api.applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(
         alloc,
         &service,
         &service.table,
@@ -1985,7 +1892,7 @@ test "api http server applies SQL derived index DDL to catalog index metadata" {
         catalog_resources.SqlCatalogSession.default(),
     );
     defer graph_target.deinit(alloc);
-    var graph = (try applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(
+    var graph = (try tables_api.applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(
         alloc,
         &service,
         &service.table,
@@ -2008,7 +1915,7 @@ test "api http server applies SQL derived index DDL to catalog index metadata" {
         catalog_resources.SqlCatalogSession.default(),
     );
     defer graph_syntax_target.deinit(alloc);
-    var graph_syntax = (try applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(
+    var graph_syntax = (try tables_api.applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(
         alloc,
         &service,
         &service.table,
@@ -2026,7 +1933,7 @@ test "api http server applies SQL derived index DDL to catalog index metadata" {
     defer graph_metric_plan.deinit(alloc);
     var graph_metric_snapshot = try service.adminSnapshot();
     defer service.freeAdminSnapshot(&graph_metric_snapshot);
-    var graph_metric = (try applyUntargetedRelationalDerivedIndexDdlOnServiceWithSessionAlloc(
+    var graph_metric = (try tables_api.applyUntargetedRelationalDerivedIndexDdlOnServiceWithSessionAlloc(
         alloc,
         &service,
         &graph_metric_snapshot,
@@ -2049,7 +1956,7 @@ test "api http server applies SQL derived index DDL to catalog index metadata" {
         catalog_resources.SqlCatalogSession.default(),
     );
     defer hybrid_target.deinit(alloc);
-    var hybrid = (try applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(
+    var hybrid = (try tables_api.applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(
         alloc,
         &service,
         &service.table,

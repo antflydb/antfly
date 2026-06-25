@@ -96,6 +96,12 @@ Logical-replication catalog DDL heads, including
 `CREATE`/`ALTER`/`DROP SUBSCRIPTION`, now use the generated DDL boundary with
 retained object-name and operation-tail metadata before delegating to the
 existing typed logical-replication catalog planner.
+Materialized-view catalog DDL heads, including `CREATE MATERIALIZED VIEW`,
+`DROP MATERIALIZED VIEW`, and `REFRESH MATERIALIZED VIEW`, now use the
+generated DDL boundary with retained view-name and population/refresh-tail
+metadata before delegating to the existing typed materialized-view catalog
+planner. `ALTER MATERIALIZED VIEW` remains an unsupported generated diagnostic
+until Antfly has a typed plan for that operation family.
 Generated
 `CREATE INDEX` ASTs also retain
 `UNIQUE`, method, element-list, covering-index `INCLUDE (...)`, options, and
@@ -108,14 +114,16 @@ name spans before delegating to the existing relation-population planner.
 Incomplete covered DDL clause-boundary shapes for `CREATE TABLE`, lifetime
 prefixed `CREATE [TEMP|TEMPORARY|UNLOGGED] TABLE`, `CREATE VIEW`,
 `CREATE DOMAIN`, `CREATE SEQUENCE`, `CREATE TYPE`, `CREATE TABLESPACE`,
-`CREATE PUBLICATION`, `CREATE SUBSCRIPTION`,
+`CREATE PUBLICATION`, `CREATE SUBSCRIPTION`, `CREATE MATERIALIZED VIEW`,
 `CREATE INDEX`, `ALTER TABLE`, `ALTER SCHEMA`, `ALTER TABLESPACE`,
 `ALTER PUBLICATION`, `ALTER SUBSCRIPTION`, `ALTER VIEW`, `ALTER DOMAIN`,
 `ALTER SEQUENCE`, `ALTER TYPE`, `DROP TABLE`, `DROP VIEW`, `DROP DOMAIN`,
-`DROP SEQUENCE`, `DROP TYPE`, `DROP TABLESPACE`, `DROP PUBLICATION`, and
-`DROP SUBSCRIPTION` now fail closed through the generated parser instead of
-falling back to the legacy DDL classifier, while rich DDL syntax that is not
-yet generated-covered still falls back to the existing typed DDL parser.
+`DROP SEQUENCE`, `DROP TYPE`, `DROP TABLESPACE`, `DROP PUBLICATION`,
+`DROP SUBSCRIPTION`, `DROP MATERIALIZED VIEW`, and
+`REFRESH MATERIALIZED VIEW` now fail closed through the generated parser
+instead of falling back to the legacy DDL classifier, while rich DDL syntax
+that is not yet generated-covered still falls back to the existing typed DDL
+parser.
 Simple DML now has generated-parser corpus
 coverage, retained generated raw and AST nodes for covered write statements,
 structured generated DML ranges for target tables, sources, assignments,
@@ -350,19 +358,18 @@ typed plans route to terminal parsed unsupported statements. Full production AST
 remains the next migration boundary for larger DDL, query, DML, and Antfly
 extension families.
 Unsupported generated diagnostics also cover PostgreSQL materialized-view DDL
-entry points, including `CREATE MATERIALIZED VIEW`, `ALTER MATERIALIZED VIEW`,
-`DROP MATERIALIZED VIEW`, and `REFRESH MATERIALIZED VIEW`; procedural blocks
-with `DO`; foreign-table DDL; trigger and rewrite-rule DDL, including
-`ALTER TRIGGER` and `ALTER RULE`; row-security policy DDL; and foreign-server
-DDL. These common
-unsupported PostgreSQL dump/admin shapes now have stable unsupported AST
-reasons instead of generic parser fallback. Legacy-supported materialized-view
-catalog operations now use those generated unsupported AST nodes as a validated
-boundary before delegating to the typed materialized-view catalog planner:
-`CREATE MATERIALIZED VIEW`, `DROP MATERIALIZED VIEW`, and
-`REFRESH MATERIALIZED VIEW` fail closed if generated kind, reason, span, subject,
-or command keywords are corrupted. Legacy-supported row-security policy catalog
-operations use the same validated generated unsupported boundary for
+entry points that Antfly does not type yet, including
+`ALTER MATERIALIZED VIEW`; procedural blocks with `DO`; foreign-table DDL;
+trigger and rewrite-rule DDL, including `ALTER TRIGGER` and `ALTER RULE`;
+row-security policy DDL; and foreign-server DDL. These common unsupported
+PostgreSQL dump/admin shapes now have stable unsupported AST reasons instead of
+generic parser fallback. Legacy-supported materialized-view catalog operations
+now use generated DDL AST nodes as a validated boundary before delegating to the
+typed materialized-view catalog planner: `CREATE MATERIALIZED VIEW`,
+`DROP MATERIALIZED VIEW`, and `REFRESH MATERIALIZED VIEW` fail closed if
+generated kind, span, object name, tail, cascade flag, or command keywords are
+corrupted. Legacy-supported row-security policy catalog operations use the same
+validated generated unsupported boundary for
 `CREATE POLICY`, `ALTER POLICY`, and `DROP POLICY`, including routine-backed
 policy predicates that require parser-context function bindings, before
 delegating to the typed row-security catalog planner. Notification channel
@@ -969,11 +976,10 @@ variants for:
   `COPY`, `VACUUM`, `REINDEX`, `CLUSTER`, `COMMENT`, `GRANT`, `REVOKE`,
   `LISTEN`, `NOTIFY`, `LOCK`, `CALL`, `CHECKPOINT`, `LOAD`, `REFRESH`,
   `SECURITY LABEL`, `UNLISTEN`, `CLOSE`, `DECLARE`, `FETCH`, `MOVE`,
-  `SAVEPOINT`, `RELEASE`, `CREATE MATERIALIZED VIEW`,
-  `ALTER MATERIALIZED VIEW`, `DROP MATERIALIZED VIEW`, `ALTER RULE`, and
-  `ALTER TRIGGER`, plus bare, simple, optioned, and
-  `EXPLAIN ANALYZE` forms with command spans, subject ranges where present,
-  and stable unsupported reason metadata. Parsed SQL now distinguishes
+  `SAVEPOINT`, `RELEASE`, `ALTER MATERIALIZED VIEW`, `ALTER RULE`, and
+  `ALTER TRIGGER`, plus bare, simple, optioned, and `EXPLAIN ANALYZE` forms
+  with command spans, subject ranges where present, and stable unsupported
+  reason metadata. Parsed SQL now distinguishes
   generated unsupported statements from ordinary DDL for unsupported heads that
   have no typed catalog/control plan, so lowerers fail closed instead of trying
   a generic DDL parse for those shapes. Generated unsupported AST heads that
@@ -1043,6 +1049,8 @@ Generated grammar work needs evidence at multiple levels:
   generated logical-replication catalog DDL for
   `CREATE`/`ALTER`/`DROP PUBLICATION` and
   `CREATE`/`ALTER`/`DROP SUBSCRIPTION`,
+  generated materialized-view catalog DDL for `CREATE MATERIALIZED VIEW`,
+  `DROP MATERIALIZED VIEW`, and `REFRESH MATERIALIZED VIEW`,
   `DROP INDEX`, generated domain catalog DDL for `CREATE DOMAIN`,
   `ALTER DOMAIN`, and `DROP DOMAIN`, generated sequence catalog DDL for
   `CREATE SEQUENCE`, `ALTER SEQUENCE`, and `DROP SEQUENCE`, generated

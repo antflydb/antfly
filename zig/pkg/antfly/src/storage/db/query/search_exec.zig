@@ -6333,7 +6333,7 @@ test "native dense constraints preserve empty positive algebraic candidate sets"
     try std.testing.expectEqual(@as(usize, 0), intersected.filter_ids.len);
 }
 
-test "native dense constraints fail closed without ordinal vector mapping" {
+test "db query result shape native dense constraints fail closed without ordinal vector mapping" {
     const alloc = std.testing.allocator;
     var filter = doc_set.ResolvedDocFilter{
         .include = try doc_set.fromOrdinalsAlloc(alloc, &.{2}),

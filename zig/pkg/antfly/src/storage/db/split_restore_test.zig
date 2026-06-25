@@ -1279,7 +1279,7 @@ test "db incomplete deferred restore import recovers before runtime repair" {
     }
 }
 
-test "db split cutover fences enrichment to the owning range" {
+test "db split cutover enrichment fence owns split range" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -1371,7 +1371,7 @@ test "db split cutover fences enrichment to the owning range" {
     }
 }
 
-test "db split cutover fences enrichment to the owning range with durable lsm primary backend" {
+test "db split cutover enrichment fence owns split range with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -1467,7 +1467,7 @@ test "db split cutover fences enrichment to the owning range with durable lsm pr
     }
 }
 
-test "db merge-style cutover fences enrichment to the merged receiver range" {
+test "db merge-style cutover enrichment fence owns merged receiver range" {
     const alloc = std.testing.allocator;
 
     var receiver_buf: [256]u8 = undefined;
@@ -1561,7 +1561,7 @@ test "db merge-style cutover fences enrichment to the merged receiver range" {
     }
 }
 
-test "db merge-style cutover fences enrichment to the merged receiver range with durable lsm primary backend" {
+test "db merge-style cutover enrichment fence owns merged receiver range with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
     var receiver_buf: [256]u8 = undefined;
@@ -1774,7 +1774,7 @@ test "db merge-style cutover routes text sparse and graph indexes to the merged 
     try std.testing.expectEqual(@as(usize, 0), donor_incoming.len);
 }
 
-test "db split cutover preserves enrichment resume and fencing across reopen" {
+test "db split cutover enrichment resume and fencing across reopen" {
     const alloc = std.testing.allocator;
 
     var parent_buf: [256]u8 = undefined;
@@ -1902,7 +1902,7 @@ test "db split cutover preserves enrichment resume and fencing across reopen" {
     try std.testing.expect(found_post_reopen);
 }
 
-test "db split cutover preserves enrichment resume and fencing across reopen with durable lsm primary backend" {
+test "db split cutover enrichment resume and fencing across reopen with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
     var parent_buf: [256]u8 = undefined;
@@ -2038,7 +2038,7 @@ test "db split cutover preserves enrichment resume and fencing across reopen wit
     try std.testing.expect(found_post_reopen);
 }
 
-test "db merge-style cutover preserves enrichment resume and fencing across reopen" {
+test "db merge-style cutover enrichment resume and fencing across reopen" {
     const alloc = std.testing.allocator;
 
     var receiver_buf: [256]u8 = undefined;
@@ -2169,7 +2169,7 @@ test "db merge-style cutover preserves enrichment resume and fencing across reop
     try std.testing.expect(found);
 }
 
-test "db merge-style cutover preserves enrichment resume and fencing across reopen with durable lsm primary backend" {
+test "db merge-style cutover enrichment resume and fencing across reopen with durable lsm primary backend" {
     const alloc = std.testing.allocator;
 
     var receiver_buf: [256]u8 = undefined;

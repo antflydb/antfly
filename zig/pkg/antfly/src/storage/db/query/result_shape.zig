@@ -1254,7 +1254,7 @@ const TestStoredLoader = struct {
     }
 };
 
-test "dedupeSearchHitsById uses ordinals when hit page is complete" {
+test "db query result shape dedupeSearchHitsById uses ordinals when hit page is complete" {
     const alloc = std.testing.allocator;
 
     var result = types.SearchResult{
@@ -1344,7 +1344,7 @@ test "applyStoredSearchPatternFilters applies native doc id constraints without 
     try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
 }
 
-test "applyStoredSearchPatternFilters resolves native doc id constraints to hit ordinals" {
+test "db query result shape applyStoredSearchPatternFilters resolves native doc id constraints to hit ordinals" {
     const alloc = std.testing.allocator;
 
     var hits = try alloc.alloc(types.SearchHit, 3);
@@ -1418,7 +1418,7 @@ test "applyStoredSearchPatternFilters applies resolved doc filters without store
     try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
 }
 
-test "applyStoredSearchPatternFilters uses hit ordinals for resolved doc filters" {
+test "db query result shape applyStoredSearchPatternFilters uses hit ordinals for resolved doc filters" {
     const alloc = std.testing.allocator;
 
     var hits = try alloc.alloc(types.SearchHit, 3);
@@ -1454,7 +1454,7 @@ test "applyStoredSearchPatternFilters uses hit ordinals for resolved doc filters
     try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
 }
 
-test "applyStoredSearchPatternFilters fails closed without resolved ordinal projection" {
+test "db query result shape applyStoredSearchPatternFilters fails closed without resolved ordinal projection" {
     const alloc = std.testing.allocator;
 
     var hits = try alloc.alloc(types.SearchHit, 2);
@@ -1488,7 +1488,7 @@ test "applyStoredSearchPatternFilters fails closed without resolved ordinal proj
     try std.testing.expectEqual(@as(usize, 0), loader.resolve_calls);
 }
 
-test "applyStoredSearchPatternFilters fails closed when ordinal projection is unsupported" {
+test "db query result shape applyStoredSearchPatternFilters fails closed when ordinal projection is unsupported" {
     const alloc = std.testing.allocator;
 
     var hits = try alloc.alloc(types.SearchHit, 2);

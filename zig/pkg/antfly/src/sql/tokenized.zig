@@ -450,6 +450,13 @@ fn isIncompleteGeneratedDdlBoundary(tokens: []const Token, raw_statement: RawSql
             if (end <= start + 3) return true;
             return isGeneratedDdlTrailingBoundary(last);
         }
+        if (tokenMatchesKeyword(tokens[start + 1], .materialized)) {
+            if (end <= start + 3) return true;
+            if (tokenMatchesKeyword(tokens[start + 2], .view)) {
+                if (end <= start + 4) return true;
+                return isGeneratedDdlTrailingBoundary(last);
+            }
+        }
         if (tokenMatchesKeyword(tokens[start + 1], .domain)) {
             if (end <= start + 3) return true;
             return isGeneratedDdlTrailingBoundary(last);
@@ -519,6 +526,13 @@ fn isIncompleteGeneratedDdlBoundary(tokens: []const Token, raw_statement: RawSql
         return isGeneratedDdlTrailingBoundary(last);
     }
     if (tokenMatchesKeyword(first, .drop)) {
+        if (tokenMatchesKeyword(tokens[start + 1], .materialized)) {
+            if (end <= start + 3) return true;
+            if (tokenMatchesKeyword(tokens[start + 2], .view)) {
+                if (end <= start + 3) return true;
+                return isGeneratedDdlTrailingBoundary(last);
+            }
+        }
         if (tokenMatchesKeyword(tokens[start + 1], .table) or
             tokenMatchesKeyword(tokens[start + 1], .view) or
             tokenMatchesKeyword(tokens[start + 1], .domain) or
@@ -533,6 +547,13 @@ fn isIncompleteGeneratedDdlBoundary(tokens: []const Token, raw_statement: RawSql
             tokenMatchesKeyword(tokens[start + 1], .extension))
         {
             if (end <= start + 2) return true;
+            return isGeneratedDdlTrailingBoundary(last);
+        }
+    }
+    if (tokenMatchesKeyword(first, .refresh)) {
+        if (end <= start + 3) return true;
+        if (tokenMatchesKeyword(tokens[start + 1], .materialized) and tokenMatchesKeyword(tokens[start + 2], .view)) {
+            if (end <= start + 4) return true;
             return isGeneratedDdlTrailingBoundary(last);
         }
     }
@@ -568,7 +589,9 @@ fn isGeneratedDdlTrailingBoundary(token: Token) bool {
         tokenMatchesKeyword(token, .restart) or
         tokenMatchesKeyword(token, .by) or
         tokenMatchesKeyword(token, .no) or
+        tokenMatchesKeyword(token, .data) or
         tokenMatchesText(token, "connection") or
+        tokenMatchesText(token, "concurrently") or
         tokenMatchesText(token, "enable") or
         tokenMatchesText(token, "disable");
 }
@@ -1050,13 +1073,11 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .cluster,
         .comment,
         .copy,
-        .create_materialized_view,
         .create_policy,
         .create_publication,
         .create_subscription,
         .create_trigger,
         .declare,
-        .drop_materialized_view,
         .drop_policy,
         .drop_publication,
         .drop_subscription,
@@ -1066,7 +1087,6 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .listen,
         .lock,
         .notify,
-        .refresh,
         .reindex,
         .release,
         .revoke,
@@ -1082,15 +1102,18 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .alter_trigger,
         .checkpoint,
         .create_foreign_table,
+        .create_materialized_view,
         .create_rule,
         .create_server,
         .do_block,
         .drop_foreign_table,
+        .drop_materialized_view,
         .drop_rule,
         .drop_server,
         .load,
         .move,
         .read_row_lock,
+        .refresh,
         .security_label,
         => false,
     };
@@ -1398,9 +1421,14 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE UNLOGGED TABLE IF NOT EXISTS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE VIEW"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE OR REPLACE VIEW active_usage AS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE MATERIALIZED VIEW"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE MATERIALIZED VIEW usage_summary AS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER SCHEMA analytics RENAME TO"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER VIEW active_usage RENAME TO"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP VIEW IF EXISTS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP MATERIALIZED VIEW IF EXISTS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "REFRESH MATERIALIZED VIEW"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "REFRESH MATERIALIZED VIEW usage_summary WITH"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE DOMAIN"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE DOMAIN positive_amount AS"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER DOMAIN positive_amount SET"));
@@ -1750,11 +1778,6 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .create_foreign_table_not_planned_by_generated_parser,
         },
         .{
-            .sql = "CREATE MATERIALIZED VIEW usage_summary AS SELECT status FROM usage_records",
-            .kind = .create_materialized_view,
-            .reason = .create_materialized_view_not_planned_by_generated_parser,
-        },
-        .{
             .sql = "CREATE POLICY usage_policy ON usage_records USING (tenant_id = current_user)",
             .kind = .create_policy,
             .reason = .create_policy_not_planned_by_generated_parser,
@@ -1830,11 +1853,6 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .notify_not_planned_by_generated_parser,
         },
         .{
-            .sql = "REFRESH MATERIALIZED VIEW usage_summary",
-            .kind = .refresh,
-            .reason = .refresh_not_planned_by_generated_parser,
-        },
-        .{
             .sql = "VACUUM (FULL, VERBOSE, ANALYZE) public.usage_records",
             .kind = .vacuum,
             .reason = .vacuum_not_planned_by_generated_parser,
@@ -1863,11 +1881,6 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "SECURITY LABEL ON TABLE usage_records IS 'internal'",
             .kind = .security_label,
             .reason = .security_label_not_planned_by_generated_parser,
-        },
-        .{
-            .sql = "DROP MATERIALIZED VIEW IF EXISTS usage_summary CASCADE",
-            .kind = .drop_materialized_view,
-            .reason = .drop_materialized_view_not_planned_by_generated_parser,
         },
         .{
             .sql = "DROP POLICY IF EXISTS usage_policy ON usage_records",
@@ -1962,6 +1975,56 @@ test "sql adapter parsed sql owns typed statement variants" {
     defer ddl.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, ddl.generatedStatementKind().?);
     switch (ddl.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var create_materialized_view = try ParsedSql.initAlloc(alloc, "CREATE MATERIALIZED VIEW IF NOT EXISTS usage_summary AS SELECT status FROM usage_records WITH NO DATA");
+    defer create_materialized_view.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, create_materialized_view.generatedStatementKind().?);
+    switch (create_materialized_view.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_materialized_view, ddl_ast.kind);
+            try std.testing.expect(ddl_ast.if_not_exists);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 6, .end = 7 }, ddl_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 7, .end = 15 }, ddl_ast.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (create_materialized_view.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_materialized_view = try ParsedSql.initAlloc(alloc, "DROP MATERIALIZED VIEW IF EXISTS usage_summary CASCADE");
+    defer drop_materialized_view.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, drop_materialized_view.generatedStatementKind().?);
+    switch (drop_materialized_view.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.drop_materialized_view, ddl_ast.kind);
+            try std.testing.expect(ddl_ast.if_exists);
+            try std.testing.expect(ddl_ast.cascade);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 6 }, ddl_ast.object_name_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (drop_materialized_view.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var refresh_materialized_view = try ParsedSql.initAlloc(alloc, "REFRESH MATERIALIZED VIEW CONCURRENTLY usage_summary WITH NO DATA");
+    defer refresh_materialized_view.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, refresh_materialized_view.generatedStatementKind().?);
+    switch (refresh_materialized_view.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.refresh_materialized_view, ddl_ast.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 8 }, ddl_ast.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (refresh_materialized_view.statement) {
         .ddl => {},
         else => return error.TestUnexpectedResult,
     }

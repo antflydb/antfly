@@ -19,6 +19,8 @@ const Allocator = std.mem.Allocator;
 const apply_rw_lock_mod = @import("../apply_rw_lock.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
 const ownership_mod = @import("../ownership.zig");
+const graph_mod = @import("../../../graph/graph.zig");
+const graph_query_mod = @import("../../../graph/query.zig");
 const platform_clock = @import("../../../platform/clock.zig");
 const background_runtime_mod = @import("../../background_runtime.zig");
 
@@ -1103,4 +1105,2571 @@ fn lockApplyExclusiveBackoff(runtime: *GraphMetricRuntime) bool {
         sleepMs(runtime, 1);
     }
     return true;
+}
+
+test "db graph metric runtime degree canary gate tracks queued active and capped degree work" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "degree-canary-worker",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectDegreeCanaryDecision(db.core.index_manager, .{}, true, 0, 1, 0, 0);
+    const queued_decision = try db.core.index_manager.graphMetricDegreeCanaryDecision(.{});
+    try std.testing.expectEqual(@as(usize, 0), queued_decision.control_records);
+    try std.testing.expect(queued_decision.queued_degree_control_records > 0);
+    const capped_queued_decision = try db.core.index_manager.graphMetricDegreeCanaryDecision(.{
+        .max_control_records = queued_decision.queued_degree_control_records - 1,
+    });
+    try std.testing.expect(!capped_queued_decision.shouldRunPlanned());
+    try std.testing.expectEqual(queued_decision.queued_degree_control_records, capped_queued_decision.queued_degree_control_records);
+
+    const start = try db.runGraphMetricPlannedCoordinatorSweep(.{
+        .max_metrics = 8,
+        .start_background_builds = true,
+    });
+    try std.testing.expectEqual(@as(usize, 1), start.builds_started);
+    try expectDegreeCanaryDecision(db.core.index_manager, .{}, true, 1, 0, 0, 0);
+
+    const active_decision = try db.core.index_manager.graphMetricDegreeCanaryDecision(.{});
+    try std.testing.expect(active_decision.control_records > 0);
+    try std.testing.expect(active_decision.shouldRunPlanned());
+
+    const capped_decision = try db.core.index_manager.graphMetricDegreeCanaryDecision(.{
+        .max_control_records = active_decision.control_records - 1,
+    });
+    try std.testing.expect(!capped_decision.shouldRunPlanned());
+    try std.testing.expectEqual(active_decision.control_records, capped_decision.control_records);
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+    try expectDegreeCanaryDecision(db.core.index_manager, .{}, false, 0, 0, 0, 0);
+}
+
+test "db graph metric runtime degree canary gate blocks non degree queued work" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}},\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":3,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectDegreeCanaryDecision(db.core.index_manager, .{}, false, 0, 1, 0, 1);
+
+    const degree_canary = try db.core.index_manager.shouldRunGraphMetricDegreeCanary(.{});
+    try std.testing.expect(!degree_canary);
+}
+
+test "db graph metric runtime degree canary runUntilIdle uses planned maintenance for one degree" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .degree_canary,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "degree-canary-idle",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectDegreeCanaryDecision(db.core.index_manager, .{}, true, 0, 1, 0, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqualStrings("doc:b", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db graph metric runtime degree canary planned maintenance reports bounded rounds and resumes" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .degree_canary,
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    const decision = try db.core.index_manager.graphMetricDegreeCanaryDecision(db.graph_metric_idle_degree_canary_options);
+    try std.testing.expect(decision.shouldRunPlanned());
+    try std.testing.expectEqual(@as(usize, 1), decision.eligible_queued_degree);
+
+    const budgeted = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+        .worker_id = "degree-canary-round-budget",
+        .max_rounds = 1,
+        .max_metrics_per_round = 8,
+        .max_pages_per_round = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 1), budgeted.rounds_executed);
+    try std.testing.expect(budgeted.budget_exhausted);
+    try std.testing.expect(budgeted.durableProgressed());
+
+    const resumed = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+        .worker_id = "degree-canary-round-budget",
+        .max_rounds = 200,
+        .max_metrics_per_round = 8,
+        .max_pages_per_round = 1,
+    });
+    try std.testing.expect(!resumed.budget_exhausted);
+    try std.testing.expect(resumed.rounds_executed > 0);
+    try std.testing.expect(resumed.rounds_executed <= 200);
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqualStrings("doc:b", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db graph metric runtime degree canary runUntilIdle preserves published scores while rebuild is active" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .degree_canary,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "degree-canary-freshness",
+            .max_rounds = 200,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"store\":true}",
+    });
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try db.runUntilIdle();
+
+    var initial = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer initial.deinit();
+    try std.testing.expectEqual(@as(usize, 1), initial.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, initial.graph_metric_results[0].status.state);
+    const published_generation = initial.graph_metric_results[0].status.published_generation;
+    try std.testing.expect(published_generation > 0);
+    try std.testing.expectEqualStrings("doc:b", initial.graph_metric_results[0].scores[0].node);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), initial.graph_metric_results[0].scores[0].score, 0.001);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:d",
+            .value = "{\"title\":\"delta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}",
+        }},
+        .sync_level = .write,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    db.graph_metric_idle_planned_options.max_rounds = 1;
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+
+    var published = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 2,
+                .freshness = .published,
+            },
+        }},
+        .limit = 0,
+    });
+    defer published.deinit();
+    try std.testing.expectEqual(@as(usize, 1), published.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, published.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(published_generation, published.graph_metric_results[0].status.published_generation);
+    try std.testing.expect(published.graph_metric_results[0].status.building_generation > published_generation);
+    try std.testing.expectEqualStrings("doc:b", published.graph_metric_results[0].scores[0].node);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), published.graph_metric_results[0].scores[0].score, 0.001);
+
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 1,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    }));
+
+    const published_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+        .name = "degree",
+        .freshness = .published,
+    }};
+    const traversal_query = graph_query_mod.GraphQuery{
+        .query_type = .neighbors,
+        .index_name = "graph_idx",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .params = .{ .edge_types = &.{"cites"}, .direction = .out, .max_depth = 1 },
+        .metrics = &published_metric_reads,
+        .include_metric_status = true,
+    };
+    var traversal = try db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = traversal_query }},
+        .limit = 0,
+    });
+    defer traversal.deinit();
+    try std.testing.expectEqual(@as(usize, 1), traversal.graph_results.len);
+    try std.testing.expectEqual(@as(usize, 1), traversal.graph_results[0].nodes.len);
+    try std.testing.expectEqualStrings("doc:b", traversal.graph_results[0].nodes[0].key);
+    try std.testing.expectEqual(@as(usize, 1), traversal.graph_results[0].nodes[0].metrics.len);
+    try std.testing.expectEqualStrings("degree", traversal.graph_results[0].nodes[0].metrics[0].name);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), traversal.graph_results[0].nodes[0].metrics[0].score orelse return error.TestUnexpectedResult, 0.001);
+    try std.testing.expectEqual(@as(usize, 1), traversal.graph_results[0].metric_status.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, traversal.graph_results[0].metric_status[0].state);
+    try std.testing.expectEqual(published_generation, traversal.graph_results[0].metric_status[0].published_generation);
+
+    const fresh_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+        .name = "degree",
+        .freshness = .fresh,
+    }};
+    var fresh_traversal_query = traversal_query;
+    fresh_traversal_query.metrics = &fresh_metric_reads;
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .graph_queries = &.{.{ .name = "neighbors", .query = fresh_traversal_query }},
+        .limit = 0,
+    }));
+
+    var rerank = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match_all = {} },
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "degree",
+            .freshness = .published,
+            .weight = 1.0,
+        },
+        .limit = 4,
+        .include_stored = false,
+    });
+    defer rerank.deinit();
+    try std.testing.expectEqualStrings("doc:b", rerank.hits[0].id);
+    const rerank_status = rerank.graph_metric_rerank_status orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, rerank_status.state);
+    try std.testing.expectEqual(published_generation, rerank_status.published_generation);
+    const rerank_details = rerank.hits[0].score_details orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("degree", rerank_details.metric_name);
+    try std.testing.expectEqual(published_generation, rerank_details.published_generation);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), rerank_details.metric_score orelse return error.TestUnexpectedResult, 0.001);
+
+    try std.testing.expectError(error.MetricStale, db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match_all = {} },
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "degree",
+            .freshness = .fresh,
+            .weight = 1.0,
+        },
+        .limit = 4,
+        .include_stored = false,
+    }));
+}
+
+test "db graph metric runtime degree canary runUntilIdle fails fast when active planned work is outside guardrails" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .degree_canary,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "degree-canary-capped-active",
+            .max_rounds = 200,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+        .graph_metric_idle_degree_canary_options = .{
+            .max_control_records = 0,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    const start = try db.runGraphMetricPlannedCoordinatorSweep(.{
+        .max_metrics = 8,
+        .start_background_builds = true,
+    });
+    try std.testing.expectEqual(@as(usize, 1), start.builds_started);
+
+    const decision = try db.core.index_manager.graphMetricDegreeCanaryDecision(db.graph_metric_idle_degree_canary_options);
+    try std.testing.expectEqual(@as(usize, 1), decision.active_degree_builds);
+    try std.testing.expect(decision.control_records > decision.max_control_records);
+    try std.testing.expect(!decision.shouldRunPlanned());
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+}
+
+test "db graph metric runtime degree canary runUntilIdle falls back to local oracle for mixed metrics" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .degree_canary,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "degree-canary-fallback",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}},\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectDegreeCanaryDecision(db.core.index_manager, .{}, false, 0, 1, 0, 1);
+
+    try db.runUntilIdle();
+
+    var degree_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 1,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer degree_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), degree_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, degree_result.graph_metric_results[0].status.state);
+
+    var pagerank_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "pagerank",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 1,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer pagerank_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), pagerank_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, pagerank_result.graph_metric_results[0].status.state);
+}
+
+test "db graph metric runtime default gate runUntilIdle can use planned graph metric maintenance when enabled" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .planned,
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
+
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "pagerank",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results[0].scores.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqualStrings("doc:d", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db graph metric runtime default gate runUntilIdle planned graph metric maintenance reports budget exhaustion and resumes" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .planned,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "planned-idle-budgeted",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":3,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    {
+        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
+        try std.testing.expect(decision.shouldRunPlanned());
+        try std.testing.expectEqual(@as(usize, 0), decision.active_builds);
+        try std.testing.expectEqual(@as(usize, 1), decision.eligible_queued);
+        try std.testing.expectEqual(@as(usize, 0), decision.ineligible_queued);
+    }
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expect(pending.active_builds > 0);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "pagerank",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqualStrings("doc:d", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db graph metric runtime default gate runUntilIdle default graph metric maintenance auto chooses planned for one degree" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "default-auto-degree-idle",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqualStrings("doc:b", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db graph metric runtime default gate runUntilIdle default graph metric maintenance auto chooses planned for one small pagerank" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "default-auto-pagerank-idle",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":3,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    {
+        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
+        try std.testing.expect(decision.shouldRunPlanned());
+        try std.testing.expectEqual(@as(usize, 0), decision.active_builds);
+        try std.testing.expectEqual(@as(usize, 1), decision.eligible_queued);
+        try std.testing.expectEqual(@as(usize, 0), decision.ineligible_queued);
+    }
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "pagerank",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqualStrings("doc:d", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db graph metric runtime default gate runUntilIdle default graph metric maintenance auto can cap larger pagerank" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "default-auto-large-pagerank-fallback",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+        .graph_metric_idle_auto_options = .{
+            .max_pagerank_iterations = 3,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":4,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, false, 0, 0, 0, 1);
+
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "pagerank",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqualStrings("doc:d", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db graph metric runtime default gate runUntilIdle default graph metric maintenance auto can widen pagerank planned gate" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "default-auto-wide-pagerank-planned",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+        .graph_metric_idle_auto_options = .{
+            .max_pagerank_iterations = 4,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":4,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    {
+        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
+        try std.testing.expect(decision.shouldRunPlanned());
+        try std.testing.expectEqual(@as(usize, 0), decision.active_builds);
+        try std.testing.expectEqual(@as(usize, 1), decision.eligible_queued);
+        try std.testing.expectEqual(@as(usize, 0), decision.ineligible_queued);
+    }
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "pagerank",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqualStrings("doc:d", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db graph metric runtime default gate runUntilIdle default graph metric maintenance auto chooses bounded planned for multi metric indexes" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "default-auto-multi-fallback",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":3,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 2, 0, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 2), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "pagerank",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "pagerank",
+                    .top_k = 2,
+                    .freshness = .fresh,
+                },
+            },
+            .{
+                .name = "degree",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "degree",
+                    .top_k = 1,
+                    .freshness = .fresh,
+                },
+            },
+        },
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[1].status.state);
+    try std.testing.expectEqualStrings("doc:b", metric_result.graph_metric_results[1].scores[0].node);
+}
+
+test "db graph metric runtime default gate runUntilIdle default graph metric maintenance auto chooses planned for one small eigenvector" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "default-auto-eigenvector-idle",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"eigenvector\":{\"enabled\":true,\"kind\":\"eigenvector\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "eigenvector",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "eigenvector",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results[0].scores.len);
+}
+
+test "db graph metric runtime default gate runUntilIdle default graph metric maintenance auto chooses planned for compatible hits by default" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "default-auto-hits-fallback",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:hub-a", .value = "{\"title\":\"hub a\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:hub-b", .value = "{\"title\":\"hub b\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:authority", .value = "{\"title\":\"authority\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "authority",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_authority",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+            .{
+                .name = "hub",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_hub",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+        },
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[1].status.state);
+    try std.testing.expectEqual(metric_result.graph_metric_results[0].status.published_generation, metric_result.graph_metric_results[1].status.published_generation);
+}
+
+test "db graph metric runtime default gate runUntilIdle default graph metric maintenance auto resumes active planned pagerank" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "default-auto-active-pagerank",
+            .max_rounds = 0,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"manual\",\"max_iterations\":3,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "pagerank", target_generation);
+    defer started.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+    try std.testing.expectEqual(target_generation, started.building_generation);
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 1, 0, 0, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "pagerank",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqualStrings("doc:d", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance chooses planned for one small pagerank" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-planned-idle",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":3,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "pagerank",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqualStrings("doc:d", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance chooses planned for one degree" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-degree-idle",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqualStrings("doc:b", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance chooses planned for one small eigenvector" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-eigenvector-idle",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"eigenvector\":{\"enabled\":true,\"kind\":\"eigenvector\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "eigenvector",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "eigenvector",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results[0].scores.len);
+}
+
+test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance chooses bounded planned for multi metric indexes" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-legacy-fallback",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":3,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 2, 0, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 2), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "pagerank",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "pagerank",
+                    .top_k = 2,
+                    .freshness = .fresh,
+                },
+            },
+            .{
+                .name = "degree",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "degree",
+                    .top_k = 1,
+                    .freshness = .fresh,
+                },
+            },
+        },
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[1].status.state);
+    try std.testing.expectEqualStrings("doc:b", metric_result.graph_metric_results[1].scores[0].node);
+}
+
+test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance defers queued work at per-index cap" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-bounded-fair-cap",
+            .max_rounds = 200,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+        .graph_metric_idle_auto_options = .{
+            .max_active_builds_per_index = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":3,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 1, 0);
+
+    try db.runUntilIdle();
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "pagerank",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "pagerank",
+                    .top_k = 2,
+                    .freshness = .fresh,
+                },
+            },
+            .{
+                .name = "degree",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "degree",
+                    .top_k = 1,
+                    .freshness = .fresh,
+                },
+            },
+        },
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[1].status.state);
+}
+
+test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance can cap larger pagerank" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-large-fallback",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+        .graph_metric_idle_auto_options = .{
+            .max_pagerank_iterations = 3,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":4,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, false, 0, 0, 0, 1);
+
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "pagerank",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqualStrings("doc:d", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance can cap larger eigenvector" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-large-eigenvector-fallback",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+        .graph_metric_idle_auto_options = .{
+            .max_eigenvector_iterations = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"eigenvector\":{\"enabled\":true,\"kind\":\"eigenvector\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, false, 0, 0, 0, 1);
+
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "eigenvector",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "eigenvector",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results[0].scores.len);
+}
+
+test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance can widen eigenvector planned gate" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-wide-eigenvector-planned",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+        .graph_metric_idle_auto_options = .{
+            .max_eigenvector_iterations = 2,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"eigenvector\":{\"enabled\":true,\"kind\":\"eigenvector\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    {
+        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
+        try std.testing.expect(decision.shouldRunPlanned());
+        try std.testing.expectEqual(@as(usize, 0), decision.active_builds);
+        try std.testing.expectEqual(@as(usize, 1), decision.eligible_queued);
+        try std.testing.expectEqual(@as(usize, 0), decision.ineligible_queued);
+    }
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "eigenvector",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "eigenvector",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results[0].scores.len);
+}
+
+test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance chooses planned for compatible hits by default" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-hits-default-fallback",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:hub-a", .value = "{\"title\":\"hub a\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:hub-b", .value = "{\"title\":\"hub b\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:authority", .value = "{\"title\":\"authority\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "authority",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_authority",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+            .{
+                .name = "hub",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_hub",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+        },
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[1].status.state);
+    try std.testing.expectEqual(metric_result.graph_metric_results[0].status.published_generation, metric_result.graph_metric_results[1].status.published_generation);
+}
+
+test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance falls back for incompatible hits pair" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-hits-incompatible-fallback",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+        .graph_metric_idle_auto_options = .{
+            .max_hits_iterations = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.00001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:hub-a", .value = "{\"title\":\"hub a\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:hub-b", .value = "{\"title\":\"hub b\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:authority", .value = "{\"title\":\"authority\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, false, 0, 0, 0, 1);
+
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "authority",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_authority",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+            .{
+                .name = "hub",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_hub",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+        },
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[1].status.state);
+}
+
+test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance chooses planned for one compatible small hits pair" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-hits-opt-in",
+            .max_rounds = 1,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+        .graph_metric_idle_auto_options = .{
+            .max_hits_iterations = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:hub-a", .value = "{\"title\":\"hub a\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:hub-b", .value = "{\"title\":\"hub b\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:authority", .value = "{\"title\":\"authority\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    {
+        const decision = try db.core.index_manager.graphMetricPlannedAutoIdleDecision(db.graph_metric_idle_auto_options);
+        try std.testing.expect(decision.shouldRunPlanned());
+        try std.testing.expectEqual(@as(usize, 0), decision.active_builds);
+        try std.testing.expectEqual(@as(usize, 1), decision.eligible_queued);
+        try std.testing.expectEqual(@as(usize, 0), decision.ineligible_queued);
+    }
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "authority",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_authority",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+            .{
+                .name = "hub",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_hub",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+        },
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[1].status.state);
+    try std.testing.expectEqual(metric_result.graph_metric_results[0].status.published_generation, metric_result.graph_metric_results[1].status.published_generation);
+    try std.testing.expectEqual(@as(usize, 3), metric_result.graph_metric_results[0].scores.len);
+    try std.testing.expectEqual(@as(usize, 3), metric_result.graph_metric_results[1].scores.len);
+    try std.testing.expectEqualStrings("doc:authority", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance resumes active planned degree" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-active-degree",
+            .max_rounds = 0,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"manual\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "degree", target_generation);
+    defer started.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+    try std.testing.expectEqual(target_generation, started.building_generation);
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 1, 0, 0, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results[0].scores.len);
+    try std.testing.expectEqualStrings("doc:b", metric_result.graph_metric_results[0].scores[0].node);
+}
+
+test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance resumes active planned eigenvector" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-active-eigenvector",
+            .max_rounds = 0,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"eigenvector\":{\"enabled\":true,\"kind\":\"eigenvector\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "eigenvector", target_generation);
+    defer started.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+    try std.testing.expectEqual(target_generation, started.building_generation);
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 1, 0, 0, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "eigenvector",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "eigenvector",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results[0].scores.len);
+}
+
+test "db graph metric runtime default gate runUntilIdle auto graph metric maintenance resumes active planned hits pair" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .auto,
+        .graph_metric_idle_planned_options = .{
+            .worker_id = "auto-active-hits",
+            .max_rounds = 0,
+            .max_metrics_per_round = 8,
+            .max_pages_per_round = 1,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"store\":true}",
+    });
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:hub-a", .value = "{\"title\":\"hub a\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:hub-b", .value = "{\"title\":\"hub b\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:authority", .value = "{\"title\":\"authority\"}" },
+        },
+        .sync_level = .full_index,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "hits_authority", target_generation);
+    defer started.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+    try std.testing.expectEqual(target_generation, started.building_generation);
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 1, 0, 0, 0);
+
+    try std.testing.expectError(error.RunUntilIdleDidNotConverge, db.runUntilIdle());
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 1), pending.active_builds);
+    }
+
+    db.graph_metric_idle_planned_options.max_rounds = 200;
+    try db.runUntilIdle();
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{
+            .{
+                .name = "authority",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_authority",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+            .{
+                .name = "hub",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_hub",
+                    .top_k = 3,
+                    .freshness = .fresh,
+                },
+            },
+        },
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[1].status.state);
+    try std.testing.expectEqual(metric_result.graph_metric_results[0].status.published_generation, metric_result.graph_metric_results[1].status.published_generation);
+    try std.testing.expectEqual(@as(usize, 3), metric_result.graph_metric_results[0].scores.len);
+    try std.testing.expectEqual(@as(usize, 3), metric_result.graph_metric_results[1].scores.len);
+    try std.testing.expectEqualStrings("doc:authority", metric_result.graph_metric_results[0].scores[0].node);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), metric_result.graph_metric_results[0].scores[0].score, 0.001);
+    try std.testing.expect(metric_result.graph_metric_results[1].scores[0].score >= metric_result.graph_metric_results[1].scores[1].score);
+    try std.testing.expect(metric_result.graph_metric_results[1].scores[1].score > metric_result.graph_metric_results[1].scores[2].score);
 }

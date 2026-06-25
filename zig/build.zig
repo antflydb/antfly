@@ -3198,43 +3198,25 @@ pub fn build(b: *std.Build) void {
     for (root_test_skip_filters) |filter| {
         run_graph_metric_cleanup_tests.addArgs(&.{ "--skip-test-filter", filter });
     }
+    const graph_metric_degree_canary_default_filters = [_][]const u8{
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime degree canary ",
+    };
     const graph_metric_degree_canary_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &.{"degree canary"}),
+        .filters = selectTestFilters(b, &graph_metric_degree_canary_default_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
     const run_graph_metric_degree_canary_tests = b.addRunArtifact(graph_metric_degree_canary_tests);
+    const graph_metric_degree_canary_step = b.step("graph-metric-degree-canary-test", "Run focused graph metric degree-canary tests");
+    graph_metric_degree_canary_step.dependOn(&run_graph_metric_degree_canary_tests.step);
     for (root_test_skip_filters) |filter| {
         run_graph_metric_degree_canary_tests.addArgs(&.{ "--skip-test-filter", filter });
     }
     const graph_metric_default_gate_default_filters = [_][]const u8{
-        "db runUntilIdle can use planned graph metric maintenance when enabled",
-        "db runUntilIdle planned graph metric maintenance reports budget exhaustion and resumes",
-        "db runUntilIdle default graph metric maintenance auto chooses planned for one degree",
-        "db runUntilIdle default graph metric maintenance auto chooses planned for one small pagerank",
-        "db runUntilIdle default graph metric maintenance auto can cap larger pagerank",
-        "db runUntilIdle default graph metric maintenance auto can widen pagerank planned gate",
-        "db runUntilIdle default graph metric maintenance auto chooses bounded planned for multi metric indexes",
-        "db runUntilIdle default graph metric maintenance auto chooses planned for one small eigenvector",
-        "db runUntilIdle default graph metric maintenance auto chooses planned for compatible hits by default",
-        "db runUntilIdle default graph metric maintenance auto resumes active planned pagerank",
-        "db runUntilIdle auto graph metric maintenance chooses planned for one small pagerank",
-        "db runUntilIdle auto graph metric maintenance chooses planned for one degree",
-        "db runUntilIdle auto graph metric maintenance chooses planned for one small eigenvector",
-        "db runUntilIdle auto graph metric maintenance chooses bounded planned for multi metric indexes",
-        "db runUntilIdle auto graph metric maintenance defers queued work at per-index cap",
-        "db runUntilIdle auto graph metric maintenance can cap larger pagerank",
-        "db runUntilIdle auto graph metric maintenance can cap larger eigenvector",
-        "db runUntilIdle auto graph metric maintenance can widen eigenvector planned gate",
-        "db runUntilIdle auto graph metric maintenance chooses planned for compatible hits by default",
-        "db runUntilIdle auto graph metric maintenance falls back for incompatible hits pair",
-        "db runUntilIdle auto graph metric maintenance chooses planned for one compatible small hits pair",
-        "db runUntilIdle auto graph metric maintenance resumes active planned degree",
-        "db runUntilIdle auto graph metric maintenance resumes active planned eigenvector",
-        "db runUntilIdle auto graph metric maintenance resumes active planned hits pair",
+        "storage.db.maintenance.graph_metric_runtime.test.db graph metric runtime default gate ",
     };
     const graph_metric_default_gate_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -3245,6 +3227,8 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_graph_metric_default_gate_tests = b.addRunArtifact(graph_metric_default_gate_tests);
+    const graph_metric_default_gate_step = b.step("graph-metric-default-gate-test", "Run focused graph metric default-gate tests");
+    graph_metric_default_gate_step.dependOn(&run_graph_metric_default_gate_tests.step);
     for (root_test_skip_filters) |filter| {
         run_graph_metric_default_gate_tests.addArgs(&.{ "--skip-test-filter", filter });
     }
@@ -3539,7 +3523,7 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "storage.db.enrichment.enrichment_runtime.test.db enrichment runtime ",
-            "storage.db.derived_async.test.db derived async replay ",
+            "storage.db.derived_async.test.db derived async ",
             "storage.db.split_restore_test.test.db split cutover",
             "storage.db.split_restore_test.test.db merge-style cutover",
         },
@@ -3561,7 +3545,7 @@ pub fn build(b: *std.Build) void {
     const lib_db_enrichment_replay_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
-            "storage.db.derived_async.test.db derived async replay ",
+            "storage.db.derived_async.test.db derived async ",
         },
     });
     const run_lib_db_enrichment_replay_tests = b.addRunArtifact(lib_db_enrichment_replay_tests);
@@ -3582,8 +3566,7 @@ pub fn build(b: *std.Build) void {
     const lib_db_enrichment_split_cutover_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
-            "storage.db.split_restore_test.test.db split cutover fences enrichment to the owning range",
-            "storage.db.split_restore_test.test.db split cutover preserves enrichment resume and fencing across reopen",
+            "storage.db.split_restore_test.test.db split cutover enrichment ",
         },
     });
     const run_lib_db_enrichment_split_cutover_tests = b.addRunArtifact(lib_db_enrichment_split_cutover_tests);
@@ -3593,8 +3576,7 @@ pub fn build(b: *std.Build) void {
     const lib_db_enrichment_merge_cutover_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
-            "storage.db.split_restore_test.test.db merge-style cutover fences enrichment to the merged receiver range",
-            "storage.db.split_restore_test.test.db merge-style cutover preserves enrichment resume and fencing across reopen",
+            "storage.db.split_restore_test.test.db merge-style cutover enrichment ",
         },
     });
     const run_lib_db_enrichment_merge_cutover_tests = b.addRunArtifact(lib_db_enrichment_merge_cutover_tests);
@@ -3603,7 +3585,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_db_enrichment_split_cutover_reopen_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"storage.db.split_restore_test.test.db split cutover preserves enrichment resume and fencing across reopen"},
+        .filters = &.{"storage.db.split_restore_test.test.db split cutover enrichment resume "},
     });
     const run_lib_db_enrichment_split_cutover_reopen_tests = b.addRunArtifact(lib_db_enrichment_split_cutover_reopen_tests);
     const lib_db_enrichment_split_cutover_reopen_step = b.step("lib-db-enrichment-split-cutover-reopen-test", "Run root-module DB split cutover reopen test");
@@ -3611,7 +3593,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_db_enrichment_merge_cutover_reopen_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"storage.db.split_restore_test.test.db merge-style cutover preserves enrichment resume and fencing across reopen"},
+        .filters = &.{"storage.db.split_restore_test.test.db merge-style cutover enrichment resume "},
     });
     const run_lib_db_enrichment_merge_cutover_reopen_tests = b.addRunArtifact(lib_db_enrichment_merge_cutover_reopen_tests);
     const lib_db_enrichment_merge_cutover_reopen_step = b.step("lib-db-enrichment-merge-cutover-reopen-test", "Run root-module DB merge cutover reopen test");
@@ -3627,6 +3609,10 @@ pub fn build(b: *std.Build) void {
             "storage.db.db.test.db search ",
             "storage.db.db.test.db document _edges",
             "storage.db.db.test.db document _embeddings",
+            "storage.db.search_runtime.test.db search runtime indexing ",
+            "storage.db.search_runtime.test.db search runtime graph composition ",
+            "storage.db.search_runtime.test.db search runtime text schema ",
+            "storage.db.search_runtime.test.db search runtime identity ",
         },
     });
     const run_lib_db_query_tests = b.addRunArtifact(lib_db_query_tests);
@@ -3635,24 +3621,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_db_result_shape_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{
-            "dedupeSearchHitsById uses ordinals when hit page is complete",
-            "applyStoredSearchPatternFilters resolves native doc id constraints to hit ordinals",
-            "applyStoredSearchPatternFilters uses hit ordinals for resolved doc filters",
-            "applyStoredSearchPatternFilters fails closed without resolved ordinal projection",
-            "applyStoredSearchPatternFilters fails closed when ordinal projection is unsupported",
-            "native dense constraints fail closed without ordinal vector mapping",
-            "buildPatternDocumentHits preserves resolved binding ordinals",
-            "executeSingleNonPatternQueryWithSets hydrates graph documents from include_documents",
-            "executeSingleNonPatternQueryWithSets hides metric status unless requested",
-            "executeSearchGraphWithSets preserves node ordinals",
-            "cloneNamedSetAsResult preserves hit ordinals",
-            "fuseNamedSets preserves source hit ordinals",
-            "fuseNamedSets deduplicates aliases by ordinal when complete",
-            "fuseNamedSets drops conflicting source hit ordinals",
-            "applyGraphUnion deduplicates by ordinals when hit pages are complete",
-            "applyGraphIntersection uses ordinals when hit pages are complete",
-        },
+        .filters = &.{"db query result shape "},
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -4647,20 +4616,14 @@ pub fn build(b: *std.Build) void {
             "export and import preserves doc identity metadata",
             "import rejects doc identity metadata with invalid canonical ids",
             "import rejects doc identity namespace mismatch unless preserving existing namespace",
-            "db resolved doc-set projection honors identity read generation",
-            "db doc set planning stats record ordinal bitmap promotion",
-            "db search requests default to current identity generation snapshot",
-            "db validates internal resolved doc filter wire namespace and generation",
-            "db explicit doc-id filter resolution honors identity generation",
+            "storage.db.search_runtime.test.db search runtime identity ",
             "doc filter wire round-trips ordinal and doc-key filters",
             "doc filter wire rejects old required-field fixtures but tolerates additive fields",
             "doc filter wire rejects invalid ordinal fixtures from mixed-version senders",
             "dense vector id ignores ordinal metadata for a different doc",
             "dense metadata prefetch includes legacy ordinal vector ids",
-            "db dense index stores stable vector ids with ordinal filter mappings",
             "db dense artifact rebuild preserves stable vector ids distinct from ordinals",
             "db sparse index keeps physical doc nums distinct from doc identity ordinals",
-            "db sparse hits resolve doc ordinals through identity not sparse doc nums",
             "native dense constraints fail closed without ordinal vector mapping",
             "native constraints fail closed when resolved ordinals cannot be represented",
             "native sparse constraints fail closed without ordinal doc num mapper",
@@ -5148,9 +5111,7 @@ pub fn build(b: *std.Build) void {
             "db stats flag document identity ordinal capacity exhaustion",
             "db rejects new document writes at ordinal exhaustion for every sync level",
             "db transaction intent writes reject new documents at ordinal exhaustion",
-            "db search requests default to current identity generation snapshot",
-            "db validates internal resolved doc filter wire namespace and generation",
-            "db resolved doc-set projection honors identity read generation",
+            "storage.db.search_runtime.test.db search runtime identity ",
             "doc filter wire rejects old required-field fixtures but tolerates additive fields",
             "doc filter wire rejects invalid ordinal fixtures from mixed-version senders",
         },
@@ -6011,6 +5972,17 @@ pub fn build(b: *std.Build) void {
     const run_db_search_runtime_tests = b.addRunArtifact(db_search_runtime_tests);
     const db_search_runtime_test_step = b.step("db-search-runtime-test", "Run focused storage/db search runtime tests");
     db_search_runtime_test_step.dependOn(&run_db_search_runtime_tests.step);
+
+    const db_lifecycle_default_filters = [_][]const u8{
+        "storage.db.lifecycle.test.",
+    };
+    const db_lifecycle_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = selectTestFilters(b, &db_lifecycle_default_filters),
+    });
+    const run_db_lifecycle_tests = b.addRunArtifact(db_lifecycle_tests);
+    const db_lifecycle_test_step = b.step("db-lifecycle-test", "Run focused storage/db lifecycle tests");
+    db_lifecycle_test_step.dependOn(&run_db_lifecycle_tests.step);
 
     const lib_db_reopen_tests = b.addTest(.{
         .root_module = db_test_mod,

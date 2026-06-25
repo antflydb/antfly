@@ -541,7 +541,7 @@ pub fn applyGraphExpandStrategy(
     }
 }
 
-test "applyGraphUnion deduplicates by ordinals when hit pages are complete" {
+test "db query result shape applyGraphUnion deduplicates by ordinals when hit pages are complete" {
     const alloc = std.testing.allocator;
 
     var result = types.SearchResult{
@@ -580,7 +580,7 @@ test "applyGraphUnion deduplicates by ordinals when hit pages are complete" {
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 9), result.hits[1].doc_ordinal);
 }
 
-test "applyGraphIntersection uses ordinals when hit pages are complete" {
+test "db query result shape applyGraphIntersection uses ordinals when hit pages are complete" {
     const alloc = std.testing.allocator;
 
     var result = types.SearchResult{
@@ -3128,7 +3128,7 @@ test "jsonDocMatchesPatternFilter supports stored structured filters" {
     try std.testing.expect(try compiled_contains.matches(alloc, "doc:b", parsed_geo_doc.value));
 }
 
-test "executeSingleNonPatternQueryWithSets hydrates graph documents from include_documents" {
+test "db query result shape executeSingleNonPatternQueryWithSets hydrates graph documents from include_documents" {
     const alloc = std.testing.allocator;
 
     const Harness = struct {
@@ -3242,7 +3242,7 @@ test "executeSingleNonPatternQueryWithSets hydrates graph documents from include
     try std.testing.expectEqualStrings("{\"title\":\"child\",\"body\":\"details about the architecture\"}", result.hits[0].stored_data.?);
 }
 
-test "executeSingleNonPatternQueryWithSets hides metric status unless requested" {
+test "db query result shape executeSingleNonPatternQueryWithSets hides metric status unless requested" {
     const alloc = std.testing.allocator;
 
     const Harness = struct {
@@ -3334,7 +3334,7 @@ test "executeSingleNonPatternQueryWithSets hides metric status unless requested"
     try std.testing.expectEqual(@as(u64, 5), included.metric_status[0].published_generation);
 }
 
-test "executeSearchGraphWithSets preserves node ordinals" {
+test "db query result shape executeSearchGraphWithSets preserves node ordinals" {
     const alloc = std.testing.allocator;
 
     const Harness = struct {
@@ -3411,7 +3411,7 @@ test "executeSearchGraphWithSets preserves node ordinals" {
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 77), result.hits[0].doc_ordinal);
 }
 
-test "cloneNamedSetAsResult preserves hit ordinals" {
+test "db query result shape cloneNamedSetAsResult preserves hit ordinals" {
     const alloc = std.testing.allocator;
 
     const hit_id = try alloc.dupe(u8, "doc:a");
@@ -3443,7 +3443,7 @@ test "cloneNamedSetAsResult preserves hit ordinals" {
     try std.testing.expectEqualStrings("{\"title\":\"A\"}", with_stored.hits[0].stored_data.?);
 }
 
-test "buildPatternDocumentHits preserves resolved binding ordinals" {
+test "db query result shape buildPatternDocumentHits preserves resolved binding ordinals" {
     const alloc = std.testing.allocator;
 
     var bindings = try alloc.alloc(types.GraphPatternBinding, 2);
@@ -3534,7 +3534,7 @@ test "buildPatternDocumentHits preserves resolved binding ordinals" {
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 12), hits[1].doc_ordinal);
 }
 
-test "fuseNamedSets preserves source hit ordinals" {
+test "db query result shape fuseNamedSets preserves source hit ordinals" {
     const alloc = std.testing.allocator;
 
     const id_a = try alloc.dupe(u8, "doc:a");
@@ -3578,7 +3578,7 @@ test "fuseNamedSets preserves source hit ordinals" {
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 12), result.hits[1].doc_ordinal);
 }
 
-test "fuseNamedSets deduplicates aliases by ordinal when complete" {
+test "db query result shape fuseNamedSets deduplicates aliases by ordinal when complete" {
     const alloc = std.testing.allocator;
 
     const dense_id = try alloc.dupe(u8, "doc:a");
@@ -3634,7 +3634,7 @@ test "fuseNamedSets deduplicates aliases by ordinal when complete" {
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 11), result.hits[0].doc_ordinal);
 }
 
-test "fuseNamedSets drops conflicting source hit ordinals" {
+test "db query result shape fuseNamedSets drops conflicting source hit ordinals" {
     const alloc = std.testing.allocator;
 
     const dense_id = try alloc.dupe(u8, "doc:a");

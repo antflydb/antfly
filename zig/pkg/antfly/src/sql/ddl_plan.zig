@@ -3271,6 +3271,10 @@ pub fn ddlPlanFromGeneratedAstAlloc(
         .alter_view,
         .drop_view,
         => try viewCatalogPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options),
+        .create_materialized_view,
+        .drop_materialized_view,
+        .refresh_materialized_view,
+        => try materializedViewCatalogPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options),
         .create_domain,
         .alter_domain,
         .drop_domain,
@@ -3310,6 +3314,7 @@ fn generatedDdlUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated
         .create_database,
         .create_schema,
         .create_view,
+        .create_materialized_view,
         .create_domain,
         .create_sequence,
         .create_enum_type,
@@ -3323,6 +3328,7 @@ fn generatedDdlUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated
         .alter_enum_type,
         .drop_table,
         .drop_view,
+        .drop_materialized_view,
         .drop_domain,
         .drop_sequence,
         .drop_enum_type,
@@ -3337,6 +3343,7 @@ fn generatedDdlUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated
         .drop_schema,
         .drop_database,
         .drop_extension,
+        .refresh_materialized_view,
         => true,
         .create_table => generatedCreateTableUsesRuntimeBoundary(tokens, ast),
         .create_index => generatedCreateIndexUsesRuntimeBoundary(tokens, ast),
@@ -3431,6 +3438,85 @@ fn validateGeneratedViewDdlAst(tokens: []const grammar.Token, ast: generated_par
             if (object_name.start != name_index) return error.UnsupportedSqlShape;
             const has_cascade = generatedRangeHasKeyword(tokens, .{ .start = object_name.end, .end = end }, "cascade");
             if (has_cascade != ast.cascade) return error.UnsupportedSqlShape;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
+fn materializedViewCatalogPlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+    options: DdlPlanParserOptions,
+) !LoweredDdlPlan {
+    try validateGeneratedMaterializedViewDdlAst(tokens, ast);
+    var pos: usize = 0;
+    var plan = try parseDdlPlanAlloc(alloc, tokens, &pos, options);
+    errdefer plan.deinit(alloc);
+    if (pos != tokens.len) return error.UnsupportedSqlShape;
+    switch (ast.kind) {
+        .create_materialized_view => switch (plan) {
+            .materialized_view_catalog => |catalog| switch (catalog) {
+                .create => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .drop_materialized_view => switch (plan) {
+            .materialized_view_catalog => |catalog| switch (catalog) {
+                .drop => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .refresh_materialized_view => switch (plan) {
+            .materialized_view_catalog => |catalog| switch (catalog) {
+                .refresh => {},
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+    return plan;
+}
+
+fn validateGeneratedMaterializedViewDdlAst(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) !void {
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    const object_name = ast.object_name_tokens orelse return error.UnsupportedSqlShape;
+    if (object_name.start >= object_name.end or object_name.end > end) return error.UnsupportedSqlShape;
+    switch (ast.kind) {
+        .create_materialized_view => {
+            if (end < 6 or !tokens[0].matchesKeyword("create") or !tokens[1].matchesKeyword("materialized") or !tokens[2].matchesKeyword("view")) return error.UnsupportedSqlShape;
+            var name_index: usize = 3;
+            const if_not_exists = consumeGeneratedPlanIfNotExists(tokens, &name_index, end);
+            if (if_not_exists != ast.if_not_exists) return error.UnsupportedSqlShape;
+            if (object_name.start != name_index) return error.UnsupportedSqlShape;
+            const operation = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+            if (operation.start != object_name.end or operation.end != end or operation.start >= end) return error.UnsupportedSqlShape;
+            if (!tokens[operation.start].matchesKeyword("as") and tokens[operation.start].kind != .lparen) return error.UnsupportedSqlShape;
+        },
+        .drop_materialized_view => {
+            if (end < 4 or !tokens[0].matchesKeyword("drop") or !tokens[1].matchesKeyword("materialized") or !tokens[2].matchesKeyword("view")) return error.UnsupportedSqlShape;
+            var name_index: usize = 3;
+            const if_exists = consumeGeneratedPlanIfExists(tokens, &name_index, end);
+            if (if_exists != ast.if_exists) return error.UnsupportedSqlShape;
+            if (object_name.start != name_index) return error.UnsupportedSqlShape;
+            const has_cascade = generatedRangeHasKeyword(tokens, .{ .start = object_name.end, .end = end }, "cascade");
+            if (has_cascade != ast.cascade) return error.UnsupportedSqlShape;
+        },
+        .refresh_materialized_view => {
+            if (end < 4 or !tokens[0].matchesKeyword("refresh") or !tokens[1].matchesKeyword("materialized") or !tokens[2].matchesKeyword("view")) return error.UnsupportedSqlShape;
+            var name_index: usize = 3;
+            if (name_index < end and tokens[name_index].matchesKeyword("concurrently")) name_index += 1;
+            if (object_name.start != name_index) return error.UnsupportedSqlShape;
+            if (object_name.end < end) {
+                const operation = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
+                if (operation.start != object_name.end or operation.end != end or operation.start >= end) return error.UnsupportedSqlShape;
+                if (!tokens[operation.start].matchesKeyword("with")) return error.UnsupportedSqlShape;
+            } else if (ast.alter_table_operation_tokens != null) {
+                return error.UnsupportedSqlShape;
+            }
         },
         else => return error.UnsupportedSqlShape,
     }
@@ -4511,6 +4597,7 @@ fn validateGeneratedDdlAstSpans(
         .create_schema,
         .create_table,
         .create_view,
+        .create_materialized_view,
         .create_domain,
         .create_sequence,
         .create_enum_type,
@@ -4535,6 +4622,7 @@ fn validateGeneratedDdlAstSpans(
         => .alter,
         .drop_table,
         .drop_view,
+        .drop_materialized_view,
         .drop_domain,
         .drop_sequence,
         .drop_enum_type,
@@ -4546,6 +4634,7 @@ fn validateGeneratedDdlAstSpans(
         .drop_database,
         .drop_extension,
         => .drop,
+        .refresh_materialized_view => .refresh,
     };
     if (!tokens[0].matchesKeywordTag(expected)) return error.UnsupportedSqlShape;
 }
@@ -9648,7 +9737,6 @@ const GeneratedUnsupportedCatalogBoundaryFamily = enum {
     cursor_savepoint,
     logical_replication,
     maintenance,
-    materialized_view,
     notification,
     procedure_call,
     row_policy,
@@ -9672,7 +9760,6 @@ fn generatedUnsupportedCatalogBoundary(
             .close, .declare, .fetch, .release, .savepoint => .{ .family = .cursor_savepoint, .kind = kind },
             .alter_publication, .alter_subscription, .create_publication, .create_subscription, .drop_publication, .drop_subscription => .{ .family = .logical_replication, .kind = kind },
             .analyze, .cluster, .reindex, .vacuum => .{ .family = .maintenance, .kind = kind },
-            .create_materialized_view, .drop_materialized_view, .refresh => .{ .family = .materialized_view, .kind = kind },
             .listen, .notify, .unlisten => .{ .family = .notification, .kind = kind },
             .call => .{ .family = .procedure_call, .kind = kind },
             .create_policy, .alter_policy, .drop_policy => .{ .family = .row_policy, .kind = kind },
@@ -9872,24 +9959,6 @@ fn validateGeneratedUnsupportedCatalogAst(
             },
             .vacuum => {
                 if (end < 1 or !tokens[0].matchesKeyword("vacuum")) {
-                    return error.UnsupportedSqlShape;
-                }
-            },
-            else => return error.UnsupportedSqlShape,
-        },
-        .materialized_view => switch (boundary.kind) {
-            .create_materialized_view => {
-                if (end < 3 or !tokens[0].matchesKeyword("create") or !tokens[1].matchesKeyword("materialized") or !tokens[2].matchesKeyword("view")) {
-                    return error.UnsupportedSqlShape;
-                }
-            },
-            .drop_materialized_view => {
-                if (end < 3 or !tokens[0].matchesKeyword("drop") or !tokens[1].matchesKeyword("materialized") or !tokens[2].matchesKeyword("view")) {
-                    return error.UnsupportedSqlShape;
-                }
-            },
-            .refresh => {
-                if (end < 3 or !tokens[0].matchesKeyword("refresh") or !tokens[1].matchesKeyword("materialized") or !tokens[2].matchesKeyword("view")) {
                     return error.UnsupportedSqlShape;
                 }
             },
@@ -10140,30 +10209,6 @@ fn catalogDdlPlanFromGeneratedUnsupportedAstAlloc(
             .vacuum => switch (plan) {
                 .maintenance_job => |maintenance| switch (maintenance) {
                     .vacuum => {},
-                    else => return error.UnsupportedSqlShape,
-                },
-                else => return error.UnsupportedSqlShape,
-            },
-            else => return error.UnsupportedSqlShape,
-        },
-        .materialized_view => switch (boundary.kind) {
-            .create_materialized_view => switch (plan) {
-                .materialized_view_catalog => |catalog| switch (catalog) {
-                    .create => {},
-                    else => return error.UnsupportedSqlShape,
-                },
-                else => return error.UnsupportedSqlShape,
-            },
-            .drop_materialized_view => switch (plan) {
-                .materialized_view_catalog => |catalog| switch (catalog) {
-                    .drop => {},
-                    else => return error.UnsupportedSqlShape,
-                },
-                else => return error.UnsupportedSqlShape,
-            },
-            .refresh => switch (plan) {
-                .materialized_view_catalog => |catalog| switch (catalog) {
-                    .refresh => {},
                     else => return error.UnsupportedSqlShape,
                 },
                 else => return error.UnsupportedSqlShape,
@@ -15667,7 +15712,7 @@ test "sql adapter ddl plan lowers routine expression bindings into ddl plans" {
     try std.testing.expectEqualStrings("status", routine_policy_expression.lhs.operands[0].field);
 }
 
-test "sql adapter generated materialized view unsupported AST lowers to catalog plans" {
+test "sql adapter generated materialized view DDL AST lowers to catalog plans" {
     const alloc = std.testing.allocator;
 
     var create_sql = try tokenized.ParsedSql.initAlloc(
@@ -15736,7 +15781,7 @@ test "sql adapter generated materialized view unsupported AST lowers to catalog 
     if (malformed_kind.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.kind = .create_rule,
+                .ddl => |*ddl| ddl.kind = .drop_materialized_view,
                 else => return error.TestUnexpectedResult,
             }
         } else return error.TestUnexpectedResult;
@@ -15751,7 +15796,7 @@ test "sql adapter generated materialized view unsupported AST lowers to catalog 
     if (malformed_subject.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .unsupported => |*unsupported| unsupported.subject_tokens = .{ .start = 2, .end = malformed_subject.items().len },
+                .ddl => |*ddl| ddl.object_name_tokens = .{ .start = 2, .end = malformed_subject.items().len },
                 else => return error.TestUnexpectedResult,
             }
         } else return error.TestUnexpectedResult;

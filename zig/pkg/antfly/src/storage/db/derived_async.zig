@@ -32,8 +32,10 @@ const db_internal = @import("internal.zig");
 const derived_types = @import("derived/derived_types.zig");
 const derived_executor_mod = @import("derived/derived_executor.zig");
 const derived_worker = @import("derived/derived_worker.zig");
+const doc_identity = @import("doc_identity.zig");
 const docstore_mod = @import("../docstore.zig");
 const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
+const embedder_mod = @import("enrichment/embedder.zig");
 const enrichment_runtime_mod = @import("enrichment/enrichment_runtime.zig");
 const enrichment_state = @import("enrichment/enrichment_state.zig");
 const enrichment_worker = @import("enrichment/enrichment_worker.zig");
@@ -45,6 +47,7 @@ const index_manager_mod = @import("catalog/index_manager.zig");
 const internal_keys = @import("../internal_keys.zig");
 const mapper = @import("document_mapper.zig");
 const promotion_runtime_mod = @import("promotion_runtime.zig");
+const replay_stream_mod = @import("derived/replay_stream.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const resolution_runtime_mod = @import("resolution_runtime.zig");
 const types = @import("types.zig");
@@ -5509,4 +5512,948 @@ test "db derived async replay replay applies dense embeddings from artifact payl
 
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "db derived async dense artifact rebuild rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded repairs external dense doc gaps on reopen" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const threadedIo = db_internal.threadedIo;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+        try db.addIndex(.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_embeddings\":{\"dense_idx\":[0,1,0]}}" },
+                .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_embeddings\":{\"dense_idx\":[0.9,0.1,0]}}" },
+            },
+            .sync_level = .full_index,
+        });
+    }
+
+    const dense_index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
+    defer alloc.free(dense_index_path);
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+    });
+    defer reopened.close();
+
+    {
+        const stats = try reopened.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 3), stats.doc_count);
+        var dense_doc_count: ?u64 = null;
+        for (stats.indexes) |index| {
+            if (!std.mem.eql(u8, index.name, "dense_idx")) continue;
+            dense_doc_count = index.doc_count;
+        }
+        try std.testing.expectEqual(@as(?u64, 0), dense_doc_count);
+    }
+
+    const rebuilt = try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+    try std.testing.expect(rebuilt > 0);
+    try reopened.runUntilIdle();
+
+    const stats = try reopened.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    var dense_doc_count: ?u64 = null;
+    for (stats.indexes) |index| {
+        if (!std.mem.eql(u8, index.name, "dense_idx")) continue;
+        dense_doc_count = index.doc_count;
+    }
+    try std.testing.expectEqual(@as(?u64, 3), dense_doc_count);
+
+    var result = try reopened.search(alloc, .{
+        .index_name = "dense_idx",
+        .query = .{ .dense_knn = .{
+            .vector = &.{ 1.0, 0.0, 0.0 },
+            .k = 3,
+        } },
+        .limit = 3,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 3), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+
+    try std.testing.expectEqual(@as(usize, 0), try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc));
+}
+
+test "db derived async dense artifact rebuild dense artifact rebuild preserves stable vector ids distinct from ordinals" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const threadedIo = db_internal.threadedIo;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_embeddings\":{\"dense_idx\":[0,1,0]}}" },
+            },
+            .sync_level = .full_index,
+        });
+
+        var txn = try db.core.store.beginProbeTxn();
+        defer txn.abort();
+        const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:b")) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(doc_identity.DocOrdinal, 2), ordinal);
+        const stable_vector_id = index_manager_mod.deterministicDenseVectorId("doc:b");
+        try std.testing.expect(stable_vector_id != @as(u64, ordinal));
+        try std.testing.expectEqual(@as(?u64, stable_vector_id), try db.core.index_manager.lookupDenseVectorId(db.core.store, "dense_idx", "doc:b"));
+    }
+
+    const dense_index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
+    defer alloc.free(dense_index_path);
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+    });
+    defer reopened.close();
+
+    try std.testing.expect(try reopened.hasPendingDenseArtifactRebuild(alloc));
+    try std.testing.expectEqual(@as(usize, 2), try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc));
+    try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
+
+    var txn = try reopened.core.store.beginProbeTxn();
+    defer txn.abort();
+    const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, &txn, "doc:b")) orelse return error.TestUnexpectedResult;
+    const stable_vector_id = index_manager_mod.deterministicDenseVectorId("doc:b");
+    try std.testing.expect(stable_vector_id != @as(u64, ordinal));
+    try std.testing.expectEqual(@as(?u64, stable_vector_id), try reopened.core.index_manager.lookupDenseVectorId(reopened.core.store, "dense_idx", "doc:b"));
+
+    const vector_ids = try reopened.core.index_manager.lookupDenseVectorIdsForOrdinalsAlloc(alloc, reopened.core.store, "dense_idx", &.{ordinal});
+    defer alloc.free(vector_ids);
+    try std.testing.expectEqual(@as(usize, 1), vector_ids.len);
+    try std.testing.expectEqual(stable_vector_id, vector_ids[0]);
+
+    const dense_entry = reopened.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
+    const stable_metadata = (try dense_entry.index.getMetadata(stable_vector_id)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(stable_metadata);
+    try std.testing.expectEqualStrings("doc:b", stable_metadata);
+    try std.testing.expectEqual(@as(?[]u8, null), try dense_entry.index.getMetadata(@as(u64, ordinal)));
+}
+
+test "db derived async dense artifact rebuild dense artifact rebuild force-resets corrupt external dense structure" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true,\"leaf_size\":2}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,0,0]}}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_embeddings\":{\"dense_idx\":[0,1,0]}}" },
+                .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_embeddings\":{\"dense_idx\":[0.9,0.1,0]}}" },
+                .{ .key = "doc:d", .value = "{\"title\":\"delta\",\"_embeddings\":{\"dense_idx\":[0,0,1]}}" },
+                .{ .key = "doc:e", .value = "{\"title\":\"epsilon\",\"_embeddings\":{\"dense_idx\":[0.8,0.2,0]}}" },
+                .{ .key = "doc:f", .value = "{\"title\":\"zeta\",\"_embeddings\":{\"dense_idx\":[0.7,0.3,0]}}" },
+            },
+            .sync_level = .full_index,
+        });
+
+        const dense_entry = db.core.index_manager.denseIndex("dense_idx").?;
+        try std.testing.expect(dense_entry.index.stats().node_count > 1);
+
+        var read_txn = try dense_entry.index.beginReadTxn();
+        defer read_txn.abort();
+        var root = try dense_entry.index.loadNode(&read_txn, dense_entry.index.metadata.root_node);
+        defer root.deinit(alloc);
+        try std.testing.expect(!root.is_leaf);
+        try dense_entry.index.deleteNodeHeaderForTest(root.children[0]);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    try std.testing.expect(try reopened.hasPendingDenseArtifactRebuild(alloc));
+
+    const rebuilt = try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+    try std.testing.expectEqual(@as(usize, 6), rebuilt);
+    try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
+
+    const stats = try reopened.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    var dense_doc_count: ?u64 = null;
+    for (stats.indexes) |index| {
+        if (std.mem.eql(u8, index.name, "dense_idx")) dense_doc_count = index.doc_count;
+    }
+    try std.testing.expectEqual(@as(?u64, 6), dense_doc_count);
+
+    var result = try reopened.search(alloc, .{
+        .index_name = "dense_idx",
+        .query = .{ .dense_knn = .{
+            .vector = &.{ 1.0, 0.0, 0.0 },
+            .k = 3,
+        } },
+        .limit = 3,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 3), result.total_hits);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "db derived async dense artifact rebuild dense artifact rebuild resumes from persisted state" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
+    const threadedIo = db_internal.threadedIo;
+    const alloc = std.testing.allocator;
+    const doc_count: usize = 8;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+
+        for (0..doc_count) |i| {
+            const doc_id = try std.fmt.allocPrint(alloc, "doc:{d:0>5}", .{i});
+            defer alloc.free(doc_id);
+            const stored_key = try internal_keys.documentKeyAlloc(alloc, doc_id);
+            defer alloc.free(stored_key);
+            const stored_value = try std.fmt.allocPrint(alloc, "{{\"title\":\"doc-{d}\"}}", .{i});
+            defer alloc.free(stored_value);
+            try db.core.store.putBatch(&.{
+                .{ .key = stored_key, .value = stored_value },
+            }, &.{});
+
+            const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_id, "dense_idx");
+            defer alloc.free(artifact_key);
+            try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{
+                @floatFromInt(i + 1),
+                0,
+                0,
+            });
+        }
+    }
+
+    const dense_index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
+    defer alloc.free(dense_index_path);
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
+    const rebuild_state = backfill_state_mod.RebuildState.init(dense_index_path);
+
+    {
+        var interrupted = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer interrupted.close();
+
+        const ResumeFailureCtx = struct {
+            rebuild_state: backfill_state_mod.RebuildState,
+            persisted_calls: usize = 0,
+
+            fn persistAndFail(ctx: *anyopaque, last_key: []const u8) !void {
+                const failure: *@This() = @ptrCast(@alignCast(ctx));
+                try failure.rebuild_state.update(last_key);
+                failure.persisted_calls += 1;
+                return error.TestInjectedFailure;
+            }
+        };
+        var failure_ctx = ResumeFailureCtx{
+            .rebuild_state = rebuild_state,
+        };
+
+        try std.testing.expectError(
+            error.TestInjectedFailure,
+            interrupted.derivedAsyncRebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(
+                alloc,
+                null,
+                null,
+                null,
+                null,
+                null,
+                &failure_ctx,
+                ResumeFailureCtx.persistAndFail,
+                4,
+                1,
+            ),
+        );
+        try std.testing.expectEqual(@as(usize, 1), failure_ctx.persisted_calls);
+
+        const partial_stats = try interrupted.stats(alloc);
+        defer types.freeDBStats(alloc, partial_stats);
+        var partial_doc_count: ?u64 = null;
+        for (partial_stats.indexes) |index| {
+            if (!std.mem.eql(u8, index.name, "dense_idx")) continue;
+            partial_doc_count = index.doc_count;
+        }
+        try std.testing.expectEqual(@as(?u64, 4), partial_doc_count);
+        const persisted_resume = try rebuild_state.check(alloc);
+        defer if (persisted_resume) |buf| alloc.free(buf);
+        try std.testing.expect(persisted_resume != null);
+    }
+
+    {
+        var resumed = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer resumed.close();
+
+        const rebuilt = try resumed.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+        try std.testing.expectEqual(@as(usize, 4), rebuilt);
+
+        try std.testing.expect((try rebuild_state.check(alloc)) == null);
+
+        const stats = try resumed.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        var dense_doc_count: ?u64 = null;
+        for (stats.indexes) |index| {
+            if (!std.mem.eql(u8, index.name, "dense_idx")) continue;
+            dense_doc_count = index.doc_count;
+        }
+        try std.testing.expectEqual(@as(?u64, doc_count), dense_doc_count);
+    }
+}
+
+test "db derived async dense artifact rebuild dense artifact rebuild progress counts source artifacts across multiple consumer indexes" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
+    const threadedIo = db_internal.threadedIo;
+    const alloc = std.testing.allocator;
+    const doc_count: usize = 3;
+    const shared_cfg = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true,\"embedding_name\":\"shared_dense_v1\"}";
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dense_a",
+            .kind = .dense_vector,
+            .config_json = shared_cfg,
+        });
+        try db.addIndex(.{
+            .name = "dense_b",
+            .kind = .dense_vector,
+            .config_json = shared_cfg,
+        });
+
+        for (0..doc_count) |i| {
+            const doc_id = try std.fmt.allocPrint(alloc, "doc:{d:0>5}", .{i});
+            defer alloc.free(doc_id);
+            const stored_key = try internal_keys.documentKeyAlloc(alloc, doc_id);
+            defer alloc.free(stored_key);
+            const stored_value = try std.fmt.allocPrint(alloc, "{{\"title\":\"doc-{d}\"}}", .{i});
+            defer alloc.free(stored_value);
+            try db.core.store.putBatch(&.{
+                .{ .key = stored_key, .value = stored_value },
+            }, &.{});
+
+            const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_id, "shared_dense_v1");
+            defer alloc.free(artifact_key);
+            try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{
+                @floatFromInt(i + 1),
+                0,
+                0,
+            });
+        }
+    }
+
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const dense_a_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_a", .{std.mem.span(path)});
+    defer alloc.free(dense_a_path);
+    try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_a_path);
+    const dense_b_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_b", .{std.mem.span(path)});
+    defer alloc.free(dense_b_path);
+    try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_b_path);
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    const Capture = struct {
+        seen: usize = 0,
+        last: db_internal.ReplayProgress = .{},
+
+        fn run(ptr: *anyopaque, _: []const u8, progress: db_internal.ReplayProgress) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.seen += 1;
+            self.last = progress;
+        }
+    };
+    var capture = Capture{};
+
+    const rebuilt = try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeededWithProgress(alloc, &capture, Capture.run);
+    try std.testing.expectEqual(doc_count, rebuilt);
+    try std.testing.expect(capture.seen > 0);
+    try std.testing.expectEqual(@as(u64, doc_count), capture.last.target_sequence);
+    try std.testing.expectEqual(@as(u64, doc_count), capture.last.applied_entries);
+    try std.testing.expectEqual(@as(u64, doc_count), capture.last.sequence);
+    try reopened.runUntilIdle();
+
+    const stats = try reopened.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    var dense_a_count: ?u64 = null;
+    var dense_b_count: ?u64 = null;
+    for (stats.indexes) |index| {
+        if (std.mem.eql(u8, index.name, "dense_a")) dense_a_count = index.doc_count;
+        if (std.mem.eql(u8, index.name, "dense_b")) dense_b_count = index.doc_count;
+    }
+    try std.testing.expectEqual(@as(?u64, doc_count), dense_a_count);
+    try std.testing.expectEqual(@as(?u64, doc_count), dense_b_count);
+}
+
+test "db derived async dense artifact rebuild chunk-backed dense artifact rebuild stays pending until all chunk artifacts are rebuilt" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const threadedIo = db_internal.threadedIo;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .enrichment = .{
+                .owner_id = "worker-a",
+                .dense_embedder = deterministic.interface(),
+            },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"abcdefghijklmno\"}" }},
+            .sync_level = .write,
+        });
+        try db.runUntilIdle();
+        try std.testing.expectEqual(@as(u64, 3), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+    }
+
+    const dense_index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dv_v1", .{std.mem.span(path)});
+    defer alloc.free(dense_index_path);
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
+    const rebuild_state = backfill_state_mod.RebuildState.init(dense_index_path);
+
+    {
+        var interrupted = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer interrupted.close();
+
+        const ResumeFailureCtx = struct {
+            rebuild_state: backfill_state_mod.RebuildState,
+            persisted_calls: usize = 0,
+
+            fn persistAndFail(ctx: *anyopaque, last_key: []const u8) !void {
+                const failure: *@This() = @ptrCast(@alignCast(ctx));
+                try failure.rebuild_state.update(last_key);
+                failure.persisted_calls += 1;
+                return error.TestInjectedFailure;
+            }
+        };
+        var failure_ctx = ResumeFailureCtx{
+            .rebuild_state = rebuild_state,
+        };
+
+        try std.testing.expectError(
+            error.TestInjectedFailure,
+            interrupted.derivedAsyncRebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(
+                alloc,
+                null,
+                null,
+                null,
+                null,
+                null,
+                &failure_ctx,
+                ResumeFailureCtx.persistAndFail,
+                1,
+                1,
+            ),
+        );
+        try std.testing.expectEqual(@as(usize, 1), failure_ctx.persisted_calls);
+        try std.testing.expectEqual(@as(u64, 1), interrupted.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+        const persisted_resume = try rebuild_state.check(alloc);
+        defer if (persisted_resume) |buf| alloc.free(buf);
+        try std.testing.expect(persisted_resume != null);
+    }
+
+    {
+        var resumed = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer resumed.close();
+
+        try std.testing.expect(try resumed.hasPendingDenseArtifactRebuild(alloc));
+
+        const Capture = struct {
+            seen: usize = 0,
+            last: db_internal.ReplayProgress = .{},
+
+            fn run(ptr: *anyopaque, _: []const u8, progress: db_internal.ReplayProgress) !void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.seen += 1;
+                self.last = progress;
+            }
+        };
+        var capture = Capture{};
+
+        const rebuilt = try resumed.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeededWithProgress(alloc, &capture, Capture.run);
+        try std.testing.expectEqual(@as(usize, 2), rebuilt);
+        try std.testing.expect(capture.seen > 0);
+        try std.testing.expectEqual(@as(u64, 3), capture.last.target_sequence);
+        try std.testing.expectEqual(@as(?u64, 3), resumed.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+        try std.testing.expect((try rebuild_state.check(alloc)) == null);
+        try std.testing.expect(!(try resumed.hasPendingDenseArtifactRebuild(alloc)));
+    }
+}
+
+test "db derived async dense artifact rebuild dense artifact rebuild does not let resumed targets skip fresh targets" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
+    const threadedIo = db_internal.threadedIo;
+    const alloc = std.testing.allocator;
+    const doc_count: usize = 4;
+    const shared_cfg = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true,\"embedding_name\":\"shared_dense_v1\"}";
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dense_a",
+            .kind = .dense_vector,
+            .config_json = shared_cfg,
+        });
+        try db.addIndex(.{
+            .name = "dense_b",
+            .kind = .dense_vector,
+            .config_json = shared_cfg,
+        });
+
+        for (0..doc_count) |i| {
+            const doc_id = try std.fmt.allocPrint(alloc, "doc:{d:0>5}", .{i});
+            defer alloc.free(doc_id);
+            const stored_key = try internal_keys.documentKeyAlloc(alloc, doc_id);
+            defer alloc.free(stored_key);
+            const stored_value = try std.fmt.allocPrint(alloc, "{{\"title\":\"doc-{d}\"}}", .{i});
+            defer alloc.free(stored_value);
+            try db.core.store.putBatch(&.{
+                .{ .key = stored_key, .value = stored_value },
+            }, &.{});
+
+            const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_id, "shared_dense_v1");
+            defer alloc.free(artifact_key);
+            try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{
+                @floatFromInt(i + 1),
+                0,
+                0,
+            });
+        }
+    }
+
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const dense_a_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_a", .{std.mem.span(path)});
+    defer alloc.free(dense_a_path);
+    try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_a_path);
+    const dense_b_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_b", .{std.mem.span(path)});
+    defer alloc.free(dense_b_path);
+    try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_b_path);
+    const rebuild_state = backfill_state_mod.RebuildState.init(dense_a_path);
+
+    {
+        var interrupted = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer interrupted.close();
+
+        const ResumeFailureCtx = struct {
+            rebuild_state: backfill_state_mod.RebuildState,
+            persisted_calls: usize = 0,
+
+            fn persistAndFail(ctx: *anyopaque, last_key: []const u8) !void {
+                const failure: *@This() = @ptrCast(@alignCast(ctx));
+                try failure.rebuild_state.update(last_key);
+                failure.persisted_calls += 1;
+                return error.TestInjectedFailure;
+            }
+        };
+        var failure_ctx = ResumeFailureCtx{
+            .rebuild_state = rebuild_state,
+        };
+
+        const targets = [_]DenseArtifactRebuildTarget{
+            .{ .dense_index_idx = 0 },
+        };
+
+        try std.testing.expectError(
+            error.TestInjectedFailure,
+            interrupted.derivedAsyncRebuildDenseIndexesFromStoredEmbeddingArtifactsResumeWithProgress(
+                alloc,
+                null,
+                &targets,
+                null,
+                null,
+                null,
+                &failure_ctx,
+                ResumeFailureCtx.persistAndFail,
+                2,
+                1,
+            ),
+        );
+        try std.testing.expectEqual(@as(usize, 1), failure_ctx.persisted_calls);
+    }
+
+    {
+        var resumed = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer resumed.close();
+
+        const rebuilt = try resumed.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+        try std.testing.expectEqual(doc_count, rebuilt);
+
+        const stats = try resumed.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        var dense_a_count: ?u64 = null;
+        var dense_b_count: ?u64 = null;
+        for (stats.indexes) |index| {
+            if (std.mem.eql(u8, index.name, "dense_a")) dense_a_count = index.doc_count;
+            if (std.mem.eql(u8, index.name, "dense_b")) dense_b_count = index.doc_count;
+        }
+        try std.testing.expectEqual(@as(?u64, doc_count), dense_a_count);
+        try std.testing.expectEqual(@as(?u64, doc_count), dense_b_count);
+    }
+}
+
+test "db derived async dense artifact rebuild dense artifact rebuild ignores stale wrong-dimension artifacts when counting progress" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
+    const threadedIo = db_internal.threadedIo;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true,\"embedding_name\":\"shared_dense_v1\"}",
+        });
+
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+        defer alloc.free(stored_key);
+        try db.core.store.putBatch(&.{
+            .{ .key = stored_key, .value = "{\"title\":\"alpha\"}" },
+        }, &.{});
+
+        const valid_artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "shared_dense_v1");
+        defer alloc.free(valid_artifact_key);
+        try putDenseEmbeddingArtifactForTest(&db, alloc, valid_artifact_key, null, &[_]f32{ 1, 0, 0 });
+
+        const stale_artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:stale", "shared_dense_v1");
+        defer alloc.free(stale_artifact_key);
+        try putDenseEmbeddingArtifactForTest(&db, alloc, stale_artifact_key, null, &[_]f32{ 1, 0 });
+    }
+
+    var io_impl = threadedIo();
+    defer io_impl.deinit();
+    const dense_index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
+    defer alloc.free(dense_index_path);
+    try std.Io.Dir.cwd().deleteTree(io_impl.io(), dense_index_path);
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    const Capture = struct {
+        seen: usize = 0,
+        last: db_internal.ReplayProgress = .{},
+
+        fn run(ptr: *anyopaque, _: []const u8, progress: db_internal.ReplayProgress) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.seen += 1;
+            self.last = progress;
+        }
+    };
+    var capture = Capture{};
+
+    const rebuilt = try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeededWithProgress(alloc, &capture, Capture.run);
+    try std.testing.expectEqual(@as(usize, 1), rebuilt);
+    try std.testing.expect(capture.seen > 0);
+    try std.testing.expectEqual(@as(u64, 1), capture.last.target_sequence);
+    try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
+
+    const stats = try reopened.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    var dense_doc_count: ?u64 = null;
+    for (stats.indexes) |index| {
+        if (std.mem.eql(u8, index.name, "dense_idx")) dense_doc_count = index.doc_count;
+    }
+    try std.testing.expectEqual(@as(?u64, 1), dense_doc_count);
+}
+
+test "db derived async dense artifact rebuild dense artifact rebuild clears stale persisted state when no valid artifacts remain" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true,\"embedding_name\":\"shared_dense_v1\"}",
+        });
+
+        const rebuild_root_path = try db.derivedAsyncDenseIndexRebuildStatePathAlloc(alloc, "dense_idx");
+        defer alloc.free(rebuild_root_path);
+        const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
+        try rebuild_state.update("doc:z");
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reopened.close();
+
+        try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
+        try std.testing.expectEqual(@as(usize, 0), try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc));
+
+        const rebuild_root_path = try reopened.derivedAsyncDenseIndexRebuildStatePathAlloc(alloc, "dense_idx");
+        defer alloc.free(rebuild_root_path);
+        const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
+        try std.testing.expect((try rebuild_state.check(alloc)) == null);
+    }
+}
+
+test "db derived async dense artifact rebuild dense artifact rebuild waits for replay debt instead of raw doc count alone" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var appended_sequence: u64 = 0;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}",
+        });
+
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+        defer alloc.free(stored_key);
+        try db.core.store.putBatch(&.{
+            .{ .key = stored_key, .value = "{\"title\":\"alpha\"}" },
+        }, &.{});
+
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
+        defer alloc.free(artifact_key);
+        try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
+
+        var dense_embeddings = try alloc.alloc(derived_types.DerivedDenseEmbeddingWrite, 1);
+        var batch = derived_types.DerivedBatch{
+            .dense_embeddings = dense_embeddings,
+        };
+        defer derived_types.deinitDerivedBatch(alloc, &batch);
+        dense_embeddings[0] = .{
+            .index_name = try alloc.dupe(u8, "dv_v1"),
+            .doc_key = try alloc.dupe(u8, "doc:a"),
+            .artifact_key = try alloc.dupe(u8, artifact_key),
+            .vector = try alloc.dupe(f32, &[_]f32{ 1, 0 }),
+        };
+
+        appended_sequence = db.core.store.reserveNextReplaySequence(1);
+        var record = try change_journal_mod.recordFromDerivedBatch(alloc, batch, appended_sequence);
+        defer change_journal_mod.deinitRecord(alloc, &record);
+        const encoded = try change_journal_mod.encodeRecord(alloc, record);
+        defer alloc.free(encoded);
+        try replay_stream_mod.appendOpaque(alloc, db.core.store, appended_sequence, encoded);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    const rebuilt = try reopened.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc);
+    try std.testing.expectEqual(@as(usize, 0), rebuilt);
+
+    const rebuild_state_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dv_v1", .{std.mem.span(path)});
+    defer alloc.free(rebuild_state_path);
+    const rebuild_state = backfill_state_mod.RebuildState.init(rebuild_state_path);
+    try std.testing.expect((try rebuild_state.check(alloc)) == null);
+
+    const replay_debt = try reopened.listDerivedReplayDebt(alloc);
+    defer {
+        for (replay_debt) |*status| status.deinit(alloc);
+        alloc.free(replay_debt);
+    }
+    try std.testing.expectEqual(@as(usize, 1), replay_debt.len);
+    try std.testing.expectEqual(@as(u64, 0), replay_debt[0].applied_sequence);
+    try std.testing.expectEqual(appended_sequence, replay_debt[0].target_sequence);
+    try std.testing.expect(replay_debt[0].catch_up_required);
 }

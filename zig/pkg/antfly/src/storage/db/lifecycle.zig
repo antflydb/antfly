@@ -24,6 +24,7 @@ const backfill_state_mod = @import("backfill_state.zig");
 const backend_erased_mod = @import("../backend_erased.zig");
 const background_runtime_mod = @import("../background_runtime.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
+const replay_stream_mod = @import("derived/replay_stream.zig");
 const common_secrets = @import("../../common/secrets.zig");
 const db_config = @import("config.zig");
 const db_core = @import("core.zig");
@@ -31,6 +32,7 @@ const db_internal = @import("internal.zig");
 const doc_identity = @import("doc_identity.zig");
 const docstore_mod = @import("../docstore.zig");
 const derived_executor_mod = @import("derived/derived_executor.zig");
+const derived_types = @import("derived/derived_types.zig");
 const enrichment_runtime_mod = @import("enrichment/enrichment_runtime.zig");
 const enrichment_state = @import("enrichment/enrichment_state.zig");
 const enrichment_worker = @import("enrichment/enrichment_worker.zig");
@@ -56,6 +58,7 @@ else
 const sparse_compaction_runtime_mod = @import("maintenance/sparse_compaction_runtime.zig");
 const text_merge_runtime_mod = @import("maintenance/text_merge_runtime.zig");
 const transaction_runtime_mod = @import("maintenance/transaction_runtime.zig");
+const transactions_mod = @import("../transactions.zig");
 const ttl_runtime_mod = @import("maintenance/ttl_runtime.zig");
 const types = @import("types.zig");
 
@@ -3847,5 +3850,1019 @@ fn replaceOptionalOwnedStringBestEffort(alloc: std.mem.Allocator, slot: *?[]cons
     } else {
         if (slot.*) |previous| alloc.free(previous);
         slot.* = null;
+    }
+}
+
+test "db lifecycle open borrows shared backend runtime" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    var first_path_buf: [256]u8 = undefined;
+    const first_path = tempPath(&first_path_buf);
+    defer cleanupTempDir(first_path);
+
+    var second_path_buf: [256]u8 = undefined;
+    const second_path = tempPath(&second_path_buf);
+    defer cleanupTempDir(second_path);
+
+    var first = try DB.open(alloc, std.mem.span(first_path), .{
+        .backend_runtime = runtime.ptr(),
+        .executor = .{ .backend = .manual },
+    });
+    defer first.close();
+
+    var second = try DB.open(alloc, std.mem.span(second_path), .{
+        .backend_runtime = runtime.ptr(),
+        .executor = .{ .backend = .manual },
+    });
+    defer second.close();
+
+    try std.testing.expectEqual(runtime.ptr(), first.backend_runtime);
+    try std.testing.expectEqual(runtime.ptr(), second.backend_runtime);
+    try std.testing.expect(first.owned_backend_runtime == null);
+    try std.testing.expect(second.owned_backend_runtime == null);
+    try std.testing.expect(first.backend_owner_id != 0);
+    try std.testing.expect(second.backend_owner_id != 0);
+    try std.testing.expect(first.backend_owner_id != second.backend_owner_id);
+    // Each open allocates two owner ids from the shared runtime: one for the
+    // backend (backend_owner_id) and one dedicated to algebraic HLL cardinality
+    // maintenance. Two opens therefore consume ids 1..4, leaving 5 next.
+    try std.testing.expectEqual(@as(u64, 5), runtime.ptr().allocOwnerId());
+}
+
+test "db lifecycle open downgrades borrowed manual backend runtime to manual executor" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime.ptr(),
+    });
+    defer db.close();
+
+    try std.testing.expectEqual(runtime.ptr(), db.backend_runtime);
+    try std.testing.expect(db.owned_backend_runtime == null);
+}
+
+test "db lifecycle open wires algebraic HLL maintenance lane and adaptively backfills sketches" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    // A manual backend runtime drives durable jobs inline (synchronously on
+    // submit), so a lane-scheduled HLL backfill completes within the call that
+    // promotes the sketch — the path a read-mostly cardinality workload takes.
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "schema_version": 1,
+        \\  "table": "docs",
+        \\  "group_fields": [{"name":"product","path":"product","type":"string"}],
+        \\  "materializations": [],
+        \\  "adaptive": {"observe": true, "lazy_materialization": true, "min_observations": 2}
+        \\}
+    ;
+
+    var adaptive_name_buf: [64]u8 = undefined;
+    var adaptive_name_len: usize = 0;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .backend_runtime = runtime.ptr(),
+        });
+        defer db.close();
+
+        try db.addIndex(.{ .name = "alg", .kind = .algebraic, .config_json = cfg });
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "d1", .value = "{\"product\":\"pen\"}" },
+                .{ .key = "d2", .value = "{\"product\":\"book\"}" },
+                .{ .key = "d3", .value = "{\"product\":\"pen\"}" },
+                .{ .key = "d4", .value = "{\"product\":\"notebook\"}" },
+            },
+            .sync_level = .full_index,
+        });
+
+        const entry = db.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
+        const index = &entry.index;
+
+        // DB.open must thread the durable-jobs lane into the algebraic index so
+        // background HLL maintenance has somewhere to run on a live server.
+        try std.testing.expect(index.hll_maintenance_lane != null);
+
+        const adaptive_name = try index.hllAdaptiveNameAlloc(null, "product");
+        defer alloc.free(adaptive_name);
+        @memcpy(adaptive_name_buf[0..adaptive_name.len], adaptive_name);
+        adaptive_name_len = adaptive_name.len;
+
+        // Reads only record observations — they never promote — so no sketch and
+        // no approximate total exist after two recurring cardinality queries.
+        index.observeCardinalityForAdaptive(db.core.store, null, "product");
+        index.observeCardinalityForAdaptive(db.core.store, null, "product");
+        try std.testing.expect(!index.hllRegistryContains(adaptive_name));
+        try std.testing.expect((try index.approxCardinalityTotalForFieldAlloc(db.core.store, "product", &.{}, null)) == null);
+
+        // The leader-gated adaptive maintenance pass promotes the over-threshold
+        // observation and backfills it, so the next read resolves an approximate
+        // distinct-product count (4 docs, 3 distinct products).
+        _ = try db.evaluateAlgebraicAdaptiveCandidates();
+        try std.testing.expect(index.hllRegistryContains(adaptive_name));
+        const estimate = (try index.approxCardinalityTotalForFieldAlloc(db.core.store, "product", &.{}, null)) orelse
+            return error.TestUnexpectedResult;
+        try std.testing.expect(@max(estimate, 3) - @min(estimate, 3) <= 1);
+    }
+
+    // The promotion is durable: a freshly reopened DB reloads the adaptive marker
+    // through the open-site wiring (attachHllMaintenance + loadAdaptiveHllCardinalities)
+    // and keeps serving the approximate count without re-observing.
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .backend_runtime = runtime.ptr(),
+        });
+        defer db.close();
+
+        const entry = db.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
+        const index = &entry.index;
+        const adaptive_name = adaptive_name_buf[0..adaptive_name_len];
+        try std.testing.expect(index.hllRegistryContains(adaptive_name));
+        const reopened = (try index.approxCardinalityTotalForFieldAlloc(db.core.store, "product", &.{}, null)) orelse
+            return error.TestUnexpectedResult;
+        try std.testing.expect(@max(reopened, 3) - @min(reopened, 3) <= 1);
+    }
+}
+
+test "db lifecycle open text merge enabled requires backend runtime io" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    try std.testing.expectError(error.MissingBackendRuntimeIo, DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime.ptr(),
+        .executor = .{ .backend = .manual },
+        .text_merge = .{ .enabled = true },
+    }));
+}
+
+test "db lifecycle open enrichment enabled requires backend runtime io" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    try std.testing.expectError(error.MissingBackendRuntimeIo, DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime.ptr(),
+        .executor = .{ .backend = .manual },
+        .enrichment = .{ .dense_embedder = deterministic.interface() },
+    }));
+}
+
+test "db lifecycle open ttl cleanup enabled requires backend runtime io" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    try std.testing.expectError(error.MissingBackendRuntimeIo, DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime.ptr(),
+        .executor = .{ .backend = .manual },
+        .ttl_cleanup = .{ .enabled = true },
+    }));
+}
+
+test "db lifecycle open transaction recovery enabled requires backend runtime io" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const TestTransactionRecoveryResolver = db_test_support.TestTransactionRecoveryResolver;
+    const alloc = std.testing.allocator;
+
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var resolver_ctx: u8 = 0;
+    try std.testing.expectError(error.MissingBackendRuntimeIo, DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime.ptr(),
+        .executor = .{ .backend = .manual },
+        .transaction_recovery = .{
+            .enabled = true,
+            .resolver_ctx = &resolver_ctx,
+            .resolve_participant_fn = TestTransactionRecoveryResolver.resolve,
+        },
+    }));
+}
+
+test "db lifecycle open status_only reads index catalog without loading index state" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"embedding\":[0.1,0.2,0.3]}" },
+            },
+            .sync_level = .write,
+        });
+        try db.addIndex(.{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3}",
+        });
+    }
+
+    {
+        var status_db = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .status_only,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+            .transaction_recovery = .{ .enabled = false },
+            .text_merge = .{ .enabled = false },
+        });
+        defer status_db.close();
+
+        try std.testing.expect(status_db.core.textIndex("ft_v1") == null);
+        try std.testing.expect(status_db.core.denseIndex("dv_v1") == null);
+
+        const indexes = try status_db.listIndexes(alloc);
+        defer types.freeIndexConfigs(alloc, indexes);
+        try std.testing.expectEqual(@as(usize, 2), indexes.len);
+
+        const stats = try status_db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 1), stats.doc_count);
+        try std.testing.expectEqual(@as(u32, 2), stats.index_count);
+        try std.testing.expectEqual(@as(usize, 2), stats.indexes.len);
+        var saw_dense = false;
+        for (stats.indexes) |item| {
+            if (!std.mem.eql(u8, item.name, "dv_v1")) continue;
+            saw_dense = true;
+            try std.testing.expectEqual(@as(u64, 1), item.doc_count);
+            try std.testing.expect(item.node_count > 0);
+            try std.testing.expect(item.root_node > 0);
+        }
+        try std.testing.expect(saw_dense);
+    }
+}
+
+test "db lifecycle open query_readonly skips pending derived replay on reopen" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var appended_sequence: u64 = 0;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+        });
+
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+        defer alloc.free(stored_key);
+        try db.core.store.putBatch(&.{
+            .{ .key = stored_key, .value = "{\"title\":\"alpha\"}" },
+        }, &.{});
+
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
+        defer alloc.free(artifact_key);
+        try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
+
+        var dense_embeddings = try alloc.alloc(derived_types.DerivedDenseEmbeddingWrite, 1);
+        var batch = derived_types.DerivedBatch{
+            .dense_embeddings = dense_embeddings,
+        };
+        defer derived_types.deinitDerivedBatch(alloc, &batch);
+        dense_embeddings[0] = .{
+            .index_name = try alloc.dupe(u8, "dv_v1"),
+            .doc_key = try alloc.dupe(u8, "doc:a"),
+            .artifact_key = try alloc.dupe(u8, artifact_key),
+            .vector = try alloc.dupe(f32, &[_]f32{ 1, 0 }),
+        };
+
+        appended_sequence = db.core.store.reserveNextReplaySequence(1);
+        var record = try change_journal_mod.recordFromDerivedBatch(alloc, batch, appended_sequence);
+        defer change_journal_mod.deinitRecord(alloc, &record);
+        const encoded = try change_journal_mod.encodeRecord(alloc, record);
+        defer alloc.free(encoded);
+        try replay_stream_mod.appendOpaque(alloc, db.core.store, appended_sequence, encoded);
+    }
+
+    {
+        var reopened_without_replay = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .query_readonly,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reopened_without_replay.close();
+
+        const skipped_applied = try reopened_without_replay.core.loadAppliedSequence(alloc, "dv_v1");
+        try std.testing.expectEqual(@as(u64, 0), skipped_applied);
+        try std.testing.expect(!reopened_without_replay.pendingWorkStats().has_async_indexes);
+
+        const replay_debt = try reopened_without_replay.listDerivedReplayDebt(alloc);
+        defer {
+            for (replay_debt) |*status| status.deinit(alloc);
+            alloc.free(replay_debt);
+        }
+        try std.testing.expectEqual(@as(usize, 1), replay_debt.len);
+        try std.testing.expectEqualStrings("dv_v1", replay_debt[0].index_name);
+        try std.testing.expectEqual(types.IndexKind.dense_vector, replay_debt[0].kind);
+        try std.testing.expectEqual(@as(u64, 0), replay_debt[0].applied_sequence);
+        try std.testing.expectEqual(appended_sequence, replay_debt[0].target_sequence);
+        try std.testing.expect(replay_debt[0].catch_up_required);
+
+        const skipped_stats = try reopened_without_replay.stats(alloc);
+        defer types.freeDBStats(alloc, skipped_stats);
+        try std.testing.expectEqual(@as(usize, 1), skipped_stats.indexes.len);
+        try std.testing.expectEqualStrings("dv_v1", skipped_stats.indexes[0].name);
+        try std.testing.expectEqual(@as(u64, 0), skipped_stats.indexes[0].replay_applied_sequence);
+        try std.testing.expectEqual(appended_sequence, skipped_stats.indexes[0].replay_target_sequence);
+        try std.testing.expect(skipped_stats.indexes[0].replay_catch_up_required);
+
+        var skipped_result = try reopened_without_replay.search(alloc, .{
+            .index_name = "dv_v1",
+            .dense = .{
+                .vector = &[_]f32{ 1, 0 },
+                .k = 1,
+            },
+            .limit = 1,
+        });
+        defer skipped_result.deinit();
+        try std.testing.expectEqual(@as(u32, 0), skipped_result.total_hits);
+    }
+
+    try std.testing.expectEqual(@as(u64, 1), appended_sequence);
+
+    {
+        var reopened_with_replay = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reopened_with_replay.close();
+
+        const replay_debt = try reopened_with_replay.listDerivedReplayDebt(alloc);
+        defer {
+            for (replay_debt) |*status| status.deinit(alloc);
+            alloc.free(replay_debt);
+        }
+        try std.testing.expectEqual(@as(usize, 1), replay_debt.len);
+        try std.testing.expectEqual(appended_sequence, replay_debt[0].applied_sequence);
+        try std.testing.expectEqual(appended_sequence, replay_debt[0].target_sequence);
+        try std.testing.expect(!replay_debt[0].catch_up_required);
+
+        const replayed_stats = try reopened_with_replay.stats(alloc);
+        defer types.freeDBStats(alloc, replayed_stats);
+        try std.testing.expectEqual(@as(usize, 1), replayed_stats.indexes.len);
+        try std.testing.expectEqual(appended_sequence, replayed_stats.indexes[0].replay_applied_sequence);
+        try std.testing.expectEqual(appended_sequence, replayed_stats.indexes[0].replay_target_sequence);
+        try std.testing.expect(!replayed_stats.indexes[0].replay_catch_up_required);
+    }
+}
+
+test "db lifecycle open query_readonly lsm primary opens physical backend read-only" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+            .sync_level = .write,
+        });
+        try db.sync(true);
+    }
+
+    var readonly = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .open_mode = .query_readonly,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer readonly.close();
+
+    switch (readonly.core.primary_store_owner) {
+        .lsm => |owner| {
+            try std.testing.expect(owner.handle.backend.options.backend.read_only);
+            try std.testing.expect(!owner.handle.backend.options.backend.create_if_missing);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectError(error.ReadOnly, readonly.batch(.{
+        .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }},
+        .sync_level = .write,
+    }));
+    const NoopDocumentArtifactChildRangeDispatcher = struct {
+        fn apply(_: *anyopaque, _: Allocator, _: DB.DocumentArtifactChildRangeDispatch) anyerror!void {}
+    };
+    var noop_dispatcher_state: u8 = 0;
+    const noop_dispatcher = DB.DocumentArtifactChildRangeDispatcher{
+        .ptr = &noop_dispatcher_state,
+        .apply = NoopDocumentArtifactChildRangeDispatcher.apply,
+    };
+    var blocked_profile = DB.BatchProfile{};
+    try std.testing.expectError(error.ReadOnly, readonly.batchProfiled(.{
+        .writes = &.{.{ .key = "doc:profiled", .value = "{\"title\":\"beta\"}" }},
+        .sync_level = .write,
+    }, &blocked_profile));
+    try std.testing.expectError(error.ReadOnly, readonly.batchWithDocumentArtifactChildRangeDispatcher(.{
+        .writes = &.{.{ .key = "doc:dispatch", .value = "{\"title\":\"beta\"}" }},
+        .sync_level = .write,
+    }, noop_dispatcher));
+    try std.testing.expectError(error.ReadOnly, readonly.batchWithoutRangeValidation(.{
+        .writes = &.{.{ .key = "doc:norange", .value = "{\"title\":\"beta\"}" }},
+        .sync_level = .write,
+    }));
+    try std.testing.expectError(error.ReadOnly, readonly.applyDocumentArtifactChildRangeBatch(.{}));
+    try std.testing.expectError(error.ReadOnly, readonly.beginBulkIngestSession());
+    try std.testing.expectError(error.ReadOnly, readonly.finishDenseAutoBulkIngestSessionWithOptions(.{}));
+    try std.testing.expectError(error.ReadOnly, readonly.rollDenseAutoBulkIngestSessionWithOptions(.{}));
+    try std.testing.expectError(error.ReadOnly, readonly.rollPrimaryStoreAutoBulkIngestSessionWithOptions(.{}));
+    try std.testing.expectError(error.ReadOnly, readonly.updateRange(.{ .start = "doc:a", .end = "doc:z" }));
+    try std.testing.expectError(error.ReadOnly, readonly.setSplitState(null));
+    try std.testing.expectError(error.ReadOnly, readonly.clearSplitState());
+    try std.testing.expectError(error.ReadOnly, readonly.setSplitDeltaFinalSeq(1));
+    try std.testing.expectError(error.ReadOnly, readonly.clearSplitDeltaEntries());
+    try std.testing.expectError(error.ReadOnly, readonly.createShadowIndexManager("doc:m", "doc:z"));
+    try std.testing.expectError(error.ReadOnly, readonly.closeShadowIndexManager());
+    try std.testing.expectError(
+        error.ReadOnly,
+        readonly.split(.{ .start = "doc:a", .end = "doc:z" }, "doc:m", "dest1", "dest2", true),
+    );
+    try std.testing.expectError(error.ReadOnly, readonly.finalizeSplit(.{ .start = "doc:a", .end = "doc:m" }));
+    try std.testing.expectError(error.ReadOnly, readonly.snapshot("blocked"));
+    try std.testing.expectError(error.ReadOnly, readonly.sync(false));
+    try std.testing.expectError(error.ReadOnly, readonly.syncIndexes(false));
+    try std.testing.expectError(error.ReadOnly, readonly.repairRestoreRuntimeStateStepIfNeeded(alloc));
+    try std.testing.expectError(error.ReadOnly, readonly.runGraphMetricMaintenanceForIdle());
+    try std.testing.expectError(error.ReadOnly, readonly.runGraphMetricPlannedMaintenanceForIdle(.{}));
+    try std.testing.expectError(error.ReadOnly, readonly.runGraphMetricServiceMaintenanceJsonAlloc(alloc, "{}"));
+    try std.testing.expectError(error.ReadOnly, readonly.refreshGraphMetric(alloc, "graph_idx", "manual_degree"));
+    try std.testing.expectError(error.ReadOnly, readonly.rebuildGraphMetric(alloc, "graph_idx", "manual_degree"));
+    try std.testing.expectError(error.ReadOnly, readonly.deleteGraphMetricMaterialization(alloc, "graph_idx", "manual_degree"));
+    try std.testing.expectError(error.ReadOnly, readonly.pauseGraphMetricMaintenance(alloc, "graph_idx", "manual_degree"));
+    try std.testing.expectError(error.ReadOnly, readonly.resumeGraphMetricMaintenance(alloc, "graph_idx", "manual_degree"));
+    try std.testing.expectError(error.ReadOnly, readonly.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "manual_degree", 1));
+    try std.testing.expectError(error.ReadOnly, readonly.runGraphMetricPlannedWorkerPageStep("graph_idx", "manual_degree", "worker-a"));
+    try std.testing.expectError(error.ReadOnly, readonly.runGraphMetricPlannedCoordinatorStep("graph_idx", "manual_degree"));
+    try std.testing.expectError(error.ReadOnly, readonly.failGraphMetricPlannedBuild(alloc, "graph_idx", "manual_degree", error.TestExpectedError));
+    try std.testing.expectError(error.ReadOnly, readonly.runGraphMetricPlannedDrain(alloc, "graph_idx", "manual_degree", 1, .{ .worker_ids = &.{"worker-a"} }));
+    try std.testing.expectError(error.ReadOnly, readonly.runGraphMetricPlannedCoordinatorSweep(.{}));
+    try std.testing.expectError(error.ReadOnly, readonly.runGraphMetricPlannedWorkerSweep(.{ .worker_id = "worker-a" }));
+    try std.testing.expectError(error.ReadOnly, readonly.runLsmMaintenanceStep());
+    try std.testing.expectError(error.ReadOnly, readonly.retryQuarantinedIndexLoads(true));
+    try std.testing.expectError(error.ReadOnly, readonly.runUntilIdle());
+    try std.testing.expectError(error.ReadOnly, readonly.evaluateAlgebraicAdaptiveCandidates());
+    try std.testing.expectError(error.ReadOnly, readonly.compactTextIndexes());
+    try std.testing.expectError(error.ReadOnly, readonly.deleteIndex("missing"));
+    try std.testing.expectError(error.ReadOnly, readonly.deleteEnrichment(.asset, "missing"));
+    try std.testing.expectError(error.ReadOnly, readonly.removeResolver("missing"));
+    try std.testing.expectError(error.ReadOnly, readonly.rewriteEntityEdges(alloc, "missing", "a", "b"));
+    try std.testing.expectError(
+        error.ReadOnly,
+        readonly.rebuildRelationalSecondaryIndexInRange("missing", 0, "doc:a", "doc:z"),
+    );
+    try std.testing.expectError(error.ReadOnly, readonly.repairForeignKeyRefsInRange("doc:a", "doc:z"));
+    try std.testing.expectError(error.ReadOnly, readonly.repairForeignKeyRefsInRangeForConstraint("fk_parent", "doc:a", "doc:z"));
+    try std.testing.expectError(error.ReadOnly, readonly.repairUniqueConstraintRowsInRange("doc:a", "doc:z"));
+    try std.testing.expectError(error.ReadOnly, readonly.repairForeignKeyRefOwnerForParent("fk_parent", "parent", "p1"));
+    try std.testing.expectError(error.ReadOnly, readonly.repairForeignKeyRefOwnerRange("fk_parent", "parent", "p1", "p9"));
+    try std.testing.expectError(error.ReadOnly, readonly.claimForeignKeyIntegrityWorkUnit("claim-a", "worker-a", 1, "scan", "repair", null, "doc:a", "doc:z", 1000));
+    try std.testing.expectError(error.ReadOnly, readonly.upsertForeignKeyIntegrityJobRecord("job-a", "child", "repair", "worker-a", null, "doc:a", "doc:z", 1000, 10, "running"));
+    try std.testing.expectError(error.ReadOnly, readonly.completeForeignKeyIntegrityJobRecord("job-a", "complete", true, .{}));
+    try std.testing.expectError(error.ReadOnly, readonly.updateForeignKeyIntegrityJobDiagnostics("job-a", "[]", 0, false));
+    try std.testing.expectError(error.ReadOnly, readonly.scheduleForeignKeyActionJob("action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16));
+    try std.testing.expectError(error.ReadOnly, readonly.requeueForeignKeyActionJob("action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16));
+    try std.testing.expectError(error.ReadOnly, readonly.scheduleForeignKeyActionSchedule("schedule-a", "action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16));
+    try std.testing.expectError(error.ReadOnly, readonly.markForeignKeyActionScheduleSeeded("schedule-a", 1));
+    try std.testing.expectError(error.ReadOnly, readonly.claimForeignKeyActionJobPage("action-a", "cascade", "worker-a", "fk_parent", "parent", "p1", 16, 1000));
+    try std.testing.expectError(error.ReadOnly, readonly.finishClaimedForeignKeyActionJobPage(@as(DB.ForeignKeyActionJobRecord, undefined), 0, false, null, null, null));
+    try std.testing.expectError(error.ReadOnly, readonly.claimAndRunForeignKeyIntegrityWorkUnit("claim-a", "worker-a", 1, "scan", .repair, null, "doc:a", "doc:z", 1000));
+    try std.testing.expectError(error.ReadOnly, readonly.catchUpPendingDerivedReplay());
+    try std.testing.expectError(error.ReadOnly, readonly.derivedAsyncAppendDerivedBatchRecord(.{}));
+    try std.testing.expectError(error.ReadOnly, readonly.rebuildDenseIndexesForTargetCoverage(alloc));
+    try std.testing.expectError(error.ReadOnly, readonly.rebuildSparseIndexesForTargetCoverage(alloc));
+    try std.testing.expectError(error.ReadOnly, readonly.rebuildGraphIndexesForTargetCoverage(alloc));
+    try std.testing.expectError(error.ReadOnly, readonly.runDensePostingMaintenanceForIdle());
+    try std.testing.expectError(error.ReadOnly, readonly.runDensePostingMaintenanceForIdleBestEffort());
+    try std.testing.expectError(error.ReadOnly, readonly.rebuildDenseIndexesFromStoredEmbeddingArtifacts(alloc));
+    try std.testing.expectError(error.ReadOnly, readonly.rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded(alloc));
+    try std.testing.expectError(error.ReadOnly, readonly.replayGeneratedEnrichmentsFromStoredDocs(alloc));
+    try std.testing.expectError(error.ReadOnly, readonly.ensureGroupCreatedAtMillis(alloc, 42, 1234));
+    try std.testing.expectError(error.ReadOnly, readonly.mutateRelationalRowsFromSource(alloc, .{}, .{ .kind = .update }));
+    try std.testing.expectError(error.ReadOnly, readonly.stagePlannedRelationalRowsMutationSourceAlloc(alloc, .{}, .{ .kind = .update }, 0, &.{}));
+    try std.testing.expectError(error.ReadOnly, readonly.mutateRelationalRowsJoinedSourceAlloc(alloc, .{}, .{ .kind = .update }));
+    try std.testing.expectError(error.ReadOnly, readonly.stagePlannedRelationalRowsJoinedMutationSourceAlloc(alloc, .{}, .{ .kind = .update }, 0, &.{}));
+    const blocked_txn: transactions_mod.TxnId = .{ 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43, 43 };
+    try std.testing.expectError(error.ReadOnly, readonly.beginTransaction(1));
+    try std.testing.expectError(error.ReadOnly, readonly.beginTransactionWithId(blocked_txn, 1));
+    try std.testing.expectError(error.ReadOnly, readonly.beginTransactionWithParticipants(1, &.{"remote"}));
+    try std.testing.expectError(error.ReadOnly, readonly.beginTransactionWithIdAndParticipants(blocked_txn, 1, &.{"remote"}));
+    try std.testing.expectError(error.ReadOnly, readonly.writeIntents(blocked_txn, &.{}, &.{}));
+    try std.testing.expectError(error.ReadOnly, readonly.writeTransaction(blocked_txn, .{}));
+    try std.testing.expectError(error.ReadOnly, readonly.claimRowsForTransaction(blocked_txn, &.{"row:a"}, .{}));
+    try std.testing.expectError(error.ReadOnly, readonly.commitTransaction(blocked_txn, 2));
+    try std.testing.expectError(error.ReadOnly, readonly.resolveTransactionIntents(blocked_txn, .committed, 3));
+    try std.testing.expectError(error.ReadOnly, readonly.abortTransaction(blocked_txn, 4));
+    try std.testing.expectError(error.ReadOnly, readonly.markTransactionParticipantResolved(blocked_txn, "remote"));
+    try std.testing.expectError(error.ReadOnly, readonly.recoverTransactions(3, 4));
+    try std.testing.expectError(
+        error.ReadOnly,
+        readonly.reassignIdentityNamespaceForInternalTransition(.{ .table_id = 301, .shard_id = 1, .range_id = 1 }),
+    );
+}
+
+test "db lifecycle open query_readonly lmdb primary does not create missing database" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var readonly = DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .lmdb,
+        .open_mode = .query_readonly,
+        .ttl_cleanup = .{ .enabled = false },
+    }) catch |err| switch (err) {
+        error.UnsupportedPlatform => return,
+        error.FileNotFound, error.NotFound, error.LmdbUnexpected => return,
+        else => return err,
+    };
+    readonly.close();
+    return error.ExpectedReadonlyLmdbMissingOpenFailure;
+}
+
+test "db lifecycle open query_readonly lmdb primary rejects writes after readonly open" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .lmdb,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        }) catch |err| switch (err) {
+            error.UnsupportedPlatform => return,
+            else => return err,
+        };
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+            .sync_level = .write,
+        });
+    }
+
+    var readonly = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .lmdb,
+        .open_mode = .query_readonly,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer readonly.close();
+
+    var result = (try readonly.lookup(alloc, "doc:a", .{})) orelse return error.MissingReadonlyLmdbDocument;
+    defer result.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, result.json, "\"alpha\"") != null);
+    try std.testing.expectError(error.ReadOnly, readonly.batch(.{
+        .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }},
+        .sync_level = .write,
+    }));
+}
+
+test "db lifecycle open writer_no_replay defers pending derived replay until runUntilIdle" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var appended_sequence: u64 = 0;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+        });
+
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+        defer alloc.free(stored_key);
+        try db.core.store.putBatch(&.{
+            .{ .key = stored_key, .value = "{\"title\":\"alpha\"}" },
+        }, &.{});
+
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
+        defer alloc.free(artifact_key);
+        try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
+
+        var dense_embeddings = try alloc.alloc(derived_types.DerivedDenseEmbeddingWrite, 1);
+        var batch = derived_types.DerivedBatch{
+            .dense_embeddings = dense_embeddings,
+        };
+        defer derived_types.deinitDerivedBatch(alloc, &batch);
+        dense_embeddings[0] = .{
+            .index_name = try alloc.dupe(u8, "dv_v1"),
+            .doc_key = try alloc.dupe(u8, "doc:a"),
+            .artifact_key = try alloc.dupe(u8, artifact_key),
+            .vector = try alloc.dupe(f32, &[_]f32{ 1, 0 }),
+        };
+
+        appended_sequence = db.core.store.reserveNextReplaySequence(1);
+        var record = try change_journal_mod.recordFromDerivedBatch(alloc, batch, appended_sequence);
+        defer change_journal_mod.deinitRecord(alloc, &record);
+        const encoded = try change_journal_mod.encodeRecord(alloc, record);
+        defer alloc.free(encoded);
+        try replay_stream_mod.appendOpaque(alloc, db.core.store, appended_sequence, encoded);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    {
+        const replay_debt = try reopened.listDerivedReplayDebt(alloc);
+        defer {
+            for (replay_debt) |*status| status.deinit(alloc);
+            alloc.free(replay_debt);
+        }
+        try std.testing.expectEqual(@as(usize, 1), replay_debt.len);
+        try std.testing.expectEqual(@as(u64, 0), replay_debt[0].applied_sequence);
+        try std.testing.expectEqual(appended_sequence, replay_debt[0].target_sequence);
+        try std.testing.expect(replay_debt[0].catch_up_required);
+    }
+
+    try reopened.catchUpPendingDerivedReplay();
+    try reopened.runUntilIdle();
+
+    {
+        const replay_debt = try reopened.listDerivedReplayDebt(alloc);
+        defer {
+            for (replay_debt) |*status| status.deinit(alloc);
+            alloc.free(replay_debt);
+        }
+        try std.testing.expectEqual(@as(usize, 1), replay_debt.len);
+        try std.testing.expectEqual(appended_sequence, replay_debt[0].applied_sequence);
+        try std.testing.expectEqual(appended_sequence, replay_debt[0].target_sequence);
+        try std.testing.expect(!replay_debt[0].catch_up_required);
+    }
+
+    var result = try reopened.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{
+            .vector = &[_]f32{ 1, 0 },
+            .k = 1,
+        },
+        .limit = 1,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+}
+
+test "db lifecycle open dense replay progress target matches replay debt target" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var appended_sequence: u64 = 0;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+        });
+
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+        defer alloc.free(stored_key);
+        try db.core.store.putBatch(&.{
+            .{ .key = stored_key, .value = "{\"title\":\"alpha\"}" },
+        }, &.{});
+
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
+        defer alloc.free(artifact_key);
+        try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
+
+        var dense_embeddings = try alloc.alloc(derived_types.DerivedDenseEmbeddingWrite, 1);
+        var batch = derived_types.DerivedBatch{
+            .dense_embeddings = dense_embeddings,
+        };
+        defer derived_types.deinitDerivedBatch(alloc, &batch);
+        dense_embeddings[0] = .{
+            .index_name = try alloc.dupe(u8, "dv_v1"),
+            .doc_key = try alloc.dupe(u8, "doc:a"),
+            .artifact_key = try alloc.dupe(u8, artifact_key),
+            .vector = try alloc.dupe(f32, &[_]f32{ 1, 0 }),
+        };
+
+        appended_sequence = db.core.store.reserveNextReplaySequence(1);
+        var record = try change_journal_mod.recordFromDerivedBatch(alloc, batch, appended_sequence);
+        defer change_journal_mod.deinitRecord(alloc, &record);
+        const encoded = try change_journal_mod.encodeRecord(alloc, record);
+        defer alloc.free(encoded);
+        try replay_stream_mod.appendOpaque(alloc, db.core.store, appended_sequence, encoded);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    const replay_debt = try reopened.listDerivedReplayDebt(alloc);
+    defer {
+        for (replay_debt) |*status| status.deinit(alloc);
+        alloc.free(replay_debt);
+    }
+    try std.testing.expectEqual(@as(usize, 1), replay_debt.len);
+    try std.testing.expectEqual(appended_sequence, replay_debt[0].target_sequence);
+
+    const Capture = struct {
+        seen: usize = 0,
+        last: DB.ReplayProgress = .{},
+
+        fn run(ptr: *anyopaque, _: []const u8, progress: DB.ReplayProgress) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.seen += 1;
+            self.last = progress;
+        }
+    };
+
+    var capture = Capture{};
+    try reopened.catchUpPendingDerivedReplayWithProgress(&capture, Capture.run);
+    try reopened.runUntilIdle();
+
+    try std.testing.expect(capture.seen > 0);
+    try std.testing.expectEqual(replay_debt[0].target_sequence, capture.last.target_sequence);
+    try std.testing.expectEqual(replay_debt[0].target_sequence, capture.last.sequence);
+}
+
+test "db lifecycle open writer_no_replay starts workers without resuming pending derived replay" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var appended_sequence: u64 = 0;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2}",
+        });
+
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+        defer alloc.free(stored_key);
+        try db.core.store.putBatch(&.{
+            .{ .key = stored_key, .value = "{\"title\":\"alpha\"}" },
+        }, &.{});
+
+        const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
+        defer alloc.free(artifact_key);
+        try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
+
+        var dense_embeddings = try alloc.alloc(derived_types.DerivedDenseEmbeddingWrite, 1);
+        var batch = derived_types.DerivedBatch{
+            .dense_embeddings = dense_embeddings,
+        };
+        defer derived_types.deinitDerivedBatch(alloc, &batch);
+        dense_embeddings[0] = .{
+            .index_name = try alloc.dupe(u8, "dv_v1"),
+            .doc_key = try alloc.dupe(u8, "doc:a"),
+            .artifact_key = try alloc.dupe(u8, artifact_key),
+            .vector = try alloc.dupe(f32, &[_]f32{ 1, 0 }),
+        };
+
+        appended_sequence = db.core.store.reserveNextReplaySequence(1);
+        var record = try change_journal_mod.recordFromDerivedBatch(alloc, batch, appended_sequence);
+        defer change_journal_mod.deinitRecord(alloc, &record);
+        const encoded = try change_journal_mod.encodeRecord(alloc, record);
+        defer alloc.free(encoded);
+        try replay_stream_mod.appendOpaque(alloc, db.core.store, appended_sequence, encoded);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = true,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+
+    platform.time.sleepNs(50 * std.time.ns_per_ms);
+
+    {
+        const replay_debt = try reopened.listDerivedReplayDebt(alloc);
+        defer {
+            for (replay_debt) |*status| status.deinit(alloc);
+            alloc.free(replay_debt);
+        }
+        try std.testing.expectEqual(@as(usize, 1), replay_debt.len);
+        try std.testing.expectEqual(@as(u64, 0), replay_debt[0].applied_sequence);
+        try std.testing.expectEqual(appended_sequence, replay_debt[0].target_sequence);
+        try std.testing.expect(replay_debt[0].catch_up_required);
+    }
+
+    try reopened.runDerivedUntil(appended_sequence);
+
+    {
+        const replay_debt = try reopened.listDerivedReplayDebt(alloc);
+        defer {
+            for (replay_debt) |*status| status.deinit(alloc);
+            alloc.free(replay_debt);
+        }
+        try std.testing.expectEqual(@as(usize, 1), replay_debt.len);
+        try std.testing.expectEqual(appended_sequence, replay_debt[0].applied_sequence);
+        try std.testing.expectEqual(appended_sequence, replay_debt[0].target_sequence);
+        try std.testing.expect(!replay_debt[0].catch_up_required);
+    }
+}
+
+test "db lifecycle open default primary backend survives reopen" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"name\":\"alpha\"}" },
+                .{ .key = "doc:b", .value = "{\"name\":\"beta\"}" },
+            },
+        });
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{});
+        defer reopened.close();
+
+        const raw = try reopened.get(alloc, "doc:a");
+        defer if (raw) |value| alloc.free(value);
+        try std.testing.expect(raw != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw.?, "\"alpha\"") != null);
+
+        const stats = try reopened.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 2), stats.doc_count);
     }
 }
