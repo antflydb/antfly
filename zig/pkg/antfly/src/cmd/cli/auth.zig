@@ -15,6 +15,7 @@
 const std = @import("std");
 const antfly_client = @import("antfly-client");
 const cli = @import("mod.zig");
+const printResponse = cli.printResponse;
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const subcommand = args.next() orelse return me(allocator, io, client);
@@ -289,16 +290,4 @@ fn parseFile(comptime T: type, allocator: std.mem.Allocator, io: std.Io, path: [
     const data = try cli.readFileAlloc(io, allocator, path, 16 * 1024 * 1024);
     defer allocator.free(data);
     return std.json.parseFromSlice(T, allocator, data, .{ .ignore_unknown_fields = true });
-}
-
-fn printResponse(allocator: std.mem.Allocator, io: std.Io, resp: anytype) !void {
-    if (resp.data) |parsed| {
-        try cli.writeJson(allocator, io, parsed.value);
-        return;
-    }
-    if (resp.status_code >= 400) {
-        if (resp.err_body) |body| cli.fatal("request failed with HTTP {d}: {s}", .{ resp.status_code, body });
-        cli.fatal("request failed with HTTP {d}", .{resp.status_code});
-    }
-    try cli.writeJson(allocator, io, .{ .status = resp.status_code });
 }

@@ -57,13 +57,13 @@ fn listArtifactsWithFirstArg(allocator: std.mem.Allocator, io: std.Io, client: *
     if (key) |doc_key| {
         var resp = try client.listDocumentArtifactManifests(table, doc_key, .{ .detail = if (raw) "raw" else "summary" });
         defer resp.deinit();
-        if (resp.data) |parsed| try cli.writeJson(allocator, io, parsed.value);
+        try cli.printResponse(allocator, io, &resp);
         return;
     }
 
     var resp = try client.listArtifactEnrichments(table);
     defer resp.deinit();
-    if (resp.data) |parsed| try cli.writeJson(allocator, io, parsed.value);
+    try cli.printResponse(allocator, io, &resp);
 }
 
 fn getArtifact(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
@@ -89,7 +89,7 @@ fn getArtifact(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.
     const artifact = artifact_name orelse cli.fatal("--artifact is required", .{});
     var resp = try client.getDocumentArtifactManifest(table, doc_key, artifact, .{ .detail = if (raw) "raw" else "summary" });
     defer resp.deinit();
-    if (resp.data) |parsed| try cli.writeJson(allocator, io, parsed.value);
+    try cli.printResponse(allocator, io, &resp);
 }
 
 fn putArtifactEnrichment(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
@@ -131,6 +131,7 @@ fn putArtifactEnrichment(allocator: std.mem.Allocator, io: std.Io, client: *antf
 
     var resp = try client.putArtifactEnrichment(table, artifact, parsed.value);
     defer resp.deinit();
+    cli.expectHttpSuccess(&resp);
     std.debug.print("Put artifact enrichment command successful.\n", .{});
 }
 
@@ -177,6 +178,7 @@ fn deleteArtifactEnrichment(client: *antfly_client.AntflyClient, args: *std.proc
     const artifact = artifact_name orelse cli.fatal("--artifact is required", .{});
     var resp = try client.deleteArtifactEnrichment(table, artifact);
     defer resp.deinit();
+    cli.expectHttpSuccess(&resp);
     std.debug.print("Delete artifact enrichment command successful.\n", .{});
 }
 
@@ -209,7 +211,7 @@ fn reprocessArtifact(allocator: std.mem.Allocator, io: std.Io, client: *antfly_c
     if (key) |doc_key| {
         var resp = try client.reprocessDocumentArtifact(table, doc_key, artifact);
         defer resp.deinit();
-        if (resp.data) |parsed| try cli.writeJson(allocator, io, parsed.value);
+        try cli.printResponse(allocator, io, &resp);
         return;
     }
 
@@ -219,7 +221,7 @@ fn reprocessArtifact(allocator: std.mem.Allocator, io: std.Io, client: *antfly_c
         .limit = limit,
     });
     defer resp.deinit();
-    if (resp.data) |parsed| try cli.writeJson(allocator, io, parsed.value);
+    try cli.printResponse(allocator, io, &resp);
 }
 
 fn artifactJob(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
@@ -240,28 +242,28 @@ fn startJob(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
         .advance = opts.advance,
     });
     defer resp.deinit();
-    if (resp.data) |parsed| try cli.writeJson(allocator, io, parsed.value);
+    try cli.printResponse(allocator, io, &resp);
 }
 
 fn getJob(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const opts = try parseJobArgs(args, false);
     var resp = try client.getDocumentArtifactReprocessJob(opts.table, opts.artifact, opts.job_id.?);
     defer resp.deinit();
-    if (resp.data) |parsed| try cli.writeJson(allocator, io, parsed.value);
+    try cli.printResponse(allocator, io, &resp);
 }
 
 fn advanceJob(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const opts = try parseJobArgs(args, false);
     var resp = try client.advanceDocumentArtifactReprocessJob(opts.table, opts.artifact, opts.job_id.?);
     defer resp.deinit();
-    if (resp.data) |parsed| try cli.writeJson(allocator, io, parsed.value);
+    try cli.printResponse(allocator, io, &resp);
 }
 
 fn cancelJob(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const opts = try parseJobArgs(args, false);
     var resp = try client.cancelDocumentArtifactReprocessJob(opts.table, opts.artifact, opts.job_id.?);
     defer resp.deinit();
-    if (resp.data) |parsed| try cli.writeJson(allocator, io, parsed.value);
+    try cli.printResponse(allocator, io, &resp);
 }
 
 const JobArgs = struct {

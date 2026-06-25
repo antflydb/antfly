@@ -66,6 +66,22 @@ pub fn writeJson(allocator: std.mem.Allocator, io: std.Io, value: anytype) !void
     writeStdout(io, "\n");
 }
 
+pub fn printResponse(allocator: std.mem.Allocator, io: std.Io, resp: anytype) !void {
+    if (resp.data) |parsed| {
+        try writeJson(allocator, io, parsed.value);
+        return;
+    }
+    expectHttpSuccess(resp);
+    try writeJson(allocator, io, .{ .status = resp.status_code });
+}
+
+pub fn expectHttpSuccess(resp: anytype) void {
+    if (resp.status_code >= 400) {
+        if (resp.err_body) |body| fatal("request failed with HTTP {d}: {s}", .{ resp.status_code, body });
+        fatal("request failed with HTTP {d}", .{resp.status_code});
+    }
+}
+
 pub fn writeStdout(io: std.Io, bytes: []const u8) void {
     std.Io.File.stdout().writeStreamingAll(io, bytes) catch {};
 }
