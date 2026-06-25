@@ -34,6 +34,8 @@ pub const c = if (build_options.link_libc) @cImport({
     @cInclude("dirent.h");
 }) else struct {};
 
+var mmap_temp_counter: std.atomic.Value(u64) = .init(0);
+
 /// Memory-mapped file region. The mapped bytes are valid until `deinit()` is called.
 pub const MmapRegion = struct {
     data: []align(std.heap.page_size_min) u8,
@@ -82,6 +84,38 @@ pub const MmapRegion = struct {
         closeFd(self.fd);
     }
 };
+
+pub fn mmapTempCopy(allocator: std.mem.Allocator, prefix: []const u8, bytes: []const u8) !MmapRegion {
+    if (!comptime build_options.link_libc) return error.UnsupportedPlatform;
+    if (bytes.len == 0) return error.EmptyFile;
+
+    const nonce = mmap_temp_counter.fetchAdd(1, .monotonic);
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "/tmp/{s}-{d}-{d}.bin",
+        .{ prefix, std.posix.system.getpid(), nonce },
+    );
+    defer allocator.free(path);
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    const fd = c.open(path_z.ptr, c.O_RDWR | c.O_CREAT | c.O_EXCL, @as(c.mode_t, 0o600));
+    if (fd < 0) return error.CreateFailed;
+    errdefer closeFd(@intCast(fd));
+    var temp_unlinked = false;
+    errdefer {
+        if (!temp_unlinked) _ = c.unlink(path_z.ptr);
+    }
+    if (c.unlink(path_z.ptr) != 0) return error.UnlinkFailed;
+    temp_unlinked = true;
+    if (c.ftruncate(fd, @intCast(bytes.len)) != 0) return error.TruncateFailed;
+    try writeAllAt(@intCast(fd), bytes, 0);
+
+    const mapped = try std.posix.mmap(null, bytes.len, .{ .READ = true }, .{ .TYPE = .SHARED }, @intCast(fd), 0);
+    var region = MmapRegion{ .data = mapped, .fd = @intCast(fd) };
+    region.adviseRandom();
+    return region;
+}
 
 /// Read an entire file into an allocated buffer.
 /// Max size is configurable (default 100MB for SafeTensors weights).
@@ -266,6 +300,32 @@ fn readAt(fd: std.posix.fd_t, buf: []u8, offset: u64) !usize {
     return error.ReadFailed;
 }
 
+fn writeAllAt(fd: std.posix.fd_t, bytes: []const u8, offset: u64) !void {
+    var total: usize = 0;
+    while (total < bytes.len) {
+        const write_off = try std.math.add(u64, offset, total);
+        const n = if (comptime build_options.link_libc) blk: {
+            const rc = c.pwrite(fd, bytes.ptr + total, bytes.len - total, @intCast(write_off));
+            if (rc < 0) return error.WriteFailed;
+            break :blk @as(usize, @intCast(rc));
+        } else blk: {
+            if (builtin.os.tag == .linux) {
+                while (true) {
+                    const rc = std.os.linux.pwrite(fd, bytes.ptr + total, bytes.len - total, @intCast(write_off));
+                    switch (std.os.linux.errno(rc)) {
+                        .SUCCESS => break :blk @as(usize, @intCast(rc)),
+                        .INTR => continue,
+                        else => return error.WriteFailed,
+                    }
+                }
+            }
+            return error.WriteFailed;
+        };
+        if (n == 0) return error.IncompleteWrite;
+        total += n;
+    }
+}
+
 fn advise(ptr: [*]u8, len: usize, advice: Advice) void {
     if (comptime build_options.link_libc) {
         const c_advice = switch (advice) {
@@ -319,5 +379,14 @@ test "MmapRegion maps file data correctly and adviseRandom does not crash" {
     region.adviseRandom();
 
     // Data should still be readable after advice change
+    try std.testing.expectEqualSlices(u8, payload, region.data[0..payload.len]);
+}
+
+test "mmapTempCopy maps unlinked temp data" {
+    const payload = "temporary mapped payload";
+    var region = try mmapTempCopy(std.testing.allocator, "termite-mmap-temp-test", payload);
+    defer region.deinit();
+
+    try std.testing.expectEqual(payload.len, region.data.len);
     try std.testing.expectEqualSlices(u8, payload, region.data[0..payload.len]);
 }

@@ -211,6 +211,7 @@ pub const TableApi = struct {
             table_name: []const u8,
             backup_id: []const u8,
             format: backups_api.BackupFormat,
+            location_uri: []const u8,
             location: *backups_api.BackupLocation,
         ) ExecuteBackupError!void,
         execute_table_restore: *const fn (
@@ -329,9 +330,10 @@ pub const TableApi = struct {
         table_name: []const u8,
         backup_id: []const u8,
         format: backups_api.BackupFormat,
+        location_uri: []const u8,
         location: *backups_api.BackupLocation,
     ) ExecuteBackupError!void {
-        return try self.vtable.execute_table_backup(self.ptr, alloc, table_name, backup_id, format, location);
+        return try self.vtable.execute_table_backup(self.ptr, alloc, table_name, backup_id, format, location_uri, location);
     }
 
     pub fn executeTableRestore(
@@ -629,7 +631,7 @@ pub fn handleTableBackup(
     };
     defer location.deinit(alloc);
 
-    api.executeTableBackup(alloc, table_name, parsed_req.value.backup_id, backup_format, &location) catch |err| switch (err) {
+    api.executeTableBackup(alloc, table_name, parsed_req.value.backup_id, backup_format, parsed_req.value.location, &location) catch |err| switch (err) {
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.UnsupportedBackupMigrationState => return .{ .status = 400, .body = try alloc.dupe(u8, "backup does not support active schema migration") },
@@ -1187,6 +1189,7 @@ fn unsupportedBackup(
     _: []const u8,
     _: []const u8,
     _: backups_api.BackupFormat,
+    _: []const u8,
     _: *backups_api.BackupLocation,
 ) TableApi.ExecuteBackupError!void {
     return error.InternalFailure;
@@ -1886,6 +1889,7 @@ test "public table backup handler maps unsupported multi-range error" {
             _: []const u8,
             _: []const u8,
             _: backups_api.BackupFormat,
+            _: []const u8,
             _: *backups_api.BackupLocation,
         ) TableApi.ExecuteBackupError!void {
             return error.UnsupportedMultiRangeTable;
@@ -1932,6 +1936,7 @@ test "public table backup handler accepts portable format" {
             _: []const u8,
             _: []const u8,
             format: backups_api.BackupFormat,
+            _: []const u8,
             _: *backups_api.BackupLocation,
         ) TableApi.ExecuteBackupError!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));

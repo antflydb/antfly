@@ -30,6 +30,7 @@ pub const GeminiProvider = struct {
     http: *httpx.Client,
     base_url: []const u8,
     api_key_header: [2][]const u8,
+    max_tokens: ?i64 = null,
 
     pub fn init(allocator: Allocator, http: *httpx.Client, options: GeminiOptions) !GeminiProvider {
         var provider = GeminiProvider{
@@ -59,13 +60,17 @@ pub const GeminiProvider = struct {
         };
     }
 
+    pub fn setMaxTokens(self: *GeminiProvider, max_tokens: i64) void {
+        self.max_tokens = max_tokens;
+    }
+
     fn generateImpl(ptr: *anyopaque, alloc: Allocator, model: []const u8, messages: []const inference.ChatMessage) anyerror!inference.GenerateResult {
         const self: *GeminiProvider = @ptrCast(@alignCast(ptr));
 
         const url = try std.fmt.allocPrint(self.allocator, "{s}/models/{s}:generateContent", .{ self.base_url, model });
         defer self.allocator.free(url);
 
-        const json_body = try vertexGenerateRequestJsonAlloc(alloc, messages);
+        const json_body = try vertexGenerateRequestJsonAlloc(alloc, messages, self.max_tokens);
         defer alloc.free(json_body);
 
         const headers = [_][2][]const u8{self.api_key_header};
@@ -96,6 +101,7 @@ pub const Provider = struct {
     location: []const u8,
     auth_header: ?[2][]const u8 = null,
     token_source: ?*google_auth.CachedTokenSource = null,
+    max_tokens: ?i64 = null,
 
     pub fn init(allocator: Allocator, http: *httpx.Client, options: Options) !Provider {
         var provider = Provider{
@@ -150,6 +156,10 @@ pub const Provider = struct {
         };
     }
 
+    pub fn setMaxTokens(self: *Provider, max_tokens: i64) void {
+        self.max_tokens = max_tokens;
+    }
+
     fn generateImpl(ptr: *anyopaque, alloc: Allocator, model: []const u8, messages: []const inference.ChatMessage) anyerror!inference.GenerateResult {
         const self: *Provider = @ptrCast(@alignCast(ptr));
 
@@ -162,7 +172,7 @@ pub const Provider = struct {
         );
         defer self.allocator.free(url);
 
-        const json_body = try vertexGenerateRequestJsonAlloc(alloc, messages);
+        const json_body = try vertexGenerateRequestJsonAlloc(alloc, messages, self.max_tokens);
         defer alloc.free(json_body);
 
         var headers = std.ArrayList([2][]const u8).empty;
@@ -234,7 +244,7 @@ fn parseGenerateResponseAlloc(alloc: Allocator, body: []const u8) !inference.Gen
     return .{ .content = try out.toOwnedSlice(alloc), .allocator = alloc };
 }
 
-fn vertexGenerateRequestJsonAlloc(alloc: Allocator, messages: []const inference.ChatMessage) ![]u8 {
+fn vertexGenerateRequestJsonAlloc(alloc: Allocator, messages: []const inference.ChatMessage, max_tokens: ?i64) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
 
@@ -259,7 +269,13 @@ fn vertexGenerateRequestJsonAlloc(alloc: Allocator, messages: []const inference.
         try appendVertexContent(alloc, &out, message);
         count += 1;
     }
-    try out.appendSlice(alloc, "]}");
+    try out.append(alloc, ']');
+    if (max_tokens) |value| {
+        const fragment = try std.fmt.allocPrint(alloc, ",\"generationConfig\":{{\"maxOutputTokens\":{d}}}", .{value});
+        defer alloc.free(fragment);
+        try out.appendSlice(alloc, fragment);
+    }
+    try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
 }
 
@@ -514,6 +530,14 @@ test "gemini provider sends api key and generates content" {
     if (run_err) |err| return err;
 
     try std.testing.expectEqualStrings("generated from gemini", result.?.content);
+}
+
+test "vertex request serialization includes max output tokens" {
+    const alloc = std.testing.allocator;
+    const messages = [_]inference.ChatMessage{.{ .role = .user, .content = .{ .text = "hello" } }};
+    const body = try vertexGenerateRequestJsonAlloc(alloc, &messages, 256);
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"generationConfig\":{\"maxOutputTokens\":256}") != null);
 }
 
 fn expectVertexGenerateRequest(req: httpx.testing_mod.RequestInfo) !void {

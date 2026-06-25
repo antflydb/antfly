@@ -70,6 +70,7 @@ const CudaCapabilityProfile = if (build_options.enable_cuda) cuda_compute_mod.Ca
     clipclap,
     deberta_reranker,
     gliner2,
+    florence2,
     gemma4,
 };
 const GpuHostedQuantExecutionMode = @import("../ops/gpu_hosted_store.zig").QuantExecutionMode;
@@ -957,23 +958,33 @@ pub fn createCudaSession(allocator: std.mem.Allocator, model_path: []const u8) !
 pub fn createCudaSessionWithTaskOverride(allocator: std.mem.Allocator, model_path: []const u8, override: ?TaskOverride) !Session {
     if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
 
+    const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
+    if (debug_cuda_session) std.log.info("cuda-session: init cuda compute start path={s}", .{model_path});
+    var cuda_compute = try cuda_compute_mod.CudaCompute.init(allocator);
+    errdefer cuda_compute.deinit();
+    if (debug_cuda_session) std.log.info("cuda-session: init cuda compute done path={s}", .{model_path});
+
+    if (debug_cuda_session) std.log.info("cuda-session: create native session start path={s}", .{model_path});
     var native_session = try createNativeSessionWithTaskOverride(allocator, model_path, override);
     defer native_session.close();
+    if (debug_cuda_session) std.log.info("cuda-session: create native session done path={s}", .{model_path});
     const native_impl: *ArchSession = @ptrCast(@alignCast(native_session.ptr));
     if (native_impl.backend_type != .native) return error.InvalidBackend;
     const cuda_profile = cudaProfileForArch(native_impl.arch_config) orelse return error.UnsupportedCudaArchitecture;
 
-    var cuda_compute = try cuda_compute_mod.CudaCompute.init(allocator);
-    errdefer cuda_compute.deinit();
+    if (debug_cuda_session) std.log.info("cuda-session: require profile {s}", .{@tagName(cuda_profile)});
     try cuda_compute.requireProfile(cuda_profile);
     var it = native_impl.backend_data.native.resident_weights.iterator();
+    var resident_count: usize = 0;
     while (it.next()) |entry| {
         const owned_key = try allocator.dupe(u8, entry.key_ptr.*);
         cuda_compute.insertWeightFromLoaded(owned_key, entry.value_ptr) catch |err| {
             allocator.free(owned_key);
             return err;
         };
+        resident_count += 1;
     }
+    if (debug_cuda_session) std.log.info("cuda-session: uploaded resident weights count={d}", .{resident_count});
 
     const impl = try allocator.create(ArchSession);
     impl.* = .{
@@ -983,6 +994,7 @@ pub fn createCudaSessionWithTaskOverride(allocator: std.mem.Allocator, model_pat
         .backend_type = .cuda,
         .backend_data = .{ .cuda = .{ .compute = cuda_compute } },
     };
+    if (debug_cuda_session) std.log.info("cuda-session: return session path={s}", .{model_path});
     return .{ .ptr = impl, .vtable = &arch_vtable };
 }
 
@@ -995,6 +1007,7 @@ fn cudaProfileForArch(arch_config: ArchConfig) ?CudaCapabilityProfile {
         .clip, .clap => .clipclap,
         .deberta => .deberta_reranker,
         .gliner => .gliner2,
+        .florence => .florence2,
         .gpt => |cfg| if (cfg.family == .gemma) .gemma4 else null,
         else => null,
     };
@@ -1007,10 +1020,12 @@ test "cuda support gate admits only supported encoder architectures" {
     try std.testing.expect(cudaSupportsArch(.{ .clap = .{} }));
     try std.testing.expect(cudaSupportsArch(.{ .deberta = .{} }));
     try std.testing.expect(cudaSupportsArch(.{ .gliner = .{} }));
+    try std.testing.expect(cudaSupportsArch(.{ .florence = .{} }));
     if (comptime build_options.enable_cuda) {
         try std.testing.expectEqual(CudaCapabilityProfile.clipclap, cudaProfileForArch(.{ .clip = .{} }).?);
         try std.testing.expectEqual(CudaCapabilityProfile.deberta_reranker, cudaProfileForArch(.{ .deberta = .{} }).?);
         try std.testing.expectEqual(CudaCapabilityProfile.gliner2, cudaProfileForArch(.{ .gliner = .{} }).?);
+        try std.testing.expectEqual(CudaCapabilityProfile.florence2, cudaProfileForArch(.{ .florence = .{} }).?);
         try std.testing.expectEqual(CudaCapabilityProfile.gemma4, cudaProfileForArch(.{ .gpt = .{ .family = .gemma } }).?);
     }
 }
@@ -2758,7 +2773,8 @@ fn shouldKeepResidentGptEmbeddingQuantizedOnly(
 fn isCudaResidentEmbeddingQuantType(tensor_type: gguf_mod.tensor_types.TensorType) bool {
     return std.meta.eql(tensor_type, gguf_mod.tensor_types.TensorType{ .known = .Q8_0 }) or
         std.meta.eql(tensor_type, gguf_mod.tensor_types.TensorType{ .known = .Q4_0 }) or
-        std.meta.eql(tensor_type, gguf_mod.tensor_types.TensorType{ .known = .Q4_K });
+        std.meta.eql(tensor_type, gguf_mod.tensor_types.TensorType{ .known = .Q4_K }) or
+        std.meta.eql(tensor_type, gguf_mod.tensor_types.TensorType{ .known = .Q6_K });
 }
 
 fn shouldKeepResidentGptWeightQuantizedOnly(
@@ -4454,9 +4470,12 @@ pub fn attachSharedPrefetchState(session: Session, shared_prefetch: *runtime.tie
 
 fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
+    if (debug_cuda_session) std.log.info("arch-run: start backend={s}", .{@tagName(self.backend_type)});
 
     // Create the appropriate ComputeBackend
     var cb = try makeComputeBackend(self, allocator, null);
+    if (debug_cuda_session) std.log.info("arch-run: compute backend made kind={s}", .{@tagName(cb.kind())});
     defer cb.deinit();
 
     // Dispatch based on architecture
@@ -4750,6 +4769,7 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
             return result;
         },
         .florence => |cfg| {
+            if (debug_cuda_session) std.log.info("arch-run: florence branch inputs={d}", .{inputs.len});
             if (inputs.len < 1) return error.MissingInputs;
             const first = inputs[0];
 
@@ -4772,6 +4792,7 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
                     prompt_ids = prompt_tensor.asInt64();
                 }
 
+                if (debug_cuda_session) std.log.info("arch-run: florence encoder start batch={d} prompt_seq={d}", .{ batch, prompt_seq_len });
                 const encoder = try florence_arch.encoderForward(
                     &cb,
                     allocator,
@@ -4781,6 +4802,7 @@ fn archRun(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator
                     prompt_ids,
                     prompt_seq_len,
                 );
+                if (debug_cuda_session) std.log.info("arch-run: florence encoder done seq={d}", .{encoder.seq_len});
                 defer allocator.free(encoder.hidden);
 
                 const shape = [_]i64{ @intCast(batch), @intCast(encoder.seq_len), @intCast(cfg.d_model) };
@@ -6148,4 +6170,15 @@ test "defaultResidentExpertsPerLayer returns 0 for non-MoE model" {
     const cfg: gpt_mod.Config = .{};
     const resident = defaultResidentExpertsPerLayer(.{ .gpt = cfg });
     try std.testing.expectEqual(@as(usize, 0), resident);
+}
+
+test "Gemma resident embeddings retain CUDA-supported quantized formats" {
+    const gemma_cfg: gpt_mod.Config = .{ .family = .gemma };
+    try std.testing.expect(shouldKeepResidentGptEmbeddingQuantizedOnly(gemma_cfg, .{ .known = .Q8_0 }));
+    try std.testing.expect(shouldKeepResidentGptEmbeddingQuantizedOnly(gemma_cfg, .{ .known = .Q4_0 }));
+    try std.testing.expect(shouldKeepResidentGptEmbeddingQuantizedOnly(gemma_cfg, .{ .known = .Q4_K }));
+    try std.testing.expect(shouldKeepResidentGptEmbeddingQuantizedOnly(gemma_cfg, .{ .known = .Q6_K }));
+
+    const llama_cfg: gpt_mod.Config = .{ .family = .llama };
+    try std.testing.expect(!shouldKeepResidentGptEmbeddingQuantizedOnly(llama_cfg, .{ .known = .Q6_K }));
 }

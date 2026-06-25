@@ -97,12 +97,30 @@ pub const Config = struct {
     };
 
     pub const InferenceConfig = struct {
+        pub const WarmModelConfig = struct {
+            kind: []u8,
+            name: []u8,
+            backend: ?[]u8 = null,
+            format: ?[]u8 = null,
+            quantization: ?[]u8 = null,
+
+            fn deinit(self: *WarmModelConfig, alloc: std.mem.Allocator) void {
+                alloc.free(self.kind);
+                alloc.free(self.name);
+                if (self.backend) |value| alloc.free(value);
+                if (self.format) |value| alloc.free(value);
+                if (self.quantization) |value| alloc.free(value);
+                self.* = undefined;
+            }
+        };
+
         api_url: ?[]u8 = null,
         api_key: ?[]u8 = null,
         models_dir: ?[]u8 = null,
         ml_dir: ?[]u8 = null,
         content_security: ?ContentSecurityConfig = null,
         s3_credentials: ?S3CredentialsConfig = null,
+        preload: []WarmModelConfig = &.{},
 
         fn deinit(self: *InferenceConfig, alloc: std.mem.Allocator) void {
             if (self.api_url) |value| alloc.free(value);
@@ -111,6 +129,8 @@ pub const Config = struct {
             if (self.ml_dir) |value| alloc.free(value);
             if (self.content_security) |*security| security.deinit(alloc);
             if (self.s3_credentials) |*credentials| credentials.deinit(alloc);
+            for (self.preload) |*model| model.deinit(alloc);
+            if (self.preload.len > 0) alloc.free(self.preload);
             self.* = undefined;
         }
     };
@@ -391,6 +411,7 @@ pub const Config = struct {
                 .ml_dir = if (inference.ml_dir) |value| try alloc.dupe(u8, value) else null,
                 .content_security = if (inference.content_security) |security| try contentSecurityFromOpenApi(alloc, security) else null,
                 .s3_credentials = try parseRawInferenceS3Credentials(alloc, raw_root, inference.s3_credentials),
+                .preload = try parseInferencePreloadModels(alloc, raw_root.get("inference")),
             } else .{},
             .remote_content = if (raw_root.get("remote_content")) |remote_content|
                 try parseRemoteContentConfig(alloc, remote_content)
@@ -978,6 +999,42 @@ fn optionalStringArrayField(alloc: std.mem.Allocator, object: std.json.ObjectMap
     return out;
 }
 
+fn parseInferencePreloadModels(
+    alloc: std.mem.Allocator,
+    raw_inference: ?std.json.Value,
+) ![]Config.InferenceConfig.WarmModelConfig {
+    const value = raw_inference orelse return &.{};
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidConfig,
+    };
+    const preload_value = object.get("preload") orelse return &.{};
+    if (preload_value != .array) return error.InvalidConfig;
+
+    const out = try alloc.alloc(Config.InferenceConfig.WarmModelConfig, preload_value.array.items.len);
+    var filled: usize = 0;
+    errdefer {
+        for (out[0..filled]) |*model| model.deinit(alloc);
+        alloc.free(out);
+    }
+
+    for (preload_value.array.items, 0..) |item, i| {
+        const model_object = switch (item) {
+            .object => |entry| entry,
+            else => return error.InvalidConfig,
+        };
+        out[i] = .{
+            .kind = try requiredStringFieldDup(alloc, model_object, "kind"),
+            .name = try requiredStringFieldDup(alloc, model_object, "name"),
+            .backend = try optionalStringFieldDup(alloc, model_object, "backend"),
+            .format = try optionalStringFieldDup(alloc, model_object, "format"),
+            .quantization = try optionalStringFieldDup(alloc, model_object, "quantization"),
+        };
+        filled = i + 1;
+    }
+    return out;
+}
+
 fn contentSecurityFromOpenApi(
     alloc: std.mem.Allocator,
     value: scraping_openapi.ContentSecurityConfig,
@@ -1152,6 +1209,9 @@ test "common config extracts antfly settings" {
         \\    "api_url": "http://127.0.0.1:8083",
         \\    "models_dir": "/tmp/models",
         \\    "ml_dir": "/tmp/ml",
+        \\    "preload": [
+        \\      { "kind": "generator", "name": "antflydb/gemma-e2b", "backend": "metal", "format": "gguf", "quantization": "q4_k" }
+        \\    ],
         \\    "content_security": {
         \\      "allowed_hosts": ["models.example.com"],
         \\      "block_private_ips": true
@@ -1174,11 +1234,44 @@ test "common config extracts antfly settings" {
     try std.testing.expectEqualStrings("http://127.0.0.1:8083", cfg.inference.api_url.?);
     try std.testing.expectEqualStrings("/tmp/models", cfg.inference.models_dir.?);
     try std.testing.expectEqualStrings("/tmp/ml", cfg.inference.ml_dir.?);
+    try std.testing.expectEqual(@as(usize, 1), cfg.inference.preload.len);
+    try std.testing.expectEqualStrings("generator", cfg.inference.preload[0].kind);
+    try std.testing.expectEqualStrings("antflydb/gemma-e2b", cfg.inference.preload[0].name);
+    try std.testing.expectEqualStrings("metal", cfg.inference.preload[0].backend.?);
+    try std.testing.expectEqualStrings("gguf", cfg.inference.preload[0].format.?);
+    try std.testing.expectEqualStrings("q4_k", cfg.inference.preload[0].quantization.?);
     try std.testing.expectEqualStrings("models.example.com", cfg.inference.content_security.?.allowed_hosts.?[0]);
     try std.testing.expectEqual(@as(?bool, true), cfg.inference.content_security.?.block_private_ips);
     try std.testing.expectEqualStrings("s3.amazonaws.com", cfg.inference.s3_credentials.?.endpoint.?);
     try std.testing.expectEqualStrings("antfly-key", cfg.inference.s3_credentials.?.access_key_id.?);
     try std.testing.expectEqualStrings("antfly-secret", cfg.inference.s3_credentials.?.secret_access_key.?);
+}
+
+test "common config parses inference preload" {
+    const alloc = std.testing.allocator;
+    const raw =
+        \\{
+        \\  "inference": {
+        \\    "api_url": "http://127.0.0.1:8090",
+        \\    "preload": [
+        \\      { "kind": "generator", "name": "antflydb/gemma-e2b", "format": "gguf", "quantization": "q8" },
+        \\      { "kind": "reranker", "name": "BAAI/bge-reranker", "backend": "native", "format": "onnx" }
+        \\    ]
+        \\  }
+        \\}
+    ;
+    var cfg = try Config.parseFromSlice(alloc, raw);
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), cfg.inference.preload.len);
+    try std.testing.expectEqualStrings("generator", cfg.inference.preload[0].kind);
+    try std.testing.expectEqualStrings("antflydb/gemma-e2b", cfg.inference.preload[0].name);
+    try std.testing.expectEqualStrings("gguf", cfg.inference.preload[0].format.?);
+    try std.testing.expectEqualStrings("q8", cfg.inference.preload[0].quantization.?);
+    try std.testing.expectEqualStrings("reranker", cfg.inference.preload[1].kind);
+    try std.testing.expectEqualStrings("BAAI/bge-reranker", cfg.inference.preload[1].name);
+    try std.testing.expectEqualStrings("native", cfg.inference.preload[1].backend.?);
+    try std.testing.expectEqualStrings("onnx", cfg.inference.preload[1].format.?);
 }
 
 test "common config defaults shard scalar fields" {

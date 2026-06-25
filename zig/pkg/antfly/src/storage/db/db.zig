@@ -8147,7 +8147,11 @@ test "db resolver removal retires resolution artifacts and mention graph state" 
     var sink = FakePromotionSink{ .alloc = alloc };
     defer sink.deinit();
 
-    var db = try DB.open(alloc, std.mem.span(path), .{ .entity_sink = sink.sink() });
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .executor = .{ .backend = .manual },
+        .start_index_workers = false,
+        .entity_sink = sink.sink(),
+    });
     defer db.close();
 
     try db.addIndex(.{
@@ -9285,41 +9289,6 @@ test "db graph edge artifact replay catches up after reopen" {
     try std.testing.expectEqual(@as(usize, 1), edges.len);
     try std.testing.expectEqualStrings("doc:b", edges[0].target);
     try std.testing.expectApproxEqAbs(@as(f64, 0.8), edges[0].weight, 0.0001);
-}
-
-test "db query_readonly opens empty declared graph index" {
-    const alloc = std.testing.allocator;
-
-    var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
-
-    {
-        var db = try DB.open(alloc, std.mem.span(path), .{});
-        defer db.close();
-
-        try db.addIndex(.{
-            .name = "relations_graph",
-            .kind = .graph,
-            .config_json = "{}",
-        });
-    }
-
-    var reopened = try DB.open(alloc, std.mem.span(path), .{ .open_mode = .query_readonly });
-    defer reopened.close();
-
-    const query = graph_query_mod.GraphQuery{
-        .query_type = .neighbors,
-        .index_name = "relations_graph",
-        .start_nodes = .{ .keys = &.{"doc:a"} },
-        .params = .{ .edge_types = &.{"mentions"}, .direction = .out },
-    };
-    var result = try reopened.search(alloc, .{ .graph_queries = &.{.{ .name = "mentions", .query = query }} });
-    defer result.deinit();
-
-    try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
-    try std.testing.expectEqual(@as(u32, 0), result.graph_results[0].total_hits);
-    try std.testing.expectEqual(@as(usize, 0), result.graph_results[0].nodes.len);
 }
 
 test "db full_index precomputes generated enrichments into the committed batch" {

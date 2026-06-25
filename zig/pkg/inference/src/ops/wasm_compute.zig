@@ -1774,6 +1774,7 @@ pub const WasmCompute = struct {
     fn decoderRuntimePrepareLinearOp(ctx: *anyopaque, request: *const ops.DecoderRuntimePrepareLinearRequest) anyerror!bool {
         const self: *WasmCompute = @ptrCast(@alignCast(ctx));
         _ = request.retain_dense_fallback;
+        _ = request.dense_fallback_max_bytes;
         try self.decoder_runtime_linear_slots.put(request.slot, .{
             .weight = toBuf(request.weight),
             .bias = toBuf(request.bias),

@@ -39,6 +39,7 @@ const enrichment_worker = @import("enrichment/enrichment_worker.zig");
 const embedder_mod = @import("enrichment/embedder.zig");
 const graph_metric_runtime_mod = @import("maintenance/graph_metric_runtime.zig");
 const graph_mod = @import("../../graph/graph.zig");
+const graph_query_mod = @import("../../graph/query.zig");
 const ha_replication = @import("ha_replication.zig");
 const hbc_mod = @import("../hbc_adapter.zig");
 const internal_keys = @import("../internal_keys.zig");
@@ -4111,7 +4112,6 @@ test "db lifecycle open status_only reads index catalog without loading index st
     const db_test_support = @import("test_support.zig");
     const tempPath = db_test_support.tempPath;
     const cleanupTempDir = db_test_support.cleanupTempDir;
-    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -4172,6 +4172,45 @@ test "db lifecycle open status_only reads index catalog without loading index st
         }
         try std.testing.expect(saw_dense);
     }
+}
+
+test "db lifecycle open query_readonly opens empty declared graph index" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json = "{}",
+        });
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{ .open_mode = .query_readonly });
+    defer reopened.close();
+
+    const query = graph_query_mod.GraphQuery{
+        .query_type = .neighbors,
+        .index_name = "relations_graph",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .params = .{ .edge_types = &.{"mentions"}, .direction = .out },
+    };
+    var result = try reopened.search(alloc, .{ .graph_queries = &.{.{ .name = "mentions", .query = query }} });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
+    try std.testing.expectEqual(@as(u32, 0), result.graph_results[0].total_hits);
+    try std.testing.expectEqual(@as(usize, 0), result.graph_results[0].nodes.len);
 }
 
 test "db lifecycle open query_readonly skips pending derived replay on reopen" {
@@ -4308,7 +4347,6 @@ test "db lifecycle open query_readonly lsm primary opens physical backend read-o
     const db_test_support = @import("test_support.zig");
     const tempPath = db_test_support.tempPath;
     const cleanupTempDir = db_test_support.cleanupTempDir;
-    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -4349,14 +4387,14 @@ test "db lifecycle open query_readonly lsm primary opens physical backend read-o
         .sync_level = .write,
     }));
     const NoopDocumentArtifactChildRangeDispatcher = struct {
-        fn apply(_: *anyopaque, _: Allocator, _: DB.DocumentArtifactChildRangeDispatch) anyerror!void {}
+        fn apply(_: *anyopaque, _: Allocator, _: @import("mod.zig").DocumentArtifactChildRangeDispatch) anyerror!void {}
     };
     var noop_dispatcher_state: u8 = 0;
-    const noop_dispatcher = DB.DocumentArtifactChildRangeDispatcher{
+    const noop_dispatcher = @import("mod.zig").DocumentArtifactChildRangeDispatcher{
         .ptr = &noop_dispatcher_state,
         .apply = NoopDocumentArtifactChildRangeDispatcher.apply,
     };
-    var blocked_profile = DB.BatchProfile{};
+    var blocked_profile = @import("mod.zig").BatchProfile{};
     try std.testing.expectError(error.ReadOnly, readonly.batchProfiled(.{
         .writes = &.{.{ .key = "doc:profiled", .value = "{\"title\":\"beta\"}" }},
         .sync_level = .write,
@@ -4473,7 +4511,6 @@ test "db lifecycle open query_readonly lmdb primary does not create missing data
     const db_test_support = @import("test_support.zig");
     const tempPath = db_test_support.tempPath;
     const cleanupTempDir = db_test_support.cleanupTempDir;
-    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -4498,7 +4535,6 @@ test "db lifecycle open query_readonly lmdb primary rejects writes after readonl
     const db_test_support = @import("test_support.zig");
     const tempPath = db_test_support.tempPath;
     const cleanupTempDir = db_test_support.cleanupTempDir;
-    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -4718,9 +4754,9 @@ test "db lifecycle open dense replay progress target matches replay debt target"
 
     const Capture = struct {
         seen: usize = 0,
-        last: DB.ReplayProgress = .{},
+        last: db_internal.ReplayProgress = .{},
 
-        fn run(ptr: *anyopaque, _: []const u8, progress: DB.ReplayProgress) !void {
+        fn run(ptr: *anyopaque, _: []const u8, progress: db_internal.ReplayProgress) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.seen += 1;
             self.last = progress;

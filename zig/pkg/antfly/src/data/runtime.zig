@@ -5150,7 +5150,14 @@ pub const DataServer = struct {
                 stats.group_count += 1;
                 if (result.busy) {
                     stats.busy_groups += 1;
-                    stats.debt_remaining = true;
+                    if (self.runtime_status_dirty.load(.acquire) or self.runtime_status_refresh_active.load(.acquire)) {
+                        stats.debt_remaining = true;
+                        continue;
+                    }
+                    const cached_debt: ?bool = self.cachedRuntimeStatusHasStartupCatchUpDebt(table.name, group_id) catch true;
+                    if (cached_debt orelse true) {
+                        stats.debt_remaining = true;
+                    }
                     continue;
                 }
                 if (!result.had_debt) continue;
@@ -5541,6 +5548,13 @@ pub const DataServer = struct {
             }
         }
         return false;
+    }
+
+    fn cachedRuntimeStatusHasStartupCatchUpDebt(self: *DataServer, table_name: []const u8, group_id: u64) !?bool {
+        const status = try self.provisioned_storage.runtime_status_cache.snapshotGroupStatus(self.alloc, table_name, group_id);
+        var owned = status orelse return null;
+        defer owned.deinit(self.alloc);
+        return runtimeStatusStartupCatchUpDebtPresent((&[_]runtime_status.LocalTableRuntimeStatus{owned})[0..]);
     }
 
     fn setProvisionedStartupCatchUpTarget(self: *DataServer, group_id: u64, table_name: []const u8) !void {
@@ -12260,6 +12274,157 @@ test "data runtime provisioned startup catch-up clears replay debt for local gro
         try std.testing.expectEqual(appended_sequence, stats.indexes[0].replay_applied_sequence);
         try std.testing.expectEqual(appended_sequence, stats.indexes[0].replay_target_sequence);
         try std.testing.expect(!stats.indexes[0].replay_catch_up_required);
+    }
+}
+
+test "data runtime startup catch-up clears no-debt busy writer groups" {
+    const alloc = std.testing.allocator;
+
+    const cases = [_]struct {
+        suffix: []const u8,
+        runtime_status_dirty: bool = false,
+        runtime_status_refresh_active: bool = false,
+        expect_dirty: bool,
+    }{
+        .{ .suffix = "quiescent", .expect_dirty = false },
+        .{ .suffix = "runtime-dirty", .runtime_status_dirty = true, .expect_dirty = true },
+        .{ .suffix = "refresh-active", .runtime_status_refresh_active = true, .expect_dirty = true },
+    };
+
+    for (cases) |tc| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-startup-catch-up-busy-no-debt-{s}", .{ tmp.sub_path, tc.suffix });
+        defer alloc.free(replica_root_dir);
+        const db_path = try std.fmt.allocPrint(alloc, "{s}/group-77/table-db", .{replica_root_dir});
+        defer alloc.free(db_path);
+
+        const FakeStatus = struct {
+            fn iface() antfly.public_api.http_server.StatusSource {
+                return .{
+                    .ptr = undefined,
+                    .vtable = &.{
+                        .status = status,
+                        .admin_snapshot = adminSnapshot,
+                        .free_admin_snapshot = freeAdminSnapshot,
+                    },
+                };
+            }
+
+            fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
+                return .{ .metadata_group_id = 1, .metrics = .{} };
+            }
+
+            fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                return .{
+                    .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                    .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                        .table_id = 7,
+                        .name = "docs",
+                        .placement_role = "data",
+                        .indexes_json = "{\"indexes\":[]}",
+                    }})[0..]),
+                    .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                        .group_id = 77,
+                        .table_id = 7,
+                        .start_key = "",
+                        .end_key = null,
+                    }})[0..]),
+                    .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{.{
+                        .store_id = 19,
+                        .node_id = 9,
+                        .role = "data",
+                        .live = true,
+                        .health_class = "healthy",
+                    }})[0..]),
+                    .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{.{
+                        .record = .{ .group_id = 77, .replica_id = 1, .local_node_id = 9 },
+                        .store_id = 19,
+                        .peer_node_ids = &.{9},
+                    }})[0..]),
+                    .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                    .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+                };
+            }
+
+            fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+        };
+
+        const FakeCatalog = struct {
+            fn iface() antfly.public_api.table_catalog.CatalogSource {
+                return .{
+                    .ptr = undefined,
+                    .vtable = &.{
+                        .admin_snapshot = adminSnapshot,
+                        .free_admin_snapshot = freeAdminSnapshot,
+                    },
+                };
+            }
+
+            fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+                return try FakeStatus.adminSnapshot(undefined);
+            }
+
+            fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+        };
+
+        var write_cache = antfly.public_api.ProvisionedTableWriteCache.init(alloc);
+        defer write_cache.deinit();
+
+        var server: DataServer = .{
+            .alloc = alloc,
+            .store_registration = .{
+                .node_id = 9,
+                .store_id = 19,
+                .role = "data",
+                .failure_domain = "test",
+            },
+            .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+            .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+                replica_root_dir,
+                FakeCatalog.iface(),
+                antfly.raft.read_gate.noopReadableLeaseRequester(),
+            ),
+            .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+                replica_root_dir,
+                FakeCatalog.iface(),
+            ),
+            .status_source = FakeStatus.iface(),
+            .api_server_cfg = undefined,
+            .query_async_limit = .limited(8),
+            .listener_cfg = undefined,
+        };
+        defer server.deinit();
+        server.provisioned_storage.attachSources(&server.read_source, &server.write_source);
+        server.write_source.write_cache = &write_cache;
+
+        try write_cache.beginBulkIngestLocked("docs");
+        {
+            lockAtomic(server.write_source.localDbMutex());
+            defer server.write_source.localDbMutex().unlock();
+
+            var cached = try write_cache.getOrOpenLocked(db_path, FakeCatalog.iface(), 77, 0, "docs");
+            defer cached.deinit(alloc);
+            const stats = try cached.db.stats(alloc);
+            defer antfly.db.types.freeDBStats(alloc, stats);
+            try server.provisioned_storage.runtime_status_cache.upsertGroupStatus("docs", .{
+                .group_id = 77,
+                .stats = stats,
+            });
+        }
+
+        server.runtime_status_dirty.store(tc.runtime_status_dirty, .release);
+        server.runtime_status_refresh_active.store(tc.runtime_status_refresh_active, .release);
+        server.provisioned_startup_catch_up_dirty.store(true, .monotonic);
+        _ = server.runProvisionedStartupCatchUp();
+
+        try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_started.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_completed.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_last_group_count.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 0), server.provisioned_startup_catch_up_last_groups_with_debt.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 1), server.provisioned_startup_catch_up_last_busy_groups.load(.monotonic));
+        try std.testing.expectEqual(tc.expect_dirty, server.provisioned_startup_catch_up_dirty.load(.monotonic));
     }
 }
 

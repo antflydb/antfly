@@ -64,6 +64,7 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     raw_linear_slot_dense_biases: [decoder_runtime_linear_slot_capacity]?MetalTensor = [_]?MetalTensor{null} ** decoder_runtime_linear_slot_capacity,
     raw_linear_slot_runtime_prepared_kind: [decoder_runtime_linear_slot_capacity]RawQuantizedRuntimeLinearKind = [_]RawQuantizedRuntimeLinearKind{.none} ** decoder_runtime_linear_slot_capacity,
     raw_linear_slot_runtime_prepared_modes: [decoder_runtime_linear_slot_capacity]RawQuantizedRuntimeLinearStorageMode = [_]RawQuantizedRuntimeLinearStorageMode{.none} ** decoder_runtime_linear_slot_capacity,
+    raw_linear_slot_disable_mapped_quant_weight: [decoder_runtime_linear_slot_capacity]bool = [_]bool{false} ** decoder_runtime_linear_slot_capacity,
     raw_quant_runtime_private_prepare_nanos: u128 = 0,
     raw_quant_runtime_mapped_prepare_nanos: u128 = 0,
     raw_quant_runtime_mapped_attempts: u64 = 0,

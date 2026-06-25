@@ -1499,6 +1499,11 @@ fn parseInferenceVariantsJson(manifest: *ModelManifest, allocator: std.mem.Alloc
     if (std.mem.eql(u8, variants_family.string, "gliner2_variants/v1")) {
         return parseGliner2InferenceVariantsJson(manifest, allocator, model_dir_path, obj);
     }
+    if (std.mem.eql(u8, variants_family.string, "florence_variants/v1") or
+        std.mem.eql(u8, variants_family.string, "florence2_variants/v1"))
+    {
+        return parseFlorence2InferenceVariantsJson(manifest, allocator, model_dir_path, obj);
+    }
     if (!std.mem.eql(u8, variants_family.string, "clipclap_variants/v1")) return;
     const variants = obj.get("variants") orelse return;
     if (variants != .array) return;
@@ -2592,6 +2597,52 @@ test "manifest parses florence2 variants gguf model" {
         \\      "target": "gguf",
         \\      "format": "Q4_K",
         \\      "model": "florence-2-base.Q4_K.gguf"
+        \\    }
+        \\  ]
+        \\}
+    );
+
+    try std.testing.expect(manifest.isFlorence2GgufBundle());
+    try std.testing.expectEqual(ModelType.reader, manifest.model_type);
+    try std.testing.expectEqual(NativeArchHint.florence, manifest.native_arch_hint);
+    try std.testing.expectEqualStrings("florence2", manifest.config_model_arch);
+    try std.testing.expectEqualStrings(q4_path, manifest.gguf_path.?);
+    try std.testing.expect(manifest.hasInput("text"));
+    try std.testing.expect(manifest.hasInput("image"));
+}
+
+test "manifest parses lowercase florence variants gguf model" {
+    const allocator = std.testing.allocator;
+    const dir_path = try testScratchDir(allocator, "manifest-florence-lowercase-variants-gguf");
+    defer {
+        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+    const q8_path = try std.fs.path.join(allocator, &.{ dir_path, "florence2.Q8_0.gguf" });
+    defer allocator.free(q8_path);
+    const q4_path = try std.fs.path.join(allocator, &.{ dir_path, "florence2.Q4_K.gguf" });
+    defer allocator.free(q4_path);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = q8_path, .data = "GGUFstub" });
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = q4_path, .data = "GGUFstub" });
+
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    try parseInferenceVariantsJson(&manifest, allocator, dir_path,
+        \\{
+        \\  "family": "florence_variants/v1",
+        \\  "variants": [
+        \\    {
+        \\      "id": "gguf-Q8_0",
+        \\      "target": "gguf",
+        \\      "format": "Q8_0",
+        \\      "model": "florence2.Q8_0.gguf"
+        \\    },
+        \\    {
+        \\      "id": "gguf-Q4_K",
+        \\      "target": "gguf",
+        \\      "format": "Q4_K",
+        \\      "model": "florence2.Q4_K.gguf"
         \\    }
         \\  ]
         \\}

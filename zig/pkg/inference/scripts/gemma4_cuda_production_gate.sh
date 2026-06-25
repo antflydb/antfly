@@ -12,7 +12,7 @@ Environment overrides:
   ZIG_BIN                       path to Zig 0.16 binary
   ANTFLY_BIN                    path to antfly-inference binary
   OUT_DIR                       output directory for logs/json timing
-  E2B_MODEL                     Gemma4 E2B target GGUF
+  E2B_MODEL                     Gemma4 E2B target model directory
   GEMMA12B_Q4_MODEL             Gemma4 12B Q4 model path/directory
   LONG_CONTEXT_TOKENS           full-mode E2B polar4 stress tokens (default: 512)
   REQUIRE_SPEED_THRESHOLDS      1 to enforce tok/s floors (default: full only)
@@ -30,7 +30,7 @@ Environment overrides:
   RUN_MTP                       auto|required|off (default: auto)
   MTP_TARGET_MODEL              MTP target model (default: E2B_MODEL)
   MTP_DRAFT_MODEL               MTP assistant GGUF
-  MTP_TOKENS                    MTP comparison tokens (default: 32)
+  MTP_TOKENS                    MTP comparison tokens (default: 128)
   MTP_SPECULATIVE_K             MTP speculative window (default: 2)
   MTP_MIN_ACTIVE_SPEED_RATIO    active-MTP tok/s floor vs target-only (default: 1.0)
 USAGE
@@ -69,12 +69,12 @@ antfly_bin="${ANTFLY_BIN:-${ANTFY_BIN:-$inference_dir/zig-out/bin/antfly-inferen
 out_dir="${OUT_DIR:-/tmp/antfly-gemma4-cuda-production-$(date -u +%Y%m%dT%H%M%SZ)}"
 mkdir -p "$out_dir"
 
-e2b_model="${E2B_MODEL:-$repo_root/.models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf}"
+e2b_model="${E2B_MODEL:-$repo_root/.models/unsloth/gemma-4-E2B-it-qat-GGUF}"
 gemma12b_q4_model="${GEMMA12B_Q4_MODEL:-$repo_root/.models/google/gemma-4-12B-it-q4_k}"
 mtp_target_model="${MTP_TARGET_MODEL:-$e2b_model}"
 mtp_draft_model="${MTP_DRAFT_MODEL:-$repo_root/.models/unsloth/gemma-4-E2B-it-qat-GGUF/MTP/gemma-4-E2B-it-Q8_0-MTP.gguf}"
-mtp_prompt="${MTP_PROMPT:-Write one sentence about ants.}"
-mtp_tokens="${MTP_TOKENS:-32}"
+mtp_prompt="${MTP_PROMPT:-Explain why database indexes improve reads but slow down writes.}"
+mtp_tokens="${MTP_TOKENS:-128}"
 mtp_speculative_k="${MTP_SPECULATIVE_K:-2}"
 mtp_min_active_speed_ratio="${MTP_MIN_ACTIVE_SPEED_RATIO:-1.0}"
 run_mtp="${RUN_MTP:-auto}"
@@ -540,7 +540,6 @@ if [ "$run_mtp" != "off" ]; then
       --temperature 0 \
       --raw-prompt \
       --no-chat-template \
-      --debug-mtp \
       --print-token-count \
       --print-timing \
       --combined-budget-mb 16000 \

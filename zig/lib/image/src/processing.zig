@@ -113,13 +113,18 @@ pub fn preprocessDecodedRectScaledWithResample(
     const result = try allocator.alloc(f32, 3 * tw * th);
     errdefer allocator.free(result);
 
+    if (solidRgb(img)) |rgb| {
+        fillSolidChw(result, tw, th, rgb, mean, std_dev, rescale_factor);
+        return result;
+    }
+
     const src_w: f32 = @floatFromInt(img.width);
     const src_h: f32 = @floatFromInt(img.height);
     const scale_x = src_w / @as(f32, @floatFromInt(tw));
     const scale_y = src_h / @as(f32, @floatFromInt(th));
 
     if (resample == .bilinear) {
-        preprocessDecodedRectBilinearSimd(img, result, tw, th, mean, std_dev, rescale_factor, scale_x, scale_y);
+        preprocessDecodedRectBilinearInterleaved(img, result, tw, th, mean, std_dev, rescale_factor, scale_x, scale_y);
         return result;
     }
 
@@ -299,6 +304,95 @@ fn preprocessDecodedRectBilinearSimd(
     }
 
     _ = one;
+}
+
+fn preprocessDecodedRectBilinearInterleaved(
+    img: ImageU8,
+    result: []f32,
+    tw: usize,
+    th: usize,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    rescale_factor: f32,
+    scale_x: f32,
+    scale_y: f32,
+) void {
+    const channels = img.channels();
+    const plane_size = tw * th;
+    const norm_scale = [3]f32{
+        rescale_factor / std_dev[0],
+        rescale_factor / std_dev[1],
+        rescale_factor / std_dev[2],
+    };
+    const norm_bias = [3]f32{
+        -mean[0] / std_dev[0],
+        -mean[1] / std_dev[1],
+        -mean[2] / std_dev[2],
+    };
+
+    for (0..th) |y| {
+        const src_y = (@as(f32, @floatFromInt(y)) + 0.5) * scale_y - 0.5;
+        const y0 = clampIndex(@intFromFloat(@floor(src_y)), img.height);
+        const y1 = clampIndex(@as(i32, @intCast(y0)) + 1, img.height);
+        const fy = src_y - @as(f32, @floatFromInt(y0));
+        const wy0 = 1.0 - fy;
+        const row0 = @as(usize, y0) * @as(usize, img.width) * channels;
+        const row1 = @as(usize, y1) * @as(usize, img.width) * channels;
+        const dst_row = y * tw;
+
+        for (0..tw) |x| {
+            const src_x = (@as(f32, @floatFromInt(x)) + 0.5) * scale_x - 0.5;
+            const x0 = clampIndex(@intFromFloat(@floor(src_x)), img.width);
+            const x1 = clampIndex(@as(i32, @intCast(x0)) + 1, img.width);
+            const fx = src_x - @as(f32, @floatFromInt(x0));
+            const wx0 = 1.0 - fx;
+
+            const idx00 = row0 + @as(usize, x0) * channels;
+            const idx10 = row0 + @as(usize, x1) * channels;
+            const idx01 = row1 + @as(usize, x0) * channels;
+            const idx11 = row1 + @as(usize, x1) * channels;
+            const dst_idx = dst_row + x;
+
+            inline for (0..3) |ch| {
+                const p00: f32 = @floatFromInt(img.data[idx00 + ch]);
+                const p10: f32 = @floatFromInt(img.data[idx10 + ch]);
+                const p01: f32 = @floatFromInt(img.data[idx01 + ch]);
+                const p11: f32 = @floatFromInt(img.data[idx11 + ch]);
+                const top = p00 * wx0 + p10 * fx;
+                const bot = p01 * wx0 + p11 * fx;
+                result[ch * plane_size + dst_idx] = (top * wy0 + bot * fy) * norm_scale[ch] + norm_bias[ch];
+            }
+        }
+    }
+}
+
+fn solidRgb(img: ImageU8) ?[3]u8 {
+    const channels = img.channels();
+    const pixel_count = @as(usize, img.width) * @as(usize, img.height);
+    if (pixel_count == 0 or img.data.len < pixel_count * channels) return null;
+
+    const rgb = [3]u8{ img.data[0], img.data[1], img.data[2] };
+    for (1..pixel_count) |i| {
+        const idx = i * channels;
+        if (img.data[idx] != rgb[0] or img.data[idx + 1] != rgb[1] or img.data[idx + 2] != rgb[2]) return null;
+    }
+    return rgb;
+}
+
+fn fillSolidChw(
+    result: []f32,
+    tw: usize,
+    th: usize,
+    rgb: [3]u8,
+    mean: [3]f32,
+    std_dev: [3]f32,
+    rescale_factor: f32,
+) void {
+    const plane_size = tw * th;
+    for (0..3) |ch| {
+        const value = normalizeSample(@floatFromInt(rgb[ch]), mean[ch], std_dev[ch], rescale_factor);
+        @memset(result[ch * plane_size .. (ch + 1) * plane_size], value);
+    }
 }
 
 fn sampleBilinear4(

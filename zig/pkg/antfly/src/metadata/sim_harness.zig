@@ -49,6 +49,7 @@ const transition_runtime = @import("../raft/transition_runtime.zig");
 const transition_state = @import("transition_state.zig");
 const raft_engine = @import("raft_engine");
 const data_mod = @import("../data/mod.zig");
+const http_common = @import("../raft/transport/http_common.zig");
 const std_http_executor = @import("../raft/transport/std_http_executor.zig");
 const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const docstore_mod = @import("../storage/docstore.zig");
@@ -4691,6 +4692,42 @@ fn PublicApiRouter(comptime N: usize) type {
     };
 }
 
+fn PublicApiMetadataForwarder(comptime N: usize) type {
+    return struct {
+        node: MetadataHttpNodeSimulation,
+        cluster: *MetadataHttpClusterSimulation,
+        api_base_uris: *const [N][]const u8,
+        executor: http_common.RequestExecutor,
+        forward_count: std.atomic.Value(u64) = .init(0),
+
+        fn iface(self: *@This()) api_http_server.RequestForwarder {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .forward = forward },
+            };
+        }
+
+        fn forward(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !?http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const leader_index = currentMetadataLeaderIndex(self.cluster) orelse return null;
+            const leader_node_id = @as(u64, @intCast(leader_index + 1));
+            const local_node_id = @as(u64, @intCast(self.node.index + 1));
+            if (leader_node_id == local_node_id) return null;
+            const uri = try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.api_base_uris[leader_index], req.uri });
+            defer alloc.free(uri);
+            _ = self.forward_count.fetchAdd(1, .monotonic);
+            return try self.executor.execute(alloc, .{
+                .method = req.method,
+                .uri = uri,
+                .source_node_id = local_node_id,
+                .authorization = req.authorization,
+                .content_type = req.content_type,
+                .body = req.body,
+            });
+        }
+    };
+}
+
 const SimAuthManager = struct {
     store: usermgr.MemoryStore,
     policy_store: casbin.MemoryAdapter,
@@ -4753,6 +4790,7 @@ fn startPublicApiServers(
     status_sources: *[N]PublicApiStatusSource,
     catalog_sources: *[N]PublicApiCatalogSource,
     routers: *[N]PublicApiRouter(N),
+    forwarders: *[N]PublicApiMetadataForwarder(N),
     read_sources: *[N]api_table_reads.HostedProvisionedTableReadSource,
     write_sources: *[N]api_table_writes.HostedProvisionedTableWriteSource,
     options: PublicApiServerOptions(N),
@@ -4768,6 +4806,7 @@ fn startPublicApiServers(
         status_sources[i] = .{ .node = cluster.node(i), .metadata_snapshot_mode = metadata_snapshot_mode };
         catalog_sources[i] = .{ .node = cluster.node(i), .metadata_snapshot_mode = metadata_snapshot_mode };
         routers[i] = .{ .node = cluster.node(i), .cluster = cluster, .api_base_uris = api_base_uris };
+        forwarders[i] = .{ .node = cluster.node(i), .cluster = cluster, .api_base_uris = api_base_uris, .executor = forward_executor.executor() };
         read_sources[i] = api_table_reads.HostedProvisionedTableReadSource.init(
             roots[i],
             catalog_sources[i].iface(),
@@ -4783,10 +4822,11 @@ fn startPublicApiServers(
             forward_executor.executor(),
         );
         attachHostedSourcesBackendRuntimeForSimulation(&read_sources[i], &write_sources[i], cluster.backendRuntime(i));
-        const server_config: api_http_server.ApiHttpServerConfig = if (options.auth_managers) |auth_managers| .{
+        var server_config: api_http_server.ApiHttpServerConfig = if (options.auth_managers) |auth_managers| .{
             .auth_enabled = true,
             .user_manager = &auth_managers[i].manager,
         } else .{};
+        server_config.metadata_mutation_forwarder = forwarders[i].iface();
         servers[i] = api_http_server.ApiHttpServer.init(
             alloc,
             server_config,
@@ -4847,6 +4887,7 @@ fn PublicApiTestRig(comptime N: usize) type {
         status_sources: [N]PublicApiStatusSource = undefined,
         catalog_sources: [N]PublicApiCatalogSource = undefined,
         routers: [N]PublicApiRouter(N) = undefined,
+        forwarders: [N]PublicApiMetadataForwarder(N) = undefined,
         read_sources: [N]api_table_reads.HostedProvisionedTableReadSource = undefined,
         write_sources: [N]api_table_writes.HostedProvisionedTableWriteSource = undefined,
         api_base_uris: [N][]const u8 = undefined,
@@ -4921,6 +4962,7 @@ fn PublicApiTestRig(comptime N: usize) type {
                 &self.status_sources,
                 &self.catalog_sources,
                 &self.routers,
+                &self.forwarders,
                 &self.read_sources,
                 &self.write_sources,
                 options,
@@ -6172,6 +6214,7 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
     var routers: [4]PublicApiRouter(4) = undefined;
+    var forwarders: [4]PublicApiMetadataForwarder(4) = undefined;
     var read_sources: [4]api_table_reads.HostedProvisionedTableReadSource = undefined;
     var write_sources: [4]api_table_writes.HostedProvisionedTableWriteSource = undefined;
     var api_base_uris: [4][]const u8 = undefined;
@@ -6193,6 +6236,7 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
         &status_sources,
         &catalog_sources,
         &routers,
+        &forwarders,
         &read_sources,
         &write_sources,
         .{},
@@ -6373,6 +6417,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     var status_sources: [4]PublicApiStatusSource = undefined;
     var catalog_sources: [4]PublicApiCatalogSource = undefined;
     var routers: [4]PublicApiRouter(4) = undefined;
+    var forwarders: [4]PublicApiMetadataForwarder(4) = undefined;
     var read_sources: [4]api_table_reads.HostedProvisionedTableReadSource = undefined;
     var write_sources: [4]api_table_writes.HostedProvisionedTableWriteSource = undefined;
     var api_base_uris: [4][]const u8 = undefined;
@@ -6394,6 +6439,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
         &status_sources,
         &catalog_sources,
         &routers,
+        &forwarders,
         &read_sources,
         &write_sources,
         .{},

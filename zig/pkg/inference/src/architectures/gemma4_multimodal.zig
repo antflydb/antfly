@@ -40,6 +40,7 @@ pub fn expandPromptText(
         allocator,
         prompt,
         "<|image|>",
+        "<start_of_image>",
         "<|image>",
         "<image|>",
         tokens_per_image,
@@ -51,6 +52,7 @@ pub fn expandPromptText(
         allocator,
         image_expanded,
         "<|audio|>",
+        null,
         "<|audio>",
         "<audio|>",
         tokens_per_audio,
@@ -62,6 +64,7 @@ fn expandMarker(
     allocator: std.mem.Allocator,
     prompt: []const u8,
     marker: []const u8,
+    marker_alias: ?[]const u8,
     begin_marker: []const u8,
     end_marker: []const u8,
     token_counts: []const usize,
@@ -71,9 +74,9 @@ fn expandMarker(
 
     var count: usize = 0;
     var cursor: usize = 0;
-    while (std.mem.indexOfPos(u8, prompt, cursor, marker)) |idx| {
+    while (nextMarker(prompt, cursor, marker, marker_alias)) |found| {
         count += 1;
-        cursor = idx + marker.len;
+        cursor = found.idx + found.len;
     }
     if (count != token_counts.len) return mismatch_error;
 
@@ -81,18 +84,40 @@ fn expandMarker(
     errdefer out.deinit(allocator);
     cursor = 0;
     var replacement_idx: usize = 0;
-    while (std.mem.indexOfPos(u8, prompt, cursor, marker)) |idx| {
-        try out.appendSlice(allocator, prompt[cursor..idx]);
+    while (nextMarker(prompt, cursor, marker, marker_alias)) |found| {
+        try out.appendSlice(allocator, prompt[cursor..found.idx]);
         try out.appendSlice(allocator, begin_marker);
         for (0..token_counts[replacement_idx]) |_| {
             try out.appendSlice(allocator, marker);
         }
         try out.appendSlice(allocator, end_marker);
         replacement_idx += 1;
-        cursor = idx + marker.len;
+        cursor = found.idx + found.len;
     }
     try out.appendSlice(allocator, prompt[cursor..]);
     return try out.toOwnedSlice(allocator);
+}
+
+const MarkerMatch = struct {
+    idx: usize,
+    len: usize,
+};
+
+fn nextMarker(prompt: []const u8, cursor: usize, marker: []const u8, marker_alias: ?[]const u8) ?MarkerMatch {
+    const primary = std.mem.indexOfPos(u8, prompt, cursor, marker);
+    if (marker_alias) |alias_marker| {
+        const alias = std.mem.indexOfPos(u8, prompt, cursor, alias_marker);
+        if (primary == null) {
+            if (alias) |idx| return .{ .idx = idx, .len = alias_marker.len };
+            return null;
+        }
+        if (alias) |idx| {
+            if (idx < primary.?) return .{ .idx = idx, .len = alias_marker.len };
+        }
+        return .{ .idx = primary.?, .len = marker.len };
+    }
+    if (primary) |idx| return .{ .idx = idx, .len = marker.len };
+    return null;
 }
 
 pub fn prepareExpandedPromptEmbeddings(
@@ -285,6 +310,13 @@ test "gemma4 expands dynamic image token sequence" {
     const expanded = try expandPromptText(allocator, "a <|image|> b", &.{3}, &.{});
     defer allocator.free(expanded);
     try std.testing.expectEqualStrings("a <|image><|image|><|image|><|image|><image|> b", expanded);
+}
+
+test "gemma4 expands fallback image marker alias" {
+    const allocator = std.testing.allocator;
+    const expanded = try expandPromptText(allocator, "a <start_of_image> b", &.{2}, &.{});
+    defer allocator.free(expanded);
+    try std.testing.expectEqualStrings("a <|image><|image|><|image|><image|> b", expanded);
 }
 
 test "gemma4 expands dynamic audio token sequence" {

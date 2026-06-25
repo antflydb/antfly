@@ -55,6 +55,8 @@ const cdc_replication_round_interval_ms: u64 = 1_000;
 pub const default_fk_schema_controller_worker_id = "metadata-fk-schema-controller";
 pub const default_unique_schema_controller_worker_id = "metadata-unique-schema-controller";
 const metadata_run_round_slow_phase_threshold_ns: u64 = 500 * std.time.ns_per_ms;
+const linearizable_metadata_read_prefix = "metadata:linearizable-read:";
+const linearizable_metadata_read_timeout_ns: u64 = 5 * std.time.ns_per_s;
 
 fn logMetadataRunRoundPhase(name: []const u8, start_ns: u64) void {
     const elapsed_ns = platform_time.monotonicNs() -| start_ns;
@@ -664,6 +666,73 @@ pub const MetadataHttpServiceDeps = struct {
 };
 
 pub const MetadataStatus = metadata_api.MetadataStatus;
+
+const LinearizableMetadataReadTracker = struct {
+    alloc: std.mem.Allocator,
+    metadata_group_id: raft_engine.core.types.GroupId,
+    mutex: std.Io.Mutex = .init,
+    next_request_id: std.atomic.Value(u64) = .init(1),
+    requests: std.AutoHashMapUnmanaged(u64, bool) = .empty,
+    downstream: ?raft_state_machine.ReadStateObserver = null,
+
+    fn deinit(self: *@This()) void {
+        self.requests.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn observer(self: *@This()) raft_state_machine.ReadStateObserver {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .on_read_states = onReadStates,
+            },
+        };
+    }
+
+    fn registerRequest(self: *@This()) !u64 {
+        const request_id = self.next_request_id.fetchAdd(1, .monotonic);
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
+        try self.requests.put(self.alloc, request_id, false);
+        return request_id;
+    }
+
+    fn isComplete(self: *@This(), request_id: u64) bool {
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
+        return if (self.requests.get(request_id)) |complete| complete else false;
+    }
+
+    fn markComplete(self: *@This(), request_id: u64) void {
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
+        if (self.requests.getPtr(request_id)) |complete| complete.* = true;
+    }
+
+    fn finishRequest(self: *@This(), request_id: u64) void {
+        self.mutex.lockUncancelable(std.Options.debug_io);
+        defer self.mutex.unlock(std.Options.debug_io);
+        _ = self.requests.remove(request_id);
+    }
+
+    fn onReadStates(
+        ptr: *anyopaque,
+        group_id: raft_engine.core.types.GroupId,
+        read_states: []const raft_engine.core.ReadState,
+    ) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (group_id == self.metadata_group_id) {
+            for (read_states) |read_state| {
+                if (!std.mem.startsWith(u8, read_state.request_ctx, linearizable_metadata_read_prefix)) continue;
+                const suffix = read_state.request_ctx[linearizable_metadata_read_prefix.len..];
+                const request_id = std.fmt.parseUnsigned(u64, suffix, 10) catch continue;
+                self.markComplete(request_id);
+            }
+        }
+        if (self.downstream) |downstream| try downstream.onReadStates(group_id, read_states);
+    }
+};
+
 // Backfill marker discovery does not need sub-second polling when the system is
 // otherwise idle. Keep active-marker refreshes fast, but back off empty-root
 // probes so they do not add filesystem churn on the read hot path.
@@ -1504,6 +1573,10 @@ pub const MetadataService = struct {
         }
         if (self.backend_runtime) |runtime| return runtime;
         unreachable;
+    }
+
+    pub fn ensureLinearizableRead(self: *MetadataService) !void {
+        _ = self;
     }
 
     pub fn lifecycleSignalCurrent(self: *const MetadataService) u32 {
@@ -2964,6 +3037,7 @@ pub const MetadataHttpService = struct {
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
     metadata_orchestration_urls: []MetadataOrchestrationUrl = &.{},
+    linearizable_read_tracker: *LinearizableMetadataReadTracker,
     json_response_calls: std.atomic.Value(u64) = .init(0),
     json_response_bytes_total: std.atomic.Value(u64) = .init(0),
     json_response_peak_bytes: std.atomic.Value(u64) = .init(0),
@@ -2984,6 +3058,15 @@ pub const MetadataHttpService = struct {
         };
         var http_deps = deps.http;
         http_deps.http.backend_runtime = backend_runtime;
+        const read_tracker = try alloc.create(LinearizableMetadataReadTracker);
+        var read_tracker_owned = true;
+        errdefer if (read_tracker_owned) alloc.destroy(read_tracker);
+        read_tracker.* = .{
+            .alloc = alloc,
+            .metadata_group_id = metadata_group_id,
+            .downstream = http_deps.read_state_observer,
+        };
+        http_deps.read_state_observer = read_tracker.observer();
         var service = MetadataHttpService{
             .alloc = alloc,
             .metadata_group_id = metadata_group_id,
@@ -3009,8 +3092,10 @@ pub const MetadataHttpService = struct {
             .foreign_key_schema_controller = cfg.foreign_key_schema_controller,
             .unique_constraint_schema_controller = cfg.unique_constraint_schema_controller,
             .metadata_orchestration_urls = try cloneMetadataOrchestrationUrls(alloc, cfg.metadata_orchestration_urls),
+            .linearizable_read_tracker = read_tracker,
             .raft = try raft_service.ManagedHttpHostService.init(alloc, host_cfg, http_deps, cfg.raft, deps.raft),
         };
+        read_tracker_owned = false;
         owned_backend_runtime = null;
         errdefer service.deinit();
         try foreign_mod.registerDefaultPostgresExecutor(alloc, &service.cdc_backfill_registry);
@@ -3024,6 +3109,8 @@ pub const MetadataHttpService = struct {
         self.lifecycle_signal.deinit();
         freeMetadataOrchestrationUrls(self.alloc, self.metadata_orchestration_urls);
         self.raft.deinit();
+        self.linearizable_read_tracker.deinit();
+        self.alloc.destroy(self.linearizable_read_tracker);
         if (self.replica_root_dir) |replica_root_dir| {
             api_table_writes.closeHostedManagedDbCacheForRoot(replica_root_dir);
         }
@@ -3194,15 +3281,31 @@ pub const MetadataHttpService = struct {
         const base_uri = self.metadataOrchestrationUrlForNode(target_node_id) orelse return null;
         const uri = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base_uri, req.uri });
         defer alloc.free(uri);
+        const headers = try filteredForwardHeaders(alloc, req.headers);
+        defer if (headers.len > 0) alloc.free(headers);
         return try self.raft.host.http_host.request_executor.execute(alloc, .{
             .method = req.method,
             .uri = uri,
-            .headers = req.headers,
+            .headers = headers,
             .source_node_id = local_node_id,
             .authorization = req.authorization,
             .content_type = req.content_type,
             .body = req.body,
         });
+    }
+
+    fn filteredForwardHeaders(alloc: std.mem.Allocator, headers: []const http_common.RequestHeader) ![]http_common.RequestHeader {
+        if (headers.len == 0) return &.{};
+        var out = std.ArrayListUnmanaged(http_common.RequestHeader).empty;
+        errdefer out.deinit(alloc);
+        for (headers) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "host")) continue;
+            if (std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
+            if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
+            if (std.ascii.eqlIgnoreCase(header.name, "content-type")) continue;
+            try out.append(alloc, header);
+        }
+        return try out.toOwnedSlice(alloc);
     }
 
     fn metadataOrchestrationUrlForNode(self: *const MetadataHttpService, node_id: u64) ?[]const u8 {
@@ -3914,6 +4017,41 @@ pub const MetadataHttpService = struct {
         current_status.metadata_epoch = self.lifecycle_signal.currentEpoch();
         current_status.metrics = self.metrics();
         return current_status;
+    }
+
+    pub fn ensureLinearizableRead(self: *MetadataHttpService) !void {
+        const request_id = try self.linearizable_read_tracker.registerRequest();
+        defer self.linearizable_read_tracker.finishRequest(request_id);
+        var request_ctx_buf: [64]u8 = undefined;
+        const request_ctx = try std.fmt.bufPrint(
+            &request_ctx_buf,
+            "{s}{d}",
+            .{ linearizable_metadata_read_prefix, request_id },
+        );
+
+        self.lockRuntime();
+        {
+            defer self.unlockRuntime();
+            try self.raft.requestReadableLease(self.metadata_group_id, request_ctx);
+        }
+
+        const deadline_ns = platform_time.monotonicNs() + linearizable_metadata_read_timeout_ns;
+        while (platform_time.monotonicNs() < deadline_ns) {
+            if (self.linearizable_read_tracker.isComplete(request_id)) return;
+            self.lockRuntime();
+            {
+                defer self.unlockRuntime();
+                if (self.raft.pending_updates.items.len > 0) {
+                    _ = try self.raft.syncPendingRaftOnly();
+                } else {
+                    try self.raft.runRaftRoundOnly();
+                }
+            }
+            if (self.linearizable_read_tracker.isComplete(request_id)) return;
+            platform_clock.Clock.real().sleepMs(1);
+        }
+        if (self.linearizable_read_tracker.isComplete(request_id)) return;
+        return error.MetadataLinearizableReadTimeout;
     }
 
     pub fn adminSnapshot(self: *MetadataHttpService) !metadata_api.AdminSnapshot {
@@ -11052,6 +11190,38 @@ test "metadata service committed metadata changes request lifecycle reconcile ho
     try svc.requestReallocation(1);
     try runServiceRounds(&svc, 8);
     try std.testing.expect(capture.calls >= 1);
+}
+
+test "linearizable metadata read tracker completes only matching request" {
+    var tracker = LinearizableMetadataReadTracker{
+        .alloc = std.testing.allocator,
+        .metadata_group_id = 42,
+    };
+    defer tracker.deinit();
+
+    const first_id = try tracker.registerRequest();
+    const second_id = try tracker.registerRequest();
+
+    const second_ctx = try std.fmt.allocPrint(std.testing.allocator, "{s}{d}", .{ linearizable_metadata_read_prefix, second_id });
+    defer std.testing.allocator.free(second_ctx);
+
+    try tracker.observer().onReadStates(43, &.{.{
+        .index = 1,
+        .request_ctx = second_ctx,
+    }});
+    try std.testing.expect(!tracker.isComplete(first_id));
+    try std.testing.expect(!tracker.isComplete(second_id));
+
+    try tracker.observer().onReadStates(42, &.{.{
+        .index = 1,
+        .request_ctx = second_ctx,
+    }});
+
+    try std.testing.expect(!tracker.isComplete(first_id));
+    try std.testing.expect(tracker.isComplete(second_id));
+
+    tracker.finishRequest(first_id);
+    tracker.finishRequest(second_id);
 }
 
 test "metadata service clears restore intent once all placement replicas report restore progress" {

@@ -63,6 +63,7 @@ const CliConfig = struct {
     inference_combined_budget_mb: usize = 0,
     inference_kv_budget_mb: usize = 0,
     inference_scratch_budget_mb: usize = 0,
+    inference_preload_models: std.ArrayListUnmanaged(inference.server.WarmModel) = .empty,
     data_dir: ?[]const u8 = null,
     replica_root_dir: ?[]const u8 = null,
     replica_catalog_path: ?[]const u8 = null,
@@ -97,6 +98,7 @@ const CliConfig = struct {
 
     fn deinit(self: *CliConfig, alloc: std.mem.Allocator) void {
         self.ha_sync_standby_names.deinit(alloc);
+        self.inference_preload_models.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -1041,12 +1043,15 @@ pub fn runFromIterator(
     // Swarm always owns a local Antfly node. Antfly-managed embeddings use it
     // directly, and the public Antfly routes are registered on the unified
     // server for compatibility with external clients.
+    var resolved_warm_models = try resolveInferenceWarmModels(alloc, cli, if (loaded_config) |*cfg| cfg else null);
+    defer resolved_warm_models.deinit(alloc);
     var antfly_node_cfg = inference.server.NodeConfig{
         .models_dir = resolveInferenceModelsDir(cli, if (loaded_config) |*cfg| cfg else null) orelse
             antfly.inference_runtime.defaultModelsDirForDataDir(alloc, data_dir),
         .ml_dir = resolveInferenceMlDir(cli, if (loaded_config) |*cfg| cfg else null) orelse
             antfly.inference_runtime.defaultMlDirForDataDir(alloc, data_dir),
         .generation_budget_overrides = resolveInferenceBudgetOverrides(cli),
+        .preload = resolved_warm_models.items,
     };
     if (loaded_config) |*cfg| {
         if (cfg.effectiveAntflyContentSecurity()) |security| antfly_node_cfg.content_security = security.*;
@@ -1054,6 +1059,7 @@ pub fn runFromIterator(
     }
     var antfly_node = try inference.server.Node.init(alloc, antfly_node_cfg);
     defer antfly_node.deinit();
+    try antfly_node.warmConfiguredModels(alloc);
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
         alloc,
@@ -2214,6 +2220,33 @@ var active_api_server: ?*antfly.public_api.http_server.ApiHttpServer = null;
 // CLI parsing
 // ---------------------------------------------------------------
 
+fn parsePreloadModelKind(value: []const u8) ?inference.server.WarmModelKind {
+    inline for (std.meta.fields(inference.server.WarmModelKind)) |field| {
+        if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+    }
+    return null;
+}
+
+fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
+    const separator = std.mem.indexOfScalar(u8, value, ':') orelse return error.InvalidArguments;
+    const kind_name = value[0..separator];
+    var model_name = value[separator + 1 ..];
+    var backend: ?inference.backends.BackendType = null;
+    if (std.mem.indexOfScalar(u8, model_name, ':')) |backend_separator| {
+        const backend_name = model_name[0..backend_separator];
+        backend = antfly.inference_runtime.parseBackendType(backend_name) orelse return error.InvalidArguments;
+        model_name = model_name[backend_separator + 1 ..];
+    }
+    if (model_name.len == 0) return error.InvalidArguments;
+    return .{
+        .kind = parsePreloadModelKind(kind_name) orelse return error.InvalidArguments,
+        .name = model_name,
+        .backend = backend,
+        .format = null,
+        .quantization = null,
+    };
+}
+
 fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConfig {
     var cfg = CliConfig{};
     errdefer cfg.deinit(alloc);
@@ -2319,6 +2352,10 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
         }
         if (std.mem.eql(u8, arg, "--inference-scratch-budget-mb")) {
             cfg.inference_scratch_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--preload-model")) {
+            try cfg.inference_preload_models.append(alloc, try parsePreloadModelFlag(args.next() orelse return error.InvalidArguments));
             continue;
         }
         if (std.mem.eql(u8, arg, "--data-dir")) {
@@ -2952,6 +2989,41 @@ fn resolveInferenceMlDir(cli: CliConfig, cfg: ?*const antfly.common.config.Confi
     return null;
 }
 
+const ResolvedWarmModels = struct {
+    items: []const inference.server.WarmModel,
+    owned: bool = false,
+
+    fn deinit(self: *ResolvedWarmModels, alloc: std.mem.Allocator) void {
+        if (self.owned and self.items.len > 0) alloc.free(self.items);
+        self.* = undefined;
+    }
+};
+
+fn resolveInferenceWarmModels(
+    alloc: std.mem.Allocator,
+    cli: CliConfig,
+    cfg: ?*const antfly.common.config.Config,
+) !ResolvedWarmModels {
+    if (cli.inference_preload_models.items.len > 0) {
+        return .{ .items = cli.inference_preload_models.items };
+    }
+    const loaded = cfg orelse return .{ .items = &.{} };
+    if (loaded.inference.preload.len == 0) return .{ .items = &.{} };
+
+    const out = try alloc.alloc(inference.server.WarmModel, loaded.inference.preload.len);
+    errdefer alloc.free(out);
+    for (loaded.inference.preload, 0..) |model, i| {
+        out[i] = .{
+            .kind = parsePreloadModelKind(model.kind) orelse return error.InvalidConfig,
+            .name = model.name,
+            .backend = antfly.inference_runtime.parseOptionalBackendType(model.backend) catch return error.InvalidConfig,
+            .format = model.format,
+            .quantization = model.quantization,
+        };
+    }
+    return .{ .items = out, .owned = true };
+}
+
 fn resolveInferenceBudgetOverrides(cli: CliConfig) antfly.inference_runtime.ServerBudgetOverrides {
     return .{
         .host_limit_bytes = mbToBytes(cli.inference_host_budget_mb),
@@ -2991,6 +3063,7 @@ fn printUsage() void {
         \\  --inference-combined-budget-mb <n>    Embedded inference native generation combined budget override
         \\  --inference-kv-budget-mb <n>          Embedded inference native generation KV cache budget override
         \\  --inference-scratch-budget-mb <n>     Embedded inference native generation scratch budget override
+        \\  --preload-model <kind:name|kind:backend:name> Preload and warm an embedded model before serving
         \\  --data-dir <path>                     Local Antfly data directory root
         \\  --replica-root-dir <path>             Replica root directory
         \\  --replica-catalog-path <path>         Replica catalog file path
@@ -3404,6 +3477,8 @@ test "parse cli accepts canonical host port and models dir flags" {
         "/tmp/models",
         "--ml-dir",
         "/tmp/ml",
+        "--preload-model",
+        "generator:metal:gemma-e2b",
         "--data-dir",
         "/tmp/antfly-data",
     };
@@ -3414,6 +3489,10 @@ test "parse cli accepts canonical host port and models dir flags" {
     try std.testing.expectEqual(@as(u16, 8080), cfg.bind_port.?);
     try std.testing.expectEqualStrings("/tmp/models", cfg.inference_models_dir.?);
     try std.testing.expectEqualStrings("/tmp/ml", cfg.inference_ml_dir.?);
+    try std.testing.expectEqual(@as(usize, 1), cfg.inference_preload_models.items.len);
+    try std.testing.expectEqual(inference.server.WarmModelKind.generator, cfg.inference_preload_models.items[0].kind);
+    try std.testing.expectEqualStrings("gemma-e2b", cfg.inference_preload_models.items[0].name);
+    try std.testing.expectEqual(inference.backends.BackendType.metal, cfg.inference_preload_models.items[0].backend.?);
     try std.testing.expectEqualStrings("/tmp/antfly-data", cfg.data_dir.?);
 }
 
@@ -4244,12 +4323,29 @@ test "inference config falls back to common config" {
             .api_url = try alloc.dupe(u8, "http://127.0.0.1:8089"),
             .models_dir = try alloc.dupe(u8, "/tmp/antfly-models"),
             .ml_dir = try alloc.dupe(u8, "/tmp/antfly-ml"),
+            .preload = try alloc.dupe(antfly.common.config.Config.InferenceConfig.WarmModelConfig, &.{
+                .{
+                    .kind = try alloc.dupe(u8, "generator"),
+                    .name = try alloc.dupe(u8, "antflydb/gemma-e2b"),
+                    .backend = try alloc.dupe(u8, "metal"),
+                    .format = try alloc.dupe(u8, "gguf"),
+                    .quantization = try alloc.dupe(u8, "q4_k"),
+                },
+            }),
         },
     };
     defer cfg.deinit();
 
     try std.testing.expectEqualStrings("/tmp/antfly-models", resolveInferenceModelsDir(.{}, &cfg).?);
     try std.testing.expectEqualStrings("/tmp/antfly-ml", resolveInferenceMlDir(.{}, &cfg).?);
+    var warm_models = try resolveInferenceWarmModels(alloc, .{}, &cfg);
+    defer warm_models.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), warm_models.items.len);
+    try std.testing.expectEqual(inference.server.WarmModelKind.generator, warm_models.items[0].kind);
+    try std.testing.expectEqualStrings("antflydb/gemma-e2b", warm_models.items[0].name);
+    try std.testing.expectEqual(inference.backends.BackendType.metal, warm_models.items[0].backend.?);
+    try std.testing.expectEqualStrings("gguf", warm_models.items[0].format.?);
+    try std.testing.expectEqualStrings("q4_k", warm_models.items[0].quantization.?);
 }
 
 test "swarm runtime resolves paths from common storage base dir" {

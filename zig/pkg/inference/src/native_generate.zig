@@ -15,6 +15,8 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
+const httpx = @import("httpx");
+const api = @import("inference_api");
 const backends = @import("backends/backends.zig");
 const decoder_gated_runtime = @import("backends/decoder_gated_runtime.zig");
 const debug_timing = @import("debug_timing.zig");
@@ -58,6 +60,14 @@ const ExecutionMode = enum {
 
 const CompiledTarget = graph_mod.compiled_backend.AttachmentTarget;
 
+fn shouldSkipAutoMtpDraftLoad(opts: Options, draft_cfg: gpt_mod.Config) bool {
+    if (opts.speculation_policy != .auto) return false;
+    if (!draft_cfg.gemma4_mtp_assistant) return false;
+    if (opts.speculation_calibration == .none) return true;
+    const requested_max_tokens: usize = @intCast(@max(opts.max_tokens, 1));
+    return requested_max_tokens < generation.gemma4MtpAutoMinGenerationTokens();
+}
+
 const Options = struct {
     model_dir: []const u8,
     prompt: []const u8,
@@ -99,6 +109,9 @@ const Options = struct {
     mode: ?ExecutionMode = null,
     compiled_target: ?CompiledTarget = null,
     artifact_dir: ?[]const u8 = null,
+    server_url: ?[]const u8 = null,
+    require_server: bool = false,
+    stream: bool = false,
     json_timing_path: ?[]const u8 = null,
 };
 
@@ -106,7 +119,18 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     const opts = try parseArgs(args);
     const effective_draft_model = if (opts.speculation_policy == .off) null else opts.draft_model;
     try native_backend_choice.validate(opts.backend);
+    const require_server = requireWarmServer(opts);
     if (effective_draft_model != null and opts.backend == .onnx) return error.SpeculativeDecodingRequiresNativeBackend;
+    if (opts.server_url orelse platform.env.getenv("ANTFLY_INFERENCE_SERVER_URL")) |server_url| {
+        var server_opts = opts;
+        server_opts.server_url = server_url;
+        if (defaultServerModelName(opts.model_dir)) |model_name| server_opts.model_dir = model_name;
+        return try runServerGenerate(allocator, io, server_opts, false);
+    }
+    if (require_server) {
+        if (!serverGenerateSupportsOptions(opts)) return error.UnsupportedServerGenerateOption;
+        return error.WarmInferenceServerUnavailable;
+    }
     const started_at = std.Io.Timestamp.now(io, .awake);
 
     var preflight_manifest = try manifest_mod.loadFromDir(allocator, opts.model_dir);
@@ -260,11 +284,11 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             )) return;
         }
 
-        var result = try pipeline.generate(&messages, config);
+        var result = try generateWithOptionalStreaming(&pipeline, &messages, config, opts.stream);
         defer result.deinit();
         const finished_generate_at = std.Io.Timestamp.now(io, .awake);
 
-        print("{s}\n", .{result.text});
+        if (!opts.stream) print("{s}\n", .{result.text});
         if (opts.print_token_ids) {
             if (result.token_ids) |ids| {
                 print("token_ids:", .{});
@@ -349,16 +373,23 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     if (effective_draft_model != null and (opts.image_count > 0 or opts.audio_count > 0)) {
         return error.MultimodalSpeculativeDecodingNotSupported;
     }
+    var draft_gpt_config: ?gpt_mod.Config = null;
     const draft_model = if (effective_draft_model) |draft_model_dir| blk: {
+        if (opts.speculation_policy == .auto) {
+            var draft_manifest = try manifest_mod.loadFromDir(allocator, draft_model_dir);
+            defer draft_manifest.deinit();
+            const draft_cfg = try session_factory.loadGptConfigFromModelDir(allocator, draft_model_dir, draft_manifest);
+            if (shouldSkipAutoMtpDraftLoad(opts, draft_cfg)) {
+                draft_gpt_config = draft_cfg;
+                break :blk null;
+            }
+        }
         const loaded = try model_manager.loadFromDir(draft_model_dir);
         const draft_cfg = session_factory.getGptConfig(loaded.session) orelse return error.InvalidDraftModelForGeneration;
         try validateDraftTokenizerCompatibility(tokenizer, loaded.getTokenizer(), gpt_config, draft_cfg);
+        draft_gpt_config = draft_cfg;
         break :blk loaded;
     } else null;
-    const draft_gpt_config: ?@import("models/gpt.zig").Config = if (draft_model) |loaded|
-        session_factory.getGptConfig(loaded.session).?
-    else
-        null;
 
     const apply_chat_template = !opts.raw_prompt and !opts.no_chat_template and model.chat_tmpl != null;
     const rendered_prompt = if (opts.raw_prompt)
@@ -493,10 +524,20 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .onnx => return error.UnexpectedOnnxBackend,
         .wasm => return error.UnexpectedWasmBackend,
     };
-    const kv_dtype = if (opts.cache_dtype) |name|
+    const requested_kv_dtype = if (opts.cache_dtype) |name|
         runtime.kv.pool.parseKvDType(name) orelse return error.InvalidCacheDtype
     else
         session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
+    const kv_dtype = effectiveGenerationKvDType(
+        requested_kv_dtype,
+        backend_kind,
+        gpt_config,
+        prompt_tokens,
+        @intCast(@max(opts.max_tokens, 1)),
+    );
+    if (opts.print_timing and kv_dtype != requested_kv_dtype) {
+        print("cache_dtype_effective: requested={s} effective={s}\n", .{ @tagName(requested_kv_dtype), @tagName(kv_dtype) });
+    }
     const budget_backend_class: runtime.tier.memory.BackendClass = switch (backend_kind) {
         .native => .cpu,
         else => .gpu,
@@ -525,25 +566,37 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         return err;
     };
     const draft_kv_dtype = if (draft_model) |loaded| blk: {
-        break :blk if (opts.cache_dtype) |name|
+        const requested_draft_kv_dtype = if (opts.cache_dtype) |name|
             runtime.kv.pool.parseKvDType(name) orelse return error.InvalidCacheDtype
         else
             session_factory.recommendedKvDTypeForSession(loaded.session, backend_kind);
+        break :blk if (draft_gpt_config) |draft_cfg|
+            effectiveGenerationKvDType(
+                requested_draft_kv_dtype,
+                backend_kind,
+                draft_cfg,
+                prompt_tokens,
+                @intCast(@max(opts.max_tokens, 1)),
+            )
+        else
+            requested_draft_kv_dtype;
     } else null;
-    if (draft_gpt_config) |draft_cfg| {
-        run_budget.reserveEstimate(runtime.tier.memory.estimateGptGeneration(
-            backend_kind,
-            draft_kv_dtype.?,
-            draft_cfg,
-            prompt_tokens,
-            @intCast(@max(opts.max_tokens, 1)),
-            admission_prefill_chunk,
-        )) catch |err| {
-            if (err == error.MemoryBudgetExceeded) {
-                printBudgetExceeded(draft_model.?.session, &run_budget);
-            }
-            return err;
-        };
+    if (draft_model != null) {
+        if (draft_gpt_config) |draft_cfg| {
+            run_budget.reserveEstimate(runtime.tier.memory.estimateGptGeneration(
+                backend_kind,
+                draft_kv_dtype.?,
+                draft_cfg,
+                prompt_tokens,
+                @intCast(@max(opts.max_tokens, 1)),
+                admission_prefill_chunk,
+            )) catch |err| {
+                if (err == error.MemoryBudgetExceeded) {
+                    printBudgetExceeded(draft_model.?.session, &run_budget);
+                }
+                return err;
+            };
+        }
     }
     var cb = session_factory.getComputeBackendWithBudget(model.session, allocator, &run_budget) catch |err| {
         if (err == error.MemoryBudgetExceeded) {
@@ -605,26 +658,28 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     defer if (draft_kv_manager) |*manager| manager.deinit();
     var draft_decode_state: ?generation.NativeDecodeState = null;
     defer if (draft_decode_state) |*state| state.deinit();
-    if (draft_gpt_config) |draft_cfg| {
-        draft_kv_manager = runtime.kv.manager.KvManager.init(allocator);
-        const draft_sliding_window_size: ?u32 = if (draft_cfg.position_encoding == .absolute)
-            null
-        else if (draft_cfg.sliding_window > 0)
-            draft_cfg.sliding_window
-        else if (draft_cfg.max_position_embeddings > 0)
-            draft_cfg.max_position_embeddings
-        else
-            null;
-        const draft_pool_id = try draft_kv_manager.?.addPool(.{
-            .backend = backend_kind,
-            .dtype = draft_kv_dtype.?,
-            .page_size_tokens = 16,
-            .num_layers_packed = @intCast(draft_cfg.num_hidden_layers),
-            .num_kv_heads = draft_cfg.maxKvHeads(),
-            .head_dim = draft_cfg.maxHeadDim(),
-            .sliding_window_size = draft_sliding_window_size,
-        });
-        draft_decode_state = generation.NativeDecodeState.initPaged(allocator, &draft_kv_manager.?, draft_pool_id, null);
+    if (draft_model != null) {
+        if (draft_gpt_config) |draft_cfg| {
+            draft_kv_manager = runtime.kv.manager.KvManager.init(allocator);
+            const draft_sliding_window_size: ?u32 = if (draft_cfg.position_encoding == .absolute)
+                null
+            else if (draft_cfg.sliding_window > 0)
+                draft_cfg.sliding_window
+            else if (draft_cfg.max_position_embeddings > 0)
+                draft_cfg.max_position_embeddings
+            else
+                null;
+            const draft_pool_id = try draft_kv_manager.?.addPool(.{
+                .backend = backend_kind,
+                .dtype = draft_kv_dtype.?,
+                .page_size_tokens = 16,
+                .num_layers_packed = @intCast(draft_cfg.num_hidden_layers),
+                .num_kv_heads = draft_cfg.maxKvHeads(),
+                .head_dim = draft_cfg.maxHeadDim(),
+                .sliding_window_size = draft_sliding_window_size,
+            });
+            draft_decode_state = generation.NativeDecodeState.initPaged(allocator, &draft_kv_manager.?, draft_pool_id, null);
+        }
     }
     if (native_generate_lease) |lease| {
         if (config.prefill_chunk_size == 0) {
@@ -688,7 +743,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         if (draft_model) |loaded_draft| session_factory.getCudaRuntimeStats(loaded_draft.session) else null
     else
         null;
-    var result = pipeline.generate(&messages, config) catch |err| {
+    var result = generateWithOptionalStreaming(&pipeline, &messages, config, opts.stream) catch |err| {
         if (err == error.MemoryBudgetExceeded) {
             printBudgetExceeded(model.session, &run_budget);
         } else if (err == error.AudioInputTooLong) {
@@ -721,7 +776,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         null;
     defer result.deinit();
 
-    print("{s}\n", .{result.text});
+    if (!opts.stream) print("{s}\n", .{result.text});
     if (opts.print_token_ids) {
         if (result.token_ids) |ids| {
             print("token_ids:", .{});
@@ -2679,8 +2734,9 @@ fn metalExecutorReuseProbeEnabled() bool {
     return envFlagEnabled("TERMITE_METAL_EXECUTOR_REUSE_PROBE");
 }
 
-fn gemmaPrefillPrewarmDisabled() bool {
-    return envFlagEnabled("TERMITE_METAL_DISABLE_GEMMA_PREFILL_PREWARM");
+fn gemmaPrefillPrewarmEnabled() bool {
+    if (envFlagEnabled("TERMITE_METAL_DISABLE_GEMMA_PREFILL_PREWARM")) return false;
+    return envFlagEnabled("TERMITE_METAL_ENABLE_GEMMA_PREFILL_PREWARM");
 }
 
 fn printLiveWholeModelExecutorDetails(runtime_opt: ?*const graph_mod.model_runtime.ModelRuntime) void {
@@ -2711,6 +2767,7 @@ fn runLiveWholeModelExecutorReuseProbe(
     allocator: std.mem.Allocator,
     io: std.Io,
     model: *model_manager_mod.LoadedModel,
+    gpt_config: @import("models/gpt.zig").Config,
     prompt_ids: []const i64,
     prefill_chunk_size: usize,
     kv_dtype: runtime.kv.pool.KvDType,
@@ -2741,15 +2798,30 @@ fn runLiveWholeModelExecutorReuseProbe(
         });
         processed = chunk_end;
     }
+    const finished_prefill_at = std.Io.Timestamp.now(io, .awake);
+    var first_token_at = finished_prefill_at;
+    if (runtime_model.capabilities().supports_greedy_decode) {
+        _ = try output_accum.?.greedyToken(allocator, gpt_config.vocab_size);
+        first_token_at = std.Io.Timestamp.now(io, .awake);
+    }
     if (output_accum) |*owned| owned.deinit(allocator);
-    const finished_at = std.Io.Timestamp.now(io, .awake);
+    const finished_at = first_token_at;
 
     print(
-        "metal_executor_reuse_ms: backend_setup={d} prefill={d} total={d}\n",
+        "metal_executor_reuse_ms: backend_setup={d} prefill={d} first_token={d} total={d}\n",
         .{
             durationMillis(started_at, created_runtime_at),
-            durationMillis(created_runtime_at, finished_at),
+            durationMillis(created_runtime_at, finished_prefill_at),
+            durationMillis(finished_prefill_at, first_token_at),
             durationMillis(started_at, finished_at),
+        },
+    );
+    print(
+        "metal_executor_reuse_first_token_ms: service={d} prefill={d} sample={d}\n",
+        .{
+            durationMillis(created_runtime_at, first_token_at),
+            durationMillis(created_runtime_at, finished_prefill_at),
+            durationMillis(finished_prefill_at, first_token_at),
         },
     );
     printLiveWholeModelExecutorDetails(&runtime_model);
@@ -2805,7 +2877,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
     if (build_options.enable_metal and
         gpt_config.family == .gemma and
         model.session.backend().usesGpuHostedSession() and
-        !gemmaPrefillPrewarmDisabled())
+        gemmaPrefillPrewarmEnabled())
     {
         const prewarm_started_at = std.Io.Timestamp.now(io, .awake);
         const prewarm_ok = runtime_model.prepare(allocator, .{
@@ -2847,6 +2919,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
     const use_sample_decode = runtime_caps.supports_sample_decode and !use_greedy_decode;
     var prefill_chunk_size = if (config.prefill_chunk_size > 0) config.prefill_chunk_size else prompt_ids.len;
     prefill_chunk_size = @max(@min(prefill_chunk_size, prompt_ids.len), 1);
+    const prefill_started_at = std.Io.Timestamp.now(io, .awake);
     var output = blk: {
         var processed: usize = 0;
         var output_accum: ?graph_mod.model_runtime.ModelOutput = null;
@@ -2865,9 +2938,11 @@ fn tryRunLiveWholeModelExecutorGenerate(
         }
         break :blk output_accum.?;
     };
+    const finished_prefill_at = std.Io.Timestamp.now(io, .awake);
     defer output.deinit(allocator);
 
     var generated: usize = 0;
+    var first_token_at: ?std.Io.Timestamp = null;
     while (generated < max_tokens) {
         const next_token_i32: i32 = if (generated == 0) blk: {
             if (use_greedy_decode) {
@@ -2911,6 +2986,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
         try generated_token_ids.append(allocator, next_token_i32);
         try all_token_ids.append(allocator, next_token_i64);
         generated += 1;
+        if (generated == 1) first_token_at = std.Io.Timestamp.now(io, .awake);
 
         if (gpt_config.eos_token_id >= 0 and next_token_i32 == gpt_config.eos_token_id) {
             finish_reason = "stop";
@@ -2964,6 +3040,16 @@ fn tryRunLiveWholeModelExecutorGenerate(
                 durationMillis(started_at, finished_generate_at),
             },
         );
+        const first_token_value_at = first_token_at orelse finished_generate_at;
+        print(
+            "first_token_ms: request={d} service={d} prefill={d} sample={d}\n",
+            .{
+                durationMillis(started_at, first_token_value_at),
+                durationMillis(warmed_runtime_at, first_token_value_at),
+                durationMillis(prefill_started_at, finished_prefill_at),
+                durationMillis(finished_prefill_at, first_token_value_at),
+            },
+        );
         if (model.session.backend().usesGpuHostedSession()) {
             printLiveWholeModelExecutorDetails(&runtime_model);
             if (metalExecutorReuseProbeEnabled()) {
@@ -2971,6 +3057,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
                     allocator,
                     io,
                     model,
+                    gpt_config,
                     prompt_ids,
                     prefill_chunk_size,
                     kv_dtype,
@@ -3378,11 +3465,11 @@ fn runOnnxWholeModelGraphGenerate(
     };
 
     gpt_arch.resetDebugTimingStats();
-    var result = try pipeline.generate(messages, config);
+    var result = try generateWithOptionalStreaming(&pipeline, messages, config, opts.stream);
     const finished_generate_at = std.Io.Timestamp.now(io, .awake);
     defer result.deinit();
 
-    print("{s}\n", .{result.text});
+    if (!opts.stream) print("{s}\n", .{result.text});
     if (opts.print_token_ids) {
         if (result.token_ids) |ids| {
             print("token_ids:", .{});
@@ -3488,6 +3575,352 @@ fn emitArtifactResultAndExit(
         );
     }
     std.process.exit(0);
+}
+
+const CliStreamPrinter = struct {
+    wrote_text: bool = false,
+
+    fn onToken(raw_ctx: *anyopaque, token_text: []const u8) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw_ctx));
+        if (token_text.len > 0) {
+            print("{s}", .{token_text});
+            self.wrote_text = true;
+        }
+        return true;
+    }
+};
+
+fn generateWithOptionalStreaming(
+    pipeline: anytype,
+    messages: []const generation.Message,
+    config: generation.GenerationConfig,
+    stream: bool,
+) !generation.GenerationResult {
+    if (!stream) return pipeline.generate(messages, config);
+
+    var stream_printer = CliStreamPrinter{};
+    var result = try pipeline.generateStreaming(
+        messages,
+        config,
+        @ptrCast(&stream_printer),
+        CliStreamPrinter.onToken,
+    );
+    errdefer result.deinit();
+    if (!stream_printer.wrote_text and result.text.len > 0) {
+        print("{s}", .{result.text});
+    }
+    print("\n", .{});
+    return result;
+}
+
+fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, quiet_errors: bool) !void {
+    if (!serverGenerateSupportsOptions(opts)) {
+        return error.UnsupportedServerGenerateOption;
+    }
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var http = httpx.Client.init(allocator, io_impl.io());
+    defer http.deinit();
+
+    const url = try generateEndpointUrl(allocator, opts.server_url.?);
+    defer allocator.free(url);
+
+    const messages = [_]api.ChatMessage{.{
+        .role = .user,
+        .content = .{ .string = opts.prompt },
+    }};
+    const request = api.GenerateRequest{
+        .model = opts.model_dir,
+        .messages = &messages,
+        .max_tokens = opts.max_tokens,
+        .temperature = opts.temperature,
+        .top_p = opts.top_p,
+        .top_k = opts.top_k,
+        .repetition_penalty = opts.repetition_penalty,
+        .stream = if (opts.stream) true else null,
+        .cache_dtype = opts.cache_dtype,
+        .cache_compaction_ratio = opts.cache_compaction_ratio,
+        .backend = generateBackendOverrideForChoice(opts.backend),
+        .mode = serverGenerateModeName(opts),
+        .compiled_target = serverGenerateCompiledTargetName(opts),
+    };
+    const body = try httpx.json.Json.stringify(allocator, request);
+    defer allocator.free(body);
+
+    if (opts.stream) {
+        return try runServerGenerateStream(allocator, io, &http, url, body, opts, quiet_errors);
+    }
+
+    const started_at = std.Io.Timestamp.now(io, .awake);
+    var resp = try http.post(url, .{ .json = body, .timeout_ms = 300_000 });
+    defer resp.deinit();
+    const finished_at = std.Io.Timestamp.now(io, .awake);
+    if (!resp.ok()) {
+        if (!quiet_errors) {
+            if (resp.body) |payload| {
+                print("server_error status={d} body={s}\n", .{ resp.status.code, payload });
+            } else {
+                print("server_error status={d}\n", .{resp.status.code});
+            }
+        }
+        return error.GenerateRequestFailed;
+    }
+    const payload = resp.body orelse return error.EmptyResponse;
+    var parsed = try std.json.parseFromSlice(api.GenerateResponse, allocator, payload, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const choice = if (parsed.value.choices.len > 0) parsed.value.choices[0] else return error.EmptyResponse;
+
+    print("{s}\n", .{choice.message.content orelse ""});
+    if (opts.print_finish_reason or opts.print_token_count) {
+        if (opts.print_finish_reason and opts.print_token_count) {
+            print("finish_reason={s} tokens={d}\n", .{ @tagName(choice.finish_reason), parsed.value.usage.completion_tokens });
+        } else if (opts.print_finish_reason) {
+            print("finish_reason={s}\n", .{@tagName(choice.finish_reason)});
+        } else {
+            print("tokens={d}\n", .{parsed.value.usage.completion_tokens});
+        }
+    }
+    if (opts.print_timing) {
+        const total_ms = durationMillis(started_at, finished_at);
+        const tokens_per_sec: f64 = if (total_ms > 0)
+            @as(f64, @floatFromInt(parsed.value.usage.completion_tokens)) * 1000.0 / @as(f64, @floatFromInt(total_ms))
+        else
+            0;
+        print("timing_ms: server_request={d} total={d} tokens_per_sec={d:.2}\n", .{ total_ms, total_ms, tokens_per_sec });
+    }
+}
+
+fn generateBackendOverrideForChoice(choice: BackendChoice) ?api.ModelBackend {
+    return switch (choice) {
+        .auto => null,
+        .onnx => .onnx,
+        .native => .native,
+        .metal => .metal,
+        .cuda => .cuda,
+        .xla => .xla,
+        .webgpu => .webgpu,
+    };
+}
+
+const SseEventBoundary = struct {
+    end: usize,
+    delimiter_len: usize,
+};
+
+const ServerGenerateSseWriter = struct {
+    allocator: std.mem.Allocator,
+    buffer: std.ArrayListUnmanaged(u8) = .empty,
+    finish_reason: ?api.FinishReason = null,
+    stream_error: bool = false,
+
+    fn deinit(self: *@This()) void {
+        self.buffer.deinit(self.allocator);
+    }
+
+    pub fn writeAll(self: *@This(), data: []const u8) !void {
+        try self.buffer.appendSlice(self.allocator, data);
+        try self.processCompleteEvents();
+    }
+
+    fn finish(self: *@This()) !void {
+        try self.processCompleteEvents();
+        if (std.mem.trim(u8, self.buffer.items, " \t\r\n").len != 0) return error.InvalidResponse;
+    }
+
+    fn processCompleteEvents(self: *@This()) !void {
+        while (findSseEventBoundary(self.buffer.items)) |boundary| {
+            try self.handleEvent(self.buffer.items[0..boundary.end]);
+            const consumed = boundary.end + boundary.delimiter_len;
+            const remaining = self.buffer.items[consumed..];
+            std.mem.copyForwards(u8, self.buffer.items[0..remaining.len], remaining);
+            self.buffer.shrinkRetainingCapacity(remaining.len);
+        }
+    }
+
+    fn handleEvent(self: *@This(), raw_event: []const u8) !void {
+        var event_name: ?[]const u8 = null;
+        var data = std.ArrayListUnmanaged(u8).empty;
+        defer data.deinit(self.allocator);
+
+        var lines = std.mem.splitScalar(u8, raw_event, '\n');
+        while (lines.next()) |raw_line| {
+            const line = std.mem.trim(u8, raw_line, "\r");
+            if (line.len == 0 or line[0] == ':') continue;
+            if (std.mem.startsWith(u8, line, "event:")) {
+                event_name = std.mem.trim(u8, line["event:".len..], " ");
+            } else if (std.mem.startsWith(u8, line, "data:")) {
+                var value = line["data:".len..];
+                if (std.mem.startsWith(u8, value, " ")) value = value[1..];
+                if (data.items.len > 0) try data.append(self.allocator, '\n');
+                try data.appendSlice(self.allocator, value);
+            }
+        }
+
+        if (data.items.len == 0) return;
+        if (event_name) |name| {
+            if (std.mem.eql(u8, name, "error")) {
+                self.stream_error = true;
+                print("server_stream_error={s}\n", .{data.items});
+                return;
+            }
+        }
+        if (std.mem.eql(u8, data.items, "[DONE]")) return;
+
+        var parsed = try std.json.parseFromSlice(api.GenerateChunk, self.allocator, data.items, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        for (parsed.value.choices) |choice| {
+            if (choice.delta.content) |content| {
+                print("{s}", .{content});
+            }
+            if (choice.finish_reason) |finish_reason| {
+                self.finish_reason = finish_reason;
+            }
+        }
+    }
+};
+
+fn findSseEventBoundary(data: []const u8) ?SseEventBoundary {
+    if (std.mem.indexOf(u8, data, "\n\n")) |idx| {
+        return .{ .end = idx, .delimiter_len = 2 };
+    }
+    if (std.mem.indexOf(u8, data, "\r\n\r\n")) |idx| {
+        return .{ .end = idx, .delimiter_len = 4 };
+    }
+    return null;
+}
+
+fn runServerGenerateStream(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    http: *httpx.Client,
+    url: []const u8,
+    body: []const u8,
+    opts: Options,
+    quiet_errors: bool,
+) !void {
+    var stream_writer = ServerGenerateSseWriter{ .allocator = allocator };
+    defer stream_writer.deinit();
+
+    const headers = [_][2][]const u8{
+        .{ "Accept", "text/event-stream" },
+    };
+
+    const started_at = std.Io.Timestamp.now(io, .awake);
+    var resp = try http.requestToWriter(.POST, url, .{
+        .json = body,
+        .headers = &headers,
+        .timeout_ms = 300_000,
+    }, &stream_writer, null, null);
+    defer resp.deinit();
+    const finished_at = std.Io.Timestamp.now(io, .awake);
+
+    if (!resp.ok()) {
+        if (!quiet_errors) {
+            if (stream_writer.buffer.items.len > 0) {
+                print("server_error status={d} body={s}\n", .{ resp.status.code, stream_writer.buffer.items });
+            } else {
+                print("server_error status={d}\n", .{resp.status.code});
+            }
+        }
+        return error.GenerateRequestFailed;
+    }
+    try stream_writer.finish();
+    if (stream_writer.stream_error) return error.GenerateRequestFailed;
+
+    print("\n", .{});
+    if (opts.print_finish_reason or opts.print_token_count) {
+        const finish_reason = if (stream_writer.finish_reason) |reason| @tagName(reason) else "unknown";
+        if (opts.print_finish_reason and opts.print_token_count) {
+            print("finish_reason={s} tokens=unavailable\n", .{finish_reason});
+        } else if (opts.print_finish_reason) {
+            print("finish_reason={s}\n", .{finish_reason});
+        } else {
+            print("tokens=unavailable\n", .{});
+        }
+    }
+    if (opts.print_timing) {
+        const total_ms = durationMillis(started_at, finished_at);
+        print("timing_ms: server_request={d} total={d}\n", .{ total_ms, total_ms });
+    }
+}
+
+fn requireWarmServer(opts: Options) bool {
+    return opts.require_server or platform.env.getenvBool("ANTFLY_INFERENCE_REQUIRE_WARM_SERVER");
+}
+
+fn defaultServerModelName(model_dir: []const u8) ?[]const u8 {
+    const home = platform.env.getenv("HOME") orelse return null;
+    return stripDefaultModelsDir(home, model_dir);
+}
+
+fn stripDefaultModelsDir(home: []const u8, model_dir: []const u8) ?[]const u8 {
+    const marker = "/.antfly/inference/models/";
+    if (!std.mem.startsWith(u8, model_dir, home)) return null;
+    const rest = model_dir[home.len..];
+    if (!std.mem.startsWith(u8, rest, marker)) return null;
+    const model_name = rest[marker.len..];
+    if (model_name.len == 0) return null;
+    return model_name;
+}
+
+fn serverGenerateSupportsOptions(opts: Options) bool {
+    return opts.image_count == 0 and
+        opts.audio_count == 0 and
+        !opts.raw_prompt and
+        !opts.no_bos and
+        !opts.no_chat_template and
+        opts.draft_model == null and
+        opts.speculation_policy == .auto and
+        opts.speculation_calibration == .none and
+        !opts.debug_mtp and
+        !opts.debug_gemma4_target and
+        !opts.disable_gemma_embedding_scale and
+        opts.prefill_chunk_size == 0 and
+        opts.host_budget_mb == 0 and
+        opts.backend_budget_mb == 0 and
+        opts.combined_budget_mb == 0 and
+        opts.kv_budget_mb == 0 and
+        opts.scratch_budget_mb == 0 and
+        opts.artifact_dir == null and
+        opts.json_timing_path == null and
+        !opts.print_token_ids and
+        !opts.print_prompt_token_ids and
+        !opts.print_prompt and
+        !opts.print_chat_template_status;
+}
+
+fn compiledTargetName(target: CompiledTarget) []const u8 {
+    return switch (target) {
+        .partitioned => "partitioned",
+        .whole_model => "whole-model",
+    };
+}
+
+fn serverGenerateModeName(opts: Options) ?[]const u8 {
+    if (opts.mode) |mode| return @tagName(mode);
+    if (opts.backend == .metal) return @tagName(ExecutionMode.compiled);
+    return null;
+}
+
+fn serverGenerateCompiledTargetName(opts: Options) ?[]const u8 {
+    if (opts.compiled_target) |target| return compiledTargetName(target);
+    if (opts.backend == .metal and (opts.mode == null or opts.mode.? != .eager)) return compiledTargetName(.whole_model);
+    return null;
+}
+
+fn generateEndpointUrl(allocator: std.mem.Allocator, server_url: []const u8) ![]u8 {
+    const root = trimRightSlash(server_url);
+    if (std.mem.endsWith(u8, root, "/ai/v1")) {
+        return try std.fmt.allocPrint(allocator, "{s}/generate", .{root});
+    }
+    return try std.fmt.allocPrint(allocator, "{s}/ai/v1/generate", .{root});
+}
+
+fn trimRightSlash(value: []const u8) []const u8 {
+    var end = value.len;
+    while (end > 0 and value[end - 1] == '/') : (end -= 1) {}
+    return value[0..end];
 }
 
 fn validateDraftTokenizerCompatibility(
@@ -3620,6 +4053,8 @@ fn parseArgs(args: []const []const u8) !Options {
             opts.print_chat_template_status = true;
         } else if (std.mem.eql(u8, arg, "--print-timing")) {
             opts.print_timing = true;
+        } else if (std.mem.eql(u8, arg, "--stream")) {
+            opts.stream = true;
         } else if (std.mem.eql(u8, arg, "--json-timing")) {
             i += 1;
             if (i >= args.len) return error.MissingJsonTimingPath;
@@ -3662,6 +4097,12 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingScratchBudget;
             opts.scratch_budget_mb = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--server")) {
+            i += 1;
+            if (i >= args.len) return error.MissingServerUrl;
+            opts.server_url = args[i];
+        } else if (std.mem.eql(u8, arg, "--require-server")) {
+            opts.require_server = true;
         } else {
             printUsage();
             return error.InvalidArguments;
@@ -4020,8 +4461,11 @@ fn metalEagerDenseMaxBytes() u64 {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir> <prompt> [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path]
+        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
+        \\  With --server or ANTFLY_INFERENCE_SERVER_URL, sends the request to an already-running inference server.
+        \\  --stream prints generated text incrementally as token deltas arrive.
+        \\  --require-server or ANTFLY_INFERENCE_REQUIRE_WARM_SERVER=1 fails unless a server URL is configured.
         \\  draft-model enables native speculative decoding with a tokenizer-compatible drafter such as a Gemma 4 *-assistant model.
         \\  speculation-calibration defaults to none; Gemma4 MTP auto mode requires probe or positive to run the drafter.
         \\  Explicit compiled backends consult ~/.antfly/inference/artifacts/<owner>/<model>/<backend>/... by default.
@@ -4048,6 +4492,28 @@ fn graphModeEnabled() bool {
 
 fn nativeGenerateSchedulerEnabled() bool {
     return !getenvBool("TERMITE_DISABLE_NATIVE_GENERATE_SCHEDULER");
+}
+
+fn effectiveGenerationKvDType(
+    requested: runtime.kv.pool.KvDType,
+    backend_kind: runtime.kv.pool.BackendKind,
+    config: gpt_mod.Config,
+    prompt_tokens: usize,
+    max_tokens: usize,
+) runtime.kv.pool.KvDType {
+    if (backend_kind != .cuda or config.family != .gemma) return requested;
+    switch (requested) {
+        .polar4, .turbo3 => {},
+        else => return requested,
+    }
+    const min_tokens = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TURBOQUANT_MIN_TOKENS") orelse 256;
+    if (min_tokens == 0) return requested;
+    const total_tokens = prompt_tokens + max_tokens;
+    if (total_tokens < min_tokens) return .f32;
+    if (requested == .turbo3 and !platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_ENABLE_TURBO3_KV")) {
+        return .polar4;
+    }
+    return requested;
 }
 
 fn getenvBool(comptime name: [*:0]const u8) bool {
@@ -4092,6 +4558,92 @@ test "parseArgs accepts compiled target" {
     try std.testing.expectEqual(BackendChoice.xla, opts.backend);
     try std.testing.expectEqual(ExecutionMode.compiled, opts.mode.?);
     try std.testing.expectEqual(CompiledTarget.whole_model, opts.compiled_target.?);
+}
+
+test "parseArgs accepts server URL" {
+    const opts = try parseArgs(&.{
+        "gemma-e2b",
+        "hello",
+        "--server",
+        "http://127.0.0.1:8090",
+        "--require-server",
+        "--stream",
+        "--max-tokens",
+        "4",
+    });
+    try std.testing.expectEqualStrings("gemma-e2b", opts.model_dir);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8090", opts.server_url.?);
+    try std.testing.expect(opts.require_server);
+    try std.testing.expect(opts.stream);
+    try std.testing.expectEqual(@as(i32, 4), opts.max_tokens);
+}
+
+test "server generate routes metal requests to whole model" {
+    const opts = Options{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .metal,
+    };
+    try std.testing.expectEqualStrings("compiled", serverGenerateModeName(opts).?);
+    try std.testing.expectEqualStrings("whole-model", serverGenerateCompiledTargetName(opts).?);
+}
+
+test "server generate rejects unsupported server options" {
+    try std.testing.expect(serverGenerateSupportsOptions(.{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .metal,
+    }));
+    try std.testing.expect(!serverGenerateSupportsOptions(.{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .metal,
+        .print_token_ids = true,
+    }));
+    try std.testing.expect(!serverGenerateSupportsOptions(.{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .metal,
+        .prefill_chunk_size = 64,
+    }));
+    try std.testing.expect(!serverGenerateSupportsOptions(.{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .metal,
+        .backend_budget_mb = 4096,
+    }));
+    try std.testing.expect(!serverGenerateSupportsOptions(.{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .metal,
+        .artifact_dir = "/tmp/artifacts",
+    }));
+    try std.testing.expect(!serverGenerateSupportsOptions(.{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .metal,
+        .speculation_policy = .force,
+    }));
+    try std.testing.expect(!serverGenerateSupportsOptions(.{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .metal,
+        .json_timing_path = "/tmp/timing.json",
+    }));
+}
+
+test "server model name strips local models dir prefix" {
+    try std.testing.expectEqualStrings(
+        "ggml-org/gemma-4-e2b-it-gguf",
+        stripDefaultModelsDir(
+            "/Users/alice",
+            "/Users/alice/.antfly/inference/models/ggml-org/gemma-4-e2b-it-gguf",
+        ).?,
+    );
+    try std.testing.expect(stripDefaultModelsDir(
+        "/Users/alice",
+        "/tmp/models/ggml-org/gemma-4-e2b-it-gguf",
+    ) == null);
 }
 
 test "explicit compiled whole model does not route through live executor" {

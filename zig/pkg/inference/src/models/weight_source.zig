@@ -145,6 +145,7 @@ pub const QuantizedStorage = struct {
     /// stronger than `raw_owned == false`: stack, heap, and synthetic borrowed
     /// buffers must not be treated as safe Metal no-copy sources.
     raw_mmap_backed: bool = false,
+    raw_mmap_region: ?c_file.MmapRegion = null,
     prepared: PreparedQuantCache = .{},
     prepared_group_cache: ?PreparedGroupCache = null,
     allocator: std.mem.Allocator,
@@ -170,7 +171,11 @@ pub const QuantizedStorage = struct {
     pub fn deinit(self: *QuantizedStorage) void {
         if (self.prepared_group_cache) |*cache| cache.deinit(self.allocator);
         self.prepared.deinit(self.allocator);
-        if (self.raw_owned) self.allocator.free(@constCast(self.raw_bytes));
+        if (self.raw_mmap_region) |*region| {
+            region.deinit();
+        } else if (self.raw_owned) {
+            self.allocator.free(@constCast(self.raw_bytes));
+        }
         if (self.source_name) |name| self.allocator.free(name);
         self.allocator.free(self.shape);
     }

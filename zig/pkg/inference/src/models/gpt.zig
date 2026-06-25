@@ -23,6 +23,7 @@
 // differences.
 
 const std = @import("std");
+const gguf_format = @import("../gguf/format.zig");
 const gguf_metadata = @import("../gguf/metadata.zig");
 
 pub const ModelFamily = enum {
@@ -1209,7 +1210,50 @@ pub fn parseGgufMetadata(view: gguf_metadata.View) ?Config {
         }
     }
 
+    applyGgufTokenizerStopMetadata(view, &config);
+
     return config;
+}
+
+fn applyGgufTokenizerStopMetadata(view: gguf_metadata.View, config: *Config) void {
+    if (ggufTokenId(view, "tokenizer.ggml.eos_token_id")) |token_id| {
+        addEosTokenId(config, token_id);
+    }
+
+    // Some GGUF exports include the special tokens but omit *_token_id
+    // metadata. Fall back to exact token names so GGUF-only generators can
+    // still stop when the model emits EOS.
+    if (config.eos_token_id < 0) {
+        if (ggufTokenStringId(view, "<eos>")) |token_id| {
+            addEosTokenId(config, token_id);
+        }
+    }
+}
+
+fn ggufTokenId(view: gguf_metadata.View, key: []const u8) ?i32 {
+    if (view.getU64(key)) |value| {
+        if (value <= @as(u64, @intCast(std.math.maxInt(i32)))) return @intCast(value);
+    }
+    if (view.getI64(key)) |value| {
+        if (value >= 0 and value <= std.math.maxInt(i32)) return @intCast(value);
+    }
+    return null;
+}
+
+fn ggufTokenStringId(view: gguf_metadata.View, token: []const u8) ?i32 {
+    const entry = view.find("tokenizer.ggml.tokens") orelse return null;
+    const array = switch (entry.value) {
+        .array => |value| value,
+        else => return null,
+    };
+    for (array.values, 0..) |value, idx| {
+        const candidate = switch (value) {
+            .string => |text| text,
+            else => continue,
+        };
+        if (std.mem.eql(u8, candidate, token)) return @intCast(idx);
+    }
+    return null;
 }
 
 fn metaU32(view: gguf_metadata.View, buf: *[96]u8, arch: []const u8, suffix: []const u8) ?u32 {
@@ -2449,6 +2493,50 @@ test "parse gemma4 multi eos and generation suppress tokens" {
     try std.testing.expectEqual(@as(usize, 2), config.suppressTokenIds().len);
     try std.testing.expectEqual(@as(i32, 258883), config.suppressTokenIds()[0]);
     try std.testing.expectEqual(@as(i32, 258882), config.suppressTokenIds()[1]);
+}
+
+test "parse GGUF tokenizer eos token metadata" {
+    var metadata = [_]gguf_format.MetadataEntry{
+        .{ .key = "general.architecture", .value = .{ .string = "gemma4" } },
+        .{ .key = "tokenizer.ggml.eos_token_id", .value = .{ .u32 = 1 } },
+    };
+    var file = gguf_format.File{
+        .header = .{ .version = 3, .tensor_count = 0, .metadata_count = metadata.len },
+        .metadata = metadata[0..],
+        .tensors = &.{},
+        .alignment = gguf_format.default_alignment,
+        .data_region_offset = 0,
+    };
+
+    const config = parseGgufMetadata(gguf_metadata.View.init(&file)).?;
+    try std.testing.expectEqual(@as(i32, 1), config.eos_token_id);
+    try std.testing.expect(config.isEosToken(1));
+}
+
+test "parse GGUF tokenizer eos token from token string fallback" {
+    var token_values = [_]gguf_format.MetadataValue{
+        .{ .string = "<pad>" },
+        .{ .string = "<eos>" },
+        .{ .string = "<bos>" },
+    };
+    var metadata = [_]gguf_format.MetadataEntry{
+        .{ .key = "general.architecture", .value = .{ .string = "gemma4" } },
+        .{ .key = "tokenizer.ggml.tokens", .value = .{ .array = .{
+            .element_type = .string,
+            .values = token_values[0..],
+        } } },
+    };
+    var file = gguf_format.File{
+        .header = .{ .version = 3, .tensor_count = 0, .metadata_count = metadata.len },
+        .metadata = metadata[0..],
+        .tensors = &.{},
+        .alignment = gguf_format.default_alignment,
+        .data_region_offset = 0,
+    };
+
+    const config = parseGgufMetadata(gguf_metadata.View.init(&file)).?;
+    try std.testing.expectEqual(@as(i32, 1), config.eos_token_id);
+    try std.testing.expect(config.isEosToken(1));
 }
 
 test "parse gemma4 moe fields from text_config" {

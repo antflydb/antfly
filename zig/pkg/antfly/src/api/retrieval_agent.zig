@@ -2457,6 +2457,7 @@ fn generatorConfigFromGenerated(cfg: generating_openapi.GeneratorConfig) !genera
         .project_id = cfg.project_id,
         .location = cfg.location,
         .credentials_path = cfg.credentials_path,
+        .max_tokens = cfg.max_tokens orelse generating.default_max_tokens,
     };
 }
 
@@ -8405,6 +8406,7 @@ test "retrieval agent supports generation step in phase 2" {
         fn executeChain(_: *anyopaque, alloc: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
             try std.testing.expectEqual(@as(usize, 1), chain.len);
             try std.testing.expectEqualStrings("local-generator", chain[0].generator.model);
+            try std.testing.expectEqual(generating.default_max_tokens, chain[0].generator.max_tokens);
             try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "doc:a") != null);
             return .{
                 .content = try alloc.dupe(u8, "Generated answer citing doc:a"),

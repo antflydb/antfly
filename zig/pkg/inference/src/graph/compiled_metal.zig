@@ -311,16 +311,19 @@ fn executeRuntimeGreedy(
     };
 }
 
-fn executeModelForwardDirect(
+fn directSessionRuntime(
     allocator: std.mem.Allocator,
     cache: *cache_mod.GraphCache,
     context: compiled_backend.AttachContext,
     _: compiled_backend.CompileMode,
-    request: model_runtime.ForwardRequest,
-) !?[]f32 {
+) !?*model_runtime.ModelRuntime {
     if (comptime !build_options.enable_metal) return null;
     if (context.attachment_target != .whole_model) return null;
     if (!shouldAttach(context, .single_device)) return null;
+
+    if (cache.getSessionCompiledModelRuntime(.metal, context.attachment_target)) |runtime| {
+        return runtime;
+    }
 
     const session = context.session orelse return null;
     const gpt_config = context.gpt_config orelse return null;
@@ -335,13 +338,23 @@ fn executeModelForwardDirect(
     );
     defer executor.deinit();
 
-    const runtime = try compiled_backend.modelRuntimeForSessionExecutor(
+    return try compiled_backend.modelRuntimeForSessionExecutor(
         allocator,
         cache,
         .metal,
         context.attachment_target,
         &executor,
     );
+}
+
+fn executeModelForwardDirect(
+    allocator: std.mem.Allocator,
+    cache: *cache_mod.GraphCache,
+    context: compiled_backend.AttachContext,
+    mode: compiled_backend.CompileMode,
+    request: model_runtime.ForwardRequest,
+) !?[]f32 {
+    const runtime = try directSessionRuntime(allocator, cache, context, mode) orelse return null;
     return executeRuntimeForward(allocator, runtime, request);
 }
 
@@ -349,33 +362,10 @@ fn executeModelForwardOutputDirect(
     allocator: std.mem.Allocator,
     cache: *cache_mod.GraphCache,
     context: compiled_backend.AttachContext,
-    _: compiled_backend.CompileMode,
+    mode: compiled_backend.CompileMode,
     request: model_runtime.ForwardRequest,
 ) !?model_runtime.ModelOutput {
-    if (comptime !build_options.enable_metal) return null;
-    if (context.attachment_target != .whole_model) return null;
-    if (!shouldAttach(context, .single_device)) return null;
-
-    const session = context.session orelse return null;
-    const gpt_config = context.gpt_config orelse return null;
-    if (!metal_executor.supportsSession(session)) return null;
-
-    var executor = try metal_executor.createModelExecutor(
-        allocator,
-        session,
-        gpt_config,
-        context.kv_dtype,
-        context.shared_moe_cache,
-    );
-    defer executor.deinit();
-
-    const runtime = try compiled_backend.modelRuntimeForSessionExecutor(
-        allocator,
-        cache,
-        .metal,
-        context.attachment_target,
-        &executor,
-    );
+    const runtime = try directSessionRuntime(allocator, cache, context, mode) orelse return null;
     return executeRuntimeOutput(allocator, runtime, request);
 }
 
@@ -383,34 +373,11 @@ fn executeModelGreedyDirect(
     allocator: std.mem.Allocator,
     cache: *cache_mod.GraphCache,
     context: compiled_backend.AttachContext,
-    _: compiled_backend.CompileMode,
+    mode: compiled_backend.CompileMode,
     request: model_runtime.ForwardRequest,
     vocab_size: usize,
 ) !?i64 {
-    if (comptime !build_options.enable_metal) return null;
-    if (context.attachment_target != .whole_model) return null;
-    if (!shouldAttach(context, .single_device)) return null;
-
-    const session = context.session orelse return null;
-    const gpt_config = context.gpt_config orelse return null;
-    if (!metal_executor.supportsSession(session)) return null;
-
-    var executor = try metal_executor.createModelExecutor(
-        allocator,
-        session,
-        gpt_config,
-        context.kv_dtype,
-        context.shared_moe_cache,
-    );
-    defer executor.deinit();
-
-    const runtime = try compiled_backend.modelRuntimeForSessionExecutor(
-        allocator,
-        cache,
-        .metal,
-        context.attachment_target,
-        &executor,
-    );
+    const runtime = try directSessionRuntime(allocator, cache, context, mode) orelse return null;
     return executeRuntimeGreedy(allocator, runtime, request, vocab_size);
 }
 
@@ -418,33 +385,10 @@ fn prepareModelRuntimeDirect(
     allocator: std.mem.Allocator,
     cache: *cache_mod.GraphCache,
     context: compiled_backend.AttachContext,
-    _: compiled_backend.CompileMode,
+    mode: compiled_backend.CompileMode,
     request: model_runtime.PrepareRequest,
 ) !bool {
-    if (comptime !build_options.enable_metal) return false;
-    if (context.attachment_target != .whole_model) return false;
-    if (!shouldAttach(context, .single_device)) return false;
-
-    const session = context.session orelse return false;
-    const gpt_config = context.gpt_config orelse return false;
-    if (!metal_executor.supportsSession(session)) return false;
-
-    var executor = try metal_executor.createModelExecutor(
-        allocator,
-        session,
-        gpt_config,
-        context.kv_dtype,
-        context.shared_moe_cache,
-    );
-    defer executor.deinit();
-
-    const runtime = try compiled_backend.modelRuntimeForSessionExecutor(
-        allocator,
-        cache,
-        .metal,
-        context.attachment_target,
-        &executor,
-    );
+    const runtime = try directSessionRuntime(allocator, cache, context, mode) orelse return false;
     return runtime.prepare(allocator, request);
 }
 

@@ -455,6 +455,34 @@ def _primary_lsn(cluster: HACluster) -> int:
     return int(status["snapshot"]["current_lsn"])
 
 
+def _wait_for_primary_slot_applied(
+    cluster: HACluster,
+    slot_name: str,
+    lsn: int,
+    *,
+    timeout_s: float = 20.0,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_s
+    last_slot: dict[str, Any] | None = None
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            status = cluster.primary.admin_get("/primary/status")
+            slot = _slot_by_name(status, slot_name)
+        except (StopIteration, requests.RequestException) as err:
+            last_error = err
+            time.sleep(0.25)
+            continue
+        last_slot = slot
+        if slot["received_lsn"] >= lsn and slot["applied_lsn"] >= lsn:
+            return slot
+        time.sleep(0.25)
+    raise AssertionError(
+        f"primary slot {slot_name!r} did not observe standby progress through LSN {lsn}; "
+        f"last={last_slot}; last_error={last_error}\n{cluster.debug_logs()}"
+    )
+
+
 def _table_identity_from_catalog(node: HASwarmNode, table_name: str) -> tuple[int, int]:
     catalog = json.loads(node.catalog_path.read_text())
     table = next(table for table in catalog["tables"] if table["name"] == table_name)
@@ -701,8 +729,7 @@ def test_standby_streams_public_writes_restarts_and_rejects_writes(ha_cluster: H
     second_doc = _wait_for_standby_lookup(ha_cluster, table_name, "doc:second")
     assert second_doc["title"] == "second"
 
-    primary_status = ha_cluster.primary.admin_get("/primary/status")
-    slot = _slot_by_name(primary_status, "standby-a")
+    slot = _wait_for_primary_slot_applied(ha_cluster, "standby-a", second_lsn)
     assert slot["received_lsn"] >= second_lsn
     assert slot["applied_lsn"] >= second_lsn
     remote_write_status = ha_cluster.primary.admin_get(

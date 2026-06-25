@@ -249,6 +249,7 @@ const prepareLocalTablePathForRestore = table_write_backup_restore.prepareLocalT
 const exportPortableBackupShard = table_write_backup_restore.exportPortableBackupShard;
 const readBackupFileAlloc = table_write_backup_restore.readBackupFileAlloc;
 const freeBackupShards = table_write_backup_restore.freeBackupShards;
+const cloneShardSnapshots = table_write_backup_restore.cloneShardSnapshots;
 
 pub const mutateRowsJoinedFromRecursiveCtePlanAlloc = table_write_relational_mutation.mutateRowsJoinedFromRecursiveCtePlanAlloc;
 pub const mutateRowsJoinedFromRecursiveCtePlanWithSessionAlloc = table_write_relational_mutation.mutateRowsJoinedFromRecursiveCtePlanWithSessionAlloc;
@@ -9540,6 +9541,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .commit_transaction_with_id = commitTransactionWithId,
                 .backup_table = backupTable,
                 .backup_catalog_table = HostedProvisionedTableWriteSource.backupCatalogTableNative,
+                .backup_table_to_location = backupTableToLocation,
                 .restore_table = restoreTable,
                 .restore_catalog_table = HostedProvisionedTableWriteSource.restoreCatalogTableNative,
                 .batch = batch,
@@ -10195,6 +10197,45 @@ pub const HostedProvisionedTableWriteSource = struct {
         const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
         defer alloc.free(table_name);
         return try backupTable(ptr, alloc, table_name, plan);
+    }
+
+    fn backupTableToLocation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        backup_id: []const u8,
+        format: backups_api.BackupFormat,
+        location_uri: []const u8,
+        location: *backups_api.BackupLocation,
+    ) !?[]backups_api.ShardSnapshot {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const group_id = (try table_catalog.resolveSingleRangeGroup(alloc, self.catalog, table_name)) orelse return null;
+        const resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
+        var route = resolved_route orelse return null;
+        defer route.deinit(alloc);
+        switch (route) {
+            .local => return error.UnsupportedOperation,
+            .remote => |remote| {
+                const format_name = switch (format) {
+                    .native => "native",
+                    .portable => "portable",
+                };
+                const body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(.{
+                    .backup_id = backup_id,
+                    .location = location_uri,
+                    .format = format_name,
+                }, .{})});
+                defer alloc.free(body);
+
+                var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                var response = try client.fetchBackupTable(remote.base_uri, table_name, body);
+                response.deinit(alloc);
+
+                var manifest = try backups_api.readManifestFromLocation(alloc, location, backup_id);
+                defer manifest.deinit(alloc);
+                return try cloneShardSnapshots(alloc, manifest.shards);
+            },
+        }
     }
 
     fn restoreTable(

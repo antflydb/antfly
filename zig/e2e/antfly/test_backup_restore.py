@@ -16,13 +16,28 @@
 
 from __future__ import annotations
 
+import json
 import os
+import signal
+import subprocess
 import tempfile
 import time
+from pathlib import Path
 
 import pytest
 import requests
 
+from conftest import (
+    ANTFLY_PUBLIC_API_ROOT,
+    DEFAULT_ANTFLY_BIN,
+    REPO_ROOT,
+    _read_log_tail,
+    antfly_public_api_url,
+    find_free_port,
+    maybe_preserve_tempdir,
+    resolve_binary_path,
+    wait_for_server,
+)
 from helpers import wait_until
 
 
@@ -30,6 +45,17 @@ def _lookup_doc(stateful_api, table_name: str, key: str) -> dict | None:
     try:
         return stateful_api.lookup_key(table_name, key)
     except requests.HTTPError:
+        return None
+
+
+def _lookup_doc_from_url(session: requests.Session, api_url: str, table_name: str, key: str) -> dict | None:
+    try:
+        response = session.get(f"{api_url}/tables/{table_name}/documents/{key}", timeout=10)
+        if response.status_code >= 400:
+            return None
+        payload = response.json()
+        return payload if isinstance(payload, dict) else None
+    except (requests.RequestException, ValueError):
         return None
 
 
@@ -178,6 +204,256 @@ def _remote_backup_location(backend: str) -> str:
 
     prefix = f"antfly-backup-e2e/{scheme}/{time.time_ns()}"
     return f"{scheme}://{bucket}/{prefix}"
+
+
+def _check_response(response: requests.Response) -> dict:
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        raise AssertionError(f"{response.request.method} {response.url} failed: {response.text}") from exc
+    payload = response.json()
+    assert isinstance(payload, dict)
+    return payload
+
+
+class MultiMetadataBackupCluster:
+    def __init__(self, binary: str):
+        self.binary = binary
+        self.host = "127.0.0.1"
+        self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-metadata-backup-e2e-")
+        self.root = Path(self.tempdir.name)
+
+        self.metadata_raft_ports = [find_free_port() for _ in range(3)]
+        self.metadata_admin_ports = [find_free_port() for _ in range(3)]
+        self.metadata_admin_urls = [f"http://{self.host}:{port}" for port in self.metadata_admin_ports]
+        self.metadata_public_urls = [
+            antfly_public_api_url(url, root=ANTFLY_PUBLIC_API_ROOT) for url in self.metadata_admin_urls
+        ]
+        self.data_port = find_free_port()
+        self.data_raft_port = find_free_port()
+        self.data_url = f"http://{self.host}:{self.data_port}"
+        self.data_api_url = antfly_public_api_url(self.data_url, binary=binary)
+
+        self.config_path = self.root / "antfly-metadata-cluster.json"
+        self._write_config()
+
+        self.metadata_log_paths = [self.root / f"metadata-{node_id}.log" for node_id in range(1, 4)]
+        self.metadata_log_files = [path.open("w") for path in self.metadata_log_paths]
+        self.data_log_path = self.root / "data.log"
+        self.data_log_file = self.data_log_path.open("w")
+
+        self.metadata_procs: list[subprocess.Popen[str]] = []
+        self.data_proc: subprocess.Popen[str] | None = None
+
+        try:
+            self._start()
+        except BaseException:
+            self.stop()
+            raise
+
+    def _write_config(self) -> None:
+        metadata = {
+            "orchestration_urls": {
+                str(node_id): self.metadata_admin_urls[node_id - 1] for node_id in range(1, 4)
+            },
+            "raft_urls": {
+                str(node_id): f"http://{self.host}:{self.metadata_raft_ports[node_id - 1]}"
+                for node_id in range(1, 4)
+            },
+        }
+        self.config_path.write_text(
+            json.dumps(
+                {
+                    "metadata": metadata,
+                    "remote_content": {"security": {"block_private_ips": False}},
+                    "replication_factor": 1,
+                    "default_shards_per_table": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def _metadata_command(self, node_id: int) -> list[str]:
+        return [
+            self.binary,
+            "metadata",
+            "--config",
+            str(self.config_path),
+            "--id",
+            str(node_id),
+            "--raft-host",
+            self.host,
+            "--raft-port",
+            str(self.metadata_raft_ports[node_id - 1]),
+            "--api-host",
+            self.host,
+            "--api-port",
+            str(self.metadata_admin_ports[node_id - 1]),
+            "--health",
+            "false",
+            "--tick-ms",
+            "5",
+            "--data-dir",
+            str(self.root / f"metadata-{node_id}"),
+            "--replica-root-dir",
+            str(self.root / f"metadata-{node_id}-replicas"),
+            "--replica-catalog-path",
+            str(self.root / f"metadata-{node_id}-catalog.txt"),
+            "--snapshot-root-dir",
+            str(self.root / f"metadata-{node_id}-snapshots"),
+        ]
+
+    def _data_command(self) -> list[str]:
+        command = [
+            self.binary,
+            "data",
+            "--config",
+            str(self.config_path),
+            "--api-host",
+            self.host,
+            "--api-port",
+            str(self.data_port),
+            "--raft-host",
+            self.host,
+            "--raft-port",
+            str(self.data_raft_port),
+            "--node-id",
+            "4",
+            "--store-id",
+            "4",
+            "--store-role",
+            "data",
+            "--health",
+            "false",
+            "--tick-ms",
+            "5",
+            "--data-dir",
+            str(self.root / "data"),
+            "--replica-root-dir",
+            str(self.root / "data-replicas"),
+            "--replica-catalog-path",
+            str(self.root / "data-catalog.txt"),
+            "--snapshot-root-dir",
+            str(self.root / "data-snapshots"),
+        ]
+        for url in self.metadata_admin_urls:
+            command.extend(["--metadata-api", url])
+        return command
+
+    def _start(self) -> None:
+        for i in range(3):
+            proc = subprocess.Popen(
+                self._metadata_command(i + 1),
+                stdout=self.metadata_log_files[i],
+                stderr=subprocess.STDOUT,
+                cwd=REPO_ROOT,
+            )
+            self.metadata_procs.append(proc)
+
+        for url in self.metadata_admin_urls:
+            if not wait_for_server(url, path="/metadata/v1/status", timeout=30.0):
+                raise RuntimeError(f"metadata server failed to start at {url}\n{self.debug_logs()}")
+
+        if self.metadata_leader_index(timeout_s=30.0) is None:
+            raise RuntimeError(f"metadata cluster did not elect a leader\n{self.debug_logs()}")
+
+        self.data_proc = subprocess.Popen(
+            self._data_command(),
+            stdout=self.data_log_file,
+            stderr=subprocess.STDOUT,
+            cwd=REPO_ROOT,
+        )
+        if not wait_for_server(self.data_api_url, timeout=30.0):
+            raise RuntimeError(f"data server failed to start at {self.data_api_url}\n{self.debug_logs()}")
+
+    def debug_logs(self) -> str:
+        for handle in self.metadata_log_files:
+            handle.flush()
+        self.data_log_file.flush()
+        parts = [
+            f"[metadata-{i + 1}]\n{_read_log_tail(path)}"
+            for i, path in enumerate(self.metadata_log_paths)
+        ]
+        parts.append(f"[data]\n{_read_log_tail(self.data_log_path)}")
+        return "\n".join(parts)
+
+    def metadata_statuses(self) -> list[dict | None]:
+        statuses: list[dict | None] = []
+        for url in self.metadata_admin_urls:
+            try:
+                response = requests.get(f"{url}/metadata/v1/status", timeout=5)
+                statuses.append(_check_response(response))
+            except (AssertionError, requests.RequestException, ValueError):
+                statuses.append(None)
+        return statuses
+
+    def metadata_leader_index(self, *, timeout_s: float) -> int | None:
+        def current_leader() -> int | None:
+            statuses = self.metadata_statuses()
+            leader_ids = {
+                int(status["metadata_raft_leader_id"])
+                for status in statuses
+                if status and status.get("metadata_raft_leader_id") is not None
+            }
+            if len(leader_ids) != 1:
+                return None
+            leader_id = leader_ids.pop()
+            if leader_id < 1 or leader_id > len(self.metadata_admin_urls):
+                return None
+            return leader_id - 1
+
+        return wait_until(current_leader, timeout_s=timeout_s, interval_s=0.25)
+
+    def metadata_follower_public_url(self) -> str:
+        leader_index = self.metadata_leader_index(timeout_s=10.0)
+        if leader_index is None:
+            raise AssertionError(f"metadata leader unavailable\n{self.debug_logs()}")
+        for index, url in enumerate(self.metadata_public_urls):
+            if index != leader_index:
+                return url
+        raise AssertionError("metadata cluster has no follower")
+
+    def stop(self) -> None:
+        if self.data_proc is not None and self.data_proc.poll() is None:
+            self.data_proc.send_signal(signal.SIGTERM)
+            try:
+                self.data_proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.data_proc.kill()
+                self.data_proc.wait()
+        self.data_proc = None
+
+        for proc in reversed(self.metadata_procs):
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGTERM)
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+        self.metadata_procs = []
+
+        for handle in [self.data_log_file, *self.metadata_log_files]:
+            if not handle.closed:
+                handle.close()
+        if not maybe_preserve_tempdir(self.tempdir):
+            self.tempdir.cleanup()
+
+
+@pytest.fixture
+def multi_metadata_backup_cluster() -> MultiMetadataBackupCluster:
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    resolved = Path(binary)
+    if resolved.name != "antfly":
+        pytest.skip("multi-metadata backup e2e requires the antfly binary")
+    if not resolved.exists():
+        pytest.skip(f"antfly binary not built: {resolved}")
+
+    cluster = MultiMetadataBackupCluster(str(resolved))
+    try:
+        yield cluster
+    finally:
+        cluster.stop()
 
 
 def test_table_backup_restore_round_trip(backup_api):
@@ -449,6 +725,65 @@ def test_cluster_backup_restore_round_trip(backup_api):
             )
             assert restored_doc is not None
             assert restored_doc["title"] == expected_title
+
+
+def test_cluster_backup_through_metadata_follower_public_api(
+    multi_metadata_backup_cluster: MultiMetadataBackupCluster,
+) -> None:
+    cluster = multi_metadata_backup_cluster
+    table_name = f"metadata_follower_backup_{time.time_ns()}"
+    backup_id = f"metadata-follower-backup-{time.time_ns()}"
+    session = requests.Session()
+    session.headers["Content-Type"] = "application/json"
+    session.headers["Connection"] = "close"
+
+    created = _check_response(
+        session.post(
+            f"{cluster.data_api_url}/tables/{table_name}",
+            json={"num_shards": 1, "description": "metadata follower backup docs"},
+            timeout=30,
+        )
+    )
+    assert created["name"] == table_name
+
+    batch = _check_response(
+        session.post(
+            f"{cluster.data_api_url}/tables/{table_name}/batch",
+            json={
+                "inserts": {
+                    "doc:1": {
+                        "title": "Follower Backup",
+                        "content": "cluster backup requests can arrive at metadata followers",
+                    }
+                }
+            },
+            timeout=30,
+        )
+    )
+    assert batch["inserted"] == 1
+    assert wait_until(
+        lambda: _lookup_doc_from_url(session, cluster.data_api_url, table_name, "doc:1"),
+        timeout_s=30.0,
+        interval_s=0.5,
+    ), cluster.debug_logs()
+
+    follower_public_url = cluster.metadata_follower_public_url()
+    with tempfile.TemporaryDirectory(prefix="antfly-metadata-follower-cluster-backup-") as backup_dir:
+        backup = _check_response(
+            session.post(
+                f"{follower_public_url}/backup",
+                json={
+                    "backup_id": backup_id,
+                    "location": f"file://{backup_dir}",
+                    "table_names": [table_name],
+                },
+                timeout=120,
+            )
+        )
+
+        assert backup["backup_id"] == backup_id
+        assert backup["status"] == "completed", f"backup={backup}\n{cluster.debug_logs()}"
+        assert [table["name"] for table in backup["tables"]] == [table_name]
 
 
 @pytest.mark.objectstore_integration

@@ -23,6 +23,16 @@ extern "C" __global__ void termite_fill_f32(float* dst, unsigned int n, float va
     if (i < n) dst[i] = value;
 }
 
+extern "C" __global__ void termite_copy_f32(float* dst, const float* src, unsigned int n) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = src[i];
+}
+
+extern "C" __global__ void termite_copy_u8(unsigned char* dst, const unsigned char* src, unsigned int n) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = src[i];
+}
+
 extern "C" __global__ void termite_scale_f32(
     float* dst,
     const float* input,
@@ -1193,6 +1203,24 @@ __device__ __forceinline__ float termite_decoder_activation_f32(float x, unsigne
     return r * r;
 }
 
+extern "C" __global__ void termite_activation_multiply_slice_last_dim_f32(
+    float* dst,
+    const float* gate,
+    const float* source,
+    unsigned int rows,
+    unsigned int source_cols,
+    unsigned int start,
+    unsigned int out_cols,
+    unsigned int activation
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int count = rows * out_cols;
+    if (i >= count) return;
+    unsigned int row = i / out_cols;
+    unsigned int col = i - row * out_cols;
+    dst[i] = termite_decoder_activation_f32(gate[i], activation) * source[row * source_cols + start + col];
+}
+
 extern "C" __global__ void termite_embedding_lookup_f32(
     float* dst,
     const float* weight,
@@ -1590,6 +1618,412 @@ extern "C" __global__ void termite_attention_f32_block(
     }
 }
 
+extern "C" __global__ void termite_cross_attention_f32(
+    float* dst,
+    const float* q,
+    const float* k,
+    const float* v,
+    const long long* mask,
+    unsigned int batch,
+    unsigned int dec_seq,
+    unsigned int enc_seq,
+    unsigned int num_heads,
+    unsigned int head_dim
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int hidden = num_heads * head_dim;
+    unsigned int total = batch * dec_seq * hidden;
+    if (idx >= total) return;
+
+    unsigned int d = idx % head_dim;
+    unsigned int tmp = idx / head_dim;
+    unsigned int head = tmp % num_heads;
+    tmp /= num_heads;
+    unsigned int qi = tmp % dec_seq;
+    unsigned int b = tmp / dec_seq;
+    float scale = rsqrtf((float)head_dim);
+
+    unsigned int q_base = (b * dec_seq + qi) * hidden + head * head_dim;
+    float max_score = -3.402823466e+38f;
+    for (unsigned int ki = 0; ki < enc_seq; ++ki) {
+        if (mask != nullptr && mask[b * enc_seq + ki] == 0ll) continue;
+        unsigned int k_base = (b * enc_seq + ki) * hidden + head * head_dim;
+        float score = 0.0f;
+        for (unsigned int j = 0; j < head_dim; ++j) {
+            score += q[q_base + j] * k[k_base + j];
+        }
+        score *= scale;
+        max_score = fmaxf(max_score, score);
+    }
+
+    float denom = 0.0f;
+    float acc = 0.0f;
+    for (unsigned int ki = 0; ki < enc_seq; ++ki) {
+        if (mask != nullptr && mask[b * enc_seq + ki] == 0ll) continue;
+        unsigned int k_base = (b * enc_seq + ki) * hidden + head * head_dim;
+        float score = 0.0f;
+        for (unsigned int j = 0; j < head_dim; ++j) {
+            score += q[q_base + j] * k[k_base + j];
+        }
+        score *= scale;
+        float e = expf(score - max_score);
+        denom += e;
+        unsigned int v_idx = (b * enc_seq + ki) * hidden + head * head_dim + d;
+        acc += e * v[v_idx];
+    }
+    dst[idx] = denom > 0.0f ? acc / denom : 0.0f;
+}
+
+extern "C" __global__ void termite_cross_attention_q1_f32(
+    float* dst,
+    const float* q,
+    const float* k,
+    const float* v,
+    const long long* mask,
+    unsigned int batch,
+    unsigned int enc_seq,
+    unsigned int num_heads,
+    unsigned int head_dim
+) {
+    extern __shared__ float shared[];
+    float* scores = shared;
+    float* scratch = shared + enc_seq;
+
+    unsigned int block = blockIdx.x;
+    unsigned int head = block % num_heads;
+    unsigned int b = block / num_heads;
+    if (b >= batch) return;
+
+    unsigned int tid = threadIdx.x;
+    unsigned int hidden = num_heads * head_dim;
+    unsigned int q_base = b * hidden + head * head_dim;
+    float scale = rsqrtf((float)head_dim);
+
+    float local_max = -3.402823466e+38f;
+    for (unsigned int ki = tid; ki < enc_seq; ki += blockDim.x) {
+        bool valid = mask == nullptr || mask[b * enc_seq + ki] != 0ll;
+        float score = -3.402823466e+38f;
+        if (valid) {
+            unsigned int k_base = (b * enc_seq + ki) * hidden + head * head_dim;
+            float dot = 0.0f;
+            for (unsigned int j = 0; j < head_dim; ++j) {
+                dot += q[q_base + j] * k[k_base + j];
+            }
+            score = dot * scale;
+        }
+        scores[ki] = score;
+        local_max = fmaxf(local_max, score);
+    }
+    scratch[tid] = local_max;
+    __syncthreads();
+
+    for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+        __syncthreads();
+    }
+    float max_score = scratch[0];
+
+    float local_denom = 0.0f;
+    for (unsigned int ki = tid; ki < enc_seq; ki += blockDim.x) {
+        float score = scores[ki];
+        float e = score > -3.0e38f ? expf(score - max_score) : 0.0f;
+        scores[ki] = e;
+        local_denom += e;
+    }
+    scratch[tid] = local_denom;
+    __syncthreads();
+
+    for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) scratch[tid] += scratch[tid + stride];
+        __syncthreads();
+    }
+    float denom = scratch[0];
+
+    for (unsigned int d = tid; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (unsigned int ki = 0; ki < enc_seq; ++ki) {
+            float e = scores[ki];
+            unsigned int v_idx = (b * enc_seq + ki) * hidden + head * head_dim + d;
+            acc += e * v[v_idx];
+        }
+        unsigned int dst_idx = b * hidden + head * head_dim + d;
+        dst[dst_idx] = denom > 0.0f ? acc / denom : 0.0f;
+    }
+}
+
+extern "C" __global__ void termite_token_to_nchw_f32(
+    float* dst,
+    const float* src,
+    unsigned int batch,
+    unsigned int channels,
+    unsigned int height,
+    unsigned int width
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = batch * height * width * channels;
+    if (idx >= total) return;
+    unsigned int c = idx % channels;
+    unsigned int tmp = idx / channels;
+    unsigned int x = tmp % width;
+    tmp /= width;
+    unsigned int y = tmp % height;
+    unsigned int b = tmp / height;
+    unsigned int dst_idx = ((b * channels + c) * height + y) * width + x;
+    dst[dst_idx] = src[idx];
+}
+
+extern "C" __global__ void termite_nchw_to_token_f32(
+    float* dst,
+    const float* src,
+    unsigned int batch,
+    unsigned int channels,
+    unsigned int height,
+    unsigned int width
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = batch * height * width * channels;
+    if (idx >= total) return;
+    unsigned int c = idx % channels;
+    unsigned int tmp = idx / channels;
+    unsigned int x = tmp % width;
+    tmp /= width;
+    unsigned int y = tmp % height;
+    unsigned int b = tmp / height;
+    unsigned int src_idx = ((b * channels + c) * height + y) * width + x;
+    dst[idx] = src[src_idx];
+}
+
+extern "C" __global__ void termite_pack_windows_f32(
+    float* dst,
+    const float* src,
+    unsigned int batch,
+    unsigned int height,
+    unsigned int width,
+    unsigned int dim,
+    unsigned int window_size,
+    unsigned int padded_h,
+    unsigned int padded_w
+) {
+    unsigned int windows_h = padded_h / window_size;
+    unsigned int windows_w = padded_w / window_size;
+    unsigned int window_area = window_size * window_size;
+    unsigned int window_count = batch * windows_h * windows_w;
+    unsigned int total = window_count * window_area * dim;
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    unsigned int feature = idx % dim;
+    unsigned int token = (idx / dim) % window_area;
+    unsigned int window_idx = idx / (dim * window_area);
+    unsigned int dx = token % window_size;
+    unsigned int dy = token / window_size;
+    unsigned int ww = window_idx % windows_w;
+    unsigned int tmp = window_idx / windows_w;
+    unsigned int wh = tmp % windows_h;
+    unsigned int b = tmp / windows_h;
+    unsigned int src_y = wh * window_size + dy;
+    unsigned int src_x = ww * window_size + dx;
+    if (src_y >= height || src_x >= width) {
+        dst[idx] = 0.0f;
+        return;
+    }
+    unsigned int src_idx = (b * height * width + src_y * width + src_x) * dim + feature;
+    dst[idx] = src[src_idx];
+}
+
+extern "C" __global__ void termite_unpad_windows_f32(
+    float* dst,
+    const float* src,
+    unsigned int batch,
+    unsigned int height,
+    unsigned int width,
+    unsigned int dim,
+    unsigned int window_size,
+    unsigned int padded_h,
+    unsigned int padded_w
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = batch * height * width * dim;
+    if (idx >= total) return;
+
+    unsigned int feature = idx % dim;
+    unsigned int tmp = idx / dim;
+    unsigned int x = tmp % width;
+    tmp /= width;
+    unsigned int y = tmp % height;
+    unsigned int b = tmp / height;
+    unsigned int windows_w = padded_w / window_size;
+    unsigned int wh = y / window_size;
+    unsigned int ww = x / window_size;
+    unsigned int dy = y % window_size;
+    unsigned int dx = x % window_size;
+    unsigned int window_idx = (b * (padded_h / window_size) + wh) * windows_w + ww;
+    unsigned int token = dy * window_size + dx;
+    unsigned int src_idx = (window_idx * window_size * window_size + token) * dim + feature;
+    dst[idx] = src[src_idx];
+}
+
+extern "C" __global__ void termite_channel_scores_softmax_f32(
+    float* scores,
+    const float* qkv,
+    unsigned int batch,
+    unsigned int seq_len,
+    unsigned int dim,
+    unsigned int groups
+) {
+    unsigned int channels_per_group = dim / groups;
+    unsigned int row_id = blockIdx.x;
+    unsigned int total_rows = batch * groups * channels_per_group;
+    if (row_id >= total_rows || channels_per_group > 256u) return;
+    unsigned int qc = row_id % channels_per_group;
+    unsigned int tmp = row_id / channels_per_group;
+    unsigned int g = tmp % groups;
+    unsigned int b = tmp / groups;
+    unsigned int tid = threadIdx.x;
+    __shared__ float row_scores[256];
+    __shared__ float scratch[256];
+    float scale = rsqrtf((float)seq_len);
+    unsigned int group_offset = g * channels_per_group;
+
+    unsigned int lanes_per_key = 256u / channels_per_group;
+    if (lanes_per_key == 0u) lanes_per_key = 1u;
+    unsigned int active_threads = lanes_per_key * channels_per_group;
+    unsigned int kc = tid % channels_per_group;
+    unsigned int lane = tid / channels_per_group;
+    float partial = 0.0f;
+    if (tid < active_threads) {
+        float acc = 0.0f;
+        for (unsigned int n = lane; n < seq_len; n += lanes_per_key) {
+            unsigned int base = ((b * seq_len + n) * dim * 3) + group_offset;
+            acc += qkv[base + qc] * qkv[base + dim + kc];
+        }
+        partial = acc;
+    }
+    scratch[tid] = partial;
+    __syncthreads();
+    for (unsigned int stride = lanes_per_key >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < active_threads && lane < stride) {
+            scratch[tid] += scratch[tid + stride * channels_per_group];
+        }
+        __syncthreads();
+    }
+
+    float value = -3.402823466e+38f;
+    if (tid < channels_per_group) {
+        value = scratch[tid] * scale;
+        row_scores[tid] = value;
+    }
+    scratch[tid] = value;
+    __syncthreads();
+    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+        __syncthreads();
+    }
+    float max_score = scratch[0];
+    float exp_value = 0.0f;
+    if (tid < channels_per_group) {
+        exp_value = expf(row_scores[tid] - max_score);
+        row_scores[tid] = exp_value;
+    }
+    scratch[tid] = exp_value;
+    __syncthreads();
+    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) scratch[tid] += scratch[tid + stride];
+        __syncthreads();
+    }
+    float denom = scratch[0];
+    if (tid < channels_per_group) {
+        unsigned int score_idx = ((b * groups + g) * channels_per_group + qc) * channels_per_group + tid;
+        scores[score_idx] = denom > 0.0f ? row_scores[tid] / denom : 0.0f;
+    }
+}
+
+extern "C" __global__ void termite_channel_apply_f32(
+    float* dst,
+    const float* qkv,
+    const float* scores,
+    unsigned int batch,
+    unsigned int seq_len,
+    unsigned int dim,
+    unsigned int groups
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = batch * seq_len * dim;
+    if (idx >= total) return;
+    unsigned int c = idx % dim;
+    unsigned int tmp = idx / dim;
+    unsigned int n = tmp % seq_len;
+    unsigned int b = tmp / seq_len;
+    unsigned int channels_per_group = dim / groups;
+    unsigned int g = c / channels_per_group;
+    unsigned int qc = c - g * channels_per_group;
+    unsigned int group_offset = g * channels_per_group;
+    float acc = 0.0f;
+    for (unsigned int vc = 0; vc < channels_per_group; ++vc) {
+        unsigned int score_idx = ((b * groups + g) * channels_per_group + qc) * channels_per_group + vc;
+        unsigned int v_idx = ((b * seq_len + n) * dim * 3) + 2 * dim + group_offset + vc;
+        acc += scores[score_idx] * qkv[v_idx];
+    }
+    dst[idx] = acc;
+}
+
+__device__ float termite_load_tail_weight_f32(const void* ptr, unsigned int dtype, unsigned int offset) {
+    if (dtype == 1u) return __half2float(reinterpret_cast<const __half*>(ptr)[offset]);
+    if (dtype == 2u) return __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(ptr)[offset]);
+    return reinterpret_cast<const float*>(ptr)[offset];
+}
+
+extern "C" __global__ void termite_florence_vision_tail_sources_f32(
+    float* dst,
+    const float* tokens,
+    const void* row_embed,
+    const void* col_embed,
+    const void* temporal_embed,
+    unsigned int batch,
+    unsigned int height,
+    unsigned int width,
+    unsigned int dim,
+    unsigned int has_temporal,
+    unsigned int row_dtype,
+    unsigned int col_dtype,
+    unsigned int temporal_dtype
+) {
+    unsigned int token_count = height * width;
+    unsigned int out_seq = token_count + 1u;
+    unsigned int total = batch * out_seq * dim;
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total || token_count == 0u) return;
+
+    unsigned int feature = idx % dim;
+    unsigned int out_token = (idx / dim) % out_seq;
+    unsigned int b = idx / (dim * out_seq);
+    unsigned int row_dim = dim / 2u;
+    unsigned int col_dim = dim - row_dim;
+
+    float temporal = (has_temporal != 0u && temporal_embed != nullptr) ? termite_load_tail_weight_f32(temporal_embed, temporal_dtype, feature) : 0.0f;
+    if (out_token == 0u) {
+        float acc = 0.0f;
+        for (unsigned int token = 0u; token < token_count; ++token) {
+            unsigned int y = token / width;
+            unsigned int x = token - y * width;
+            float pos = feature < col_dim
+                ? termite_load_tail_weight_f32(col_embed, col_dtype, x * col_dim + feature)
+                : termite_load_tail_weight_f32(row_embed, row_dtype, y * row_dim + (feature - col_dim));
+            acc += tokens[(b * token_count + token) * dim + feature] + pos + temporal;
+        }
+        dst[idx] = acc / (float)token_count;
+        return;
+    }
+
+    unsigned int token = out_token - 1u;
+    unsigned int y = token / width;
+    unsigned int x = token - y * width;
+    float pos = feature < col_dim
+        ? termite_load_tail_weight_f32(col_embed, col_dtype, x * col_dim + feature)
+        : termite_load_tail_weight_f32(row_embed, row_dtype, y * row_dim + (feature - col_dim));
+    dst[idx] = tokens[(b * token_count + token) * dim + feature] + pos + temporal;
+}
+
 __device__ float termite_rope_frequency(unsigned int pair_index, unsigned int rope_dim, float theta) {
     return 1.0f / powf(theta, (2.0f * (float)pair_index) / (float)rope_dim);
 }
@@ -1683,6 +2117,32 @@ extern "C" __global__ void termite_rope_f32(
     dst[idx] = termite_rope_value(input, base, d, head_dim, rope_dim, position, theta, freq_scale, consecutive_pairs);
 }
 
+extern "C" __global__ void termite_rope_decode_scalars_f32(
+    float* dst,
+    const float* input,
+    unsigned int total_chunks,
+    unsigned int head_dim,
+    unsigned int rope_dim,
+    float theta,
+    float freq_scale,
+    unsigned int position_offset,
+    unsigned int seq_len,
+    unsigned int chunks_per_position,
+    unsigned int consecutive_pairs,
+    const unsigned int* decode_scalars
+) {
+    if (decode_scalars != 0) position_offset = decode_scalars[0];
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = total_chunks * head_dim;
+    if (idx >= total) return;
+    unsigned int chunk = idx / head_dim;
+    unsigned int d = idx - chunk * head_dim;
+    unsigned int token_pos = (chunk / chunks_per_position) % seq_len;
+    unsigned int position = position_offset + token_pos;
+    unsigned int base = chunk * head_dim;
+    dst[idx] = termite_rope_value(input, base, d, head_dim, rope_dim, position, theta, freq_scale, consecutive_pairs);
+}
+
 extern "C" __global__ void termite_rope_scaled_f32(
     float* dst,
     const float* input,
@@ -1697,6 +2157,34 @@ extern "C" __global__ void termite_rope_scaled_f32(
     unsigned int consecutive_pairs,
     float scale
 ) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = total_chunks * head_dim;
+    if (idx >= total) return;
+    unsigned int chunk = idx / head_dim;
+    unsigned int d = idx - chunk * head_dim;
+    unsigned int token_pos = (chunk / chunks_per_position) % seq_len;
+    unsigned int position = position_offset + token_pos;
+    unsigned int base = chunk * head_dim;
+    float value = termite_rope_value(input, base, d, head_dim, rope_dim, position, theta, freq_scale, consecutive_pairs);
+    dst[idx] = value * scale;
+}
+
+extern "C" __global__ void termite_rope_scaled_decode_scalars_f32(
+    float* dst,
+    const float* input,
+    unsigned int total_chunks,
+    unsigned int head_dim,
+    unsigned int rope_dim,
+    float theta,
+    float freq_scale,
+    unsigned int position_offset,
+    unsigned int seq_len,
+    unsigned int chunks_per_position,
+    unsigned int consecutive_pairs,
+    float scale,
+    const unsigned int* decode_scalars
+) {
+    if (decode_scalars != 0) position_offset = decode_scalars[0];
     unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned int total = total_chunks * head_dim;
     if (idx >= total) return;
@@ -2069,6 +2557,7 @@ extern "C" __global__ void termite_gqa_attention_decode_scalars_f32(
     const unsigned int* decode_scalars
 ) {
     if (decode_scalars != 0) {
+        kv_position_offset = decode_scalars[4];
         query_position_offset = decode_scalars[1];
         kv_seq_len = decode_scalars[2];
         total_sequence_len = decode_scalars[3];
@@ -2462,7 +2951,10 @@ extern "C" __global__ void termite_gqa_attention_decode_turboquant_f32(
     unsigned int value_format,
     unsigned int physical_token_capacity
 ) {
+    const unsigned int score_cache_limit = 4096u;
+    const float neg_inf = -3.402823466e+38f;
     __shared__ float reduce[512];
+    __shared__ float shared_scores[4096];
     __shared__ float shared_max_score;
     __shared__ float shared_denom;
     __shared__ float shared_score;
@@ -2482,6 +2974,7 @@ extern "C" __global__ void termite_gqa_attention_decode_turboquant_f32(
     unsigned int q_hidden = num_heads * head_dim;
     unsigned int query_pos = query_position_offset + qi;
     unsigned int q_base = (b * q_seq_len + qi) * q_hidden + head * head_dim;
+    bool cache_scores = kv_seq_len <= score_cache_limit;
     float scale = rsqrtf((float)head_dim);
     if (format == 1u && lane < 32u) {
         float projected_query = 0.0f;
@@ -2490,49 +2983,9 @@ extern "C" __global__ void termite_gqa_attention_decode_turboquant_f32(
         }
         shared_turbo3_projected_query[lane] = projected_query;
     }
-    if (lane == 0u) shared_max_score = -3.402823466e+38f;
+    if (lane == 0u) shared_max_score = neg_inf;
     __syncthreads();
 
-    for (unsigned int ki = 0u; ki < kv_seq_len; ++ki) {
-        unsigned int key_pos = kv_position_offset + ki;
-        unsigned int mask_idx = query_pos * total_sequence_len + key_pos;
-        bool future_allowed = attn_or_mask != 0 && mask_idx < mask_len && attn_or_mask[mask_idx] != 0u;
-        bool future_blocked = key_pos > query_pos && !future_allowed;
-        bool past_blocked = key_pos > query_pos || (sliding_window != 0u && (query_pos - key_pos) >= sliding_window);
-        bool valid = !(future_blocked || past_blocked);
-        unsigned int physical_token = termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);
-        if (physical_token == 0xffffffffu) valid = false;
-        const unsigned char* k_row = valid ? k + physical_token * key_row_bytes : k;
-        float partial = 0.0f;
-        if (valid && lane < head_dim) {
-            unsigned int value_index = kv_head * head_dim + lane;
-            float key_value = format == 0u
-                ? termite_tq_decode_polar4_at(k_row, value_index)
-                : termite_tq_decode_turbo3_at(k_row, value_index);
-            partial = q[q_base + lane] * key_value;
-        }
-        reduce[lane] = partial;
-        __syncthreads();
-        for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
-            if (lane < stride) reduce[lane] += reduce[lane + stride];
-            __syncthreads();
-        }
-        if (lane == 0u && valid) {
-            float score = reduce[0];
-            if (format == 1u) {
-                score += 0.125f * termite_tq_turbo3_projected_residual_score(shared_turbo3_projected_query, k_row + base_key_row_bytes, kv_head);
-            }
-            score *= scale;
-            if (bias_mode == 1u) score += bias[(head * q_seq_len + qi) * kv_seq_len + ki];
-            if (bias_mode == 2u) score += bias[((b * num_heads + head) * q_seq_len + qi) * kv_seq_len + ki];
-            shared_max_score = fmaxf(shared_max_score, score);
-        }
-        __syncthreads();
-    }
-
-    if (lane == 0u) shared_denom = 0.0f;
-    __syncthreads();
-    float acc = 0.0f;
     for (unsigned int ki = 0u; ki < kv_seq_len; ++ki) {
         unsigned int key_pos = kv_position_offset + ki;
         unsigned int mask_idx = query_pos * total_sequence_len + key_pos;
@@ -2558,21 +3011,70 @@ extern "C" __global__ void termite_gqa_attention_decode_turboquant_f32(
             __syncthreads();
         }
         if (lane == 0u) {
+            float score = neg_inf;
             if (valid) {
-                float score = reduce[0];
+                score = reduce[0];
                 if (format == 1u) {
                     score += 0.125f * termite_tq_turbo3_projected_residual_score(shared_turbo3_projected_query, k_row + base_key_row_bytes, kv_head);
                 }
                 score *= scale;
                 if (bias_mode == 1u) score += bias[(head * q_seq_len + qi) * kv_seq_len + ki];
                 if (bias_mode == 2u) score += bias[((b * num_heads + head) * q_seq_len + qi) * kv_seq_len + ki];
-                shared_score = score;
-            } else {
-                shared_score = -3.402823466e+38f;
+                shared_max_score = fmaxf(shared_max_score, score);
             }
+            if (cache_scores) shared_scores[ki] = score;
         }
         __syncthreads();
-        float e = valid ? expf(shared_score - shared_max_score) : 0.0f;
+    }
+
+    if (lane == 0u) shared_denom = 0.0f;
+    __syncthreads();
+    float acc = 0.0f;
+    for (unsigned int ki = 0u; ki < kv_seq_len; ++ki) {
+        unsigned int key_pos = kv_position_offset + ki;
+        unsigned int mask_idx = query_pos * total_sequence_len + key_pos;
+        bool future_allowed = attn_or_mask != 0 && mask_idx < mask_len && attn_or_mask[mask_idx] != 0u;
+        bool future_blocked = key_pos > query_pos && !future_allowed;
+        bool past_blocked = key_pos > query_pos || (sliding_window != 0u && (query_pos - key_pos) >= sliding_window);
+        bool valid = !(future_blocked || past_blocked);
+        unsigned int physical_token = termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);
+        if (physical_token == 0xffffffffu) valid = false;
+        const unsigned char* k_row = valid ? k + physical_token * key_row_bytes : k;
+        if (cache_scores) {
+            if (lane == 0u) shared_score = shared_scores[ki];
+            __syncthreads();
+        } else {
+            float partial = 0.0f;
+            if (valid && lane < head_dim) {
+                unsigned int value_index = kv_head * head_dim + lane;
+                float key_value = format == 0u
+                    ? termite_tq_decode_polar4_at(k_row, value_index)
+                    : termite_tq_decode_turbo3_at(k_row, value_index);
+                partial = q[q_base + lane] * key_value;
+            }
+            reduce[lane] = partial;
+            __syncthreads();
+            for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+                if (lane < stride) reduce[lane] += reduce[lane + stride];
+                __syncthreads();
+            }
+            if (lane == 0u) {
+                if (valid) {
+                    float score = reduce[0];
+                    if (format == 1u) {
+                        score += 0.125f * termite_tq_turbo3_projected_residual_score(shared_turbo3_projected_query, k_row + base_key_row_bytes, kv_head);
+                    }
+                    score *= scale;
+                    if (bias_mode == 1u) score += bias[(head * q_seq_len + qi) * kv_seq_len + ki];
+                    if (bias_mode == 2u) score += bias[((b * num_heads + head) * q_seq_len + qi) * kv_seq_len + ki];
+                    shared_score = score;
+                } else {
+                    shared_score = neg_inf;
+                }
+            }
+            __syncthreads();
+        }
+        float e = (valid && shared_score > neg_inf * 0.5f) ? expf(shared_score - shared_max_score) : 0.0f;
         if (lane == 0u) shared_denom += e;
         if (valid && lane < head_dim) {
             const unsigned char* v_row = v + physical_token * value_row_bytes;
@@ -3142,6 +3644,31 @@ __device__ float termite_q4k_value(const unsigned char* bp, unsigned int value_i
     return scale * (float)q - minv;
 }
 
+__device__ __forceinline__ float termite_q6k_value(const unsigned char* bp, unsigned int value_index) {
+    const unsigned char* ql = bp;
+    const unsigned char* qh = bp + 128u;
+    const unsigned char* scales = bp + 192u;
+    unsigned short dh = (unsigned short)bp[208] | ((unsigned short)bp[209] << 8);
+    float d = termite_half_to_float(dh);
+
+    unsigned int sub = value_index / 16u;
+    unsigned int i = value_index & 15u;
+    unsigned int half = sub / 8u;
+    unsigned int group = (sub % 8u) / 2u;
+    unsigned int l_base = (sub & 1u) * 16u;
+    unsigned int ql_off = half * 64u + (group & 1u) * 32u;
+    unsigned int qh_off = half * 32u;
+    unsigned int qh_shift = group * 2u;
+    unsigned int nibble_shift = (group / 2u) * 4u;
+    unsigned int l = l_base + i;
+
+    unsigned int low4 = (unsigned int)((ql[ql_off + l] >> nibble_shift) & 0x0fu);
+    unsigned int high2 = (unsigned int)((qh[qh_off + l] >> qh_shift) & 0x03u);
+    int q = (int)(low4 | (high2 << 4u)) - 32;
+    float scale = d * (float)((signed char)scales[sub]);
+    return scale * (float)q;
+}
+
 __device__ float termite_q4k_value_broadcast_scale(const unsigned char* bp, unsigned int value_index, unsigned int lane) {
     unsigned int sub = value_index / 32u;
     unsigned int chunk = value_index / 64u;
@@ -3418,6 +3945,47 @@ extern "C" __global__ void termite_linear_q4_k_bias_relu_f32_tc_hmma(
     unsigned int out_dim
 ) {
     termite_qtc_hmma_tile<5u, true>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_triple_bias_f32_tc_hmma(
+    float* dst_a,
+    float* dst_b,
+    float* dst_c,
+    const float* input,
+    const unsigned char* packed_weight_a,
+    const float* bias_a,
+    const unsigned char* packed_weight_b,
+    const float* bias_b,
+    const unsigned char* packed_weight_c,
+    const float* bias_c,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    unsigned int projection = blockIdx.z;
+    float* dst = projection == 0u ? dst_a : (projection == 1u ? dst_b : dst_c);
+    const unsigned char* packed_weight = projection == 0u ? packed_weight_a : (projection == 1u ? packed_weight_b : packed_weight_c);
+    const float* bias = projection == 0u ? bias_a : (projection == 1u ? bias_b : bias_c);
+    termite_qtc_hmma_tile<1u, true>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_pair_bias_f32_tc_hmma(
+    float* dst_a,
+    float* dst_b,
+    const float* input,
+    const unsigned char* packed_weight_a,
+    const float* bias_a,
+    const unsigned char* packed_weight_b,
+    const float* bias_b,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    unsigned int projection = blockIdx.z;
+    float* dst = projection == 0u ? dst_a : dst_b;
+    const unsigned char* packed_weight = projection == 0u ? packed_weight_a : packed_weight_b;
+    const float* bias = projection == 0u ? bias_a : bias_b;
+    termite_qtc_hmma_tile<1u, true>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
 }
 
 template <unsigned int COLS, unsigned int MODE>
@@ -3753,6 +4321,56 @@ extern "C" __global__ void termite_linear_q4_k_f32_tile4(
     termite_q4k_tile_cols<4u, 0u>(dst, input, weight, nullptr, nullptr, rows, in_dim, out_dim);
 }
 
+extern "C" __global__ void termite_linear_q6_k_f32_tile4(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    unsigned int col_tile = blockIdx.x * 4u;
+    unsigned int row = blockIdx.y;
+    if (row >= rows) return;
+    unsigned int tid = threadIdx.x;
+    unsigned int row_blocks = in_dim / 256u;
+    __shared__ float partial[4][256];
+    float acc[4];
+    #pragma unroll
+    for (unsigned int c = 0; c < 4u; ++c) acc[c] = 0.0f;
+    if (tid < 256u) {
+        for (unsigned int block = 0; block < row_blocks; ++block) {
+            unsigned int input_idx = row * in_dim + block * 256u + tid;
+            float x = input[input_idx];
+            #pragma unroll
+            for (unsigned int c = 0; c < 4u; ++c) {
+                unsigned int col = col_tile + c;
+                if (col < out_dim) {
+                    const unsigned char* bp = weight + (col * row_blocks + block) * 210u;
+                    acc[c] += x * termite_q6k_value(bp, tid);
+                }
+            }
+        }
+        #pragma unroll
+        for (unsigned int c = 0; c < 4u; ++c) partial[c][tid] = acc[c];
+    }
+    __syncthreads();
+    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            #pragma unroll
+            for (unsigned int c = 0; c < 4u; ++c) partial[c][tid] += partial[c][tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        #pragma unroll
+        for (unsigned int c = 0; c < 4u; ++c) {
+            unsigned int col = col_tile + c;
+            if (col < out_dim) dst[row * out_dim + col] = partial[c][0];
+        }
+    }
+}
+
 extern "C" __global__ void termite_linear_q4_k_gated_down_f32_tile4(
     float* dst,
     const float* gate,
@@ -3782,6 +4400,58 @@ extern "C" __global__ void termite_linear_q4_k_gated_down_f32_tile4(
                 if (col < out_dim) {
                     const unsigned char* bp = weight + (col * row_blocks + block) * 144u;
                     acc[c] += x * termite_q4k_value(bp, tid);
+                }
+            }
+        }
+        #pragma unroll
+        for (unsigned int c = 0; c < 4u; ++c) partial[c][tid] = acc[c];
+    }
+    __syncthreads();
+    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            #pragma unroll
+            for (unsigned int c = 0; c < 4u; ++c) partial[c][tid] += partial[c][tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        #pragma unroll
+        for (unsigned int c = 0; c < 4u; ++c) {
+            unsigned int col = col_tile + c;
+            if (col < out_dim) dst[row * out_dim + col] = partial[c][0];
+        }
+    }
+}
+
+extern "C" __global__ void termite_linear_q6_k_gated_down_f32_tile4(
+    float* dst,
+    const float* gate,
+    const float* up,
+    const unsigned char* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int activation
+) {
+    unsigned int col_tile = blockIdx.x * 4u;
+    unsigned int row = blockIdx.y;
+    if (row >= rows) return;
+    unsigned int tid = threadIdx.x;
+    unsigned int row_blocks = in_dim / 256u;
+    __shared__ float partial[4][256];
+    float acc[4];
+    #pragma unroll
+    for (unsigned int c = 0; c < 4u; ++c) acc[c] = 0.0f;
+    if (tid < 256u) {
+        for (unsigned int block = 0; block < row_blocks; ++block) {
+            unsigned int input_idx = row * in_dim + block * 256u + tid;
+            float x = termite_decoder_activation_f32(gate[input_idx], activation) * up[input_idx];
+            #pragma unroll
+            for (unsigned int c = 0; c < 4u; ++c) {
+                unsigned int col = col_tile + c;
+                if (col < out_dim) {
+                    const unsigned char* bp = weight + (col * row_blocks + block) * 210u;
+                    acc[c] += x * termite_q6k_value(bp, tid);
                 }
             }
         }
@@ -5269,6 +5939,26 @@ extern "C" __global__ void termite_embedding_lookup_q4_k_f32(
     dst[idx] = termite_q4k_value(bp, value_index);
 }
 
+extern "C" __global__ void termite_embedding_lookup_q6_k_f32(
+    float* dst,
+    const unsigned char* weight,
+    const long long* ids,
+    unsigned int total,
+    unsigned int dim
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int count = total * dim;
+    if (idx >= count) return;
+    unsigned int out_row = idx / dim;
+    unsigned int col = idx - out_row * dim;
+    unsigned long long src_row = (unsigned long long)ids[out_row];
+    unsigned int row_blocks = dim / 256u;
+    unsigned int block = col / 256u;
+    unsigned int value_index = col - block * 256u;
+    const unsigned char* bp = weight + (src_row * row_blocks + block) * 210ull;
+    dst[idx] = termite_q6k_value(bp, value_index);
+}
+
 extern "C" __global__ void termite_embedding_lookup_q8_0_f32(
     float* dst,
     const unsigned char* weight,
@@ -5327,6 +6017,26 @@ extern "C" __global__ void termite_embedding_lookup_i32_q4_k_f32(
     unsigned int value_index = col - block * 256u;
     const unsigned char* bp = weight + (src_row * row_blocks + block) * 144ull;
     dst[idx] = termite_q4k_value(bp, value_index);
+}
+
+extern "C" __global__ void termite_embedding_lookup_i32_q6_k_f32(
+    float* dst,
+    const unsigned char* weight,
+    const int* ids,
+    unsigned int total,
+    unsigned int dim
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int count = total * dim;
+    if (idx >= count) return;
+    unsigned int out_row = idx / dim;
+    unsigned int col = idx - out_row * dim;
+    unsigned long long src_row = (unsigned long long)((unsigned int)ids[out_row]);
+    unsigned int row_blocks = dim / 256u;
+    unsigned int block = col / 256u;
+    unsigned int value_index = col - block * 256u;
+    const unsigned char* bp = weight + (src_row * row_blocks + block) * 210ull;
+    dst[idx] = termite_q6k_value(bp, value_index);
 }
 
 extern "C" __global__ void termite_embedding_lookup_i32_q8_0_f32(

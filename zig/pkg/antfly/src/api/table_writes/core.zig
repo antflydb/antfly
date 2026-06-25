@@ -150,6 +150,15 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             plan: backups_api.TableBackupPlan,
         ) anyerror!?[]backups_api.ShardSnapshot = null,
+        backup_table_to_location: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            backup_id: []const u8,
+            format: backups_api.BackupFormat,
+            location_uri: []const u8,
+            location: *backups_api.BackupLocation,
+        ) anyerror!?[]backups_api.ShardSnapshot = null,
         backup_catalog_table: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -875,6 +884,19 @@ pub const TableWriteSource = struct {
     ) !?[]backups_api.ShardSnapshot {
         const fn_ptr = self.vtable.backup_table orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name, plan);
+    }
+
+    pub fn backupTableToLocation(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        backup_id: []const u8,
+        format: backups_api.BackupFormat,
+        location_uri: []const u8,
+        location: *backups_api.BackupLocation,
+    ) !?[]backups_api.ShardSnapshot {
+        const fn_ptr = self.vtable.backup_table_to_location orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, backup_id, format, location_uri, location);
     }
 
     pub fn backupCatalogTable(

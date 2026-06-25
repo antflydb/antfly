@@ -59,7 +59,7 @@ class _ExtensionProcess:
         self.tempdir = tempfile.TemporaryDirectory(prefix=f"antfly-zig-extensions-{mode}-")
         self.root = Path(self.tempdir.name)
         self.package_store = MEMORYAF_PACKAGE_STORE
-        if not (self.package_store / "memoryaf" / MEMORYAF_VERSION / "extension.json").exists():
+        if not (self.package_store / "memoryaf" / "extension.json").exists():
             raise RuntimeError(f"memoryaf extension package not found under {self.package_store}")
 
         self.public_port = find_free_port()

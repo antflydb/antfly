@@ -105,6 +105,28 @@ pub fn freeBackupShards(alloc: std.mem.Allocator, shards: []const backups_api.Sh
     alloc.free(@constCast(shards));
 }
 
+pub fn cloneShardSnapshots(
+    alloc: std.mem.Allocator,
+    shards: []const backups_api.ShardSnapshot,
+) ![]backups_api.ShardSnapshot {
+    const out = try alloc.alloc(backups_api.ShardSnapshot, shards.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |shard| shard.deinit(alloc);
+        alloc.free(out);
+    }
+    for (shards, 0..) |shard, i| {
+        out[i] = .{
+            .group_id = shard.group_id,
+            .start_key = try alloc.dupe(u8, shard.start_key),
+            .end_key = if (shard.end_key) |value| try alloc.dupe(u8, value) else null,
+            .snapshot_path = try alloc.dupe(u8, shard.snapshot_path),
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
 pub fn droppedTableTrashDirPath(alloc: std.mem.Allocator, replica_root_dir: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ replica_root_dir, dropped_table_trash_dir_name });
 }
