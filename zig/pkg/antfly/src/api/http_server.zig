@@ -5072,7 +5072,7 @@ pub const ApiHttpServer = struct {
         if (table.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
 
         const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
-        if (try table_writes_source.backupTableToLocation(self.alloc, table_name, backup_id, format, location_uri)) |shards| {
+        if (try table_writes_source.backupTableToLocation(self.alloc, table_name, backup_id, format, location_uri, backup_location)) |shards| {
             defer freeBackupShards(self.alloc, shards);
             var manifest = try backups_api.createManifest(self.alloc, backup_id, &table, shards);
             defer manifest.deinit(self.alloc);

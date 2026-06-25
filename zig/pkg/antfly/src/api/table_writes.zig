@@ -2252,6 +2252,7 @@ pub const TableWriteSource = struct {
             backup_id: []const u8,
             format: backups_api.BackupFormat,
             location_uri: []const u8,
+            location: *backups_api.BackupLocation,
         ) anyerror!?[]backups_api.ShardSnapshot = null,
         restore_table: ?*const fn (
             ptr: *anyopaque,
@@ -2512,9 +2513,10 @@ pub const TableWriteSource = struct {
         backup_id: []const u8,
         format: backups_api.BackupFormat,
         location_uri: []const u8,
+        location: *backups_api.BackupLocation,
     ) !?[]backups_api.ShardSnapshot {
         const fn_ptr = self.vtable.backup_table_to_location orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, backup_id, format, location_uri);
+        return try fn_ptr(self.ptr, alloc, table_name, backup_id, format, location_uri, location);
     }
 
     pub fn restoreTable(
@@ -8178,6 +8180,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         backup_id: []const u8,
         format: backups_api.BackupFormat,
         location_uri: []const u8,
+        location: *backups_api.BackupLocation,
     ) !?[]backups_api.ShardSnapshot {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const group_id = (try table_catalog.resolveSingleRangeGroup(alloc, self.catalog, table_name)) orelse return null;
@@ -8202,9 +8205,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 var response = try client.fetchBackupTable(remote.base_uri, table_name, body);
                 response.deinit(alloc);
 
-                var location = try backups_api.openBackupLocation(alloc, location_uri);
-                defer location.deinit(alloc);
-                var manifest = try backups_api.readManifestFromLocation(alloc, &location, backup_id);
+                var manifest = try backups_api.readManifestFromLocation(alloc, location, backup_id);
                 defer manifest.deinit(alloc);
                 return try cloneShardSnapshots(alloc, manifest.shards);
             },
