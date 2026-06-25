@@ -2036,6 +2036,14 @@ pub const AntflyApiHandler = struct {
         return respondOwnedApiResponse(ctx, &resp);
     }
 
+    pub fn listArtifactEnrichments(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        var resp = try public_table_http.handleListArtifactEnrichments(ctx.allocator, table_name, self.api_server.tableApi());
+        return respondOwnedApiResponse(ctx, &resp);
+    }
+
     pub fn reprocessDocumentArtifact(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, key: []const u8, artifact_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);

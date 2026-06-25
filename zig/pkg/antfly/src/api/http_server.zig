@@ -4171,6 +4171,11 @@ pub const ApiHttpServer = struct {
             }
         }
         if (req.method == .GET) {
+            if (routes.Routes.matchTableArtifacts(uri_parts.path)) |artifact_route| {
+                return try self.handlePublicListArtifactEnrichments(artifact_route.table_name);
+            }
+        }
+        if (req.method == .GET) {
             if (routes.Routes.matchTablePath(uri_parts.path)) |table_path| {
                 if (runtimeSchemaDebugRequested(uri_parts.query) and !self.runtimeSchemaDebugAllowed(authenticated_identity)) {
                     return try textResponse(self.alloc, 403, "forbidden");
@@ -5492,6 +5497,7 @@ pub const ApiHttpServer = struct {
                 .execute_table_delete_index = executePublicTableDeleteIndex,
                 .execute_put_artifact_enrichment = executePublicPutArtifactEnrichment,
                 .execute_delete_artifact_enrichment = executePublicDeleteArtifactEnrichment,
+                .execute_list_artifact_enrichments = executePublicListArtifactEnrichments,
                 .execute_document_artifact_manifest = executePublicDocumentArtifactManifest,
                 .execute_document_artifact_manifests = executePublicDocumentArtifactManifests,
                 .execute_reprocess_document_artifact = executePublicReprocessDocumentArtifact,
@@ -6231,6 +6237,18 @@ pub const ApiHttpServer = struct {
         ) catch return error.InternalFailure;
     }
 
+    fn executePublicListArtifactEnrichments(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) public_table_http.TableApi.ExecuteListArtifactEnrichmentsError![]u8 {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        var snapshot = (self.statusAdminSnapshot() catch return error.InternalFailure) orelse return error.NotFound;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.NotFound;
+        return indexes_api.encodeArtifactEnrichmentList(alloc, table_name, table.indexes_json) catch return error.InternalFailure;
+    }
+
     fn executePublicTableCreateIndex(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -6883,6 +6901,15 @@ pub const ApiHttpServer = struct {
 
     pub fn handlePublicTableGetIndex(self: *ApiHttpServer, table_name: []const u8, index_name: []const u8) !http_common.HttpResponse {
         var resp = try public_table_http.handleTableGetIndex(self.alloc, table_name, index_name, self.tableApi());
+        defer resp.deinit(self.alloc);
+        return switch (resp.status) {
+            200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
+            else => try textResponse(self.alloc, resp.status, resp.body),
+        };
+    }
+
+    pub fn handlePublicListArtifactEnrichments(self: *ApiHttpServer, table_name: []const u8) !http_common.HttpResponse {
+        var resp = try public_table_http.handleListArtifactEnrichments(self.alloc, table_name, self.tableApi());
         defer resp.deinit(self.alloc);
         return switch (resp.status) {
             200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
@@ -17655,7 +17682,7 @@ test "api http server serves table index metadata routes" {
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
                     .table_id = 1,
                     .name = "docs",
-                    .indexes_json = "{\"search_idx\":{\"type\":\"full_text\"},\"embed_idx\":{\"type\":\"embeddings\",\"dimension\":384},\"alg\":{\"type\":\"algebraic\"}}",
+                    .indexes_json = "{\"search_idx\":{\"type\":\"full_text\"},\"embed_idx\":{\"type\":\"embeddings\",\"dimension\":384,\"enrichments\":[{\"name\":\"body_chunks_v1\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":512},{\"name\":\"body_dense_v1\",\"kind\":\"embedding\",\"field\":\"text\",\"source_artifact_name\":\"body_chunks_v1\",\"expected_dims\":384}]},\"alg\":{\"type\":\"algebraic\"}}",
                     .placement_role = "data",
                 }})[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
@@ -17701,6 +17728,27 @@ test "api http server serves table index metadata routes" {
     defer parsed_detail.deinit();
     try std.testing.expectEqualStrings("embed_idx", parsed_detail.value.object.get("config").?.object.get("name").?.string);
     try std.testing.expectEqual(@as(usize, 2), source.cached_snapshot_calls);
+
+    var artifacts_resp = try server.handle(.{
+        .method = .GET,
+        .uri = "/tables/docs/artifacts",
+    });
+    defer artifacts_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), artifacts_resp.status);
+    try std.testing.expectEqualStrings("application/json", artifacts_resp.content_type.?);
+    var parsed_artifacts = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, artifacts_resp.body, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed_artifacts.deinit();
+    try std.testing.expectEqualStrings("docs", parsed_artifacts.value.object.get("table_name").?.string);
+    const artifacts = parsed_artifacts.value.object.get("artifacts").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), artifacts.len);
+    try std.testing.expectEqualStrings("body_chunks_v1", artifacts[0].object.get("name").?.string);
+    try std.testing.expectEqualStrings("chunk", artifacts[0].object.get("kind").?.string);
+    try std.testing.expectEqualStrings("body_dense_v1", artifacts[1].object.get("name").?.string);
+    try std.testing.expectEqualStrings("embedding", artifacts[1].object.get("kind").?.string);
+    try std.testing.expectEqualStrings("body_chunks_v1", artifacts[1].object.get("source_artifact_name").?.string);
+    try std.testing.expectEqual(@as(usize, 3), source.cached_snapshot_calls);
     try std.testing.expectEqual(@as(usize, 0), source.admin_snapshot_calls);
 
     var algebraic_detail_resp = try server.handle(.{

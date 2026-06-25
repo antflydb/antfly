@@ -632,6 +632,15 @@ pub const Client = struct {
         return ApiResponse(types.DocumentArtifactManifestList).fromResponse(self.allocator, &resp);
     }
 
+    /// List table artifact enrichments
+    /// GET /db/v1/tables/{tableName}/artifacts
+    pub fn listArtifactEnrichments(self: *@This(), table_name: []const u8) !ApiResponse(types.TableArtifactEnrichmentList) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts", .{ self.base_url, table_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.TableArtifactEnrichmentList).fromResponse(self.allocator, &resp);
+    }
+
     /// Reprocess a derived document artifact across a table range
     /// POST /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess
     pub fn reprocessDocumentArtifactRange(self: *@This(), table_name: []const u8, artifact_name: []const u8, body: types.DocumentArtifactTableReprocessRequest) !ApiResponse(types.DocumentArtifactTableReprocessResponse) {

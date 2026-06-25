@@ -165,6 +165,10 @@ pub const Routes = struct {
         table_name: []const u8,
     };
 
+    pub const TableArtifacts = struct {
+        table_name: []const u8,
+    };
+
     pub const TableIndex = struct {
         table_name: []const u8,
         index_name: []const u8,
@@ -455,6 +459,14 @@ pub const Routes = struct {
         if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
         if (!std.mem.endsWith(u8, path, schema_suffix)) return null;
         const table_name = path[tables_prefix.len .. path.len - schema_suffix.len];
+        if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
+        return .{ .table_name = table_name };
+    }
+
+    pub fn matchTableArtifacts(path: []const u8) ?TableArtifacts {
+        if (!std.mem.startsWith(u8, path, tables_prefix)) return null;
+        if (!std.mem.endsWith(u8, path, artifacts_suffix)) return null;
+        const table_name = path[tables_prefix.len .. path.len - artifacts_suffix.len];
         if (table_name.len == 0 or std.mem.indexOfScalar(u8, table_name, '/') != null) return null;
         return .{ .table_name = table_name };
     }

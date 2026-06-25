@@ -19,6 +19,7 @@ const httpx = @import("httpx");
 
 pub const table = @import("table.zig");
 pub const index = @import("index.zig");
+pub const artifact = @import("artifact.zig");
 pub const query = @import("query.zig");
 pub const data = @import("data.zig");
 pub const backup = @import("backup.zig");
@@ -95,6 +96,7 @@ pub fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
 test "cli mod compiles" {
     _ = table;
     _ = index;
+    _ = artifact;
     _ = query;
     _ = data;
     _ = backup;

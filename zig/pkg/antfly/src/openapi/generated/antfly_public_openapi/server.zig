@@ -294,6 +294,12 @@ pub const ListDocumentArtifactManifestsParams = struct {
     detail: ?[]const u8 = null,
 };
 
+/// List table artifact enrichments
+pub const ListArtifactEnrichmentsPathParams = struct {
+    /// Name of the table
+    table_name: []const u8,
+};
+
 /// Reprocess a derived document artifact across a table range
 pub const ReprocessDocumentArtifactRangePathParams = struct {
     /// Name of the table
@@ -666,6 +672,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/lookup", .operation_id = "scanKeys" },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}", .operation_id = "lookupKey" },
     .{ .method = "GET", .path = "/tables/{tableName}/documents/{key}/artifacts", .operation_id = "listDocumentArtifactManifests" },
+    .{ .method = "GET", .path = "/tables/{tableName}/artifacts", .operation_id = "listArtifactEnrichments" },
     .{ .method = "POST", .path = "/tables/{tableName}/artifacts/{artifactName}/reprocess", .operation_id = "reprocessDocumentArtifactRange" },
     .{ .method = "PUT", .path = "/tables/{tableName}/artifacts/{artifactName}/enrichment", .operation_id = "putArtifactEnrichment" },
     .{ .method = "DELETE", .path = "/tables/{tableName}/artifacts/{artifactName}/enrichment", .operation_id = "deleteArtifactEnrichment" },
@@ -747,6 +754,7 @@ pub const routes = [_]Route{
 //   fn scanKeys(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn lookupKey(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: LookupKeyParams) !httpx.Response
 //   fn listDocumentArtifactManifests(self: *Impl, ctx: *httpx.Context, table_name: []const u8, key: []const u8, params: ListDocumentArtifactManifestsParams) !httpx.Response
+//   fn listArtifactEnrichments(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn reprocessDocumentArtifactRange(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn putArtifactEnrichment(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response
 //   fn deleteArtifactEnrichment(self: *Impl, ctx: *httpx.Context, table_name: []const u8, artifact_name: []const u8) !httpx.Response

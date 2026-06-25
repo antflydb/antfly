@@ -355,6 +355,13 @@ pub const DocumentArtifactChildRange = struct {
     text_bytes: ?i64 = null,
 };
 
+/// Table-level generated artifact enrichments configured for a table.
+pub const TableArtifactEnrichmentList = struct {
+    /// Table containing the configured artifact enrichments.
+    table_name: []const u8,
+    artifacts: []const antfly_indexes_openapi.EnrichmentConfig,
+};
+
 pub const DocumentArtifactReprocessResponse = struct {
     /// Indicates that reprocessing was accepted.
     reprocess: []const u8,

@@ -2001,6 +2001,20 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/DocumentArtifactManifest"
+    TableArtifactEnrichmentList:
+      type: object
+      description: Table-level generated artifact enrichments configured for a table.
+      required:
+        - table_name
+        - artifacts
+      properties:
+        table_name:
+          type: string
+          description: Table containing the configured artifact enrichments.
+        artifacts:
+          type: array
+          items:
+            $ref: "indexes.yaml#/components/schemas/EnrichmentConfig"
     DocumentArtifactReprocessResponse:
       type: object
       required:
@@ -8072,6 +8086,35 @@ paths:
           $ref: "#/components/responses/MethodNotAllowed"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/artifacts:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+    get:
+      summary: List table artifact enrichments
+      description: |
+        Returns table-level generated artifact enrichments configured for a
+        table, including enrichments declared inline by indexes. This is the
+        artifact control-plane view; use the document artifact routes to inspect
+        materialized manifests for a specific source document.
+      tags:
+        - index_management
+      operationId: listArtifactEnrichments
+      responses:
+        "200":
+          description: Artifact enrichment list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TableArtifactEnrichmentList"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /tables/{tableName}/artifacts/{artifactName}/reprocess:
