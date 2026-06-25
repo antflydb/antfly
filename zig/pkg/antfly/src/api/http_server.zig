@@ -5063,6 +5063,7 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         table_name: []const u8,
         backup_location: *backups_api.BackupLocation,
+        location_uri: []const u8,
         backup_id: []const u8,
         format: backups_api.BackupFormat,
     ) !void {
@@ -5071,6 +5072,14 @@ pub const ApiHttpServer = struct {
         if (table.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
 
         const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
+        if (try table_writes_source.backupTableToLocation(self.alloc, table_name, backup_id, format, location_uri)) |shards| {
+            defer freeBackupShards(self.alloc, shards);
+            var manifest = try backups_api.createManifest(self.alloc, backup_id, &table, shards);
+            defer manifest.deinit(self.alloc);
+            try backups_api.writeManifestToLocation(self.alloc, backup_location, &manifest);
+            return;
+        }
+
         const local_backup_root = switch (backup_location.*) {
             .file => |value| value,
             .remote => try createBackupStagingRoot(self.alloc, backup_id),
@@ -6111,10 +6120,11 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         backup_id: []const u8,
         format: backups_api.BackupFormat,
+        location_uri: []const u8,
         location: *backups_api.BackupLocation,
     ) public_table_http.TableApi.ExecuteBackupError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        self.backupOwnedTable(table_name, location, backup_id, format) catch |err| switch (err) {
+        self.backupOwnedTable(table_name, location, location_uri, backup_id, format) catch |err| switch (err) {
             error.TableNotFound => return error.NotFound,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.UnsupportedBackupMigrationState => return error.UnsupportedBackupMigrationState,
@@ -6516,7 +6526,7 @@ pub const ApiHttpServer = struct {
         for (table_names, 0..) |table_name, i| {
             statuses[i] = .{ .name = table_name, .status = "failed", .@"error" = null };
             const table_backup_id = backups_api.clusterTableBackupId(alloc, req.backup_id, table_name) catch return error.InternalFailure;
-            self.backupOwnedTable(table_name, location, table_backup_id, .native) catch |err| {
+            self.backupOwnedTable(table_name, location, req.location, table_backup_id, .native) catch |err| {
                 statuses[i].@"error" = switch (err) {
                     error.TableNotFound => "not found",
                     error.UnsupportedOperation => "method not allowed",

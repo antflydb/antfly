@@ -2245,6 +2245,14 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             plan: backups_api.TableBackupPlan,
         ) anyerror!?[]backups_api.ShardSnapshot = null,
+        backup_table_to_location: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            backup_id: []const u8,
+            format: backups_api.BackupFormat,
+            location_uri: []const u8,
+        ) anyerror!?[]backups_api.ShardSnapshot = null,
         restore_table: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -2495,6 +2503,18 @@ pub const TableWriteSource = struct {
     ) !?[]backups_api.ShardSnapshot {
         const fn_ptr = self.vtable.backup_table orelse return null;
         return try fn_ptr(self.ptr, alloc, table_name, plan);
+    }
+
+    pub fn backupTableToLocation(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        backup_id: []const u8,
+        format: backups_api.BackupFormat,
+        location_uri: []const u8,
+    ) !?[]backups_api.ShardSnapshot {
+        const fn_ptr = self.vtable.backup_table_to_location orelse return null;
+        return try fn_ptr(self.ptr, alloc, table_name, backup_id, format, location_uri);
     }
 
     pub fn restoreTable(
@@ -7949,6 +7969,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .commit_transaction = commitTransaction,
                 .commit_transaction_with_id = commitTransactionWithId,
                 .backup_table = backupTable,
+                .backup_table_to_location = backupTableToLocation,
                 .restore_table = restoreTable,
                 .batch = batch,
                 .batch_group_local = batchGroupLocal,
@@ -8148,6 +8169,46 @@ pub const HostedProvisionedTableWriteSource = struct {
         _: backups_api.TableBackupPlan,
     ) !?[]backups_api.ShardSnapshot {
         return error.UnsupportedOperation;
+    }
+
+    fn backupTableToLocation(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        backup_id: []const u8,
+        format: backups_api.BackupFormat,
+        location_uri: []const u8,
+    ) !?[]backups_api.ShardSnapshot {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        const group_id = (try table_catalog.resolveSingleRangeGroup(alloc, self.catalog, table_name)) orelse return null;
+        const resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
+        var route = resolved_route orelse return null;
+        defer route.deinit(alloc);
+        switch (route) {
+            .local => return error.UnsupportedOperation,
+            .remote => |remote| {
+                const format_name = switch (format) {
+                    .native => "native",
+                    .portable => "portable",
+                };
+                const body = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(.{
+                    .backup_id = backup_id,
+                    .location = location_uri,
+                    .format = format_name,
+                }, .{})});
+                defer alloc.free(body);
+
+                var client = http_client.ApiHttpClient.init(alloc, self.executor);
+                var response = try client.fetchBackupTable(remote.base_uri, table_name, body);
+                response.deinit(alloc);
+
+                var location = try backups_api.openBackupLocation(alloc, location_uri);
+                defer location.deinit(alloc);
+                var manifest = try backups_api.readManifestFromLocation(alloc, &location, backup_id);
+                defer manifest.deinit(alloc);
+                return try cloneShardSnapshots(alloc, manifest.shards);
+            },
+        }
     }
 
     fn restoreTable(
@@ -11363,6 +11424,28 @@ fn readBackupFileAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
 fn freeBackupShards(alloc: std.mem.Allocator, shards: []const backups_api.ShardSnapshot) void {
     for (shards) |shard| shard.deinit(alloc);
     alloc.free(@constCast(shards));
+}
+
+fn cloneShardSnapshots(
+    alloc: std.mem.Allocator,
+    shards: []const backups_api.ShardSnapshot,
+) ![]backups_api.ShardSnapshot {
+    const out = try alloc.alloc(backups_api.ShardSnapshot, shards.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |shard| shard.deinit(alloc);
+        alloc.free(out);
+    }
+    for (shards, 0..) |shard, i| {
+        out[i] = .{
+            .group_id = shard.group_id,
+            .start_key = try alloc.dupe(u8, shard.start_key),
+            .end_key = if (shard.end_key) |value| try alloc.dupe(u8, value) else null,
+            .snapshot_path = try alloc.dupe(u8, shard.snapshot_path),
+        };
+        initialized += 1;
+    }
+    return out;
 }
 
 fn resolveWritesForSchemaValidation(
