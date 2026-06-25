@@ -95,7 +95,9 @@ statements now validate generated target, source, and
 coverage for multiple matched/not-matched arms, conditional arms, matched
 `DELETE`, matched/not-matched `DO NOTHING`, expression-filtered matched
 `UPDATE`, filtered not-matched `INSERT`, `RETURNING`, and non-recursive CTE
-write prefixes; and `TRUNCATE`
+write prefixes; recursive CTE insert-source, update, delete, and `MERGE`
+forms now validate generated CTE and command ranges before dispatching to the
+typed recursive write-plan variants; and `TRUNCATE`
 lowers directly from generated AST ranges into mutation-source plans. Incomplete
 migrated DML statements that stop at required generated clause boundaries now
 fail closed through the generated parser instead of falling back to the legacy
@@ -104,10 +106,10 @@ AST-to-plan wrapper that fails closed if the generated DML family does not
 match the existing write classifier before delegating to the current typed DML
 lowerer. Unsupported DML still falls back, and deeper DML cutover still
 requires replacing token-based command-body parsing with complete generated AST
-payloads for recursive CTE DML, insert-select source bodies that need generated
-read-body ASTs beyond statement ranges, joined mutation source bodies that need
-generated read-body ASTs beyond statement ranges, and recursive CTE `MERGE`
-forms.
+payloads for recursive CTE DML beyond generated range validation,
+insert-select source bodies that need generated read-body ASTs beyond statement
+ranges, and joined mutation source bodies that need generated read-body ASTs
+beyond statement ranges.
 Representative
 read queries now have generated-parser corpus coverage, retained generated raw
 and AST nodes for covered read statements, top-level generated AST ranges for
@@ -377,11 +379,12 @@ Unsupported DDL remains on the existing parser until
    truncate, and merge now use generated fail-closed diagnostics instead of
    classifier fallback.
    Switching the full DML family from fallback to required generated parsing
-   still requires generated command-body ASTs for recursive CTE DML,
+   still requires generated command-body ASTs for recursive CTE DML beyond
+   generated range validation and direct recursive write-plan dispatch,
    insert-select source bodies that need generated read-body ASTs beyond
    statement ranges, joined mutation source bodies that need generated
-   read-body ASTs beyond statement ranges, recursive CTE merge forms, and
-   broader unsupported-shape diagnostics.
+   read-body ASTs beyond statement ranges, and broader unsupported-shape
+   diagnostics.
 4. Read queries: projections, predicates, joins, CTEs, aggregates, windows,
    set operations, lateral, ordering, limits, and document-table sources.
    Initial generated-parser coverage now retains raw and AST read nodes for
@@ -790,6 +793,8 @@ Generated grammar work needs evidence at multiple levels:
   delete-using joined mutation-source requests, direct generated AST-to-plan
   coverage for merge plans and non-recursive CTE write prefixes across
   insert-source, point update/delete, joined update/delete, and merge,
+  generated-direct validation and dispatch for recursive CTE insert-source,
+  update, delete, and merge write-plan variants,
   generated-first write lowering context
   dispatch, and generated-family validation fallback over other representative
   write plans. Read plans have initial

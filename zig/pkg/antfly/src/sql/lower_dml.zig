@@ -12457,6 +12457,9 @@ pub fn lowerWritePlanFromGeneratedDmlAstDirectAlloc(
 ) !plan_mod.LoweredWritePlan {
     const write_kind = parsed_sql.writeStatementKind() orelse return error.UnsupportedSqlShape;
     if (!generatedDmlAstMatchesWriteKind(dml_ast.kind, write_kind)) return error.UnsupportedSqlShape;
+    if (dml_ast.cte_recursive) {
+        return try lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(alloc, parsed_sql, dml_ast, schema, params, options, write_kind);
+    }
     if (dml_ast.kind == .insert_values) {
         if (insertValuesFromGeneratedDmlAstAlloc(alloc, parsed_sql.items(), dml_ast, schema, params, options)) |insert| {
             return .{ .insert = insert };
@@ -12556,6 +12559,119 @@ pub fn lowerWritePlanFromGeneratedDmlAstDirectAlloc(
         }
     }
     return error.UnsupportedSqlShape;
+}
+
+fn lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    ast: generated_parser.GeneratedSqlDmlAst,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+    write_kind: classifier.SqlWriteStatementKind,
+) !plan_mod.LoweredWritePlan {
+    if (!ast.cte_recursive) return error.UnsupportedSqlShape;
+    const tokens = parsed_sql.items();
+    const end = generatedDmlStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    _ = try generatedDmlCommandStart(tokens, ast, end);
+    const parser_context = @import("parser_context.zig");
+    switch (ast.kind) {
+        .insert_select => {
+            if (write_kind != .insert_source) return error.UnsupportedSqlShape;
+            try validateGeneratedInsertSourceRanges(tokens, ast, end);
+            if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+            const source_schema = options.insert_source_schema orelse schema;
+            if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+            var parser_state = parser_context.ParserState{
+                .alloc = alloc,
+                .tokens = tokens,
+                .schema = schema,
+                .joined_source_schema = source_schema,
+                .insert_source_allows_different_table = true,
+                .params = params,
+                .unique_resolver = options.unique_resolver orelse return error.UnsupportedRowsSelector,
+            };
+            var lowered = parser_context.ParserState.ContextAccessors.parseRecursiveInsertSource(&parser_state) catch |err| switch (err) {
+                error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+                else => return err,
+            };
+            lowered.insert_source.sync_level = options.sync_level;
+            return .{ .recursive_insert_source = lowered };
+        },
+        .update => {
+            switch (write_kind) {
+                .update, .update_source => try validateGeneratedUpdateSourceRanges(tokens, ast, end),
+                .update_joined_source => try validateGeneratedUpdateJoinedRanges(tokens, ast, end),
+                else => return error.UnsupportedSqlShape,
+            }
+            if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+            const source_schema = options.joined_source_schema orelse schema;
+            if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+            const row_claim = options.row_claim orelse return error.UnsupportedRowsQuery;
+            if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
+            var parser_state = parser_context.ParserState{
+                .alloc = alloc,
+                .tokens = tokens,
+                .schema = schema,
+                .joined_source_schema = source_schema,
+                .params = params,
+                .mutation_claim = row_claim,
+            };
+            var lowered = parser_context.ParserState.ContextAccessors.parseRecursiveUpdateJoinedMutationSource(&parser_state) catch |err| switch (err) {
+                error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+                else => return err,
+            };
+            lowered.mutation.sync_level = options.sync_level;
+            return .{ .recursive_update_joined_source = lowered };
+        },
+        .delete => {
+            switch (write_kind) {
+                .delete, .delete_source => try validateGeneratedDeleteSourceRanges(tokens, ast, end),
+                .delete_joined_source => try validateGeneratedDeleteJoinedRanges(tokens, ast, end),
+                else => return error.UnsupportedSqlShape,
+            }
+            if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+            const source_schema = options.joined_source_schema orelse schema;
+            if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+            const row_claim = options.row_claim orelse return error.UnsupportedRowsQuery;
+            if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
+            var parser_state = parser_context.ParserState{
+                .alloc = alloc,
+                .tokens = tokens,
+                .schema = schema,
+                .joined_source_schema = source_schema,
+                .params = params,
+                .mutation_claim = row_claim,
+            };
+            var lowered = parser_context.ParserState.ContextAccessors.parseRecursiveDeleteJoinedMutationSource(&parser_state) catch |err| switch (err) {
+                error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+                else => return err,
+            };
+            lowered.mutation.sync_level = options.sync_level;
+            return .{ .recursive_delete_joined_source = lowered };
+        },
+        .merge => {
+            if (write_kind != .merge) return error.UnsupportedSqlShape;
+            try validateGeneratedMergeRanges(tokens, ast, end);
+            if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+            const source_schema = options.joined_source_schema orelse schema;
+            if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+            var parser_state = parser_context.ParserState{
+                .alloc = alloc,
+                .tokens = tokens,
+                .schema = schema,
+                .joined_source_schema = source_schema,
+                .params = params,
+            };
+            var lowered = parser_context.ParserState.ContextAccessors.parseRecursiveMergeMutation(&parser_state) catch |err| switch (err) {
+                error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+                else => return err,
+            };
+            lowered.merge.sync_level = options.sync_level;
+            return .{ .recursive_merge_mutation = lowered };
+        },
+        .insert_values, .truncate => return error.UnsupportedSqlShape,
+    }
 }
 
 fn insertValuesFromGeneratedDmlAstAlloc(
@@ -14257,6 +14373,78 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
     try std.testing.expectEqualStrings("usage_records", generated_cte_merge.source_table_name);
     try std.testing.expectEqual(@as(usize, 1), generated_cte_merge.match_fields.len);
     try std.testing.expectEqual(@as(usize, 1), generated_cte_merge.matched_arms.len);
+
+    var generated_recursive_insert = try lowerGeneratedDmlWritePlanForDmlTestAlloc(
+        alloc,
+        "WITH RECURSIVE source_rows AS (SELECT id, status, quantity FROM usage_records WHERE status = 'ready' UNION ALL SELECT child.id, child.status, child.quantity FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) INSERT INTO usage_records (id, status, quantity) SELECT id, status, quantity FROM source_rows RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer generated_recursive_insert.deinit(alloc);
+    switch (generated_recursive_insert) {
+        .recursive_insert_source => |recursive_insert| {
+            try std.testing.expectEqualStrings("source_rows", recursive_insert.recursive.cte_name);
+            try std.testing.expectEqualStrings("usage_records", recursive_insert.insert_source.table_name);
+            try std.testing.expectEqualStrings("source_rows", recursive_insert.insert_source.insert_source.req.source.source_cte);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, recursive_insert.insert_source.sync_level);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var generated_recursive_update = try lowerGeneratedDmlWritePlanForDmlTestAlloc(
+        alloc,
+        "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records WHERE status = 'ready' UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)",
+        schema,
+        &.{},
+        options,
+    );
+    defer generated_recursive_update.deinit(alloc);
+    switch (generated_recursive_update) {
+        .recursive_update_joined_source => |recursive_update| {
+            try std.testing.expectEqualStrings("source_rows", recursive_update.recursive.cte_name);
+            try std.testing.expectEqualStrings("usage_records", recursive_update.mutation.target_table_name);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, recursive_update.mutation.mutation.req.kind);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, recursive_update.mutation.sync_level);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var generated_recursive_delete = try lowerGeneratedDmlWritePlanForDmlTestAlloc(
+        alloc,
+        "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records WHERE status = 'ready' UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) DELETE FROM usage_records WHERE id IN (SELECT id FROM source_rows)",
+        schema,
+        &.{},
+        options,
+    );
+    defer generated_recursive_delete.deinit(alloc);
+    switch (generated_recursive_delete) {
+        .recursive_delete_joined_source => |recursive_delete| {
+            try std.testing.expectEqualStrings("source_rows", recursive_delete.recursive.cte_name);
+            try std.testing.expectEqualStrings("usage_records", recursive_delete.mutation.target_table_name);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, recursive_delete.mutation.mutation.req.kind);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, recursive_delete.mutation.sync_level);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var generated_recursive_merge = try lowerGeneratedDmlWritePlanForDmlTestAlloc(
+        alloc,
+        "WITH RECURSIVE source_rows AS (SELECT id, status FROM usage_records WHERE status = 'ready' UNION ALL SELECT child.id, child.status FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status",
+        schema,
+        &.{},
+        options,
+    );
+    defer generated_recursive_merge.deinit(alloc);
+    switch (generated_recursive_merge) {
+        .recursive_merge_mutation => |recursive_merge| {
+            try std.testing.expectEqualStrings("source_rows", recursive_merge.recursive.cte_name);
+            try std.testing.expectEqualStrings("usage_records", recursive_merge.merge.target_table_name);
+            try std.testing.expectEqualStrings("source_rows", recursive_merge.merge.source.source_cte);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, recursive_merge.merge.sync_level);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 
     var parsed_generated_cross_merge = try tokenized.ParsedSql.initAlloc(
         alloc,
