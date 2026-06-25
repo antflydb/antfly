@@ -4348,8 +4348,16 @@ pub const ApiHttpServer = struct {
     }
 
     fn publicSqlTransactionStatus(_: *ApiHttpServer, session: *const sql_adapter.OwnedSqlCatalogSession) PublicSqlTransactionStatus {
+        if (session.sql_transaction_failed) return .failed_transaction;
         if (session.in_sql_transaction or session.transaction_local_search_path or session.transaction_local_settings) return .in_transaction;
         return .idle;
+    }
+
+    fn markPublicSqlTransactionFailedIfActive(_: *ApiHttpServer, session: *sql_adapter.OwnedSqlCatalogSession) void {
+        if (session.in_sql_transaction or session.transaction_local_search_path or session.transaction_local_settings) {
+            session.in_sql_transaction = true;
+            session.sql_transaction_failed = true;
+        }
     }
 
     fn publicSqlReadOnlyActive(_: *ApiHttpServer, session: *const sql_adapter.OwnedSqlCatalogSession) !bool {
@@ -4429,6 +4437,7 @@ pub const ApiHttpServer = struct {
     fn applyTransactionModePlanToSession(self: *ApiHttpServer, session: *sql_adapter.OwnedSqlCatalogSession, plan: sql_adapter.TransactionModePlan) !bool {
         if (plan.starter == .begin or plan.starter == .start_transaction) {
             session.in_sql_transaction = true;
+            session.sql_transaction_failed = false;
         }
         const access_mode = plan.access_mode orelse return false;
         const value = switch (access_mode) {
@@ -4479,6 +4488,7 @@ pub const ApiHttpServer = struct {
                 }
                 if (noop.reason == .transaction_control and parsedSqlTransactionBoundaryStartsSession(parsed_sql)) {
                     session.in_sql_transaction = true;
+                    session.sql_transaction_failed = false;
                     var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
                     applied.noop = true;
                     try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
@@ -6401,13 +6411,25 @@ pub const ApiHttpServer = struct {
         defer session.deinit(self.alloc);
 
         var parsed_sql = sql_adapter.ParsedSql.initAlloc(self.alloc, request.sql) catch |err| switch (err) {
-            error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
+            error.UnsupportedSqlShape => {
+                self.markPublicSqlTransactionFailedIfActive(&session);
+                try self.savePublicSqlSession(session);
+                return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") };
+            },
             else => return err,
         };
         defer parsed_sql.deinit(self.alloc);
+        if (session.sql_transaction_failed and !parsedSqlTransactionBoundaryClearsLocalSession(&parsed_sql)) {
+            try self.savePublicSqlSession(session);
+            return .{ .response = try textResponse(self.alloc, 400, "current transaction is aborted") };
+        }
         if (parsed_sql.writeStatementKind() != null) {
             var outcome = try self.handlePublicSqlWrite(&parsed_sql, &session, authenticated_identity);
             errdefer outcome.deinit(self.alloc);
+            switch (outcome) {
+                .response => self.markPublicSqlTransactionFailedIfActive(&session),
+                .result => {},
+            }
             try self.savePublicSqlSession(session);
             switch (outcome) {
                 .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(&session),
@@ -6418,6 +6440,10 @@ pub const ApiHttpServer = struct {
         if (parsed_sql.readStatementKind() != null) {
             var outcome = try self.handlePublicSqlRead(&parsed_sql, &session, authenticated_identity);
             errdefer outcome.deinit(self.alloc);
+            switch (outcome) {
+                .response => self.markPublicSqlTransactionFailedIfActive(&session),
+                .result => {},
+            }
             try self.savePublicSqlSession(session);
             switch (outcome) {
                 .result => |*result| result.transaction_status = self.publicSqlTransactionStatus(&session),
@@ -6427,10 +6453,26 @@ pub const ApiHttpServer = struct {
         }
 
         const applied = self.applyRelationalParsedSqlDdlWithSession(&parsed_sql, &session) catch |err| switch (err) {
-            error.DocumentSqlViewMappingUnsupported => return .{ .response = try textResponse(self.alloc, 400, "document_sql_view_mapping_unsupported") },
-            error.SqlReadOnlyTransaction => return .{ .response = try textResponse(self.alloc, 400, "cannot execute statement in a read-only transaction") },
-            error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
-            error.StatementTimeout => return .{ .response = try textResponse(self.alloc, 408, "sql statement timeout") },
+            error.DocumentSqlViewMappingUnsupported => {
+                self.markPublicSqlTransactionFailedIfActive(&session);
+                try self.savePublicSqlSession(session);
+                return .{ .response = try textResponse(self.alloc, 400, "document_sql_view_mapping_unsupported") };
+            },
+            error.SqlReadOnlyTransaction => {
+                self.markPublicSqlTransactionFailedIfActive(&session);
+                try self.savePublicSqlSession(session);
+                return .{ .response = try textResponse(self.alloc, 400, "cannot execute statement in a read-only transaction") };
+            },
+            error.UnsupportedSqlShape => {
+                self.markPublicSqlTransactionFailedIfActive(&session);
+                try self.savePublicSqlSession(session);
+                return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") };
+            },
+            error.StatementTimeout => {
+                self.markPublicSqlTransactionFailedIfActive(&session);
+                try self.savePublicSqlSession(session);
+                return .{ .response = try textResponse(self.alloc, 408, "sql statement timeout") };
+            },
             error.InvalidSqlSession,
             error.PreparedStatementAlreadyExists,
             error.PreparedStatementNotFound,
@@ -6438,7 +6480,11 @@ pub const ApiHttpServer = struct {
             error.InvalidSqlCatalog,
             error.InvalidRoleSetting,
             error.RoleSettingNotFound,
-            => return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") },
+            => {
+                self.markPublicSqlTransactionFailedIfActive(&session);
+                try self.savePublicSqlSession(session);
+                return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") };
+            },
             else => return err,
         };
         const session_id = self.ensureSqlProtocolSessionId(&session);

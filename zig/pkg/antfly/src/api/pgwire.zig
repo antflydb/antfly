@@ -585,6 +585,7 @@ const Connection = struct {
         switch (outcome) {
             .response => |*response| {
                 defer response.deinit(self.api_server.alloc);
+                self.markTransactionError();
                 try self.sendError(pgwire_module.sqlstateForHttpStatus(response.status), response.body);
                 return false;
             },
@@ -614,6 +615,7 @@ const Connection = struct {
         switch (outcome) {
             .response => |*response| {
                 defer response.deinit(self.api_server.alloc);
+                self.markTransactionError();
                 try self.sendError(pgwire_module.sqlstateForHttpStatus(response.status), response.body);
                 if (send_ready_on_error) try self.sendReadyForQuery();
                 return false;
@@ -853,6 +855,10 @@ const Connection = struct {
         const payload = [_]u8{self.ready_for_query_status};
         try self.sendMessage('Z', &payload);
         try self.writer.flush();
+    }
+
+    fn markTransactionError(self: *Connection) void {
+        if (self.ready_for_query_status == 'T') self.ready_for_query_status = 'E';
     }
 
     fn sendEmptyQueryResponse(self: *Connection) !void {

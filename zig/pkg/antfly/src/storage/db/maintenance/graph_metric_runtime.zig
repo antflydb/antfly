@@ -4387,6 +4387,2437 @@ test "db graph metric runtime background coordinator and worker pool loops publi
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), metric_result.graph_metric_results[0].scores[0].score, 0.001);
 }
 
+test "db graph metric runtime background worker pool survives separate reopened handles" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var target_generation: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph_idx",
+            .kind = .graph,
+            .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:hub", .value = "{\"title\":\"hub\"}" }},
+            .sync_level = .write,
+        });
+
+        for (0..130) |i| {
+            const key = try std.fmt.allocPrint(alloc, "doc:{d:0>3}", .{i});
+            defer alloc.free(key);
+            const value = try std.fmt.allocPrint(
+                alloc,
+                "{{\"title\":\"source {d}\",\"_edges\":{{\"graph_idx\":{{\"cites\":[{{\"target\":\"doc:hub\",\"weight\":1.0}}]}}}}}}",
+                .{i},
+            );
+            defer alloc.free(value);
+            try db.batch(.{
+                .writes = &.{.{ .key = key, .value = value }},
+                .sync_level = .write,
+            });
+        }
+
+        try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        target_generation = graph_entry.index.edge_generation;
+    }
+
+    const workers = [_][]const u8{ "runtime-reopened-pool-worker-a", "runtime-reopened-pool-worker-b" };
+    const reversed_workers = [_][]const u8{ "runtime-reopened-pool-worker-b", "runtime-reopened-pool-worker-a" };
+    var coordinator_total = index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult{};
+    var worker_total = index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult{};
+    var saw_worker_pool_role = false;
+    var saw_two_page_worker_pool_tick = false;
+    var saw_live_duplicate_worker_pool_fenced = false;
+    var fresh = false;
+    for (0..400) |_| {
+        const worker_tick = blk: {
+            var worker_pool = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .writer_no_replay,
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer worker_pool.close();
+
+            const worker_resources = worker_pool.core.asyncResources();
+            var runtime = try GraphMetricRuntime.init(
+                alloc,
+                worker_resources.store,
+                worker_resources.index_manager,
+                worker_resources.apply_mutex,
+                worker_pool.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .worker_pool,
+                    .runtime_id = "runtime-reopened-pool-worker-owner",
+                    .lease_owned = true,
+                    .owner_id = "runtime-reopened-pool-worker-owner",
+                    .planned_options = .{
+                        .worker_ids = &workers,
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 2,
+                    },
+                },
+            );
+            defer runtime.deinit();
+
+            const tick = try runtime.runOnceDetailed();
+            const stats = runtime.stats();
+            try std.testing.expectEqual(Role.worker_pool, stats.role);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-pool-worker-owner"), stats.runtime_id_hash);
+            try std.testing.expect(stats.lease_owned);
+            try std.testing.expect(stats.has_lease);
+            const expected_worker_hash = workerSetIdentityHash(workers[0..]);
+            try std.testing.expectEqual(expected_worker_hash, stats.worker_id_hash);
+            try std.testing.expectEqual(@as(usize, 2), stats.worker_count);
+            try std.testing.expectEqual(@as(usize, 0), stats.total_result.coordinator_steps);
+            saw_worker_pool_role = true;
+            if (tick.worker_steps >= 2 and tick.pages_completed >= 2) saw_two_page_worker_pool_tick = true;
+            if (tick.worker_steps > 0) {
+                var duplicate_runtime = try GraphMetricRuntime.init(
+                    alloc,
+                    worker_resources.store,
+                    worker_resources.index_manager,
+                    worker_resources.apply_mutex,
+                    worker_pool.backend_runtime,
+                    .{
+                        .enabled = true,
+                        .role = .worker_pool,
+                        .runtime_id = "runtime-reopened-pool-worker-owner-duplicate",
+                        .lease_owned = true,
+                        .owner_id = "runtime-reopened-pool-worker-owner-duplicate",
+                        .planned_options = .{
+                            .worker_ids = &reversed_workers,
+                            .max_rounds = 1,
+                            .max_metrics_per_round = 8,
+                            .max_pages_per_round = 2,
+                        },
+                    },
+                );
+                defer duplicate_runtime.deinit();
+
+                const duplicate_tick = try duplicate_runtime.runOnceDetailed();
+                try std.testing.expect(!duplicate_tick.durableProgressed());
+                try std.testing.expectEqual(@as(usize, 0), duplicate_tick.worker_steps);
+                try std.testing.expectEqual(@as(usize, 0), duplicate_tick.pages_completed);
+                const duplicate_stats = duplicate_runtime.stats();
+                try std.testing.expect(duplicate_stats.lease_owned);
+                try std.testing.expect(!duplicate_stats.has_lease);
+                try std.testing.expectEqual(stats.worker_id_hash, duplicate_stats.worker_id_hash);
+                try std.testing.expectEqual(stats.lease_key_hash, duplicate_stats.lease_key_hash);
+                try std.testing.expectEqual(@as(u64, 0), duplicate_stats.acquisition_count);
+                try std.testing.expectEqual(@as(u64, 1), duplicate_stats.lease_acquire_failures);
+                saw_live_duplicate_worker_pool_fenced = true;
+            }
+            break :blk tick;
+        };
+        worker_total.add(worker_tick);
+
+        const coordinator_tick = blk: {
+            var coordinator = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .writer_no_replay,
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer coordinator.close();
+
+            const coordinator_resources = coordinator.core.asyncResources();
+            var runtime = try GraphMetricRuntime.init(
+                alloc,
+                coordinator_resources.store,
+                coordinator_resources.index_manager,
+                coordinator_resources.apply_mutex,
+                coordinator.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .coordinator,
+                    .runtime_id = "runtime-reopened-pool-coordinator-owner",
+                    .lease_owned = true,
+                    .owner_id = "runtime-reopened-pool-coordinator-owner",
+                    .planned_options = .{
+                        .worker_id = "runtime-reopened-pool-coordinator-unused",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer runtime.deinit();
+
+            const tick = try runtime.runOnceDetailed();
+            const stats = runtime.stats();
+            try std.testing.expectEqual(Role.coordinator, stats.role);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-pool-coordinator-owner"), stats.runtime_id_hash);
+            try std.testing.expect(stats.lease_owned);
+            try std.testing.expect(stats.has_lease);
+            try std.testing.expectEqual(@as(u64, 0), stats.worker_id_hash);
+            try std.testing.expectEqual(@as(usize, 0), stats.worker_count);
+            try std.testing.expectEqual(@as(usize, 0), stats.total_result.worker_steps);
+            break :blk tick;
+        };
+        coordinator_total.add(coordinator_tick);
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .query_readonly,
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("degree");
+            defer status.deinit(alloc);
+            if (status.state == .fresh and status.published_generation == target_generation) {
+                fresh = true;
+                break;
+            }
+        }
+
+        if (!worker_tick.durableProgressed() and !coordinator_tick.durableProgressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(fresh);
+    try std.testing.expect(saw_worker_pool_role);
+    try std.testing.expect(saw_two_page_worker_pool_tick);
+    try std.testing.expect(saw_live_duplicate_worker_pool_fenced);
+    try std.testing.expect(coordinator_total.builds_started > 0);
+    try std.testing.expect(coordinator_total.coordinator_steps > 0);
+    try std.testing.expect(coordinator_total.phases_advanced > 0);
+    try std.testing.expectEqual(@as(usize, 0), coordinator_total.worker_steps);
+    try std.testing.expect(worker_total.worker_steps >= 2);
+    try std.testing.expect(worker_total.pages_completed >= 2);
+    try std.testing.expectEqual(@as(usize, 0), worker_total.coordinator_steps);
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .query_readonly,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        var metric_result = try reader.search(alloc, .{
+            .graph_metric_queries = &.{.{
+                .name = "degree",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "degree",
+                    .top_k = 1,
+                    .freshness = .fresh,
+                },
+            }},
+            .limit = 0,
+        });
+        defer metric_result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+        try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results[0].scores.len);
+        try std.testing.expectEqualStrings("doc:hub", metric_result.graph_metric_results[0].scores[0].node);
+        try std.testing.expectApproxEqAbs(@as(f64, 130.0), metric_result.graph_metric_results[0].scores[0].score, 0.001);
+    }
+}
+
+test "db graph metric runtime background open-configured pagerank worker pool survives separate reopened handles" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var target_generation: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph_idx",
+            .kind = .graph,
+            .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+            },
+            .sync_level = .write,
+        });
+
+        try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        target_generation = graph_entry.index.edge_generation;
+    }
+
+    const workers = [_][]const u8{ "runtime-reopened-pagerank-pool-worker-a", "runtime-reopened-pagerank-pool-worker-b" };
+    const reversed_workers = [_][]const u8{ "runtime-reopened-pagerank-pool-worker-b", "runtime-reopened-pagerank-pool-worker-a" };
+    var coordinator_total = index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult{};
+    var worker_total = index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult{};
+    var saw_worker_pool_role = false;
+    var saw_live_duplicate_worker_pool_fenced = false;
+    var fresh = false;
+    for (0..500) |_| {
+        const worker_tick = blk: {
+            var worker_pool = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .writer_no_replay,
+                .ttl_cleanup = .{ .enabled = false },
+                .graph_metric_maintenance = .{
+                    .enabled = true,
+                    .start_background_loop = false,
+                    .role = .worker_pool,
+                    .runtime_id = "runtime-reopened-pagerank-pool-worker-owner",
+                    .lease_owned = true,
+                    .owner_id = "runtime-reopened-pagerank-pool-worker-owner",
+                    .planned_options = .{
+                        .worker_ids = &workers,
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 2,
+                    },
+                },
+            });
+            defer worker_pool.close();
+
+            const tick = try worker_pool.graph_metric_runtime.?.runOnceDetailed();
+            const stats = worker_pool.graphMetricRuntimeStats();
+            try std.testing.expect(stats.enabled);
+            try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, stats.role.?);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-pagerank-pool-worker-owner"), stats.runtime_id_hash);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-pagerank-pool-worker-owner"), stats.owner_id_hash);
+            try std.testing.expect(stats.lease_owned);
+            try std.testing.expect(stats.has_lease);
+            try std.testing.expect(!stats.started);
+            const expected_worker_hash = workerSetIdentityHash(workers[0..]);
+            try std.testing.expectEqual(expected_worker_hash, stats.worker_id_hash);
+            try std.testing.expectEqual(@as(u64, 2), stats.worker_count);
+            try std.testing.expectEqual(@as(u64, 0), stats.total_coordinator_steps);
+            saw_worker_pool_role = true;
+            if (tick.worker_steps > 0) {
+                var duplicate_worker_pool = try DB.open(alloc, std.mem.span(path), .{
+                    .open_mode = .writer_no_replay,
+                    .ttl_cleanup = .{ .enabled = false },
+                    .graph_metric_maintenance = .{
+                        .enabled = true,
+                        .start_background_loop = false,
+                        .role = .worker_pool,
+                        .runtime_id = "runtime-reopened-pagerank-pool-worker-owner-duplicate",
+                        .lease_owned = true,
+                        .owner_id = "runtime-reopened-pagerank-pool-worker-owner-duplicate",
+                        .planned_options = .{
+                            .worker_ids = &reversed_workers,
+                            .max_rounds = 1,
+                            .max_metrics_per_round = 8,
+                            .max_pages_per_round = 2,
+                        },
+                    },
+                });
+                defer duplicate_worker_pool.close();
+
+                const duplicate_tick = try duplicate_worker_pool.graph_metric_runtime.?.runOnceDetailed();
+                try std.testing.expect(!duplicate_tick.durableProgressed());
+                try std.testing.expectEqual(@as(usize, 0), duplicate_tick.worker_steps);
+                try std.testing.expectEqual(@as(usize, 0), duplicate_tick.pages_completed);
+                const duplicate_stats = duplicate_worker_pool.graphMetricRuntimeStats();
+                try std.testing.expect(duplicate_stats.enabled);
+                try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, duplicate_stats.role.?);
+                try std.testing.expect(duplicate_stats.lease_owned);
+                try std.testing.expect(!duplicate_stats.has_lease);
+                try std.testing.expectEqual(stats.worker_id_hash, duplicate_stats.worker_id_hash);
+                try std.testing.expectEqual(stats.lease_key_hash, duplicate_stats.lease_key_hash);
+                try std.testing.expectEqual(@as(u64, 0), duplicate_stats.acquisition_count);
+                try std.testing.expectEqual(@as(u64, 1), duplicate_stats.lease_acquire_failures);
+                saw_live_duplicate_worker_pool_fenced = true;
+            }
+            break :blk tick;
+        };
+        worker_total.add(worker_tick);
+
+        const coordinator_tick = blk: {
+            var coordinator = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .writer_no_replay,
+                .ttl_cleanup = .{ .enabled = false },
+                .graph_metric_maintenance = .{
+                    .enabled = true,
+                    .start_background_loop = false,
+                    .role = .coordinator,
+                    .runtime_id = "runtime-reopened-pagerank-pool-coordinator-owner",
+                    .lease_owned = true,
+                    .owner_id = "runtime-reopened-pagerank-pool-coordinator-owner",
+                    .planned_options = .{
+                        .worker_id = "runtime-reopened-pagerank-pool-coordinator-unused",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            });
+            defer coordinator.close();
+
+            const tick = try coordinator.graph_metric_runtime.?.runOnceDetailed();
+            const stats = coordinator.graphMetricRuntimeStats();
+            try std.testing.expect(stats.enabled);
+            try std.testing.expectEqual(types.GraphMetricRuntimeRole.coordinator, stats.role.?);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-pagerank-pool-coordinator-owner"), stats.runtime_id_hash);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-pagerank-pool-coordinator-owner"), stats.owner_id_hash);
+            try std.testing.expect(stats.lease_owned);
+            try std.testing.expect(stats.has_lease);
+            try std.testing.expect(!stats.started);
+            try std.testing.expectEqual(@as(u64, 0), stats.worker_id_hash);
+            try std.testing.expectEqual(@as(u64, 0), stats.worker_count);
+            try std.testing.expectEqual(@as(u64, 0), stats.total_worker_steps);
+            break :blk tick;
+        };
+        coordinator_total.add(coordinator_tick);
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .query_readonly,
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("pagerank");
+            defer status.deinit(alloc);
+            if (status.state == .fresh and status.published_generation == target_generation) {
+                fresh = true;
+                break;
+            }
+        }
+
+        if (!worker_tick.durableProgressed() and !coordinator_tick.durableProgressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(fresh);
+    try std.testing.expect(saw_worker_pool_role);
+    try std.testing.expect(saw_live_duplicate_worker_pool_fenced);
+    try std.testing.expect(coordinator_total.builds_started > 0);
+    try std.testing.expect(coordinator_total.coordinator_steps > 0);
+    try std.testing.expect(coordinator_total.phases_advanced > 0);
+    try std.testing.expect(coordinator_total.published > 0);
+    try std.testing.expectEqual(@as(usize, 0), coordinator_total.worker_steps);
+    try std.testing.expect(worker_total.worker_steps > 0);
+    try std.testing.expect(worker_total.pages_completed > 0);
+    try std.testing.expectEqual(@as(usize, 0), worker_total.coordinator_steps);
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .query_readonly,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        var metric_result = try reader.search(alloc, .{
+            .graph_metric_queries = &.{.{
+                .name = "pagerank",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "pagerank",
+                    .top_k = 2,
+                    .freshness = .fresh,
+                },
+            }},
+            .limit = 0,
+        });
+        defer metric_result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+        try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+        try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results[0].scores.len);
+        try std.testing.expectEqualStrings("doc:d", metric_result.graph_metric_results[0].scores[0].node);
+        try std.testing.expect(metric_result.graph_metric_results[0].scores[0].score >= metric_result.graph_metric_results[0].scores[1].score);
+    }
+}
+
+test "db graph metric runtime background open-configured eigenvector worker pool survives separate reopened handles" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var target_generation: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph_idx",
+            .kind = .graph,
+            .config_json = "{\"metrics\":{\"eigenvector\":{\"enabled\":true,\"kind\":\"eigenvector\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+            },
+            .sync_level = .write,
+        });
+
+        try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        target_generation = graph_entry.index.edge_generation;
+    }
+
+    const workers = [_][]const u8{ "runtime-reopened-eigenvector-pool-worker-a", "runtime-reopened-eigenvector-pool-worker-b" };
+    const reversed_workers = [_][]const u8{ "runtime-reopened-eigenvector-pool-worker-b", "runtime-reopened-eigenvector-pool-worker-a" };
+    var coordinator_total = index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult{};
+    var worker_total = index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult{};
+    var saw_worker_pool_role = false;
+    var saw_live_duplicate_worker_pool_fenced = false;
+    var fresh = false;
+    for (0..500) |_| {
+        const worker_tick = blk: {
+            var worker_pool = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .writer_no_replay,
+                .ttl_cleanup = .{ .enabled = false },
+                .graph_metric_maintenance = .{
+                    .enabled = true,
+                    .start_background_loop = false,
+                    .role = .worker_pool,
+                    .runtime_id = "runtime-reopened-eigenvector-pool-worker-owner",
+                    .lease_owned = true,
+                    .owner_id = "runtime-reopened-eigenvector-pool-worker-owner",
+                    .planned_options = .{
+                        .worker_ids = &workers,
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 2,
+                    },
+                },
+            });
+            defer worker_pool.close();
+
+            const tick = try worker_pool.graph_metric_runtime.?.runOnceDetailed();
+            const stats = worker_pool.graphMetricRuntimeStats();
+            try std.testing.expect(stats.enabled);
+            try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, stats.role.?);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-eigenvector-pool-worker-owner"), stats.runtime_id_hash);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-eigenvector-pool-worker-owner"), stats.owner_id_hash);
+            try std.testing.expect(stats.lease_owned);
+            try std.testing.expect(stats.has_lease);
+            try std.testing.expect(!stats.started);
+            const expected_worker_hash = workerSetIdentityHash(workers[0..]);
+            try std.testing.expectEqual(expected_worker_hash, stats.worker_id_hash);
+            try std.testing.expectEqual(@as(u64, 2), stats.worker_count);
+            try std.testing.expectEqual(@as(u64, 0), stats.total_coordinator_steps);
+            saw_worker_pool_role = true;
+            if (tick.worker_steps > 0) {
+                var duplicate_worker_pool = try DB.open(alloc, std.mem.span(path), .{
+                    .open_mode = .writer_no_replay,
+                    .ttl_cleanup = .{ .enabled = false },
+                    .graph_metric_maintenance = .{
+                        .enabled = true,
+                        .start_background_loop = false,
+                        .role = .worker_pool,
+                        .runtime_id = "runtime-reopened-eigenvector-pool-worker-owner-duplicate",
+                        .lease_owned = true,
+                        .owner_id = "runtime-reopened-eigenvector-pool-worker-owner-duplicate",
+                        .planned_options = .{
+                            .worker_ids = &reversed_workers,
+                            .max_rounds = 1,
+                            .max_metrics_per_round = 8,
+                            .max_pages_per_round = 2,
+                        },
+                    },
+                });
+                defer duplicate_worker_pool.close();
+
+                const duplicate_tick = try duplicate_worker_pool.graph_metric_runtime.?.runOnceDetailed();
+                try std.testing.expect(!duplicate_tick.durableProgressed());
+                try std.testing.expectEqual(@as(usize, 0), duplicate_tick.worker_steps);
+                try std.testing.expectEqual(@as(usize, 0), duplicate_tick.pages_completed);
+                const duplicate_stats = duplicate_worker_pool.graphMetricRuntimeStats();
+                try std.testing.expect(duplicate_stats.enabled);
+                try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, duplicate_stats.role.?);
+                try std.testing.expect(duplicate_stats.lease_owned);
+                try std.testing.expect(!duplicate_stats.has_lease);
+                try std.testing.expectEqual(stats.worker_id_hash, duplicate_stats.worker_id_hash);
+                try std.testing.expectEqual(stats.lease_key_hash, duplicate_stats.lease_key_hash);
+                try std.testing.expectEqual(@as(u64, 0), duplicate_stats.acquisition_count);
+                try std.testing.expectEqual(@as(u64, 1), duplicate_stats.lease_acquire_failures);
+                saw_live_duplicate_worker_pool_fenced = true;
+            }
+            break :blk tick;
+        };
+        worker_total.add(worker_tick);
+
+        const coordinator_tick = blk: {
+            var coordinator = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .writer_no_replay,
+                .ttl_cleanup = .{ .enabled = false },
+                .graph_metric_maintenance = .{
+                    .enabled = true,
+                    .start_background_loop = false,
+                    .role = .coordinator,
+                    .runtime_id = "runtime-reopened-eigenvector-pool-coordinator-owner",
+                    .lease_owned = true,
+                    .owner_id = "runtime-reopened-eigenvector-pool-coordinator-owner",
+                    .planned_options = .{
+                        .worker_id = "runtime-reopened-eigenvector-pool-coordinator-unused",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            });
+            defer coordinator.close();
+
+            const tick = try coordinator.graph_metric_runtime.?.runOnceDetailed();
+            const stats = coordinator.graphMetricRuntimeStats();
+            try std.testing.expect(stats.enabled);
+            try std.testing.expectEqual(types.GraphMetricRuntimeRole.coordinator, stats.role.?);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-eigenvector-pool-coordinator-owner"), stats.runtime_id_hash);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-eigenvector-pool-coordinator-owner"), stats.owner_id_hash);
+            try std.testing.expect(stats.lease_owned);
+            try std.testing.expect(stats.has_lease);
+            try std.testing.expect(!stats.started);
+            try std.testing.expectEqual(@as(u64, 0), stats.worker_id_hash);
+            try std.testing.expectEqual(@as(u64, 0), stats.worker_count);
+            try std.testing.expectEqual(@as(u64, 0), stats.total_worker_steps);
+            break :blk tick;
+        };
+        coordinator_total.add(coordinator_tick);
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .query_readonly,
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("eigenvector");
+            defer status.deinit(alloc);
+            if (status.state == .fresh and status.published_generation == target_generation) {
+                fresh = true;
+                break;
+            }
+        }
+
+        if (!worker_tick.durableProgressed() and !coordinator_tick.durableProgressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(fresh);
+    try std.testing.expect(saw_worker_pool_role);
+    try std.testing.expect(saw_live_duplicate_worker_pool_fenced);
+    try std.testing.expect(coordinator_total.builds_started > 0);
+    try std.testing.expect(coordinator_total.coordinator_steps > 0);
+    try std.testing.expect(coordinator_total.phases_advanced > 0);
+    try std.testing.expect(coordinator_total.published > 0);
+    try std.testing.expectEqual(@as(usize, 0), coordinator_total.worker_steps);
+    try std.testing.expect(worker_total.worker_steps > 0);
+    try std.testing.expect(worker_total.pages_completed > 0);
+    try std.testing.expectEqual(@as(usize, 0), worker_total.coordinator_steps);
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .query_readonly,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        var metric_result = try reader.search(alloc, .{
+            .graph_metric_queries = &.{.{
+                .name = "eigenvector",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "eigenvector",
+                    .top_k = 2,
+                    .freshness = .fresh,
+                },
+            }},
+            .limit = 0,
+        });
+        defer metric_result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+        try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+        try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results[0].scores.len);
+    }
+}
+
+test "db graph metric runtime background open-configured hits worker pool survives separate reopened handles" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var target_generation: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph_idx",
+            .kind = .graph,
+            .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"background\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:hub-a", .value = "{\"title\":\"hub a\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:hub-b", .value = "{\"title\":\"hub b\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:authority", .value = "{\"title\":\"authority\"}" },
+            },
+            .sync_level = .write,
+        });
+
+        try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        target_generation = graph_entry.index.edge_generation;
+    }
+
+    const workers = [_][]const u8{ "runtime-reopened-hits-pool-worker-a", "runtime-reopened-hits-pool-worker-b" };
+    const reversed_workers = [_][]const u8{ "runtime-reopened-hits-pool-worker-b", "runtime-reopened-hits-pool-worker-a" };
+    var coordinator_total = index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult{};
+    var worker_total = index_manager_mod.IndexManager.GraphMetricPlannedSchedulerSweepResult{};
+    var saw_worker_pool_role = false;
+    var saw_live_duplicate_worker_pool_fenced = false;
+    var fresh = false;
+    for (0..500) |_| {
+        const worker_tick = blk: {
+            var worker_pool = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .writer_no_replay,
+                .ttl_cleanup = .{ .enabled = false },
+                .graph_metric_maintenance = .{
+                    .enabled = true,
+                    .start_background_loop = false,
+                    .role = .worker_pool,
+                    .runtime_id = "runtime-reopened-hits-pool-worker-owner",
+                    .lease_owned = true,
+                    .owner_id = "runtime-reopened-hits-pool-worker-owner",
+                    .planned_options = .{
+                        .worker_ids = &workers,
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 2,
+                    },
+                },
+            });
+            defer worker_pool.close();
+
+            const tick = try worker_pool.graph_metric_runtime.?.runOnceDetailed();
+            const stats = worker_pool.graphMetricRuntimeStats();
+            try std.testing.expect(stats.enabled);
+            try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, stats.role.?);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-hits-pool-worker-owner"), stats.runtime_id_hash);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-hits-pool-worker-owner"), stats.owner_id_hash);
+            try std.testing.expect(stats.lease_owned);
+            try std.testing.expect(stats.has_lease);
+            try std.testing.expect(!stats.started);
+            const expected_worker_hash = workerSetIdentityHash(workers[0..]);
+            try std.testing.expectEqual(expected_worker_hash, stats.worker_id_hash);
+            try std.testing.expectEqual(@as(u64, 2), stats.worker_count);
+            try std.testing.expectEqual(@as(u64, 0), stats.total_coordinator_steps);
+            saw_worker_pool_role = true;
+            if (tick.worker_steps > 0) {
+                var duplicate_worker_pool = try DB.open(alloc, std.mem.span(path), .{
+                    .open_mode = .writer_no_replay,
+                    .ttl_cleanup = .{ .enabled = false },
+                    .graph_metric_maintenance = .{
+                        .enabled = true,
+                        .start_background_loop = false,
+                        .role = .worker_pool,
+                        .runtime_id = "runtime-reopened-hits-pool-worker-owner-duplicate",
+                        .lease_owned = true,
+                        .owner_id = "runtime-reopened-hits-pool-worker-owner-duplicate",
+                        .planned_options = .{
+                            .worker_ids = &reversed_workers,
+                            .max_rounds = 1,
+                            .max_metrics_per_round = 8,
+                            .max_pages_per_round = 2,
+                        },
+                    },
+                });
+                defer duplicate_worker_pool.close();
+
+                const duplicate_tick = try duplicate_worker_pool.graph_metric_runtime.?.runOnceDetailed();
+                try std.testing.expect(!duplicate_tick.durableProgressed());
+                try std.testing.expectEqual(@as(usize, 0), duplicate_tick.worker_steps);
+                try std.testing.expectEqual(@as(usize, 0), duplicate_tick.pages_completed);
+                const duplicate_stats = duplicate_worker_pool.graphMetricRuntimeStats();
+                try std.testing.expect(duplicate_stats.enabled);
+                try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, duplicate_stats.role.?);
+                try std.testing.expect(duplicate_stats.lease_owned);
+                try std.testing.expect(!duplicate_stats.has_lease);
+                try std.testing.expectEqual(stats.worker_id_hash, duplicate_stats.worker_id_hash);
+                try std.testing.expectEqual(stats.lease_key_hash, duplicate_stats.lease_key_hash);
+                try std.testing.expectEqual(@as(u64, 0), duplicate_stats.acquisition_count);
+                try std.testing.expectEqual(@as(u64, 1), duplicate_stats.lease_acquire_failures);
+                saw_live_duplicate_worker_pool_fenced = true;
+            }
+            break :blk tick;
+        };
+        worker_total.add(worker_tick);
+
+        const coordinator_tick = blk: {
+            var coordinator = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .writer_no_replay,
+                .ttl_cleanup = .{ .enabled = false },
+                .graph_metric_maintenance = .{
+                    .enabled = true,
+                    .start_background_loop = false,
+                    .role = .coordinator,
+                    .runtime_id = "runtime-reopened-hits-pool-coordinator-owner",
+                    .lease_owned = true,
+                    .owner_id = "runtime-reopened-hits-pool-coordinator-owner",
+                    .planned_options = .{
+                        .worker_id = "runtime-reopened-hits-pool-coordinator-unused",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            });
+            defer coordinator.close();
+
+            const tick = try coordinator.graph_metric_runtime.?.runOnceDetailed();
+            const stats = coordinator.graphMetricRuntimeStats();
+            try std.testing.expect(stats.enabled);
+            try std.testing.expectEqual(types.GraphMetricRuntimeRole.coordinator, stats.role.?);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-hits-pool-coordinator-owner"), stats.runtime_id_hash);
+            try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-reopened-hits-pool-coordinator-owner"), stats.owner_id_hash);
+            try std.testing.expect(stats.lease_owned);
+            try std.testing.expect(stats.has_lease);
+            try std.testing.expect(!stats.started);
+            try std.testing.expectEqual(@as(u64, 0), stats.worker_id_hash);
+            try std.testing.expectEqual(@as(u64, 0), stats.worker_count);
+            try std.testing.expectEqual(@as(u64, 0), stats.total_worker_steps);
+            break :blk tick;
+        };
+        coordinator_total.add(coordinator_tick);
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .open_mode = .query_readonly,
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var authority_status = try graph_entry.index.graphMetricStatus("hits_authority");
+            defer authority_status.deinit(alloc);
+            var hub_status = try graph_entry.index.graphMetricStatus("hits_hub");
+            defer hub_status.deinit(alloc);
+            if (authority_status.state == .fresh and
+                hub_status.state == .fresh and
+                authority_status.published_generation == target_generation and
+                hub_status.published_generation == target_generation)
+            {
+                fresh = true;
+                break;
+            }
+        }
+
+        if (!worker_tick.durableProgressed() and !coordinator_tick.durableProgressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(fresh);
+    try std.testing.expect(saw_worker_pool_role);
+    try std.testing.expect(saw_live_duplicate_worker_pool_fenced);
+    try std.testing.expect(coordinator_total.builds_started > 0);
+    try std.testing.expect(coordinator_total.coordinator_steps > 0);
+    try std.testing.expect(coordinator_total.phases_advanced > 0);
+    try std.testing.expect(coordinator_total.published > 0);
+    try std.testing.expectEqual(@as(usize, 0), coordinator_total.worker_steps);
+    try std.testing.expect(worker_total.worker_steps > 0);
+    try std.testing.expect(worker_total.pages_completed > 0);
+    try std.testing.expectEqual(@as(usize, 0), worker_total.coordinator_steps);
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .query_readonly,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        var metric_result = try reader.search(alloc, .{
+            .graph_metric_queries = &.{
+                .{
+                    .name = "authority",
+                    .query = .{
+                        .index_name = "graph_idx",
+                        .metric_name = "hits_authority",
+                        .top_k = 3,
+                        .freshness = .fresh,
+                    },
+                },
+                .{
+                    .name = "hub",
+                    .query = .{
+                        .index_name = "graph_idx",
+                        .metric_name = "hits_hub",
+                        .top_k = 3,
+                        .freshness = .fresh,
+                    },
+                },
+            },
+            .limit = 0,
+        });
+        defer metric_result.deinit();
+        try std.testing.expectEqual(@as(usize, 2), metric_result.graph_metric_results.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+        try std.testing.expectEqual(target_generation, metric_result.graph_metric_results[0].status.published_generation);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[1].status.state);
+        try std.testing.expectEqual(metric_result.graph_metric_results[0].status.published_generation, metric_result.graph_metric_results[1].status.published_generation);
+        try std.testing.expectEqualStrings("doc:authority", metric_result.graph_metric_results[0].scores[0].node);
+        try std.testing.expectApproxEqAbs(@as(f64, 1.0), metric_result.graph_metric_results[0].scores[0].score, 0.001);
+    }
+}
+
+test "db graph metric runtime background split ticks survive reopened pagerank handles" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var target_generation: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph_idx",
+            .kind = .graph,
+            .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+            },
+            .sync_level = .write,
+        });
+
+        try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.not_ready, status.state);
+        target_generation = graph_entry.index.edge_generation;
+    }
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        const resources = coordinator.core.asyncResources();
+        var runtime = try GraphMetricRuntime.init(
+            alloc,
+            resources.store,
+            resources.index_manager,
+            resources.apply_mutex,
+            coordinator.backend_runtime,
+            .{
+                .enabled = true,
+                .role = .coordinator,
+                .runtime_id = "runtime-reopened-coordinator",
+                .lease_owned = true,
+                .owner_id = "runtime-reopened-coordinator",
+                .planned_options = .{
+                    .worker_id = "runtime-reopened-coordinator",
+                    .max_rounds = 1,
+                    .max_metrics_per_round = 8,
+                    .max_pages_per_round = 1,
+                },
+            },
+        );
+        defer runtime.deinit();
+
+        const started = try runtime.runCoordinatorOnce(true);
+        try std.testing.expectEqual(@as(usize, 1), started.builds_started);
+        try std.testing.expectEqual(@as(usize, 0), started.worker_steps);
+        try std.testing.expectEqual(@as(usize, 0), started.pages_completed);
+        {
+            const stats = runtime.stats();
+            try std.testing.expect(stats.lease_owned);
+            try std.testing.expect(stats.has_lease);
+            try std.testing.expectEqual(Role.coordinator, stats.role);
+        }
+    }
+
+    {
+        var worker = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer worker.close();
+
+        const resources = worker.core.asyncResources();
+        var runtime = try GraphMetricRuntime.init(
+            alloc,
+            resources.store,
+            resources.index_manager,
+            resources.apply_mutex,
+            worker.backend_runtime,
+            .{
+                .enabled = true,
+                .role = .worker,
+                .runtime_id = "runtime-reopened-worker-a",
+                .lease_owned = true,
+                .owner_id = "runtime-reopened-worker-a",
+                .planned_options = .{
+                    .worker_id = "runtime-reopened-worker-a",
+                    .max_rounds = 1,
+                    .max_metrics_per_round = 8,
+                    .max_pages_per_round = 1,
+                },
+            },
+        );
+        defer runtime.deinit();
+
+        const prepared = try runtime.runWorkerOnce("runtime-reopened-worker-a");
+        try std.testing.expectEqual(@as(usize, 1), prepared.worker_steps);
+        try std.testing.expectEqual(@as(usize, 1), prepared.pages_completed);
+        try std.testing.expectEqual(@as(usize, 0), prepared.phases_advanced);
+        try std.testing.expectEqual(@as(usize, 0), prepared.published);
+        {
+            const stats = runtime.stats();
+            try std.testing.expect(stats.lease_owned);
+            try std.testing.expect(stats.has_lease);
+            try std.testing.expectEqual(Role.worker, stats.role);
+        }
+    }
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.prepare_generation, status.phase);
+    }
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        const resources = coordinator.core.asyncResources();
+        var runtime = try GraphMetricRuntime.init(
+            alloc,
+            resources.store,
+            resources.index_manager,
+            resources.apply_mutex,
+            coordinator.backend_runtime,
+            .{
+                .enabled = true,
+                .role = .coordinator,
+                .runtime_id = "runtime-reopened-coordinator",
+                .lease_owned = true,
+                .owner_id = "runtime-reopened-coordinator",
+                .planned_options = .{
+                    .worker_id = "runtime-reopened-coordinator",
+                    .max_rounds = 1,
+                    .max_metrics_per_round = 8,
+                    .max_pages_per_round = 1,
+                },
+            },
+        );
+        defer runtime.deinit();
+
+        const advanced = try runtime.runCoordinatorOnce(false);
+        try std.testing.expectEqual(@as(usize, 0), advanced.builds_started);
+        try std.testing.expect(advanced.phases_advanced > 0);
+        {
+            const stats = runtime.stats();
+            try std.testing.expect(stats.lease_owned);
+            try std.testing.expect(stats.has_lease);
+            try std.testing.expectEqual(Role.coordinator, stats.role);
+        }
+    }
+
+    const workers = [_][]const u8{ "runtime-reopened-worker-a", "runtime-reopened-worker-b" };
+    var finished = false;
+    var step_index: usize = 0;
+    while (step_index < 400) : (step_index += 1) {
+        const worker_tick = blk: {
+            var worker = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer worker.close();
+
+            const resources = worker.core.asyncResources();
+            var runtime = try GraphMetricRuntime.init(
+                alloc,
+                resources.store,
+                resources.index_manager,
+                resources.apply_mutex,
+                worker.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .worker,
+                    .runtime_id = workers[step_index % workers.len],
+                    .lease_owned = true,
+                    .owner_id = workers[step_index % workers.len],
+                    .planned_options = .{
+                        .worker_id = workers[step_index % workers.len],
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer runtime.deinit();
+            break :blk try runtime.runWorkerOnce(workers[step_index % workers.len]);
+        };
+
+        const coordinator_tick = blk: {
+            var coordinator = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer coordinator.close();
+
+            const resources = coordinator.core.asyncResources();
+            var runtime = try GraphMetricRuntime.init(
+                alloc,
+                resources.store,
+                resources.index_manager,
+                resources.apply_mutex,
+                coordinator.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .coordinator,
+                    .runtime_id = "runtime-reopened-coordinator",
+                    .lease_owned = true,
+                    .owner_id = "runtime-reopened-coordinator",
+                    .planned_options = .{
+                        .worker_id = "runtime-reopened-coordinator",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer runtime.deinit();
+            const tick = try runtime.runCoordinatorOnce(false);
+            const graph_entry = coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("pagerank");
+            defer status.deinit(alloc);
+            if (status.state == .fresh and status.published_generation == target_generation and status.phase == .complete) {
+                try std.testing.expect(status.iterations_completed > 0);
+                finished = true;
+            }
+            break :blk tick;
+        };
+
+        if (finished) break;
+        if (!worker_tick.durableProgressed() and !coordinator_tick.durableProgressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(finished);
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        var published_result = try reader.search(alloc, .{
+            .graph_metric_queries = &.{.{
+                .name = "central",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "pagerank",
+                    .top_k = 2,
+                    .freshness = .fresh,
+                },
+            }},
+            .limit = 0,
+        });
+        defer published_result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), published_result.graph_metric_results.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, published_result.graph_metric_results[0].status.state);
+        try std.testing.expectEqual(target_generation, published_result.graph_metric_results[0].status.published_generation);
+        try std.testing.expectEqual(@as(usize, 2), published_result.graph_metric_results[0].scores.len);
+        try std.testing.expectEqualStrings("doc:d", published_result.graph_metric_results[0].scores[0].node);
+        try std.testing.expect(published_result.graph_metric_results[0].scores[0].score >= published_result.graph_metric_results[0].scores[1].score);
+    }
+}
+
+test "db graph metric runtime background reopened coordinators do not duplicate pagerank publish" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var target_generation: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph_idx",
+            .kind = .graph,
+            .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+            },
+            .sync_level = .write,
+        });
+        try db.runUntilIdle();
+
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        target_generation = graph_entry.index.edge_generation;
+    }
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "pagerank", target_generation);
+        defer started.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+        try std.testing.expectEqual(target_generation, started.building_generation);
+    }
+
+    const workers = [_][]const u8{ "runtime-publish-race-worker-a", "runtime-publish-race-worker-b" };
+    var reached_publish = false;
+    var step_index: usize = 0;
+    while (step_index < 400) : (step_index += 1) {
+        const worker_tick = blk: {
+            var worker = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer worker.close();
+
+            const resources = worker.core.asyncResources();
+            var runtime = try GraphMetricRuntime.init(
+                alloc,
+                resources.store,
+                resources.index_manager,
+                resources.apply_mutex,
+                worker.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .worker,
+                    .lease_owned = true,
+                    .owner_id = workers[step_index % workers.len],
+                    .planned_options = .{
+                        .worker_id = workers[step_index % workers.len],
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer runtime.deinit();
+            break :blk try runtime.runWorkerOnce(workers[step_index % workers.len]);
+        };
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("pagerank");
+            defer status.deinit(alloc);
+            if (status.phase == .publish_generation) {
+                reached_publish = true;
+                break;
+            }
+        }
+
+        const coordinator_tick = blk: {
+            var coordinator = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer coordinator.close();
+
+            const resources = coordinator.core.asyncResources();
+            var runtime = try GraphMetricRuntime.init(
+                alloc,
+                resources.store,
+                resources.index_manager,
+                resources.apply_mutex,
+                coordinator.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .coordinator,
+                    .lease_owned = true,
+                    .owner_id = "runtime-publish-race-coordinator",
+                    .planned_options = .{
+                        .worker_id = "runtime-publish-race-coordinator",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer runtime.deinit();
+            break :blk try runtime.runCoordinatorOnce(false);
+        };
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("pagerank");
+            defer status.deinit(alloc);
+            if (status.phase == .publish_generation) {
+                reached_publish = true;
+                break;
+            }
+        }
+
+        if (!worker_tick.durableProgressed() and !coordinator_tick.durableProgressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(reached_publish);
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        const resources = coordinator.core.asyncResources();
+        var runtime = try GraphMetricRuntime.init(
+            alloc,
+            resources.store,
+            resources.index_manager,
+            resources.apply_mutex,
+            coordinator.backend_runtime,
+            .{
+                .enabled = true,
+                .role = .coordinator,
+                .runtime_id = "runtime-publish-race-coordinator-a",
+                .lease_owned = true,
+                .owner_id = "runtime-publish-race-coordinator-a",
+                .planned_options = .{
+                    .worker_id = "runtime-publish-race-coordinator-a",
+                    .max_rounds = 1,
+                    .max_metrics_per_round = 8,
+                    .max_pages_per_round = 1,
+                },
+            },
+        );
+        defer runtime.deinit();
+
+        const publish = try runtime.runCoordinatorOnce(false);
+        try std.testing.expect(publish.phases_advanced > 0);
+        try std.testing.expectEqual(@as(usize, 0), publish.worker_steps);
+        const publish_stats = runtime.stats();
+        try std.testing.expect(publish_stats.lease_owned);
+        try std.testing.expect(publish_stats.has_lease);
+        try std.testing.expectEqual(Role.coordinator, publish_stats.role);
+
+        {
+            var live_duplicate_coordinator = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer live_duplicate_coordinator.close();
+
+            const duplicate_resources = live_duplicate_coordinator.core.asyncResources();
+            var duplicate_runtime = try GraphMetricRuntime.init(
+                alloc,
+                duplicate_resources.store,
+                duplicate_resources.index_manager,
+                duplicate_resources.apply_mutex,
+                live_duplicate_coordinator.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .coordinator,
+                    .runtime_id = "runtime-publish-race-coordinator-b",
+                    .lease_owned = true,
+                    .owner_id = "runtime-publish-race-coordinator-b",
+                    .planned_options = .{
+                        .worker_id = "runtime-publish-race-coordinator-b",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer duplicate_runtime.deinit();
+
+            const live_duplicate = try duplicate_runtime.runCoordinatorOnce(false);
+            try std.testing.expectEqual(@as(usize, 0), live_duplicate.phases_advanced);
+            try std.testing.expectEqual(@as(usize, 0), live_duplicate.published);
+            try std.testing.expectEqual(@as(usize, 0), live_duplicate.worker_steps);
+            const live_duplicate_stats = duplicate_runtime.stats();
+            try std.testing.expect(live_duplicate_stats.lease_owned);
+            try std.testing.expect(!live_duplicate_stats.has_lease);
+            try std.testing.expectEqual(@as(u64, 1), live_duplicate_stats.lease_acquire_failures);
+            try std.testing.expectEqual(Role.coordinator, live_duplicate_stats.role);
+        }
+
+        const graph_entry = coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, status.phase);
+        try std.testing.expectEqual(target_generation, status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), status.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, status.recent_events[0].kind);
+    }
+
+    {
+        var duplicate_coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer duplicate_coordinator.close();
+
+        const resources = duplicate_coordinator.core.asyncResources();
+        var runtime = try GraphMetricRuntime.init(
+            alloc,
+            resources.store,
+            resources.index_manager,
+            resources.apply_mutex,
+            duplicate_coordinator.backend_runtime,
+            .{
+                .enabled = true,
+                .role = .coordinator,
+                .runtime_id = "runtime-publish-race-coordinator-b",
+                .lease_owned = true,
+                .owner_id = "runtime-publish-race-coordinator-b",
+                .planned_options = .{
+                    .worker_id = "runtime-publish-race-coordinator-b",
+                    .max_rounds = 1,
+                    .max_metrics_per_round = 8,
+                    .max_pages_per_round = 1,
+                },
+            },
+        );
+        defer runtime.deinit();
+
+        const duplicate = try runtime.runCoordinatorOnce(false);
+        try std.testing.expectEqual(@as(usize, 0), duplicate.phases_advanced);
+        try std.testing.expectEqual(@as(usize, 0), duplicate.published);
+        try std.testing.expectEqual(@as(usize, 0), duplicate.worker_steps);
+        const duplicate_stats = runtime.stats();
+        try std.testing.expect(duplicate_stats.lease_owned);
+        try std.testing.expect(duplicate_stats.has_lease);
+        try std.testing.expectEqual(Role.coordinator, duplicate_stats.role);
+
+        const graph_entry = duplicate_coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, status.phase);
+        try std.testing.expectEqual(target_generation, status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), status.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, status.recent_events[0].kind);
+    }
+
+    {
+        var worker = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer worker.close();
+
+        var cleanup_finished = false;
+        for (0..12) |_| {
+            const resources = worker.core.asyncResources();
+            var runtime = try GraphMetricRuntime.init(
+                alloc,
+                resources.store,
+                resources.index_manager,
+                resources.apply_mutex,
+                worker.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .worker,
+                    .lease_owned = true,
+                    .owner_id = "runtime-publish-race-cleaner",
+                    .planned_options = .{
+                        .worker_id = "runtime-publish-race-cleaner",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer runtime.deinit();
+
+            const cleanup = try runtime.runWorkerOnce("runtime-publish-race-cleaner");
+            try std.testing.expectEqual(@as(usize, 0), cleanup.phases_advanced);
+            try std.testing.expectEqual(@as(usize, 0), cleanup.published);
+            const graph_entry = worker.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("pagerank");
+            defer status.deinit(alloc);
+            if (status.state == .fresh and status.phase == .complete) {
+                cleanup_finished = true;
+                break;
+            }
+        }
+        try std.testing.expect(cleanup_finished);
+    }
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, status.phase);
+        try std.testing.expectEqual(target_generation, status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), status.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, status.recent_events[0].kind);
+    }
+}
+
+test "db graph metric runtime background reopened coordinators do not duplicate eigenvector publish" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var target_generation: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph_idx",
+            .kind = .graph,
+            .config_json = "{\"metrics\":{\"eigenvector\":{\"enabled\":true,\"kind\":\"eigenvector\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+            },
+            .sync_level = .write,
+        });
+        try db.runUntilIdle();
+
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        target_generation = graph_entry.index.edge_generation;
+    }
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "eigenvector", target_generation);
+        defer started.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+        try std.testing.expectEqual(target_generation, started.building_generation);
+    }
+
+    const workers = [_][]const u8{ "runtime-eigenvector-publish-race-worker-a", "runtime-eigenvector-publish-race-worker-b" };
+    var reached_publish = false;
+    var step_index: usize = 0;
+    while (step_index < 400) : (step_index += 1) {
+        const worker_tick = blk: {
+            var worker = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer worker.close();
+
+            const resources = worker.core.asyncResources();
+            var runtime = try GraphMetricRuntime.init(
+                alloc,
+                resources.store,
+                resources.index_manager,
+                resources.apply_mutex,
+                worker.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .worker,
+                    .lease_owned = true,
+                    .owner_id = workers[step_index % workers.len],
+                    .planned_options = .{
+                        .worker_id = workers[step_index % workers.len],
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer runtime.deinit();
+            break :blk try runtime.runWorkerOnce(workers[step_index % workers.len]);
+        };
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("eigenvector");
+            defer status.deinit(alloc);
+            if (status.phase == .publish_generation) {
+                reached_publish = true;
+                break;
+            }
+        }
+
+        const coordinator_tick = blk: {
+            var coordinator = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer coordinator.close();
+
+            const resources = coordinator.core.asyncResources();
+            var runtime = try GraphMetricRuntime.init(
+                alloc,
+                resources.store,
+                resources.index_manager,
+                resources.apply_mutex,
+                coordinator.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .coordinator,
+                    .lease_owned = true,
+                    .owner_id = "runtime-eigenvector-publish-race-coordinator",
+                    .planned_options = .{
+                        .worker_id = "runtime-eigenvector-publish-race-coordinator",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer runtime.deinit();
+            break :blk try runtime.runCoordinatorOnce(false);
+        };
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("eigenvector");
+            defer status.deinit(alloc);
+            if (status.phase == .publish_generation) {
+                reached_publish = true;
+                break;
+            }
+        }
+
+        if (!worker_tick.durableProgressed() and !coordinator_tick.durableProgressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(reached_publish);
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        const resources = coordinator.core.asyncResources();
+        var runtime = try GraphMetricRuntime.init(
+            alloc,
+            resources.store,
+            resources.index_manager,
+            resources.apply_mutex,
+            coordinator.backend_runtime,
+            .{
+                .enabled = true,
+                .role = .coordinator,
+                .runtime_id = "runtime-eigenvector-publish-race-coordinator-a",
+                .lease_owned = true,
+                .owner_id = "runtime-eigenvector-publish-race-coordinator-a",
+                .planned_options = .{
+                    .worker_id = "runtime-eigenvector-publish-race-coordinator-a",
+                    .max_rounds = 1,
+                    .max_metrics_per_round = 8,
+                    .max_pages_per_round = 1,
+                },
+            },
+        );
+        defer runtime.deinit();
+
+        const publish = try runtime.runCoordinatorOnce(false);
+        try std.testing.expect(publish.phases_advanced > 0);
+        try std.testing.expectEqual(@as(usize, 0), publish.worker_steps);
+        const publish_stats = runtime.stats();
+        try std.testing.expect(publish_stats.lease_owned);
+        try std.testing.expect(publish_stats.has_lease);
+        try std.testing.expectEqual(Role.coordinator, publish_stats.role);
+
+        {
+            var live_duplicate_coordinator = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer live_duplicate_coordinator.close();
+
+            const duplicate_resources = live_duplicate_coordinator.core.asyncResources();
+            var duplicate_runtime = try GraphMetricRuntime.init(
+                alloc,
+                duplicate_resources.store,
+                duplicate_resources.index_manager,
+                duplicate_resources.apply_mutex,
+                live_duplicate_coordinator.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .coordinator,
+                    .runtime_id = "runtime-eigenvector-publish-race-coordinator-b",
+                    .lease_owned = true,
+                    .owner_id = "runtime-eigenvector-publish-race-coordinator-b",
+                    .planned_options = .{
+                        .worker_id = "runtime-eigenvector-publish-race-coordinator-b",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer duplicate_runtime.deinit();
+
+            const live_duplicate = try duplicate_runtime.runCoordinatorOnce(false);
+            try std.testing.expectEqual(@as(usize, 0), live_duplicate.phases_advanced);
+            try std.testing.expectEqual(@as(usize, 0), live_duplicate.published);
+            try std.testing.expectEqual(@as(usize, 0), live_duplicate.worker_steps);
+            const live_duplicate_stats = duplicate_runtime.stats();
+            try std.testing.expect(live_duplicate_stats.lease_owned);
+            try std.testing.expect(!live_duplicate_stats.has_lease);
+            try std.testing.expectEqual(@as(u64, 1), live_duplicate_stats.lease_acquire_failures);
+            try std.testing.expectEqual(Role.coordinator, live_duplicate_stats.role);
+        }
+
+        const graph_entry = coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("eigenvector");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, status.phase);
+        try std.testing.expectEqual(target_generation, status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), status.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, status.recent_events[0].kind);
+    }
+
+    {
+        var duplicate_coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer duplicate_coordinator.close();
+
+        const resources = duplicate_coordinator.core.asyncResources();
+        var runtime = try GraphMetricRuntime.init(
+            alloc,
+            resources.store,
+            resources.index_manager,
+            resources.apply_mutex,
+            duplicate_coordinator.backend_runtime,
+            .{
+                .enabled = true,
+                .role = .coordinator,
+                .runtime_id = "runtime-eigenvector-publish-race-coordinator-b",
+                .lease_owned = true,
+                .owner_id = "runtime-eigenvector-publish-race-coordinator-b",
+                .planned_options = .{
+                    .worker_id = "runtime-eigenvector-publish-race-coordinator-b",
+                    .max_rounds = 1,
+                    .max_metrics_per_round = 8,
+                    .max_pages_per_round = 1,
+                },
+            },
+        );
+        defer runtime.deinit();
+
+        const duplicate = try runtime.runCoordinatorOnce(false);
+        try std.testing.expectEqual(@as(usize, 0), duplicate.phases_advanced);
+        try std.testing.expectEqual(@as(usize, 0), duplicate.published);
+        try std.testing.expectEqual(@as(usize, 0), duplicate.worker_steps);
+        const duplicate_stats = runtime.stats();
+        try std.testing.expect(duplicate_stats.lease_owned);
+        try std.testing.expect(duplicate_stats.has_lease);
+        try std.testing.expectEqual(Role.coordinator, duplicate_stats.role);
+
+        const graph_entry = duplicate_coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("eigenvector");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, status.phase);
+        try std.testing.expectEqual(target_generation, status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), status.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, status.recent_events[0].kind);
+    }
+
+    {
+        var worker = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer worker.close();
+
+        var cleanup_finished = false;
+        for (0..12) |_| {
+            const resources = worker.core.asyncResources();
+            var runtime = try GraphMetricRuntime.init(
+                alloc,
+                resources.store,
+                resources.index_manager,
+                resources.apply_mutex,
+                worker.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .worker,
+                    .lease_owned = true,
+                    .owner_id = "runtime-eigenvector-publish-race-cleaner",
+                    .planned_options = .{
+                        .worker_id = "runtime-eigenvector-publish-race-cleaner",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer runtime.deinit();
+
+            const cleanup = try runtime.runWorkerOnce("runtime-eigenvector-publish-race-cleaner");
+            try std.testing.expectEqual(@as(usize, 0), cleanup.phases_advanced);
+            try std.testing.expectEqual(@as(usize, 0), cleanup.published);
+            const graph_entry = worker.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("eigenvector");
+            defer status.deinit(alloc);
+            if (status.state == .fresh and status.phase == .complete) {
+                cleanup_finished = true;
+                break;
+            }
+        }
+        try std.testing.expect(cleanup_finished);
+    }
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("eigenvector");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, status.phase);
+        try std.testing.expectEqual(target_generation, status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), status.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, status.recent_events[0].kind);
+    }
+}
+
+test "db graph metric runtime background reopened coordinators do not duplicate hits publish" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var target_generation: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph_idx",
+            .kind = .graph,
+            .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:hub_a", .value = "{\"title\":\"hub a\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:hub_b", .value = "{\"title\":\"hub b\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:authority", .value = "{\"title\":\"authority\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            },
+            .sync_level = .write,
+        });
+        try db.runUntilIdle();
+
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        target_generation = graph_entry.index.edge_generation;
+    }
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "hits_authority", target_generation);
+        defer started.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+        try std.testing.expectEqual(target_generation, started.building_generation);
+    }
+
+    const workers = [_][]const u8{ "runtime-hits-publish-race-worker-a", "runtime-hits-publish-race-worker-b" };
+    var reached_publish = false;
+    var step_index: usize = 0;
+    while (step_index < 400) : (step_index += 1) {
+        const worker_tick = blk: {
+            var worker = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer worker.close();
+
+            const resources = worker.core.asyncResources();
+            var runtime = try GraphMetricRuntime.init(
+                alloc,
+                resources.store,
+                resources.index_manager,
+                resources.apply_mutex,
+                worker.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .worker,
+                    .lease_owned = true,
+                    .owner_id = workers[step_index % workers.len],
+                    .planned_options = .{
+                        .worker_id = workers[step_index % workers.len],
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer runtime.deinit();
+            break :blk try runtime.runWorkerOnce(workers[step_index % workers.len]);
+        };
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("hits_authority");
+            defer status.deinit(alloc);
+            if (status.phase == .publish_generation) {
+                reached_publish = true;
+                break;
+            }
+        }
+
+        const coordinator_tick = blk: {
+            var coordinator = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer coordinator.close();
+
+            const resources = coordinator.core.asyncResources();
+            var runtime = try GraphMetricRuntime.init(
+                alloc,
+                resources.store,
+                resources.index_manager,
+                resources.apply_mutex,
+                coordinator.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .coordinator,
+                    .lease_owned = true,
+                    .owner_id = "runtime-hits-publish-race-coordinator",
+                    .planned_options = .{
+                        .worker_id = "runtime-hits-publish-race-coordinator",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer runtime.deinit();
+            break :blk try runtime.runCoordinatorOnce(false);
+        };
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("hits_authority");
+            defer status.deinit(alloc);
+            if (status.phase == .publish_generation) {
+                reached_publish = true;
+                break;
+            }
+        }
+
+        if (!worker_tick.durableProgressed() and !coordinator_tick.durableProgressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(reached_publish);
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        const resources = coordinator.core.asyncResources();
+        var runtime = try GraphMetricRuntime.init(
+            alloc,
+            resources.store,
+            resources.index_manager,
+            resources.apply_mutex,
+            coordinator.backend_runtime,
+            .{
+                .enabled = true,
+                .role = .coordinator,
+                .runtime_id = "runtime-hits-publish-race-coordinator-a",
+                .lease_owned = true,
+                .owner_id = "runtime-hits-publish-race-coordinator-a",
+                .planned_options = .{
+                    .worker_id = "runtime-hits-publish-race-coordinator-a",
+                    .max_rounds = 1,
+                    .max_metrics_per_round = 8,
+                    .max_pages_per_round = 1,
+                },
+            },
+        );
+        defer runtime.deinit();
+
+        const publish = try runtime.runCoordinatorOnce(false);
+        try std.testing.expect(publish.phases_advanced > 0);
+        try std.testing.expectEqual(@as(usize, 0), publish.worker_steps);
+        const publish_stats = runtime.stats();
+        try std.testing.expect(publish_stats.lease_owned);
+        try std.testing.expect(publish_stats.has_lease);
+        try std.testing.expectEqual(Role.coordinator, publish_stats.role);
+
+        {
+            var live_duplicate_coordinator = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer live_duplicate_coordinator.close();
+
+            const duplicate_resources = live_duplicate_coordinator.core.asyncResources();
+            var duplicate_runtime = try GraphMetricRuntime.init(
+                alloc,
+                duplicate_resources.store,
+                duplicate_resources.index_manager,
+                duplicate_resources.apply_mutex,
+                live_duplicate_coordinator.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .coordinator,
+                    .runtime_id = "runtime-hits-publish-race-coordinator-b",
+                    .lease_owned = true,
+                    .owner_id = "runtime-hits-publish-race-coordinator-b",
+                    .planned_options = .{
+                        .worker_id = "runtime-hits-publish-race-coordinator-b",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer duplicate_runtime.deinit();
+
+            const live_duplicate = try duplicate_runtime.runCoordinatorOnce(false);
+            try std.testing.expectEqual(@as(usize, 0), live_duplicate.phases_advanced);
+            try std.testing.expectEqual(@as(usize, 0), live_duplicate.published);
+            try std.testing.expectEqual(@as(usize, 0), live_duplicate.worker_steps);
+            const live_duplicate_stats = duplicate_runtime.stats();
+            try std.testing.expect(live_duplicate_stats.lease_owned);
+            try std.testing.expect(!live_duplicate_stats.has_lease);
+            try std.testing.expectEqual(@as(u64, 1), live_duplicate_stats.lease_acquire_failures);
+            try std.testing.expectEqual(Role.coordinator, live_duplicate_stats.role);
+        }
+
+        const graph_entry = coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var authority = try graph_entry.index.graphMetricStatus("hits_authority");
+        defer authority.deinit(alloc);
+        var hub = try graph_entry.index.graphMetricStatus("hits_hub");
+        defer hub.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, authority.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, hub.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, authority.phase);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, hub.phase);
+        try std.testing.expectEqual(target_generation, authority.published_generation);
+        try std.testing.expectEqual(authority.published_generation, hub.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), authority.recent_events.len);
+        try std.testing.expectEqual(@as(usize, 1), hub.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, authority.recent_events[0].kind);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, hub.recent_events[0].kind);
+    }
+
+    {
+        var duplicate_coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer duplicate_coordinator.close();
+
+        const resources = duplicate_coordinator.core.asyncResources();
+        var runtime = try GraphMetricRuntime.init(
+            alloc,
+            resources.store,
+            resources.index_manager,
+            resources.apply_mutex,
+            duplicate_coordinator.backend_runtime,
+            .{
+                .enabled = true,
+                .role = .coordinator,
+                .runtime_id = "runtime-hits-publish-race-coordinator-b",
+                .lease_owned = true,
+                .owner_id = "runtime-hits-publish-race-coordinator-b",
+                .planned_options = .{
+                    .worker_id = "runtime-hits-publish-race-coordinator-b",
+                    .max_rounds = 1,
+                    .max_metrics_per_round = 8,
+                    .max_pages_per_round = 1,
+                },
+            },
+        );
+        defer runtime.deinit();
+
+        const duplicate = try runtime.runCoordinatorOnce(false);
+        try std.testing.expectEqual(@as(usize, 0), duplicate.phases_advanced);
+        try std.testing.expectEqual(@as(usize, 0), duplicate.published);
+        try std.testing.expectEqual(@as(usize, 0), duplicate.worker_steps);
+        const duplicate_stats = runtime.stats();
+        try std.testing.expect(duplicate_stats.lease_owned);
+        try std.testing.expect(duplicate_stats.has_lease);
+        try std.testing.expectEqual(Role.coordinator, duplicate_stats.role);
+
+        const graph_entry = duplicate_coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var authority = try graph_entry.index.graphMetricStatus("hits_authority");
+        defer authority.deinit(alloc);
+        var hub = try graph_entry.index.graphMetricStatus("hits_hub");
+        defer hub.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, authority.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, hub.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, authority.phase);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, hub.phase);
+        try std.testing.expectEqual(target_generation, authority.published_generation);
+        try std.testing.expectEqual(authority.published_generation, hub.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), authority.recent_events.len);
+        try std.testing.expectEqual(@as(usize, 1), hub.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, authority.recent_events[0].kind);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, hub.recent_events[0].kind);
+    }
+
+    {
+        var worker = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer worker.close();
+
+        var cleanup_finished = false;
+        for (0..12) |_| {
+            const resources = worker.core.asyncResources();
+            var runtime = try GraphMetricRuntime.init(
+                alloc,
+                resources.store,
+                resources.index_manager,
+                resources.apply_mutex,
+                worker.backend_runtime,
+                .{
+                    .enabled = true,
+                    .role = .worker,
+                    .lease_owned = true,
+                    .owner_id = "runtime-hits-publish-race-cleaner",
+                    .planned_options = .{
+                        .worker_id = "runtime-hits-publish-race-cleaner",
+                        .max_rounds = 1,
+                        .max_metrics_per_round = 8,
+                        .max_pages_per_round = 1,
+                    },
+                },
+            );
+            defer runtime.deinit();
+
+            const cleanup = try runtime.runWorkerOnce("runtime-hits-publish-race-cleaner");
+            try std.testing.expectEqual(@as(usize, 0), cleanup.phases_advanced);
+            try std.testing.expectEqual(@as(usize, 0), cleanup.published);
+            const graph_entry = worker.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var authority = try graph_entry.index.graphMetricStatus("hits_authority");
+            defer authority.deinit(alloc);
+            var hub = try graph_entry.index.graphMetricStatus("hits_hub");
+            defer hub.deinit(alloc);
+            if (authority.state == .fresh and authority.phase == .complete and hub.state == .fresh and hub.phase == .complete) {
+                cleanup_finished = true;
+                break;
+            }
+        }
+        try std.testing.expect(cleanup_finished);
+    }
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var authority = try graph_entry.index.graphMetricStatus("hits_authority");
+        defer authority.deinit(alloc);
+        var hub = try graph_entry.index.graphMetricStatus("hits_hub");
+        defer hub.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, authority.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, hub.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, authority.phase);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, hub.phase);
+        try std.testing.expectEqual(target_generation, authority.published_generation);
+        try std.testing.expectEqual(authority.published_generation, hub.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), authority.recent_events.len);
+        try std.testing.expectEqual(@as(usize, 1), hub.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, authority.recent_events[0].kind);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, hub.recent_events[0].kind);
+    }
+}
+
+test "db graph metric runtime background cycles multiple worker ids across planned pages" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"background\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:hub", .value = "{\"title\":\"hub\"}" }},
+        .sync_level = .write,
+    });
+
+    for (0..130) |i| {
+        const key = try std.fmt.allocPrint(alloc, "doc:{d:0>3}", .{i});
+        defer alloc.free(key);
+        const value = try std.fmt.allocPrint(
+            alloc,
+            "{{\"title\":\"source {d}\",\"_edges\":{{\"graph_idx\":{{\"cites\":[{{\"target\":\"doc:hub\",\"weight\":1.0}}]}}}}}}",
+            .{i},
+        );
+        defer alloc.free(value);
+        try db.batch(.{
+            .writes = &.{.{ .key = key, .value = value }},
+            .sync_level = .write,
+        });
+    }
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const workers = [_][]const u8{ "runtime-worker-a", "runtime-worker-b" };
+    const resources = db.core.asyncResources();
+    var runtime = try GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .planned_options = .{
+                .worker_ids = &workers,
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 2,
+            },
+        },
+    );
+    defer runtime.deinit();
+
+    const prepare_tick = try runtime.runOnceDetailed();
+    try std.testing.expectEqual(@as(usize, 1), prepare_tick.builds_started);
+    try std.testing.expectEqual(@as(usize, 2), prepare_tick.worker_steps);
+    try std.testing.expectEqual(@as(usize, 1), prepare_tick.pages_completed);
+    try std.testing.expect(prepare_tick.phases_advanced > 0);
+
+    const scan_tick = try runtime.runOnceDetailed();
+    try std.testing.expectEqual(@as(usize, 0), scan_tick.builds_started);
+    try std.testing.expectEqual(@as(usize, 2), scan_tick.worker_steps);
+    try std.testing.expectEqual(@as(usize, 2), scan_tick.pages_completed);
+    try std.testing.expectEqual(@as(usize, 0), scan_tick.phases_advanced);
+
+    var steps: usize = 0;
+    while (try runtime.runOnce()) {
+        steps += 1;
+        if (steps > 200) return error.TestUnexpectedResult;
+    }
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+    }
+
+    var metric_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "degree",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 1,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer metric_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, metric_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(@as(usize, 1), metric_result.graph_metric_results[0].scores.len);
+    try std.testing.expectEqualStrings("doc:hub", metric_result.graph_metric_results[0].scores[0].node);
+    try std.testing.expectApproxEqAbs(@as(f64, 130.0), metric_result.graph_metric_results[0].scores[0].score, 0.001);
+}
+
 test "db graph metric runtime query public reads fail not ready before first publish" {
     const DB = @import("../mod.zig").DB;
     const db_test_support = @import("../test_support.zig");

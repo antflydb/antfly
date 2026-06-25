@@ -1116,7 +1116,11 @@ Generated grammar work needs evidence at multiple levels:
   dispatch, generated read AST kind now drives parsed-statement read-family
   classification for generated-covered reads with fail-closed classifier
   disagreement checks plus generated pagination payload consistency checks
-  before a parsed read family is assigned, and generated-family validation wrappers over
+  before a parsed read family is assigned; generated read classification also
+  validates retained statement/command spans, top-level `WITH`/`SELECT`
+  boundary metadata, projection/source/join/predicate/group/window/order/result-tail
+  ranges, and CTE count/first/last/body range compatibility before publishing
+  the parsed read family, and generated-family validation wrappers over
   representative query, aggregate, join, lateral, and non-recursive CTE plans,
   AST-shape coverage for
   generated-ranged multi-CTE and recursive CTE

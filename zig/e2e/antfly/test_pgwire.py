@@ -252,6 +252,26 @@ def test_pgwire_ready_for_query_tracks_transaction_status(pgwire_server):
     assert [message["status"] for message in rollback_messages if message["type"] == "ready"] == ["I"]
 
 
+def test_pgwire_failed_transaction_reports_error_status_until_rollback(pgwire_server):
+    table = _table_name("pgwire_failed_tx")
+
+    with socket.create_connection((pgwire_server.host, pgwire_server.pgwire_port), timeout=5) as sock:
+        _pgwire_startup(sock)
+        begin_messages = _pgwire_simple_query(sock, "BEGIN;")
+        missing_messages = _pgwire_simple_query_error(sock, "SELECT id FROM missing_pgwire_table;")
+        blocked_messages = _pgwire_simple_query_error(sock, f"CREATE TABLE {table} (id text PRIMARY KEY);")
+        rollback_messages = _pgwire_simple_query(sock, "ROLLBACK;")
+        create_messages = _pgwire_simple_query(sock, f"CREATE TABLE {table} (id text PRIMARY KEY);")
+
+    assert [message["status"] for message in begin_messages if message["type"] == "ready"] == ["T"]
+    assert [message["status"] for message in missing_messages if message["type"] == "ready"] == ["E"]
+    assert [message["status"] for message in blocked_messages if message["type"] == "ready"] == ["E"]
+    assert any("current transaction is aborted" in message["message"] for message in blocked_messages if message["type"] == "error")
+    assert [message["status"] for message in rollback_messages if message["type"] == "ready"] == ["I"]
+    assert [message["tag"] for message in create_messages if message["type"] == "command"] == ["CREATE TABLE"]
+    assert [message["status"] for message in create_messages if message["type"] == "ready"] == ["I"]
+
+
 def test_pgwire_extended_query_binds_text_parameters(pgwire_server):
     table = _table_name("pgwire_extended")
 
@@ -403,6 +423,21 @@ def _pgwire_simple_query(sock: socket.socket, sql: str) -> list[dict[str, Any]]:
             messages.append({"type": "message", "tag": tag.decode(errors="replace"), "columns": columns})
 
 
+def _pgwire_simple_query_error(sock: socket.socket, sql: str) -> list[dict[str, Any]]:
+    payload = sql.encode() + b"\x00"
+    sock.sendall(b"Q" + struct.pack("!i", len(payload) + 4) + payload)
+    messages: list[dict[str, Any]] = []
+    while True:
+        tag, payload = _pgwire_read_message(sock)
+        if tag == b"E":
+            messages.append({"type": "error", **_pgwire_error_response(payload)})
+        elif tag == b"Z":
+            messages.append({"type": "ready", "status": payload.decode()})
+            return messages
+        else:
+            messages.append({"type": "message", "tag": tag.decode(errors="replace")})
+
+
 def _pgwire_extended_query(sock: socket.socket, sql: str, params: list[str | None]) -> list[dict[str, Any]]:
     statement_name = b""
     portal_name = b""
@@ -523,6 +558,18 @@ def _pgwire_parameter_description(payload: bytes) -> list[int]:
         oids.append(struct.unpack("!i", payload[offset : offset + 4])[0])
         offset += 4
     return oids
+
+
+def _pgwire_error_response(payload: bytes) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    offset = 0
+    while offset < len(payload) and payload[offset] != 0:
+        field = chr(payload[offset])
+        offset += 1
+        end = payload.index(b"\x00", offset)
+        fields[field] = payload[offset:end].decode()
+        offset = end + 1
+    return {"severity": fields.get("S", ""), "sqlstate": fields.get("C", ""), "message": fields.get("M", "")}
 
 
 def _pgwire_data_row(payload: bytes) -> list[str | None]:

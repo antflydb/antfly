@@ -1187,6 +1187,36 @@ fn generatedReadAstHasValidClassificationPayload(
     tokens: []const Token,
     read_ast: generated_parser.GeneratedSqlReadAst,
 ) bool {
+    const end = generatedReadStatementEnd(tokens, read_ast.statement_span) orelse return false;
+    const select_index = generatedReadSelectIndex(tokens, end, read_ast) orelse return false;
+    if (!std.meta.eql(read_ast.command_span, tokens[select_index].sourceSpan())) return false;
+    if (read_ast.projection_tokens) |projection| {
+        if (!generatedReadTokenRangeIsValidThrough(tokens, end, projection)) return false;
+        if (projection.start <= select_index) return false;
+    } else return false;
+
+    if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.distinct_tokens)) return false;
+    if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.source_tokens)) return false;
+    if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.source_graph_function_tokens)) return false;
+    if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.source_graph_function_name_tokens)) return false;
+    if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.source_graph_function_argument_tokens)) return false;
+    if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.join_tokens)) return false;
+    if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.join_operator_tokens)) return false;
+    if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.join_left_tokens)) return false;
+    if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.join_right_tokens)) return false;
+    if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.join_predicate_tokens)) return false;
+    if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.where_tokens)) return false;
+    if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.group_tokens)) return false;
+    if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.having_tokens)) return false;
+    if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.window_tokens)) return false;
+    if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.order_tokens)) return false;
+    if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.limit_tokens)) return false;
+    if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.offset_tokens)) return false;
+    if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.fetch_tokens)) return false;
+    if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.fetch_count_tokens)) return false;
+    if (!generatedReadOptionalTokenRangeIsValidThrough(tokens, end, read_ast.set_operation_tokens)) return false;
+    if (!generatedReadCtePayloadIsValid(tokens, end, select_index, read_ast)) return false;
+
     if (!generatedReadPaginationPayloadIsValid(
         tokens,
         read_ast.limit_tokens,
@@ -1213,6 +1243,131 @@ fn generatedReadAstHasValidClassificationPayload(
         )) return false;
     }
     return true;
+}
+
+fn generatedReadStatementEnd(tokens: []const Token, statement_span: SourceSpan) ?usize {
+    if (tokens.len == 0) return null;
+    var end = tokens.len;
+    while (end > 0 and tokens[end - 1].kind == .semicolon) {
+        end -= 1;
+    }
+    if (end == 0) return null;
+    if (tokens[0].sourceSpan().start != statement_span.start) return null;
+    if (tokens[end - 1].sourceSpan().end != statement_span.end) return null;
+    return end;
+}
+
+fn generatedReadSelectIndex(
+    tokens: []const Token,
+    end: usize,
+    read_ast: generated_parser.GeneratedSqlReadAst,
+) ?usize {
+    if (end == 0 or end > tokens.len) return null;
+    if (read_ast.cte_tokens) |cte_tokens| {
+        if (!generatedReadTokenRangeIsValidThrough(tokens, end, cte_tokens)) return null;
+        if (cte_tokens.start != 1 or cte_tokens.end >= end) return null;
+        if (!tokens[0].matchesKeywordTag(.with)) return null;
+        const recursive = cte_tokens.start < cte_tokens.end and tokens[cte_tokens.start].matchesKeywordTag(.recursive);
+        if (recursive != read_ast.cte_recursive) return null;
+        return if (tokens[cte_tokens.end].matchesKeywordTag(.select)) cte_tokens.end else null;
+    }
+    if (read_ast.cte_recursive or read_ast.cte_items.len != 0 or read_ast.cte_count != 0) return null;
+    if (tokens[0].matchesKeywordTag(.with)) return null;
+    return if (tokens[0].matchesKeywordTag(.select)) 0 else null;
+}
+
+fn generatedReadCtePayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    select_index: usize,
+    read_ast: generated_parser.GeneratedSqlReadAst,
+) bool {
+    if (read_ast.cte_tokens == null) {
+        return read_ast.cte_list_tokens == null and
+            read_ast.cte_name_tokens == null and
+            read_ast.cte_body_tokens == null and
+            read_ast.cte_last_name_tokens == null and
+            read_ast.cte_last_body_tokens == null and
+            read_ast.cte_items.len == 0 and
+            read_ast.cte_count == 0 and
+            !read_ast.cte_recursive;
+    }
+
+    const cte_tokens = read_ast.cte_tokens.?;
+    if (cte_tokens.end != select_index) return false;
+    const list_tokens = read_ast.cte_list_tokens orelse return false;
+    if (!generatedReadTokenRangeIsValidThrough(tokens, end, list_tokens)) return false;
+    if (list_tokens.start < cte_tokens.start or list_tokens.end != cte_tokens.end) return false;
+    if (read_ast.cte_count == 0 or read_ast.cte_count != read_ast.cte_items.len) return false;
+    if (read_ast.cte_name_tokens == null or read_ast.cte_body_tokens == null or read_ast.cte_last_name_tokens == null or read_ast.cte_last_body_tokens == null) return false;
+    if (!std.meta.eql(read_ast.cte_items[0].name_tokens, read_ast.cte_name_tokens.?)) return false;
+    if (!std.meta.eql(read_ast.cte_items[read_ast.cte_items.len - 1].name_tokens, read_ast.cte_last_name_tokens.?)) return false;
+    if (!std.meta.eql(read_ast.cte_items[0].body_tokens orelse return false, read_ast.cte_body_tokens.?)) return false;
+    if (!std.meta.eql(read_ast.cte_items[read_ast.cte_items.len - 1].body_tokens orelse return false, read_ast.cte_last_body_tokens.?)) return false;
+
+    for (read_ast.cte_items) |cte| {
+        if (!generatedReadTokenRangeIsValidThrough(tokens, end, cte.name_tokens)) return false;
+        if (!generatedReadOptionalNestedRangeIsValid(tokens, end, list_tokens, cte.column_tokens)) return false;
+        if (!generatedReadOptionalNestedRangeIsValid(tokens, end, list_tokens, cte.column_name_tokens)) return false;
+        if (!generatedReadOptionalNestedRangeIsValid(tokens, end, list_tokens, cte.materialization_tokens)) return false;
+        const body = cte.body_tokens orelse return false;
+        if (!generatedReadTokenRangeIsValidThrough(tokens, end, body)) return false;
+        if (body.start == 0 or body.end >= select_index) return false;
+        if (tokens[body.start - 1].kind != .lparen or tokens[body.end].kind != .rparen) return false;
+        if (cte.body_kind == null) return false;
+        if (!std.meta.eql(cte.body_select_tokens orelse return false, generated_parser.GeneratedSqlTokenRange{ .start = body.start, .end = body.start + 1 })) return false;
+        if (!tokens[body.start].matchesKeywordTag(.select)) return false;
+        if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_distinct_tokens)) return false;
+        if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_projection_tokens)) return false;
+        if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_source_tokens)) return false;
+        if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_join_tokens)) return false;
+        if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_join_operator_tokens)) return false;
+        if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_join_left_tokens)) return false;
+        if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_join_right_tokens)) return false;
+        if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_join_predicate_tokens)) return false;
+        if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_where_tokens)) return false;
+        if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_group_tokens)) return false;
+        if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_having_tokens)) return false;
+        if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_window_tokens)) return false;
+        if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_order_tokens)) return false;
+        if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_limit_tokens)) return false;
+        if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_offset_tokens)) return false;
+        if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_fetch_tokens)) return false;
+        if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_fetch_count_tokens)) return false;
+        if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_set_operation_tokens)) return false;
+        if (cte.body_projection_tokens == null) return false;
+    }
+    return true;
+}
+
+fn generatedReadOptionalNestedRangeIsValid(
+    tokens: []const Token,
+    end: usize,
+    outer: generated_parser.GeneratedSqlTokenRange,
+    range: ?generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (range) |inner| {
+        if (!generatedReadTokenRangeIsValidThrough(tokens, end, inner)) return false;
+        return inner.start >= outer.start and inner.end <= outer.end;
+    }
+    return true;
+}
+
+fn generatedReadOptionalTokenRangeIsValidThrough(
+    tokens: []const Token,
+    end: usize,
+    range: ?generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (range) |value| return generatedReadTokenRangeIsValidThrough(tokens, end, value);
+    return true;
+}
+
+fn generatedReadTokenRangeIsValidThrough(
+    tokens: []const Token,
+    end: usize,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    return end <= tokens.len and range.start < range.end and range.end <= end;
 }
 
 fn generatedReadPaginationPayloadIsValid(
@@ -3861,6 +4016,20 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
     try std.testing.expect(generated_offset_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_offset_query.statement));
 
+    var malformed_command_span = generated_query.generated_statement.?;
+    if (malformed_command_span.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |*read_ast| read_ast.command_span = .{ .start = read_ast.command_span.start + 1, .end = read_ast.command_span.end },
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_query.tokenized_sql.read_statement_kind = .query;
+    generated_query.statement = parseStatement(generated_query.raw_statement, malformed_command_span, &generated_query.tokenized_sql);
+    try std.testing.expect(generated_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_query.statement));
+
     var generated_cte = try ParsedSql.initAlloc(alloc, "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows");
     defer generated_cte.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_cte.generatedStatementKind().?);
@@ -3875,6 +4044,19 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
         return error.TestUnexpectedResult;
     }
     generated_cte.statement = parseStatement(generated_cte.raw_statement, malformed_generated, &generated_cte.tokenized_sql);
+    try std.testing.expect(generated_cte.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_cte.statement));
+
+    var malformed_cte_count = generated_cte.generated_statement.?;
+    if (malformed_cte_count.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |*read_ast| read_ast.cte_count += 1,
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_cte.statement = parseStatement(generated_cte.raw_statement, malformed_cte_count, &generated_cte.tokenized_sql);
     try std.testing.expect(generated_cte.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_cte.statement));
 }
