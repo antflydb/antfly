@@ -21,6 +21,8 @@ const (
 	defaultDocsafMaxMergeRequestBytes  int64 = 48 << 20
 	defaultDocsafMaxInlineContentBytes int64 = 3 << 20
 	defaultDriveMaxInlineContentBytes  int64 = 100 << 20
+	defaultDocsafEmbeddingProvider           = "antfly"
+	defaultDocsafEmbeddingModel              = "antflydb/clipclap:gguf:Q4_K"
 )
 
 // StringSliceFlag allows repeated flags to build a slice.
@@ -288,7 +290,9 @@ func loadCmd(args []string) error {
 	authToken := fs.String("token", "", "Bearer token for Antfly Cloud auth; falls back to ANTFLY_TOKEN or ANTFLY_AUTH_TOKEN")
 	chunkSize := fs.Int("chunk-size", 512, "Target characters/tokens for unit-derived chunks")
 	chunkOverlap := fs.Int("chunk-overlap", 50, "Overlap for unit-derived chunks")
-	embeddingModel := fs.String("embedding-model", "embeddinggemma", "Ollama embedding model for managed vector search")
+	embeddingProvider := fs.String("embedding-provider", defaultDocsafEmbeddingProvider, "Embedding provider for managed vector search")
+	embeddingModel := fs.String("embedding-model", defaultDocsafEmbeddingModel, "Embedding model for managed vector search")
+	embeddingConfigJSON := fs.String("embedding-config-json", "", "Full JSON Antfly SDK EmbedderConfig for managed vector search; overrides --embedding-provider and --embedding-model")
 	embeddingDims := fs.Int("embedding-dims", 0, "Expected embedding dimensions; 0 lets Antfly probe the embedder")
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
@@ -321,7 +325,7 @@ func loadCmd(args []string) error {
 
 	if *createTable {
 		fmt.Printf("Creating table '%s' with derived document hierarchy indexes...\n", *tableName)
-		indexes, err := createHierarchyIndexes(*chunkSize, *chunkOverlap, *embeddingModel, *embeddingDims)
+		indexes, err := createHierarchyIndexes(*chunkSize, *chunkOverlap, *embeddingProvider, *embeddingModel, *embeddingConfigJSON, *embeddingDims)
 		if err != nil {
 			return fmt.Errorf("building hierarchy index config: %w", err)
 		}
@@ -359,7 +363,9 @@ func syncCmd(args []string) error {
 	authToken := fs.String("token", "", "Bearer token for Antfly Cloud auth; falls back to ANTFLY_TOKEN or ANTFLY_AUTH_TOKEN")
 	chunkSize := fs.Int("chunk-size", 512, "Target characters/tokens for unit-derived chunks")
 	chunkOverlap := fs.Int("chunk-overlap", 50, "Overlap for unit-derived chunks")
-	embeddingModel := fs.String("embedding-model", "embeddinggemma", "Ollama embedding model for managed vector search")
+	embeddingProvider := fs.String("embedding-provider", defaultDocsafEmbeddingProvider, "Embedding provider for managed vector search")
+	embeddingModel := fs.String("embedding-model", defaultDocsafEmbeddingModel, "Embedding model for managed vector search")
+	embeddingConfigJSON := fs.String("embedding-config-json", "", "Full JSON Antfly SDK EmbedderConfig for managed vector search; overrides --embedding-provider and --embedding-model")
 	embeddingDims := fs.Int("embedding-dims", 0, "Expected embedding dimensions; 0 lets Antfly probe the embedder")
 	sourceFlags := registerSourceFlags(fs)
 
@@ -388,7 +394,7 @@ func syncCmd(args []string) error {
 
 	if *createTable {
 		fmt.Printf("Creating table '%s' with derived document hierarchy indexes...\n", *tableName)
-		indexes, err := createHierarchyIndexes(*chunkSize, *chunkOverlap, *embeddingModel, *embeddingDims)
+		indexes, err := createHierarchyIndexes(*chunkSize, *chunkOverlap, *embeddingProvider, *embeddingModel, *embeddingConfigJSON, *embeddingDims)
 		if err != nil {
 			return fmt.Errorf("building hierarchy index config: %w", err)
 		}
@@ -441,7 +447,7 @@ func printDocumentSample(docs []docsaf.SourceDocument) {
 	fmt.Printf("\n")
 }
 
-func createHierarchyIndexes(chunkSize, chunkOverlap int, embeddingModel string, embeddingDims int) (map[string]any, error) {
+func createHierarchyIndexes(chunkSize, chunkOverlap int, embeddingProvider, embeddingModel, embeddingConfigJSON string, embeddingDims int) (map[string]any, error) {
 	sourceConfig := map[string]any{
 		"filename_field":     "filename",
 		"content_type_field": "mime_type",
@@ -464,9 +470,7 @@ func createHierarchyIndexes(chunkSize, chunkOverlap int, embeddingModel string, 
 		return nil, fmt.Errorf("marshal document extraction producer: %w", err)
 	}
 
-	embedder, err := antfly.NewEmbedderConfig(antfly.OllamaEmbedderConfig{
-		Model: embeddingModel,
-	})
+	embedder, err := docsafEmbedderConfig(embeddingProvider, embeddingModel, embeddingConfigJSON)
 	if err != nil {
 		return nil, fmt.Errorf("build embedder config: %w", err)
 	}
@@ -534,6 +538,40 @@ func createHierarchyIndexes(chunkSize, chunkOverlap int, embeddingModel string, 
 		},
 		"document_vectors": vectorIndexBody,
 	}, nil
+}
+
+func docsafEmbedderConfig(provider, model, configJSON string) (*antfly.EmbedderConfig, error) {
+	if raw := strings.TrimSpace(configJSON); raw != "" {
+		var cfg antfly.EmbedderConfig
+		if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+			return nil, fmt.Errorf("parse embedding config JSON: %w", err)
+		}
+		if strings.TrimSpace(string(cfg.Provider)) == "" {
+			return nil, fmt.Errorf("embedding provider is required")
+		}
+		return &cfg, nil
+	}
+
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "" {
+		provider = defaultDocsafEmbeddingProvider
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return nil, fmt.Errorf("embedding model is required")
+	}
+	raw, err := json.Marshal(map[string]any{
+		"provider": provider,
+		"model":    model,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal embedding config: %w", err)
+	}
+	var cfg antfly.EmbedderConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return nil, fmt.Errorf("build embedding config: %w", err)
+	}
+	return &cfg, nil
 }
 
 func indexConfigMap(index antfly.IndexConfig) (map[string]any, error) {

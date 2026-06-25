@@ -93,6 +93,8 @@ const (
 	haAdminJobPhaseSucceeded         = "Succeeded"
 	haAdminJobPhaseFailed            = "Failed"
 	haAdminJobPhaseMissingAdminURL   = "MissingAdminURL"
+
+	defaultManagedInferenceAPIPort = 8080
 )
 
 //+kubebuilder:rbac:groups=antfly.io,resources=antflyclusters,verbs=get;list;watch;create;update;patch;delete
@@ -1795,6 +1797,36 @@ func managedInferencePoolName(cluster *antflyv1.AntflyCluster, managed antflyv1.
 	return fmt.Sprintf("%s-inference-%d", cluster.Name, index)
 }
 
+func configuredInferenceAPIURL(cluster *antflyv1.AntflyCluster) string {
+	if cluster.Spec.Inference == nil {
+		return ""
+	}
+	inference := cluster.Spec.Inference
+	switch antflyInferenceMode(inference) {
+	case antflyv1.AntflyInferenceModeManaged:
+		for i, managed := range inference.ManagedPools {
+			name := managedInferencePoolName(cluster, managed, len(inference.ManagedPools), i)
+			if strings.TrimSpace(name) != "" {
+				return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", name, cluster.Namespace, defaultManagedInferenceAPIPort)
+			}
+		}
+	case antflyv1.AntflyInferenceModeSharedRef:
+		return firstInferencePoolReferenceAPIURL(inference.SharedPools)
+	case antflyv1.AntflyInferenceModePlatformShared:
+		return firstInferencePoolReferenceAPIURL(inference.PlatformPools)
+	}
+	return ""
+}
+
+func firstInferencePoolReferenceAPIURL(refs []antflyv1.InferencePoolReference) string {
+	for _, ref := range refs {
+		if apiURL := strings.TrimRight(strings.TrimSpace(ref.APIURL), "/"); apiURL != "" {
+			return apiURL
+		}
+	}
+	return ""
+}
+
 func (r *AntflyClusterReconciler) reconcileManagedInferencePool(
 	ctx context.Context,
 	cluster *antflyv1.AntflyCluster,
@@ -2034,6 +2066,9 @@ func (r *AntflyClusterReconciler) generateClusteredConfig(cluster *antflyv1.Antf
 		}
 	}
 	completeConfig["storage"] = storageConfig
+	if apiURL := configuredInferenceAPIURL(cluster); apiURL != "" {
+		ensureInferenceAPIURL(completeConfig, apiURL)
+	}
 
 	// Convert back to JSON
 	configBytes, err := json.MarshalIndent(completeConfig, "", "  ")
@@ -2042,6 +2077,18 @@ func (r *AntflyClusterReconciler) generateClusteredConfig(cluster *antflyv1.Antf
 	}
 
 	return string(configBytes), nil
+}
+
+func ensureInferenceAPIURL(config map[string]any, apiURL string) {
+	inferenceConfig, _ := config["inference"].(map[string]any)
+	if inferenceConfig == nil {
+		inferenceConfig = map[string]any{}
+	}
+	if existing, _ := inferenceConfig["api_url"].(string); strings.TrimSpace(existing) != "" {
+		return
+	}
+	inferenceConfig["api_url"] = apiURL
+	config["inference"] = inferenceConfig
 }
 
 func (r *AntflyClusterReconciler) generateSwarmConfig(cluster *antflyv1.AntflyCluster) (string, error) {
