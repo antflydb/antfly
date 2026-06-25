@@ -647,7 +647,7 @@ fn generatedCteReadAstForParsedSql(
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
-                .read => |*read| if (read.kind == .cte and read.cte_tokens != null and read.set_operation_tokens == null) read else null,
+                .read => |*read| if (read.kind == .cte and read.cte_tokens != null) read else null,
                 else => null,
             };
         }

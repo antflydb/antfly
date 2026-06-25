@@ -253,7 +253,10 @@ function-call argument, ordered-argument, `WITHIN GROUP`, `FILTER`, and `OVER`
 payload ranges. Generated CTE read lowering now derives non-recursive final read-family
 dispatch from generated final-select ranges and clause metadata, including
 final set-operation reads, instead of re-entering the legacy read classifier;
-recursive CTEs still dispatch through the recursive CTE family after validating
+direct CTE query-plan lowering also preserves generated final set-operation
+metadata for same-source CTE set-operation arms and fails closed when retained
+set-operation payloads are malformed.
+Recursive CTEs still dispatch through the recursive CTE family after validating
 their generated recursive flag.
 Unsupported read shapes
 still fall back, and deeper read cutover still requires full generated

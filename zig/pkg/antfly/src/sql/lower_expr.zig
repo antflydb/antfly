@@ -699,8 +699,20 @@ fn generatedProjectionClauseEnd(
     tokens: []const Token,
     pos: usize,
     generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+    use_set_operation_right_side: bool,
 ) !?usize {
     const read = generated_read_ast orelse return null;
+    if (use_set_operation_right_side) {
+        if (read.set_operation_tokens == null) return error.UnsupportedSqlShape;
+        if (read.set_operation.right_projection_tokens) |right_range| {
+            if (right_range.start == pos) {
+                if (right_range.end > tokens.len) return error.UnsupportedSqlShape;
+                try validateGeneratedProjectionListForClause(tokens, right_range, read.set_operation.right_projection_items);
+                return right_range.end;
+            }
+        }
+        return error.UnsupportedSqlShape;
+    }
     if (read.projection_tokens) |range| {
         if (range.start == pos) {
             if (range.end > tokens.len) return error.UnsupportedSqlShape;
@@ -752,8 +764,20 @@ fn generatedDistinctClauseEnd(
     tokens: []const Token,
     pos: usize,
     generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+    use_set_operation_right_side: bool,
 ) !?GeneratedDistinctClause {
     const read = generated_read_ast orelse return null;
+    if (use_set_operation_right_side) {
+        if (read.set_operation_tokens == null) return error.UnsupportedSqlShape;
+        if (read.set_operation.right_distinct_tokens) |right_range| {
+            if (right_range.start == pos) {
+                return try validateGeneratedDistinctClause(tokens, right_range, read.set_operation.right_distinct_on_items);
+            }
+            return error.UnsupportedSqlShape;
+        }
+        if (pos < tokens.len and tokens[pos].matchesKeywordTag(.distinct)) return error.UnsupportedSqlShape;
+        return null;
+    }
     if (read.distinct_tokens) |range| {
         if (range.start == pos) {
             return try validateGeneratedDistinctClause(tokens, range, read.distinct_on_items);
@@ -775,8 +799,19 @@ fn generatedSourceClauseEnd(
     tokens: []const Token,
     pos: usize,
     generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+    use_set_operation_right_side: bool,
 ) !?usize {
     const read = generated_read_ast orelse return null;
+    if (use_set_operation_right_side) {
+        if (read.set_operation_tokens == null) return error.UnsupportedSqlShape;
+        if (read.set_operation.right_source_tokens) |right_range| {
+            if (right_range.start == pos) {
+                if (right_range.end > tokens.len) return error.UnsupportedSqlShape;
+                return right_range.end;
+            }
+        }
+        return error.UnsupportedSqlShape;
+    }
     if (read.source_tokens) |range| {
         if (range.start == pos) {
             if (range.end > tokens.len) return error.UnsupportedSqlShape;
@@ -973,9 +1008,22 @@ fn generatedWhereClauseEnd(
     keyword_index: usize,
     pos: usize,
     generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+    use_set_operation_right_side: bool,
 ) !?usize {
     const read = generated_read_ast orelse return null;
     if (keyword_index >= tokens.len or !tokens[keyword_index].matchesKeywordTag(.where)) return null;
+    if (use_set_operation_right_side) {
+        if (read.set_operation_tokens == null) return error.UnsupportedSqlShape;
+        if (read.set_operation.right_where_tokens) |right_range| {
+            if (right_range.start == pos) {
+                if (right_range.end > tokens.len) return error.UnsupportedSqlShape;
+                if (!generatedTokenRangeEqual(read.set_operation.right_where_expression.tokens orelse return error.UnsupportedSqlShape, right_range)) return error.UnsupportedSqlShape;
+                try validateGeneratedExpressionPayloads(tokens, read.set_operation.right_where_expression);
+                return right_range.end;
+            }
+        }
+        return error.UnsupportedSqlShape;
+    }
     if (read.where_tokens) |range| {
         if (range.start == pos) {
             if (range.end > tokens.len) return error.UnsupportedSqlShape;
@@ -16668,7 +16716,7 @@ pub fn parseSelectAlloc(
         options.context_hooks.set_context(options.context_hooks.ptr, current_context);
     }
 
-    const generated_distinct = try generatedDistinctClauseEnd(tokens, pos.*, options.generated_read_ast);
+    const generated_distinct = try generatedDistinctClauseEnd(tokens, pos.*, options.generated_read_ast, options.allow_select_set_result_tail_boundary);
     const distinct_on = try parseOptionalDistinctOnAlloc(
         alloc,
         tokens,
@@ -16685,7 +16733,7 @@ pub fn parseSelectAlloc(
         return error.UnsupportedSqlShape;
     }
 
-    const generated_projection_end = try generatedProjectionClauseEnd(tokens, pos.*, options.generated_read_ast);
+    const generated_projection_end = try generatedProjectionClauseEnd(tokens, pos.*, options.generated_read_ast, options.allow_select_set_result_tail_boundary);
     const select = try parseSelectListAlloc(
         alloc,
         tokens,
@@ -16715,7 +16763,7 @@ pub fn parseSelectAlloc(
     }
 
     try parser.expectKeyword(tokens, pos, "from");
-    const generated_source_end = try generatedSourceClauseEnd(tokens, pos.*, options.generated_read_ast);
+    const generated_source_end = try generatedSourceClauseEnd(tokens, pos.*, options.generated_read_ast, options.allow_select_set_result_tail_boundary);
     const table_ref = if (direct_graph_source) |source| table_ref: {
         if (pos.* != source.function_start) return error.UnsupportedSqlShape;
         pos.* = source.source_end;
@@ -16835,7 +16883,7 @@ pub fn parseSelectAlloc(
     while (!parser.atEnd(tokens, pos.*)) {
         if (parser.matchKeyword(tokens, pos, "where")) {
             const keyword_index = pos.* - 1;
-            const generated_where_end = try generatedWhereClauseEnd(tokens, keyword_index, pos.*, options.generated_read_ast);
+            const generated_where_end = try generatedWhereClauseEnd(tokens, keyword_index, pos.*, options.generated_read_ast, options.allow_select_set_result_tail_boundary);
             const where_context = options.context_hooks.get_context(options.context_hooks.ptr);
             try parseWhereAlloc(
                 alloc,
@@ -17028,7 +17076,7 @@ pub fn parseAggregateAlloc(
         options.context_hooks.set_context(options.context_hooks.ptr, current_context);
     }
 
-    const generated_distinct = try generatedDistinctClauseEnd(tokens, pos.*, options.generated_read_ast);
+    const generated_distinct = try generatedDistinctClauseEnd(tokens, pos.*, options.generated_read_ast, false);
     const select_distinct = parser.matchKeyword(tokens, pos, "distinct");
     if (select_distinct and parser.peekKeyword(tokens, pos.*, "on")) return error.UnsupportedSqlShape;
     if (generated_distinct) |distinct| {
@@ -17038,7 +17086,7 @@ pub fn parseAggregateAlloc(
     }
 
     const select_context = options.context_hooks.get_context(options.context_hooks.ptr);
-    const generated_projection_end = try generatedProjectionClauseEnd(tokens, pos.*, options.generated_read_ast);
+    const generated_projection_end = try generatedProjectionClauseEnd(tokens, pos.*, options.generated_read_ast, false);
     const select = try parseAggregateSelectListAlloc(
         alloc,
         tokens,
@@ -17074,7 +17122,7 @@ pub fn parseAggregateAlloc(
     } else if (select.aggregations.len == 0) return error.UnsupportedSqlShape;
 
     try parser.expectKeyword(tokens, pos, "from");
-    const generated_source_end = try generatedSourceClauseEnd(tokens, pos.*, options.generated_read_ast);
+    const generated_source_end = try generatedSourceClauseEnd(tokens, pos.*, options.generated_read_ast, false);
     const table_ref = if (direct_graph_source) |source| table_ref: {
         if (pos.* != source.function_start) return error.UnsupportedSqlShape;
         pos.* = source.source_end;
@@ -17221,7 +17269,7 @@ pub fn parseAggregateAlloc(
     while (!parser.atEnd(tokens, pos.*)) {
         if (parser.matchKeyword(tokens, pos, "where")) {
             const keyword_index = pos.* - 1;
-            const generated_where_end = try generatedWhereClauseEnd(tokens, keyword_index, pos.*, options.generated_read_ast);
+            const generated_where_end = try generatedWhereClauseEnd(tokens, keyword_index, pos.*, options.generated_read_ast, false);
             const where_context = options.context_hooks.get_context(options.context_hooks.ptr);
             try parseWhereAlloc(
                 alloc,
@@ -17492,7 +17540,7 @@ pub fn parseWindowSelectAlloc(
     options.named_window_hooks.set_specs(options.named_window_hooks.ptr, parsed_named_windows);
     defer options.named_window_hooks.set_specs(options.named_window_hooks.ptr, previous_named_window_specs);
 
-    const generated_projection_end = try generatedProjectionClauseEnd(tokens, pos.*, options.generated_read_ast);
+    const generated_projection_end = try generatedProjectionClauseEnd(tokens, pos.*, options.generated_read_ast, false);
     const select = try parseWindowSelectListAlloc(
         alloc,
         tokens,
@@ -17530,7 +17578,7 @@ pub fn parseWindowSelectAlloc(
     if (select.windows.len == 0) return error.UnsupportedSqlShape;
 
     try parser.expectKeyword(tokens, pos, "from");
-    const generated_source_end = try generatedSourceClauseEnd(tokens, pos.*, options.generated_read_ast);
+    const generated_source_end = try generatedSourceClauseEnd(tokens, pos.*, options.generated_read_ast, false);
     const table_ref = if (direct_graph_source) |source| table_ref: {
         if (pos.* != source.function_start) return error.UnsupportedSqlShape;
         pos.* = source.source_end;
@@ -17647,7 +17695,7 @@ pub fn parseWindowSelectAlloc(
     while (!parser.atEnd(tokens, pos.*)) {
         if (parser.matchKeyword(tokens, pos, "where")) {
             const keyword_index = pos.* - 1;
-            const generated_where_end = try generatedWhereClauseEnd(tokens, keyword_index, pos.*, options.generated_read_ast);
+            const generated_where_end = try generatedWhereClauseEnd(tokens, keyword_index, pos.*, options.generated_read_ast, false);
             const where_context = options.context_hooks.get_context(options.context_hooks.ptr);
             try parseWhereAlloc(
                 alloc,
@@ -17814,7 +17862,7 @@ pub fn parseJoinAlloc(
     try validateGeneratedJoinExecutableContract(options.generated_read_ast, tokens, .join);
     try parser.expectKeyword(tokens, pos, "select");
 
-    const generated_projection_end = try generatedProjectionClauseEnd(tokens, pos.*, options.generated_read_ast);
+    const generated_projection_end = try generatedProjectionClauseEnd(tokens, pos.*, options.generated_read_ast, false);
     const raw_select = try plan_mod.parseJoinProjectionListAlloc(alloc, tokens, pos);
     defer plan_mod.freeQualifiedProjections(alloc, raw_select);
     if (generated_projection_end) |end| {
@@ -18117,7 +18165,7 @@ pub fn parseJoinAlloc(
     while (!parser.atEnd(tokens, pos.*)) {
         if (parser.matchKeyword(tokens, pos, "where")) {
             const keyword_index = pos.* - 1;
-            const generated_where_end = try generatedWhereClauseEnd(tokens, keyword_index, pos.*, options.generated_read_ast);
+            const generated_where_end = try generatedWhereClauseEnd(tokens, keyword_index, pos.*, options.generated_read_ast, false);
             var where_targets = JoinWherePredicateTargets{
                 .left_predicates = &left_predicates,
                 .right_predicates = &right_predicates,
@@ -18565,7 +18613,7 @@ pub fn parseLateralAlloc(
     try validateGeneratedJoinExecutableContract(options.generated_read_ast, tokens, .lateral);
     try parser.expectKeyword(tokens, pos, "select");
 
-    const generated_projection_end = try generatedProjectionClauseEnd(tokens, pos.*, options.generated_read_ast);
+    const generated_projection_end = try generatedProjectionClauseEnd(tokens, pos.*, options.generated_read_ast, false);
     const raw_select = try plan_mod.parseJoinProjectionListAlloc(alloc, tokens, pos);
     defer plan_mod.freeQualifiedProjections(alloc, raw_select);
     if (generated_projection_end) |end| {
@@ -18784,7 +18832,7 @@ pub fn parseLateralAlloc(
     while (!parser.atEnd(tokens, pos.*)) {
         if (parser.matchKeyword(tokens, pos, "where")) {
             const keyword_index = pos.* - 1;
-            const generated_where_end = try generatedWhereClauseEnd(tokens, keyword_index, pos.*, options.generated_read_ast);
+            const generated_where_end = try generatedWhereClauseEnd(tokens, keyword_index, pos.*, options.generated_read_ast, false);
             var where_targets = JoinWherePredicateTargets{
                 .left_predicates = &left_predicates,
                 .right_predicates = &unsupported_right_predicates,
@@ -26327,7 +26375,7 @@ fn generatedCteReadAstForParsedSql(
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
-                .read => |*read| if (read.kind == .cte and read.cte_tokens != null and read.set_operation_tokens == null) read else null,
+                .read => |*read| if (read.kind == .cte and read.cte_tokens != null) read else null,
                 else => null,
             };
         }
@@ -36071,6 +36119,45 @@ test "sql adapter lower expr lowers non recursive cte query plans" {
     try std.testing.expectEqual(@as(usize, 1), direct_select.plan.query.order_by.len);
     try std.testing.expectEqualStrings("created_at", direct_select.plan.query.order_by[0].field);
     try std.testing.expectEqual(@as(u32, 5), direct_select.plan.query.limit.?);
+
+    const final_set_operation_sql = "WITH all_orders AS (SELECT id, status FROM orders) SELECT id FROM all_orders WHERE status = 'open' UNION ALL SELECT id FROM all_orders WHERE status = 'closed'";
+    var final_set_operation = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        final_set_operation_sql,
+        schema,
+        &.{},
+    );
+    defer final_set_operation.deinit(alloc);
+    try std.testing.expectEqualStrings("orders", final_set_operation.table_name);
+    try std.testing.expectEqual(@as(usize, 1), final_set_operation.plan.ctes.len);
+    try std.testing.expectEqualStrings("all_orders", final_set_operation.plan.ctes[0].name);
+    try std.testing.expectEqualStrings("all_orders", final_set_operation.plan.query.source_cte);
+    try std.testing.expectEqual(@as(usize, 0), final_set_operation.plan.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), final_set_operation.plan.query.or_predicates.len);
+
+    var malformed_final_set_operation = try tokenized.ParsedSql.initAlloc(alloc, final_set_operation_sql);
+    defer malformed_final_set_operation.deinit(alloc);
+    if (malformed_final_set_operation.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |*read_ast| read_ast.set_operation.right_projection_tokens = .{ .start = 0, .end = 1 },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    if (lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_final_set_operation,
+        schema,
+        &.{},
+        .{},
+    )) |unexpected| {
+        var owned = unexpected;
+        owned.deinit(alloc);
+        return error.TestExpectedError;
+    } else |err| {
+        try std.testing.expectEqual(error.UnsupportedSqlShape, err);
+    }
 
     var column_alias_list = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
