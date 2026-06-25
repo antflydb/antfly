@@ -466,7 +466,10 @@ Unsupported DDL remains on the existing parser until
    and `MERGE ... USING` wrappers do not depend only on lightweight range
    payload checks. Insert-source and recursive DML CTE retained generated
    child-read metadata now also validate `SELECT`, `FROM`, `WHERE`, and
-   set-operation keyword layout before the child read is reparsed.
+   set-operation keyword layout plus statement/command source spans before the
+   child read is reparsed. Joined mutation and merge relation-source wrappers
+   apply the same retained source-span validation before wrapping their source
+   body in a generated child read.
    Recursive DML CTE prefixes now reparse each recorded generated CTE body as a
    child read and validate that child through the shared generated read-AST
    contract before dispatching to typed recursive write-plan lowering; selector-based

@@ -12586,6 +12586,7 @@ fn validateGeneratedDmlReadBodyLayout(
 ) !void {
     if (body_range.start >= body_range.end or body_range.end > tokens.len) return error.UnsupportedSqlShape;
     if (body_read.tokens.start != body_range.start or body_read.tokens.end != body_range.end) return error.UnsupportedSqlShape;
+    try validateGeneratedDmlReadBodySpans(tokens, body_range, body_read);
     if (body_read.wrapper_projection_star) return error.UnsupportedSqlShape;
     if (body_read.kind != .query and body_read.kind != .aggregate and body_read.kind != .join and body_read.kind != .window and body_read.kind != .set_operation and body_read.kind != .cte) return error.UnsupportedSqlShape;
     if (body_read.kind != .cte and !parsedSourceReadStartsWithSelect(tokens, body_range)) return error.UnsupportedSqlShape;
@@ -12611,6 +12612,18 @@ fn validateGeneratedDmlReadBodyLayout(
     } else if (body_read.kind == .set_operation) {
         return error.UnsupportedSqlShape;
     }
+}
+
+fn validateGeneratedDmlReadBodySpans(
+    tokens: []const Token,
+    body_range: generated_parser.GeneratedSqlTokenRange,
+    body_read: generated_parser.GeneratedSqlDmlReadBodyAst,
+) !void {
+    if (body_range.start >= body_range.end or body_range.end > tokens.len) return error.UnsupportedSqlShape;
+    const first = tokens[body_range.start];
+    const last = tokens[body_range.end - 1];
+    if (body_read.statement_span.start != first.source_start or body_read.statement_span.end != last.source_end) return error.UnsupportedSqlShape;
+    if (body_read.command_span.start != first.source_start or body_read.command_span.end != first.source_end) return error.UnsupportedSqlShape;
 }
 
 fn validateGeneratedChildReadParsedSql(parsed_sql: *const tokenized.ParsedSql) !void {
@@ -13061,7 +13074,7 @@ fn validateGeneratedDmlRelationSourceBodyAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     ast: generated_parser.GeneratedSqlDmlAst,
 ) !void {
-    try validateGeneratedDmlRelationSourceBodyAst(ast);
+    try validateGeneratedDmlRelationSourceBodyAst(parsed_sql.items(), ast);
     const source_range = ast.source_tokens orelse return error.UnsupportedSqlShape;
     const tokens = parsed_sql.items();
     if (source_range.start >= source_range.end or source_range.end > tokens.len) return error.UnsupportedSqlShape;
@@ -13080,11 +13093,16 @@ fn validateGeneratedDmlRelationSourceBodyAlloc(
     try validateGeneratedChildReadParsedSql(&child);
 }
 
-fn validateGeneratedDmlRelationSourceBodyAst(ast: generated_parser.GeneratedSqlDmlAst) !void {
+fn validateGeneratedDmlRelationSourceBodyAst(
+    tokens: []const Token,
+    ast: generated_parser.GeneratedSqlDmlAst,
+) !void {
     const source_range = ast.source_tokens orelse return error.UnsupportedSqlShape;
     const source_read = ast.source_read orelse return error.UnsupportedSqlShape;
+    if (source_range.start >= source_range.end or source_range.end > tokens.len) return error.UnsupportedSqlShape;
     if (!source_read.wrapper_projection_star) return error.UnsupportedSqlShape;
     if (source_read.tokens.start != source_range.start or source_read.tokens.end != source_range.end) return error.UnsupportedSqlShape;
+    try validateGeneratedDmlReadBodySpans(tokens, source_range, source_read);
     const read_source_range = source_read.source_tokens orelse return error.UnsupportedSqlShape;
     if (read_source_range.start != source_range.start or read_source_range.end != source_range.end) return error.UnsupportedSqlShape;
     if (source_read.projection_tokens != null or source_read.where_tokens != null or source_read.set_operation_tokens != null) return error.UnsupportedSqlShape;
@@ -14014,6 +14032,50 @@ test "sql adapter lower dml validates generated child read payloads" {
     } else return error.TestUnexpectedResult;
     switch (set_source.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
         .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedDmlReadSourceBodyAlloc(alloc, &set_source, dml)),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var span_source = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id) SELECT id FROM usage_records",
+    );
+    defer span_source.deinit(alloc);
+    switch (span_source.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| try validateGeneratedDmlReadSourceBodyAlloc(alloc, &span_source, dml),
+        else => return error.TestUnexpectedResult,
+    }
+    if (span_source.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| dml.source_read.?.command_span.start = 0,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    switch (span_source.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedDmlReadSourceBodyAlloc(alloc, &span_source, dml)),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var relation_source = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET status = archived_records.status FROM archived_records WHERE usage_records.id = archived_records.id",
+    );
+    defer relation_source.deinit(alloc);
+    switch (relation_source.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| try validateGeneratedDmlRelationSourceBodyAlloc(alloc, &relation_source, dml),
+        else => return error.TestUnexpectedResult,
+    }
+    if (relation_source.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| dml.source_read.?.statement_span.start = 0,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    switch (relation_source.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedDmlRelationSourceBodyAlloc(alloc, &relation_source, dml)),
         else => return error.TestUnexpectedResult,
     }
 }
