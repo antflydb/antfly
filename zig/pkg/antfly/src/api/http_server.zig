@@ -376,6 +376,7 @@ pub const StatusSource = struct {
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot = null,
         cached_admin_snapshot: ?*const fn (ptr: *anyopaque) anyerror!?metadata_api.AdminSnapshot = null,
+        ensure_linearizable_read: ?*const fn (ptr: *anyopaque) anyerror!void = null,
         free_admin_snapshot: ?*const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void = null,
         create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         restore_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) anyerror!void = null,
@@ -411,6 +412,11 @@ pub const StatusSource = struct {
 
     pub fn cachedAdminSnapshot(self: StatusSource) !?metadata_api.AdminSnapshot {
         const fn_ptr = self.vtable.cached_admin_snapshot orelse return null;
+        return try fn_ptr(self.ptr);
+    }
+
+    pub fn ensureLinearizableRead(self: StatusSource) !void {
+        const fn_ptr = self.vtable.ensure_linearizable_read orelse return;
         return try fn_ptr(self.ptr);
     }
 
@@ -554,6 +560,10 @@ pub const StatusSource = struct {
                 return try cast(ptr).adminSnapshot();
             }
 
+            fn ensureLinearizableRead(ptr: *anyopaque) anyerror!void {
+                return try cast(ptr).ensureLinearizableRead();
+            }
+
             fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
                 cast(ptr).freeAdminSnapshot(snapshot);
             }
@@ -659,6 +669,7 @@ pub const StatusSource = struct {
             .status = Gen.status,
             .admin_snapshot = Gen.adminSnapshot,
             .cached_admin_snapshot = Gen.cachedAdminSnapshot,
+            .ensure_linearizable_read = Gen.ensureLinearizableRead,
             .free_admin_snapshot = Gen.freeAdminSnapshot,
             .create_table = Gen.createTable,
             .restore_table = Gen.restoreTable,
@@ -3873,7 +3884,6 @@ pub const ApiHttpServer = struct {
             }
         }
         if (req.method == .POST and std.mem.eql(u8, uri_parts.path, routes.Routes.backup)) {
-            if (try self.forwardMetadataMutationToLeader(req)) |resp| return resp;
             return try self.handlePublicClusterBackup(req.body);
         }
         if (req.method == .POST) {
@@ -6124,6 +6134,10 @@ pub const ApiHttpServer = struct {
         location: *backups_api.BackupLocation,
     ) public_table_http.TableApi.ExecuteBackupError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        self.source.ensureLinearizableRead() catch |err| {
+            std.log.warn("table backup metadata read barrier failed table={s} err={s}", .{ table_name, @errorName(err) });
+            return error.InternalFailure;
+        };
         self.backupOwnedTable(table_name, location, location_uri, backup_id, format) catch |err| switch (err) {
             error.TableNotFound => return error.NotFound,
             error.UnsupportedOperation => return error.MethodNotAllowed,
@@ -6505,6 +6519,11 @@ pub const ApiHttpServer = struct {
         location: *backups_api.BackupLocation,
     ) cluster_api_http.ClusterApi.ExecuteBackupError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+
+        self.source.ensureLinearizableRead() catch |err| {
+            std.log.warn("cluster backup metadata read barrier failed err={s}", .{@errorName(err)});
+            return error.InternalFailure;
+        };
 
         const owns_table_names = req.table_names == null;
         const table_names = if (req.table_names) |values|
