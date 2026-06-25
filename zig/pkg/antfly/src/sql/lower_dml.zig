@@ -12344,6 +12344,23 @@ fn lowerGeneratedDmlWritePlanForDmlTestAlloc(
     return try lowerWritePlanFromGeneratedDmlAstDirectAlloc(alloc, &parsed_sql, dml_ast, schema, params, options);
 }
 
+fn lowerGeneratedMergeForDmlTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+) !plan_mod.LoweredMergeMutationPlan {
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    const generated_raw = parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    const dml_ast = switch (generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .dml => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    return try mergeMutationFromGeneratedDmlAstAlloc(alloc, &parsed_sql, dml_ast, schema, params, options);
+}
+
 fn lowerWritePlanParsedSqlForDmlTestAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
@@ -13994,6 +14011,30 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
     try std.testing.expectEqual(@as(usize, 1), generated_cross_merge.not_matched_arms.len);
     try std.testing.expectEqual(@as(usize, 3), generated_cross_merge.not_matched_arms[0].insert.len);
     try std.testing.expectEqual(@as(usize, 2), generated_cross_merge.returning.fields.len);
+
+    var generated_merge_arms = try lowerGeneratedMergeForDmlTestAlloc(
+        alloc,
+        "MERGE INTO usage_records AS target USING archived_records AS source ON target.id = source.archive_id WHEN MATCHED AND source.archive_status = 'expired' THEN DELETE WHEN MATCHED AND lower(source.archive_status) = lower(target.status) THEN UPDATE SET quantity = source.archive_quantity WHEN MATCHED THEN DO NOTHING WHEN NOT MATCHED AND source.archive_status = 'ready' THEN INSERT (id, status, quantity) VALUES (source.archive_id, source.archive_status, source.archive_quantity) WHEN NOT MATCHED THEN DO NOTHING RETURNING target.id, target.status",
+        schema,
+        &.{},
+        cross_source_options,
+    );
+    defer generated_merge_arms.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", generated_merge_arms.target_table_name);
+    try std.testing.expectEqualStrings("archived_records", generated_merge_arms.source_table_name);
+    try std.testing.expectEqual(@as(usize, 3), generated_merge_arms.matched_arms.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_merge_arms.matched_arms[0].predicates.len);
+    try std.testing.expectEqualStrings("archive_status", generated_merge_arms.matched_arms[0].predicates[0].field);
+    try std.testing.expect(generated_merge_arms.matched_arms[0].delete);
+    try std.testing.expectEqual(@as(usize, 1), generated_merge_arms.matched_arms[1].expression_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_merge_arms.matched_arms[1].update_expressions.len);
+    try std.testing.expectEqualStrings("quantity", generated_merge_arms.matched_arms[1].update_expressions[0].target_field);
+    try std.testing.expect(generated_merge_arms.matched_arms[2].do_nothing);
+    try std.testing.expectEqual(@as(usize, 2), generated_merge_arms.not_matched_arms.len);
+    try std.testing.expectEqual(@as(usize, 1), generated_merge_arms.not_matched_arms[0].predicates.len);
+    try std.testing.expectEqual(@as(usize, 3), generated_merge_arms.not_matched_arms[0].insert.len);
+    try std.testing.expect(generated_merge_arms.not_matched_arms[1].do_nothing);
+    try std.testing.expectEqual(@as(usize, 2), generated_merge_arms.returning.fields.len);
 
     const default_schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword","default":"u_default"},"status":{"type":"keyword","default":"active"},"quantity":{"type":"numeric","default":1}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}

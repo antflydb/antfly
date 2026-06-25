@@ -81,10 +81,12 @@ joined mutation-source statements now validate generated target, source,
 predicate, and returning ranges before direct joined mutation-source lowering,
 and generated-direct parity now covers simple, correlated, filtered, computed,
 row-value, and `EXISTS` semijoin joined mutation-source forms for both
-`UPDATE` and `DELETE`.
-non-CTE `MERGE` statements now validate generated target, source, and
-`ON`/arm ranges before direct merge-plan lowering, and `TRUNCATE` lowers
-directly from generated AST ranges into mutation-source plans. Incomplete
+`UPDATE` and `DELETE`. Non-CTE `MERGE` statements now validate generated target, source, and
+`ON`/arm ranges before direct merge-plan lowering, with generated-direct
+coverage for multiple matched/not-matched arms, conditional arms, matched
+`DELETE`, matched/not-matched `DO NOTHING`, expression-filtered matched
+`UPDATE`, filtered not-matched `INSERT`, and `RETURNING`; and `TRUNCATE`
+lowers directly from generated AST ranges into mutation-source plans. Incomplete
 migrated DML statements that stop at required generated clause boundaries now
 fail closed through the generated parser instead of falling back to the legacy
 write classifier. Other DML shapes still use an initial generated
@@ -93,8 +95,8 @@ match the existing write classifier before delegating to the current typed DML
 lowerer. Unsupported DML still falls back, and deeper DML cutover still
 requires replacing token-based command-body parsing with complete generated AST
 payloads for broader `INSERT ... SELECT` source bodies, richer joined mutation
-source bodies beyond the promoted semijoin surface, and full `MERGE` arm
-bodies.
+source bodies beyond the promoted semijoin surface, and CTE/recursive
+`MERGE` forms.
 Representative
 read queries now have generated-parser corpus coverage, retained generated raw
 and AST nodes for covered read statements, top-level generated AST ranges for
@@ -338,9 +340,13 @@ Unsupported DDL remains on the existing parser until
    and `DELETE ... USING` have generated range-validated direct joined
    mutation-source lowerers; simple, correlated, filtered, computed,
    row-value, and `EXISTS` semijoin `UPDATE` and `DELETE` mutation sources now
-   have generated-direct parity coverage; non-CTE `MERGE` has a generated range-validated
-   direct merge-plan lowerer; and `TRUNCATE` has a direct generated AST-to-plan
-   lowerer for the supported table-list, identity, and drop-behavior surface.
+   have generated-direct parity coverage; non-CTE `MERGE` has a generated
+   range-validated direct merge-plan lowerer with generated-direct coverage for
+   multiple matched/not-matched arms, conditional arms, matched `DELETE`,
+   matched/not-matched `DO NOTHING`, expression-filtered matched `UPDATE`,
+   filtered not-matched `INSERT`, and `RETURNING`; and `TRUNCATE` has a direct
+   generated AST-to-plan lowerer for the supported table-list, identity, and
+   drop-behavior surface.
    The write-plan lowering context now dispatches through retained generated
    DML ASTs when the generated parser covers the statement, using direct
    generated AST-to-plan lowerers where available and falling back to the
@@ -354,8 +360,7 @@ Unsupported DDL remains on the existing parser until
    Switching the full DML family from fallback to required generated parsing
    still requires generated command-body ASTs for broader insert-select source bodies,
    richer joined mutation source bodies beyond the promoted semijoin surface,
-   full merge arms, and CTE/recursive merge forms, plus broader
-   unsupported-shape diagnostics.
+   CTE/recursive merge forms, and broader unsupported-shape diagnostics.
 4. Read queries: projections, predicates, joins, CTEs, aggregates, windows,
    set operations, lateral, ordering, limits, and document-table sources.
    Initial generated-parser coverage now retains raw and AST read nodes for
