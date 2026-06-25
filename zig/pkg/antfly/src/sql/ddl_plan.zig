@@ -3343,6 +3343,7 @@ pub fn graphDdlPlanFromGeneratedAstAlloc(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlGraphAst,
 ) !LoweredDdlPlan {
+    try validateGeneratedGraphAstSpans(tokens, ast);
     const tail = generatedStatementTail(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
     var pos: usize = 0;
     return switch (ast.kind) {
@@ -3350,6 +3351,17 @@ pub fn graphDdlPlanFromGeneratedAstAlloc(
         .create_metric => .{ .create_index = try parseCreateGraphMetricPlanAlloc(alloc, tail, &pos) },
         .alter_metric => .{ .create_index = try parseAlterGraphIndexAddMetricPlanAlloc(alloc, tail, &pos) },
     };
+}
+
+fn validateGeneratedGraphAstSpans(
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlGraphAst,
+) !void {
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    if (tokens[0].source_start != ast.command_span.start or tokens[0].source_end != ast.command_span.end) {
+        return error.UnsupportedSqlShape;
+    }
+    if (end < 2 or !tokens[1].matchesKeywordTag(.graph)) return error.UnsupportedSqlShape;
 }
 
 fn setSessionCatalogPlanFromGeneratedTailAlloc(alloc: std.mem.Allocator, tail: []const grammar.Token) !SessionCatalogPlan {
@@ -14495,6 +14507,32 @@ test "sql adapter ddl plan lowers generated graph AST into typed index plans" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var malformed_graph_span = try tokenized.ParsedSql.initAlloc(alloc, graph_index_sql);
+    defer malformed_graph_span.deinit(alloc);
+    const malformed_graph_span_raw = malformed_graph_span.generated_statement orelse return error.TestUnexpectedResult;
+    var malformed_graph_span_ast = switch (malformed_graph_span_raw.ast orelse return error.TestUnexpectedResult) {
+        .graph => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    malformed_graph_span_ast.statement_span.start += 1;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        graphDdlPlanFromGeneratedAstAlloc(alloc, malformed_graph_span.items(), malformed_graph_span_ast),
+    );
+
+    var malformed_graph_command = try tokenized.ParsedSql.initAlloc(alloc, graph_alter_metric_sql);
+    defer malformed_graph_command.deinit(alloc);
+    const malformed_graph_command_raw = malformed_graph_command.generated_statement orelse return error.TestUnexpectedResult;
+    var malformed_graph_command_ast = switch (malformed_graph_command_raw.ast orelse return error.TestUnexpectedResult) {
+        .graph => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    malformed_graph_command_ast.command_span.end += 1;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        graphDdlPlanFromGeneratedAstAlloc(alloc, malformed_graph_command.items(), malformed_graph_command_ast),
+    );
 }
 
 test "sql adapter ddl plan lowers routine expression bindings into ddl plans" {

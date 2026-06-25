@@ -279,8 +279,9 @@ boundary. The generated parser now also treats graph DDL as a distinct graph
 statement family and `ParsedSql` retains those generated raw and AST nodes.
 Seed and rich `CREATE GRAPH INDEX`, `CREATE GRAPH METRIC`, and
 `ALTER GRAPH INDEX ... ADD METRIC` statements now have graph-specific generated
-AST-to-plan wrappers that lower to typed index plans instead of only routing
-through the generic DDL family, and `ParsedSql` now requires generated-parser
+AST-to-plan wrappers that validate retained statement/command source spans and
+lower to typed index plans instead of only routing through the generic DDL
+family, and `ParsedSql` now requires generated-parser
 success for `CREATE GRAPH` and `ALTER GRAPH` statement heads instead of falling
 back to the legacy DDL classifier on malformed graph DDL. The generated
 facade now returns closed statement-family nodes for the covered families and
