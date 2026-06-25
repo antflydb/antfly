@@ -111,6 +111,14 @@ fn generatedTokenRangeEqual(
     return a.start == b.start and a.end == b.end;
 }
 
+fn validateGeneratedOptionalChildExpressionGroup(
+    range: ?generated_parser.GeneratedSqlTokenRange,
+    kind: ?generated_parser.GeneratedSqlExpressionKind,
+    expression: ?*const generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    if (range == null and (kind != null or expression != null)) return error.UnsupportedSqlShape;
+}
+
 fn validateGeneratedOrderListForClause(
     tokens: []const Token,
     range: generated_parser.GeneratedSqlTokenRange,
@@ -640,6 +648,26 @@ fn validateGeneratedExpressionPayloads(
 ) anyerror!void {
     const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
     if (expression_tokens.start >= expression_tokens.end or expression_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+
+    if (expression.kind != .subquery) {
+        try validateGeneratedOptionalChildExpressionGroup(expression.inner_tokens, expression.inner_expression_kind, expression.inner_expression);
+    }
+    try validateGeneratedOptionalChildExpressionGroup(expression.subquery_where_tokens, expression.subquery_where_expression_kind, expression.subquery_where_expression);
+    try validateGeneratedOptionalChildExpressionGroup(expression.filter_predicate_tokens, expression.filter_expression_kind, expression.filter_expression);
+    try validateGeneratedOptionalChildExpressionGroup(expression.over_frame_start_expression_tokens, expression.over_frame_start_expression_kind, expression.over_frame_start_expression);
+    try validateGeneratedOptionalChildExpressionGroup(expression.over_frame_end_expression_tokens, expression.over_frame_end_expression_kind, expression.over_frame_end_expression);
+    try validateGeneratedOptionalChildExpressionGroup(expression.cast_expression_tokens, expression.cast_expression_kind, expression.cast_expression);
+    try validateGeneratedOptionalChildExpressionGroup(expression.case_first_condition_tokens, expression.case_first_condition_kind, expression.case_first_condition);
+    try validateGeneratedOptionalChildExpressionGroup(expression.case_first_result_tokens, expression.case_first_result_kind, expression.case_first_result);
+    try validateGeneratedOptionalChildExpressionGroup(expression.case_else_expression_tokens, expression.case_else_expression_kind, expression.case_else_expression);
+    try validateGeneratedOptionalChildExpressionGroup(expression.boolean_first_condition_tokens, expression.boolean_first_condition_kind, expression.boolean_first_condition);
+    try validateGeneratedOptionalChildExpressionGroup(expression.boolean_last_condition_tokens, expression.boolean_last_condition_kind, expression.boolean_last_condition);
+    try validateGeneratedOptionalChildExpressionGroup(expression.extract_source_tokens, expression.extract_source_expression_kind, expression.extract_source_expression);
+    try validateGeneratedOptionalChildExpressionGroup(expression.left_tokens, expression.left_expression_kind, expression.left_expression);
+    try validateGeneratedOptionalChildExpressionGroup(expression.between_lower_tokens, expression.between_lower_expression_kind, expression.between_lower_expression);
+    try validateGeneratedOptionalChildExpressionGroup(expression.between_upper_tokens, expression.between_upper_expression_kind, expression.between_upper_expression);
+    try validateGeneratedOptionalChildExpressionGroup(expression.right_tokens, expression.right_expression_kind, expression.right_expression);
+    try validateGeneratedOptionalChildExpressionGroup(expression.escape_tokens, expression.escape_expression_kind, expression.escape_expression);
 
     switch (expression.kind) {
         .quantified_comparison => {
@@ -30293,6 +30321,23 @@ fn corruptGeneratedReadFirstProjectionExpressionItem(parsed_sql: *tokenized.Pars
     return error.TestUnexpectedResult;
 }
 
+fn corruptGeneratedReadFirstProjectionOrphanChildKind(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |*read| {
+                    if (read.projection_items.expressions.len == 0) return error.TestUnexpectedResult;
+                    if (read.projection_items.expressions[0].left_tokens != null or read.projection_items.expressions[0].left_expression != null) return error.TestUnexpectedResult;
+                    read.projection_items.expressions[0].left_expression_kind = .token_range;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn corruptGeneratedReadFirstProjectionCastChildExpressionRange(parsed_sql: *tokenized.ParsedSql) !void {
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
@@ -30617,6 +30662,19 @@ test "sql adapter lower expr lowers grouped aggregate queries with generated gro
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
         alloc,
         &malformed_projection,
+        schema,
+        &.{},
+    ));
+
+    var malformed_orphan_child_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT status, SUM(amount) AS total FROM usage_records GROUP BY status ORDER BY total DESC LIMIT 5",
+    );
+    defer malformed_orphan_child_kind.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionOrphanChildKind(&malformed_orphan_child_kind);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
+        alloc,
+        &malformed_orphan_child_kind,
         schema,
         &.{},
     ));
