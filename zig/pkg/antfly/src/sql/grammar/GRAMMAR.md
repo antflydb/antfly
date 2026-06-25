@@ -71,27 +71,31 @@ plans, including `ON CONFLICT` actions and field/all-field/expression
 AST ranges into relational row batches. Supported explicit-column
 `INSERT ... SELECT` plans, including `ON CONFLICT` actions and returning lists,
 now validate generated source, conflict, and returning ranges before direct
-insert-source lowering, with generated-direct coverage for non-CTE computed
-source projections, expression predicates, ordering, pagination, `RETURNING *`
-plus expressions, cross-table sources, and conflict-update predicates and
-expressions. Single-table point `UPDATE` and `DELETE` statements with generated
+insert-source lowering, with generated-direct coverage for computed source
+projections, expression predicates, ordering, pagination, `RETURNING *`
+plus expressions, cross-table sources, conflict-update predicates and
+expressions, and non-recursive CTE write prefixes. Single-table point `UPDATE`
+and `DELETE` statements with generated
 `WHERE` ranges and field/all-field/expression `RETURNING` lists now also lower
-directly from generated AST ranges into relational row batches. Table-wide and
+directly from generated AST ranges into relational row batches, including
+non-recursive CTE write prefixes. Table-wide and
 single-table source `UPDATE` and `DELETE` statements without joined
 `FROM`/`USING` sources now validate generated AST ranges before direct
 mutation-source lowering. Explicit `UPDATE ... FROM` and `DELETE ... USING`
 joined mutation-source statements now validate generated target, source,
 predicate, and returning ranges before direct joined mutation-source lowering,
-and generated-direct parity now covers non-CTE explicit joined
+and generated-direct parity now covers explicit joined
 `UPDATE ... FROM` and `DELETE ... USING` bodies with separate source schemas,
 computed source assignments, expression predicates, source-qualified returning
 expressions, and lock options, plus simple, correlated, filtered, computed,
 row-value, and `EXISTS` semijoin joined mutation-source forms for both
-`UPDATE` and `DELETE`. Non-CTE `MERGE` statements now validate generated target, source, and
+`UPDATE` and `DELETE`, including non-recursive CTE write prefixes. `MERGE`
+statements now validate generated target, source, and
 `ON`/arm ranges before direct merge-plan lowering, with generated-direct
 coverage for multiple matched/not-matched arms, conditional arms, matched
 `DELETE`, matched/not-matched `DO NOTHING`, expression-filtered matched
-`UPDATE`, filtered not-matched `INSERT`, and `RETURNING`; and `TRUNCATE`
+`UPDATE`, filtered not-matched `INSERT`, `RETURNING`, and non-recursive CTE
+write prefixes; and `TRUNCATE`
 lowers directly from generated AST ranges into mutation-source plans. Incomplete
 migrated DML statements that stop at required generated clause boundaries now
 fail closed through the generated parser instead of falling back to the legacy
@@ -100,9 +104,9 @@ AST-to-plan wrapper that fails closed if the generated DML family does not
 match the existing write classifier before delegating to the current typed DML
 lowerer. Unsupported DML still falls back, and deeper DML cutover still
 requires replacing token-based command-body parsing with complete generated AST
-payloads for CTE/recursive DML, insert-select source bodies that need generated
+payloads for recursive CTE DML, insert-select source bodies that need generated
 read-body ASTs beyond statement ranges, joined mutation source bodies that need
-generated read-body ASTs beyond statement ranges, and CTE/recursive `MERGE`
+generated read-body ASTs beyond statement ranges, and recursive CTE `MERGE`
 forms.
 Representative
 read queries now have generated-parser corpus coverage, retained generated raw
@@ -353,8 +357,10 @@ Unsupported DDL remains on the existing parser until
    source-qualified returning expressions, and lock options; simple,
    correlated, filtered, computed, row-value, and `EXISTS` semijoin `UPDATE`
    and `DELETE` mutation sources now have generated-direct parity coverage;
-   non-CTE `MERGE` has a generated
-   range-validated direct merge-plan lowerer with generated-direct coverage for
+   non-recursive CTE write prefixes parse as generated DML, retain CTE prefix
+   metadata, and have generated-direct coverage for insert-source, point
+   update/delete, joined update/delete, and merge lowering; `MERGE` has a
+   generated range-validated direct merge-plan lowerer with generated-direct coverage for
    multiple matched/not-matched arms, conditional arms, matched `DELETE`,
    matched/not-matched `DO NOTHING`, expression-filtered matched `UPDATE`,
    filtered not-matched `INSERT`, and `RETURNING`; and `TRUNCATE` has a direct
@@ -371,10 +377,10 @@ Unsupported DDL remains on the existing parser until
    truncate, and merge now use generated fail-closed diagnostics instead of
    classifier fallback.
    Switching the full DML family from fallback to required generated parsing
-   still requires generated command-body ASTs for CTE/recursive DML,
+   still requires generated command-body ASTs for recursive CTE DML,
    insert-select source bodies that need generated read-body ASTs beyond
    statement ranges, joined mutation source bodies that need generated
-   read-body ASTs beyond statement ranges, CTE/recursive merge forms, and
+   read-body ASTs beyond statement ranges, recursive CTE merge forms, and
    broader unsupported-shape diagnostics.
 4. Read queries: projections, predicates, joins, CTEs, aggregates, windows,
    set operations, lateral, ordering, limits, and document-table sources.
@@ -782,7 +788,9 @@ Generated grammar work needs evidence at multiple levels:
   single-table source update/delete mutation-source requests without joined
   sources, direct generated AST-to-plan coverage for explicit update-from and
   delete-using joined mutation-source requests, direct generated AST-to-plan
-  coverage for non-CTE merge plans, generated-first write lowering context
+  coverage for merge plans and non-recursive CTE write prefixes across
+  insert-source, point update/delete, joined update/delete, and merge,
+  generated-first write lowering context
   dispatch, and generated-family validation fallback over other representative
   write plans. Read plans have initial
   generated AST-to-plan parity through generated-first read lowering context

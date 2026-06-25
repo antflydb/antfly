@@ -155,10 +155,14 @@ drop_database_force_opt:
 
 dml_statement:
     insert_statement
+  | with_clause insert_statement
   | update_statement
+  | with_clause update_statement
   | delete_statement
+  | with_clause delete_statement
   | truncate_statement
   | merge_statement
+  | with_clause merge_statement
   ;
 
 insert_statement:
