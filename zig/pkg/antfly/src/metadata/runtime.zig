@@ -578,6 +578,7 @@ pub const Server = struct {
         });
         try self.server.runRound();
         self.refreshMetadataRaftStorageDiagnostics();
+        try self.server.campaignMetadataGroup();
         try self.bootstrapPublicApiPrerequisites(local_node_id);
     }
 

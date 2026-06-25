@@ -1579,21 +1579,6 @@ pub fn findUniqueConstraintByName(unique_constraints: []const schema_mod.UniqueC
     return null;
 }
 
-pub fn uniqueOwnerConstraintsAlloc(alloc: Allocator, runtime_schema: schema_mod.TableSchema) ![]schema_mod.UniqueConstraint {
-    const extra: usize = if (runtime_schema.primary_key != null) 1 else 0;
-    const constraints = try alloc.alloc(schema_mod.UniqueConstraint, runtime_schema.unique_constraints.len + extra);
-    var index: usize = 0;
-    if (runtime_schema.primary_key) |primary_key| {
-        constraints[index] = relational_store_mod.primaryKeyAsUniqueConstraint(primary_key);
-        index += 1;
-    }
-    for (runtime_schema.unique_constraints) |constraint| {
-        constraints[index] = constraint;
-        index += 1;
-    }
-    return constraints;
-}
-
 fn findForeignKeyByName(foreign_keys: []const schema_mod.ForeignKey, name: []const u8) ?schema_mod.ForeignKey {
     for (foreign_keys) |foreign_key| {
         if (std.mem.eql(u8, foreign_key.name, name)) return foreign_key;
