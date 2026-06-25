@@ -235,7 +235,10 @@ from generated expression ranges for `LIMIT`, `OFFSET`, and counted `FETCH`
 forms, while expression-free `LIMIT ALL` and default `FETCH FIRST ROW ONLY`
 remain explicit generated cases. Lateral, set-operation, and non-recursive CTE
 final-read pagination now use the same generated range validation on their
-typed lowerer paths. Generated CTE read lowering now derives non-recursive final read-family
+typed lowerer paths. Generated `ORDER BY` lists now validate generated item,
+expression, direction, `USING`, and `NULLS FIRST`/`NULLS LAST` ranges before
+typed order planning, and the typed parser must consume the same generated
+order-list span. Generated CTE read lowering now derives non-recursive final read-family
 dispatch from generated final-select ranges and clause metadata, including
 final set-operation reads, instead of re-entering the legacy read classifier;
 recursive CTEs still dispatch through the recursive CTE family after validating
@@ -600,7 +603,10 @@ Unsupported DDL remains on the existing parser until
    generated range-validated lowering when generated read metadata is available.
    Numeric and placeholder pagination values are parsed from generated
    expression ranges instead of the full clause tail in the executable
-   pagination helpers.
+   pagination helpers. Generated read order clauses now fail closed when the
+   generated order-list item, expression, direction, `USING`, or `NULLS`
+   ranges disagree with the token stream or with the span consumed by typed
+   order planning.
    Generated read validation
    rejects pagination payloads that are missing required expressions, attach
    expressions to `LIMIT ALL`, place expression spans outside their owning

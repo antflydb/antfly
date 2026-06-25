@@ -78,6 +78,98 @@ fn generatedPaginationExpressionRange(expression: generated_parser.GeneratedSqlE
     return expression.tokens orelse error.UnsupportedSqlShape;
 }
 
+fn generatedTokenRangeEqual(
+    a: generated_parser.GeneratedSqlTokenRange,
+    b: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    return a.start == b.start and a.end == b.end;
+}
+
+fn validateGeneratedOrderListForClause(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    list: generated_parser.GeneratedSqlListAst,
+) !void {
+    if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    if (list.count == 0 or list.items.len != list.count or list.expression_items.len != list.count or list.expressions.len != list.count) return error.UnsupportedSqlShape;
+    if (list.alias_items.len != list.count or list.alias_name_items.len != list.count) return error.UnsupportedSqlShape;
+    if (list.direction_items.len != list.count or list.directions.len != list.count) return error.UnsupportedSqlShape;
+    if (list.order_using_operator_items.len != list.count or list.nulls_order_items.len != list.count or list.nulls_orders.len != list.count) return error.UnsupportedSqlShape;
+    if (list.first_tokens == null or !generatedTokenRangeEqual(list.first_tokens.?, list.items[0])) return error.UnsupportedSqlShape;
+    if (list.last_tokens == null or !generatedTokenRangeEqual(list.last_tokens.?, list.items[list.count - 1])) return error.UnsupportedSqlShape;
+
+    for (list.items, 0..) |item, index| {
+        if (item.start >= item.end or item.start < range.start or item.end > range.end) return error.UnsupportedSqlShape;
+        if (index == 0) {
+            if (item.start != range.start) return error.UnsupportedSqlShape;
+        } else {
+            const previous = list.items[index - 1];
+            if (previous.end + 1 != item.start or previous.end >= tokens.len or tokens[previous.end].kind != .comma) return error.UnsupportedSqlShape;
+        }
+        if (index + 1 == list.count and item.end != range.end) return error.UnsupportedSqlShape;
+        if (list.alias_items[index] != null or list.alias_name_items[index] != null) return error.UnsupportedSqlShape;
+
+        const expression_range = list.expression_items[index];
+        if (expression_range.start < item.start or expression_range.end > item.end or expression_range.start >= expression_range.end) return error.UnsupportedSqlShape;
+        if (!generatedTokenRangeEqual(list.expressions[index].tokens orelse return error.UnsupportedSqlShape, expression_range)) return error.UnsupportedSqlShape;
+
+        const direction_end = if (list.direction_items[index]) |direction_range| blk: {
+            if (direction_range.start != expression_range.end or direction_range.end > item.end or direction_range.start >= direction_range.end) return error.UnsupportedSqlShape;
+            if (tokens[direction_range.start].matchesKeywordTag(.using)) {
+                const using_operator = list.order_using_operator_items[index] orelse return error.UnsupportedSqlShape;
+                if (list.directions[index] != null) return error.UnsupportedSqlShape;
+                if (using_operator.start != direction_range.start + 1 or using_operator.end != direction_range.end) return error.UnsupportedSqlShape;
+                if (using_operator.end != using_operator.start + 1) return error.UnsupportedSqlShape;
+                switch (tokens[using_operator.start].kind) {
+                    .lt, .lte, .gt, .gte => {},
+                    else => return error.UnsupportedSqlShape,
+                }
+            } else {
+                if (list.order_using_operator_items[index] != null) return error.UnsupportedSqlShape;
+                const direction = list.directions[index] orelse return error.UnsupportedSqlShape;
+                if (direction_range.end != direction_range.start + 1) return error.UnsupportedSqlShape;
+                switch (direction) {
+                    .asc => if (!tokens[direction_range.start].matchesKeywordTag(.asc)) return error.UnsupportedSqlShape,
+                    .desc => if (!tokens[direction_range.start].matchesKeywordTag(.desc)) return error.UnsupportedSqlShape,
+                }
+            }
+            break :blk direction_range.end;
+        } else blk: {
+            if (list.directions[index] != null or list.order_using_operator_items[index] != null) return error.UnsupportedSqlShape;
+            break :blk expression_range.end;
+        };
+
+        const item_end = if (list.nulls_order_items[index]) |nulls_range| blk: {
+            if (nulls_range.start != direction_end or nulls_range.end != nulls_range.start + 2 or nulls_range.end > item.end) return error.UnsupportedSqlShape;
+            if (!tokens[nulls_range.start].matchesKeywordTag(.nulls)) return error.UnsupportedSqlShape;
+            const nulls_order = list.nulls_orders[index] orelse return error.UnsupportedSqlShape;
+            switch (nulls_order) {
+                .first => if (!tokens[nulls_range.start + 1].matchesKeywordTag(.first)) return error.UnsupportedSqlShape,
+                .last => if (!tokens[nulls_range.start + 1].matchesKeywordTag(.last)) return error.UnsupportedSqlShape,
+            }
+            break :blk nulls_range.end;
+        } else blk: {
+            if (list.nulls_orders[index] != null) return error.UnsupportedSqlShape;
+            break :blk direction_end;
+        };
+        if (item_end != item.end) return error.UnsupportedSqlShape;
+    }
+}
+
+fn generatedOrderClauseEnd(
+    tokens: []const Token,
+    keyword_index: usize,
+    pos: usize,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !?usize {
+    const read = generated_read_ast orelse return null;
+    if (keyword_index + 1 >= tokens.len or !tokens[keyword_index].matchesKeywordTag(.order) or !tokens[keyword_index + 1].matchesKeywordTag(.by)) return null;
+    const range = read.order_tokens orelse return error.UnsupportedSqlShape;
+    if (range.start != pos or range.end > tokens.len) return error.UnsupportedSqlShape;
+    try validateGeneratedOrderListForClause(tokens, range, read.order_items);
+    return range.end;
+}
+
 pub const SelectList = struct {
     fields: []const []const u8 = &.{},
     json_extract: []const db_mod.types.RelationalRowsJsonExtractProjection = &.{},
@@ -1552,8 +1644,13 @@ pub fn parseSimpleSelectSetResultTailAlloc(
     while (!parser.atEnd(tokens, pos.*)) {
         if (parser.matchKeywordTag(tokens, pos, .order)) {
             if (order_by.items.len > 0) return error.UnsupportedSqlShape;
+            const keyword_index = pos.* - 1;
             try parser.expectKeywordTag(tokens, pos, .by);
+            const generated_order_end = try generatedOrderClauseEnd(tokens, keyword_index, pos.*, generated_read_ast);
             try hooks.parse_order_by(hooks.ptr, &order_by, select);
+            if (generated_order_end) |end| {
+                if (pos.* != end) return error.UnsupportedSqlShape;
+            }
         } else if (parser.matchKeywordTag(tokens, pos, .limit)) {
             if (lowered.query.limit != null) return error.UnsupportedSqlShape;
             const keyword_index = pos.* - 1;
@@ -1619,8 +1716,13 @@ pub fn parseSetOperationResultTailAlloc(
     while (!parser.atEnd(tokens, pos.*)) {
         if (parser.matchKeywordTag(tokens, pos, .order)) {
             if (order_by.items.len > 0) return error.UnsupportedSqlShape;
+            const keyword_index = pos.* - 1;
             try parser.expectKeywordTag(tokens, pos, .by);
+            const generated_order_end = try generatedOrderClauseEnd(tokens, keyword_index, pos.*, generated_read_ast);
             try hooks.parse_order_by(hooks.ptr, &order_by, select);
+            if (generated_order_end) |end| {
+                if (pos.* != end) return error.UnsupportedSqlShape;
+            }
             for (order_by.items) |order| {
                 if (order.expression != null) return error.UnsupportedSqlShape;
             }
