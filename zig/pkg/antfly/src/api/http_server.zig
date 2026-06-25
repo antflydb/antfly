@@ -3432,6 +3432,8 @@ pub const ApiHttpServer = struct {
         }
 
         fn sessionHasPersistentCatalogState(_: *@This(), session: sql_adapter.OwnedSqlCatalogSession) bool {
+            if (session.in_sql_transaction) return true;
+            if (session.sql_transaction_failed) return true;
             if (session.settings.len > 0) return true;
             if (session.transaction_local_settings_base != null) return true;
             if (session.transaction_local_search_path_base != null) return true;

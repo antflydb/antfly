@@ -160,6 +160,7 @@ pub const GeneratedSqlUnsupportedKind = enum {
     comment,
     copy,
     alter_foreign_table,
+    alter_foreign_data_wrapper,
     alter_materialized_view,
     alter_policy,
     alter_publication,
@@ -167,7 +168,10 @@ pub const GeneratedSqlUnsupportedKind = enum {
     alter_server,
     alter_subscription,
     alter_trigger,
+    alter_user_mapping,
     create_foreign_table,
+    create_foreign_data_wrapper,
+    create_language,
     create_materialized_view,
     create_policy,
     create_publication,
@@ -175,9 +179,13 @@ pub const GeneratedSqlUnsupportedKind = enum {
     create_server,
     create_subscription,
     create_trigger,
+    create_user_mapping,
     declare,
     do_block,
     drop_foreign_table,
+    drop_foreign_data_wrapper,
+    drop_language,
+    drop_user_mapping,
     explain,
     fetch,
     grant,
@@ -213,6 +221,7 @@ pub const GeneratedSqlUnsupportedReason = enum {
     comment_not_planned_by_generated_parser,
     copy_not_planned_by_generated_parser,
     alter_foreign_table_not_planned_by_generated_parser,
+    alter_foreign_data_wrapper_not_planned_by_generated_parser,
     alter_materialized_view_not_planned_by_generated_parser,
     alter_policy_not_planned_by_generated_parser,
     alter_publication_not_planned_by_generated_parser,
@@ -220,7 +229,10 @@ pub const GeneratedSqlUnsupportedReason = enum {
     alter_server_not_planned_by_generated_parser,
     alter_subscription_not_planned_by_generated_parser,
     alter_trigger_not_planned_by_generated_parser,
+    alter_user_mapping_not_planned_by_generated_parser,
     create_foreign_table_not_planned_by_generated_parser,
+    create_foreign_data_wrapper_not_planned_by_generated_parser,
+    create_language_not_planned_by_generated_parser,
     create_materialized_view_not_planned_by_generated_parser,
     create_policy_not_planned_by_generated_parser,
     create_publication_not_planned_by_generated_parser,
@@ -228,9 +240,13 @@ pub const GeneratedSqlUnsupportedReason = enum {
     create_server_not_planned_by_generated_parser,
     create_subscription_not_planned_by_generated_parser,
     create_trigger_not_planned_by_generated_parser,
+    create_user_mapping_not_planned_by_generated_parser,
     declare_not_planned_by_generated_parser,
     do_block_not_planned_by_generated_parser,
     drop_foreign_table_not_planned_by_generated_parser,
+    drop_foreign_data_wrapper_not_planned_by_generated_parser,
+    drop_language_not_planned_by_generated_parser,
+    drop_user_mapping_not_planned_by_generated_parser,
     explain_not_planned_by_generated_parser,
     fetch_not_planned_by_generated_parser,
     grant_not_planned_by_generated_parser,
@@ -1741,10 +1757,12 @@ pub const simple_graph_corpus = [_]GeneratedSqlCorpusCase{
 
 pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "ALTER FOREIGN TABLE foreign_usage_records RENAME TO foreign_usage_archive", .kind = .unsupported },
+    .{ .sql = "ALTER FOREIGN DATA WRAPPER usage_fdw OPTIONS (ADD host 'localhost')", .kind = .unsupported },
     .{ .sql = "ALTER MATERIALIZED VIEW usage_summary RENAME TO usage_summary_v2", .kind = .unsupported },
     .{ .sql = "ALTER RULE usage_insert ON usage_records RENAME TO usage_insert_v2", .kind = .unsupported },
     .{ .sql = "ALTER SERVER usage_server VERSION '15'", .kind = .unsupported },
     .{ .sql = "ALTER TRIGGER usage_audit ON usage_records RENAME TO usage_audit_v2", .kind = .unsupported },
+    .{ .sql = "ALTER USER MAPPING FOR usage_user SERVER usage_server OPTIONS (SET user 'remote')", .kind = .unsupported },
     .{ .sql = "ANALYZE", .kind = .unsupported },
     .{ .sql = "CALL refresh_usage_records()", .kind = .unsupported },
     .{ .sql = "CHECKPOINT", .kind = .unsupported },
@@ -1753,12 +1771,17 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "COMMENT ON TABLE usage_records IS 'billing rows'", .kind = .unsupported },
     .{ .sql = "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv)", .kind = .unsupported },
     .{ .sql = "CREATE FOREIGN TABLE foreign_usage_records (id text) SERVER usage_fdw", .kind = .unsupported },
+    .{ .sql = "CREATE FOREIGN DATA WRAPPER usage_fdw HANDLER usage_fdw_handler", .kind = .unsupported },
+    .{ .sql = "CREATE LANGUAGE usage_lang", .kind = .unsupported },
     .{ .sql = "CREATE RULE usage_insert AS ON INSERT TO usage_records DO ALSO NOTIFY usage_events", .kind = .unsupported },
     .{ .sql = "CREATE SERVER usage_server FOREIGN DATA WRAPPER postgres_fdw", .kind = .unsupported },
     .{ .sql = "CREATE TRIGGER usage_audit BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage()", .kind = .unsupported },
+    .{ .sql = "CREATE USER MAPPING FOR usage_user SERVER usage_server OPTIONS (user 'remote')", .kind = .unsupported },
     .{ .sql = "DECLARE usage_cursor NO SCROLL CURSOR FOR SELECT id FROM usage_records", .kind = .unsupported },
     .{ .sql = "DO 'BEGIN NULL; END'", .kind = .unsupported },
     .{ .sql = "DROP FOREIGN TABLE IF EXISTS foreign_usage_records", .kind = .unsupported },
+    .{ .sql = "DROP FOREIGN DATA WRAPPER IF EXISTS usage_fdw CASCADE", .kind = .unsupported },
+    .{ .sql = "DROP LANGUAGE IF EXISTS usage_lang CASCADE", .kind = .unsupported },
     .{ .sql = "EXPLAIN", .kind = .unsupported },
     .{ .sql = "EXPLAIN SELECT id FROM usage_records", .kind = .unsupported },
     .{ .sql = "EXPLAIN ANALYZE INSERT INTO usage_records (id) VALUES ('u1')", .kind = .unsupported },
@@ -1783,6 +1806,7 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "DROP RULE IF EXISTS usage_insert ON usage_records", .kind = .unsupported },
     .{ .sql = "DROP SERVER IF EXISTS usage_server CASCADE", .kind = .unsupported },
     .{ .sql = "DROP TRIGGER IF EXISTS usage_audit ON usage_records", .kind = .unsupported },
+    .{ .sql = "DROP USER MAPPING IF EXISTS FOR usage_user SERVER usage_server", .kind = .unsupported },
     .{ .sql = "UNLISTEN *", .kind = .unsupported },
 };
 
@@ -1988,6 +2012,8 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
         if (second.matchesKeywordTag(.unique) and tokens.len > 2 and tokens[2].matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
         if (second.matchesKeywordTag(.foreign) and tokens.len > 2 and tokens[2].matchesKeywordTag(.table)) return .{ .unsupported = .create_foreign_table };
+        if (second.matchesKeywordTag(.foreign) and tokens.len > 3 and tokens[2].matchesKeywordTag(.data) and tokens[3].matchesKeyword("wrapper")) return .{ .unsupported = .create_foreign_data_wrapper };
+        if (second.matchesKeyword("language")) return .{ .unsupported = .create_language };
         if (second.matchesKeywordTag(.graph) and tokens.len > 2) {
             if (tokens[2].matchesKeywordTag(.index)) return .{ .graph = .create_index };
             if (tokens[2].matchesKeywordTag(.metric)) return .{ .graph = .create_metric };
@@ -1995,6 +2021,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.rule)) return .{ .unsupported = .create_rule };
         if (second.matchesKeywordTag(.server)) return .{ .unsupported = .create_server };
         if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .create_trigger };
+        if (second.matchesKeyword("user") and tokens.len > 2 and tokens[2].matchesKeyword("mapping")) return .{ .unsupported = .create_user_mapping };
         if (second.matchesKeywordTag(.extension)) return .{ .extension_index = .create_extension };
     }
     if (first.matchesKeywordTag(.alter) and tokens.len > 2 and tokens[1].matchesKeywordTag(.graph) and tokens[2].matchesKeywordTag(.index)) {
@@ -2002,6 +2029,9 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     }
     if (first.matchesKeywordTag(.alter) and tokens.len > 2 and tokens[1].matchesKeywordTag(.foreign) and tokens[2].matchesKeywordTag(.table)) {
         return .{ .unsupported = .alter_foreign_table };
+    }
+    if (first.matchesKeywordTag(.alter) and tokens.len > 3 and tokens[1].matchesKeywordTag(.foreign) and tokens[2].matchesKeywordTag(.data) and tokens[3].matchesKeyword("wrapper")) {
+        return .{ .unsupported = .alter_foreign_data_wrapper };
     }
     if (first.matchesKeywordTag(.alter) and tokens.len > 1 and tokens[1].matchesKeywordTag(.table)) {
         return .{ .ddl = .alter_table };
@@ -2033,6 +2063,7 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.server)) return .{ .unsupported = .alter_server };
         if (second.matchesKeywordTag(.subscription)) return .{ .ddl = .alter_subscription };
         if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .alter_trigger };
+        if (second.matchesKeyword("user") and tokens.len > 2 and tokens[2].matchesKeyword("mapping")) return .{ .unsupported = .alter_user_mapping };
     }
     if (first.matchesKeywordTag(.drop) and tokens.len > 1) {
         const second = tokens[1];
@@ -2049,11 +2080,14 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.database)) return .{ .ddl = .drop_database };
         if (second.matchesKeywordTag(.extension)) return .{ .extension_index = .drop_extension };
         if (second.matchesKeywordTag(.foreign) and tokens.len > 2 and tokens[2].matchesKeywordTag(.table)) return .{ .unsupported = .drop_foreign_table };
+        if (second.matchesKeywordTag(.foreign) and tokens.len > 3 and tokens[2].matchesKeywordTag(.data) and tokens[3].matchesKeyword("wrapper")) return .{ .unsupported = .drop_foreign_data_wrapper };
+        if (second.matchesKeyword("language")) return .{ .unsupported = .drop_language };
         if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .ddl = .drop_materialized_view };
         if (second.matchesKeywordTag(.policy)) return .{ .ddl = .drop_policy };
         if (second.matchesKeywordTag(.rule)) return .{ .unsupported = .drop_rule };
         if (second.matchesKeywordTag(.server)) return .{ .unsupported = .drop_server };
         if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .drop_trigger };
+        if (second.matchesKeyword("user") and tokens.len > 2 and tokens[2].matchesKeyword("mapping")) return .{ .unsupported = .drop_user_mapping };
     }
     if (first.matchesKeywordTag(.insert)) {
         for (tokens) |token| {
@@ -2222,6 +2256,7 @@ fn buildUnsupportedAst(
             .comment => .comment_not_planned_by_generated_parser,
             .copy => .copy_not_planned_by_generated_parser,
             .alter_foreign_table => .alter_foreign_table_not_planned_by_generated_parser,
+            .alter_foreign_data_wrapper => .alter_foreign_data_wrapper_not_planned_by_generated_parser,
             .alter_materialized_view => .alter_materialized_view_not_planned_by_generated_parser,
             .alter_policy => .alter_policy_not_planned_by_generated_parser,
             .alter_publication => .alter_publication_not_planned_by_generated_parser,
@@ -2229,7 +2264,10 @@ fn buildUnsupportedAst(
             .alter_server => .alter_server_not_planned_by_generated_parser,
             .alter_subscription => .alter_subscription_not_planned_by_generated_parser,
             .alter_trigger => .alter_trigger_not_planned_by_generated_parser,
+            .alter_user_mapping => .alter_user_mapping_not_planned_by_generated_parser,
             .create_foreign_table => .create_foreign_table_not_planned_by_generated_parser,
+            .create_foreign_data_wrapper => .create_foreign_data_wrapper_not_planned_by_generated_parser,
+            .create_language => .create_language_not_planned_by_generated_parser,
             .create_materialized_view => .create_materialized_view_not_planned_by_generated_parser,
             .create_policy => .create_policy_not_planned_by_generated_parser,
             .create_publication => .create_publication_not_planned_by_generated_parser,
@@ -2237,9 +2275,13 @@ fn buildUnsupportedAst(
             .create_server => .create_server_not_planned_by_generated_parser,
             .create_subscription => .create_subscription_not_planned_by_generated_parser,
             .create_trigger => .create_trigger_not_planned_by_generated_parser,
+            .create_user_mapping => .create_user_mapping_not_planned_by_generated_parser,
             .declare => .declare_not_planned_by_generated_parser,
             .do_block => .do_block_not_planned_by_generated_parser,
             .drop_foreign_table => .drop_foreign_table_not_planned_by_generated_parser,
+            .drop_foreign_data_wrapper => .drop_foreign_data_wrapper_not_planned_by_generated_parser,
+            .drop_language => .drop_language_not_planned_by_generated_parser,
+            .drop_user_mapping => .drop_user_mapping_not_planned_by_generated_parser,
             .explain => .explain_not_planned_by_generated_parser,
             .fetch => .fetch_not_planned_by_generated_parser,
             .grant => .grant_not_planned_by_generated_parser,
@@ -9468,6 +9510,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 7 },
         },
         .{
+            .sql = "ALTER FOREIGN DATA WRAPPER usage_fdw OPTIONS (ADD host 'localhost')",
+            .kind = .alter_foreign_data_wrapper,
+            .reason = .alter_foreign_data_wrapper_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 11 },
+        },
+        .{
             .sql = "ALTER MATERIALIZED VIEW usage_summary RENAME TO usage_summary_v2",
             .kind = .alter_materialized_view,
             .reason = .alter_materialized_view_not_planned_by_generated_parser,
@@ -9490,6 +9538,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .kind = .alter_trigger,
             .reason = .alter_trigger_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 8 },
+        },
+        .{
+            .sql = "ALTER USER MAPPING FOR usage_user SERVER usage_server OPTIONS (SET user 'remote')",
+            .kind = .alter_user_mapping,
+            .reason = .alter_user_mapping_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 13 },
         },
         .{
             .sql = "CALL refresh_usage_records()",
@@ -9516,6 +9570,18 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 10 },
         },
         .{
+            .sql = "CREATE FOREIGN DATA WRAPPER usage_fdw HANDLER usage_fdw_handler",
+            .kind = .create_foreign_data_wrapper,
+            .reason = .create_foreign_data_wrapper_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 7 },
+        },
+        .{
+            .sql = "CREATE LANGUAGE usage_lang",
+            .kind = .create_language,
+            .reason = .create_language_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 3 },
+        },
+        .{
             .sql = "CREATE RULE usage_insert AS ON INSERT TO usage_records DO ALSO NOTIFY usage_events",
             .kind = .create_rule,
             .reason = .create_rule_not_planned_by_generated_parser,
@@ -9534,6 +9600,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 15 },
         },
         .{
+            .sql = "CREATE USER MAPPING FOR usage_user SERVER usage_server OPTIONS (user 'remote')",
+            .kind = .create_user_mapping,
+            .reason = .create_user_mapping_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 12 },
+        },
+        .{
             .sql = "DECLARE usage_cursor NO SCROLL CURSOR FOR SELECT id FROM usage_records",
             .kind = .declare,
             .reason = .declare_not_planned_by_generated_parser,
@@ -9549,6 +9621,18 @@ test "generated SQL parser facade builds extended read AST spans" {
             .sql = "DROP FOREIGN TABLE IF EXISTS foreign_usage_records",
             .kind = .drop_foreign_table,
             .reason = .drop_foreign_table_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 6 },
+        },
+        .{
+            .sql = "DROP FOREIGN DATA WRAPPER IF EXISTS usage_fdw CASCADE",
+            .kind = .drop_foreign_data_wrapper,
+            .reason = .drop_foreign_data_wrapper_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 8 },
+        },
+        .{
+            .sql = "DROP LANGUAGE IF EXISTS usage_lang CASCADE",
+            .kind = .drop_language,
+            .reason = .drop_language_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 6 },
         },
         .{
@@ -9610,6 +9694,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .kind = .drop_trigger,
             .reason = .drop_trigger_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 7 },
+        },
+        .{
+            .sql = "DROP USER MAPPING IF EXISTS FOR usage_user SERVER usage_server",
+            .kind = .drop_user_mapping,
+            .reason = .drop_user_mapping_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 9 },
         },
         .{
             .sql = "UNLISTEN *",

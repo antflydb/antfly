@@ -990,8 +990,9 @@ variants for:
   `COPY`, `VACUUM`, `REINDEX`, `CLUSTER`, `COMMENT`, `GRANT`, `REVOKE`,
   `LISTEN`, `NOTIFY`, `LOCK`, `CALL`, `CHECKPOINT`, `LOAD`, `REFRESH`,
   `SECURITY LABEL`, `UNLISTEN`, `CLOSE`, `DECLARE`, `FETCH`, `MOVE`,
-  `SAVEPOINT`, `RELEASE`, `ALTER MATERIALIZED VIEW`, `ALTER RULE`, and
-  `ALTER TRIGGER`, plus bare, simple, optioned, and `EXPLAIN ANALYZE` forms
+  `SAVEPOINT`, `RELEASE`, `ALTER MATERIALIZED VIEW`, foreign table,
+  foreign data wrapper, user mapping, language, rule, server, and trigger DDL
+  forms, plus bare, simple, optioned, and `EXPLAIN ANALYZE` forms
   with command spans, subject ranges where present, and stable unsupported
   reason metadata. Parsed SQL now distinguishes
   generated unsupported statements from ordinary DDL for unsupported heads that
@@ -1035,9 +1036,11 @@ Generated grammar work needs evidence at multiple levels:
   diagnostics. Seed `ANALYZE`, bulk I/O `COPY`, maintenance `VACUUM`/`REINDEX`,
   utility/control statements such as `CLUSTER`, `COMMENT`, `GRANT`/`REVOKE`,
   `LISTEN`/`NOTIFY`, `LOCK`, `CALL`, `CHECKPOINT`, `LOAD`, `REFRESH`,
-  `SECURITY LABEL`, `UNLISTEN`, cursor commands `CLOSE`/`DECLARE`/`FETCH`/`MOVE`, and
-  transaction-control commands `SAVEPOINT`/`RELEASE`, and bare, simple, optioned, and
-  `EXPLAIN ANALYZE` forms now produce generated unsupported AST nodes with
+  `SECURITY LABEL`, `UNLISTEN`, cursor commands `CLOSE`/`DECLARE`/`FETCH`/`MOVE`,
+  transaction-control commands `SAVEPOINT`/`RELEASE`, PostgreSQL foreign-data
+  declarations for foreign data wrappers, foreign tables, servers, and user
+  mappings, plus language, rule, and trigger DDL, and bare, simple, optioned,
+  and `EXPLAIN ANALYZE` forms now produce generated unsupported AST nodes with
   stable reason metadata and subject ranges where available.
 - AST shape tests for source spans, identifier normalization, literals,
   placeholders, casts, operators, and nested statements. The first AST shape
