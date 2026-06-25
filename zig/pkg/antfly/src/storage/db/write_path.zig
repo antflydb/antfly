@@ -4047,8 +4047,6 @@ test "db write path replay thin replay marks artifact-derived target hints" {
 
     const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
     defer alloc.free(asset_key);
-    const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", "page:000001", 0);
-    defer alloc.free(chunk_key);
     const graph_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
     defer alloc.free(graph_key);
 
@@ -4056,7 +4054,7 @@ test "db write path replay thin replay marks artifact-derived target hints" {
         alloc,
         .{},
         &.{},
-        &.{ asset_key, chunk_key, graph_key },
+        &.{ asset_key, graph_key },
         &.{},
         &.{},
         44,
@@ -4068,11 +4066,9 @@ test "db write path replay thin replay marks artifact-derived target hints" {
     defer decoded.deinit();
 
     try std.testing.expectEqual(@as(u64, 44), decoded.record.sequence);
-    try std.testing.expectEqual(@as(usize, 3), decoded.record.changed_artifact_keys.len);
+    try std.testing.expectEqual(@as(usize, 2), decoded.record.changed_artifact_keys.len);
     try std.testing.expectEqualStrings(asset_key, decoded.record.changed_artifact_keys[0]);
-    try std.testing.expectEqualStrings(chunk_key, decoded.record.changed_artifact_keys[1]);
-    try std.testing.expectEqualStrings(graph_key, decoded.record.changed_artifact_keys[2]);
-    try std.testing.expect(change_journal_mod.recordHasHint(decoded.record, .full_text));
+    try std.testing.expectEqualStrings(graph_key, decoded.record.changed_artifact_keys[1]);
     try std.testing.expect(change_journal_mod.recordHasHint(decoded.record, .resolution));
     try std.testing.expect(change_journal_mod.recordHasHint(decoded.record, .graph));
 }

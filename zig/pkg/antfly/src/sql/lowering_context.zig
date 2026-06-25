@@ -3945,6 +3945,7 @@ fn lowerRecursiveCteParsedSqlForLoweringContextTestAlloc(
         .schema = schema,
         .params = params,
         .function_bindings = function_bindings,
+        .generated_read_ast = generatedReadAstForParsedSql(parsed_sql),
     };
     return try plan.parseRecursiveCtePlanAlloc(
         alloc,

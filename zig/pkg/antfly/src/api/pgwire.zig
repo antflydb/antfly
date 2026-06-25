@@ -1350,3 +1350,42 @@ test "pgwire extended bind renders null parameters" {
     defer std.testing.allocator.free(sql);
     try std.testing.expectEqualStrings("SELECT * FROM docs WHERE deleted_at IS NULL", sql);
 }
+
+test "pgwire relational column descriptions use postgres-compatible text types" {
+    const typed_columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric },
+        .{ .name = "active", .path = "active", .field_type = .boolean },
+        .{ .name = "created_at", .path = "created_at", .field_type = .datetime },
+        .{ .name = "attrs", .path = "attrs", .field_type = .json },
+        .{ .name = "tags", .path = "tags", .field_type = .array, .array_item_type = .keyword },
+    };
+    const expected_oids = [_]i32{
+        text_oid,
+        numeric_oid,
+        bool_oid,
+        timestamptz_oid,
+        jsonb_oid,
+        jsonb_oid,
+    };
+    const expected_sizes = [_]i16{
+        text_type_size,
+        text_type_size,
+        bool_type_size,
+        timestamptz_type_size,
+        text_type_size,
+        text_type_size,
+    };
+
+    for (typed_columns, expected_oids, expected_sizes) |column, expected_oid, expected_size| {
+        const pg_column = pgwireColumnForRelationalColumn(column);
+        try std.testing.expectEqualStrings(column.name, pg_column.name);
+        try std.testing.expectEqual(expected_oid, pg_column.type_oid);
+        try std.testing.expectEqual(expected_size, pg_column.type_size);
+        try std.testing.expectEqual(column.field_type, pg_column.antfly_type.?);
+    }
+
+    const rendered = try timestampNsTextAlloc(std.testing.allocator, 123_456_789);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expectEqualStrings("1970-01-01T00:00:00.123456Z", rendered);
+}

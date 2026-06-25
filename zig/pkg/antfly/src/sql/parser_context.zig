@@ -1379,6 +1379,11 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             available_ctes: []const db_mod.types.RelationalRowsCte,
         ) anyerror!plan.LoweredSelect {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
+            var generated_body_ast: ?generated_parser.GeneratedSqlReadAst = null;
+            if (self.generated_read_ast != null and tokens.len != self.tokens.len) {
+                generated_body_ast = try Accessors.generatedCteBodyReadAstForTokensAlloc(self, tokens);
+            }
+            defer if (generated_body_ast) |*ast| ast.deinit(self.alloc);
             var sub = ParserType{
                 .alloc = self.alloc,
                 .tokens = tokens,
@@ -1389,6 +1394,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .unique_resolver = self.unique_resolver,
                 .available_ctes = available_ctes,
                 .allow_select_set_boundary = true,
+                .generated_read_ast = if (generated_body_ast) |*ast| ast else self.generated_read_ast,
             };
             const lowered = try Accessors.parseSelect(&sub);
             pos.* = sub.pos;

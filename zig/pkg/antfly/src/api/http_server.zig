@@ -4649,6 +4649,31 @@ pub const ApiHttpServer = struct {
         }
     };
 
+    pub const PublicSqlDescribeResult = struct {
+        session_id: u64,
+        statement_kind: []const u8,
+        has_row_description: bool = false,
+        columns: []const runtime_schema_mod.RelationalColumn = &.{},
+
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            relational_rows_api.freeRowsOutputColumns(alloc, self.columns);
+            self.* = undefined;
+        }
+    };
+
+    pub const PublicSqlDescribeResultOrResponse = union(enum) {
+        result: PublicSqlDescribeResult,
+        response: http_common.HttpResponse,
+
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            switch (self.*) {
+                .result => |*result| result.deinit(alloc),
+                .response => |*response| response.deinit(alloc),
+            }
+            self.* = undefined;
+        }
+    };
+
     fn ownedSqlCatalogSessionForPublicRequestAlloc(self: *ApiHttpServer, request: PublicSqlRequest) !sql_adapter.OwnedSqlCatalogSession {
         var session = try self.sql_catalog_session_runtime.loadAlloc(request.session_id);
         errdefer session.deinit(self.alloc);
@@ -5745,6 +5770,86 @@ pub const ApiHttpServer = struct {
         } };
     }
 
+    fn describePublicSqlReadColumnsAlloc(
+        self: *ApiHttpServer,
+        parsed_sql: *const sql_adapter.ParsedSql,
+        session: *sql_adapter.OwnedSqlCatalogSession,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !PublicSqlDescribeResultOrResponse {
+        const statement_start_ns = platform_time.monotonicNs();
+        const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session());
+        try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+
+        const statement_kind = parsed_sql.readStatementKind() orelse return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") };
+        var table_names = (sql_adapter.readSourceTableNamesFromParsedSqlAlloc(self.alloc, parsed_sql) catch |err| switch (err) {
+            error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
+            else => return err,
+        }) orelse return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") };
+        defer table_names.deinit(self.alloc);
+
+        _ = self.effectivePublicTableReads() orelse return .{ .response = try textResponse(self.alloc, 404, "not found") };
+        const schema = sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(
+            self.alloc,
+            self.catalogSource(),
+            table_names.left,
+            session.session(),
+        ) catch |err| switch (err) {
+            error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try textResponse(self.alloc, 404, "not found") },
+            else => return err,
+        };
+        defer runtime_schema_mod.freeSchema(self.alloc, schema);
+
+        const routine_bindings = try self.sql_routine_runtime.listExpressionRoutineBindingsAlloc(self.alloc);
+        defer sql_routines.freeExpressionRoutineBindings(self.alloc, routine_bindings);
+        const function_bindings: sql_adapter.SqlFunctionBindings = .{
+            .routine_expressions = routine_bindings,
+        };
+
+        var lowered = sql_adapter_runtime.lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(
+            self.alloc,
+            parsed_sql,
+            schema,
+            &.{},
+            self.catalogSource(),
+            function_bindings,
+        ) catch |err| {
+            if (documentSqlReadErrorMessage(err)) |message| return .{ .response = try textResponse(self.alloc, 400, message) };
+            switch (err) {
+                error.InvalidSqlCatalog, error.TableNotFound => return .{ .response = try textResponse(self.alloc, 404, "not found") },
+                error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") },
+                error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
+                else => return err,
+            }
+        };
+        defer lowered.deinit(self.alloc);
+        self.applyPublicSqlDocumentReadRowFilter(&lowered, session.session(), authenticated_identity) catch |err| switch (err) {
+            error.InvalidQueryRequest => return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") },
+            else => return err,
+        };
+        try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+
+        const result_columns = self.publicSqlReadResultColumnsAlloc(
+            table_names.left,
+            schema,
+            table_names.source,
+            lowered,
+            session.session(),
+        ) catch |err| switch (err) {
+            error.InvalidRowsRequest, error.TableNotFound => return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") },
+            else => return err,
+        };
+        var result_columns_owned = true;
+        defer if (result_columns_owned) relational_rows_api.freeRowsOutputColumns(self.alloc, result_columns);
+
+        result_columns_owned = false;
+        return .{ .result = .{
+            .session_id = self.ensureSqlProtocolSessionId(session),
+            .statement_kind = @tagName(statement_kind),
+            .has_row_description = true,
+            .columns = result_columns,
+        } };
+    }
+
     fn applyPublicSqlDocumentReadRowFilter(
         self: *ApiHttpServer,
         lowered: *sql_adapter_runtime.LoweredReadPlan,
@@ -6299,6 +6404,37 @@ pub const ApiHttpServer = struct {
             .session_id = session_id,
             .statement_kind = "ddl",
             .result = .{ .ddl = applied },
+        } };
+    }
+
+    pub fn handlePublicSqlDescribeRequestResult(self: *ApiHttpServer, request: PublicSqlRequest, authenticated_identity: ?AuthenticatedIdentity) !PublicSqlDescribeResultOrResponse {
+        if (std.mem.trim(u8, request.sql, " \t\r\n").len == 0) return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") };
+
+        var session = self.ownedSqlCatalogSessionForPublicRequestAlloc(request) catch |err| switch (err) {
+            error.InvalidSqlRequest => return .{ .response = try textResponse(self.alloc, 400, "invalid sql request") },
+            else => return err,
+        };
+        defer session.deinit(self.alloc);
+
+        var parsed_sql = sql_adapter.ParsedSql.initAlloc(self.alloc, request.sql) catch |err| switch (err) {
+            error.UnsupportedSqlShape => return .{ .response = try textResponse(self.alloc, 501, "unsupported sql statement") },
+            else => return err,
+        };
+        defer parsed_sql.deinit(self.alloc);
+        if (parsed_sql.readStatementKind() != null) {
+            var outcome = try self.describePublicSqlReadColumnsAlloc(&parsed_sql, &session, authenticated_identity);
+            errdefer outcome.deinit(self.alloc);
+            try self.savePublicSqlSession(session);
+            return outcome;
+        }
+
+        const statement_kind: []const u8 = if (parsed_sql.writeStatementKind()) |kind| @tagName(kind) else "ddl";
+        const session_id = self.ensureSqlProtocolSessionId(&session);
+        try self.savePublicSqlSession(session);
+        return .{ .result = .{
+            .session_id = session_id,
+            .statement_kind = statement_kind,
+            .has_row_description = false,
         } };
     }
 

@@ -26752,11 +26752,20 @@ fn lowerRecursiveCtePlanForLowerExprTestAlloc(
     schema: runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
 ) !plan_mod.LoweredRecursiveCtePlan {
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerParsedRecursiveCtePlanForLowerExprTestAlloc(alloc, &parsed_sql, schema, params);
+}
+
+fn lowerParsedRecursiveCtePlanForLowerExprTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+) !plan_mod.LoweredRecursiveCtePlan {
     const parser_context = @import("parser_context.zig");
 
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
-    defer parsed_sql.deinit(alloc);
     const tokens = parsed_sql.items();
 
     var parser_state = parser_context.ParserState{
@@ -26764,6 +26773,7 @@ fn lowerRecursiveCtePlanForLowerExprTestAlloc(
         .tokens = tokens,
         .schema = schema,
         .params = params,
+        .generated_read_ast = generatedCteReadAstForParsedSql(parsed_sql),
     };
     return try plan_mod.parseRecursiveCtePlanAlloc(
         alloc,
@@ -26812,6 +26822,28 @@ test "sql adapter lower expr lowers recursive cte stream contract" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, recursive_member_join.projections[1].expression.kind);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, recursive_member_join.projections[1].expression.operands[0].field_source);
     try std.testing.expectEqualStrings("depth", recursive_member_join.projections[1].expression.operands[0].field);
+
+    var malformed_generated_anchor = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH RECURSIVE walk(id, depth) AS (SELECT id, depth FROM nodes WHERE parent_id = 'root' UNION ALL SELECT nodes.id, walk.depth + 1 FROM nodes JOIN walk ON nodes.parent_id = walk.id) SELECT id FROM walk",
+    );
+    defer malformed_generated_anchor.deinit(alloc);
+    if (malformed_generated_anchor.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |*read| {
+                if (read.cte_items.len == 0) return error.TestUnexpectedResult;
+                const first_projection = read.cte_items[0].body_projection_items.expression_items[0];
+                read.cte_items[0].body_where_expression.tokens = first_projection;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedRecursiveCtePlanForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_anchor,
+        schema,
+        &.{},
+    ));
 
     try std.testing.expectError(error.UnsupportedSqlShape, lowerRecursiveCtePlanForLowerExprTestAlloc(
         alloc,
