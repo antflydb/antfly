@@ -632,6 +632,7 @@ select_item:
     expression
   | expression AS identifier_name
   | expression identifier_name
+  | qualified_name DOT STAR
   | window_function_expression
   | window_function_expression AS identifier_name
   | window_function_expression identifier_name

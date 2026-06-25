@@ -214,8 +214,9 @@ window clauses, ordering, pagination, set-operation tails, and CTE prefixes,
 owned list item and expression arrays plus first/last expression metadata for
 top-level projection, grouping, ordering, and function argument lists, explicit
 projection expression/alias token splits for explicit `AS` aliases and
-PostgreSQL-style bare aliases, generated ordering direction, `USING` operator,
-and `NULLS` ordering token splits, and first-join generated metadata for
+PostgreSQL-style bare aliases, generated projection metadata for PostgreSQL
+qualified-star projections such as `d.*`, generated ordering direction,
+`USING` operator, and `NULLS` ordering token splits, and first-join generated metadata for
 join operator/type, left input, right input, `ON` predicate ranges, and
 `USING` column-list ranges, explicit generated join-tree root/depth metadata
 for left-associative generated join nodes, plus simple top-level

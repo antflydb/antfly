@@ -53,6 +53,11 @@ const Portal = struct {
     params: []sql_adapter.SqlValue = &.{},
 };
 
+const CancelEntry = struct {
+    secret_key: i32,
+    connection: *Connection,
+};
+
 pub const Config = struct {
     bind_host: []const u8,
     bind_port: u16,
@@ -79,6 +84,9 @@ const State = struct {
     thread: ?std.Thread = null,
     stopping: std.atomic.Value(bool) = .init(false),
     active_connection_threads: std.atomic.Value(u32) = .init(0),
+    next_backend_pid: std.atomic.Value(u32) = .init(1),
+    cancel_mutex: std.atomic.Mutex = .unlocked,
+    cancel_connections: std.AutoHashMapUnmanaged(i32, CancelEntry) = .empty,
 
     fn stop(self: *State) void {
         const io = self.io_impl.io();
@@ -109,6 +117,7 @@ const State = struct {
             return;
         }
 
+        self.cancel_connections.deinit(self.alloc);
         self.io_impl.deinit();
         self.alloc.free(self.owned_host);
         self.alloc.destroy(self);
@@ -117,6 +126,50 @@ const State = struct {
     fn boundAddress(self: *const State) ?std.Io.net.IpAddress {
         const listener = self.listener orelse return null;
         return listener.socket.address;
+    }
+
+    fn registerCancelHandle(self: *State, connection: *Connection) !void {
+        if (connection.backend_pid != 0) return;
+        const secret_key = randomPositiveI32();
+
+        self.cancel_mutex.lock();
+        defer self.cancel_mutex.unlock();
+        while (true) {
+            const pid = self.allocateBackendPid();
+            if (self.cancel_connections.contains(pid)) continue;
+            try self.cancel_connections.put(self.alloc, pid, .{
+                .secret_key = secret_key,
+                .connection = connection,
+            });
+            connection.backend_pid = pid;
+            connection.cancel_key = secret_key;
+            return;
+        }
+    }
+
+    fn unregisterCancelHandle(self: *State, connection: *Connection) void {
+        if (connection.backend_pid == 0) return;
+        self.cancel_mutex.lock();
+        defer self.cancel_mutex.unlock();
+        _ = self.cancel_connections.remove(connection.backend_pid);
+        connection.backend_pid = 0;
+        connection.cancel_key = 0;
+    }
+
+    fn cancelBackendRequest(self: *State, backend_pid: i32, secret_key: i32) bool {
+        self.cancel_mutex.lock();
+        defer self.cancel_mutex.unlock();
+        const entry = self.cancel_connections.get(backend_pid) orelse return false;
+        if (entry.secret_key != secret_key) return false;
+        if (!entry.connection.active_execution.load(.acquire)) return true;
+        entry.connection.cancel_requested.store(true, .release);
+        return true;
+    }
+
+    fn allocateBackendPid(self: *State) i32 {
+        const raw = self.next_backend_pid.fetchAdd(1, .acq_rel);
+        const positive = (raw & 0x7fff_ffff) + 1;
+        return @intCast(positive);
     }
 };
 
@@ -197,6 +250,7 @@ fn serveConnection(
     var writer_state = stream.writer(io, &write_buffer);
     var conn = Connection{
         .alloc = alloc,
+        .state = state,
         .api_server = state.api_server,
         .reader = &reader_state.interface,
         .writer = &writer_state.interface,
@@ -210,6 +264,7 @@ fn serveConnection(
 
 const Connection = struct {
     alloc: std.mem.Allocator,
+    state: *State,
     api_server: *http_server.ApiHttpServer,
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
@@ -224,8 +279,13 @@ const Connection = struct {
     prepared_statements: std.StringHashMapUnmanaged(PreparedStatement) = .empty,
     portals: std.StringHashMapUnmanaged(Portal) = .empty,
     described_portals: std.StringHashMapUnmanaged(void) = .empty,
+    backend_pid: i32 = 0,
+    cancel_key: i32 = 0,
+    active_execution: std.atomic.Value(bool) = .init(false),
+    cancel_requested: std.atomic.Value(bool) = .init(false),
 
     fn deinit(self: *Connection) void {
+        self.state.unregisterCancelHandle(self);
         if (self.database) |database| self.alloc.free(database);
         if (self.namespace) |namespace| self.alloc.free(namespace);
         if (self.unnamed_statement) |sql| self.alloc.free(sql);
@@ -238,7 +298,7 @@ const Connection = struct {
     }
 
     fn run(self: *Connection) !void {
-        try self.startup();
+        if (!try self.startup()) return;
         while (true) {
             const tag = self.reader.takeByte() catch |err| switch (err) {
                 error.EndOfStream => return,
@@ -267,7 +327,7 @@ const Connection = struct {
         }
     }
 
-    fn startup(self: *Connection) !void {
+    fn startup(self: *Connection) !bool {
         while (true) {
             const len = try self.reader.takeInt(i32, .big);
             if (len < 8 or len > max_packet_len) return error.InvalidPgwireStartup;
@@ -280,7 +340,10 @@ const Connection = struct {
                     try self.writer.flush();
                     continue;
                 },
-                cancel_request_code => return error.PgwireCancelNotSupported,
+                cancel_request_code => {
+                    try self.handleCancelRequest(payload);
+                    return false;
+                },
                 protocol_version_3 => {
                     try self.applyStartupParams(payload[4..]);
                     if (self.api_server.cfg.auth_enabled) {
@@ -288,6 +351,7 @@ const Connection = struct {
                         try self.writer.flush();
                         return error.PgwireAuthNotSupported;
                     }
+                    try self.state.registerCancelHandle(self);
                     try self.sendAuthenticationOk();
                     try self.sendParameterStatus("server_version", "16.0-antfly");
                     try self.sendParameterStatus("server_encoding", "UTF8");
@@ -298,7 +362,7 @@ const Connection = struct {
                     try self.sendParameterStatus("TimeZone", "UTC");
                     try self.sendBackendKeyData();
                     try self.sendReadyForQuery();
-                    return;
+                    return true;
                 },
                 else => {
                     try self.sendError("08P01", "unsupported postgres protocol version");
@@ -307,6 +371,13 @@ const Connection = struct {
                 },
             }
         }
+    }
+
+    fn handleCancelRequest(self: *Connection, payload: []const u8) !void {
+        if (payload.len != 12) return error.InvalidPgwireStartup;
+        const backend_pid = std.mem.readInt(i32, payload[4..8], .big);
+        const secret_key = std.mem.readInt(i32, payload[8..12], .big);
+        _ = self.state.cancelBackendRequest(backend_pid, secret_key);
     }
 
     fn applyStartupParams(self: *Connection, payload: []const u8) !void {
@@ -640,12 +711,31 @@ const Connection = struct {
     }
 
     fn executeAndEncodeOne(self: *Connection, sql: []const u8, params: []const sql_adapter.SqlValue, send_ready_on_error: bool, include_row_description: bool) !bool {
+        if (self.consumeCancelRequested()) {
+            self.markTransactionError();
+            try self.sendError("57014", "canceling statement due to user request");
+            if (send_ready_on_error) try self.sendReadyForQuery();
+            return false;
+        }
+        self.active_execution.store(true, .release);
         var outcome = self.executeSql(sql, params) catch |err| {
+            self.active_execution.store(false, .release);
             std.log.warn("pgwire sql execution failed err={}", .{err});
             try self.sendError("XX000", "internal sql execution error");
             if (send_ready_on_error) try self.sendReadyForQuery();
             return false;
         };
+        self.active_execution.store(false, .release);
+        if (self.consumeCancelRequested()) {
+            switch (outcome) {
+                .response => |*response| response.deinit(self.api_server.alloc),
+                .result => |*result| result.deinit(self.api_server.alloc),
+            }
+            self.markTransactionError();
+            try self.sendError("57014", "canceling statement due to user request");
+            if (send_ready_on_error) try self.sendReadyForQuery();
+            return false;
+        }
         switch (outcome) {
             .response => |*response| {
                 defer response.deinit(self.api_server.alloc);
@@ -882,8 +972,8 @@ const Connection = struct {
 
     fn sendBackendKeyData(self: *Connection) !void {
         var payload: [8]u8 = undefined;
-        std.mem.writeInt(i32, payload[0..4], 0, .big);
-        std.mem.writeInt(i32, payload[4..8], 0, .big);
+        std.mem.writeInt(i32, payload[0..4], self.backend_pid, .big);
+        std.mem.writeInt(i32, payload[4..8], self.cancel_key, .big);
         try self.sendMessage('K', &payload);
     }
 
@@ -895,6 +985,12 @@ const Connection = struct {
 
     fn markTransactionError(self: *Connection) void {
         if (self.ready_for_query_status == 'T') self.ready_for_query_status = 'E';
+    }
+
+    fn consumeCancelRequested(self: *Connection) bool {
+        if (!self.cancel_requested.load(.acquire)) return false;
+        self.cancel_requested.store(false, .release);
+        return true;
     }
 
     fn sendEmptyQueryResponse(self: *Connection) !void {
@@ -1546,6 +1642,53 @@ fn dollarQuoteDelimiter(sql: []const u8) ?[]const u8 {
     }
     if (i >= sql.len or sql[i] != '$') return null;
     return sql[0 .. i + 1];
+}
+
+fn randomPositiveI32() i32 {
+    const raw = std.crypto.random.int(u32) & 0x7fff_ffff;
+    return @intCast(if (raw == 0) 1 else raw);
+}
+
+test "pgwire cancel registry matches backend key data" {
+    const alloc = std.testing.allocator;
+    var state = State{
+        .alloc = alloc,
+        .owned_host = try alloc.dupe(u8, "127.0.0.1"),
+        .bind_port = 0,
+        .api_server = undefined,
+        .io_impl = std.Io.Threaded.init(alloc, .{}),
+    };
+    defer {
+        state.cancel_connections.deinit(alloc);
+        state.io_impl.deinit();
+        alloc.free(state.owned_host);
+    }
+
+    var conn = Connection{
+        .alloc = alloc,
+        .state = &state,
+        .api_server = undefined,
+        .reader = undefined,
+        .writer = undefined,
+    };
+    defer conn.deinit();
+
+    try state.registerCancelHandle(&conn);
+    try std.testing.expect(conn.backend_pid != 0);
+    try std.testing.expect(conn.cancel_key != 0);
+    try std.testing.expect(!conn.cancel_requested.load(.acquire));
+
+    try std.testing.expect(!state.cancelBackendRequest(conn.backend_pid, conn.cancel_key +% 1));
+    try std.testing.expect(!conn.cancel_requested.load(.acquire));
+
+    try std.testing.expect(state.cancelBackendRequest(conn.backend_pid, conn.cancel_key));
+    try std.testing.expect(!conn.consumeCancelRequested());
+
+    conn.active_execution.store(true, .release);
+    try std.testing.expect(state.cancelBackendRequest(conn.backend_pid, conn.cancel_key));
+    conn.active_execution.store(false, .release);
+    try std.testing.expect(conn.consumeCancelRequested());
+    try std.testing.expect(!conn.consumeCancelRequested());
 }
 
 test "pgwire ddl command tags preserve concrete statement shape" {

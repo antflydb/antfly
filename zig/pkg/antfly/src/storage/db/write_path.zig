@@ -4623,6 +4623,188 @@ test "db write path replay buildDerivedBatch stores thin document and embedding 
     try std.testing.expectEqual(@as(f32, 0.75), derived_batch.sparse_embeddings[0].values[1]);
 }
 
+test "db write path batch appends only thin replay stream records" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const replay_stream_mod = @import("derived/replay_stream.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"machine learning\"}" },
+        },
+    });
+
+    const entries = try replay_stream_mod.iterateFrom(alloc, db.core.store, 1);
+    defer {
+        for (entries) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+}
+
+test "db write path batch writes thin change journal record" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const replay_stream_mod = @import("derived/replay_stream.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"machine learning\"}" },
+        },
+    });
+
+    const entries = try replay_stream_mod.iterateFrom(alloc, db.core.store, 1);
+    defer {
+        for (entries) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    var record = try change_journal_mod.decodeRecord(alloc, entries[0].payload);
+    defer record.deinit();
+
+    try std.testing.expectEqual(@as(u64, 1), record.record.sequence);
+    try std.testing.expectEqual(@as(usize, 1), record.record.changed_doc_keys.len);
+    try std.testing.expectEqualStrings("doc:a", record.record.changed_doc_keys[0]);
+    try std.testing.expectEqual(@as(usize, 0), record.record.changed_artifact_keys.len);
+}
+
+test "db write path batch uses change journal as the replay authority" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const replay_stream_mod = @import("derived/replay_stream.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"body\":\"machine learning\"}" },
+        },
+    });
+
+    const entries = try replay_stream_mod.iterateFrom(alloc, db.core.store, 1);
+    defer {
+        for (entries) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+}
+
+test "db write path direct graph writes record graph artifacts in the replay stream instead of graph payload replay" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const replay_stream_mod = @import("derived/replay_stream.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "gr_v1",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .graph_writes = &.{
+            .{ .index_name = "gr_v1", .source = "doc:a", .target = "doc:b", .edge_type = "links", .weight = 1.0 },
+        },
+        .sync_level = .write,
+    });
+
+    const journal_entries = try replay_stream_mod.iterateFrom(alloc, db.core.store, 1);
+    defer {
+        for (journal_entries) |*entry| entry.deinit(alloc);
+        alloc.free(journal_entries);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), journal_entries.len);
+    var journal_record = try change_journal_mod.decodeRecord(alloc, journal_entries[0].payload);
+    defer journal_record.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), journal_record.record.changed_artifact_keys.len);
+    try std.testing.expect(internal_keys.isGraphEdgeArtifactKey(journal_record.record.changed_artifact_keys[0]));
+}
+
+test "db write path _edges writes record graph artifacts in the replay stream instead of graph payload replay" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const replay_stream_mod = @import("derived/replay_stream.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "gr_v1",
+        .kind = .graph,
+        .config_json = "{}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"gr_v1\":{\"links\":[{\"target\":\"doc:b\"},{\"target\":\"doc:c\"}]}}}" },
+        },
+        .sync_level = .write,
+    });
+
+    const journal_entries = try replay_stream_mod.iterateFrom(alloc, db.core.store, 1);
+    defer {
+        for (journal_entries) |*entry| entry.deinit(alloc);
+        alloc.free(journal_entries);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), journal_entries.len);
+    var journal_record = try change_journal_mod.decodeRecord(alloc, journal_entries[0].payload);
+    defer journal_record.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), journal_record.record.changed_artifact_keys.len);
+    for (journal_record.record.changed_artifact_keys) |artifact_key| {
+        try std.testing.expect(internal_keys.isGraphEdgeArtifactKey(artifact_key));
+    }
+}
+
 test "db write path replay encodeThinReplayRecordPayload preserves async write replay contract" {
     const alloc = std.testing.allocator;
 

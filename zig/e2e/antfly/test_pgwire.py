@@ -298,6 +298,17 @@ def test_pgwire_postgres_compatibility_probes_return_rows(pgwire_server):
     assert show_all_settings["search_path"] == "public"
 
 
+def test_pgwire_cancel_request_uses_backend_key_side_channel(pgwire_server):
+    with socket.create_connection((pgwire_server.host, pgwire_server.pgwire_port), timeout=5) as sock:
+        backend_pid, cancel_key = _pgwire_startup(sock)
+        assert backend_pid != 0
+        assert cancel_key != 0
+        _pgwire_cancel_request(pgwire_server.host, pgwire_server.pgwire_port, backend_pid, cancel_key)
+        messages = _pgwire_simple_query(sock, "SELECT version();")
+
+    assert [message["tag"] for message in messages if message["type"] == "command"] == ["SELECT 1"]
+
+
 def test_pgwire_ready_for_query_tracks_transaction_status(pgwire_server):
     with socket.create_connection((pgwire_server.host, pgwire_server.pgwire_port), timeout=5) as sock:
         _pgwire_startup(sock)
@@ -449,18 +460,34 @@ def test_metadata_pgwire_simple_query_uses_public_api_sql(metadata_pgwire_server
     assert commands == ["CREATE TABLE"]
 
 
-def _pgwire_startup(sock: socket.socket) -> None:
+def _pgwire_startup(sock: socket.socket) -> tuple[int, int]:
     payload = struct.pack("!i", 196608)
     for key, value in (("user", "antfly"),):
         payload += key.encode() + b"\x00" + value.encode() + b"\x00"
     payload += b"\x00"
     sock.sendall(struct.pack("!i", len(payload) + 4) + payload)
+    backend_key: tuple[int, int] | None = None
     while True:
         tag, payload = _pgwire_read_message(sock)
         if tag == b"E":
             raise AssertionError(f"pgwire startup error: {payload!r}")
+        if tag == b"K":
+            assert len(payload) == 8
+            backend_key = struct.unpack("!ii", payload)
         if tag == b"Z":
-            return
+            assert backend_key is not None
+            return backend_key
+
+
+def _pgwire_cancel_request(host: str, port: int, backend_pid: int, cancel_key: int) -> None:
+    payload = struct.pack("!iii", 80877102, backend_pid, cancel_key)
+    with socket.create_connection((host, port), timeout=5) as cancel_sock:
+        cancel_sock.sendall(struct.pack("!i", len(payload) + 4) + payload)
+        cancel_sock.settimeout(5)
+        try:
+            assert cancel_sock.recv(1) == b""
+        except ConnectionResetError:
+            pass
 
 
 def _pgwire_simple_query(sock: socket.socket, sql: str) -> list[dict[str, Any]]:
