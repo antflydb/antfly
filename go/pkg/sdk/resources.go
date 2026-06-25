@@ -159,6 +159,206 @@ func (c *AntflyClient) GetIndex(ctx context.Context, tableName, indexName string
 	return &index, nil
 }
 
+// ListArtifactEnrichments lists table-level generated artifact enrichments.
+func (c *AntflyClient) ListArtifactEnrichments(ctx context.Context, tableName string) (*TableArtifactEnrichmentList, error) {
+	resp, err := c.client.ListArtifactEnrichments(ctx, tableName)
+	if err != nil {
+		return nil, fmt.Errorf("listing artifact enrichments: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("listing artifact enrichments: %w", readErrorResponse(resp))
+	}
+
+	var result TableArtifactEnrichmentList
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("parsing artifact enrichment list response: %w", err)
+	}
+	return &result, nil
+}
+
+// PutArtifactEnrichment registers or replaces a table-level generated artifact enrichment.
+func (c *AntflyClient) PutArtifactEnrichment(ctx context.Context, tableName, artifactName string, config EnrichmentConfig) error {
+	resp, err := c.client.PutArtifactEnrichment(ctx, tableName, artifactName, config)
+	if err != nil {
+		return fmt.Errorf("putting artifact enrichment: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("putting artifact enrichment: %w", readErrorResponse(resp))
+	}
+	return nil
+}
+
+// DeleteArtifactEnrichment deletes a table-level generated artifact enrichment.
+func (c *AntflyClient) DeleteArtifactEnrichment(ctx context.Context, tableName, artifactName string) error {
+	resp, err := c.client.DeleteArtifactEnrichment(ctx, tableName, artifactName)
+	if err != nil {
+		return fmt.Errorf("deleting artifact enrichment: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("deleting artifact enrichment: %w", readErrorResponse(resp))
+	}
+	return nil
+}
+
+// ListDocumentArtifactManifests lists generated artifact manifests attached to a document.
+func (c *AntflyClient) ListDocumentArtifactManifests(ctx context.Context, tableName, key string, detail string) (*DocumentArtifactManifestList, error) {
+	var params *oapi.ListDocumentArtifactManifestsParams
+	if detail != "" {
+		params = &oapi.ListDocumentArtifactManifestsParams{
+			Detail: oapi.ListDocumentArtifactManifestsParamsDetail(detail),
+		}
+	}
+	resp, err := c.client.ListDocumentArtifactManifests(ctx, tableName, key, params)
+	if err != nil {
+		return nil, fmt.Errorf("listing document artifact manifests: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("listing document artifact manifests: %w", readErrorResponse(resp))
+	}
+
+	var result DocumentArtifactManifestList
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("parsing document artifact manifest list response: %w", err)
+	}
+	return &result, nil
+}
+
+// GetDocumentArtifactManifest gets one generated artifact manifest attached to a document.
+func (c *AntflyClient) GetDocumentArtifactManifest(ctx context.Context, tableName, key, artifactName string, detail string) (*DocumentArtifactManifest, error) {
+	var params *oapi.GetDocumentArtifactManifestParams
+	if detail != "" {
+		params = &oapi.GetDocumentArtifactManifestParams{
+			Detail: oapi.GetDocumentArtifactManifestParamsDetail(detail),
+		}
+	}
+	resp, err := c.client.GetDocumentArtifactManifest(ctx, tableName, key, artifactName, params)
+	if err != nil {
+		return nil, fmt.Errorf("getting document artifact manifest: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("getting document artifact manifest: %w", readErrorResponse(resp))
+	}
+
+	var result DocumentArtifactManifest
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("parsing document artifact manifest response: %w", err)
+	}
+	return &result, nil
+}
+
+// ReprocessDocumentArtifact reprocesses one generated artifact for one document.
+func (c *AntflyClient) ReprocessDocumentArtifact(ctx context.Context, tableName, key, artifactName string) (*DocumentArtifactReprocessResponse, error) {
+	resp, err := c.client.ReprocessDocumentArtifact(ctx, tableName, key, artifactName)
+	if err != nil {
+		return nil, fmt.Errorf("reprocessing document artifact: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("reprocessing document artifact: %w", readErrorResponse(resp))
+	}
+
+	var result DocumentArtifactReprocessResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("parsing document artifact reprocess response: %w", err)
+	}
+	return &result, nil
+}
+
+// ReprocessDocumentArtifactRange runs one bounded table-wide reprocess pass for an artifact.
+func (c *AntflyClient) ReprocessDocumentArtifactRange(ctx context.Context, tableName, artifactName string, request DocumentArtifactTableReprocessRequest) (*DocumentArtifactTableReprocessResponse, error) {
+	resp, err := c.client.ReprocessDocumentArtifactRange(ctx, tableName, artifactName, request)
+	if err != nil {
+		return nil, fmt.Errorf("reprocessing document artifact range: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("reprocessing document artifact range: %w", readErrorResponse(resp))
+	}
+
+	var result DocumentArtifactTableReprocessResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("parsing document artifact range reprocess response: %w", err)
+	}
+	return &result, nil
+}
+
+// StartDocumentArtifactReprocessJob starts a durable table-wide artifact reprocess job.
+func (c *AntflyClient) StartDocumentArtifactReprocessJob(ctx context.Context, tableName, artifactName string, request DocumentArtifactReprocessJobStartRequest) (*DocumentArtifactReprocessJob, error) {
+	resp, err := c.client.StartDocumentArtifactReprocessJob(ctx, tableName, artifactName, request)
+	if err != nil {
+		return nil, fmt.Errorf("starting document artifact reprocess job: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("starting document artifact reprocess job: %w", readErrorResponse(resp))
+	}
+
+	var result DocumentArtifactReprocessJob
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("parsing document artifact reprocess job response: %w", err)
+	}
+	return &result, nil
+}
+
+// GetDocumentArtifactReprocessJob gets a durable artifact reprocess job.
+func (c *AntflyClient) GetDocumentArtifactReprocessJob(ctx context.Context, tableName, artifactName, jobID string) (*DocumentArtifactReprocessJob, error) {
+	resp, err := c.client.GetDocumentArtifactReprocessJob(ctx, tableName, artifactName, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("getting document artifact reprocess job: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("getting document artifact reprocess job: %w", readErrorResponse(resp))
+	}
+
+	var result DocumentArtifactReprocessJob
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("parsing document artifact reprocess job response: %w", err)
+	}
+	return &result, nil
+}
+
+// AdvanceDocumentArtifactReprocessJob advances a durable artifact reprocess job.
+func (c *AntflyClient) AdvanceDocumentArtifactReprocessJob(ctx context.Context, tableName, artifactName, jobID string) (*DocumentArtifactReprocessJob, error) {
+	resp, err := c.client.AdvanceDocumentArtifactReprocessJob(ctx, tableName, artifactName, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("advancing document artifact reprocess job: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("advancing document artifact reprocess job: %w", readErrorResponse(resp))
+	}
+
+	var result DocumentArtifactReprocessJob
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("parsing document artifact reprocess job response: %w", err)
+	}
+	return &result, nil
+}
+
+// CancelDocumentArtifactReprocessJob cancels a durable artifact reprocess job.
+func (c *AntflyClient) CancelDocumentArtifactReprocessJob(ctx context.Context, tableName, artifactName, jobID string) (*DocumentArtifactReprocessJob, error) {
+	resp, err := c.client.CancelDocumentArtifactReprocessJob(ctx, tableName, artifactName, jobID)
+	if err != nil {
+		return nil, fmt.Errorf("canceling document artifact reprocess job: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("canceling document artifact reprocess job: %w", readErrorResponse(resp))
+	}
+
+	var result DocumentArtifactReprocessJob
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("parsing document artifact reprocess job response: %w", err)
+	}
+	return &result, nil
+}
+
 // Backup backs up a table
 func (c *AntflyClient) Backup(ctx context.Context, tableName, backupID, location string) error {
 	if tableName == "" {

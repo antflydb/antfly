@@ -108,6 +108,8 @@ export type DocumentArtifactReprocessShardCursor =
 export type DocumentArtifactReprocessJobStartRequest =
   components["schemas"]["DocumentArtifactReprocessJobStartRequest"];
 export type DocumentArtifactReprocessJob = components["schemas"]["DocumentArtifactReprocessJob"];
+export type TableArtifactEnrichmentList = components["schemas"]["TableArtifactEnrichmentList"];
+export type EnrichmentConfig = components["schemas"]["EnrichmentConfig"];
 
 // Index types
 export type IndexConfig = components["schemas"]["IndexConfig"];

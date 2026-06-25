@@ -6,10 +6,10 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-from ..models.inference_generate_request_backend import InferenceGenerateRequestBackend
 from ..models.inference_generate_request_cache_dtype import InferenceGenerateRequestCacheDtype
 from ..models.inference_generate_request_compiled_target import InferenceGenerateRequestCompiledTarget
 from ..models.inference_generate_request_mode import InferenceGenerateRequestMode
+from ..models.inference_model_backend import InferenceModelBackend
 from ..models.inference_tool_choice_type_0 import InferenceToolChoiceType0
 from ..types import UNSET, Unset
 
@@ -61,15 +61,13 @@ class InferenceGenerateRequest:
             Attention Matching.
             Selects a subset of keys and fits new values via OLS to preserve attention behavior.
             0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
-        backend (InferenceGenerateRequestBackend | Unset): Optional backend override for this request.
+        backend (InferenceModelBackend | Unset): Optional backend preference for model loading or request execution.
             `auto` keeps the node default behavior.
-            `onnx` forces ONNX generation when the model/package supports it.
-            `native` and `metal` force the native host backend choice.
-            `xla` runs native generation with explicit PJRT/XLA compiled graph partitions and
-            requires a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`,
-            `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
+            `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via
+            `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`,
+            `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
             `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with
-            `mode: "compiled"` to request WebGPU graph partition execution.
+            `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
         mode (InferenceGenerateRequestMode | Unset): inference-native graph execution mode. `eager` keeps the direct
             runtime path when possible.
             `compiled` runs inference graph planning, partitioning, and backend executor attachment.
@@ -103,7 +101,7 @@ class InferenceGenerateRequest:
     speculative_k: int | Unset = 4
     cache_dtype: InferenceGenerateRequestCacheDtype | Unset = UNSET
     cache_compaction_ratio: float | Unset = UNSET
-    backend: InferenceGenerateRequestBackend | Unset = UNSET
+    backend: InferenceModelBackend | Unset = UNSET
     mode: InferenceGenerateRequestMode | Unset = UNSET
     compiled_target: InferenceGenerateRequestCompiledTarget | Unset = UNSET
     tool_choice: InferenceToolChoiceType0 | InferenceToolChoiceType1 | Unset = UNSET
@@ -296,11 +294,11 @@ class InferenceGenerateRequest:
         cache_compaction_ratio = d.pop("cache_compaction_ratio", UNSET)
 
         _backend = d.pop("backend", UNSET)
-        backend: InferenceGenerateRequestBackend | Unset
+        backend: InferenceModelBackend | Unset
         if isinstance(_backend, Unset):
             backend = UNSET
         else:
-            backend = InferenceGenerateRequestBackend(_backend)
+            backend = InferenceModelBackend(_backend)
 
         _mode = d.pop("mode", UNSET)
         mode: InferenceGenerateRequestMode | Unset
