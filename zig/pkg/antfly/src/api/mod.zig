@@ -1414,12 +1414,18 @@ test "api retrieval agent recursive mode stops scheduling after wall time budget
     try std.testing.expectEqual(@as(usize, 1), fake_generation.calls);
 
     var subcall_count: usize = 0;
+    var decomposition_actual_concurrency: ?i64 = null;
     const merge = for (parsed.value.steps.?) |step| {
+        if (step.kind != null and step.kind.? == .recursive_decomposition) {
+            decomposition_actual_concurrency = step.details.?.object.get("actual_concurrency").?.integer;
+        }
         if (step.kind != null and step.kind.? == .recursive_subcall) subcall_count += 1;
         if (step.kind != null and step.kind.? == .recursive_merge) break step;
     } else return error.MissingRecursiveMergeStep;
-    try std.testing.expectEqual(@as(usize, 1), subcall_count);
+    try std.testing.expectEqual(@as(i64, 1), decomposition_actual_concurrency.?);
+    try std.testing.expectEqual(@as(usize, 3), subcall_count);
     try std.testing.expectEqual(metadata_openapi.AgentStepStatus.skipped, merge.status.?);
+    try std.testing.expectEqual(@as(i64, 2), merge.details.?.object.get("skipped_child_count").?.integer);
     try std.testing.expect(merge.details.?.object.get("wall_time_exhausted").?.bool);
     try std.testing.expect(merge.details.?.object.get("elapsed_ms").?.integer >= 1);
 }

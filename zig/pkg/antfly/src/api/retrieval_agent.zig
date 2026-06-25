@@ -2653,6 +2653,11 @@ const RecursiveMergeVerification = struct {
     missing_context_ids: []const []const u8 = &.{},
 };
 
+const RecursiveChildExecutionStats = struct {
+    max_actual_concurrency: usize = 0,
+    wall_time_skips: usize = 0,
+};
+
 const RecursiveTokenCounter = struct {
     allocator: std.mem.Allocator,
     tokenizer: ?*HfTokenizer = null,
@@ -2749,6 +2754,9 @@ fn executeRecursiveRetrievalGeneration(
     defer child_tasks.deinit(arena);
     var skipped_children = std.ArrayListUnmanaged(RecursiveSkippedChild).empty;
     defer skipped_children.deinit(arena);
+    var recursive_steps = std.ArrayListUnmanaged(AgentStep).empty;
+    defer recursive_steps.deinit(arena);
+    var buffered_live = LiveEmitter{ .alloc = arena };
     var token_budget_skips: usize = 0;
     var wall_time_exhausted = false;
 
@@ -2795,17 +2803,6 @@ fn executeRecursiveRetrievalGeneration(
         });
     }
 
-    const actual_concurrency = if (child_tasks.items.len == 0) 0 else @min(scheduled_concurrency, child_tasks.items.len);
-    try appendStep(arena, steps, live, .{
-        .kind = .recursive_decomposition,
-        .name = "recursive_decomposition",
-        .action = if (truncated_by_budget)
-            try std.fmt.allocPrint(arena, "partitioned {d} of {d} retrieved context objects into recursive child frames before hitting max_subcalls", .{ child_count, hits.len })
-        else
-            try std.fmt.allocPrint(arena, "partitioned retrieved context into {d} recursive child frames", .{child_count}),
-        .status = .success,
-        .details = try buildRecursiveDecompositionDetails(arena, recursive_cfg, hits.len, child_count, scheduled_concurrency, actual_concurrency),
-    });
     for (skipped_children.items) |skipped| {
         try trace_subcalls.append(arena, try buildRecursiveTraceSubcall(
             arena,
@@ -2817,7 +2814,7 @@ fn executeRecursiveRetrievalGeneration(
             null,
             "max_child_context_tokens",
         ));
-        try appendStep(arena, steps, live, .{
+        try appendStep(arena, &recursive_steps, &buffered_live, .{
             .kind = .recursive_subcall,
             .name = try std.fmt.allocPrint(arena, "recursive_subcall_{d}", .{skipped.child_index + 1}),
             .action = try std.fmt.allocPrint(arena, "skipped recursive context object {s} because it exceeded max_child_context_tokens", .{skipped.context_object.id}),
@@ -2826,7 +2823,7 @@ fn executeRecursiveRetrievalGeneration(
         });
     }
 
-    try runRecursiveChildTasks(
+    const execution_stats = try runRecursiveChildTasks(
         alloc,
         arena,
         exec,
@@ -2838,10 +2835,24 @@ fn executeRecursiveRetrievalGeneration(
         &summaries,
         &successful_context_ids,
         &trace_subcalls,
-        steps,
-        live,
+        &recursive_steps,
+        &buffered_live,
         &wall_time_exhausted,
     );
+    const actual_concurrency = execution_stats.max_actual_concurrency;
+    const skipped_child_count = token_budget_skips + execution_stats.wall_time_skips;
+
+    try appendStep(arena, steps, live, .{
+        .kind = .recursive_decomposition,
+        .name = "recursive_decomposition",
+        .action = if (truncated_by_budget)
+            try std.fmt.allocPrint(arena, "partitioned {d} of {d} retrieved context objects into recursive child frames before hitting max_subcalls", .{ child_count, hits.len })
+        else
+            try std.fmt.allocPrint(arena, "partitioned retrieved context into {d} recursive child frames", .{child_count}),
+        .status = .success,
+        .details = try buildRecursiveDecompositionDetails(arena, recursive_cfg, hits.len, child_count, scheduled_concurrency, actual_concurrency),
+    });
+    for (recursive_steps.items) |step| try appendStep(arena, steps, live, step);
 
     const merge_messages = try buildRecursiveMergeMessages(arena, request.query, summaries.items, recursive_cfg, cfg);
     var merge_executed = true;
@@ -2865,7 +2876,7 @@ fn executeRecursiveRetrievalGeneration(
         .name = "recursive_merge",
         .action = if (merge_executed) "merged recursive child outputs into the final answer" else "skipped recursive merge because max_wall_time_ms was exhausted",
         .status = if (merge_executed) .success else .skipped,
-        .details = try buildRecursiveMergeDetails(arena, recursive_cfg, summaries.items.len, token_budget_skips, wall_time_exhausted, budget.elapsedMs(), verification),
+        .details = try buildRecursiveMergeDetails(arena, recursive_cfg, summaries.items.len, skipped_child_count, wall_time_exhausted, budget.elapsedMs(), verification),
     });
     if (verification.requested) {
         try appendStep(arena, steps, live, .{
@@ -2905,21 +2916,27 @@ fn runRecursiveChildTasks(
     steps: *std.ArrayListUnmanaged(AgentStep),
     live: *LiveEmitter,
     wall_time_exhausted: *bool,
-) !void {
+) !RecursiveChildExecutionStats {
     _ = recursive_cfg;
     const max_concurrency = @max(@as(usize, 1), scheduled_concurrency);
+    var stats = RecursiveChildExecutionStats{};
     var cursor: usize = 0;
     while (cursor < tasks.len) {
         if (budget.expired()) {
             wall_time_exhausted.* = true;
+            stats.wall_time_skips += tasks.len - cursor;
+            try appendRemainingRecursiveTimeoutSubcalls(arena, trace_subcalls, steps, live, tasks[cursor..], null);
             break;
         }
 
         if (max_concurrency == 1) {
             const timeout_ms = budget.remainingMs() orelse {
                 wall_time_exhausted.* = true;
+                stats.wall_time_skips += tasks.len - cursor;
+                try appendRemainingRecursiveTimeoutSubcalls(arena, trace_subcalls, steps, live, tasks[cursor..], null);
                 break;
             };
+            stats.max_actual_concurrency = @max(stats.max_actual_concurrency, @as(usize, 1));
             var worker = RecursiveChildWorker{
                 .exec = exec,
                 .chain = cfg.chain,
@@ -2930,23 +2947,9 @@ fn runRecursiveChildTasks(
             if (worker.err) |err| {
                 if (budget.expired()) {
                     wall_time_exhausted.* = true;
-                    try trace_subcalls.append(arena, try buildRecursiveTraceSubcall(
-                        arena,
-                        worker.task.child_index,
-                        worker.task.context_object.id,
-                        .skipped,
-                        worker.task.estimated_context_tokens,
-                        worker.task.token_count_method,
-                        null,
-                        "max_wall_time_ms",
-                    ));
-                    try appendStep(arena, steps, live, .{
-                        .kind = .recursive_subcall,
-                        .name = try std.fmt.allocPrint(arena, "recursive_subcall_{d}", .{worker.task.child_index + 1}),
-                        .action = try std.fmt.allocPrint(arena, "skipped recursive context object {s} because max_wall_time_ms was exhausted", .{worker.task.context_object.id}),
-                        .status = .skipped,
-                        .details = try buildRecursiveTimeoutSubcallDetails(arena, worker.task, worker.timeout_ms),
-                    });
+                    stats.wall_time_skips += tasks.len - cursor;
+                    try appendRecursiveTimeoutSubcall(arena, trace_subcalls, steps, live, worker.task, worker.timeout_ms);
+                    if (cursor + 1 < tasks.len) try appendRemainingRecursiveTimeoutSubcalls(arena, trace_subcalls, steps, live, tasks[cursor + 1 ..], null);
                     break;
                 }
                 return err;
@@ -2962,6 +2965,8 @@ fn runRecursiveChildTasks(
         const wave_len = @min(remaining, max_concurrency);
         const timeout_ms = budget.remainingMs() orelse {
             wall_time_exhausted.* = true;
+            stats.wall_time_skips += tasks.len - cursor;
+            try appendRemainingRecursiveTimeoutSubcalls(arena, trace_subcalls, steps, live, tasks[cursor..], null);
             break;
         };
         const workers = try alloc.alloc(RecursiveChildWorker, wave_len);
@@ -2983,6 +2988,7 @@ fn runRecursiveChildTasks(
             threads[i] = try std.Thread.spawn(.{}, RecursiveChildWorker.run, .{worker});
             spawned += 1;
         }
+        stats.max_actual_concurrency = @max(stats.max_actual_concurrency, spawned);
 
         for (threads[0..spawned]) |thread| thread.join();
 
@@ -2995,30 +3001,19 @@ fn runRecursiveChildTasks(
         if (first_err) |err| {
             if (budget.expired()) {
                 wall_time_exhausted.* = true;
+                var skipped_in_wave: usize = 0;
                 for (workers) |*worker| {
                     if (worker.result) |*result| {
                         defer result.deinit();
                         try appendRecursiveSuccessfulChildResult(arena, summaries, successful_context_ids, trace_subcalls, steps, live, worker, result.content);
                         continue;
                     }
-                    try trace_subcalls.append(arena, try buildRecursiveTraceSubcall(
-                        arena,
-                        worker.task.child_index,
-                        worker.task.context_object.id,
-                        .skipped,
-                        worker.task.estimated_context_tokens,
-                        worker.task.token_count_method,
-                        null,
-                        "max_wall_time_ms",
-                    ));
-                    try appendStep(arena, steps, live, .{
-                        .kind = .recursive_subcall,
-                        .name = try std.fmt.allocPrint(arena, "recursive_subcall_{d}", .{worker.task.child_index + 1}),
-                        .action = try std.fmt.allocPrint(arena, "skipped recursive context object {s} because max_wall_time_ms was exhausted", .{worker.task.context_object.id}),
-                        .status = .skipped,
-                        .details = try buildRecursiveTimeoutSubcallDetails(arena, worker.task, worker.timeout_ms),
-                    });
+                    skipped_in_wave += 1;
+                    try appendRecursiveTimeoutSubcall(arena, trace_subcalls, steps, live, worker.task, worker.timeout_ms);
                 }
+                const remaining_after_wave = tasks.len - @min(tasks.len, cursor + wave_len);
+                stats.wall_time_skips += skipped_in_wave + remaining_after_wave;
+                if (remaining_after_wave > 0) try appendRemainingRecursiveTimeoutSubcalls(arena, trace_subcalls, steps, live, tasks[cursor + wave_len ..], null);
                 break;
             }
             for (workers) |*worker| {
@@ -3036,9 +3031,50 @@ fn runRecursiveChildTasks(
         cursor += wave_len;
         if (budget.expired()) {
             wall_time_exhausted.* = true;
+            stats.wall_time_skips += tasks.len - cursor;
+            if (cursor < tasks.len) try appendRemainingRecursiveTimeoutSubcalls(arena, trace_subcalls, steps, live, tasks[cursor..], null);
             break;
         }
     }
+    return stats;
+}
+
+fn appendRecursiveTimeoutSubcall(
+    arena: std.mem.Allocator,
+    trace_subcalls: *std.ArrayListUnmanaged(metadata_openapi.RecursiveTraceSubcall),
+    steps: *std.ArrayListUnmanaged(AgentStep),
+    live: *LiveEmitter,
+    task: RecursiveChildTask,
+    timeout_ms: ?u64,
+) !void {
+    try trace_subcalls.append(arena, try buildRecursiveTraceSubcall(
+        arena,
+        task.child_index,
+        task.context_object.id,
+        .skipped,
+        task.estimated_context_tokens,
+        task.token_count_method,
+        null,
+        "max_wall_time_ms",
+    ));
+    try appendStep(arena, steps, live, .{
+        .kind = .recursive_subcall,
+        .name = try std.fmt.allocPrint(arena, "recursive_subcall_{d}", .{task.child_index + 1}),
+        .action = try std.fmt.allocPrint(arena, "skipped recursive context object {s} because max_wall_time_ms was exhausted", .{task.context_object.id}),
+        .status = .skipped,
+        .details = try buildRecursiveTimeoutSubcallDetails(arena, task, timeout_ms),
+    });
+}
+
+fn appendRemainingRecursiveTimeoutSubcalls(
+    arena: std.mem.Allocator,
+    trace_subcalls: *std.ArrayListUnmanaged(metadata_openapi.RecursiveTraceSubcall),
+    steps: *std.ArrayListUnmanaged(AgentStep),
+    live: *LiveEmitter,
+    tasks: []const RecursiveChildTask,
+    timeout_ms: ?u64,
+) !void {
+    for (tasks) |task| try appendRecursiveTimeoutSubcall(arena, trace_subcalls, steps, live, task, timeout_ms);
 }
 
 fn appendRecursiveSuccessfulChildResult(
@@ -3266,7 +3302,7 @@ fn buildRecursiveSkippedSubcallDetails(
 fn buildRecursiveTimeoutSubcallDetails(
     alloc: std.mem.Allocator,
     task: RecursiveChildTask,
-    timeout_ms: u64,
+    timeout_ms: ?u64,
 ) !std.json.Value {
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, "child_index", .{ .integer = @intCast(task.child_index) });
@@ -3274,7 +3310,7 @@ fn buildRecursiveTimeoutSubcallDetails(
     try obj.put(alloc, "context_id", .{ .string = task.context_object.id });
     try obj.put(alloc, "estimated_context_tokens", .{ .integer = @intCast(task.estimated_context_tokens) });
     try obj.put(alloc, "token_count_method", .{ .string = @tagName(task.token_count_method) });
-    try obj.put(alloc, "timeout_ms", .{ .integer = @intCast(timeout_ms) });
+    if (timeout_ms) |value| try obj.put(alloc, "timeout_ms", .{ .integer = @intCast(value) });
     try obj.put(alloc, "skip_reason", .{ .string = "max_wall_time_ms" });
     return .{ .object = obj };
 }
