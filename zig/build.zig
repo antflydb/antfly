@@ -4189,6 +4189,7 @@ pub fn build(b: *std.Build) void {
             "api query contract parses typed row claim request",
             "api query contract parses typed json filters",
             "sql adapter parsed sql exposes raw statement source spans",
+            "sql adapter parsed sql owns typed statement variants",
             "sql adapter binder resolves catalog prebind table names from shared tokens",
             "sql adapter binder validates relational catalog lookups",
             "sql adapter binder resolves join projection bindings",

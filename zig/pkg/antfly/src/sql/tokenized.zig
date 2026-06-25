@@ -775,7 +775,7 @@ test "sql adapter parsed sql owns typed statement variants" {
     defer explain.deinit(alloc);
     switch (explain.statement) {
         .explain => |statement| {
-            try std.testing.expectEqualStrings("EXPLAIN SELECT id FROM usage_records;", statement.raw.sql(explain.sql()));
+            try std.testing.expectEqualStrings("EXPLAIN SELECT id FROM usage_records", statement.raw.sql(explain.sql()));
             try std.testing.expect(!statement.analyze);
             try std.testing.expectEqual(ast.SqlExplainFormat.text, statement.format);
             try std.testing.expect(!statement.verbose);
@@ -886,6 +886,31 @@ test "sql adapter parsed sql owns typed statement variants" {
         reason: generated_parser.GeneratedSqlUnsupportedReason,
     }{
         .{
+            .sql = "ALTER FOREIGN TABLE foreign_usage_records RENAME TO foreign_usage_archive",
+            .kind = .alter_foreign_table,
+            .reason = .alter_foreign_table_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "ALTER POLICY usage_policy ON usage_records RENAME TO usage_policy_v2",
+            .kind = .alter_policy,
+            .reason = .alter_policy_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "ALTER PUBLICATION usage_pub ADD TABLE usage_records",
+            .kind = .alter_publication,
+            .reason = .alter_publication_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "ALTER SERVER usage_server VERSION '15'",
+            .kind = .alter_server,
+            .reason = .alter_server_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "ALTER SUBSCRIPTION usage_sub DISABLE",
+            .kind = .alter_subscription,
+            .reason = .alter_subscription_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "CALL refresh_usage_records()",
             .kind = .call,
             .reason = .call_not_planned_by_generated_parser,
@@ -916,14 +941,59 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .copy_not_planned_by_generated_parser,
         },
         .{
+            .sql = "CREATE FOREIGN TABLE foreign_usage_records (id text) SERVER usage_fdw",
+            .kind = .create_foreign_table,
+            .reason = .create_foreign_table_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "CREATE MATERIALIZED VIEW usage_summary AS SELECT status FROM usage_records",
             .kind = .create_materialized_view,
             .reason = .create_materialized_view_not_planned_by_generated_parser,
         },
         .{
+            .sql = "CREATE POLICY usage_policy ON usage_records USING (tenant_id = current_user)",
+            .kind = .create_policy,
+            .reason = .create_policy_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "CREATE PUBLICATION usage_pub FOR TABLE usage_records",
+            .kind = .create_publication,
+            .reason = .create_publication_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "CREATE RULE usage_insert AS ON INSERT TO usage_records DO ALSO NOTIFY usage_events",
+            .kind = .create_rule,
+            .reason = .create_rule_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "CREATE SERVER usage_server FOREIGN DATA WRAPPER postgres_fdw",
+            .kind = .create_server,
+            .reason = .create_server_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=example dbname=usage' PUBLICATION usage_pub",
+            .kind = .create_subscription,
+            .reason = .create_subscription_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "CREATE TRIGGER usage_audit BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage()",
+            .kind = .create_trigger,
+            .reason = .create_trigger_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "DECLARE usage_cursor NO SCROLL CURSOR FOR SELECT id FROM usage_records",
             .kind = .declare,
             .reason = .declare_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "DO 'BEGIN NULL; END'",
+            .kind = .do_block,
+            .reason = .do_block_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "DROP FOREIGN TABLE IF EXISTS foreign_usage_records",
+            .kind = .drop_foreign_table,
+            .reason = .drop_foreign_table_not_planned_by_generated_parser,
         },
         .{
             .sql = "FETCH FROM usage_cursor",
@@ -999,6 +1069,36 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "DROP MATERIALIZED VIEW IF EXISTS usage_summary CASCADE",
             .kind = .drop_materialized_view,
             .reason = .drop_materialized_view_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "DROP POLICY IF EXISTS usage_policy ON usage_records",
+            .kind = .drop_policy,
+            .reason = .drop_policy_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "DROP PUBLICATION IF EXISTS usage_pub",
+            .kind = .drop_publication,
+            .reason = .drop_publication_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "DROP RULE IF EXISTS usage_insert ON usage_records",
+            .kind = .drop_rule,
+            .reason = .drop_rule_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "DROP SERVER IF EXISTS usage_server CASCADE",
+            .kind = .drop_server,
+            .reason = .drop_server_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "DROP SUBSCRIPTION IF EXISTS usage_sub",
+            .kind = .drop_subscription,
+            .reason = .drop_subscription_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "DROP TRIGGER IF EXISTS usage_audit ON usage_records",
+            .kind = .drop_trigger,
+            .reason = .drop_trigger_not_planned_by_generated_parser,
         },
         .{
             .sql = "UNLISTEN *",
@@ -1161,9 +1261,13 @@ test "sql adapter parsed sql owns typed statement variants" {
         else => return error.TestUnexpectedResult,
     }
 
-    var unsupported_generated = try ParsedSql.initAlloc(alloc, "SELECT id FROM docs WHERE status = 'active' LIMIT 5");
-    defer unsupported_generated.deinit(alloc);
-    try std.testing.expect(unsupported_generated.generated_statement == null);
+    var generated_read = try ParsedSql.initAlloc(alloc, "SELECT id FROM docs WHERE status = 'active' LIMIT 5");
+    defer generated_read.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_read.generatedStatementKind().?);
+    switch (generated_read.generated_statement.?.ast.?) {
+        .read => |read_ast| try std.testing.expectEqual(generated_parser.GeneratedSqlReadKind.query, read_ast.kind),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "sql adapter parsed sql retains generated DML nodes for covered write corpus" {
