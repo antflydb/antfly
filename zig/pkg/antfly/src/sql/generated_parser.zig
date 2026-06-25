@@ -944,11 +944,25 @@ pub const GeneratedSqlDmlReadBodyAst = struct {
     wrapper_projection_star: bool = false,
 };
 
+pub const GeneratedSqlDmlCteAst = struct {
+    tokens: GeneratedSqlTokenRange,
+    list_tokens: GeneratedSqlTokenRange,
+    first_name_tokens: GeneratedSqlTokenRange,
+    first_body_tokens: GeneratedSqlTokenRange,
+    first_body_read: GeneratedSqlDmlReadBodyAst,
+    last_name_tokens: GeneratedSqlTokenRange,
+    last_body_tokens: GeneratedSqlTokenRange,
+    last_body_read: GeneratedSqlDmlReadBodyAst,
+    count: usize = 0,
+    recursive: bool = false,
+};
+
 pub const GeneratedSqlDmlAst = struct {
     kind: GeneratedSqlDmlKind,
     statement_span: token_mod.SourceSpan,
     command_span: token_mod.SourceSpan,
     cte_tokens: ?GeneratedSqlTokenRange = null,
+    cte_prefix: ?GeneratedSqlDmlCteAst = null,
     target_table_tokens: ?GeneratedSqlTokenRange = null,
     insert_columns_tokens: ?GeneratedSqlTokenRange = null,
     values_tokens: ?GeneratedSqlTokenRange = null,
@@ -1958,6 +1972,7 @@ fn buildDmlAst(
     if (start > 0 and tokens.len > 0 and tokens[0].matchesKeywordTag(.with)) {
         ast.cte_tokens = .{ .start = 1, .end = start };
         ast.cte_recursive = tokens.len > 1 and tokens[1].matchesKeywordTag(.recursive);
+        buildDmlCteAst(tokens, start, &ast);
     }
     switch (kind) {
         .insert_values, .insert_select => buildInsertDmlAst(tokens, start, end, &ast),
@@ -1968,6 +1983,72 @@ fn buildDmlAst(
     }
     buildDmlChildReadAst(tokens, &ast);
     return ast;
+}
+
+fn buildDmlCteAst(
+    tokens: []const token_mod.Token,
+    final_statement_index: usize,
+    ast: *GeneratedSqlDmlAst,
+) void {
+    const cte_tokens = ast.cte_tokens orelse return;
+    var index: usize = if (ast.cte_recursive) 2 else 1;
+    if (index >= final_statement_index) return;
+    const list_tokens = GeneratedSqlTokenRange{ .start = index, .end = final_statement_index };
+    var count: usize = 0;
+    var first_name: ?GeneratedSqlTokenRange = null;
+    var first_body: ?GeneratedSqlTokenRange = null;
+    var first_read: ?GeneratedSqlDmlReadBodyAst = null;
+    var last_name: ?GeneratedSqlTokenRange = null;
+    var last_body: ?GeneratedSqlTokenRange = null;
+    var last_read: ?GeneratedSqlDmlReadBodyAst = null;
+    while (index < final_statement_index) {
+        if (tokens[index].kind != .identifier) return;
+        const name_tokens = GeneratedSqlTokenRange{ .start = index, .end = index + 1 };
+        index += 1;
+        if (index < final_statement_index and tokens[index].kind == .lparen) {
+            index = (findMatchingParen(tokens, index, final_statement_index) orelse return) + 1;
+        }
+        if (index >= final_statement_index or !tokens[index].matchesKeywordTag(.as)) return;
+        index += 1;
+        if (index < final_statement_index and tokens[index].matchesKeywordTag(.materialized)) {
+            index += 1;
+        } else if (index + 1 < final_statement_index and tokens[index].matchesKeywordTag(.not) and tokens[index + 1].matchesKeywordTag(.materialized)) {
+            index += 2;
+        }
+        if (index >= final_statement_index or tokens[index].kind != .lparen) return;
+        const close = findMatchingParen(tokens, index, final_statement_index) orelse return;
+        if (index + 1 >= close) return;
+        const body_tokens = GeneratedSqlTokenRange{ .start = index + 1, .end = close };
+        const body_read = buildDmlReadBodyMetadata(tokens, body_tokens) orelse return;
+        if (count == 0) {
+            first_name = name_tokens;
+            first_body = body_tokens;
+            first_read = body_read;
+        }
+        last_name = name_tokens;
+        last_body = body_tokens;
+        last_read = body_read;
+        count += 1;
+        index = close + 1;
+        if (index < final_statement_index and tokens[index].kind == .comma) {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    if (count == 0 or index != final_statement_index) return;
+    ast.cte_prefix = .{
+        .tokens = cte_tokens,
+        .list_tokens = list_tokens,
+        .first_name_tokens = first_name.?,
+        .first_body_tokens = first_body.?,
+        .first_body_read = first_read.?,
+        .last_name_tokens = last_name.?,
+        .last_body_tokens = last_body.?,
+        .last_body_read = last_read.?,
+        .count = count,
+        .recursive = ast.cte_recursive,
+    };
 }
 
 fn buildDmlChildReadAst(
@@ -1988,8 +2069,16 @@ fn buildDmlSelectSourceReadAst(
     ast: *GeneratedSqlDmlAst,
     source_tokens: GeneratedSqlTokenRange,
 ) void {
-    if (!tokens[source_tokens.start].matchesKeywordTag(.select)) return;
-    const statement_span = sourceSpanForTokenRange(tokens, source_tokens) orelse return;
+    ast.source_read = buildDmlReadBodyMetadata(tokens, source_tokens) orelse return;
+}
+
+fn buildDmlReadBodyMetadata(
+    tokens: []const token_mod.Token,
+    source_tokens: GeneratedSqlTokenRange,
+) ?GeneratedSqlDmlReadBodyAst {
+    if (source_tokens.start >= source_tokens.end or source_tokens.end > tokens.len) return null;
+    if (!tokens[source_tokens.start].matchesKeywordTag(.select)) return null;
+    const statement_span = sourceSpanForTokenRange(tokens, source_tokens) orelse return null;
     var read_body = GeneratedSqlDmlReadBodyAst{
         .tokens = source_tokens,
         .kind = classifyReadKindInRange(tokens, source_tokens),
@@ -2022,7 +2111,7 @@ fn buildDmlSelectSourceReadAst(
         const where_end = firstOptionalIndex(&[_]?usize{ group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
         if (idx + 1 < where_end) read_body.where_tokens = .{ .start = idx + 1, .end = where_end };
     }
-    ast.source_read = read_body;
+    return read_body;
 }
 
 fn buildDmlRelationSourceReadAst(
@@ -5236,6 +5325,14 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlDmlKind.update, dml.kind);
             try std.testing.expectEqualStrings("UPDATE", spanText(cte_update_sql, dml.command_span));
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 9 }, dml.cte_tokens.?);
+            const cte_prefix = dml.cte_prefix orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 9 }, cte_prefix.list_tokens);
+            try std.testing.expectEqual(@as(usize, 1), cte_prefix.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, cte_prefix.first_name_tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 8 }, cte_prefix.first_body_tokens);
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, cte_prefix.first_body_read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, cte_prefix.first_body_read.projection_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, cte_prefix.first_body_read.source_tokens.?);
             try std.testing.expect(!dml.cte_recursive);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, dml.target_table_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 15 }, dml.assignments_tokens.?);
@@ -5297,6 +5394,15 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqual(GeneratedSqlDmlKind.insert_select, dml.kind);
             try std.testing.expectEqualStrings("INSERT", spanText(recursive_insert_sql, dml.command_span));
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 10 }, dml.cte_tokens.?);
+            const cte_prefix = dml.cte_prefix orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 10 }, cte_prefix.list_tokens);
+            try std.testing.expectEqual(@as(usize, 1), cte_prefix.count);
+            try std.testing.expect(cte_prefix.recursive);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, cte_prefix.first_name_tokens);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 9 }, cte_prefix.first_body_tokens);
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, cte_prefix.first_body_read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, cte_prefix.first_body_read.projection_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, cte_prefix.first_body_read.source_tokens.?);
             try std.testing.expect(dml.cte_recursive);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 12, .end = 13 }, dml.target_table_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 16 }, dml.insert_columns_tokens.?);
