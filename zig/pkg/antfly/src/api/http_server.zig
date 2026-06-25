@@ -8164,6 +8164,14 @@ pub fn requiredPermissionForRequest(method: http_common.Method, path: []const u8
             .GET, .PUT, .DELETE => return null,
         },
     };
+    if (routes.Routes.matchTableArtifacts(path)) |artifact| return .{
+        .resource_type = .table,
+        .resource = artifact.table_name,
+        .permission_type = switch (method) {
+            .GET => .read,
+            .POST, .PUT, .DELETE => return null,
+        },
+    };
     if (routes.Routes.matchTableArtifactEnrichment(path)) |artifact| return .{
         .resource_type = .table,
         .resource = artifact.table_name,
@@ -8275,6 +8283,12 @@ test "document artifact routes declare read and admin permissions" {
         try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
         try std.testing.expectEqualStrings("docs", required.resource);
         try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    }
+    {
+        const required = requiredPermissionForRequest(.GET, "/tables/docs/artifacts").?;
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
     }
     {
         const required = requiredPermissionForRequest(.POST, "/tables/docs/artifacts/document_units_v1/reprocess").?;
