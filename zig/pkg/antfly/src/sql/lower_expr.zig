@@ -400,6 +400,75 @@ fn generatedHavingClauseEnd(
     return range.end;
 }
 
+fn validateGeneratedWindowListForClause(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    windows: []const generated_parser.GeneratedSqlWindowAst,
+) !void {
+    if (range.start >= range.end or range.end > tokens.len or windows.len == 0) return error.UnsupportedSqlShape;
+    for (windows, 0..) |window, index| {
+        if (window.tokens.start >= window.tokens.end or window.tokens.start < range.start or window.tokens.end > range.end) return error.UnsupportedSqlShape;
+        if (index == 0) {
+            if (window.tokens.start != range.start) return error.UnsupportedSqlShape;
+        } else {
+            const previous = windows[index - 1].tokens;
+            if (previous.end + 1 != window.tokens.start or previous.end >= tokens.len or tokens[previous.end].kind != .comma) return error.UnsupportedSqlShape;
+        }
+        if (index + 1 == windows.len and window.tokens.end != range.end) return error.UnsupportedSqlShape;
+        if (window.name_tokens.start != window.tokens.start or window.name_tokens.start >= window.name_tokens.end or window.name_tokens.end + 2 > window.tokens.end) return error.UnsupportedSqlShape;
+        if (!tokens[window.name_tokens.end].matchesKeywordTag(.as) or tokens[window.name_tokens.end + 1].kind != .lparen or tokens[window.tokens.end - 1].kind != .rparen) return error.UnsupportedSqlShape;
+        if (window.definition_tokens.start != window.name_tokens.end + 2 or window.definition_tokens.end != window.tokens.end - 1) return error.UnsupportedSqlShape;
+
+        if (window.partition_tokens) |partition_range| {
+            if (partition_range.start < window.definition_tokens.start or partition_range.end > window.definition_tokens.end) return error.UnsupportedSqlShape;
+            try validateGeneratedExpressionListForClause(tokens, partition_range, window.partition_items);
+        } else if (window.partition_items.count != 0 or window.partition_items.items.len != 0) {
+            return error.UnsupportedSqlShape;
+        }
+
+        if (window.order_tokens) |order_range| {
+            if (order_range.start < window.definition_tokens.start or order_range.end > window.definition_tokens.end) return error.UnsupportedSqlShape;
+            try validateGeneratedOrderListForClause(tokens, order_range, window.order_items);
+        } else if (window.order_items.count != 0 or window.order_items.items.len != 0) {
+            return error.UnsupportedSqlShape;
+        }
+
+        if (window.frame_tokens) |frame_range| {
+            if (frame_range.start < window.definition_tokens.start or frame_range.end > window.definition_tokens.end) return error.UnsupportedSqlShape;
+            if (window.frame_start_expression_tokens) |expression_range| {
+                if (expression_range.start < frame_range.start or expression_range.end > frame_range.end) return error.UnsupportedSqlShape;
+                if (!generatedTokenRangeEqual((window.frame_start_expression orelse return error.UnsupportedSqlShape).tokens orelse return error.UnsupportedSqlShape, expression_range)) return error.UnsupportedSqlShape;
+            } else if (window.frame_start_expression != null or window.frame_start_expression_kind != null) {
+                return error.UnsupportedSqlShape;
+            }
+            if (window.frame_end_expression_tokens) |expression_range| {
+                if (expression_range.start < frame_range.start or expression_range.end > frame_range.end) return error.UnsupportedSqlShape;
+                if (!generatedTokenRangeEqual((window.frame_end_expression orelse return error.UnsupportedSqlShape).tokens orelse return error.UnsupportedSqlShape, expression_range)) return error.UnsupportedSqlShape;
+            } else if (window.frame_end_expression != null or window.frame_end_expression_kind != null) {
+                return error.UnsupportedSqlShape;
+            }
+        } else if (window.frame_start_expression_tokens != null or window.frame_start_expression != null or window.frame_start_expression_kind != null or
+            window.frame_end_expression_tokens != null or window.frame_end_expression != null or window.frame_end_expression_kind != null)
+        {
+            return error.UnsupportedSqlShape;
+        }
+    }
+}
+
+fn generatedWindowClauseEnd(
+    tokens: []const Token,
+    keyword_index: usize,
+    pos: usize,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !?usize {
+    const read = generated_read_ast orelse return null;
+    if (keyword_index >= tokens.len or !tokens[keyword_index].matchesKeywordTag(.window)) return null;
+    const range = read.window_tokens orelse return error.UnsupportedSqlShape;
+    if (range.start != pos or range.end > tokens.len or read.window_items.len != read.window_count) return error.UnsupportedSqlShape;
+    try validateGeneratedWindowListForClause(tokens, range, read.window_items);
+    return range.end;
+}
+
 fn generatedWhereClauseEnd(
     tokens: []const Token,
     keyword_index: usize,
@@ -16977,6 +17046,8 @@ pub fn parseWindowSelectAlloc(
                 if (pos.* != end) return error.UnsupportedSqlShape;
             }
         } else if (parser.matchKeyword(tokens, pos, "window")) {
+            const keyword_index = pos.* - 1;
+            const generated_window_end = try generatedWindowClauseEnd(tokens, keyword_index, pos.*, options.generated_read_ast);
             const end = topLevelWindowClauseEnd(tokens, pos.*);
             var window_pos: usize = 0;
             const window_context = options.context_hooks.get_context(options.context_hooks.ptr);
@@ -16997,6 +17068,9 @@ pub fn parseWindowSelectAlloc(
             );
             defer plan_mod.freeNamedWindowSpecs(alloc, discarded_named_windows);
             pos.* = end;
+            if (generated_window_end) |generated_end| {
+                if (pos.* != generated_end) return error.UnsupportedSqlShape;
+            }
         } else if (parser.matchKeyword(tokens, pos, "order")) {
             const keyword_index = pos.* - 1;
             try parser.expectKeyword(tokens, pos, "by");
@@ -29438,6 +29512,38 @@ fn corruptGeneratedReadSourceRange(parsed_sql: *tokenized.ParsedSql) !void {
     return error.TestUnexpectedResult;
 }
 
+fn corruptGeneratedReadWindowRangeToProjection(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |*read| {
+                    if (read.window_tokens == null) return error.TestUnexpectedResult;
+                    read.window_tokens = read.projection_tokens orelse return error.TestUnexpectedResult;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadFirstWindowOrderExpressionItem(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |*read| {
+                    if (read.window_items.len == 0 or read.window_items[0].order_items.items.len == 0 or read.window_items[0].order_items.expression_items.len == 0 or read.projection_items.items.len == 0) return error.TestUnexpectedResult;
+                    read.window_items[0].order_items.expression_items[0] = read.projection_items.items[0];
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn corruptGeneratedReadDistinctRangeToProjection(parsed_sql: *tokenized.ParsedSql) !void {
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
@@ -36139,6 +36245,32 @@ test "sql adapter lower expr lowers row_number window query plans" {
     try std.testing.expectEqualStrings("tenant", partition_only_sum.plan.window.windows[0].partition_by[0]);
     try std.testing.expectEqual(@as(usize, 0), partition_only_sum.plan.window.windows[0].order_by.len);
     try std.testing.expectEqualStrings("tenant_amount", partition_only_sum.plan.window.windows[0].output);
+
+    var malformed_window_range = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id, row_number() OVER usage_window AS rn FROM usage_records WINDOW usage_window AS (ORDER BY id)",
+    );
+    defer malformed_window_range.deinit(alloc);
+    try corruptGeneratedReadWindowRangeToProjection(&malformed_window_range);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedWindowPlanForLowerExprTestAlloc(
+        alloc,
+        &malformed_window_range,
+        schema,
+        &.{},
+    ));
+
+    var malformed_window_order = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id, row_number() OVER usage_window AS rn FROM usage_records WINDOW usage_window AS (ORDER BY id)",
+    );
+    defer malformed_window_order.deinit(alloc);
+    try corruptGeneratedReadFirstWindowOrderExpressionItem(&malformed_window_order);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedWindowPlanForLowerExprTestAlloc(
+        alloc,
+        &malformed_window_order,
+        schema,
+        &.{},
+    ));
 
     try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
         alloc,

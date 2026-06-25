@@ -88,6 +88,33 @@ pub fn scanRemote(
     return .{ .ndjson = try alloc.dupe(u8, result.body) };
 }
 
+pub fn queryRemoteWithVectorWorkerBody(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    req: db_mod.types.SearchRequest,
+    vector_worker_body: ?[]const u8,
+) !db_mod.types.SearchResult {
+    var client = http_client.ApiHttpClient.init(alloc, executor);
+    if (searchRequestHasUnserializableResolvedDocFilter(req)) return error.UnsupportedQueryRequest;
+    if (vector_worker_body) |body| {
+        var result = try client.fetchGroupVectorWorker(base_uri, group_id, table_name, body);
+        defer result.deinit(alloc);
+        var parsed = try parseRemoteSearchResultForHostedQuery(alloc, result.body);
+        parsed.identity_read_generation = req.identity_read_generation;
+        return parsed;
+    }
+    const body = try encodeQueryRequest(alloc, req);
+    defer alloc.free(body);
+    var result = try client.fetchGroupQuery(base_uri, group_id, table_name, body);
+    defer result.deinit(alloc);
+    var parsed = try parseRemoteSearchResultForHostedQuery(alloc, result.body);
+    parsed.identity_read_generation = req.identity_read_generation;
+    return parsed;
+}
+
 pub fn preflightRemote(
     executor: http_common.RequestExecutor,
     alloc: std.mem.Allocator,

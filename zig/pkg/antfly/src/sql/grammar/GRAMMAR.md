@@ -623,6 +623,9 @@ Unsupported DDL remains on the existing parser until
    window, join, and lateral read lowerers now validate the retained generated
    predicate span and require typed predicate planning to consume the same
    clause body; aggregate `HAVING` clauses apply the same guard.
+   Generated named `WINDOW` clauses now validate top-level window item,
+   name/definition, partition list, order list, and frame expression spans
+   before the typed window lowerer accepts a consumed `WINDOW` tail.
    Generated read validation
    rejects pagination payloads that are missing required expressions, attach
    expressions to `LIMIT ALL`, place expression spans outside their owning

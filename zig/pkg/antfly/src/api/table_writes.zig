@@ -16507,12 +16507,10 @@ test "provisioned query visibility read preparation does not block on same-table
 
     _ = try source.source().createTable(alloc, "docs", .{});
 
-    lockAtomic(&source.local_db_mutex);
     {
         var cached = try source.getOrOpenCachedDbMode(alloc, &write_cache, path, 7001, "docs", .default, null, null);
         defer cached.deinit(alloc);
     }
-    source.local_db_mutex.unlock();
 
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expect(!source.isWriteCacheDirtyForTable("docs"));

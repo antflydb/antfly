@@ -4830,6 +4830,14 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
+    const provisioned_query_visibility_tests = b.addTest(.{
+        .root_module = api_table_writes_docid_test_mod,
+        .filters = selectTestFilters(b, &.{"provisioned query visibility "}),
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
     const api_table_reads_docid_tests = b.addTest(.{
         .root_module = api_table_reads_docid_test_mod,
         .filters = &.{
@@ -5045,6 +5053,7 @@ pub fn build(b: *std.Build) void {
     const run_lib_serverless_docid_tests = b.addRunArtifact(lib_serverless_docid_tests);
     const run_api_transactions_docid_tests = b.addRunArtifact(api_transactions_docid_tests);
     const run_api_table_writes_docid_tests = b.addRunArtifact(api_table_writes_docid_tests);
+    const run_provisioned_query_visibility_tests = b.addRunArtifact(provisioned_query_visibility_tests);
     const run_api_table_reads_docid_tests = b.addRunArtifact(api_table_reads_docid_tests);
     const run_api_table_reads_graph_metric_tests = b.addRunArtifact(api_table_reads_graph_metric_tests);
     const run_api_public_table_http_docid_tests = b.addRunArtifact(api_public_table_http_docid_tests);
@@ -5062,6 +5071,10 @@ pub fn build(b: *std.Build) void {
 
     const api_table_writes_docid_test_step = b.step("api-table-writes-docid-test", "Run focused API table write DOCID tests");
     api_table_writes_docid_test_step.dependOn(&run_api_table_writes_docid_tests.step);
+
+    const provisioned_query_visibility_step = b.step("provisioned-query-visibility-test", "Run focused provisioned query visibility tests");
+    provisioned_query_visibility_step.dependOn(&run_provisioned_query_visibility_tests.step);
+    unit_test_step.dependOn(&run_provisioned_query_visibility_tests.step);
 
     const api_table_reads_docid_test_step = b.step("api-table-reads-docid-test", "Run focused API table read DOCID tests");
     api_table_reads_docid_test_step.dependOn(&run_api_table_reads_docid_tests.step);
@@ -6011,19 +6024,6 @@ pub fn build(b: *std.Build) void {
     const run_db_enrichment_tests = b.addRunArtifact(db_enrichment_tests);
     const db_enrichment_test_step = b.step("db-enrichment-test", "Run storage/db enrichment-related unit tests");
     db_enrichment_test_step.dependOn(&run_db_enrichment_tests.step);
-
-    const provisioned_query_visibility_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = selectTestFilters(b, &.{"provisioned query visibility "}),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_provisioned_query_visibility_tests = b.addRunArtifact(provisioned_query_visibility_tests);
-    const provisioned_query_visibility_step = b.step("provisioned-query-visibility-test", "Run focused provisioned query visibility tests");
-    provisioned_query_visibility_step.dependOn(&run_provisioned_query_visibility_tests.step);
-    unit_test_step.dependOn(&run_provisioned_query_visibility_tests.step);
 
     const sparse_test_mod = makeLmdbModule(b, "pkg/antfly/src/sparse_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     sparse_test_mod.addImport("bloom", bloom_mod);

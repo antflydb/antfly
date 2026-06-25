@@ -107,8 +107,6 @@ const searchRequestHasUnserializableResolvedDocFilter = table_read_remote_wire.s
 const encodeLookupFields = table_read_remote_wire.encodeLookupFields;
 const encodeScanRequest = table_read_remote_wire.encodeScanRequest;
 const encodeQueryRequest = table_read_remote_wire.encodeQueryRequest;
-const parseRemoteSearchResult = table_read_remote_wire.parseRemoteSearchResult;
-const parseRemoteSearchResultForHostedQuery = table_read_remote_wire.parseRemoteSearchResultForHostedQuery;
 const lookupRemote = table_read_remote_wire.lookupRemote;
 const scanRemote = table_read_remote_wire.scanRemote;
 const preflightRemote = table_read_remote_wire.preflightRemote;
@@ -14277,23 +14275,17 @@ fn queryRemote(
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
 ) !db_mod.types.SearchResult {
-    var client = http_client.ApiHttpClient.init(alloc, executor);
-    if (searchRequestHasUnserializableResolvedDocFilter(req)) return error.UnsupportedQueryRequest;
-    if (try encodeAlgebraicVectorWorkerRequestForSearchRequestAlloc(alloc, req)) |body| {
-        defer alloc.free(body);
-        var result = try client.fetchGroupVectorWorker(base_uri, group_id, table_name, body);
-        defer result.deinit(alloc);
-        var parsed = try parseRemoteSearchResultForHostedQuery(alloc, result.body);
-        parsed.identity_read_generation = req.identity_read_generation;
-        return parsed;
-    }
-    const body = try encodeQueryRequest(alloc, req);
-    defer alloc.free(body);
-    var result = try client.fetchGroupQuery(base_uri, group_id, table_name, body);
-    defer result.deinit(alloc);
-    var parsed = try parseRemoteSearchResultForHostedQuery(alloc, result.body);
-    parsed.identity_read_generation = req.identity_read_generation;
-    return parsed;
+    const vector_worker_body = try encodeAlgebraicVectorWorkerRequestForSearchRequestAlloc(alloc, req);
+    defer if (vector_worker_body) |body| alloc.free(body);
+    return try table_read_remote_wire.queryRemoteWithVectorWorkerBody(
+        executor,
+        alloc,
+        base_uri,
+        group_id,
+        table_name,
+        req,
+        vector_worker_body,
+    );
 }
 
 fn appendScanLine(
