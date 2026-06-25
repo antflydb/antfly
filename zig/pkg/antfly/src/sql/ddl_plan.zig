@@ -10386,7 +10386,8 @@ fn validateGeneratedUnsupportedCatalogAst(
     if (ast.command_span.start != tokens[0].source_start or ast.command_span.end != tokens[0].source_end) {
         return error.UnsupportedSqlShape;
     }
-    if (!std.meta.eql(ast.subject_tokens orelse return error.UnsupportedSqlShape, generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = end })) {
+    const subject_tokens = ast.subject_tokens orelse return error.UnsupportedSqlShape;
+    if (!std.meta.eql(subject_tokens, generatedUnsupportedCatalogSubjectRange(boundary, end) orelse return error.UnsupportedSqlShape)) {
         return error.UnsupportedSqlShape;
     }
     switch (boundary.family) {
@@ -10551,6 +10552,22 @@ fn validateGeneratedUnsupportedCatalogAst(
             else => return error.UnsupportedSqlShape,
         },
     }
+}
+
+fn generatedUnsupportedCatalogSubjectRange(
+    boundary: GeneratedUnsupportedCatalogBoundary,
+    end: usize,
+) ?generated_parser.GeneratedSqlTokenRange {
+    const start: usize = switch (boundary.family) {
+        .update_policy_trigger => switch (boundary.kind) {
+            .create_trigger,
+            .drop_trigger,
+            => 2,
+            else => return null,
+        },
+        else => 1,
+    };
+    return if (end > start) .{ .start = start, .end = end } else null;
 }
 
 fn catalogDdlPlanFromGeneratedUnsupportedAstAlloc(
@@ -17004,6 +17021,25 @@ test "sql adapter generated utility unsupported AST lowers to typed catalog plan
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_subject));
+
+    var malformed_trigger_subject = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION touch_updated_at('updated_at_ns');",
+    );
+    defer malformed_trigger_subject.deinit(alloc);
+    if (malformed_trigger_subject.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| {
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.create_trigger, unsupported.kind);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = malformed_trigger_subject.items().len - 1 }, unsupported.subject_tokens.?);
+                    unsupported.subject_tokens = .{ .start = 1, .end = malformed_trigger_subject.items().len - 1 };
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_trigger_subject));
 }
 
 test "sql adapter generated notification unsupported AST lowers to catalog plans" {

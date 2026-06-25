@@ -2646,7 +2646,13 @@ test "sql adapter parsed sql owns typed statement variants" {
                 if (parsed.items().len == 1) {
                     try std.testing.expect(unsupported.subject_tokens == null);
                 } else {
-                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = parsed.items().len }, unsupported.subject_tokens.?);
+                    const expected_subject_start: usize = switch (case.kind) {
+                        .create_trigger,
+                        .drop_trigger,
+                        => 2,
+                        else => 1,
+                    };
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = expected_subject_start, .end = parsed.items().len }, unsupported.subject_tokens.?);
                 }
             },
             else => return error.TestUnexpectedResult,

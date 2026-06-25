@@ -2650,10 +2650,20 @@ fn buildUnsupportedAst(
         if (generatedExplainSubjectStart(tokens, end)) |subject_start| {
             ast.subject_tokens = .{ .start = subject_start, .end = end };
         }
-    } else if (end > 1) {
-        ast.subject_tokens = .{ .start = 1, .end = end };
+    } else if (generatedUnsupportedSubjectStart(kind, end)) |subject_start| {
+        ast.subject_tokens = .{ .start = subject_start, .end = end };
     }
     return ast;
+}
+
+fn generatedUnsupportedSubjectStart(kind: GeneratedSqlUnsupportedKind, end: usize) ?usize {
+    const start: usize = switch (kind) {
+        .create_trigger,
+        .drop_trigger,
+        => 2,
+        else => 1,
+    };
+    return if (end > start) start else null;
 }
 
 fn generatedExplainSubjectStart(tokens: []const token_mod.Token, end: usize) ?usize {
@@ -10549,7 +10559,7 @@ test "generated SQL parser facade builds extended read AST spans" {
             .sql = "CREATE TRIGGER usage_audit BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage()",
             .kind = .create_trigger,
             .reason = .create_trigger_not_planned_by_generated_parser,
-            .subject_tokens = .{ .start = 1, .end = 15 },
+            .subject_tokens = .{ .start = 2, .end = 15 },
         },
         .{
             .sql = "CREATE USER MAPPING FOR usage_user SERVER usage_server OPTIONS (user 'remote')",
@@ -10723,7 +10733,7 @@ test "generated SQL parser facade builds extended read AST spans" {
             .sql = "DROP TRIGGER IF EXISTS usage_audit ON usage_records",
             .kind = .drop_trigger,
             .reason = .drop_trigger_not_planned_by_generated_parser,
-            .subject_tokens = .{ .start = 1, .end = 7 },
+            .subject_tokens = .{ .start = 2, .end = 7 },
         },
         .{
             .sql = "DROP USER MAPPING IF EXISTS FOR usage_user SERVER usage_server",
