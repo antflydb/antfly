@@ -446,6 +446,16 @@ fn isIncompleteGeneratedReadBoundary(tokens: []const Token, raw_statement: RawSq
     if (end == start + 1) {
         return tokenMatchesKeyword(first, .select) or tokenMatchesKeyword(first, .with);
     }
+    if (tokenMatchesKeyword(first, .select) and tokenMatchesKeyword(last, .distinct)) return true;
+    if (last.kind == .lparen and end > start + 1 and tokenMatchesKeyword(tokens[end - 2], .on)) return true;
+    if (generatedReadHasCompleteSourceBefore(tokens, start, end - 1) and
+        (tokenMatchesKeyword(last, .@"union") or
+            tokenMatchesKeyword(last, .intersect) or
+            tokenMatchesKeyword(last, .except)))
+    {
+        return true;
+    }
+    if (tokenMatchesKeyword(last, .all) and end > start + 1 and tokenMatchesKeyword(tokens[end - 2], .@"union")) return true;
     if (tokenMatchesKeyword(last, .select) or
         tokenMatchesKeyword(last, .from) or
         tokenMatchesKeyword(last, .where) or
@@ -470,12 +480,39 @@ fn isIncompleteGeneratedReadBoundary(tokens: []const Token, raw_statement: RawSq
         const previous = tokens[end - 2];
         return tokenMatchesKeyword(previous, .group) or tokenMatchesKeyword(previous, .order);
     }
+    if (generatedReadHasPriorResultTail(tokens, start, end - 1) and
+        (tokenMatchesKeyword(last, .window) or
+            tokenMatchesKeyword(last, .nulls) or
+            tokenMatchesKeyword(last, .between) or
+            tokenMatchesKeyword(last, .preceding) or
+            tokenMatchesKeyword(last, .following)))
+    {
+        return true;
+    }
     if (tokenMatchesKeyword(first, .with)) {
         return last.kind == .lparen or
             tokenMatchesKeyword(last, .as) or
             tokenMatchesKeyword(last, .recursive) or
             tokenMatchesKeyword(last, .materialized) or
             tokenMatchesKeyword(last, .not);
+    }
+    return false;
+}
+
+fn generatedReadHasCompleteSourceBefore(tokens: []const Token, start: usize, end: usize) bool {
+    var depth: usize = 0;
+    var index = start;
+    while (index < end and index < tokens.len) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth > 0) depth -= 1;
+            },
+            else => {},
+        }
+        if (depth == 0 and tokenMatchesKeyword(tokens[index], .from) and index + 1 < end) {
+            return true;
+        }
     }
     return false;
 }
@@ -1095,16 +1132,25 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "MERGE INTO usage_records USING source_rows ON"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "INSERT INTO usage_records OVERRIDING SYSTEM VALUE VALUES ('u1')"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT DISTINCT"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT DISTINCT ON ("));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT status, COUNT(*) FROM usage_records GROUP BY"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT status, COUNT(*) FROM usage_records GROUP BY status HAVING"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records ORDER BY"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records ORDER BY id NULLS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records ORDER BY id ROWS BETWEEN 1 PRECEDING"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records ORDER BY id LIMIT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE status = 'active' OFFSET"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records ORDER BY id FETCH"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT usage_records.id FROM usage_records JOIN"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT usage_records.id FROM usage_records JOIN accounts ON"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records UNION"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records UNION ALL"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records INTERSECT"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records EXCEPT"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT row_number() OVER usage_window FROM usage_records WINDOW"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "WITH"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "WITH RECURSIVE"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "WITH source_rows AS"));
