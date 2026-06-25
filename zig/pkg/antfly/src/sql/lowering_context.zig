@@ -543,6 +543,7 @@ fn validateGeneratedCteBodyMetadata(tokens: []const tokenized.Token, cte: genera
     const select_tokens = cte.body_select_tokens orelse return error.UnsupportedSqlShape;
     const projection_tokens = cte.body_projection_tokens orelse return error.UnsupportedSqlShape;
     if (select_tokens.start != body.start or select_tokens.end != body.start + 1) return error.UnsupportedSqlShape;
+    if (!tokens[select_tokens.start].matchesKeywordTag(.select)) return error.UnsupportedSqlShape;
     if (projection_tokens.start < select_tokens.end or projection_tokens.end > body.end) return error.UnsupportedSqlShape;
     if (cte.body_projection_items.count == 0) return error.UnsupportedSqlShape;
     if (cte.body_projection_items.count != 0 and !std.meta.eql(cte.body_projection_items.first_tokens orelse return error.UnsupportedSqlShape, cte.body_projection_items.items[0])) {
@@ -2973,6 +2974,7 @@ fn validateGeneratedExpressionAstRanges(
         const select_tokens = expression.subquery_select_tokens orelse return error.UnsupportedSqlShape;
         const projection_tokens = expression.subquery_projection_tokens orelse return error.UnsupportedSqlShape;
         if (select_tokens.start < inner.start or select_tokens.end > inner.end) return error.UnsupportedSqlShape;
+        if (!tokens[select_tokens.start].matchesKeywordTag(.select)) return error.UnsupportedSqlShape;
         if (projection_tokens.start < select_tokens.end or projection_tokens.end > inner.end) return error.UnsupportedSqlShape;
         if (expression.subquery_projection_items.count == 0) return error.UnsupportedSqlShape;
         try validateGeneratedReadListAstContainedByRange(expression.subquery_projection_items, projection_tokens);
@@ -4878,6 +4880,24 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_exists_subquery_projection_parsed_sql, malformed_exists_subquery_projection_read_ast),
     );
 
+    var malformed_exists_subquery_select_keyword_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE EXISTS (SELECT 1 FROM thresholds WHERE active IS TRUE)",
+    );
+    defer malformed_exists_subquery_select_keyword_parsed_sql.deinit(alloc);
+    const malformed_exists_subquery_select_keyword_generated_raw = malformed_exists_subquery_select_keyword_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    const malformed_exists_subquery_select_keyword_read_ast = switch (malformed_exists_subquery_select_keyword_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    const malformed_exists_subquery_select_tokens =
+        malformed_exists_subquery_select_keyword_read_ast.where_expression.right_expression.?.subquery_select_tokens orelse return error.UnsupportedSqlShape;
+    @constCast(malformed_exists_subquery_select_keyword_parsed_sql.items())[malformed_exists_subquery_select_tokens.start].keyword = .from;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_exists_subquery_select_keyword_parsed_sql, malformed_exists_subquery_select_keyword_read_ast),
+    );
+
     malformed_exists_subquery_projection_read_ast = switch (malformed_exists_subquery_projection_generated_raw.ast orelse return error.UnsupportedSqlShape) {
         .read => |ast| ast,
         else => return error.UnsupportedSqlShape,
@@ -5467,6 +5487,24 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_cte_body_kind_parsed_sql, malformed_cte_body_kind_read_ast),
+    );
+
+    var malformed_cte_body_select_keyword_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows",
+    );
+    defer malformed_cte_body_select_keyword_parsed_sql.deinit(alloc);
+    const malformed_cte_body_select_keyword_generated_raw = malformed_cte_body_select_keyword_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    const malformed_cte_body_select_keyword_read_ast = switch (malformed_cte_body_select_keyword_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    const malformed_cte_body_select_tokens =
+        malformed_cte_body_select_keyword_read_ast.cte_items[0].body_select_tokens orelse return error.UnsupportedSqlShape;
+    @constCast(malformed_cte_body_select_keyword_parsed_sql.items())[malformed_cte_body_select_tokens.start].keyword = .from;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_cte_body_select_keyword_parsed_sql, malformed_cte_body_select_keyword_read_ast),
     );
 
     var malformed_cte_body_projection_parsed_sql = try tokenized.ParsedSql.initAlloc(
