@@ -323,6 +323,13 @@ pub const ClientGenerator = struct {
         var fmt_str = std.ArrayListUnmanaged(u8).empty;
         var param_args = std.ArrayListUnmanaged(u8).empty;
 
+        for (path_params) |p| {
+            const pname = try naming.zigFieldName(self.arena, p.name);
+            const encoded_name = try encodedPathParamName(self.arena, p.name);
+            try self.w.line("const {s} = try httpx.PercentEncoding.encode(self.allocator, {s});", .{ encoded_name, pname });
+            try self.w.line("defer self.allocator.free({s});", .{encoded_name});
+        }
+
         try fmt_str.appendSlice(self.arena, "{s}");
         try param_args.appendSlice(self.arena, "self.base_url");
 
@@ -332,8 +339,8 @@ pub const ClientGenerator = struct {
                 .literal => |c| try fmt_str.append(self.arena, c),
                 .param => |name| {
                     try fmt_str.appendSlice(self.arena, "{s}");
-                    const pname = try naming.zigFieldName(self.arena, name);
-                    try param_args.print(self.arena, ", {s}", .{pname});
+                    const encoded_name = try encodedPathParamName(self.arena, name);
+                    try param_args.print(self.arena, ", {s}", .{encoded_name});
                 },
             }
         }
@@ -370,6 +377,11 @@ pub const ClientGenerator = struct {
     }
 };
 
+fn encodedPathParamName(allocator: Allocator, name: []const u8) ![]u8 {
+    const prefixed = try std.fmt.allocPrint(allocator, "encoded_{s}", .{name});
+    return naming.zigFieldName(allocator, prefixed);
+}
+
 test "client generator smoke" {
     // Just verify the module compiles
     const alloc = std.testing.allocator;
@@ -385,4 +397,39 @@ test "client generator smoke" {
     var w = SourceWriter.init(arena);
     var type_gen = TypeGenerator.init(arena, &w, &resolver);
     _ = ClientGenerator.init(arena, &w, &resolver, &type_gen);
+}
+
+test "client generator percent-encodes path parameters" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var path_params = [_]types.ParameterOrRef{
+        .{ .parameter = .{ .name = "tableName", .in = .path, .required = true } },
+        .{ .parameter = .{ .name = "key", .in = .path, .required = true } },
+        .{ .parameter = .{ .name = "artifactName", .in = .path, .required = true } },
+    };
+    var doc = types.OpenApiDoc{
+        .openapi = "3.0.3",
+        .info = .{ .title = "Test", .version = "1.0" },
+    };
+    try doc.paths.put(arena, "/db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}", .{
+        .get = .{
+            .operation_id = "getArtifact",
+            .parameters = &path_params,
+        },
+    });
+
+    var resolver = Resolver.init(arena, &doc);
+    var w = SourceWriter.init(arena);
+    var type_gen = TypeGenerator.init(arena, &w, &resolver);
+    var generator = ClientGenerator.init(arena, &w, &resolver, &type_gen);
+    try generator.generate(&doc);
+
+    const generated = w.toSlice();
+    try std.testing.expect(std.mem.indexOf(u8, generated, "const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "const encoded_artifact_name = try httpx.PercentEncoding.encode(self.allocator, artifact_name);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generated, "self.base_url, encoded_table_name, encoded_key, encoded_artifact_name") != null);
 }

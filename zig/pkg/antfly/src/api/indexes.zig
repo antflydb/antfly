@@ -232,6 +232,48 @@ pub fn collectArtifactEnrichmentsFromTableIndexesJson(
     return try out.toOwnedSlice(alloc);
 }
 
+pub fn encodeArtifactEnrichmentList(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    indexes_json: []const u8,
+) ![]u8 {
+    var enrichments = try collectArtifactEnrichmentsFromTableIndexesJson(alloc, indexes_json);
+    var unique_len: usize = 0;
+    defer {
+        for (enrichments[0..unique_len]) |*cfg| cfg.deinit(alloc);
+        alloc.free(enrichments);
+    }
+
+    sortArtifactEnrichmentsByDependency(enrichments);
+    for (enrichments, 0..) |*cfg, i| {
+        var duplicate = false;
+        for (enrichments[0..unique_len]) |prior| {
+            if (std.mem.eql(u8, prior.name, cfg.name)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            cfg.deinit(alloc);
+            continue;
+        }
+        if (unique_len != i) {
+            enrichments[unique_len] = cfg.*;
+            cfg.* = undefined;
+        }
+        unique_len += 1;
+    }
+
+    const response = struct {
+        table_name: []const u8,
+        artifacts: []const db_mod.types.EnrichmentConfig,
+    }{
+        .table_name = table_name,
+        .artifacts = enrichments[0..unique_len],
+    };
+    return try std.json.Stringify.valueAlloc(alloc, response, .{});
+}
+
 pub fn validateArtifactEnrichmentsForTableIndexesJson(
     alloc: std.mem.Allocator,
     indexes_json: []const u8,

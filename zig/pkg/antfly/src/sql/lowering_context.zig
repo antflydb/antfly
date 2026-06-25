@@ -108,7 +108,7 @@ pub const ReadPlanLoweringContext = struct {
 
     pub fn lowerParsed(self: *@This(), parsed_sql: *const tokenized.ParsedSql) !plan.LoweredReadPlan {
         if (generatedReadAstForParsedSql(parsed_sql)) |read_ast| {
-            return try lowerReadPlanFromGeneratedReadAstAlloc(self, parsed_sql, read_ast.*);
+            return try lowerReadPlanFromGeneratedReadAstAlloc(self, parsed_sql, read_ast);
         }
         return try self.lowerParsedWithClassifier(parsed_sql);
     }
@@ -181,7 +181,7 @@ fn generatedReadAstForParsedSql(parsed_sql: *const tokenized.ParsedSql) ?*const 
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
-                .read => |*read| read,
+                .read => |read| read,
                 else => null,
             };
         }
@@ -192,7 +192,7 @@ fn generatedReadAstForParsedSql(parsed_sql: *const tokenized.ParsedSql) ?*const 
 pub fn lowerReadPlanFromGeneratedReadAstAlloc(
     context: *ReadPlanLoweringContext,
     parsed_sql: *const tokenized.ParsedSql,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
 ) !plan.LoweredReadPlan {
     const read_kind = try generatedReadStatementKind(parsed_sql.items(), read_ast);
     try validateGeneratedReadAstRanges(parsed_sql.items(), read_ast);
@@ -265,7 +265,7 @@ pub fn lowerReadPlanFromGeneratedReadAstAlloc(
 
 pub fn validateGeneratedReadAstForStatement(
     tokens: []const tokenized.Token,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
 ) !void {
     _ = try generatedReadStatementKind(tokens, read_ast);
     try validateGeneratedReadAstRanges(tokens, read_ast);
@@ -282,7 +282,7 @@ pub fn validateGeneratedReadAstForStatement(
 
 fn generatedReadStatementKind(
     tokens: []const tokenized.Token,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
 ) !classifier.SqlReadStatementKind {
     return switch (read_ast.kind) {
         .query => .query,
@@ -300,7 +300,7 @@ fn generatedReadStatementKind(
 
 fn generatedCteFinalReadStatementKind(
     tokens: []const tokenized.Token,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
 ) !classifier.SqlReadStatementKind {
     if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return error.UnsupportedSqlShape;
     if (read_ast.set_operation_tokens != null) return .set_operation;
@@ -327,7 +327,7 @@ fn generatedCteFinalReadStatementKind(
     return .query;
 }
 
-fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: generated_parser.GeneratedSqlReadAst) !void {
+fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: *const generated_parser.GeneratedSqlReadAst) !void {
     try validateGeneratedReadStatementSpans(tokens, read_ast);
     const ranges = [_]?generated_parser.GeneratedSqlTokenRange{
         read_ast.cte_tokens,
@@ -494,7 +494,7 @@ fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: gen
     }
 }
 
-fn validateGeneratedCteListMetadata(tokens: []const tokenized.Token, read_ast: generated_parser.GeneratedSqlReadAst) !void {
+fn validateGeneratedCteListMetadata(tokens: []const tokenized.Token, read_ast: *const generated_parser.GeneratedSqlReadAst) !void {
     if (read_ast.cte_items.len == 0) {
         if (read_ast.cte_count != 0 or
             read_ast.cte_tokens != null or
@@ -715,7 +715,7 @@ fn validateGeneratedCteBodyMetadata(tokens: []const tokenized.Token, cte: genera
 
 fn validateGeneratedJoinTreeMetadata(
     tokens: []const tokenized.Token,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
 ) !void {
     return validateGeneratedJoinTreeMetadataForSource(
         tokens,
@@ -826,7 +826,7 @@ fn validateGeneratedJoinTreeMetadataForSource(
 
 fn validateGeneratedJoinAstRanges(
     tokens: []const tokenized.Token,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
     join_items: []const generated_parser.GeneratedSqlJoinAst,
 ) !void {
     for (join_items) |join| {
@@ -855,7 +855,7 @@ fn optionalGeneratedTokenRangeEql(
     return rhs == null;
 }
 
-fn validateGeneratedReadClauseMetadata(tokens: []const tokenized.Token, read_ast: generated_parser.GeneratedSqlReadAst) !void {
+fn validateGeneratedReadClauseMetadata(tokens: []const tokenized.Token, read_ast: *const generated_parser.GeneratedSqlReadAst) !void {
     const projection_tokens = read_ast.projection_tokens orelse return error.UnsupportedSqlShape;
     const select_tokens: generated_parser.GeneratedSqlTokenRange = if (read_ast.cte_tokens) |cte_tokens| blk: {
         if (cte_tokens.end >= tokens.len or !tokens[cte_tokens.end].matchesKeywordTag(.select)) {
@@ -968,7 +968,7 @@ fn validateGeneratedReadClauseMetadata(tokens: []const tokenized.Token, read_ast
     }
 }
 
-fn validateGeneratedSimpleQueryReadAst(tokens: []const tokenized.Token, read_ast: generated_parser.GeneratedSqlReadAst) !void {
+fn validateGeneratedSimpleQueryReadAst(tokens: []const tokenized.Token, read_ast: *const generated_parser.GeneratedSqlReadAst) !void {
     if (read_ast.cte_tokens != null or
         read_ast.group_tokens != null or
         read_ast.having_tokens != null or
@@ -993,7 +993,7 @@ fn validateGeneratedSimpleQueryReadAst(tokens: []const tokenized.Token, read_ast
     if (read_ast.fetch_tokens) |range| try validateGeneratedReadRangePrecededByKeyword(tokens, range, .fetch);
 }
 
-fn validateGeneratedAggregateReadAst(tokens: []const tokenized.Token, read_ast: generated_parser.GeneratedSqlReadAst) !void {
+fn validateGeneratedAggregateReadAst(tokens: []const tokenized.Token, read_ast: *const generated_parser.GeneratedSqlReadAst) !void {
     if (read_ast.cte_tokens != null or read_ast.window_tokens != null or read_ast.set_operation_tokens != null) {
         return error.UnsupportedSqlShape;
     }
@@ -1009,7 +1009,7 @@ fn validateGeneratedAggregateReadAst(tokens: []const tokenized.Token, read_ast: 
 
 fn validateGeneratedJoinedReadAst(
     tokens: []const tokenized.Token,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
     keyword: token_mod.TokenKeyword,
 ) !void {
     if (read_ast.cte_tokens != null or read_ast.group_tokens != null or read_ast.having_tokens != null or
@@ -1021,7 +1021,7 @@ fn validateGeneratedJoinedReadAst(
     try validateGeneratedReadRangeContainsKeyword(tokens, read_ast.source_tokens.?, keyword);
 }
 
-fn validateGeneratedWindowReadAst(tokens: []const tokenized.Token, read_ast: generated_parser.GeneratedSqlReadAst) !void {
+fn validateGeneratedWindowReadAst(tokens: []const tokenized.Token, read_ast: *const generated_parser.GeneratedSqlReadAst) !void {
     if (read_ast.cte_tokens != null or read_ast.group_tokens != null or read_ast.having_tokens != null or
         read_ast.set_operation_tokens != null)
     {
@@ -1032,7 +1032,7 @@ fn validateGeneratedWindowReadAst(tokens: []const tokenized.Token, read_ast: gen
     if (read_ast.window_tokens) |range| try validateGeneratedReadRangePrecededByKeyword(tokens, range, .window);
 }
 
-fn validateGeneratedSetOperationReadAst(tokens: []const tokenized.Token, read_ast: generated_parser.GeneratedSqlReadAst) !void {
+fn validateGeneratedSetOperationReadAst(tokens: []const tokenized.Token, read_ast: *const generated_parser.GeneratedSqlReadAst) !void {
     if (read_ast.cte_tokens != null) return error.UnsupportedSqlShape;
     if (read_ast.projection_tokens == null or read_ast.source_tokens == null or read_ast.set_operation_tokens == null) {
         return error.UnsupportedSqlShape;
@@ -1043,7 +1043,7 @@ fn validateGeneratedSetOperationReadAst(tokens: []const tokenized.Token, read_as
     if (read_ast.fetch_tokens) |range| try validateGeneratedReadRangePrecededByKeyword(tokens, range, .fetch);
 }
 
-fn validateGeneratedCteReadAst(tokens: []const tokenized.Token, read_ast: generated_parser.GeneratedSqlReadAst) !void {
+fn validateGeneratedCteReadAst(tokens: []const tokenized.Token, read_ast: *const generated_parser.GeneratedSqlReadAst) !void {
     const cte = read_ast.cte_tokens orelse return error.UnsupportedSqlShape;
     const name = read_ast.cte_name_tokens orelse return error.UnsupportedSqlShape;
     const body = read_ast.cte_body_tokens orelse return error.UnsupportedSqlShape;
@@ -1075,7 +1075,7 @@ fn validateGeneratedCteReadAst(tokens: []const tokenized.Token, read_ast: genera
 
 fn validateGeneratedCteFinalReadKind(
     tokens: []const tokenized.Token,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
     final_read_kind: classifier.SqlReadStatementKind,
 ) !void {
     if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return error.UnsupportedSqlShape;
@@ -1199,7 +1199,7 @@ fn lowerGeneratedCteReadPlanAlloc(
 
 fn validateGeneratedReadStatementSpans(
     tokens: []const tokenized.Token,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
 ) !void {
     const end = generatedReadStatementTokenEnd(tokens);
     if (end == 0) return error.UnsupportedSqlShape;
@@ -1223,7 +1223,7 @@ fn generatedReadStatementTokenEnd(tokens: []const tokenized.Token) usize {
 
 fn validateGeneratedReadTokenRange(
     tokens: []const tokenized.Token,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
     range: generated_parser.GeneratedSqlTokenRange,
 ) !void {
     if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
@@ -1405,7 +1405,7 @@ fn generatedExpressionAstHasMetadata(expression: generated_parser.GeneratedSqlEx
 
 fn validateGeneratedExpressionAstRangesIfPresent(
     tokens: []const tokenized.Token,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
     expression: generated_parser.GeneratedSqlExpressionAst,
 ) !void {
     if (!generatedExpressionAstHasMetadata(expression)) return;
@@ -1446,7 +1446,7 @@ fn generatedAntflyTableFunctionKindForToken(token: tokenized.Token) ?generated_p
 
 fn validateGeneratedAntflySourceMetadata(
     tokens: []const tokenized.Token,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
 ) !void {
     if (read_ast.source_antfly_function_items.len != read_ast.source_antfly_function_count) return error.UnsupportedSqlShape;
     var previous_end: usize = if (read_ast.source_tokens) |source_tokens| source_tokens.start else 0;
@@ -1459,7 +1459,7 @@ fn validateGeneratedAntflySourceMetadata(
 
 fn validateGeneratedAntflySourceItemMetadata(
     tokens: []const tokenized.Token,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
     item: generated_parser.GeneratedSqlAntflyTableFunctionAst,
 ) !void {
     const source_tokens = read_ast.source_tokens orelse return error.UnsupportedSqlShape;
@@ -1604,7 +1604,7 @@ fn validateGeneratedGraphSourceSemanticMetadata(
 
 fn validateGeneratedGraphSourceMetadata(
     tokens: []const tokenized.Token,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
 ) !void {
     if (read_ast.source_graph_function_items.len != read_ast.source_graph_function_count) return error.UnsupportedSqlShape;
     if (read_ast.source_graph_function_items.len == 0) {
@@ -1650,7 +1650,7 @@ fn validateGeneratedGraphSourceMetadata(
 
 fn validateGeneratedGraphSourceItemMetadata(
     tokens: []const tokenized.Token,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
     item: generated_parser.GeneratedSqlGraphTableFunctionAst,
 ) !void {
     const source_tokens = read_ast.source_tokens orelse return error.UnsupportedSqlShape;
@@ -1668,7 +1668,7 @@ fn validateGeneratedGraphSourceItemMetadata(
 
 fn validateGeneratedOptionalExpressionAstContainedByRange(
     tokens: []const tokenized.Token,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
     range: generated_parser.GeneratedSqlTokenRange,
     expression: generated_parser.GeneratedSqlExpressionAst,
 ) !void {
@@ -1680,7 +1680,7 @@ fn validateGeneratedOptionalExpressionAstContainedByRange(
 
 fn validateGeneratedOffsetExpressionAstMatchesRange(
     tokens: []const tokenized.Token,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
     range: generated_parser.GeneratedSqlTokenRange,
     expression: generated_parser.GeneratedSqlExpressionAst,
 ) !void {
@@ -1696,7 +1696,7 @@ fn validateGeneratedOffsetExpressionAstMatchesRange(
 
 fn validateGeneratedReadPaginationPayloads(
     tokens: []const tokenized.Token,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
     limit_tokens: ?generated_parser.GeneratedSqlTokenRange,
     limit_expression: ?*const generated_parser.GeneratedSqlExpressionAst,
     limit_all: bool,
@@ -2095,7 +2095,7 @@ fn validateGeneratedReadListAstContainedByOptionalRange(
 
 fn validateGeneratedReadListAstBoundaryExpressions(
     tokens: []const tokenized.Token,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
     list: generated_parser.GeneratedSqlListAst,
     first_expression: ?*const generated_parser.GeneratedSqlExpressionAst,
     last_expression: ?*const generated_parser.GeneratedSqlExpressionAst,
@@ -2494,7 +2494,7 @@ fn generatedExpressionAstHasSubqueryMetadata(expression: generated_parser.Genera
 
 fn validateGeneratedSubqueryTailAstRanges(
     tokens: []const tokenized.Token,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
     expression: generated_parser.GeneratedSqlExpressionAst,
     tail: generated_parser.GeneratedSqlSubqueryTailAst,
 ) !void {
@@ -2984,7 +2984,7 @@ fn validateGeneratedExpressionAstStructure(expression: generated_parser.Generate
 
 fn validateGeneratedExpressionAstRanges(
     tokens: []const tokenized.Token,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
     expression: generated_parser.GeneratedSqlExpressionAst,
 ) GeneratedReadValidationError!void {
     try validateGeneratedExpressionAstStructure(expression);
@@ -3211,7 +3211,7 @@ fn validateGeneratedExpressionAstRanges(
 
 fn validateGeneratedWindowAstListRanges(
     tokens: []const tokenized.Token,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
     window_tokens: ?generated_parser.GeneratedSqlTokenRange,
     window_items: []const generated_parser.GeneratedSqlWindowAst,
     window_count: usize,
@@ -3302,7 +3302,7 @@ fn validateGeneratedWindowAstListRanges(
 
 fn validateGeneratedDistinctOnListAstRanges(
     tokens: []const tokenized.Token,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
     distinct_tokens: ?generated_parser.GeneratedSqlTokenRange,
     distinct_on_items: generated_parser.GeneratedSqlListAst,
 ) !void {
@@ -3349,7 +3349,7 @@ fn validateGeneratedDistinctOnListMetadata(
 
 fn validateGeneratedSetOperationAstRanges(
     tokens: []const tokenized.Token,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
     set_operation_tokens: ?generated_parser.GeneratedSqlTokenRange,
     set_operation: generated_parser.GeneratedSqlSetOperationAst,
 ) !void {
@@ -3454,7 +3454,7 @@ fn generatedSetOperationAstHasMetadata(set_operation: generated_parser.Generated
 
 fn validateGeneratedReadListAstRanges(
     tokens: []const tokenized.Token,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
     list: generated_parser.GeneratedSqlListAst,
 ) GeneratedReadValidationError!void {
     if (list.count == 0) {

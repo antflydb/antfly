@@ -7053,3 +7053,261 @@ test "db derived async dense startup catch-up defaults keep more than one cache 
     try std.testing.expect(denseCatchUpStartupCacheNodes() > 1);
     try std.testing.expect(denseCatchUpStartupCacheVectors() > 1);
 }
+
+test "db derived async io_threaded executor stress applies explicit dense embeddings on lsm backend" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const stressDenseBackend = db_test_support.stressDenseBackend;
+    const allocStressDenseDocJson = db_test_support.allocStressDenseDocJson;
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    if (db_internal.getenv("ANTFLY_STRESS_DB_DENSE_REPRO") == null) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    const dims = index_manager_mod.stressEnvUsize("ANTFLY_STRESS_DENSE_DIMS", 256);
+    const total_docs = index_manager_mod.stressEnvUsize("ANTFLY_STRESS_DENSE_DOCS", 4096);
+    const batch_size = @max(@as(usize, 1), index_manager_mod.stressEnvUsize("ANTFLY_STRESS_DENSE_BATCH", 256));
+    const progress_interval = @max(batch_size, index_manager_mod.stressEnvUsize("ANTFLY_STRESS_DENSE_PROGRESS", batch_size * 8));
+    const dense_backend = stressDenseBackend();
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .executor = .{ .backend = .io_threaded },
+        .index_backends = .{
+            .dense_storage_backend = dense_backend,
+        },
+    });
+    defer db.close();
+
+    const config_json = try std.fmt.allocPrint(alloc, "{{\"field\":\"embedding\",\"dims\":{d},\"metric\":\"l2_squared\"}}", .{dims});
+    defer alloc.free(config_json);
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = config_json,
+    });
+
+    var queued_docs: usize = 0;
+    while (queued_docs < total_docs) {
+        const end = @min(queued_docs + batch_size, total_docs);
+
+        var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
+        defer {
+            for (writes.items) |write| {
+                alloc.free(@constCast(write.key));
+                alloc.free(@constCast(write.value));
+            }
+            writes.deinit(alloc);
+        }
+
+        for (queued_docs..end) |doc_index| {
+            const doc_key = try std.fmt.allocPrint(alloc, "doc:{d:0>8}", .{doc_index});
+            const doc_json = try allocStressDenseDocJson(alloc, dims, doc_index);
+            try writes.append(alloc, .{
+                .key = doc_key,
+                .value = doc_json,
+            });
+        }
+
+        try db.batch(.{
+            .writes = writes.items,
+            .sync_level = .write,
+        });
+        queued_docs = end;
+
+        if (queued_docs % progress_interval == 0 or queued_docs == total_docs) {
+            try db.runDerivedUntil(db.core.nextDerivedSequence());
+            const entry = db.core.index_manager.denseIndex("dv_v1") orelse return error.IndexNotFound;
+            try std.testing.expectEqual(@as(u64, @intCast(queued_docs)), entry.index.stats().active_count);
+        }
+    }
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try db.runUntilIdle();
+
+    const entry = db.core.index_manager.denseIndex("dv_v1") orelse return error.IndexNotFound;
+    try std.testing.expectEqual(@as(u64, @intCast(total_docs)), entry.index.stats().active_count);
+
+    const first_vector_id = (try db.core.index_manager.lookupDenseVectorId(db.core.store, "dv_v1", "doc:00000000")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(index_manager_mod.deterministicDenseVectorId("doc:00000000"), first_vector_id);
+    const first_doc = (try db.core.index_manager.lookupDenseDocKey(db.core.store, "dv_v1", first_vector_id)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(first_doc);
+    try std.testing.expectEqualStrings("doc:00000000", first_doc);
+
+    const expected_last_doc = try std.fmt.allocPrint(alloc, "doc:{d:0>8}", .{total_docs - 1});
+    defer alloc.free(expected_last_doc);
+    const last_vector_id = (try db.core.index_manager.lookupDenseVectorId(db.core.store, "dv_v1", expected_last_doc)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(index_manager_mod.deterministicDenseVectorId(expected_last_doc), last_vector_id);
+    const last_doc = (try db.core.index_manager.lookupDenseDocKey(db.core.store, "dv_v1", last_vector_id)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(last_doc);
+    try std.testing.expectEqualStrings(expected_last_doc, last_doc);
+
+    var read_txn = try entry.index.beginReadTxn();
+    defer read_txn.abort();
+    const last_vector = try entry.index.getVector(&read_txn, last_vector_id);
+    defer alloc.free(last_vector);
+
+    const expected_last_vector = try alloc.alloc(f32, dims);
+    defer alloc.free(expected_last_vector);
+    index_manager_mod.fillStressDenseVector(expected_last_vector, total_docs - 1);
+    try std.testing.expectEqualSlices(f32, expected_last_vector, last_vector);
+}
+
+test "db derived async hbc posting lazy versus eager profile benchmark" {
+    const DB = @import("mod.zig").DB;
+    const BatchProfile = @import("mod.zig").BatchProfile;
+    const db_test_support = @import("test_support.zig");
+    const profileBenchTestsEnabled = db_test_support.profileBenchTestsEnabled;
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const monotonicTimeNs = platform.time.monotonicNs;
+    if (!profileBenchTestsEnabled()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    const dims: usize = @max(@as(usize, 1), readEnvUsize("ANTFLY_HBC_POSTING_BENCH_DIMS", 16));
+    const doc_count: usize = @max(@as(usize, 1), readEnvUsize("ANTFLY_HBC_POSTING_BENCH_DOCS", 1024));
+    const Mode = struct {
+        name: []const u8,
+        lazy: bool,
+    };
+    const modes = [_]Mode{
+        .{
+            .name = "eager",
+            .lazy = false,
+        },
+        .{
+            .name = "lazy",
+            .lazy = true,
+        },
+    };
+
+    const BenchWrites = struct {
+        fn fill(
+            allocator: Allocator,
+            writes: []types.BatchWrite,
+            vector_buf: []f32,
+            salt: usize,
+        ) !void {
+            for (writes, 0..) |*write, doc_id| {
+                var norm_sq: f32 = 0;
+                for (vector_buf, 0..) |*slot, dim| {
+                    const raw: u32 = @intCast(((doc_id + salt) * 1103515245 + dim * 2654435761 + 19) % 1000);
+                    const centered = (@as(f32, @floatFromInt(raw)) / 500.0) - 1.0;
+                    slot.* = centered;
+                    norm_sq += centered * centered;
+                }
+                const inv_norm: f32 = 1.0 / @sqrt(norm_sq);
+                for (vector_buf) |*slot| slot.* *= inv_norm;
+
+                const key = try std.fmt.allocPrint(allocator, "doc:{d}", .{doc_id});
+                errdefer allocator.free(key);
+                const value = try std.fmt.allocPrint(
+                    allocator,
+                    "{{\"embedding\":{f}}}",
+                    .{std.json.fmt(vector_buf, .{})},
+                );
+                write.* = .{
+                    .key = key,
+                    .value = value,
+                };
+            }
+        }
+
+        fn free(allocator: Allocator, writes: []types.BatchWrite) void {
+            for (writes) |*write| {
+                allocator.free(write.key);
+                allocator.free(write.value);
+                write.* = .{ .key = &.{}, .value = &.{} };
+            }
+        }
+    };
+
+    for (modes) |mode| {
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        const config_json = try std.fmt.allocPrint(
+            alloc,
+            "{{\"field\":\"embedding\",\"dims\":{d},\"metric\":\"cosine\",\"use_quantization\":true,\"lazy_posting_maintenance\":{s},\"auto_posting_maintenance_max_postings\":0}}",
+            .{ dims, if (mode.lazy) "true" else "false" },
+        );
+        defer alloc.free(config_json);
+
+        try db.addIndex(.{
+            .name = "dv_v1",
+            .kind = .dense_vector,
+            .config_json = config_json,
+        });
+
+        const writes = try alloc.alloc(types.BatchWrite, doc_count);
+        @memset(writes, .{ .key = &.{}, .value = &.{} });
+        defer {
+            BenchWrites.free(alloc, writes);
+            alloc.free(writes);
+        }
+
+        const vector_buf = try alloc.alloc(f32, dims);
+        defer alloc.free(vector_buf);
+
+        try BenchWrites.fill(alloc, writes, vector_buf, 0);
+        const seed_start = monotonicTimeNs();
+        try db.batch(.{
+            .writes = writes,
+            .sync_level = .full_index,
+        });
+        const seed_ns = monotonicTimeNs() - seed_start;
+
+        const seed_stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, seed_stats);
+
+        BenchWrites.free(alloc, writes);
+        try BenchWrites.fill(alloc, writes, vector_buf, 17);
+
+        var batch_profile = BatchProfile{};
+        const write_start = monotonicTimeNs();
+        try db.batchProfiled(.{
+            .writes = writes,
+            .sync_level = .full_index,
+        }, &batch_profile);
+        const write_ns = monotonicTimeNs() - write_start;
+
+        const before_idle_stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, before_idle_stats);
+
+        const idle_start = monotonicTimeNs();
+        const idle_steps = try db.runDensePostingMaintenanceForIdle();
+        const idle_ns = monotonicTimeNs() - idle_start;
+
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+
+        std.debug.print(
+            "hbc_posting_lazy_vs_eager mode={s} docs={d} seed_ms={d} update_ms={d} idle_ms={d} idle_steps={d} dirty_before_idle={d} dirty_after_idle={d} update_lazy_centroid_deferrals={d} update_repaired_postings={d} total_lazy_centroid_deferrals={d} total_repaired_postings={d} split_postings={d} merged_postings={d} boundary_reassigned={d}\n",
+            .{
+                mode.name,
+                doc_count,
+                @divTrunc(seed_ns, std.time.ns_per_ms),
+                @divTrunc(write_ns, std.time.ns_per_ms),
+                @divTrunc(idle_ns, std.time.ns_per_ms),
+                idle_steps,
+                before_idle_stats.indexes[0].hbc_posting.dirty_postings,
+                stats.indexes[0].hbc_posting.dirty_postings,
+                profileDelta(stats.indexes[0].hbc_posting.lazy_centroid_deferrals, seed_stats.indexes[0].hbc_posting.lazy_centroid_deferrals),
+                profileDelta(stats.indexes[0].hbc_posting.maintenance_repaired_postings, seed_stats.indexes[0].hbc_posting.maintenance_repaired_postings),
+                stats.indexes[0].hbc_posting.lazy_centroid_deferrals,
+                stats.indexes[0].hbc_posting.maintenance_repaired_postings,
+                stats.indexes[0].hbc_posting.maintenance_split_postings,
+                stats.indexes[0].hbc_posting.maintenance_merged_postings,
+                stats.indexes[0].hbc_posting.maintenance_boundary_reassigned_vectors,
+            },
+        );
+    }
+}

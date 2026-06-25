@@ -8138,10 +8138,13 @@ pub const ApiHttpServer = struct {
                 return try textResponse(self.alloc, 403, "forbidden");
             }
             if (route_requires_authentication) {
-                if (requiredPermissionForRequest(req.method, uri_parts.path)) |required| {
-                    const resource = try required.resourceNameAlloc(self.alloc);
-                    defer self.alloc.free(resource);
-                    if (!permissionsAllow(identity.permissions, required.resource_type, resource, required.permission_type)) {
+                const required_permission = requiredPermissionForRequest(self.alloc, req.method, uri_parts.path) catch |err| switch (err) {
+                    error.InvalidArgument => return try textResponse(self.alloc, 400, "invalid path parameter"),
+                    else => return err,
+                };
+                if (required_permission) |required| {
+                    defer required.deinit(self.alloc);
+                    if (!permissionsAllow(identity.permissions, required.resource_type, required.resource, required.permission_type)) {
                         return try textResponse(self.alloc, 403, "forbidden");
                     }
                 }
@@ -8214,7 +8217,11 @@ pub const ApiHttpServer = struct {
         if (try self.dispatchSecretRoutes(req, uri_parts)) |resp| return resp;
         if (try self.dispatchTransactionRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         if (try http_internal_routes.handle(self.internalRoutesContext(uri_parts), req)) |resp| return resp;
-        if (try self.dispatchPublicTableRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
+        const public_table_resp = self.dispatchPublicTableRoutes(req, uri_parts, authenticated_identity) catch |err| switch (err) {
+            error.InvalidPathParameter => return try textResponse(self.alloc, 400, "invalid path parameter"),
+            else => return err,
+        };
+        if (public_table_resp) |resp| return resp;
         return try textResponse(self.alloc, 404, "not found");
     }
 
@@ -10970,11 +10977,17 @@ pub const ApiHttpServer = struct {
         }
         if (req.method == .GET) {
             if (routes.Routes.matchTableIndexes(uri_parts.path)) |table_indexes| {
-                return try self.handlePublicTableListIndexes(table_indexes.table_name);
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_indexes.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicTableListIndexes(table_name);
             }
         }
         if (req.method == .GET) {
             if (routes.Routes.matchTableIndex(uri_parts.path)) |table_index| {
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_index.table_name);
+                defer self.alloc.free(table_name);
+                const index_name = try decodeRequestPathParamAlloc(self.alloc, table_index.index_name);
+                defer self.alloc.free(index_name);
                 if (runtimeSchemaDebugRequested(uri_parts.query)) {
                     if (!self.runtimeSchemaDebugAllowed(authenticated_identity)) return try textResponse(self.alloc, 403, "forbidden");
                     var snapshot = (try self.source.adminSnapshot()) orelse return try textResponse(self.alloc, 404, "not found");
@@ -10982,22 +10995,22 @@ pub const ApiHttpServer = struct {
                     var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                     defer arena_impl.deinit();
                     const arena = arena_impl.allocator();
-                    const table = tables_api.findTableByName(&snapshot, table_index.table_name) orelse return try textResponse(self.alloc, 404, "not found");
-                    var local_statuses = self.localTableRuntimeStatusesWithSnapshot(table_index.table_name, &snapshot) catch return try textResponse(self.alloc, 500, "index lookup failed");
+                    const table = tables_api.findTableByName(&snapshot, table_name) orelse return try textResponse(self.alloc, 404, "not found");
+                    var local_statuses = self.localTableRuntimeStatusesWithSnapshot(table_name, &snapshot) catch return try textResponse(self.alloc, 500, "index lookup failed");
                     defer if (local_statuses) |*status| status.deinit(self.alloc);
                     const body = (indexes_api.encodeSingleIndex(
                         arena,
                         &snapshot,
-                        table_index.table_name,
-                        table_index.index_name,
+                        table_name,
+                        index_name,
                         if (local_statuses) |*status| status else null,
                     ) catch return try textResponse(self.alloc, 500, "index lookup failed")) orelse return try textResponse(self.alloc, 404, "not found");
                     var value = parseOwnedJsonValueAlloc(arena, body) catch return try textResponse(self.alloc, 500, "index lookup failed");
                     if (value != .object) return try textResponse(self.alloc, 500, "index lookup failed");
-                    try value.object.put(arena, try arena.dupe(u8, "debug"), try tables_api.buildTableIndexRuntimeSchemaDebugValue(arena, table, table_index.index_name));
+                    try value.object.put(arena, try arena.dupe(u8, "debug"), try tables_api.buildTableIndexRuntimeSchemaDebugValue(arena, table, index_name));
                     return try jsonResponse(self.alloc, value);
                 }
-                return try self.handlePublicTableGetIndex(table_index.table_name, table_index.index_name);
+                return try self.handlePublicTableGetIndex(table_name, index_name);
             }
         }
         if (req.method == .POST and std.mem.eql(u8, uri_parts.path, routes.Routes.backup)) {
@@ -11011,41 +11024,84 @@ pub const ApiHttpServer = struct {
         }
         if (req.method == .POST) {
             if (routes.Routes.matchTableBackup(uri_parts.path)) |table_backup| {
-                return try self.handlePublicTableBackup(table_backup.table_name, req.body);
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_backup.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicTableBackup(table_name, req.body);
             }
         }
         if (req.method == .POST) {
             if (routes.Routes.matchTableRestore(uri_parts.path)) |table_restore| {
-                return try self.handlePublicTableRestore(table_restore.table_name, req.body);
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_restore.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicTableRestore(table_name, req.body);
             }
         }
         if (req.method == .POST) {
+            if (routes.Routes.matchTableArtifactReprocessJobs(uri_parts.path)) |job_route| {
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicStartDocumentArtifactReprocessJob(table_name, job_route.artifact_name, req.body);
+            }
+            if (routes.Routes.matchTableArtifactReprocessJobAdvance(uri_parts.path)) |job_route| {
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicAdvanceDocumentArtifactReprocessJob(table_name, job_route.artifact_name, job_route.job_id);
+            }
+            if (routes.Routes.matchTableArtifactReprocessJobCancel(uri_parts.path)) |job_route| {
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicCancelDocumentArtifactReprocessJob(table_name, job_route.artifact_name, job_route.job_id);
+            }
+            if (routes.Routes.matchTableArtifactReprocess(uri_parts.path)) |artifact_route| {
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, artifact_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicReprocessDocumentArtifactRange(table_name, artifact_route.artifact_name, req.body);
+            }
+            if (routes.Routes.matchTableDocumentArtifactReprocess(uri_parts.path)) |artifact_route| {
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, artifact_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicReprocessDocumentArtifact(table_name, artifact_route.key, artifact_route.artifact_name, authenticated_identity);
+            }
             if (routes.Routes.matchTableForeignKeyIntegrity(uri_parts.path)) |fk_integrity| {
-                return try self.handlePublicTableForeignKeyIntegrity(fk_integrity.table_name, req.body);
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, fk_integrity.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicTableForeignKeyIntegrity(table_name, req.body);
             }
-        }
-        if (req.method == .POST) {
             if (routes.Routes.matchTableUniqueIntegrity(uri_parts.path)) |unique_integrity| {
-                return try self.handlePublicTableUniqueIntegrity(unique_integrity.table_name, req.body);
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, unique_integrity.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicTableUniqueIntegrity(table_name, req.body);
             }
-        }
-        if (req.method == .POST) {
             if (routes.Routes.matchTableGraphMetric(uri_parts.path)) |graph_metric| {
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, graph_metric.table_name);
+                defer self.alloc.free(table_name);
+                const index_name = try decodeRequestPathParamAlloc(self.alloc, graph_metric.index_name);
+                defer self.alloc.free(index_name);
+                const metric_name = try decodeRequestPathParamAlloc(self.alloc, graph_metric.metric_name);
+                defer self.alloc.free(metric_name);
+                const action = try decodeRequestPathParamAlloc(self.alloc, graph_metric.action);
+                defer self.alloc.free(action);
                 return try self.handlePublicTableGraphMetricAction(
-                    graph_metric.table_name,
-                    graph_metric.index_name,
-                    graph_metric.metric_name,
-                    graph_metric.action,
+                    table_name,
+                    index_name,
+                    metric_name,
+                    action,
                 );
             }
         }
         if (req.method == .POST) {
             if (routes.Routes.matchTableIndex(uri_parts.path)) |table_index| {
-                return try self.handlePublicTableCreateIndex(table_index.table_name, table_index.index_name, req.body);
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_index.table_name);
+                defer self.alloc.free(table_name);
+                const index_name = try decodeRequestPathParamAlloc(self.alloc, table_index.index_name);
+                defer self.alloc.free(index_name);
+                return try self.handlePublicTableCreateIndex(table_name, index_name, req.body);
             }
         }
         if (req.method == .POST) {
             if (routes.Routes.matchTablePath(uri_parts.path)) |table_path| {
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_path.table_name);
+                defer self.alloc.free(table_name);
                 var create_req = table_contract.parseCreateTableRequest(self.alloc, req.body) catch |err| {
                     std.log.err("create table parse failed: {} body_len={d}", .{ err, req.body.len });
                     return try textResponse(self.alloc, 400, "invalid create table request");
@@ -11069,55 +11125,62 @@ pub const ApiHttpServer = struct {
                 tables_api.validatePublicAlgebraicIndexesJson(self.alloc, create_req.indexes_json orelse tables_api.default_indexes_json) catch {
                     return try textResponse(self.alloc, 400, "unsupported table index configuration");
                 };
-                std.log.info("public create table begin table={s}", .{table_path.table_name});
+                std.log.info("public create table begin table={s}", .{table_name});
                 const metadata_create_timeout_ns = 5 * std.time.ns_per_s;
                 const metadata_create_poll_ns = 50 * std.time.ns_per_ms;
                 const metadata_create_start_ns = platform_time.monotonicNs();
                 while (true) {
-                    self.source.createTable(self.alloc, table_path.table_name, create_req) catch |err| switch (err) {
+                    self.source.createTable(self.alloc, table_name, create_req) catch |err| switch (err) {
                         error.InvalidTablespacePlacementPolicy => return try textResponse(self.alloc, 400, "invalid tablespace placement policy"),
                         error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
                         error.UnexpectedHttpStatus => {
                             if (platform_time.monotonicNs() -| metadata_create_start_ns >= metadata_create_timeout_ns) {
-                                std.log.err("public create table metadata create failed table={s} err={}", .{ table_path.table_name, err });
+                                std.log.err("public create table metadata create failed table={s} err={}", .{ table_name, err });
                                 return err;
                             }
                             sleepNs(metadata_create_poll_ns);
                             continue;
                         },
                         else => {
-                            std.log.err("public create table metadata create failed table={s} err={}", .{ table_path.table_name, err });
+                            std.log.err("public create table metadata create failed table={s} err={}", .{ table_name, err });
                             return err;
                         },
                     };
                     break;
                 }
-                std.log.info("public create table metadata done table={s}", .{table_path.table_name});
+                std.log.info("public create table metadata done table={s}", .{table_name});
                 const local_create_handled = if (self.table_writes) |table_writes_source| blk: {
-                    break :blk (table_writes_source.createTable(self.alloc, table_path.table_name, create_req) catch |err| switch (err) {
+                    break :blk (table_writes_source.createTable(self.alloc, table_name, create_req) catch |err| switch (err) {
                         error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported table index configuration"),
                         else => {
-                            std.log.err("public create table local create failed table={s} err={}", .{ table_path.table_name, err });
+                            std.log.err("public create table local create failed table={s} err={}", .{ table_name, err });
                             return err;
                         },
                     }) != null;
                 } else false;
                 if (local_create_handled) {
-                    std.log.info("public create table wait projected presence table={s}", .{table_path.table_name});
-                    self.waitForProjectedTablePresence(table_path.table_name) catch |err| switch (err) {
+                    std.log.info("public create table wait projected presence table={s}", .{table_name});
+                    self.waitForProjectedTablePresence(table_name) catch |err| switch (err) {
                         error.TableVisibilityTimeout => {
-                            std.log.err("public create table metadata visibility timed out table={s}", .{table_path.table_name});
+                            std.log.err("public create table metadata visibility timed out table={s}", .{table_name});
+                            return try textResponse(self.alloc, 500, "table create did not converge");
+                        },
+                        else => return err,
+                    };
+                    self.waitForProjectedTableWriteQuorum(table_name) catch |err| switch (err) {
+                        error.TableVisibilityTimeout => {
+                            std.log.err("public create table write quorum timed out table={s}", .{table_name});
                             return try textResponse(self.alloc, 500, "table create did not converge");
                         },
                         else => return err,
                     };
                 } else {
-                    const metadata_wait_handled = self.source.waitTableLifecycle(table_path.table_name, .present) catch |err| lifecycle: {
+                    const metadata_wait_handled = self.source.waitTableLifecycle(table_name, .present) catch |err| lifecycle: {
                         break :lifecycle switch (err) {
                             error.TableVisibilityTimeout => {
-                                self.waitForProjectedTableCreateReadiness(table_path.table_name) catch |fallback_err| switch (fallback_err) {
+                                self.waitForProjectedTableCreateReadiness(table_name) catch |fallback_err| switch (fallback_err) {
                                     error.TableVisibilityTimeout => {
-                                        std.log.err("public create table metadata lifecycle timed out table={s}", .{table_path.table_name});
+                                        std.log.err("public create table metadata lifecycle timed out table={s}", .{table_name});
                                         return try textResponse(self.alloc, 500, "table create did not converge");
                                     },
                                     else => return fallback_err,
@@ -11125,29 +11188,29 @@ pub const ApiHttpServer = struct {
                                 break :lifecycle true;
                             },
                             else => {
-                                std.log.err("public create table metadata lifecycle failed table={s} err={}", .{ table_path.table_name, err });
+                                std.log.err("public create table metadata lifecycle failed table={s} err={}", .{ table_name, err });
                                 return err;
                             },
                         };
                     };
                     if (!metadata_wait_handled) {
-                        std.log.info("public create table wait metadata visibility table={s}", .{table_path.table_name});
-                        self.waitForTableVisibility(table_path.table_name, .present) catch |err| switch (err) {
+                        std.log.info("public create table wait metadata visibility table={s}", .{table_name});
+                        self.waitForTableVisibility(table_name, .present) catch |err| switch (err) {
                             error.TableVisibilityTimeout => {
-                                std.log.err("public create table metadata visibility timed out table={s}", .{table_path.table_name});
+                                std.log.err("public create table metadata visibility timed out table={s}", .{table_name});
                                 return try textResponse(self.alloc, 500, "table create did not converge");
                             },
                             else => return err,
                         };
                     }
                 }
-                std.log.info("public create table visible table={s}", .{table_path.table_name});
+                std.log.info("public create table visible table={s}", .{table_name});
 
                 var snapshot = (try self.source.adminSnapshot()) orelse return try textResponse(self.alloc, 404, "not found");
                 defer self.source.freeAdminSnapshot(&snapshot);
                 var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                 defer arena_impl.deinit();
-                const response = (try tables_api.buildSingleTableStatusWithStorageStatuses(arena_impl.allocator(), &snapshot, table_path.table_name, null)) orelse {
+                const response = (try tables_api.buildSingleTableStatusWithStorageStatuses(arena_impl.allocator(), &snapshot, table_name, null)) orelse {
                     return try textResponse(self.alloc, 404, "not found");
                 };
                 return try jsonResponse(self.alloc, response);
@@ -11155,23 +11218,27 @@ pub const ApiHttpServer = struct {
         }
         if (req.method == .PUT) {
             if (routes.Routes.matchTableArtifactEnrichment(uri_parts.path)) |artifact_route| {
-                return try self.handlePublicPutArtifactEnrichment(artifact_route.table_name, artifact_route.artifact_name, req.body);
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, artifact_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicPutArtifactEnrichment(table_name, artifact_route.artifact_name, req.body);
             }
             if (routes.Routes.matchTableSchema(uri_parts.path)) |table_schema| {
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_schema.table_name);
+                defer self.alloc.free(table_name);
                 const schema_json = table_contract.parseSchemaUpdateRequest(self.alloc, req.body) catch {
                     return try textResponse(self.alloc, 400, "invalid schema update request");
                 };
                 defer self.alloc.free(schema_json);
 
-                const table_before = try self.loadOwnedTableRecord(table_schema.table_name);
+                const table_before = try self.loadOwnedTableRecord(table_name);
                 if (table_before == null) {
-                    self.source.updateSchema(self.alloc, table_schema.table_name, schema_json) catch |err| switch (err) {
+                    self.source.updateSchema(self.alloc, table_name, schema_json) catch |err| switch (err) {
                         error.InvalidSchemaUpdateRequest => return try textResponse(self.alloc, 400, "invalid schema update request"),
                         error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
                         error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                         error.UnsupportedOperation => {
                             const table_writes_source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
-                            _ = table_writes_source.updateSchema(self.alloc, table_schema.table_name, schema_json) catch |write_err| switch (write_err) {
+                            _ = table_writes_source.updateSchema(self.alloc, table_name, schema_json) catch |write_err| switch (write_err) {
                                 error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, "invalid schema update request"),
                                 else => return write_err,
                             } orelse return try textResponse(self.alloc, 404, "not found");
@@ -11180,19 +11247,19 @@ pub const ApiHttpServer = struct {
                     };
                     var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                     defer arena_impl.deinit();
-                    const value = try buildLocalSchemaUpdateStatus(arena_impl.allocator(), table_schema.table_name, schema_json);
+                    const value = try buildLocalSchemaUpdateStatus(arena_impl.allocator(), table_name, schema_json);
                     return try jsonResponse(self.alloc, value);
                 }
                 defer metadata_table_manager.freeTable(self.alloc, table_before.?);
 
                 var local_schema_applied = false;
-                self.source.updateSchema(self.alloc, table_schema.table_name, schema_json) catch |err| switch (err) {
+                self.source.updateSchema(self.alloc, table_name, schema_json) catch |err| switch (err) {
                     error.InvalidSchemaUpdateRequest => return try textResponse(self.alloc, 400, "invalid schema update request"),
                     error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
                     error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                     error.UnsupportedOperation => {
                         const table_writes_source = self.table_writes orelse return try textResponse(self.alloc, 405, "method not allowed");
-                        _ = table_writes_source.updateSchema(self.alloc, table_schema.table_name, schema_json) catch |write_err| switch (write_err) {
+                        _ = table_writes_source.updateSchema(self.alloc, table_name, schema_json) catch |write_err| switch (write_err) {
                             error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, "invalid schema update request"),
                             else => return write_err,
                         };
@@ -11202,13 +11269,13 @@ pub const ApiHttpServer = struct {
                 };
                 const expected_table = try tables_api.applySchemaUpdateRecord(self.alloc, &table_before.?, schema_json);
                 defer metadata_table_manager.freeTable(self.alloc, expected_table);
-                self.waitForMetadataProjection(table_schema.table_name, expected_table.schema_json, expected_table.indexes_json) catch |err| switch (err) {
+                self.waitForMetadataProjection(table_name, expected_table.schema_json, expected_table.indexes_json) catch |err| switch (err) {
                     error.TableVisibilityTimeout => return try textResponse(self.alloc, 500, "schema update did not converge"),
                     else => return err,
                 };
                 if (self.table_writes) |table_writes_source| {
                     if (!local_schema_applied) {
-                        _ = table_writes_source.updateSchema(self.alloc, table_schema.table_name, schema_json) catch |write_err| switch (write_err) {
+                        _ = table_writes_source.updateSchema(self.alloc, table_name, schema_json) catch |write_err| switch (write_err) {
                             error.InvalidSchemaUpdateRequest, error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, "invalid schema update request"),
                             else => return write_err,
                         };
@@ -11219,17 +11286,23 @@ pub const ApiHttpServer = struct {
                     }
                 }
 
-                const body = try self.encodeSchemaUpdateResponse(table_schema.table_name, schema_json);
+                const body = try self.encodeSchemaUpdateResponse(table_name, schema_json);
                 defer self.alloc.free(body);
                 return try jsonBodyResponseWithStatus(self.alloc, 200, body);
             }
         }
         if (req.method == .DELETE) {
             if (routes.Routes.matchTableArtifactEnrichment(uri_parts.path)) |artifact_route| {
-                return try self.handlePublicDeleteArtifactEnrichment(artifact_route.table_name, artifact_route.artifact_name);
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, artifact_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicDeleteArtifactEnrichment(table_name, artifact_route.artifact_name);
             }
             if (routes.Routes.matchTableIndex(uri_parts.path)) |table_index| {
-                return try self.handlePublicTableDeleteIndex(table_index.table_name, table_index.index_name);
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_index.table_name);
+                defer self.alloc.free(table_name);
+                const index_name = try decodeRequestPathParamAlloc(self.alloc, table_index.index_name);
+                defer self.alloc.free(index_name);
+                return try self.handlePublicTableDeleteIndex(table_name, index_name);
             }
         }
         if (req.method == .GET) {
@@ -11239,8 +11312,10 @@ pub const ApiHttpServer = struct {
         }
         if (req.method == .GET) {
             if (routes.Routes.matchTableLookup(uri_parts.path)) |lookup| {
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, lookup.table_name);
+                defer self.alloc.free(table_name);
                 const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
-                const decoded_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, lookup.key);
+                const decoded_key = try decodeRequestPathParamAlloc(self.alloc, lookup.key);
                 defer self.alloc.free(decoded_key);
                 var lookup_opts = try http_route_helpers.parseLookupOptions(self.alloc, uri_parts.query);
                 defer lookup_opts.deinit(self.alloc);
@@ -11248,18 +11323,18 @@ pub const ApiHttpServer = struct {
                     return try textResponse(self.alloc, 400, "invalid read consistency");
                 };
 
-                var result = (source.lookup(self.alloc, lookup.table_name, decoded_key, lookup_opts.opts, consistency) catch |err| switch (err) {
+                var result = (source.lookup(self.alloc, table_name, decoded_key, lookup_opts.opts, consistency) catch |err| switch (err) {
                     error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return try textResponse(self.alloc, 503, "read requires primary"),
                     error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return try textResponse(self.alloc, 503, "standby read unavailable"),
                     else => {
-                        std.log.err("public table lookup failed table={s} key={s} err={}", .{ lookup.table_name, decoded_key, err });
+                        std.log.err("public table lookup failed table={s} key={s} err={}", .{ table_name, decoded_key, err });
                         return try textResponse(self.alloc, 500, "lookup failed");
                     },
                 }) orelse {
                     return try textResponse(self.alloc, 404, "not found");
                 };
                 defer result.deinit(self.alloc);
-                const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, lookup.table_name);
+                const row_filter_json = try self.resolveEffectiveRowFilterJsonForDatabase(self.alloc, authenticated_identity, tables_api.default_database_name, table_name);
                 defer if (row_filter_json) |value| self.alloc.free(value);
                 if (row_filter_json) |value| {
                     if (!(try self.docJsonMatchesRowFilter(decoded_key, result.json, value))) {
@@ -11276,58 +11351,75 @@ pub const ApiHttpServer = struct {
         }
         if (req.method == .GET) {
             if (routes.Routes.matchTableArtifactReprocessJob(uri_parts.path)) |job_route| {
-                return try self.handlePublicDocumentArtifactReprocessJob(job_route.table_name, job_route.artifact_name, job_route.job_id);
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, job_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicDocumentArtifactReprocessJob(table_name, job_route.artifact_name, job_route.job_id);
             }
         }
         if (req.method == .GET) {
             if (routes.Routes.matchTableDocumentArtifacts(uri_parts.path)) |artifact_route| {
-                return try self.handlePublicDocumentArtifactManifests(artifact_route.table_name, artifact_route.key, uri_parts.query, authenticated_identity);
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, artifact_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicDocumentArtifactManifests(table_name, artifact_route.key, uri_parts.query, authenticated_identity);
             }
         }
         if (req.method == .GET) {
             if (routes.Routes.matchTableDocumentArtifact(uri_parts.path)) |artifact_route| {
-                return try self.handlePublicDocumentArtifactManifest(artifact_route.table_name, artifact_route.key, artifact_route.artifact_name, uri_parts.query, authenticated_identity);
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, artifact_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicDocumentArtifactManifest(table_name, artifact_route.key, artifact_route.artifact_name, uri_parts.query, authenticated_identity);
+            }
+        }
+        if (req.method == .GET) {
+            if (routes.Routes.matchTableArtifacts(uri_parts.path)) |artifact_route| {
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, artifact_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicListArtifactEnrichments(table_name);
             }
         }
         if (req.method == .GET) {
             if (routes.Routes.matchTablePath(uri_parts.path)) |table_path| {
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_path.table_name);
+                defer self.alloc.free(table_name);
                 if (runtimeSchemaDebugRequested(uri_parts.query) and !self.runtimeSchemaDebugAllowed(authenticated_identity)) {
                     return try textResponse(self.alloc, 403, "forbidden");
                 }
                 var snapshot = (try self.source.adminSnapshot()) orelse return try textResponse(self.alloc, 404, "not found");
                 defer self.source.freeAdminSnapshot(&snapshot);
                 var storage_status_buf: [1]tables_api.TableStorageStatus = undefined;
-                const storage_statuses = try self.bestEffortSingleTableStorageStatuses(table_path.table_name, &storage_status_buf);
+                const storage_statuses = try self.bestEffortSingleTableStorageStatuses(table_name, &storage_status_buf);
                 if (runtimeSchemaDebugRequested(uri_parts.query)) {
                     var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
                     defer arena_impl.deinit();
                     const response =
-                        (try tables_api.buildSingleTableStatusWithRuntimeSchemaDebug(arena_impl.allocator(), &snapshot, table_path.table_name, storage_statuses)) orelse return try textResponse(self.alloc, 404, "not found");
+                        (try tables_api.buildSingleTableStatusWithRuntimeSchemaDebug(arena_impl.allocator(), &snapshot, table_name, storage_statuses)) orelse return try textResponse(self.alloc, 404, "not found");
                     return try jsonResponse(self.alloc, response);
                 }
-                const body = (try tables_api.encodeSingleTableStatusWithStorageStatuses(self.alloc, &snapshot, table_path.table_name, storage_statuses)) orelse return try textResponse(self.alloc, 404, "not found");
+                const body = (try tables_api.encodeSingleTableStatusWithStorageStatuses(self.alloc, &snapshot, table_name, storage_statuses)) orelse return try textResponse(self.alloc, 404, "not found");
                 defer self.alloc.free(body);
                 return try jsonBodyResponseWithStatus(self.alloc, 200, body);
             }
         }
         if (req.method == .DELETE) {
             if (routes.Routes.matchTablePath(uri_parts.path)) |table_path| {
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, table_path.table_name);
+                defer self.alloc.free(table_name);
                 var local_drop_group_ids: ?[]u64 = null;
                 defer if (local_drop_group_ids) |group_ids| self.alloc.free(group_ids);
                 if (self.table_writes != null) {
                     if (try self.source.adminSnapshot()) |snapshot_value| {
                         var snapshot = snapshot_value;
                         defer self.source.freeAdminSnapshot(&snapshot);
-                        local_drop_group_ids = try tableGroupIdsFromSnapshot(self.alloc, &snapshot, table_path.table_name);
+                        local_drop_group_ids = try tableGroupIdsFromSnapshot(self.alloc, &snapshot, table_name);
                     }
                 }
-                self.source.dropTable(self.alloc, table_path.table_name) catch |err| switch (err) {
+                self.source.dropTable(self.alloc, table_name) catch |err| switch (err) {
                     error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
                     error.ExtensionOwnedObject => return try textResponse(self.alloc, 405, "method not allowed"),
                     error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
                     else => {
                         std.log.err("public drop table metadata remove failed table={s} err={s}", .{
-                            table_path.table_name,
+                            table_name,
                             @errorName(err),
                         });
                         return err;
@@ -11335,20 +11427,20 @@ pub const ApiHttpServer = struct {
                 };
                 if (self.table_writes) |write_source| {
                     const group_ids = local_drop_group_ids orelse &.{};
-                    _ = write_source.dropTable(self.alloc, table_path.table_name, group_ids) catch |err| switch (err) {
+                    _ = write_source.dropTable(self.alloc, table_name, group_ids) catch |err| switch (err) {
                         error.TableNotFound => null,
                         else => {
                             std.log.err("public drop table local cleanup failed table={s} err={s}", .{
-                                table_path.table_name,
+                                table_name,
                                 @errorName(err),
                             });
                             return err;
                         },
                     };
                 }
-                self.waitForTableVisibility(table_path.table_name, .absent) catch |err| switch (err) {
+                self.waitForTableVisibility(table_name, .absent) catch |err| switch (err) {
                     error.TableVisibilityTimeout => {
-                        std.log.err("public drop table metadata visibility timed out table={s}", .{table_path.table_name});
+                        std.log.err("public drop table metadata visibility timed out table={s}", .{table_name});
                         return try textResponse(self.alloc, 500, "table delete did not converge");
                     },
                     else => return err,
@@ -11362,23 +11454,25 @@ pub const ApiHttpServer = struct {
         }
         if (req.method == .POST) {
             if (routes.Routes.matchTableScan(uri_parts.path)) |scan| {
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, scan.table_name);
+                defer self.alloc.free(table_name);
                 const source = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
                 var scan_req = try http_route_helpers.parseScanKeysRequest(self.alloc, req.body);
                 defer scan_req.deinit(self.alloc);
 
                 var result = (try source.scan(
                     self.alloc,
-                    scan.table_name,
+                    table_name,
                     scan_req.from,
                     scan_req.to,
                     scan_req.opts,
                     .read_index,
                 )) orelse return try textResponse(self.alloc, 404, "not found");
                 defer result.deinit(self.alloc);
-                const row_filter_json = try self.resolveEffectiveRowFilterJsonForDatabase(self.alloc, authenticated_identity, tables_api.default_database_name, scan.table_name);
+                const row_filter_json = try resolveEffectiveRowFilterJson(self.alloc, authenticated_identity, table_name);
                 defer if (row_filter_json) |value| self.alloc.free(value);
                 if (row_filter_json) |value| {
-                    const filtered = try self.filterScanResultByRowFilter(source, scan.table_name, result.ndjson, value);
+                    const filtered = try self.filterScanResultByRowFilter(source, table_name, result.ndjson, value);
                     defer self.alloc.free(filtered);
                     return try http_route_helpers.ndjsonResponse(self.alloc, 200, filtered);
                 }
@@ -11387,79 +11481,109 @@ pub const ApiHttpServer = struct {
         }
         if (req.method == .POST) {
             if (routes.Routes.matchTableQuery(uri_parts.path)) |query_route| {
-                return try self.handlePublicTableQuery(query_route.table_name, req.body, authenticated_identity);
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, query_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicTableQueryWithContentType(table_name, req.body, req.content_type, authenticated_identity);
             }
         }
         if (req.method == .POST) {
             if (routes.Routes.matchTableRowsBatch(uri_parts.path)) |rows_route| {
-                return try self.handlePublicTableRowsBatch(rows_route.table_name, req.body, authenticated_identity);
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, rows_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicTableRowsBatch(table_name, req.body, authenticated_identity);
             }
         }
         if (req.method == .POST) {
             if (routes.Routes.matchTableRowsGet(uri_parts.path)) |rows_route| {
-                return try self.handlePublicTableRowsGet(rows_route.table_name, req.body, authenticated_identity);
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, rows_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicTableRowsGet(table_name, req.body, authenticated_identity);
             }
         }
         if (req.method == .POST) {
             if (routes.Routes.matchTableRowsPlan(uri_parts.path)) |rows_route| {
-                return try self.handlePublicTableRowsPlan(rows_route.table_name, req.body, authenticated_identity);
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, rows_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicTableRowsPlan(table_name, req.body, authenticated_identity);
             }
         }
         if (req.method == .POST) {
             if (routes.Routes.matchTableRowsQuery(uri_parts.path)) |rows_route| {
-                return try self.handlePublicTableRowsQuery(rows_route.table_name, req.body, authenticated_identity);
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, rows_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicTableRowsQuery(table_name, req.body, authenticated_identity);
             }
         }
         if (req.method == .POST) {
             if (routes.Routes.matchTableRowsAggregate(uri_parts.path)) |rows_route| {
-                return try self.handlePublicTableRowsAggregate(rows_route.table_name, req.body, authenticated_identity);
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, rows_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicTableRowsAggregate(table_name, req.body, authenticated_identity);
             }
         }
         if (req.method == .POST) {
             if (routes.Routes.matchTableRowsWindow(uri_parts.path)) |rows_route| {
-                return try self.handlePublicTableRowsWindow(rows_route.table_name, req.body, authenticated_identity);
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, rows_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicTableRowsWindow(table_name, req.body, authenticated_identity);
             }
         }
         if (req.method == .POST) {
             if (routes.Routes.matchTableRowsJoin(uri_parts.path)) |rows_route| {
-                return try self.handlePublicTableRowsJoin(rows_route.table_name, req.body, authenticated_identity);
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, rows_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicTableRowsJoin(table_name, req.body, authenticated_identity);
             }
         }
         if (req.method == .POST) {
             if (routes.Routes.matchTableRowsLateral(uri_parts.path)) |rows_route| {
-                return try self.handlePublicTableRowsLateral(rows_route.table_name, req.body, authenticated_identity);
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, rows_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicTableRowsLateral(table_name, req.body, authenticated_identity);
             }
         }
         if (req.method == .POST) {
             if (routes.Routes.matchTableRowsMutationSource(uri_parts.path)) |rows_route| {
-                return try self.handlePublicTableRowsMutationSource(rows_route.table_name, req.body, authenticated_identity);
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, rows_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicTableRowsMutationSource(table_name, req.body, authenticated_identity);
             }
         }
         if (req.method == .GET) {
             if (routes.Routes.matchTableRowsSource(uri_parts.path)) |rows_route| {
-                return try self.handlePublicTableRowsSource(rows_route.table_name);
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, rows_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicTableRowsSource(table_name);
             }
         }
         if (req.method == .GET) {
             if (routes.Routes.matchTableRowsExplain(uri_parts.path)) |rows_route| {
-                return try self.handlePublicTableRowsExplain(rows_route.table_name, &.{}, authenticated_identity);
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, rows_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicTableRowsExplain(table_name, &.{}, authenticated_identity);
             }
         }
         if (req.method == .POST) {
             if (routes.Routes.matchTableRowsExplain(uri_parts.path)) |rows_route| {
-                return try self.handlePublicTableRowsExplain(rows_route.table_name, req.body, authenticated_identity);
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, rows_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicTableRowsExplain(table_name, req.body, authenticated_identity);
             }
         }
         if (req.method == .POST) {
             if (routes.Routes.matchTableBatch(uri_parts.path)) |batch_route| {
-                return try self.handlePublicTableBatch(batch_route.table_name, req.body);
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, batch_route.table_name);
+                defer self.alloc.free(table_name);
+                return try self.handlePublicTableBatch(table_name, req.body);
             }
         }
         if (req.method == .POST) {
             if (routes.Routes.matchTableMerge(uri_parts.path)) |merge_route| {
+                const table_name = try decodeRequestPathParamAlloc(self.alloc, merge_route.table_name);
+                defer self.alloc.free(table_name);
                 const reads = self.table_reads orelse return try textResponse(self.alloc, 404, "not found");
                 const writes = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
-                if (!(try self.tableExists(merge_route.table_name))) return try textResponse(self.alloc, 404, "not found");
+                if (!(try self.tableExists(table_name))) return try textResponse(self.alloc, 404, "not found");
 
                 var merge_req = linear_merge_api.parseRequest(self.alloc, req.body) catch |err| switch (err) {
                     error.ValueTooLong => return try textResponse(self.alloc, 413, "value too large"),
@@ -11468,7 +11592,7 @@ pub const ApiHttpServer = struct {
                 };
                 defer merge_req.deinit(self.alloc);
 
-                self.validateTableWritesAgainstSchema(merge_route.table_name, merge_req.writes) catch |err| switch (err) {
+                self.validateTableWritesAgainstSchema(table_name, merge_req.writes) catch |err| switch (err) {
                     error.InvalidBatchRequest => return try textResponse(self.alloc, 400, "invalid linear merge request"),
                     else => return err,
                 };
@@ -11479,7 +11603,7 @@ pub const ApiHttpServer = struct {
                     arena_impl.allocator(),
                     reads,
                     writes,
-                    merge_route.table_name,
+                    table_name,
                     merge_req,
                 ) catch |err| switch (err) {
                     error.InvalidLinearMergeRequest => return try textResponse(self.alloc, 400, "invalid linear merge request"),
@@ -12899,10 +13023,9 @@ pub const ApiHttpServer = struct {
             }) catch return false;
             const identity = authenticated_identity.?;
             if (requiresAdminPermission(uri_parts.path) and !permissionsAllow(identity.permissions, .@"*", "*", .admin)) return false;
-            if (requiredPermissionForRequest(req.method, uri_parts.path)) |required| {
-                const resource = required.resourceNameAlloc(self.alloc) catch return false;
-                defer self.alloc.free(resource);
-                if (!permissionsAllow(identity.permissions, required.resource_type, resource, required.permission_type)) return false;
+            if (requiredPermissionForRequest(self.alloc, req.method, uri_parts.path) catch return false) |required| {
+                defer required.deinit(self.alloc);
+                if (!permissionsAllow(identity.permissions, required.resource_type, required.resource, required.permission_type)) return false;
             }
         }
 
@@ -12926,6 +13049,7 @@ pub const ApiHttpServer = struct {
                 .execute_table_graph_metric_action = executePublicTableGraphMetricAction,
                 .execute_put_artifact_enrichment = executePublicPutArtifactEnrichment,
                 .execute_delete_artifact_enrichment = executePublicDeleteArtifactEnrichment,
+                .execute_list_artifact_enrichments = executePublicListArtifactEnrichments,
                 .execute_document_artifact_manifest = executePublicDocumentArtifactManifest,
                 .execute_document_artifact_manifests = executePublicDocumentArtifactManifests,
                 .execute_reprocess_document_artifact = executePublicReprocessDocumentArtifact,
@@ -13877,6 +14001,18 @@ pub const ApiHttpServer = struct {
             lookup.config,
             if (local_statuses) |*status| status else null,
         ) catch return error.InternalFailure;
+    }
+
+    fn executePublicListArtifactEnrichments(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) public_table_http.TableApi.ExecuteListArtifactEnrichmentsError![]u8 {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        var snapshot = (self.statusAdminSnapshot() catch return error.InternalFailure) orelse return error.NotFound;
+        defer self.source.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.NotFound;
+        return indexes_api.encodeArtifactEnrichmentList(alloc, table_name, table.indexes_json) catch return error.InternalFailure;
     }
 
     fn executePublicTableCreateIndex(
@@ -17966,6 +18102,15 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    pub fn handlePublicListArtifactEnrichments(self: *ApiHttpServer, table_name: []const u8) !http_common.HttpResponse {
+        var resp = try public_table_http.handleListArtifactEnrichments(self.alloc, table_name, self.tableApi());
+        defer resp.deinit(self.alloc);
+        return switch (resp.status) {
+            200 => try jsonBodyResponseWithStatus(self.alloc, 200, resp.body),
+            else => try textResponse(self.alloc, resp.status, resp.body),
+        };
+    }
+
     pub fn handlePublicTableCreateIndex(self: *ApiHttpServer, table_name: []const u8, index_name: []const u8, body: []const u8) !http_common.HttpResponse {
         var resp = try public_table_http.handleTableCreateIndex(self.alloc, table_name, index_name, body, self.tableApi());
         defer resp.deinit(self.alloc);
@@ -18010,7 +18155,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicPutArtifactEnrichment(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, body: []const u8) !http_common.HttpResponse {
-        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
         defer self.alloc.free(artifact_name);
         var resp = try public_table_http.handlePutArtifactEnrichment(self.alloc, table_name, artifact_name, body, self.tableApi());
         defer resp.deinit(self.alloc);
@@ -18026,7 +18171,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicDeleteArtifactEnrichment(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8) !http_common.HttpResponse {
-        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
         defer self.alloc.free(artifact_name);
         var resp = try public_table_http.handleDeleteArtifactEnrichment(self.alloc, table_name, artifact_name, self.tableApi());
         defer resp.deinit(self.alloc);
@@ -18042,9 +18187,9 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicDocumentArtifactManifest(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8, encoded_artifact_name: []const u8, query: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
-        const doc_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_doc_key);
+        const doc_key = try decodeRequestPathParamAlloc(self.alloc, encoded_doc_key);
         defer self.alloc.free(doc_key);
-        const artifact_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_artifact_name);
+        const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
         defer self.alloc.free(artifact_name);
         const opts = self.documentArtifactManifestOptionsForRequest(table_name, query, authenticated_identity) catch |err| switch (err) {
             error.InvalidDetail => return try textResponse(self.alloc, 400, "invalid artifact detail"),
@@ -18063,7 +18208,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handlePublicDocumentArtifactManifests(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8, query: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
-        const doc_key = try http_route_helpers.decodePercentEncodedPathComponentAlloc(self.alloc, encoded_doc_key);
+        const doc_key = try decodeRequestPathParamAlloc(self.alloc, encoded_doc_key);
         defer self.alloc.free(doc_key);
         const opts = self.documentArtifactManifestOptionsForRequest(table_name, query, authenticated_identity) catch |err| switch (err) {
             error.InvalidDetail => return try textResponse(self.alloc, 400, "invalid artifact detail"),
@@ -18081,128 +18226,186 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    pub fn handlePublicStartDocumentArtifactReprocessJob(
-        self: *ApiHttpServer,
-        table_name: []const u8,
-        artifact_name: []const u8,
-        body: []const u8,
-    ) !http_common.HttpResponse {
+    pub fn handlePublicReprocessDocumentArtifact(self: *ApiHttpServer, table_name: []const u8, encoded_doc_key: []const u8, encoded_artifact_name: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
+        const doc_key = try decodeRequestPathParamAlloc(self.alloc, encoded_doc_key);
+        defer self.alloc.free(doc_key);
+        const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+
+        if (!(try self.sourceDocumentVisibleToIdentity(table_name, doc_key, authenticated_identity))) {
+            return try textResponse(self.alloc, 404, "not found");
+        }
+        var resp = try public_table_http.handleReprocessDocumentArtifact(self.alloc, table_name, doc_key, artifact_name, self.tableApi());
+        defer resp.deinit(self.alloc);
+        return switch (resp.status) {
+            202 => try jsonBodyResponseWithStatus(self.alloc, 202, resp.body),
+            else => try textResponse(self.alloc, resp.status, resp.body),
+        };
+    }
+
+    pub fn handlePublicReprocessDocumentArtifactRange(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, body: []const u8) !http_common.HttpResponse {
+        const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+
+        var resp = try public_table_http.handleReprocessDocumentArtifactRange(self.alloc, table_name, artifact_name, body, self.tableApi());
+        defer resp.deinit(self.alloc);
+        return switch (resp.status) {
+            202 => try jsonBodyResponseWithStatus(self.alloc, 202, resp.body),
+            else => try textResponse(self.alloc, resp.status, resp.body),
+        };
+    }
+
+    pub fn handlePublicStartDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, body: []const u8) !http_common.HttpResponse {
+        if (self.table_writes == null) return try textResponse(self.alloc, 405, "method not allowed");
+        const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
         var parsed = std.json.parseFromSlice(artifact_reprocess_jobs.StartRequest, self.alloc, if (body.len > 0) body else "{}", .{}) catch {
             return try textResponse(self.alloc, 400, "invalid request");
         };
         defer parsed.deinit();
 
         const encoded = try self.artifact_reprocess_job_store.startJob(self.alloc, table_name, artifact_name, parsed.value);
+        defer self.alloc.free(encoded);
         if (parsed.value.advance) {
-            var encoded_to_free: ?[]u8 = encoded;
-            errdefer if (encoded_to_free) |value| self.alloc.free(value);
-            var parsed_job = try std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded_to_free.?, .{ .ignore_unknown_fields = true });
-            defer parsed_job.deinit();
-            const job_id = try std.fmt.allocPrint(self.alloc, "{d}", .{parsed_job.value.job_id});
-            defer self.alloc.free(job_id);
-            self.alloc.free(encoded_to_free.?);
-            encoded_to_free = null;
-            return try self.handlePublicAdvanceDocumentArtifactReprocessJob(table_name, artifact_name, job_id);
+            var parsed_state = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+                return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+            };
+            defer parsed_state.deinit();
+            return try self.advanceDocumentArtifactReprocessJobState(table_name, artifact_name, parsed_state.value);
         }
-        return .{
-            .status = 202,
-            .content_type = try self.alloc.dupe(u8, "application/json"),
-            .body = encoded,
-        };
+        return try jsonBodyResponseWithStatus(self.alloc, 202, encoded);
     }
 
-    pub fn handlePublicDocumentArtifactReprocessJob(
-        self: *ApiHttpServer,
-        table_name: []const u8,
-        artifact_name: []const u8,
-        job_id_raw: []const u8,
-    ) !http_common.HttpResponse {
-        const job_id = std.fmt.parseUnsigned(u64, job_id_raw, 10) catch return try textResponse(self.alloc, 400, "invalid job id");
+    pub fn handlePublicDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
+        const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
         const encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
-        errdefer self.alloc.free(encoded);
-        var parsed_job = try std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true });
-        defer parsed_job.deinit();
-        if (!std.mem.eql(u8, parsed_job.value.table_name, table_name) or !std.mem.eql(u8, parsed_job.value.artifact_name, artifact_name)) {
-            self.alloc.free(encoded);
+        defer self.alloc.free(encoded);
+        var parsed = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+        };
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.table_name, table_name) or !std.mem.eql(u8, parsed.value.artifact_name, artifact_name)) {
             return try textResponse(self.alloc, 404, "not found");
         }
-        return .{
-            .status = 200,
-            .content_type = try self.alloc.dupe(u8, "application/json"),
-            .body = encoded,
-        };
+        return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
     }
 
-    pub fn handlePublicAdvanceDocumentArtifactReprocessJob(
-        self: *ApiHttpServer,
-        table_name: []const u8,
-        artifact_name: []const u8,
-        job_id_raw: []const u8,
-    ) !http_common.HttpResponse {
-        const job_id = std.fmt.parseUnsigned(u64, job_id_raw, 10) catch return try textResponse(self.alloc, 400, "invalid job id");
-        const current_encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
-        defer self.alloc.free(current_encoded);
-        var parsed_current = try std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, current_encoded, .{ .ignore_unknown_fields = true });
-        defer parsed_current.deinit();
-        if (!std.mem.eql(u8, parsed_current.value.table_name, table_name) or !std.mem.eql(u8, parsed_current.value.artifact_name, artifact_name)) {
+    pub fn handlePublicAdvanceDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
+        const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.alloc.free(encoded);
+        var parsed = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+        };
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.table_name, table_name) or !std.mem.eql(u8, parsed.value.artifact_name, artifact_name)) {
             return try textResponse(self.alloc, 404, "not found");
         }
+        return try self.advanceDocumentArtifactReprocessJobState(table_name, artifact_name, parsed.value);
+    }
 
-        const begin = try self.artifact_reprocess_job_store.beginAdvance(self.alloc, parsed_current.value);
-        defer self.alloc.free(begin.encoded);
-        if (!begin.started) {
-            return try jsonBodyResponseWithStatus(self.alloc, 200, begin.encoded);
+    pub fn handlePublicCancelDocumentArtifactReprocessJob(self: *ApiHttpServer, table_name: []const u8, encoded_artifact_name: []const u8, encoded_job_id: []const u8) !http_common.HttpResponse {
+        const artifact_name = try decodeRequestPathParamAlloc(self.alloc, encoded_artifact_name);
+        defer self.alloc.free(artifact_name);
+        const job_id = parseArtifactReprocessJobId(encoded_job_id) catch return try textResponse(self.alloc, 400, "invalid job id");
+        const encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
+        defer self.alloc.free(encoded);
+        var parsed = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, encoded, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "artifact reprocess job failed");
+        };
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, parsed.value.table_name, table_name) or !std.mem.eql(u8, parsed.value.artifact_name, artifact_name)) {
+            return try textResponse(self.alloc, 404, "not found");
+        }
+        if (artifact_reprocess_jobs.isTerminalPhase(parsed.value.phase)) {
+            return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
+        }
+        const cancelled = try self.artifact_reprocess_job_store.markPhase(self.alloc, parsed.value, .cancelled, null);
+        defer self.alloc.free(cancelled);
+        return try jsonBodyResponseWithStatus(self.alloc, 200, cancelled);
+    }
+
+    fn advanceDocumentArtifactReprocessJobState(self: *ApiHttpServer, table_name: []const u8, artifact_name: []const u8, state: artifact_reprocess_jobs.JobState) !http_common.HttpResponse {
+        if (artifact_reprocess_jobs.isTerminalPhase(state.phase)) {
+            const encoded = try artifact_reprocess_jobs.encodeState(self.alloc, state);
+            defer self.alloc.free(encoded);
+            return try jsonBodyResponseWithStatus(self.alloc, 200, encoded);
         }
 
-        var parsed_running = try std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, begin.encoded, .{ .ignore_unknown_fields = true });
+        const begin = try self.artifact_reprocess_job_store.beginAdvance(self.alloc, state);
+        defer self.alloc.free(begin.encoded);
+        var parsed_running = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, begin.encoded, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "invalid job state");
+        };
         defer parsed_running.deinit();
-        var pass = self.tableApi().executeReprocessDocumentArtifactRange(self.alloc, table_name, artifact_name, .{
-            .from_key = parsed_running.value.next_key orelse parsed_running.value.from_key,
-            .to_key = parsed_running.value.to_key,
-            .limit = parsed_running.value.limit,
-        }) catch |err| switch (err) {
+        const running_state = parsed_running.value;
+        if (!begin.started) {
+            return try jsonBodyResponseWithStatus(self.alloc, if (artifact_reprocess_jobs.isTerminalPhase(running_state.phase)) 200 else 202, begin.encoded);
+        }
+
+        const source = self.table_writes orelse {
+            const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, "method not allowed");
+            defer self.alloc.free(failed);
+            return try textResponse(self.alloc, 405, "method not allowed");
+        };
+
+        const shard_resumes = try self.alloc.alloc(db_mod.types.DocumentArtifactReprocessShardResume, running_state.shard_cursors.len);
+        defer self.alloc.free(shard_resumes);
+        for (running_state.shard_cursors, shard_resumes) |cursor, *out_resume| {
+            out_resume.* = .{
+                .group_id = cursor.group_id,
+                .next_key = cursor.next_key,
+                .limit = cursor.limit,
+            };
+        }
+        const req = db_mod.types.DocumentArtifactTableReprocessRequest{
+            .from_key = if (shard_resumes.len > 0) "" else (running_state.next_key orelse running_state.from_key),
+            .to_key = running_state.to_key,
+            .limit = running_state.limit,
+            .shard_cursors = shard_resumes,
+        };
+        var result = (source.reprocessDocumentArtifactRange(self.alloc, table_name, artifact_name, req) catch |err| switch (err) {
+            error.DocIdentityNamespaceMismatch => {
+                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
+                defer self.alloc.free(failed);
+                return try textResponse(self.alloc, 503, "doc identity unavailable");
+            },
+            error.InvalidArgument => {
+                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
+                defer self.alloc.free(failed);
+                return try textResponse(self.alloc, 400, "invalid request");
+            },
             error.NotFound => {
-                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, parsed_running.value, .failed, "not found");
+                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
                 defer self.alloc.free(failed);
                 return try textResponse(self.alloc, 404, "not found");
             },
-            error.MethodNotAllowed => return try textResponse(self.alloc, 405, "method not allowed"),
-            error.InvalidRequest => return try textResponse(self.alloc, 400, "invalid request"),
-            error.DocIdentityUnavailable => return try textResponse(self.alloc, 503, "doc identity unavailable"),
-            error.InternalFailure => return try textResponse(self.alloc, 500, "artifact reprocess failed"),
-        };
-        defer pass.deinit(self.alloc);
+            error.MethodNotAllowed => {
+                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
+                defer self.alloc.free(failed);
+                return try textResponse(self.alloc, 405, "method not allowed");
+            },
+            error.InternalFailure => {
+                const failed = try self.artifact_reprocess_job_store.markPhase(self.alloc, running_state, .failed, @errorName(err));
+                defer self.alloc.free(failed);
+                return try textResponse(self.alloc, 500, "artifact reprocess failed");
+            },
+            else => return err,
+        }) orelse return try textResponse(self.alloc, 404, "not found");
+        defer result.deinit(self.alloc);
 
-        const updated = try self.artifact_reprocess_job_store.recordPass(self.alloc, parsed_running.value, pass);
-        errdefer self.alloc.free(updated);
-        return .{
-            .status = 202,
-            .content_type = try self.alloc.dupe(u8, "application/json"),
-            .body = updated,
+        const updated = try self.artifact_reprocess_job_store.recordPass(self.alloc, running_state, result);
+        defer self.alloc.free(updated);
+        var parsed_updated = std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, updated, .{ .ignore_unknown_fields = true }) catch {
+            return try textResponse(self.alloc, 500, "artifact reprocess job failed");
         };
-    }
-
-    pub fn handlePublicCancelDocumentArtifactReprocessJob(
-        self: *ApiHttpServer,
-        table_name: []const u8,
-        artifact_name: []const u8,
-        job_id_raw: []const u8,
-    ) !http_common.HttpResponse {
-        const job_id = std.fmt.parseUnsigned(u64, job_id_raw, 10) catch return try textResponse(self.alloc, 400, "invalid job id");
-        const current_encoded = (try self.artifact_reprocess_job_store.loadJobAlloc(self.alloc, job_id)) orelse return try textResponse(self.alloc, 404, "not found");
-        defer self.alloc.free(current_encoded);
-        var parsed_current = try std.json.parseFromSlice(artifact_reprocess_jobs.JobState, self.alloc, current_encoded, .{ .ignore_unknown_fields = true });
-        defer parsed_current.deinit();
-        if (!std.mem.eql(u8, parsed_current.value.table_name, table_name) or !std.mem.eql(u8, parsed_current.value.artifact_name, artifact_name)) {
-            return try textResponse(self.alloc, 404, "not found");
-        }
-        const updated = try self.artifact_reprocess_job_store.markPhase(self.alloc, parsed_current.value, .cancelled, null);
-        errdefer self.alloc.free(updated);
-        return .{
-            .status = 200,
-            .content_type = try self.alloc.dupe(u8, "application/json"),
-            .body = updated,
-        };
+        defer parsed_updated.deinit();
+        const status: u16 = if (artifact_reprocess_jobs.isTerminalPhase(parsed_updated.value.phase)) 200 else 202;
+        return try jsonBodyResponseWithStatus(self.alloc, status, updated);
     }
 
     pub fn handlePublicTableBackup(self: *ApiHttpServer, table_name: []const u8, body: []const u8) !http_common.HttpResponse {
@@ -19697,8 +19900,14 @@ pub const RequiredPermission = struct {
     database_name: ?[]const u8 = null,
     namespace_name: ?[]const u8 = null,
     table_name: ?[]const u8 = null,
+    owns_resource: bool = false,
+
+    pub fn deinit(self: RequiredPermission, alloc: std.mem.Allocator) void {
+        if (self.owns_resource) alloc.free(self.resource);
+    }
 
     pub fn resourceNameAlloc(self: RequiredPermission, alloc: std.mem.Allocator) ![]u8 {
+        if (self.owns_resource) return try alloc.dupe(u8, self.resource);
         if (self.resource_type == .tablespace) return try catalog_resources.tablespaceResourceNameAlloc(alloc, self.resource);
         if (self.database_name) |database_name| {
             if (self.namespace_name) |namespace_name| {
@@ -19712,7 +19921,12 @@ pub const RequiredPermission = struct {
     }
 };
 
-pub fn requiredPermissionForRequest(method: http_common.Method, path: []const u8) ?RequiredPermission {
+fn parseArtifactReprocessJobId(encoded_job_id: []const u8) !u64 {
+    if (encoded_job_id.len == 0) return error.InvalidJobId;
+    return std.fmt.parseUnsigned(u64, encoded_job_id, 10);
+}
+
+pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_common.Method, path: []const u8) !?RequiredPermission {
     if (method == .POST and std.mem.eql(u8, path, routes.Routes.db_v1_sql)) return .{
         .resource_type = .database,
         .resource = catalog_resources.default_database_name,
@@ -19728,11 +19942,16 @@ pub fn requiredPermissionForRequest(method: http_common.Method, path: []const u8
     };
     if (routes.Routes.matchTablespacePath(path)) |tablespace_path| return .{
         .resource_type = .tablespace,
-        .resource = tablespace_path.tablespace_name,
+        .resource = blk: {
+            const tablespace_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, tablespace_path.tablespace_name);
+            defer alloc.free(tablespace_name);
+            break :blk try catalog_resources.tablespaceResourceNameAlloc(alloc, tablespace_name);
+        },
         .permission_type = switch (method) {
             .GET => .read,
             .POST, .PUT, .DELETE => .admin,
         },
+        .owns_resource = true,
     };
     if (std.mem.eql(u8, path, routes.Routes.databases)) return switch (method) {
         .GET => .{
@@ -19742,66 +19961,29 @@ pub fn requiredPermissionForRequest(method: http_common.Method, path: []const u8
         },
         .POST, .PUT, .DELETE => null,
     };
-    if (routes.Routes.matchDatabaseTablespace(path)) |database_path| return .{
-        .resource_type = .database,
-        .resource = database_path.database_name,
-        .permission_type = .admin,
-    };
-    if (routes.Routes.matchDatabaseNamespaceTables(path)) |tables_path| return .{
-        .resource_type = .namespace,
-        .resource = tables_path.namespace_name,
-        .permission_type = switch (method) {
-            .GET => .read,
-            .POST, .PUT, .DELETE => .admin,
-        },
-        .database_name = tables_path.database_name,
-        .namespace_name = tables_path.namespace_name,
-    };
+    if (routes.Routes.matchDatabaseTablespace(path)) |database_path| return try databasePermission(alloc, database_path.database_name, .admin);
+    if (routes.Routes.matchDatabaseNamespaceTables(path)) |tables_path| return try namespacePermission(alloc, tables_path.database_name, tables_path.namespace_name, switch (method) {
+        .GET => .read,
+        .POST, .PUT, .DELETE => .admin,
+    });
     if (routes.Routes.matchDatabaseNamespaceTablePath(path)) |table_path| {
         const table_subroute = explicitCatalogPermissionSubroute(table_path.table_path);
         const permission_type = explicitCatalogTablePermissionType(method, table_subroute.suffix) orelse return null;
-        return .{
-            .resource_type = .table,
-            .resource = table_subroute.table_name,
-            .permission_type = permission_type,
-            .database_name = table_path.database_name,
-            .namespace_name = table_path.namespace_name,
-            .table_name = table_subroute.table_name,
-        };
+        return try catalogTablePermission(alloc, table_path.database_name, table_path.namespace_name, table_subroute.table_name, permission_type);
     }
-    if (routes.Routes.matchDatabaseNamespaceTablespace(path)) |namespace_path| return .{
-        .resource_type = .namespace,
-        .resource = namespace_path.namespace_name,
-        .permission_type = .admin,
-        .database_name = namespace_path.database_name,
-        .namespace_name = namespace_path.namespace_name,
-    };
-    if (routes.Routes.matchDatabaseNamespaces(path)) |database_path| return .{
-        .resource_type = .database,
-        .resource = database_path.database_name,
-        .permission_type = switch (method) {
-            .GET => .read,
-            .POST, .PUT, .DELETE => .admin,
-        },
-    };
-    if (routes.Routes.matchDatabaseNamespacePath(path)) |namespace_path| return .{
-        .resource_type = .namespace,
-        .resource = namespace_path.namespace_name,
-        .permission_type = switch (method) {
-            .GET => .read,
-            .POST, .PUT, .DELETE => .admin,
-        },
-        .database_name = namespace_path.database_name,
-        .namespace_name = namespace_path.namespace_name,
-    };
-    if (routes.Routes.matchDatabasePath(path)) |database_path| return .{
-        .resource_type = .database,
-        .resource = database_path.database_name,
-        .permission_type = switch (method) {
-            .GET => .read,
-            .POST, .PUT, .DELETE => .admin,
-        },
-    };
+    if (routes.Routes.matchDatabaseNamespaceTablespace(path)) |namespace_path| return try namespacePermission(alloc, namespace_path.database_name, namespace_path.namespace_name, .admin);
+    if (routes.Routes.matchDatabaseNamespaces(path)) |database_path| return try databasePermission(alloc, database_path.database_name, switch (method) {
+        .GET => .read,
+        .POST, .PUT, .DELETE => .admin,
+    });
+    if (routes.Routes.matchDatabaseNamespacePath(path)) |namespace_path| return try namespacePermission(alloc, namespace_path.database_name, namespace_path.namespace_name, switch (method) {
+        .GET => .read,
+        .POST, .PUT, .DELETE => .admin,
+    });
+    if (routes.Routes.matchDatabasePath(path)) |database_path| return try databasePermission(alloc, database_path.database_name, switch (method) {
+        .GET => .read,
+        .POST, .PUT, .DELETE => .admin,
+    });
     if (std.mem.eql(u8, path, routes.Routes.tables)) return switch (method) {
         .GET => .{
             .resource_type = .table,
@@ -19810,138 +19992,83 @@ pub fn requiredPermissionForRequest(method: http_common.Method, path: []const u8
         },
         .POST, .PUT, .DELETE => null,
     };
-    if (matchTableDocumentLookupForPermission(path)) |document| return .{
-        .resource_type = .table,
-        .resource = document.table_name,
-        .permission_type = .read,
-    };
-    if (routes.Routes.matchTableLookup(path)) |lookup| return .{
-        .resource_type = .table,
-        .resource = lookup.table_name,
-        .permission_type = .read,
-    };
-    if (routes.Routes.matchTableQuery(path)) |query| return .{
-        .resource_type = .table,
-        .resource = query.table_name,
-        .permission_type = .read,
-    };
-    if (routes.Routes.matchTableRowsGet(path)) |rows| return .{
-        .resource_type = .table,
-        .resource = rows.table_name,
-        .permission_type = .read,
-    };
-    if (routes.Routes.matchTableRowsPlan(path)) |rows| return .{
-        .resource_type = .table,
-        .resource = rows.table_name,
-        .permission_type = .read,
-    };
-    if (routes.Routes.matchTableRowsQuery(path)) |rows| return .{
-        .resource_type = .table,
-        .resource = rows.table_name,
-        .permission_type = .read,
-    };
-    if (routes.Routes.matchTableRowsAggregate(path)) |rows| return .{
-        .resource_type = .table,
-        .resource = rows.table_name,
-        .permission_type = .read,
-    };
-    if (routes.Routes.matchTableRowsWindow(path)) |rows| return .{
-        .resource_type = .table,
-        .resource = rows.table_name,
-        .permission_type = .read,
-    };
-    if (routes.Routes.matchTableRowsJoin(path)) |rows| return .{
-        .resource_type = .table,
-        .resource = rows.table_name,
-        .permission_type = .read,
-    };
-    if (routes.Routes.matchTableRowsLateral(path)) |rows| return .{
-        .resource_type = .table,
-        .resource = rows.table_name,
-        .permission_type = .read,
-    };
-    if (routes.Routes.matchTableRowsBatch(path)) |rows| return .{
-        .resource_type = .table,
-        .resource = rows.table_name,
-        .permission_type = .write,
-    };
-    if (routes.Routes.matchTableArtifactEnrichment(path)) |artifact| return .{
-        .resource_type = .table,
-        .resource = artifact.table_name,
-        .permission_type = switch (method) {
-            .PUT, .DELETE => .admin,
-            .GET, .POST => return null,
-        },
-    };
+    if (matchTableDocumentLookupForPermission(path)) |document| return try tablePermission(alloc, document.table_name, .read);
+    if (routes.Routes.matchTableLookup(path)) |lookup| return try tablePermission(alloc, lookup.table_name, .read);
+    if (routes.Routes.matchTableQuery(path)) |query| return try tablePermission(alloc, query.table_name, .read);
+    if (routes.Routes.matchTableRowsGet(path)) |rows| return try tablePermission(alloc, rows.table_name, .read);
+    if (routes.Routes.matchTableRowsPlan(path)) |rows| return try tablePermission(alloc, rows.table_name, .read);
+    if (routes.Routes.matchTableRowsQuery(path)) |rows| return try tablePermission(alloc, rows.table_name, .read);
+    if (routes.Routes.matchTableRowsAggregate(path)) |rows| return try tablePermission(alloc, rows.table_name, .read);
+    if (routes.Routes.matchTableRowsWindow(path)) |rows| return try tablePermission(alloc, rows.table_name, .read);
+    if (routes.Routes.matchTableRowsJoin(path)) |rows| return try tablePermission(alloc, rows.table_name, .read);
+    if (routes.Routes.matchTableRowsLateral(path)) |rows| return try tablePermission(alloc, rows.table_name, .read);
+    if (routes.Routes.matchTableRowsBatch(path)) |rows| return try tablePermission(alloc, rows.table_name, .write);
+    if (routes.Routes.matchTableDocumentArtifacts(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
+        .GET => .read,
+        .POST, .PUT, .DELETE => return null,
+    });
+    if (routes.Routes.matchTableDocumentArtifact(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
+        .GET => .read,
+        .POST, .PUT, .DELETE => return null,
+    });
+    if (routes.Routes.matchTableDocumentArtifactReprocess(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
+        .POST => .admin,
+        .GET, .PUT, .DELETE => return null,
+    });
+    if (routes.Routes.matchTableArtifactReprocessJobs(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
+        .POST => .admin,
+        .GET, .PUT, .DELETE => return null,
+    });
+    if (routes.Routes.matchTableArtifactReprocessJob(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
+        .GET => .read,
+        .POST, .PUT, .DELETE => return null,
+    });
+    if (routes.Routes.matchTableArtifactReprocessJobAdvance(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
+        .POST => .admin,
+        .GET, .PUT, .DELETE => return null,
+    });
+    if (routes.Routes.matchTableArtifactReprocessJobCancel(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
+        .POST => .admin,
+        .GET, .PUT, .DELETE => return null,
+    });
+    if (routes.Routes.matchTableArtifactReprocess(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
+        .POST => .admin,
+        .GET, .PUT, .DELETE => return null,
+    });
+    if (routes.Routes.matchTableArtifacts(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
+        .GET => .read,
+        .POST, .PUT, .DELETE => return null,
+    });
+    if (routes.Routes.matchTableArtifactEnrichment(path)) |artifact| return try tablePermission(alloc, artifact.table_name, switch (method) {
+        .PUT, .DELETE => .admin,
+        .GET, .POST => return null,
+    });
     if (routes.Routes.matchTablePath(path)) |table_path| {
-        return .{
-            .resource_type = .table,
-            .resource = table_path.table_name,
-            .permission_type = switch (method) {
-                .GET => .read,
-                .POST, .PUT, .DELETE => .admin,
-            },
-        };
+        return try tablePermission(alloc, table_path.table_name, switch (method) {
+            .GET => .read,
+            .POST, .PUT, .DELETE => .admin,
+        });
     }
-    if (routes.Routes.matchTableBatch(path)) |batch| return .{
-        .resource_type = .table,
-        .resource = batch.table_name,
-        .permission_type = .write,
-    };
-    if (routes.Routes.matchTableMerge(path)) |merge| return .{
-        .resource_type = .table,
-        .resource = merge.table_name,
-        .permission_type = .write,
-    };
-    if (routes.Routes.matchTableSchema(path)) |schema| return .{
-        .resource_type = .table,
-        .resource = schema.table_name,
-        .permission_type = .admin,
-    };
-    if (routes.Routes.matchTableIndexes(path)) |indexes| return .{
-        .resource_type = .table,
-        .resource = indexes.table_name,
-        .permission_type = switch (method) {
-            .GET => .read,
-            .POST => .admin,
-            .PUT, .DELETE => return null,
-        },
-    };
-    if (routes.Routes.matchTableIndex(path)) |index| return .{
-        .resource_type = .table,
-        .resource = index.table_name,
-        .permission_type = switch (method) {
-            .GET => .read,
-            .DELETE => .admin,
-            .POST => .admin,
-            .PUT => return null,
-        },
-    };
-    if (routes.Routes.matchTableBackup(path)) |table_backup| return .{
-        .resource_type = .table,
-        .resource = table_backup.table_name,
-        .permission_type = .admin,
-    };
-    if (routes.Routes.matchTableRestore(path)) |table_restore| return .{
-        .resource_type = .table,
-        .resource = table_restore.table_name,
-        .permission_type = .admin,
-    };
-    if (routes.Routes.matchTableForeignKeyIntegrity(path)) |fk_integrity| return .{
-        .resource_type = .table,
-        .resource = fk_integrity.table_name,
-        .permission_type = .admin,
-    };
-    if (routes.Routes.matchTableUniqueIntegrity(path)) |unique_integrity| return .{
-        .resource_type = .table,
-        .resource = unique_integrity.table_name,
-        .permission_type = .admin,
-    };
-    if (tableNameForGraphPath(path)) |table_name| return .{
-        .resource_type = .table,
-        .resource = table_name,
-        .permission_type = .read,
-    };
+    if (routes.Routes.matchTableBatch(path)) |batch| return try tablePermission(alloc, batch.table_name, .write);
+    if (routes.Routes.matchTableMerge(path)) |merge| return try tablePermission(alloc, merge.table_name, .write);
+    if (routes.Routes.matchTableSchema(path)) |schema| return try tablePermission(alloc, schema.table_name, .admin);
+    if (routes.Routes.matchTableIndexes(path)) |indexes| return try tablePermission(alloc, indexes.table_name, switch (method) {
+        .GET => .read,
+        .POST => .admin,
+        .PUT, .DELETE => return null,
+    });
+    if (routes.Routes.matchTableIndex(path)) |index| return try tablePermission(alloc, index.table_name, switch (method) {
+        .GET => .read,
+        .DELETE => .admin,
+        .POST => .admin,
+        .PUT => return null,
+    });
+    if (routes.Routes.matchTableBackup(path)) |table_backup| return try tablePermission(alloc, table_backup.table_name, .admin);
+    if (routes.Routes.matchTableRestore(path)) |table_restore| return try tablePermission(alloc, table_restore.table_name, .admin);
+    if (routes.Routes.matchTableForeignKeyIntegrity(path)) |fk_integrity| return try tablePermission(alloc, fk_integrity.table_name, .admin);
+    if (routes.Routes.matchTableUniqueIntegrity(path)) |unique_integrity| return try tablePermission(alloc, unique_integrity.table_name, .admin);
+    if (routes.Routes.matchTableGraphMetric(path)) |graph_metric| return try tablePermission(alloc, graph_metric.table_name, .admin);
+    if (tableNameForGraphPath(path)) |table_name| return try tablePermission(alloc, table_name, .read);
     return null;
 }
 
@@ -19983,8 +20110,70 @@ fn explicitCatalogTablePermissionType(method: http_common.Method, suffix: ?[]con
         .POST, .DELETE => .admin,
         else => null,
     };
-    if (std.mem.startsWith(u8, value, "documents/")) return if (method == .GET) .read else null;
+    if (std.mem.startsWith(u8, value, "documents/")) {
+        if (std.mem.endsWith(u8, value, "/reprocess")) return if (method == .POST) .admin else null;
+        return if (method == .GET) .read else null;
+    }
+    if (std.mem.eql(u8, value, "artifacts")) return if (method == .GET) .read else null;
+    if (std.mem.startsWith(u8, value, "artifacts/")) {
+        if (std.mem.endsWith(u8, value, "/enrichment")) return switch (method) {
+            .PUT, .DELETE => .admin,
+            else => null,
+        };
+        if (std.mem.endsWith(u8, value, "/reprocess")) return if (method == .POST) .admin else null;
+        if (std.mem.indexOf(u8, value, "/reprocess-jobs/")) |_| {
+            if (std.mem.endsWith(u8, value, "/advance") or std.mem.endsWith(u8, value, "/cancel")) return if (method == .POST) .admin else null;
+            return if (method == .GET) .read else null;
+        }
+        if (std.mem.endsWith(u8, value, "/reprocess-jobs")) return if (method == .POST) .admin else null;
+    }
     return null;
+}
+
+fn databasePermission(alloc: std.mem.Allocator, encoded_database_name: []const u8, permission_type: usermgr.PermissionType) !RequiredPermission {
+    return .{
+        .resource_type = .database,
+        .resource = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, encoded_database_name),
+        .permission_type = permission_type,
+        .owns_resource = true,
+    };
+}
+
+fn namespacePermission(alloc: std.mem.Allocator, encoded_database_name: []const u8, encoded_namespace_name: []const u8, permission_type: usermgr.PermissionType) !RequiredPermission {
+    const database_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, encoded_database_name);
+    defer alloc.free(database_name);
+    const namespace_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, encoded_namespace_name);
+    defer alloc.free(namespace_name);
+    return .{
+        .resource_type = .namespace,
+        .resource = try catalog_resources.namespaceResourceNameAlloc(alloc, database_name, namespace_name),
+        .permission_type = permission_type,
+        .owns_resource = true,
+    };
+}
+
+fn catalogTablePermission(alloc: std.mem.Allocator, encoded_database_name: []const u8, encoded_namespace_name: []const u8, encoded_table_name: []const u8, permission_type: usermgr.PermissionType) !RequiredPermission {
+    const database_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, encoded_database_name);
+    defer alloc.free(database_name);
+    const namespace_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, encoded_namespace_name);
+    defer alloc.free(namespace_name);
+    const table_name = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, encoded_table_name);
+    defer alloc.free(table_name);
+    return .{
+        .resource_type = .table,
+        .resource = try catalog_resources.tableResourceNameAlloc(alloc, database_name, namespace_name, table_name),
+        .permission_type = permission_type,
+        .owns_resource = true,
+    };
+}
+
+fn tablePermission(alloc: std.mem.Allocator, encoded_table_name: []const u8, permission_type: usermgr.PermissionType) !RequiredPermission {
+    return .{
+        .resource_type = .table,
+        .resource = try http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, encoded_table_name),
+        .permission_type = permission_type,
+        .owns_resource = true,
+    };
 }
 
 fn tableNameForGraphPath(path: []const u8) ?[]const u8 {
@@ -20034,7 +20223,8 @@ test "explicit catalog routes declare qualified namespace and table permissions"
     const alloc = std.testing.allocator;
 
     {
-        const required = requiredPermissionForRequest(.POST, stripApiPrefix(routes.Routes.db_v1_sql)).?;
+        const required = (try requiredPermissionForRequest(alloc, .POST, stripApiPrefix(routes.Routes.db_v1_sql))).?;
+        defer required.deinit(alloc);
         try std.testing.expectEqual(usermgr.ResourceType.database, required.resource_type);
         try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
         const resource = try required.resourceNameAlloc(alloc);
@@ -20042,7 +20232,8 @@ test "explicit catalog routes declare qualified namespace and table permissions"
         try std.testing.expectEqualStrings(catalog_resources.default_database_name, resource);
     }
     {
-        const required = requiredPermissionForRequest(.GET, "/databases/tenant_ops/namespaces/analytics/tables").?;
+        const required = (try requiredPermissionForRequest(alloc, .GET, "/databases/tenant_ops/namespaces/analytics/tables")).?;
+        defer required.deinit(alloc);
         try std.testing.expectEqual(usermgr.ResourceType.namespace, required.resource_type);
         try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
         const resource = try required.resourceNameAlloc(alloc);
@@ -20050,7 +20241,8 @@ test "explicit catalog routes declare qualified namespace and table permissions"
         try std.testing.expectEqualStrings("tenant_ops.analytics", resource);
     }
     {
-        const required = requiredPermissionForRequest(.DELETE, "/databases/tenant_ops/namespaces/analytics").?;
+        const required = (try requiredPermissionForRequest(alloc, .DELETE, "/databases/tenant_ops/namespaces/analytics")).?;
+        defer required.deinit(alloc);
         try std.testing.expectEqual(usermgr.ResourceType.namespace, required.resource_type);
         try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
         const resource = try required.resourceNameAlloc(alloc);
@@ -20058,7 +20250,8 @@ test "explicit catalog routes declare qualified namespace and table permissions"
         try std.testing.expectEqualStrings("tenant_ops.analytics", resource);
     }
     {
-        const required = requiredPermissionForRequest(.GET, "/databases/tenant_ops/namespaces/analytics/tables/events").?;
+        const required = (try requiredPermissionForRequest(alloc, .GET, "/databases/tenant_ops/namespaces/analytics/tables/events")).?;
+        defer required.deinit(alloc);
         try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
         try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
         const resource = try required.resourceNameAlloc(alloc);
@@ -20066,7 +20259,8 @@ test "explicit catalog routes declare qualified namespace and table permissions"
         try std.testing.expectEqualStrings("tenant_ops.analytics.events", resource);
     }
     {
-        const required = requiredPermissionForRequest(.POST, "/databases/tenant_ops/namespaces/analytics/tables/events/query").?;
+        const required = (try requiredPermissionForRequest(alloc, .POST, "/databases/tenant_ops/namespaces/analytics/tables/events/query")).?;
+        defer required.deinit(alloc);
         try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
         try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
         const resource = try required.resourceNameAlloc(alloc);
@@ -20074,7 +20268,8 @@ test "explicit catalog routes declare qualified namespace and table permissions"
         try std.testing.expectEqualStrings("tenant_ops.analytics.events", resource);
     }
     {
-        const required = requiredPermissionForRequest(.POST, "/databases/tenant_ops/namespaces/analytics/tables/events/batch").?;
+        const required = (try requiredPermissionForRequest(alloc, .POST, "/databases/tenant_ops/namespaces/analytics/tables/events/batch")).?;
+        defer required.deinit(alloc);
         try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
         try std.testing.expectEqual(usermgr.PermissionType.write, required.permission_type);
         const resource = try required.resourceNameAlloc(alloc);
@@ -20082,7 +20277,8 @@ test "explicit catalog routes declare qualified namespace and table permissions"
         try std.testing.expectEqualStrings("tenant_ops.analytics.events", resource);
     }
     {
-        const required = requiredPermissionForRequest(.GET, "/databases/tenant_ops/namespaces/analytics/tables/events/documents/doc%2Fa").?;
+        const required = (try requiredPermissionForRequest(alloc, .GET, "/databases/tenant_ops/namespaces/analytics/tables/events/documents/doc%2Fa")).?;
+        defer required.deinit(alloc);
         try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
         try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
         const resource = try required.resourceNameAlloc(alloc);
@@ -20090,7 +20286,8 @@ test "explicit catalog routes declare qualified namespace and table permissions"
         try std.testing.expectEqualStrings("tenant_ops.analytics.events", resource);
     }
     {
-        const required = requiredPermissionForRequest(.DELETE, "/databases/tenant_ops/namespaces/analytics/tables/events/indexes/search_idx").?;
+        const required = (try requiredPermissionForRequest(alloc, .DELETE, "/databases/tenant_ops/namespaces/analytics/tables/events/indexes/search_idx")).?;
+        defer required.deinit(alloc);
         try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
         try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
         const resource = try required.resourceNameAlloc(alloc);
@@ -20101,60 +20298,93 @@ test "explicit catalog routes declare qualified namespace and table permissions"
 
 test "document artifact routes declare read and admin permissions" {
     {
-        const required = requiredPermissionForRequest(.GET, "/tables/docs/documents/doc%2Fa").?;
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .GET, "/tables/docs/documents/doc%2Fa")).?;
+        defer required.deinit(std.testing.allocator);
         try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
         try std.testing.expectEqualStrings("docs", required.resource);
         try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
     }
     {
-        const required = requiredPermissionForRequest(.GET, "/tables/docs/documents/doc%2Fa/artifacts").?;
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .GET, "/tables/docs/documents/doc%2Fa/artifacts")).?;
+        defer required.deinit(std.testing.allocator);
         try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
         try std.testing.expectEqualStrings("docs", required.resource);
         try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
     }
     {
-        const required = requiredPermissionForRequest(.GET, "/tables/docs/documents/doc%2Fa/artifacts/document_units_v1").?;
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .GET, "/tables/docs/documents/doc%2Fa/artifacts/document_units_v1")).?;
+        defer required.deinit(std.testing.allocator);
         try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
         try std.testing.expectEqualStrings("docs", required.resource);
         try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
     }
     {
-        const required = requiredPermissionForRequest(.POST, "/tables/docs/documents/doc%2Fa/artifacts/document_units_v1/reprocess").?;
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .POST, "/tables/docs/documents/doc%2Fa/artifacts/document_units_v1/reprocess")).?;
+        defer required.deinit(std.testing.allocator);
         try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
         try std.testing.expectEqualStrings("docs", required.resource);
         try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
     }
     {
-        const required = requiredPermissionForRequest(.POST, "/tables/docs/artifacts/document_units_v1/reprocess").?;
-        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
-        try std.testing.expectEqualStrings("docs", required.resource);
-        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
-    }
-    {
-        const required = requiredPermissionForRequest(.POST, "/tables/docs/artifacts/document_units_v1/reprocess-jobs").?;
-        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
-        try std.testing.expectEqualStrings("docs", required.resource);
-        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
-    }
-    {
-        const required = requiredPermissionForRequest(.GET, "/tables/docs/artifacts/document_units_v1/reprocess-jobs/42").?;
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .GET, "/tables/docs/artifacts")).?;
+        defer required.deinit(std.testing.allocator);
         try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
         try std.testing.expectEqualStrings("docs", required.resource);
         try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
     }
     {
-        const required = requiredPermissionForRequest(.POST, "/tables/docs/artifacts/document_units_v1/reprocess-jobs/42/advance").?;
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .POST, "/tables/docs/artifacts/document_units_v1/reprocess")).?;
+        defer required.deinit(std.testing.allocator);
         try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
         try std.testing.expectEqualStrings("docs", required.resource);
         try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
     }
     {
-        const required = requiredPermissionForRequest(.POST, "/tables/docs/artifacts/document_units_v1/reprocess-jobs/42/cancel").?;
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .POST, "/tables/docs/artifacts/document_units_v1/reprocess-jobs")).?;
+        defer required.deinit(std.testing.allocator);
         try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
         try std.testing.expectEqualStrings("docs", required.resource);
         try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
     }
-    try std.testing.expect(requiredPermissionForRequest(.GET, "/tables/docs/artifacts/document_units_v1/reprocess") == null);
+    {
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .GET, "/tables/docs/artifacts/document_units_v1/reprocess-jobs/42")).?;
+        defer required.deinit(std.testing.allocator);
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
+    }
+    {
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .POST, "/tables/docs/artifacts/document_units_v1/reprocess-jobs/42/advance")).?;
+        defer required.deinit(std.testing.allocator);
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    }
+    {
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .POST, "/tables/docs/artifacts/document_units_v1/reprocess-jobs/42/cancel")).?;
+        defer required.deinit(std.testing.allocator);
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    }
+    try std.testing.expect((try requiredPermissionForRequest(std.testing.allocator, .GET, "/tables/docs/artifacts/document_units_v1/reprocess")) == null);
+}
+
+test "required permissions decode table path resources" {
+    {
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .GET, "/tables/docs%20table/artifacts")).?;
+        defer required.deinit(std.testing.allocator);
+        try std.testing.expectEqual(usermgr.ResourceType.table, required.resource_type);
+        try std.testing.expectEqualStrings("docs table", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.read, required.permission_type);
+    }
+    {
+        const required = (try requiredPermissionForRequest(std.testing.allocator, .POST, "/tables/docs%2Farchive/artifacts/document_units_v1/reprocess")).?;
+        defer required.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("docs/archive", required.resource);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+    }
+    try std.testing.expectError(error.InvalidArgument, requiredPermissionForRequest(std.testing.allocator, .GET, "/tables/docs%ZZ/artifacts"));
 }
 
 fn base64UrlDecodeAlloc(alloc: std.mem.Allocator, value: []const u8) ![]u8 {
@@ -21583,6 +21813,13 @@ fn splitTarget(target: []const u8) UriParts {
 fn rawPathOnly(target: []const u8) []const u8 {
     const query_index = std.mem.indexOfScalar(u8, target, '?') orelse return target;
     return target[0..query_index];
+}
+
+fn decodeRequestPathParamAlloc(alloc: std.mem.Allocator, encoded: []const u8) ![]u8 {
+    return http_route_helpers.decodePercentEncodedPathComponentAlloc(alloc, encoded) catch |err| switch (err) {
+        error.InvalidArgument => return error.InvalidPathParameter,
+        else => return err,
+    };
 }
 
 fn parseSimpleQueryParam(query: []const u8, key: []const u8) ?[]const u8 {
@@ -37544,14 +37781,24 @@ test "api http server serves table index metadata routes" {
         }
 
         fn snapshot() metadata_api.AdminSnapshot {
+            const indexes_json =
+                "{\"search_idx\":{\"type\":\"full_text\"},\"embed_idx\":{\"type\":\"embeddings\",\"dimension\":384,\"enrichments\":[{\"name\":\"body_chunks_v1\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":512},{\"name\":\"body_dense_v1\",\"kind\":\"embedding\",\"field\":\"text\",\"source_artifact_name\":\"body_chunks_v1\",\"expected_dims\":384}]},\"alg\":{\"type\":\"algebraic\"}}";
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
-                    .table_id = 1,
-                    .name = "docs",
-                    .indexes_json = "{\"search_idx\":{\"type\":\"full_text\"},\"embed_idx\":{\"type\":\"embeddings\",\"dimension\":384},\"alg\":{\"type\":\"algebraic\"}}",
-                    .placement_role = "data",
-                }})[0..]),
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+                    .{
+                        .table_id = 1,
+                        .name = "docs",
+                        .indexes_json = indexes_json,
+                        .placement_role = "data",
+                    },
+                    .{
+                        .table_id = 2,
+                        .name = "docs table",
+                        .indexes_json = indexes_json,
+                        .placement_role = "data",
+                    },
+                })[0..]),
                 .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
@@ -37595,6 +37842,42 @@ test "api http server serves table index metadata routes" {
     defer parsed_detail.deinit();
     try std.testing.expectEqualStrings("embed_idx", parsed_detail.value.object.get("config").?.object.get("name").?.string);
     try std.testing.expectEqual(@as(usize, 2), source.cached_snapshot_calls);
+
+    var artifacts_resp = try server.handle(.{
+        .method = .GET,
+        .uri = "/tables/docs/artifacts",
+    });
+    defer artifacts_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), artifacts_resp.status);
+    try std.testing.expectEqualStrings("application/json", artifacts_resp.content_type.?);
+    var parsed_artifacts = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, artifacts_resp.body, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed_artifacts.deinit();
+    try std.testing.expectEqualStrings("docs", parsed_artifacts.value.object.get("table_name").?.string);
+    const artifacts = parsed_artifacts.value.object.get("artifacts").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), artifacts.len);
+    try std.testing.expectEqualStrings("body_chunks_v1", artifacts[0].object.get("name").?.string);
+    try std.testing.expectEqualStrings("chunk", artifacts[0].object.get("kind").?.string);
+    try std.testing.expectEqualStrings("body_dense_v1", artifacts[1].object.get("name").?.string);
+    try std.testing.expectEqualStrings("embedding", artifacts[1].object.get("kind").?.string);
+    try std.testing.expectEqualStrings("body_chunks_v1", artifacts[1].object.get("source_artifact_name").?.string);
+    try std.testing.expectEqual(@as(usize, 3), source.cached_snapshot_calls);
+
+    var encoded_table_artifacts_resp = try server.handle(.{
+        .method = .GET,
+        .uri = "/tables/docs%20table/artifacts",
+    });
+    defer encoded_table_artifacts_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), encoded_table_artifacts_resp.status);
+    var parsed_encoded_table_artifacts = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded_table_artifacts_resp.body, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed_encoded_table_artifacts.deinit();
+    try std.testing.expectEqualStrings("docs table", parsed_encoded_table_artifacts.value.object.get("table_name").?.string);
+    try std.testing.expectEqual(@as(usize, 2), parsed_encoded_table_artifacts.value.object.get("artifacts").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 4), source.cached_snapshot_calls);
+
     try std.testing.expectEqual(@as(usize, 0), source.admin_snapshot_calls);
 
     var algebraic_detail_resp = try server.handle(.{

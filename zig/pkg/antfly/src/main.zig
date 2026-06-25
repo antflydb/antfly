@@ -65,10 +65,11 @@ pub fn main(init: std.process.Init) !void {
 
     // CLI client subcommands — these talk to a remote Antfly server via HTTP
     const cli_commands = [_][]const u8{
-        "table",  "database", "namespace", "tablespace",
-        "index",  "query",    "lookup",    "load",
-        "sql",    "insert",   "delete",    "agents",
-        "backup", "restore",  "auth",      "internal",
+        "table",    "database", "namespace", "tablespace",
+        "index",    "artifact", "query",     "lookup",
+        "load",     "sql",      "insert",    "delete",
+        "agents",   "backup",   "restore",   "auth",
+        "internal",
     };
     for (cli_commands) |cli_cmd| {
         if (std.mem.eql(u8, subcommand, cli_cmd)) {
@@ -156,6 +157,7 @@ fn runCliCommand(allocator: std.mem.Allocator, subcommand: []const u8, args: *st
     if (std.mem.eql(u8, subcommand, "namespace")) return cmd.cli.namespace_cmd.run(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "tablespace")) return cmd.cli.tablespace.run(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "index")) return cmd.cli.index.run(allocator, io, &client, args);
+    if (std.mem.eql(u8, subcommand, "artifact")) return cmd.cli.artifact.run(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "query")) return cmd.cli.query.run(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "lookup")) return cmd.cli.query.lookup(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "sql")) return cmd.cli.sql.run(allocator, io, &client, args);
@@ -189,6 +191,7 @@ fn printUsage(argv0: []const u8) void {
         \\  tablespace     Manage tablespaces (create, drop, list, get)
         \\  table          Manage tables (create, drop, list, get)
         \\  index          Manage indexes (create, drop, list, get)
+        \\  artifact       Manage generated artifact enrichments and reprocessing
         \\  query          Query data from a table
         \\  lookup         Look up a document by key
         \\  sql            Execute SQL or start a psql-style SQL REPL

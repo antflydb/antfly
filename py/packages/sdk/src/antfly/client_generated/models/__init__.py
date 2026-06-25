@@ -327,7 +327,6 @@ from .inference_generate_json_schema_config import InferenceGenerateJsonSchemaCo
 from .inference_generate_json_schema_config_schema import InferenceGenerateJsonSchemaConfigSchema
 from .inference_generate_message import InferenceGenerateMessage
 from .inference_generate_request import InferenceGenerateRequest
-from .inference_generate_request_backend import InferenceGenerateRequestBackend
 from .inference_generate_request_cache_dtype import InferenceGenerateRequestCacheDtype
 from .inference_generate_request_compiled_target import InferenceGenerateRequestCompiledTarget
 from .inference_generate_request_mode import InferenceGenerateRequestMode
@@ -342,7 +341,12 @@ from .inference_image_url_content_part_type import InferenceImageURLContentPartT
 from .inference_level import InferenceLevel
 from .inference_media_content_part import InferenceMediaContentPart
 from .inference_media_content_part_type import InferenceMediaContentPartType
+from .inference_model_backend import InferenceModelBackend
+from .inference_model_format import InferenceModelFormat
 from .inference_model_info import InferenceModelInfo
+from .inference_model_kind import InferenceModelKind
+from .inference_model_quantization import InferenceModelQuantization
+from .inference_model_ref import InferenceModelRef
 from .inference_models_response import InferenceModelsResponse
 from .inference_models_response_chunkers import InferenceModelsResponseChunkers
 from .inference_models_response_classifiers import InferenceModelsResponseClassifiers
@@ -670,6 +674,7 @@ from .sse_tool_mode_mode import SSEToolModeMode
 from .storage_status import StorageStatus
 from .success_message import SuccessMessage
 from .sync_level import SyncLevel
+from .table_artifact_enrichment_list import TableArtifactEnrichmentList
 from .table_backup_status import TableBackupStatus
 from .table_backup_status_status import TableBackupStatusStatus
 from .table_migration import TableMigration
@@ -1071,7 +1076,6 @@ __all__ = (
     "InferenceGenerateJsonSchemaConfigSchema",
     "InferenceGenerateMessage",
     "InferenceGenerateRequest",
-    "InferenceGenerateRequestBackend",
     "InferenceGenerateRequestCacheDtype",
     "InferenceGenerateRequestCompiledTarget",
     "InferenceGenerateRequestMode",
@@ -1086,7 +1090,12 @@ __all__ = (
     "InferenceLevel",
     "InferenceMediaContentPart",
     "InferenceMediaContentPartType",
+    "InferenceModelBackend",
+    "InferenceModelFormat",
     "InferenceModelInfo",
+    "InferenceModelKind",
+    "InferenceModelQuantization",
+    "InferenceModelRef",
     "InferenceModelsResponse",
     "InferenceModelsResponseChunkers",
     "InferenceModelsResponseClassifiers",
@@ -1414,6 +1423,7 @@ __all__ = (
     "StorageStatus",
     "SuccessMessage",
     "SyncLevel",
+    "TableArtifactEnrichmentList",
     "TableBackupStatus",
     "TableBackupStatusStatus",
     "TableMigration",

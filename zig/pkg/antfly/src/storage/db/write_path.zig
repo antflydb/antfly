@@ -17,6 +17,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
 
+const algebraic_mod = @import("algebraic/mod.zig");
 const artifact_ids = @import("artifact_ids.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
 const common_secrets = @import("../../common/secrets.zig");
@@ -4183,6 +4184,194 @@ test "db write path bulk ingest finish publishes primary store before external d
     });
     defer result.deinit();
     try std.testing.expect(result.total_hits > 0);
+}
+
+test "db write path bulk ingest algebraic survives reopen with durable lsm primary backend" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    const cfg =
+        \\{
+        \\  "version": 1,
+        \\  "table": "orders",
+        \\  "group_fields": [{"name":"customer","path":"customer","type":"string"}],
+        \\  "measure_fields": [{"name":"amount","path":"amount","type":"number"}],
+        \\  "materializations": [{"name":"sum_by_customer","op":"sum","group_by":["customer"],"measure":"amount"}]
+        \\}
+    ;
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 2 } },
+            .start_index_workers = false,
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "alg",
+            .kind = .algebraic,
+            .config_json = cfg,
+        });
+
+        try db.beginBulkIngestSession();
+        errdefer db.abortBulkIngestSession();
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "o1", .value = "{\"customer\":\"alice\",\"amount\":10}" },
+                .{ .key = "o2", .value = "{\"customer\":\"alice\",\"amount\":20}" },
+                .{ .key = "o3", .value = "{\"customer\":\"bob\",\"amount\":7}" },
+            },
+            .sync_level = .write,
+        });
+
+        try db.finishBulkIngestSessionWithOptions(.{
+            .compact = false,
+            .flush = true,
+            .max_deferred_l0_runs = 2,
+            .max_foreground_compaction_steps = 1,
+        });
+
+        const entry = db.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
+        const alice_token = try entry.index.constraintTokenAlloc(alloc, "customer", "alice");
+        defer alloc.free(alice_token);
+        const alice_group = try algebraic_mod.token.canonicalTupleAlloc(alloc, &.{alice_token});
+        defer alloc.free(alice_group);
+        try std.testing.expectEqual(@as(f64, 30), (try entry.index.numericValue(db.core.store, "sum_by_customer", alice_group)).?);
+    }
+
+    {
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 2 } },
+            .start_index_workers = false,
+        });
+        defer reopened.close();
+
+        try std.testing.expectEqual(@as(u32, 1), reopened.core.index_manager.count());
+        const entry = reopened.core.index_manager.algebraicIndex("alg") orelse return error.TestUnexpectedResult;
+
+        const alice_token = try entry.index.constraintTokenAlloc(alloc, "customer", "alice");
+        defer alloc.free(alice_token);
+        const alice_group = try algebraic_mod.token.canonicalTupleAlloc(alloc, &.{alice_token});
+        defer alloc.free(alice_group);
+        try std.testing.expectEqual(@as(f64, 30), (try entry.index.numericValue(reopened.core.store, "sum_by_customer", alice_group)).?);
+
+        const bob_token = try entry.index.constraintTokenAlloc(alloc, "customer", "bob");
+        defer alloc.free(bob_token);
+        const bob_group = try algebraic_mod.token.canonicalTupleAlloc(alloc, &.{bob_token});
+        defer alloc.free(bob_group);
+        try std.testing.expectEqual(@as(f64, 7), (try entry.index.numericValue(reopened.core.store, "sum_by_customer", bob_group)).?);
+    }
+}
+
+test "db write path batch load profile benchmark" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const profileBenchTestsEnabled = db_test_support.profileBenchTestsEnabled;
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    if (!profileBenchTestsEnabled()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+    });
+    defer db.close();
+
+    const dims: usize = 16;
+    const batch_docs: usize = 32;
+    const batch_count: usize = 1;
+    const total_docs: usize = batch_docs * batch_count;
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":16,\"metric\":\"cosine\",\"external\":true}",
+    });
+
+    const vector_buf = try alloc.alloc(f32, dims);
+    defer alloc.free(vector_buf);
+
+    var total_profile = BatchProfile{};
+    for (0..batch_count) |batch_index| {
+        const writes = try alloc.alloc(types.BatchWrite, batch_docs);
+        defer {
+            for (writes) |write| {
+                alloc.free(write.key);
+                alloc.free(write.value);
+            }
+            alloc.free(writes);
+        }
+        for (writes, 0..) |*write, doc_offset| {
+            const doc_id = batch_index * batch_docs + doc_offset;
+            var norm_sq: f32 = 0;
+            for (vector_buf, 0..) |*slot, dim| {
+                const raw: u32 = @intCast((doc_id * 1315423911 + dim * 2654435761 + 17) % 1000);
+                const centered = (@as(f32, @floatFromInt(raw)) / 500.0) - 1.0;
+                slot.* = centered;
+                norm_sq += centered * centered;
+            }
+            const inv_norm: f32 = 1.0 / @sqrt(norm_sq);
+            for (vector_buf) |*slot| slot.* *= inv_norm;
+
+            write.* = .{
+                .key = try std.fmt.allocPrint(alloc, "doc:{d}", .{doc_id}),
+                .value = try std.fmt.allocPrint(
+                    alloc,
+                    "{{\"title\":\"doc-{d}\",\"_embeddings\":{{\"dv_v1\":{f}}}}}",
+                    .{ doc_id, std.json.fmt(vector_buf, .{}) },
+                ),
+            };
+        }
+
+        var batch_profile = BatchProfile{};
+        try db.batchProfiled(.{
+            .writes = writes,
+            .sync_level = .full_index,
+        }, &batch_profile);
+        addBatchProfile(&total_profile, batch_profile);
+    }
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expectEqual(@as(u64, total_docs), stats.indexes[0].doc_count);
+
+    std.debug.print(
+        "batch_load_profile docs={d} batch_docs={d} batches={d} dims={d} avg_total_ms={d} avg_resolve_transforms_ms={d} avg_merge_req_ms={d} avg_predicates_ms={d} avg_validate_range_ms={d} avg_extract_writes_ms={d} avg_delete_artifacts_ms={d} avg_precompute_generated_ms={d} avg_store_write_ms={d} avg_split_delta_ms={d} avg_build_derived_ms={d} avg_apply_shadow_ms={d} avg_collect_sync_targets_ms={d} avg_append_replay_journal_ms={d} avg_wait_sync_ms={d} avg_notify_enrichment_ms={d}\n",
+        .{
+            total_docs,
+            batch_docs,
+            batch_count,
+            dims,
+            @divTrunc(@divTrunc(total_profile.total_ns, batch_count), std.time.ns_per_ms),
+            @divTrunc(@divTrunc(total_profile.resolve_transforms_ns, batch_count), std.time.ns_per_ms),
+            @divTrunc(@divTrunc(total_profile.merge_effective_req_ns, batch_count), std.time.ns_per_ms),
+            @divTrunc(@divTrunc(total_profile.predicates_ns, batch_count), std.time.ns_per_ms),
+            @divTrunc(@divTrunc(total_profile.validate_range_ns, batch_count), std.time.ns_per_ms),
+            @divTrunc(@divTrunc(total_profile.extract_writes_ns, batch_count), std.time.ns_per_ms),
+            @divTrunc(@divTrunc(total_profile.delete_artifacts_ns, batch_count), std.time.ns_per_ms),
+            @divTrunc(@divTrunc(total_profile.precompute_generated_ns, batch_count), std.time.ns_per_ms),
+            @divTrunc(@divTrunc(total_profile.store_write_ns, batch_count), std.time.ns_per_ms),
+            @divTrunc(@divTrunc(total_profile.split_delta_ns, batch_count), std.time.ns_per_ms),
+            @divTrunc(@divTrunc(total_profile.build_derived_ns, batch_count), std.time.ns_per_ms),
+            @divTrunc(@divTrunc(total_profile.apply_shadow_ns, batch_count), std.time.ns_per_ms),
+            @divTrunc(@divTrunc(total_profile.collect_sync_targets_ns, batch_count), std.time.ns_per_ms),
+            @divTrunc(@divTrunc(total_profile.append_replay_journal_ns, batch_count), std.time.ns_per_ms),
+            @divTrunc(@divTrunc(total_profile.wait_sync_ns, batch_count), std.time.ns_per_ms),
+            @divTrunc(@divTrunc(total_profile.notify_enrichment_ns, batch_count), std.time.ns_per_ms),
+        },
+    );
 }
 
 test "db write path extract enrichments exposes cleaned writes and special fields" {

@@ -28,6 +28,7 @@ const docstore_mod = @import("../docstore.zig");
 const embedder_mod = @import("enrichment/embedder.zig");
 const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
+const lsm_backend_mod = @import("../lsm_backend/mod.zig");
 const planning_adapter_mod = @import("planning_adapter.zig");
 const planning_bindings_mod = @import("planning_bindings.zig");
 const planning_stats_mod = @import("planning_stats.zig");
@@ -14912,4 +14913,287 @@ test "db search runtime relational dense HBC loader reads committed base rows" {
     defer result.deinit();
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqualStrings("row:a", result.hits[0].id);
+}
+
+test "db search runtime dense lsm cache profile benchmark" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const profileBenchTestsEnabled = db_test_support.profileBenchTestsEnabled;
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const cacheBlockHitsForBench = db_test_support.cacheBlockHitsForBench;
+    const monotonicTimeNs = platform_time.monotonicNs;
+    if (!profileBenchTestsEnabled()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var lsm_cache = lsm_backend_mod.Cache.init(alloc, 64 * 1024 * 1024);
+    defer lsm_cache.deinit();
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .lsm_cache = &lsm_cache,
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":32,\"metric\":\"cosine\"}",
+    });
+
+    const doc_count: usize = 8192;
+    const dims: usize = 32;
+    const reps: usize = 20;
+
+    const writes = try alloc.alloc(types.BatchWrite, doc_count);
+    defer {
+        for (writes) |write| {
+            alloc.free(write.key);
+            alloc.free(write.value);
+        }
+        alloc.free(writes);
+    }
+
+    const vector_buf = try alloc.alloc(f32, dims);
+    defer alloc.free(vector_buf);
+
+    for (writes, 0..) |*write, doc_id| {
+        var norm_sq: f32 = 0;
+        for (vector_buf, 0..) |*slot, dim| {
+            const raw: u32 = @intCast((doc_id * 1315423911 + dim * 2654435761 + 17) % 1000);
+            const centered = (@as(f32, @floatFromInt(raw)) / 500.0) - 1.0;
+            slot.* = centered;
+            norm_sq += centered * centered;
+        }
+        const inv_norm: f32 = 1.0 / @sqrt(norm_sq);
+        for (vector_buf) |*slot| slot.* *= inv_norm;
+
+        write.* = .{
+            .key = try std.fmt.allocPrint(alloc, "doc:{d}", .{doc_id}),
+            .value = try std.fmt.allocPrint(
+                alloc,
+                "{{\"title\":\"doc-{d}\",\"embedding\":{f}}}",
+                .{ doc_id, std.json.fmt(vector_buf, .{}) },
+            ),
+        };
+    }
+
+    try db.batch(.{
+        .writes = writes,
+        .sync_level = .full_index,
+    });
+
+    const dense_entry = db.core.denseIndex("dv_v1").?;
+    const query = vector_buf[0..dims];
+    @memcpy(query, &[_]f32{
+        0.31,  -0.09, 0.27,  -0.41, 0.12,  0.05,  -0.33, 0.44,
+        -0.11, 0.22,  -0.18, 0.39,  -0.28, 0.07,  0.14,  -0.36,
+        0.25,  -0.19, 0.08,  0.17,  -0.45, 0.29,  -0.04, 0.35,
+        -0.23, 0.16,  0.03,  -0.27, 0.41,  -0.15, 0.21,  -0.32,
+    });
+    var query_norm_sq: f32 = 0;
+    for (query) |value| query_norm_sq += value * value;
+    const query_inv_norm: f32 = 1.0 / @sqrt(query_norm_sq);
+    for (query) |*value| value.* *= query_inv_norm;
+
+    const dense_query: types.DenseKnnQuery = .{
+        .vector = query,
+        .k = 100,
+    };
+
+    const req: types.SearchRequest = .{
+        .index_name = "dv_v1",
+        .query = .{ .dense_knn = dense_query },
+        .dense = dense_query,
+        .limit = 100,
+        .include_stored = false,
+    };
+
+    const cache_before = lsm_cache.snapshotStats();
+    const block_hits_before = cacheBlockHitsForBench(cache_before);
+    const index_hits_before = cache_before.run_table_index.hits;
+
+    const cold_hbc_start = monotonicTimeNs();
+    var cold_profiled = try dense_entry.index.searchProfiledRequest(.{
+        .query = query,
+        .k = 100,
+    });
+    const cold_hbc_ns: u64 = monotonicTimeNs() - cold_hbc_start;
+    defer cold_profiled.results.deinit();
+
+    const cold_db_start = monotonicTimeNs();
+    var cold_result = try db.search(alloc, req);
+    const cold_db_ns: u64 = monotonicTimeNs() - cold_db_start;
+    defer cold_result.deinit();
+
+    var warm_hbc_total_ns: u64 = 0;
+    var warm_hbc_rerank_load_ns: u64 = 0;
+    var warm_hbc_rerank_ns: u64 = 0;
+    var warm_hbc_total_reranked: u64 = 0;
+    var warm_dense_total_ns: u64 = 0;
+    const warm_dense_index_lookup_ns: u64 = 0;
+    var warm_dense_hbc_search_ns: u64 = 0;
+    var warm_dense_doc_key_resolve_ns: u64 = 0;
+    var warm_dense_load_projected_ns: u64 = 0;
+    var warm_dense_postprocess_ns: u64 = 0;
+    var warm_dense_inline_metadata_hits: u64 = 0;
+    var warm_dense_fetched_metadata_hits: u64 = 0;
+    var warm_dense_lookup_doc_key_hits: u64 = 0;
+    for (0..reps) |_| {
+        const start = monotonicTimeNs();
+        var profiled = try dense_entry.index.searchProfiledRequest(.{
+            .query = query,
+            .k = 100,
+        });
+        warm_hbc_total_ns += monotonicTimeNs() - start;
+        warm_hbc_rerank_load_ns += profiled.profile.rerank_vector_load_ns;
+        warm_hbc_rerank_ns += profiled.profile.rerank_ns;
+        warm_hbc_total_reranked += profiled.profile.reranked_vectors;
+        profiled.results.deinit();
+    }
+
+    for (0..reps) |_| {
+        const total_start = monotonicTimeNs();
+        const profiled_entry = dense_entry;
+        const chunk_backed = profiled_entry.chunk_name != null;
+        const group_chunk_parents = db_query_search.shouldGroupChunkParents(req, chunk_backed);
+        const effective_k: u32 = if (group_chunk_parents)
+            @intCast(profiled_entry.index.metadata.active_count)
+        else
+            req.dense.?.k;
+        const effort = db_query_search.resolvedSearchEffort(req.search_effort);
+
+        const hbc_search_start = monotonicTimeNs();
+        var dense_results = try profiled_entry.index.searchWithRequest(.{
+            .query = req.dense.?.vector,
+            .k = effective_k,
+            .search_width = db_query_search.resolveSearchWidth(req.dense.?.k, effort, profiled_entry.index.stats()),
+            .epsilon = db_query_search.resolveSearchEpsilon(effort),
+            .filter_prefix = req.filter_prefix,
+            .distance_over = req.distance_over,
+            .distance_under = req.distance_under,
+            .filter_ids = req.filter_ids,
+            .exclude_ids = req.exclude_ids,
+        });
+        warm_dense_hbc_search_ns += monotonicTimeNs() - hbc_search_start;
+        defer dense_results.deinit();
+
+        const raw_hits = dense_results.getHits();
+        const start: u32 = if (group_chunk_parents) 0 else @min(req.offset, @as(u32, @intCast(raw_hits.len)));
+        const end: u32 = if (group_chunk_parents) @intCast(raw_hits.len) else @min(start + req.limit, @as(u32, @intCast(raw_hits.len)));
+
+        var hits = std.ArrayListUnmanaged(types.SearchHit).empty;
+        errdefer {
+            for (hits.items) |*hit| hit.deinit(alloc);
+            hits.deinit(alloc);
+        }
+
+        for (raw_hits[@intCast(start)..@intCast(end)], 0..) |hit, i| {
+            const result_index: usize = @as(usize, @intCast(start)) + i;
+            const resolve_start = monotonicTimeNs();
+            const doc_key = if (dense_results.takeMetadata(result_index)) |metadata| blk: {
+                warm_dense_inline_metadata_hits += 1;
+                break :blk metadata;
+            } else blk: {
+                if (try profiled_entry.index.getMetadata(hit.vector_id)) |metadata| {
+                    warm_dense_fetched_metadata_hits += 1;
+                    break :blk metadata;
+                }
+                const looked_up = (try db.core.index_manager.lookupDenseDocKey(
+                    db.core.store,
+                    profiled_entry.config.name,
+                    hit.vector_id,
+                )) orelse {
+                    warm_dense_doc_key_resolve_ns += monotonicTimeNs() - resolve_start;
+                    continue;
+                };
+                warm_dense_lookup_doc_key_hits += 1;
+                break :blk looked_up;
+            };
+            warm_dense_doc_key_resolve_ns += monotonicTimeNs() - resolve_start;
+
+            const stored_data = if (req.include_stored and !(chunk_backed and group_chunk_parents)) blk: {
+                const load_start = monotonicTimeNs();
+                const loaded = try db.searchRuntimeProjectOwnedStoredBytesForSearch(
+                    alloc,
+                    req,
+                    doc_key,
+                    (try db.get(alloc, doc_key)) orelse return error.StoredDocMissing,
+                );
+                warm_dense_load_projected_ns += monotonicTimeNs() - load_start;
+                break :blk loaded;
+            } else null;
+
+            try hits.append(alloc, .{
+                .id = doc_key,
+                .score = hit.distance,
+                .stored_data = stored_data,
+            });
+        }
+
+        const postprocess_start = monotonicTimeNs();
+        var profiled_result = try db.searchRuntimePostprocessVectorSearchResult(
+            alloc,
+            req,
+            .{
+                .alloc = alloc,
+                .hits = try hits.toOwnedSlice(alloc),
+                .total_hits = @intCast(hits.items.len),
+                .graph_results = &.{},
+            },
+            chunk_backed,
+        );
+        warm_dense_postprocess_ns += monotonicTimeNs() - postprocess_start;
+        warm_dense_total_ns += monotonicTimeNs() - total_start;
+        profiled_result.deinit();
+    }
+
+    var warm_db_total_ns: u64 = 0;
+    for (0..reps) |_| {
+        const start = monotonicTimeNs();
+        var result = try db.search(alloc, req);
+        warm_db_total_ns += monotonicTimeNs() - start;
+        result.deinit();
+    }
+
+    const cache_after = lsm_cache.snapshotStats();
+    const block_hits_after = cacheBlockHitsForBench(cache_after);
+    const index_hits_after = cache_after.run_table_index.hits;
+    const warm_db_overhead_total_ns = if (warm_db_total_ns > warm_dense_total_ns)
+        warm_db_total_ns - warm_dense_total_ns
+    else
+        0;
+
+    std.debug.print(
+        "dense_lsm_cache_profile docs={d} reps={d} cold_hbc_ms={d} cold_db_ms={d} warm_hbc_avg_ms={d} warm_db_avg_ms={d} warm_dense_total_avg_ms={d} warm_dense_index_lookup_avg_ms={d} warm_dense_hbc_search_avg_ms={d} warm_dense_doc_key_avg_ms={d} warm_dense_load_projected_avg_ms={d} warm_dense_postprocess_avg_ms={d} warm_db_overhead_avg_ms={d} warm_rerank_load_avg_ms={d} warm_rerank_avg_ms={d} avg_reranked={d} avg_inline_metadata_hits={d} avg_fetched_metadata_hits={d} avg_lookup_doc_key_hits={d} cache_index_hits_delta={d} cache_block_hits_delta={d}\n",
+        .{
+            doc_count,
+            reps,
+            @divTrunc(cold_hbc_ns, std.time.ns_per_ms),
+            @divTrunc(cold_db_ns, std.time.ns_per_ms),
+            @divTrunc(@divTrunc(warm_hbc_total_ns, reps), std.time.ns_per_ms),
+            @divTrunc(@divTrunc(warm_db_total_ns, reps), std.time.ns_per_ms),
+            @divTrunc(@divTrunc(warm_dense_total_ns, reps), std.time.ns_per_ms),
+            @divTrunc(@divTrunc(warm_dense_index_lookup_ns, reps), std.time.ns_per_ms),
+            @divTrunc(@divTrunc(warm_dense_hbc_search_ns, reps), std.time.ns_per_ms),
+            @divTrunc(@divTrunc(warm_dense_doc_key_resolve_ns, reps), std.time.ns_per_ms),
+            @divTrunc(@divTrunc(warm_dense_load_projected_ns, reps), std.time.ns_per_ms),
+            @divTrunc(@divTrunc(warm_dense_postprocess_ns, reps), std.time.ns_per_ms),
+            @divTrunc(@divTrunc(warm_db_overhead_total_ns, reps), std.time.ns_per_ms),
+            @divTrunc(@divTrunc(warm_hbc_rerank_load_ns, reps), std.time.ns_per_ms),
+            @divTrunc(@divTrunc(warm_hbc_rerank_ns, reps), std.time.ns_per_ms),
+            @divTrunc(warm_hbc_total_reranked, reps),
+            @divTrunc(warm_dense_inline_metadata_hits, reps),
+            @divTrunc(warm_dense_fetched_metadata_hits, reps),
+            @divTrunc(warm_dense_lookup_doc_key_hits, reps),
+            index_hits_after - index_hits_before,
+            block_hits_after - block_hits_before,
+        },
+    );
+
+    try std.testing.expectEqual(@as(u32, 100), cold_result.total_hits);
 }

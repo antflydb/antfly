@@ -1609,7 +1609,7 @@ pub const GeneratedSqlAst = union(enum) {
     prepared: GeneratedSqlPreparedAst,
     ddl: GeneratedSqlDdlAst,
     dml: GeneratedSqlDmlAst,
-    read: GeneratedSqlReadAst,
+    read: *GeneratedSqlReadAst,
     extension_index: GeneratedSqlDdlAst,
     graph: GeneratedSqlGraphAst,
     unsupported: GeneratedSqlUnsupportedAst,
@@ -1617,7 +1617,10 @@ pub const GeneratedSqlAst = union(enum) {
     pub fn deinit(self: *GeneratedSqlAst, alloc: std.mem.Allocator) void {
         switch (self.*) {
             .dml => |*dml| dml.deinit(alloc),
-            .read => |*read| read.deinit(alloc),
+            .read => |read| {
+                read.deinit(alloc);
+                alloc.destroy(read);
+            },
             else => {},
         }
         self.* = undefined;
@@ -1633,6 +1636,11 @@ pub const GeneratedSqlParseResult = struct {
         if (self.ast) |*ast| ast.deinit(alloc);
         self.* = undefined;
     }
+};
+
+pub const GeneratedSqlAstMode = enum {
+    full,
+    skip_read,
 };
 
 pub const GeneratedSqlDiagnostic = struct {
@@ -1976,6 +1984,14 @@ pub fn parseSqlAlloc(alloc: std.mem.Allocator, sql: []const u8) !GeneratedSqlPar
 }
 
 pub fn parseTokensAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token) !GeneratedSqlParseResult {
+    return parseTokensAllocWithAstMode(alloc, tokens, .full);
+}
+
+pub fn parseTokensAllocWithAstMode(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    ast_mode: GeneratedSqlAstMode,
+) !GeneratedSqlParseResult {
     const token_ids = try tokenIdsAlloc(alloc, tokens);
     defer alloc.free(token_ids);
     try generated.parse(alloc, token_ids);
@@ -1983,7 +1999,7 @@ pub fn parseTokensAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Toke
     return .{
         .kind = std.meta.activeTag(statement),
         .statement = statement,
-        .ast = try buildGeneratedAst(alloc, tokens, statement),
+        .ast = if (ast_mode == .skip_read and statement == .read) null else try buildGeneratedAst(alloc, tokens, statement),
     };
 }
 
@@ -1993,16 +2009,32 @@ pub fn parseFirstFamilyTokensAlloc(alloc: std.mem.Allocator, tokens: []const tok
 }
 
 pub fn parseGeneratedGateTokensAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token) !?GeneratedSqlParseResult {
-    return parseGeneratedGateTokensStrictAlloc(alloc, tokens) catch |err| switch (err) {
+    return try parseGeneratedGateTokensAllocWithAstMode(alloc, tokens, .full);
+}
+
+pub fn parseGeneratedGateTokensAllocWithAstMode(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    ast_mode: GeneratedSqlAstMode,
+) !?GeneratedSqlParseResult {
+    return parseGeneratedGateTokensStrictAllocWithAstMode(alloc, tokens, ast_mode) catch |err| switch (err) {
         error.UnsupportedSqlShape, error.UnexpectedToken => return null,
         else => return err,
     };
 }
 
 pub fn parseGeneratedGateTokensStrictAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token) !?GeneratedSqlParseResult {
+    return try parseGeneratedGateTokensStrictAllocWithAstMode(alloc, tokens, .full);
+}
+
+pub fn parseGeneratedGateTokensStrictAllocWithAstMode(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    ast_mode: GeneratedSqlAstMode,
+) !?GeneratedSqlParseResult {
     const kind = classifyTokens(tokens);
     if (kind == .other) return null;
-    return try parseTokensAlloc(alloc, tokens);
+    return try parseTokensAllocWithAstMode(alloc, tokens, ast_mode);
 }
 
 pub fn isFirstFamilyTokens(tokens: []const token_mod.Token) bool {
@@ -2642,7 +2674,12 @@ fn buildGeneratedAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, 
         .prepared => |kind| .{ .prepared = buildPreparedAst(tokens, end, kind, statement_span, command_span) },
         .ddl => |kind| .{ .ddl = buildDdlAst(tokens, end, kind, statement_span, command_span) },
         .dml => |kind| .{ .dml = try buildDmlAst(alloc, tokens, command_start, end, kind, statement_span, command_span) },
-        .read => |kind| .{ .read = try buildReadAst(alloc, tokens, end, kind, statement_span, command_span) },
+        .read => |kind| {
+            const read_ast = try alloc.create(GeneratedSqlReadAst);
+            errdefer alloc.destroy(read_ast);
+            try buildReadAstInPlace(alloc, tokens, end, kind, statement_span, command_span, read_ast);
+            return .{ .read = read_ast };
+        },
         .extension_index => |kind| .{ .extension_index = buildDdlAst(tokens, end, ddlKindFromExtensionIndexKind(kind), statement_span, command_span) },
         .graph => |kind| .{ .graph = .{
             .kind = kind,
@@ -3419,27 +3456,23 @@ fn buildDmlRelationSourceReadAst(
     };
 }
 
-fn buildReadAst(
+fn buildReadAstInPlace(
     alloc: std.mem.Allocator,
     tokens: []const token_mod.Token,
     end: usize,
     kind: GeneratedSqlReadKind,
     statement_span: token_mod.SourceSpan,
     command_span: token_mod.SourceSpan,
-) !GeneratedSqlReadAst {
-    const ast = try alloc.create(GeneratedSqlReadAst);
-    defer alloc.destroy(ast);
+    ast: *GeneratedSqlReadAst,
+) !void {
     ast.* = .{
         .kind = kind,
         .statement_span = statement_span,
         .command_span = command_span,
     };
-    var ast_moved = false;
-    errdefer if (!ast_moved) ast.deinit(alloc);
+    errdefer ast.deinit(alloc);
     const select_index = findTopLevelKeyword(tokens, 0, end, .select) orelse {
-        const result = ast.*;
-        ast_moved = true;
-        return result;
+        return;
     };
     if (select_index > 0 and tokens[0].matchesKeywordTag(.with)) {
         ast.cte_tokens = .{ .start = 1, .end = select_index };
@@ -3581,9 +3614,7 @@ fn buildReadAst(
         try buildGeneratedReadResultTailAst(alloc, tokens, set_operation_tokens.end, end, ast);
     }
 
-    const result = ast.*;
-    ast_moved = true;
-    return result;
+    return;
 }
 
 fn generatedSetOperationResultTailStart(

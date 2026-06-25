@@ -26375,7 +26375,7 @@ fn generatedReadAstForParsedSql(
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
-                .read => |*read| if (read.kind == expected_kind and read.cte_tokens == null and (expected_kind == .set_operation or read.set_operation_tokens == null)) read else null,
+                .read => |read| if (read.kind == expected_kind and read.cte_tokens == null and (expected_kind == .set_operation or read.set_operation_tokens == null)) read else null,
                 else => null,
             };
         }
@@ -26389,7 +26389,7 @@ fn generatedQueryPlanReadAstForParsedSql(
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
-                .read => |*read| if ((read.kind == .query or read.kind == .set_operation) and read.cte_tokens == null) read else null,
+                .read => |read| if ((read.kind == .query or read.kind == .set_operation) and read.cte_tokens == null) read else null,
                 else => null,
             };
         }
@@ -26403,7 +26403,7 @@ fn generatedCteReadAstForParsedSql(
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             return switch (generated_ast.*) {
-                .read => |*read| if (read.kind == .cte and read.cte_tokens != null) read else null,
+                .read => |read| if (read.kind == .cte and read.cte_tokens != null) read else null,
                 else => null,
             };
         }
@@ -26830,7 +26830,7 @@ test "sql adapter lower expr lowers recursive cte stream contract" {
     defer malformed_generated_anchor.deinit(alloc);
     if (malformed_generated_anchor.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
-            .read => |*read| {
+            .read => |read| {
                 if (read.cte_items.len == 0) return error.TestUnexpectedResult;
                 const first_projection = read.cte_items[0].body_projection_items.expression_items[0];
                 read.cte_items[0].body_where_expression.tokens = first_projection;
@@ -30095,7 +30095,7 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms" {
     if (malformed_generated_pagination.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| read.limit_tokens = .{ .start = 3, .end = 4 },
+                .read => |read| read.limit_tokens = .{ .start = 3, .end = 4 },
                 else => return error.TestUnexpectedResult,
             }
         } else return error.TestUnexpectedResult;
@@ -30127,7 +30127,7 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms" {
     if (malformed_generated_simple_set_tail.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| read.limit_tokens = .{ .start = 3, .end = 4 },
+                .read => |read| read.limit_tokens = .{ .start = 3, .end = 4 },
                 else => return error.TestUnexpectedResult,
             }
         } else return error.TestUnexpectedResult;
@@ -30148,7 +30148,7 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms" {
     if (malformed_generated_set_operation_pagination.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| read.limit_tokens = .{ .start = 3, .end = 4 },
+                .read => |read| read.limit_tokens = .{ .start = 3, .end = 4 },
                 else => return error.TestUnexpectedResult,
             }
         } else return error.TestUnexpectedResult;
@@ -30179,7 +30179,7 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms" {
     if (malformed_generated_aggregate_pagination.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| read.limit_tokens = .{ .start = 13, .end = 14 },
+                .read => |read| read.limit_tokens = .{ .start = 13, .end = 14 },
                 else => return error.TestUnexpectedResult,
             }
         } else return error.TestUnexpectedResult;
@@ -30209,7 +30209,7 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms" {
     if (malformed_generated_window_pagination.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| read.limit_tokens = .{ .start = 3, .end = 4 },
+                .read => |read| read.limit_tokens = .{ .start = 3, .end = 4 },
                 else => return error.TestUnexpectedResult,
             }
         } else return error.TestUnexpectedResult;
@@ -30226,7 +30226,7 @@ fn corruptGeneratedReadFirstOrderExpressionItem(parsed_sql: *tokenized.ParsedSql
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| {
+                .read => |read| {
                     if (read.order_items.items.len == 0 or read.order_items.expression_items.len == 0) return error.TestUnexpectedResult;
                     read.order_items.expression_items[0] = read.order_items.items[0];
                     return;
@@ -30242,7 +30242,7 @@ fn corruptGeneratedReadFirstGroupExpressionItem(parsed_sql: *tokenized.ParsedSql
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| {
+                .read => |read| {
                     if (read.group_items.items.len == 0 or read.group_items.expression_items.len == 0 or read.projection_items.items.len == 0) return error.TestUnexpectedResult;
                     read.group_items.expression_items[0] = read.projection_items.items[0];
                     return;
@@ -30258,7 +30258,7 @@ fn corruptGeneratedReadHavingExpressionRange(parsed_sql: *tokenized.ParsedSql) !
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| {
+                .read => |read| {
                     const group_tokens = read.group_tokens orelse return error.TestUnexpectedResult;
                     if (read.having_tokens == null or read.having_expression.tokens == null) return error.TestUnexpectedResult;
                     read.having_expression.tokens = group_tokens;
@@ -30275,7 +30275,7 @@ fn corruptGeneratedReadWhereExpressionRange(parsed_sql: *tokenized.ParsedSql) !v
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| {
+                .read => |read| {
                     if (read.where_tokens == null or read.where_expression.tokens == null or read.projection_items.items.len == 0) return error.TestUnexpectedResult;
                     read.where_expression.tokens = read.projection_items.items[0];
                     return;
@@ -30291,7 +30291,7 @@ fn corruptGeneratedReadWhereQuantifierRange(parsed_sql: *tokenized.ParsedSql) !v
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| {
+                .read => |read| {
                     if (read.where_expression.quantifier_tokens == null or read.source_tokens == null) return error.TestUnexpectedResult;
                     read.where_expression.quantifier_tokens = read.source_tokens;
                     return;
@@ -30307,7 +30307,7 @@ fn corruptGeneratedReadJoinSummaryOperatorRange(parsed_sql: *tokenized.ParsedSql
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| {
+                .read => |read| {
                     const source_tokens = read.source_tokens orelse return error.TestUnexpectedResult;
                     if (read.join_operator_tokens == null) return error.TestUnexpectedResult;
                     read.join_operator_tokens = source_tokens;
@@ -30324,7 +30324,7 @@ fn corruptGeneratedReadFirstJoinPredicateExpressionRange(parsed_sql: *tokenized.
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| {
+                .read => |read| {
                     const source_tokens = read.source_tokens orelse return error.TestUnexpectedResult;
                     if (read.join_items.len == 0 or read.join_items[0].predicate_expression.tokens == null) return error.TestUnexpectedResult;
                     read.join_items[0].predicate_expression.tokens = source_tokens;
@@ -30341,7 +30341,7 @@ fn corruptGeneratedReadFirstProjectionExpressionItem(parsed_sql: *tokenized.Pars
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| {
+                .read => |read| {
                     if (read.projection_items.items.len == 0 or read.projection_items.expression_items.len == 0 or read.group_items.items.len == 0) return error.TestUnexpectedResult;
                     read.projection_items.expression_items[0] = read.group_items.items[0];
                     return;
@@ -30357,7 +30357,7 @@ fn corruptGeneratedReadFirstProjectionOrphanChildKind(parsed_sql: *tokenized.Par
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| {
+                .read => |read| {
                     if (read.projection_items.expressions.len == 0) return error.TestUnexpectedResult;
                     if (read.projection_items.expressions[0].left_tokens != null or read.projection_items.expressions[0].left_expression != null) return error.TestUnexpectedResult;
                     read.projection_items.expressions[0].left_expression_kind = .token_range;
@@ -30374,7 +30374,7 @@ fn corruptGeneratedReadFirstProjectionCastChildExpressionRange(parsed_sql: *toke
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| {
+                .read => |read| {
                     const source_tokens = read.source_tokens orelse return error.TestUnexpectedResult;
                     for (read.projection_items.expressions) |*expression| {
                         if (expression.cast_expression) |child| {
@@ -30396,7 +30396,7 @@ fn corruptGeneratedReadFirstProjectionFunctionArgumentExpressionRange(parsed_sql
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| {
+                .read => |read| {
                     const source_tokens = read.source_tokens orelse return error.TestUnexpectedResult;
                     for (read.projection_items.expressions) |*expression| {
                         if (expression.argument_items.expressions.len == 0) continue;
@@ -30460,7 +30460,7 @@ fn corruptGeneratedReadWhereSubqueryTailLimitExpressionRange(parsed_sql: *tokeni
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| {
+                .read => |read| {
                     const source_tokens = read.source_tokens orelse return error.TestUnexpectedResult;
                     if (corruptGeneratedSubqueryTailLimitExpressionRange(&read.where_expression, source_tokens)) return;
                     return error.TestUnexpectedResult;
@@ -30476,7 +30476,7 @@ fn corruptGeneratedReadSourceRange(parsed_sql: *tokenized.ParsedSql) !void {
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| {
+                .read => |read| {
                     if (read.source_tokens == null or read.projection_items.items.len == 0) return error.TestUnexpectedResult;
                     read.source_tokens = read.projection_items.items[0];
                     return;
@@ -30492,7 +30492,7 @@ fn corruptGeneratedReadWindowRangeToProjection(parsed_sql: *tokenized.ParsedSql)
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| {
+                .read => |read| {
                     if (read.window_tokens == null) return error.TestUnexpectedResult;
                     read.window_tokens = read.projection_tokens orelse return error.TestUnexpectedResult;
                     return;
@@ -30508,7 +30508,7 @@ fn corruptGeneratedReadFirstWindowOrderExpressionItem(parsed_sql: *tokenized.Par
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| {
+                .read => |read| {
                     if (read.window_items.len == 0 or read.window_items[0].order_items.items.len == 0 or read.window_items[0].order_items.expression_items.len == 0 or read.projection_items.items.len == 0) return error.TestUnexpectedResult;
                     read.window_items[0].order_items.expression_items[0] = read.projection_items.items[0];
                     return;
@@ -30524,7 +30524,7 @@ fn corruptGeneratedReadFirstProjectionWindowOverRange(parsed_sql: *tokenized.Par
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| {
+                .read => |read| {
                     if (read.source_tokens == null) return error.TestUnexpectedResult;
                     for (read.projection_items.expressions) |*expression| {
                         if (expression.over_tokens != null) {
@@ -30545,7 +30545,7 @@ fn corruptGeneratedReadFirstProjectionWindowOrderExpressionItem(parsed_sql: *tok
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| {
+                .read => |read| {
                     if (read.projection_items.items.len == 0) return error.TestUnexpectedResult;
                     for (read.projection_items.expressions) |*expression| {
                         if (expression.over_order_items.items.len == 0 or expression.over_order_items.expression_items.len == 0) continue;
@@ -30565,7 +30565,7 @@ fn corruptGeneratedReadFirstProjectionFunctionArgumentRange(parsed_sql: *tokeniz
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| {
+                .read => |read| {
                     const source_tokens = read.source_tokens orelse return error.TestUnexpectedResult;
                     for (read.projection_items.expressions) |*expression| {
                         if (expression.argument_tokens != null) {
@@ -30586,7 +30586,7 @@ fn corruptGeneratedReadFirstProjectionFunctionFilterRange(parsed_sql: *tokenized
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| {
+                .read => |read| {
                     const source_tokens = read.source_tokens orelse return error.TestUnexpectedResult;
                     for (read.projection_items.expressions) |*expression| {
                         if (expression.filter_tokens != null) {
@@ -30607,7 +30607,7 @@ fn corruptGeneratedReadFirstProjectionFunctionWithinGroupOrderExpressionItem(par
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| {
+                .read => |read| {
                     if (read.projection_items.items.len == 0) return error.TestUnexpectedResult;
                     for (read.projection_items.expressions) |*expression| {
                         if (expression.within_group_order_items.items.len == 0 or expression.within_group_order_items.expression_items.len == 0) continue;
@@ -30627,7 +30627,7 @@ fn corruptGeneratedReadDistinctRangeToProjection(parsed_sql: *tokenized.ParsedSq
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| {
+                .read => |read| {
                     read.distinct_tokens = read.projection_tokens orelse return error.TestUnexpectedResult;
                     return;
                 },
@@ -30642,7 +30642,7 @@ fn corruptGeneratedReadFirstDistinctOnExpressionItem(parsed_sql: *tokenized.Pars
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| {
+                .read => |read| {
                     if (read.distinct_on_items.items.len == 0 or read.distinct_on_items.expression_items.len == 0 or read.projection_items.items.len == 0) return error.TestUnexpectedResult;
                     read.distinct_on_items.expression_items[0] = read.projection_items.items[0];
                     return;
@@ -36230,7 +36230,7 @@ test "sql adapter lower expr lowers non recursive cte query plans" {
     if (malformed_final_set_operation.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read_ast| read_ast.set_operation.right_projection_tokens = .{ .start = 0, .end = 1 },
+                .read => |read_ast| read_ast.set_operation.right_projection_tokens = .{ .start = 0, .end = 1 },
                 else => return error.TestUnexpectedResult,
             }
         } else return error.TestUnexpectedResult;
@@ -36322,7 +36322,7 @@ test "sql adapter lower expr lowers non recursive cte query plans" {
     defer malformed_generated_cte_pagination.deinit(alloc);
     if (malformed_generated_cte_pagination.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
-            .read => |*read| read.limit_tokens = .{ .start = 3, .end = 4 },
+            .read => |read| read.limit_tokens = .{ .start = 3, .end = 4 },
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
@@ -36341,7 +36341,7 @@ test "sql adapter lower expr lowers non recursive cte query plans" {
     defer malformed_generated_cte_body_pagination.deinit(alloc);
     if (malformed_generated_cte_body_pagination.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
-            .read => |*read| {
+            .read => |read| {
                 if (read.cte_items.len == 0) return error.TestUnexpectedResult;
                 read.cte_items[0].body_limit_expression.tokens = read.cte_items[0].body_projection_items.expression_items[0];
             },
@@ -36457,7 +36457,7 @@ test "sql adapter lower expr lowers equality join queries" {
     defer malformed_generated_join.deinit(alloc);
     if (malformed_generated_join.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
-            .read => |*read| read.join_tree_depth = 2,
+            .read => |read| read.join_tree_depth = 2,
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
@@ -36919,7 +36919,7 @@ test "sql adapter lower expr lowers bounded left join lateral queries" {
     defer malformed_generated_lateral_join.deinit(alloc);
     if (malformed_generated_lateral_join.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
-            .read => |*read| read.join_tree_depth = 2,
+            .read => |read| read.join_tree_depth = 2,
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
@@ -36943,7 +36943,7 @@ test "sql adapter lower expr lowers bounded left join lateral queries" {
     defer malformed_generated_lateral_pagination.deinit(alloc);
     if (malformed_generated_lateral_pagination.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
-            .read => |*read| read.limit_tokens = .{ .start = 3, .end = 4 },
+            .read => |read| read.limit_tokens = .{ .start = 3, .end = 4 },
             else => return error.TestUnexpectedResult,
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;

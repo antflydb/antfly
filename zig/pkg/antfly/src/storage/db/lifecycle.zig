@@ -6417,3 +6417,107 @@ test "db lifecycle group created-at metadata is written once and readable" {
     try std.testing.expectEqual(@as(u64, 1234), (try db.getGroupCreatedAtMillis(alloc, 42)).?);
     try std.testing.expectEqual(@as(u64, 1234), try db.ensureGroupCreatedAtMillis(alloc, 42, 5678));
 }
+
+test "db lifecycle rw lock allows search and scan while shared read lock is held" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const SharedReadLockHold = db_test_support.SharedReadLockHold(DB);
+    const ConcurrentReadProbe = db_test_support.ConcurrentReadProbe(DB);
+    const alloc = std.heap.c_allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"field\":\"title\"}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" },
+        },
+        .sync_level = .full_text,
+    });
+
+    var held = SharedReadLockHold{ .db = &db };
+    const held_thread = try std.Thread.spawn(.{}, SharedReadLockHold.run, .{&held});
+    try std.testing.expect(db_internal.waitForAtomicU8(&held.acquired, 1, 10_000));
+
+    var search_probe = ConcurrentReadProbe{ .db = &db };
+    const search_thread = try std.Thread.spawn(.{}, ConcurrentReadProbe.runSearch, .{&search_probe});
+
+    try std.testing.expect(db_internal.waitForAtomicU8(&search_probe.started, 1, 10_000));
+    try std.testing.expect(db_internal.waitForAtomicU8(&search_probe.done, 1, 10_000));
+    try std.testing.expectEqual(@as(u8, 0), search_probe.failed.load(.monotonic));
+    search_thread.join();
+
+    var scan_probe = ConcurrentReadProbe{ .db = &db };
+    const scan_thread = try std.Thread.spawn(.{}, ConcurrentReadProbe.runScan, .{&scan_probe});
+    try std.testing.expect(db_internal.waitForAtomicU8(&scan_probe.started, 1, 10_000));
+    try std.testing.expect(db_internal.waitForAtomicU8(&scan_probe.done, 1, 10_000));
+    try std.testing.expectEqual(@as(u8, 0), scan_probe.failed.load(.monotonic));
+    scan_thread.join();
+
+    held.release.store(1, .monotonic);
+    held_thread.join();
+}
+
+test "db lifecycle rw lock keeps batch writes blocked behind shared read lock" {
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const SharedReadLockHold = db_test_support.SharedReadLockHold(DB);
+    const ConcurrentWriteProbe = db_test_support.ConcurrentWriteProbe(DB);
+    const alloc = std.heap.c_allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" },
+        },
+    });
+
+    var held = SharedReadLockHold{ .db = &db };
+    const held_thread = try std.Thread.spawn(.{}, SharedReadLockHold.run, .{&held});
+    try std.testing.expect(db_internal.waitForAtomicU8(&held.acquired, 1, 10_000));
+
+    var write_probe = ConcurrentWriteProbe{ .db = &db };
+    const write_thread = try std.Thread.spawn(.{}, ConcurrentWriteProbe.runBatch, .{&write_probe});
+
+    try std.testing.expect(db_internal.waitForAtomicU8(&write_probe.started, 1, 10_000));
+
+    var still_blocked = true;
+    var attempts: usize = 0;
+    while (attempts < 10_000) : (attempts += 1) {
+        if (write_probe.done.load(.monotonic) != 0 or write_probe.failed.load(.monotonic) != 0) {
+            still_blocked = false;
+            break;
+        }
+        db_internal.spinOrYield();
+    }
+    try std.testing.expect(still_blocked);
+
+    held.release.store(1, .monotonic);
+    held_thread.join();
+    write_thread.join();
+    try std.testing.expectEqual(@as(u8, 0), write_probe.failed.load(.monotonic));
+    try std.testing.expectEqual(@as(u8, 1), write_probe.done.load(.monotonic));
+
+    const doc = (try db.get(alloc, "doc:b")) orelse return error.TestExpectedEqual;
+    defer alloc.free(doc);
+    try std.testing.expectEqualStrings("{\"title\":\"bravo\"}", doc);
+}

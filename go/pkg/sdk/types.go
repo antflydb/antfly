@@ -36,6 +36,20 @@ type (
 	IndexStatus        = oapi.IndexStatus
 	IndexType          = oapi.IndexType
 
+	// Artifact types
+	DocumentArtifactChildRange               = oapi.DocumentArtifactChildRange
+	DocumentArtifactManifest                 = oapi.DocumentArtifactManifest
+	DocumentArtifactManifestList             = oapi.DocumentArtifactManifestList
+	DocumentArtifactReprocessFailure         = oapi.DocumentArtifactReprocessFailure
+	DocumentArtifactReprocessJob             = oapi.DocumentArtifactReprocessJob
+	DocumentArtifactReprocessJobPhase        = oapi.DocumentArtifactReprocessJobPhase
+	DocumentArtifactReprocessJobStartRequest = oapi.DocumentArtifactReprocessJobStartRequest
+	DocumentArtifactReprocessResponse        = oapi.DocumentArtifactReprocessResponse
+	DocumentArtifactReprocessShardCursor     = oapi.DocumentArtifactReprocessShardCursor
+	DocumentArtifactTableReprocessRequest    = oapi.DocumentArtifactTableReprocessRequest
+	DocumentArtifactTableReprocessResponse   = oapi.DocumentArtifactTableReprocessResponse
+	TableArtifactEnrichmentList              = oapi.TableArtifactEnrichmentList
+
 	// Index config types
 	EmbeddingsIndexConfig = oapi.EmbeddingsIndexConfig
 	DistanceMetric        = oapi.DistanceMetric

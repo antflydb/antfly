@@ -892,6 +892,8 @@ fn parseStatement(
                     if (classified_kind != kind) return .{ .unknown = raw_statement };
                 }
                 return .{ .read = .{ .kind = kind, .raw = raw_statement } };
+            } else if (tokenized_sql.read_statement_kind) |classified_kind| {
+                return .{ .read = .{ .kind = classified_kind, .raw = raw_statement } };
             } else return .{ .unknown = raw_statement },
             .graph => return .{ .ddl = .{ .raw = raw_statement } },
             .unsupported => |kind| {
@@ -1185,7 +1187,7 @@ fn generatedReadStatementKind(
 
 fn generatedReadAstHasValidClassificationPayload(
     tokens: []const Token,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
 ) bool {
     const end = generatedReadStatementEnd(tokens, read_ast.statement_span) orelse return false;
     const select_index = generatedReadSelectIndex(tokens, end, read_ast) orelse return false;
@@ -1260,7 +1262,7 @@ fn generatedReadStatementEnd(tokens: []const Token, statement_span: SourceSpan) 
 fn generatedReadSelectIndex(
     tokens: []const Token,
     end: usize,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
 ) ?usize {
     if (end == 0 or end > tokens.len) return null;
     if (read_ast.cte_tokens) |cte_tokens| {
@@ -1280,7 +1282,7 @@ fn generatedReadCtePayloadIsValid(
     tokens: []const Token,
     end: usize,
     select_index: usize,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
 ) bool {
     if (read_ast.cte_tokens == null) {
         return read_ast.cte_list_tokens == null and
@@ -1440,7 +1442,7 @@ fn generatedReadOffsetExpressionTokensMatchRange(
 
 fn generatedCteReadStatementKind(
     tokens: []const Token,
-    read_ast: generated_parser.GeneratedSqlReadAst,
+    read_ast: *const generated_parser.GeneratedSqlReadAst,
 ) ?classifier.SqlReadStatementKind {
     if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return null;
     if (read_ast.cte_recursive) return .recursive_cte;
@@ -4562,7 +4564,7 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
     var malformed_offset_generated = generated_offset_query.generated_statement.?;
     if (malformed_offset_generated.ast) |*generated_ast| {
         switch (generated_ast.*) {
-            .read => |*read_ast| read_ast.offset_expression.tokens = read_ast.offset_tokens.?,
+            .read => |read_ast| read_ast.offset_expression.tokens = read_ast.offset_tokens.?,
             else => return error.TestUnexpectedResult,
         }
     } else {
@@ -4575,7 +4577,7 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
     var malformed_command_span = generated_query.generated_statement.?;
     if (malformed_command_span.ast) |*generated_ast| {
         switch (generated_ast.*) {
-            .read => |*read_ast| read_ast.command_span = .{ .start = read_ast.command_span.start + 1, .end = read_ast.command_span.end },
+            .read => |read_ast| read_ast.command_span = .{ .start = read_ast.command_span.start + 1, .end = read_ast.command_span.end },
             else => return error.TestUnexpectedResult,
         }
     } else {
@@ -4593,7 +4595,7 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
     var malformed_generated = generated_cte.generated_statement.?;
     if (malformed_generated.ast) |*generated_ast| {
         switch (generated_ast.*) {
-            .read => |*read_ast| read_ast.projection_tokens = null,
+            .read => |read_ast| read_ast.projection_tokens = null,
             else => return error.TestUnexpectedResult,
         }
     } else {
@@ -4606,7 +4608,7 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
     var malformed_cte_count = generated_cte.generated_statement.?;
     if (malformed_cte_count.ast) |*generated_ast| {
         switch (generated_ast.*) {
-            .read => |*read_ast| read_ast.cte_count += 1,
+            .read => |read_ast| read_ast.cte_count += 1,
             else => return error.TestUnexpectedResult,
         }
     } else {

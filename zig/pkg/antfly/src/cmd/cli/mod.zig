@@ -22,6 +22,7 @@ pub const database_cmd = @import("database.zig");
 pub const namespace_cmd = @import("namespace.zig");
 pub const tablespace = @import("tablespace.zig");
 pub const index = @import("index.zig");
+pub const artifact = @import("artifact.zig");
 pub const query = @import("query.zig");
 pub const sql = @import("sql.zig");
 pub const data = @import("data.zig");
@@ -118,6 +119,22 @@ pub fn writeJson(allocator: std.mem.Allocator, io: std.Io, value: anytype) !void
     writeStdout(io, "\n");
 }
 
+pub fn printResponse(allocator: std.mem.Allocator, io: std.Io, resp: anytype) !void {
+    if (resp.data) |parsed| {
+        try writeJson(allocator, io, parsed.value);
+        return;
+    }
+    expectHttpSuccess(resp);
+    try writeJson(allocator, io, .{ .status = resp.status_code });
+}
+
+pub fn expectHttpSuccess(resp: anytype) void {
+    if (resp.status_code >= 400) {
+        if (resp.err_body) |body| fatal("request failed with HTTP {d}: {s}", .{ resp.status_code, body });
+        fatal("request failed with HTTP {d}", .{resp.status_code});
+    }
+}
+
 pub fn writeStdout(io: std.Io, bytes: []const u8) void {
     std.Io.File.stdout().writeStreamingAll(io, bytes) catch {};
 }
@@ -151,6 +168,7 @@ test "cli mod compiles" {
     _ = namespace_cmd;
     _ = tablespace;
     _ = index;
+    _ = artifact;
     _ = query;
     _ = sql;
     _ = data;

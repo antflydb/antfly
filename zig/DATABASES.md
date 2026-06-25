@@ -267,6 +267,22 @@ Explicit catalog routes are public API when they are present in OpenAPI:
 /db/v1/tablespaces/{tablespace}
 ```
 
+Generated artifact operations currently use the shorthand table route and
+resolve through the same `default.public.{table}` rule:
+
+```text
+/db/v1/tables/{table}/artifacts
+/db/v1/tables/{table}/artifacts/{artifact}/enrichment
+/db/v1/tables/{table}/artifacts/{artifact}/reprocess
+/db/v1/tables/{table}/artifacts/{artifact}/reprocess-jobs
+/db/v1/tables/{table}/artifacts/{artifact}/reprocess-jobs/{job}
+/db/v1/tables/{table}/artifacts/{artifact}/reprocess-jobs/{job}/advance
+/db/v1/tables/{table}/artifacts/{artifact}/reprocess-jobs/{job}/cancel
+/db/v1/tables/{table}/documents/{key}/artifacts
+/db/v1/tables/{table}/documents/{key}/artifacts/{artifact}
+/db/v1/tables/{table}/documents/{key}/artifacts/{artifact}/reprocess
+```
+
 The generated API types should expose `database` and `namespace` as structured
 fields where possible. When an older endpoint only has `{table}`, the server
 must resolve that table through the same defaulting rule before planning,
@@ -504,7 +520,8 @@ Completed baseline:
 Transitional bridge:
 
 1. Public explicit catalog table I/O routes (`query`, `batch`, `rows/batch`,
-   `documents/{key}`, `indexes`, `backup`, and `restore`) resolve typed catalog
+   `documents/{key}`, `indexes`, generated artifact inspection/reprocessing,
+   `backup`, and `restore`) resolve typed catalog
    targets first, then use catalog-aware read/write vtable methods. The current
    implementation still uses compatibility storage names where a backend entry
    point only accepts one table string; the bridge must disappear once those

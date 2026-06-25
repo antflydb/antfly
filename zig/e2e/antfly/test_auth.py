@@ -346,7 +346,7 @@ def test_swarm_auth_api_keys_follow_owner_permissions(auth_api: AuthApi):
                     "body": "world",
                 }
             },
-            "sync_level": "write",
+            "sync_level": "full_index",
         },
     )
 
@@ -467,7 +467,7 @@ def test_swarm_auth_enforces_row_filters_on_lookup_and_scan(auth_api: AuthApi):
                     "tier": "silver",
                 },
             },
-            "sync_level": "write",
+            "sync_level": "full_index",
         },
     )
     auth_api.post(
@@ -535,7 +535,7 @@ def test_stateful_auth_enforces_table_permissions(stateful_auth_api: AuthApi):
                     "body": "world",
                 }
             },
-            "sync_level": "write",
+            "sync_level": "full_index",
         },
     )
     stateful_auth_api.post(
@@ -589,7 +589,7 @@ def test_stateful_auth_enforces_row_filters_on_lookup_and_scan(stateful_auth_api
                     "tier": "silver",
                 },
             },
-            "sync_level": "write",
+            "sync_level": "full_index",
         },
     )
 

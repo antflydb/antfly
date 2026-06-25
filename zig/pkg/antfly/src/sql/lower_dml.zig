@@ -14067,7 +14067,7 @@ test "sql adapter lower dml validates generated child read payloads" {
     if (parsed.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read| read.projection_tokens = read.source_tokens,
+                .read => |read| read.projection_tokens = read.source_tokens,
                 else => return error.TestUnexpectedResult,
             }
         } else return error.TestUnexpectedResult;
