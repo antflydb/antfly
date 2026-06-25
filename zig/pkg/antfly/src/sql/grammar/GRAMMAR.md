@@ -306,16 +306,18 @@ or command keywords are corrupted. Legacy-supported row-security policy catalog
 operations use the same validated generated unsupported boundary for
 `CREATE POLICY`, `ALTER POLICY`, and `DROP POLICY`, including routine-backed
 policy predicates that require parser-context function bindings, before
-delegating to the typed row-security catalog planner.
+delegating to the typed row-security catalog planner. Notification channel
+commands also use the validated unsupported boundary for `LISTEN`, `NOTIFY`,
+and `UNLISTEN` before delegating to typed notification catalog planning.
 Generated unsupported nodes now also participate in the parsed statement
 boundary: generated-covered unsupported heads that are not intentionally
 supported by the existing catalog planner become terminal parsed unsupported
 statements and fail closed before legacy DDL probing. Generated unsupported
 heads that already have legacy catalog/runtime support, such as `EXPLAIN`,
 `COPY`, remaining materialized-view catalog variants such as
-`ALTER MATERIALIZED VIEW`, notification commands, maintenance commands, and
-cursor/savepoint catalog commands, stay on an explicit compatibility allowlist
-until their generated AST-to-plan implementations are promoted.
+`ALTER MATERIALIZED VIEW`, maintenance commands, and cursor/savepoint catalog
+commands, stay on an explicit compatibility allowlist until their generated
+AST-to-plan implementations are promoted.
 
 ## Compatibility Policy
 

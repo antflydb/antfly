@@ -8898,6 +8898,7 @@ pub fn relationalIndexLifecycleName(lifecycle: runtime_schema.RelationalIndexLif
 
 const GeneratedUnsupportedCatalogBoundaryFamily = enum {
     materialized_view,
+    notification,
     row_policy,
 };
 
@@ -8912,6 +8913,7 @@ fn generatedUnsupportedCatalogBoundary(
     return switch (statement) {
         .unsupported => |kind| switch (kind) {
             .create_materialized_view, .drop_materialized_view, .refresh => .{ .family = .materialized_view, .kind = kind },
+            .listen, .notify, .unlisten => .{ .family = .notification, .kind = kind },
             .create_policy, .alter_policy, .drop_policy => .{ .family = .row_policy, .kind = kind },
             else => null,
         },
@@ -9016,6 +9018,24 @@ fn validateGeneratedUnsupportedCatalogAst(
             },
             else => return error.UnsupportedSqlShape,
         },
+        .notification => switch (boundary.kind) {
+            .listen => {
+                if (end < 1 or !tokens[0].matchesKeyword("listen")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            .notify => {
+                if (end < 1 or !tokens[0].matchesKeyword("notify")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            .unlisten => {
+                if (end < 1 or !tokens[0].matchesKeyword("unlisten")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            else => return error.UnsupportedSqlShape,
+        },
         .row_policy => switch (boundary.kind) {
             .create_policy => {
                 if (end < 2 or !tokens[0].matchesKeyword("create") or !tokens[1].matchesKeyword("policy")) {
@@ -9075,6 +9095,30 @@ fn catalogDdlPlanFromGeneratedUnsupportedAstAlloc(
             .refresh => switch (plan) {
                 .materialized_view_catalog => |catalog| switch (catalog) {
                     .refresh => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        .notification => switch (boundary.kind) {
+            .listen => switch (plan) {
+                .notification_channel => |catalog| switch (catalog) {
+                    .listen => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            .notify => switch (plan) {
+                .notification_channel => |catalog| switch (catalog) {
+                    .notify => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            .unlisten => switch (plan) {
+                .notification_channel => |catalog| switch (catalog) {
+                    .unlisten => {},
                     else => return error.UnsupportedSqlShape,
                 },
                 else => return error.UnsupportedSqlShape,
@@ -14379,6 +14423,91 @@ test "sql adapter generated row policy unsupported AST lowers to catalog plans" 
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
                 .unsupported => |*unsupported| unsupported.subject_tokens = .{ .start = 2, .end = malformed_subject.items().len },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_subject));
+}
+
+test "sql adapter generated notification unsupported AST lowers to catalog plans" {
+    const alloc = std.testing.allocator;
+
+    var listen_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "LISTEN usage_events;",
+    );
+    defer listen_sql.deinit(alloc);
+    var listen_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &listen_sql);
+    defer listen_plan.deinit(alloc);
+    switch (listen_plan) {
+        .notification_channel => |catalog| switch (catalog) {
+            .listen => |listen| try std.testing.expectEqualStrings("usage_events", listen.channel_name),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var notify_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "NOTIFY usage_events, 'updated';",
+    );
+    defer notify_sql.deinit(alloc);
+    var notify_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &notify_sql);
+    defer notify_plan.deinit(alloc);
+    switch (notify_plan) {
+        .notification_channel => |catalog| switch (catalog) {
+            .notify => |notify| {
+                try std.testing.expectEqualStrings("usage_events", notify.channel_name);
+                try std.testing.expectEqualStrings("\"updated\"", notify.payload_json orelse return error.TestUnexpectedResult);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var unlisten_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UNLISTEN *;",
+    );
+    defer unlisten_sql.deinit(alloc);
+    var unlisten_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &unlisten_sql);
+    defer unlisten_plan.deinit(alloc);
+    switch (unlisten_plan) {
+        .notification_channel => |catalog| switch (catalog) {
+            .unlisten => |unlisten| {
+                try std.testing.expect(unlisten.all);
+                try std.testing.expect(unlisten.channel_name == null);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var malformed_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "NOTIFY usage_events;",
+    );
+    defer malformed_kind.deinit(alloc);
+    if (malformed_kind.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.kind = .listen,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_kind));
+
+    var malformed_subject = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UNLISTEN usage_events;",
+    );
+    defer malformed_subject.deinit(alloc);
+    if (malformed_subject.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.subject_tokens = .{ .start = 0, .end = malformed_subject.items().len },
                 else => return error.TestUnexpectedResult,
             }
         } else return error.TestUnexpectedResult;
