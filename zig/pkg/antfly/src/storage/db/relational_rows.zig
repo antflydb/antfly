@@ -13512,3 +13512,408 @@ test "db relational rows check concatenation preserves expression metadata" {
     try std.testing.expectEqualStrings("tenant_id", combined[1].field);
     try std.testing.expect(combined[1].expression == null);
 }
+
+test "relational rows query uses indexed candidates and authoritative base rows" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index":false},"created_at":{"type":"numeric"}},"required":["id","status","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"open\",\"amount\":12,\"created_at\":20}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"status\":\"open\",\"amount\":3,\"created_at\":40}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"status\":\"closed\",\"amount\":99,\"created_at\":50}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"status\":\"open\",\"amount\":25,\"created_at\":10}" },
+        },
+        .sync_level = .write,
+    });
+
+    const status_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "status", "row:a");
+    defer alloc.free(status_index_key);
+    const status_index_value = try db.core.store.get(alloc, status_index_key);
+    defer alloc.free(status_index_value);
+
+    const amount_index_key = try internal_keys.relationalColumnIndexKeyAlloc(alloc, "amount", "row:a");
+    defer alloc.free(amount_index_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, amount_index_key));
+
+    const predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "status", .op = .eq, .value_json = "\"open\"" },
+        .{ .name = "", .field = "amount", .op = .gt, .value_json = "10" },
+    };
+    const select = [_][]const u8{ "id", "created_at" };
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "created_at",
+        .direction = .desc,
+    }};
+    var result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+        .limit = 10,
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 2), result.total);
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"created_at\":20}", result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"d\",\"created_at\":10}", result.rows[1]);
+
+    const distinct_on = [_][]const u8{"status"};
+    const distinct_order = [_]types.RelationalRowsQueryOrder{
+        .{ .field = "status", .direction = .asc },
+        .{ .field = "created_at", .direction = .desc },
+    };
+    const distinct_select = [_][]const u8{ "status", "id", "created_at" };
+    var distinct = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .select = distinct_select[0..],
+        .select_all = false,
+        .distinct_on = distinct_on[0..],
+        .order_by = distinct_order[0..],
+        .limit = 10,
+    });
+    defer distinct.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), distinct.total);
+    try std.testing.expectEqual(@as(usize, 2), distinct.rows.len);
+    try std.testing.expectEqualStrings("{\"status\":\"closed\",\"id\":\"c\",\"created_at\":50}", distinct.rows[0]);
+    try std.testing.expectEqualStrings("{\"status\":\"open\",\"id\":\"b\",\"created_at\":40}", distinct.rows[1]);
+
+    const in_predicates = [_]types.RelationalRowsInPredicate{.{
+        .field = "status",
+        .values_json = "[\"closed\"]",
+    }};
+    var in_set = (try db.resolveRelationalRowsQueryCandidateSetAlloc(alloc, runtime_schema, .{
+        .in_predicates = in_predicates[0..],
+    }, null)) orelse return error.TestExpectedEqual;
+    defer in_set.deinit(alloc);
+    const in_ids = (try db.internalDocIdsForResolvedDocSetNoLockAtGenerationAlloc(alloc, &in_set, null)) orelse return error.TestExpectedEqual;
+    defer {
+        for (in_ids) |id| alloc.free(@constCast(id));
+        alloc.free(in_ids);
+    }
+    try std.testing.expectEqual(@as(usize, 1), in_ids.len);
+    try std.testing.expectEqualStrings("row:c", in_ids[0]);
+
+    const in_with_recheck_predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "amount", .op = .gt, .value_json = "10" },
+    };
+    var in_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = in_with_recheck_predicates[0..],
+        .in_predicates = in_predicates[0..],
+        .select = select[0..1],
+        .select_all = false,
+        .limit = 10,
+    });
+    defer in_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), in_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", in_result.rows[0]);
+
+    const or_branch_closed = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "status", .op = .eq, .value_json = "\"closed\"" },
+    };
+    const or_branch_open_old = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "status", .op = .eq, .value_json = "\"open\"" },
+        .{ .name = "", .field = "created_at", .op = .lt, .value_json = "15" },
+    };
+    const or_predicates = [_]types.RelationalRowsPredicateGroup{
+        .{ .predicates = or_branch_closed[0..] },
+        .{ .predicates = or_branch_open_old[0..] },
+    };
+    var or_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .or_predicates = or_predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+        .limit = 10,
+    });
+    defer or_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), or_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"c\",\"created_at\":50}", or_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"d\",\"created_at\":10}", or_result.rows[1]);
+
+    const not_branch_closed = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "status", .op = .eq, .value_json = "\"closed\"" },
+    };
+    const not_predicates = [_]types.RelationalRowsPredicateGroup{.{
+        .predicates = not_branch_closed[0..],
+    }};
+    var not_result = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = in_with_recheck_predicates[0..],
+        .not_predicates = not_predicates[0..],
+        .select = select[0..1],
+        .select_all = false,
+        .limit = 10,
+    });
+    defer not_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), not_result.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", not_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"d\"}", not_result.rows[1]);
+}
+
+test "relational rows query planner orders candidate sets by estimated cardinality" {
+    const alloc = std.testing.allocator;
+
+    var small = try doc_set.cloneDocKeysAlloc(alloc, &.{"row:small"});
+    var medium = try doc_set.fromOrdinalsAlloc(alloc, &.{ 1, 2, 3 });
+    var planned = [_]PlannedCandidateSet{
+        .{
+            .set = .all,
+            .estimated_cardinality = null,
+            .ordinal = 0,
+        },
+        .{
+            .set = medium,
+            .estimated_cardinality = medium.estimatedCardinality(),
+            .ordinal = 1,
+        },
+        .{
+            .set = .none,
+            .estimated_cardinality = 0,
+            .ordinal = 2,
+        },
+        .{
+            .set = small,
+            .estimated_cardinality = small.estimatedCardinality(),
+            .ordinal = 3,
+        },
+    };
+    medium = .none;
+    small = .none;
+    defer for (&planned) |*item| item.deinit(alloc);
+
+    std.sort.pdq(PlannedCandidateSet, &planned, {}, plannedCandidateSetLessThan);
+
+    try std.testing.expectEqual(@as(usize, 2), planned[0].ordinal);
+    try std.testing.expectEqual(@as(usize, 3), planned[1].ordinal);
+    try std.testing.expectEqual(@as(usize, 1), planned[2].ordinal);
+    try std.testing.expectEqual(@as(usize, 0), planned[3].ordinal);
+}
+
+test "relational rows set operation plan executes typed set semantics" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"side":{"type":"keyword"}},"required":["id","side"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"side\":\"left\"}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"side\":\"both\"}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"side\":\"right\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const select = [_][]const u8{"id"};
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "id",
+        .direction = .asc,
+    }};
+    const left_values = [_]types.RelationalRowsInPredicate{.{
+        .field = "side",
+        .values_json = "[\"left\",\"both\"]",
+    }};
+    const right_values = [_]types.RelationalRowsInPredicate{.{
+        .field = "side",
+        .values_json = "[\"right\",\"both\"]",
+    }};
+    const left_plan = types.RelationalRowsQueryPlan{ .query = .{
+        .in_predicates = left_values[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+    } };
+    const right_plan = types.RelationalRowsQueryPlan{ .query = .{
+        .in_predicates = right_values[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+    } };
+
+    var union_all = try db.queryRelationalRowsSetOperationPlan(alloc, runtime_schema, .{
+        .operation = .union_all,
+        .left = left_plan,
+        .right = right_plan,
+    });
+    defer union_all.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 4), union_all.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", union_all.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", union_all.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", union_all.rows[2]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", union_all.rows[3]);
+
+    var union_distinct = try db.queryRelationalRowsSetOperationPlan(alloc, runtime_schema, .{
+        .operation = .union_distinct,
+        .left = left_plan,
+        .right = right_plan,
+    });
+    defer union_distinct.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), union_distinct.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", union_distinct.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", union_distinct.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", union_distinct.rows[2]);
+
+    var intersect = try db.queryRelationalRowsSetOperationPlan(alloc, runtime_schema, .{
+        .operation = .intersect,
+        .left = left_plan,
+        .right = right_plan,
+    });
+    defer intersect.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), intersect.total);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", intersect.rows[0]);
+
+    var except = try db.queryRelationalRowsSetOperationPlan(alloc, runtime_schema, .{
+        .operation = .except,
+        .left = left_plan,
+        .right = right_plan,
+    });
+    defer except.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), except.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", except.rows[0]);
+
+    const tail_order = [_]types.RelationalRowsQueryOrder{.{
+        .field = "id",
+        .direction = .desc,
+    }};
+    var globally_ordered = try db.queryRelationalRowsSetOperationPlan(alloc, runtime_schema, .{
+        .operation = .union_all,
+        .left = left_plan,
+        .right = right_plan,
+        .order_by = tail_order[0..],
+        .limit = 2,
+        .offset = 1,
+    });
+    defer globally_ordered.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 4), globally_ordered.total);
+    try std.testing.expectEqual(@as(usize, 2), globally_ordered.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", globally_ordered.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", globally_ordered.rows[1]);
+
+    var spill_admitted = try db.queryRelationalRowsSetOperationPlan(alloc, runtime_schema, .{
+        .operation = .union_distinct,
+        .left = left_plan,
+        .right = right_plan,
+        .spill_after_bytes = 8,
+    });
+    defer spill_admitted.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), spill_admitted.total);
+
+    try std.testing.expectError(error.RelationalRowsCteMaterializationRejected, db.queryRelationalRowsSetOperationPlan(alloc, runtime_schema, .{
+        .operation = .union_distinct,
+        .left = left_plan,
+        .right = right_plan,
+        .max_rows = 2,
+    }));
+}
+
+test "relational rows query doc key range scopes indexed and scanned candidates" {
+    const DB = @import("mod.zig").DB;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric","x-antfly-index":false},"rank":{"type":"numeric"}},"required":["id","status","amount","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"open\",\"amount\":100,\"rank\":1}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"status\":\"open\",\"amount\":20,\"rank\":2}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"status\":\"open\",\"amount\":30,\"rank\":3}" },
+            .{ .key = "row:d", .value = "{\"id\":\"d\",\"status\":\"open\",\"amount\":40,\"rank\":4}" },
+        },
+        .sync_level = .write,
+    });
+
+    const indexed_predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "status", .op = .eq, .value_json = "\"open\"" },
+    };
+    const select = [_][]const u8{"id"};
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "rank",
+        .direction = .asc,
+    }};
+    var indexed = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = indexed_predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+        .doc_key_range = .{ .start = "row:b", .end = "row:d" },
+    });
+    defer indexed.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 2), indexed.total);
+    try std.testing.expectEqual(@as(usize, 2), indexed.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", indexed.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", indexed.rows[1]);
+
+    const scanned_predicates = [_]schema_mod.RelationalCheck{
+        .{ .name = "", .field = "amount", .op = .gt, .value_json = "10" },
+    };
+    var scanned = try db.queryRelationalRows(alloc, runtime_schema, .{
+        .predicates = scanned_predicates[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+        .doc_key_range = .{ .start = "row:b", .end = "row:d" },
+    });
+    defer scanned.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 2), scanned.total);
+    try std.testing.expectEqual(@as(usize, 2), scanned.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", scanned.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", scanned.rows[1]);
+}

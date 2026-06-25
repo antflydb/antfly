@@ -254,10 +254,13 @@ unsupported_statement:
   | CREATE SUBSCRIPTION diagnostic_tail_opt
   | CREATE TRIGGER diagnostic_tail_opt
   | ALTER FOREIGN TABLE diagnostic_tail_opt
+  | ALTER MATERIALIZED VIEW diagnostic_tail_opt
   | ALTER POLICY diagnostic_tail_opt
   | ALTER PUBLICATION diagnostic_tail_opt
+  | ALTER RULE diagnostic_tail_opt
   | ALTER SERVER diagnostic_tail_opt
   | ALTER SUBSCRIPTION diagnostic_tail_opt
+  | ALTER TRIGGER diagnostic_tail_opt
   | DROP FOREIGN TABLE diagnostic_tail_opt
   | DROP MATERIALIZED VIEW diagnostic_tail_opt
   | DROP POLICY diagnostic_tail_opt

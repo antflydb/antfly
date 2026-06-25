@@ -547,7 +547,10 @@ fn generatedUnsupportedUsesLegacyPlanner(kind: generated_parser.GeneratedSqlUnsu
         .vacuum,
         => true,
         .alter_foreign_table,
+        .alter_materialized_view,
+        .alter_rule,
         .alter_server,
+        .alter_trigger,
         .checkpoint,
         .create_foreign_table,
         .create_rule,
@@ -1025,6 +1028,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .alter_foreign_table_not_planned_by_generated_parser,
         },
         .{
+            .sql = "ALTER MATERIALIZED VIEW usage_summary RENAME TO usage_summary_v2",
+            .kind = .alter_materialized_view,
+            .reason = .alter_materialized_view_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "ALTER POLICY usage_policy ON usage_records RENAME TO usage_policy_v2",
             .kind = .alter_policy,
             .reason = .alter_policy_not_planned_by_generated_parser,
@@ -1035,6 +1043,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .alter_publication_not_planned_by_generated_parser,
         },
         .{
+            .sql = "ALTER RULE usage_insert ON usage_records RENAME TO usage_insert_v2",
+            .kind = .alter_rule,
+            .reason = .alter_rule_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "ALTER SERVER usage_server VERSION '15'",
             .kind = .alter_server,
             .reason = .alter_server_not_planned_by_generated_parser,
@@ -1043,6 +1056,11 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "ALTER SUBSCRIPTION usage_sub DISABLE",
             .kind = .alter_subscription,
             .reason = .alter_subscription_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "ALTER TRIGGER usage_audit ON usage_records RENAME TO usage_audit_v2",
+            .kind = .alter_trigger,
+            .reason = .alter_trigger_not_planned_by_generated_parser,
         },
         .{
             .sql = "CALL refresh_usage_records()",

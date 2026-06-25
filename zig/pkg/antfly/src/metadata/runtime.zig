@@ -579,6 +579,15 @@ pub const Server = struct {
         try self.server.runRound();
         self.refreshMetadataRaftStorageDiagnostics();
         try self.server.campaignMetadataGroup();
+        try self.server.svc.upsertReplicaIntent(.{
+            .record = .{
+                .group_id = metadata_group_id,
+                .replica_id = 1,
+                .local_node_id = local_node_id,
+                .bootstrap_mode = .persisted,
+            },
+            .peer_node_ids = &.{},
+        });
         try self.bootstrapPublicApiPrerequisites(local_node_id);
     }
 
@@ -1918,4 +1927,19 @@ test "metadata runtime bootstrapLocal skips local replica-root reconcile on the 
         try server.runRound();
     }
     try std.testing.expect(hook_ctx.runs > 0);
+
+    const metadata_status = server.server.svc.raft.host.status(group_ids.main_metadata_group_id);
+    try std.testing.expect(metadata_status == .active or metadata_status == .quiesced);
+
+    var snapshot = try server.metadataHttpService().adminSnapshot();
+    defer server.metadataHttpService().freeAdminSnapshot(&snapshot);
+    const default_database_id = metadata_table_manager.deriveDatabaseId(metadata_table_manager.default_database_name);
+    var found_default_database = false;
+    for (snapshot.databases) |database| {
+        if (database.database_id == default_database_id and std.mem.eql(u8, database.name, metadata_table_manager.default_database_name)) {
+            found_default_database = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_default_database);
 }

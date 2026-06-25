@@ -131,10 +131,13 @@ pub const GeneratedSqlUnsupportedKind = enum {
     comment,
     copy,
     alter_foreign_table,
+    alter_materialized_view,
     alter_policy,
     alter_publication,
+    alter_rule,
     alter_server,
     alter_subscription,
+    alter_trigger,
     create_foreign_table,
     create_materialized_view,
     create_policy,
@@ -180,10 +183,13 @@ pub const GeneratedSqlUnsupportedReason = enum {
     comment_not_planned_by_generated_parser,
     copy_not_planned_by_generated_parser,
     alter_foreign_table_not_planned_by_generated_parser,
+    alter_materialized_view_not_planned_by_generated_parser,
     alter_policy_not_planned_by_generated_parser,
     alter_publication_not_planned_by_generated_parser,
+    alter_rule_not_planned_by_generated_parser,
     alter_server_not_planned_by_generated_parser,
     alter_subscription_not_planned_by_generated_parser,
+    alter_trigger_not_planned_by_generated_parser,
     create_foreign_table_not_planned_by_generated_parser,
     create_materialized_view_not_planned_by_generated_parser,
     create_policy_not_planned_by_generated_parser,
@@ -1226,10 +1232,13 @@ pub const simple_graph_corpus = [_]GeneratedSqlCorpusCase{
 
 pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "ALTER FOREIGN TABLE foreign_usage_records RENAME TO foreign_usage_archive", .kind = .unsupported },
+    .{ .sql = "ALTER MATERIALIZED VIEW usage_summary RENAME TO usage_summary_v2", .kind = .unsupported },
     .{ .sql = "ALTER POLICY usage_policy ON usage_records RENAME TO usage_policy_v2", .kind = .unsupported },
     .{ .sql = "ALTER PUBLICATION usage_pub ADD TABLE usage_records", .kind = .unsupported },
+    .{ .sql = "ALTER RULE usage_insert ON usage_records RENAME TO usage_insert_v2", .kind = .unsupported },
     .{ .sql = "ALTER SERVER usage_server VERSION '15'", .kind = .unsupported },
     .{ .sql = "ALTER SUBSCRIPTION usage_sub DISABLE", .kind = .unsupported },
+    .{ .sql = "ALTER TRIGGER usage_audit ON usage_records RENAME TO usage_audit_v2", .kind = .unsupported },
     .{ .sql = "ANALYZE", .kind = .unsupported },
     .{ .sql = "CALL refresh_usage_records()", .kind = .unsupported },
     .{ .sql = "CHECKPOINT", .kind = .unsupported },
@@ -1491,10 +1500,13 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     }
     if (first.matchesKeywordTag(.alter) and tokens.len > 1) {
         const second = tokens[1];
+        if (second.matchesKeywordTag(.materialized) and tokens.len > 2 and tokens[2].matchesKeywordTag(.view)) return .{ .unsupported = .alter_materialized_view };
         if (second.matchesKeywordTag(.policy)) return .{ .unsupported = .alter_policy };
         if (second.matchesKeywordTag(.publication)) return .{ .unsupported = .alter_publication };
+        if (second.matchesKeywordTag(.rule)) return .{ .unsupported = .alter_rule };
         if (second.matchesKeywordTag(.server)) return .{ .unsupported = .alter_server };
         if (second.matchesKeywordTag(.subscription)) return .{ .unsupported = .alter_subscription };
+        if (second.matchesKeywordTag(.trigger)) return .{ .unsupported = .alter_trigger };
     }
     if (first.matchesKeywordTag(.drop) and tokens.len > 1) {
         const second = tokens[1];
@@ -1601,10 +1613,13 @@ fn buildUnsupportedAst(
             .comment => .comment_not_planned_by_generated_parser,
             .copy => .copy_not_planned_by_generated_parser,
             .alter_foreign_table => .alter_foreign_table_not_planned_by_generated_parser,
+            .alter_materialized_view => .alter_materialized_view_not_planned_by_generated_parser,
             .alter_policy => .alter_policy_not_planned_by_generated_parser,
             .alter_publication => .alter_publication_not_planned_by_generated_parser,
+            .alter_rule => .alter_rule_not_planned_by_generated_parser,
             .alter_server => .alter_server_not_planned_by_generated_parser,
             .alter_subscription => .alter_subscription_not_planned_by_generated_parser,
+            .alter_trigger => .alter_trigger_not_planned_by_generated_parser,
             .create_foreign_table => .create_foreign_table_not_planned_by_generated_parser,
             .create_materialized_view => .create_materialized_view_not_planned_by_generated_parser,
             .create_policy => .create_policy_not_planned_by_generated_parser,
@@ -5164,6 +5179,9 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .create_metric }, (try parseSqlAlloc(alloc, "CREATE GRAPH METRIC docs_pagerank ON doc_edges")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .alter_metric }, (try parseSqlAlloc(alloc, "ALTER GRAPH INDEX docs_edge_graph ADD METRIC pagerank_v1 USING pagerank")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .analyze }, (try parseSqlAlloc(alloc, "ANALYZE")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_materialized_view }, (try parseSqlAlloc(alloc, "ALTER MATERIALIZED VIEW usage_summary RENAME TO usage_summary_v2")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_rule }, (try parseSqlAlloc(alloc, "ALTER RULE usage_insert ON usage_records RENAME TO usage_insert_v2")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_trigger }, (try parseSqlAlloc(alloc, "ALTER TRIGGER usage_audit ON usage_records RENAME TO usage_audit_v2")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .call }, (try parseSqlAlloc(alloc, "CALL refresh_usage_records()")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .checkpoint }, (try parseSqlAlloc(alloc, "CHECKPOINT")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .close }, (try parseSqlAlloc(alloc, "CLOSE usage_cursor")).statement);
@@ -8146,6 +8164,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 7 },
         },
         .{
+            .sql = "ALTER MATERIALIZED VIEW usage_summary RENAME TO usage_summary_v2",
+            .kind = .alter_materialized_view,
+            .reason = .alter_materialized_view_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 7 },
+        },
+        .{
             .sql = "ALTER POLICY usage_policy ON usage_records RENAME TO usage_policy_v2",
             .kind = .alter_policy,
             .reason = .alter_policy_not_planned_by_generated_parser,
@@ -8158,6 +8182,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 6 },
         },
         .{
+            .sql = "ALTER RULE usage_insert ON usage_records RENAME TO usage_insert_v2",
+            .kind = .alter_rule,
+            .reason = .alter_rule_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 8 },
+        },
+        .{
             .sql = "ALTER SERVER usage_server VERSION '15'",
             .kind = .alter_server,
             .reason = .alter_server_not_planned_by_generated_parser,
@@ -8168,6 +8198,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .kind = .alter_subscription,
             .reason = .alter_subscription_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 4 },
+        },
+        .{
+            .sql = "ALTER TRIGGER usage_audit ON usage_records RENAME TO usage_audit_v2",
+            .kind = .alter_trigger,
+            .reason = .alter_trigger_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 8 },
         },
         .{
             .sql = "CALL refresh_usage_records()",
