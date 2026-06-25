@@ -270,6 +270,7 @@ pub const ApiHttpServerConfig = struct {
     user_manager: ?*usermgr.UserManager = null,
     session_router: ?table_router.HostedGroupRouter = null,
     session_executor: ?http_common.RequestExecutor = null,
+    metadata_mutation_forwarder: ?RequestForwarder = null,
     session_store: ?*transactions_api.DurableSessionStore = null,
     session_store_path: ?[]const u8 = null,
     ha_admin_executor: ?http_common.RequestExecutor = null,
@@ -284,6 +285,19 @@ pub const ApiHttpServerConfig = struct {
     session_owner_lease_ttl_ns: ?u64 = null,
     session_owner_lease_renew_interval_ns: ?u64 = null,
     session_savepoint_limit: ?usize = null,
+};
+
+pub const RequestForwarder = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        forward: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!?http_common.HttpResponse,
+    };
+
+    pub fn forward(self: RequestForwarder, alloc: std.mem.Allocator, req: http_common.HttpRequest) !?http_common.HttpResponse {
+        return try self.vtable.forward(self.ptr, alloc, req);
+    }
 };
 
 pub const trusted_principal_header = "X-Antfly-Trusted-Principal";
@@ -362,6 +376,7 @@ pub const StatusSource = struct {
         status: *const fn (ptr: *anyopaque) anyerror!metadata_api.MetadataStatus,
         admin_snapshot: ?*const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot = null,
         cached_admin_snapshot: ?*const fn (ptr: *anyopaque) anyerror!?metadata_api.AdminSnapshot = null,
+        ensure_linearizable_read: ?*const fn (ptr: *anyopaque) anyerror!void = null,
         free_admin_snapshot: ?*const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void = null,
         create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         restore_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) anyerror!void = null,
@@ -397,6 +412,11 @@ pub const StatusSource = struct {
 
     pub fn cachedAdminSnapshot(self: StatusSource) !?metadata_api.AdminSnapshot {
         const fn_ptr = self.vtable.cached_admin_snapshot orelse return null;
+        return try fn_ptr(self.ptr);
+    }
+
+    pub fn ensureLinearizableRead(self: StatusSource) !void {
+        const fn_ptr = self.vtable.ensure_linearizable_read orelse return;
         return try fn_ptr(self.ptr);
     }
 
@@ -540,6 +560,10 @@ pub const StatusSource = struct {
                 return try cast(ptr).adminSnapshot();
             }
 
+            fn ensureLinearizableRead(ptr: *anyopaque) anyerror!void {
+                return try cast(ptr).ensureLinearizableRead();
+            }
+
             fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
                 cast(ptr).freeAdminSnapshot(snapshot);
             }
@@ -645,6 +669,7 @@ pub const StatusSource = struct {
             .status = Gen.status,
             .admin_snapshot = Gen.adminSnapshot,
             .cached_admin_snapshot = Gen.cachedAdminSnapshot,
+            .ensure_linearizable_read = Gen.ensureLinearizableRead,
             .free_admin_snapshot = Gen.freeAdminSnapshot,
             .create_table = Gen.createTable,
             .restore_table = Gen.restoreTable,
@@ -3863,6 +3888,7 @@ pub const ApiHttpServer = struct {
         }
         if (req.method == .POST) {
             if (std.mem.eql(u8, uri_parts.path, routes.Routes.restore)) {
+                if (try self.forwardMetadataMutationToLeader(req)) |resp| return resp;
                 return try self.handlePublicClusterRestore(req.body);
             }
         }
@@ -5047,6 +5073,7 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         table_name: []const u8,
         backup_location: *backups_api.BackupLocation,
+        location_uri: []const u8,
         backup_id: []const u8,
         format: backups_api.BackupFormat,
     ) !void {
@@ -5055,6 +5082,14 @@ pub const ApiHttpServer = struct {
         if (table.read_schema_json.len > 0) return error.UnsupportedBackupMigrationState;
 
         const table_writes_source = self.table_writes orelse return error.UnsupportedOperation;
+        if (try table_writes_source.backupTableToLocation(self.alloc, table_name, backup_id, format, location_uri, backup_location)) |shards| {
+            defer freeBackupShards(self.alloc, shards);
+            var manifest = try backups_api.createManifest(self.alloc, backup_id, &table, shards);
+            defer manifest.deinit(self.alloc);
+            try backups_api.writeManifestToLocation(self.alloc, backup_location, &manifest);
+            return;
+        }
+
         const local_backup_root = switch (backup_location.*) {
             .file => |value| value,
             .remote => try createBackupStagingRoot(self.alloc, backup_id),
@@ -5335,6 +5370,12 @@ pub const ApiHttpServer = struct {
             if (try self.tryAdoptSession(txn_id)) return null;
             return err;
         };
+    }
+
+    fn forwardMetadataMutationToLeader(self: *ApiHttpServer, req: http_common.HttpRequest) !?http_common.HttpResponse {
+        if (req.source_node_id != null) return null;
+        const forwarder = self.cfg.metadata_mutation_forwarder orelse return null;
+        return try forwarder.forward(self.alloc, req);
     }
 
     fn tryAdoptSession(self: *ApiHttpServer, txn_id: db_mod.types.TxnId) !bool {
@@ -6089,10 +6130,15 @@ pub const ApiHttpServer = struct {
         table_name: []const u8,
         backup_id: []const u8,
         format: backups_api.BackupFormat,
+        location_uri: []const u8,
         location: *backups_api.BackupLocation,
     ) public_table_http.TableApi.ExecuteBackupError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
-        self.backupOwnedTable(table_name, location, backup_id, format) catch |err| switch (err) {
+        self.source.ensureLinearizableRead() catch |err| {
+            std.log.warn("table backup metadata read barrier failed table={s} err={s}", .{ table_name, @errorName(err) });
+            return error.InternalFailure;
+        };
+        self.backupOwnedTable(table_name, location, location_uri, backup_id, format) catch |err| switch (err) {
             error.TableNotFound => return error.NotFound,
             error.UnsupportedOperation => return error.MethodNotAllowed,
             error.UnsupportedBackupMigrationState => return error.UnsupportedBackupMigrationState,
@@ -6112,21 +6158,17 @@ pub const ApiHttpServer = struct {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         if (self.tableExists(table_name) catch return error.InternalFailure) return error.TableAlreadyExists;
 
-        if (self.source.restoreTable(self.alloc, table_name, location_uri, backup_id) catch |err| switch (err) {
-            error.UnsupportedOperation => false,
-            error.InvalidBackupRequest => {
-                if (self.tableExists(table_name) catch return error.InternalFailure) return error.TableAlreadyExists;
-                return error.InvalidBackupRequest;
-            },
-            else => return mapExecuteRestoreError(err),
-        }) {
-            if (self.cfg.swarm_mode) {
-                self.restoreLocalTableDataFromManifest(table_name, location, backup_id) catch |err| {
-                    std.log.err("swarm local restore data apply failed table={s} backup_id={s} err={}", .{ table_name, backup_id, err });
-                    return mapExecuteRestoreError(err);
-                };
+        if (!self.cfg.swarm_mode) {
+            if (self.source.restoreTable(self.alloc, table_name, location_uri, backup_id) catch |err| switch (err) {
+                error.UnsupportedOperation => false,
+                error.InvalidBackupRequest => {
+                    if (self.tableExists(table_name) catch return error.InternalFailure) return error.TableAlreadyExists;
+                    return error.InvalidBackupRequest;
+                },
+                else => return mapExecuteRestoreError(err),
+            }) {
+                return;
             }
-            return;
         }
 
         self.restoreOwnedTableWithRetry(table_name, location, backup_id) catch |err| switch (err) {
@@ -6474,6 +6516,11 @@ pub const ApiHttpServer = struct {
     ) cluster_api_http.ClusterApi.ExecuteBackupError![]u8 {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
 
+        self.source.ensureLinearizableRead() catch |err| {
+            std.log.warn("cluster backup metadata read barrier failed err={s}", .{@errorName(err)});
+            return error.InternalFailure;
+        };
+
         const owns_table_names = req.table_names == null;
         const table_names = if (req.table_names) |values|
             values
@@ -6494,7 +6541,7 @@ pub const ApiHttpServer = struct {
         for (table_names, 0..) |table_name, i| {
             statuses[i] = .{ .name = table_name, .status = "failed", .@"error" = null };
             const table_backup_id = backups_api.clusterTableBackupId(alloc, req.backup_id, table_name) catch return error.InternalFailure;
-            self.backupOwnedTable(table_name, location, table_backup_id, .native) catch |err| {
+            self.backupOwnedTable(table_name, location, req.location, table_backup_id, .native) catch |err| {
                 statuses[i].@"error" = switch (err) {
                     error.TableNotFound => "not found",
                     error.UnsupportedOperation => "method not allowed",
@@ -6621,7 +6668,7 @@ pub const ApiHttpServer = struct {
 
             // For overwrite, skip the metadata restore path and use the owned-table
             // restore which creates the table and copies data synchronously.
-            if (!is_overwrite) {
+            if (!is_overwrite and !self.cfg.swarm_mode) {
                 const restored_via_metadata = self.source.restoreTable(alloc, table_name, req.location, table_backup_id) catch |err| switch (err) {
                     error.UnsupportedOperation => false,
                     else => {
@@ -6642,25 +6689,6 @@ pub const ApiHttpServer = struct {
                     },
                 };
                 if (restored_via_metadata) {
-                    if (self.cfg.swarm_mode) {
-                        self.restoreLocalTableDataFromManifest(table_name, location, table_backup_id) catch |err| {
-                            std.log.err("cluster restore local data apply failed table={s} backup_id={s} err={}", .{
-                                table_name,
-                                table_backup_id,
-                                err,
-                            });
-                            statuses[i].@"error" = switch (err) {
-                                error.UnsupportedOperation => "method not allowed",
-                                error.UnsupportedBackupFormat => "restore does not support this backup layout",
-                                error.UnsupportedBackupMigrationState => "restore does not support active schema migration",
-                                error.TableAlreadyExists => "table already exists",
-                                error.TableNotFound => "not found",
-                                error.InvalidBackupRequest => "invalid restore request",
-                                else => "restore failed",
-                            };
-                            continue;
-                        };
-                    }
                     statuses[i].status = "triggered";
                     continue;
                 }

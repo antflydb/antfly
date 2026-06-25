@@ -53,6 +53,7 @@ pub const MetadataServer = struct {
     owned_admin_http_server: ?*metadata_http_server.MetadataHttpServer = null,
     owned_public_read_source: ?*api_table_reads.HostedProvisionedTableReadSource = null,
     owned_public_write_source: ?*api_table_writes.HostedProvisionedTableWriteSource = null,
+    owned_public_forwarder: ?*MetadataPublicApiForwarder = null,
     owned_public_http_server: ?*public_api_http_server.ApiHttpServer = null,
     owned_admin_mux: ?*MetadataAdminMux = null,
     owned_admin_listener: ?*raft_transport.StdHttpListener = null,
@@ -106,6 +107,8 @@ pub const MetadataServer = struct {
         errdefer if (owned_public_read_source) |read_source| alloc.destroy(read_source);
         var owned_public_write_source: ?*api_table_writes.HostedProvisionedTableWriteSource = null;
         errdefer if (owned_public_write_source) |write_source| alloc.destroy(write_source);
+        var owned_public_forwarder: ?*MetadataPublicApiForwarder = null;
+        errdefer if (owned_public_forwarder) |forwarder| alloc.destroy(forwarder);
         var owned_public_http_server: ?*public_api_http_server.ApiHttpServer = null;
         errdefer if (owned_public_http_server) |public_http_server| {
             public_http_server.deinit();
@@ -153,9 +156,14 @@ pub const MetadataServer = struct {
             _ = public_write_source.withRemoteContent(cfg.api_server_cfg.remote_content);
             owned_public_write_source = public_write_source;
 
+            const public_forwarder = try alloc.create(MetadataPublicApiForwarder);
+            public_forwarder.* = .{ .svc = svc };
+            owned_public_forwarder = public_forwarder;
+
             var api_server_cfg = cfg.api_server_cfg;
             api_server_cfg.shard_ops = if (owned_hosted_shard_ops) |ops| ops.adapter() else null;
             api_server_cfg.shard_db_adapter = owned_hosted_shard_db.?.adapter();
+            api_server_cfg.metadata_mutation_forwarder = public_forwarder.forwarder();
 
             const public_http_server = try alloc.create(public_api_http_server.ApiHttpServer);
             public_http_server.* = public_api_http_server.ApiHttpServer.init(
@@ -191,6 +199,7 @@ pub const MetadataServer = struct {
             .owned_admin_http_server = owned_admin_http_server,
             .owned_public_read_source = owned_public_read_source,
             .owned_public_write_source = owned_public_write_source,
+            .owned_public_forwarder = owned_public_forwarder,
             .owned_public_http_server = owned_public_http_server,
             .owned_admin_mux = owned_admin_mux,
             .owned_admin_listener = owned_admin_listener,
@@ -211,6 +220,9 @@ pub const MetadataServer = struct {
         }
         if (self.owned_public_write_source) |write_source| {
             self.alloc.destroy(write_source);
+        }
+        if (self.owned_public_forwarder) |forwarder| {
+            self.alloc.destroy(forwarder);
         }
         if (self.owned_public_read_source) |read_source| {
             self.alloc.destroy(read_source);
@@ -317,6 +329,22 @@ pub const MetadataServer = struct {
         try self.control_loop.stateRef().syncProjected(self.svc);
         try self.control_loop.stateRef().seedDesiredFromProjected();
         _ = try self.svc.reconcilePreparedIfLeaseHeld(&self.control_loop);
+    }
+};
+
+const MetadataPublicApiForwarder = struct {
+    svc: *service.MetadataHttpService,
+
+    fn forwarder(self: *@This()) public_api_http_server.RequestForwarder {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .forward = forward },
+        };
+    }
+
+    fn forward(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !?http_common.HttpResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.svc.forwardMetadataLeaderRequest(alloc, req);
     }
 };
 
