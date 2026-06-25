@@ -901,6 +901,7 @@ fn validateGeneratedSingleJoinForClause(
 ) !void {
     const read = generated_read_ast orelse return;
     if (read.kind != expected_read_kind and read.kind != .cte) return error.UnsupportedSqlShape;
+    try validateGeneratedJoinItemsMetadata(tokens, read.*);
     const root_index = read.join_tree_root_index orelse return error.UnsupportedSqlShape;
     if (read.join_items.len != 1 or root_index != 0 or read.join_tree_depth != 1) return error.UnsupportedSqlShape;
     const join = read.join_items[0];
@@ -921,12 +922,99 @@ fn validateGeneratedSingleJoinForClause(
     if (join.tokens.end > tokens.len) return error.UnsupportedSqlShape;
 }
 
+fn validateGeneratedJoinKindForOperator(tokens: []const Token, operator_tokens: generated_parser.GeneratedSqlTokenRange, kind: generated_parser.GeneratedSqlJoinKind) !void {
+    if (operator_tokens.start >= operator_tokens.end or operator_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    switch (kind) {
+        .inner => {
+            if (operator_tokens.end == operator_tokens.start + 1) {
+                if (!tokens[operator_tokens.start].matchesKeywordTag(.join)) return error.UnsupportedSqlShape;
+            } else if (operator_tokens.end == operator_tokens.start + 2) {
+                if (!tokens[operator_tokens.start].matchesKeywordTag(.inner) or !tokens[operator_tokens.start + 1].matchesKeywordTag(.join)) return error.UnsupportedSqlShape;
+            } else {
+                return error.UnsupportedSqlShape;
+            }
+        },
+        .left, .right, .full => {
+            const expected_keyword: TokenKeyword = switch (kind) {
+                .left => .left,
+                .right => .right,
+                .full => .full,
+                .inner => unreachable,
+            };
+            if (!tokens[operator_tokens.start].matchesKeywordTag(expected_keyword)) return error.UnsupportedSqlShape;
+            if (operator_tokens.end == operator_tokens.start + 2) {
+                if (!tokens[operator_tokens.start + 1].matchesKeywordTag(.join)) return error.UnsupportedSqlShape;
+            } else if (operator_tokens.end == operator_tokens.start + 3) {
+                if (!tokens[operator_tokens.start + 1].matchesKeywordTag(.outer) or !tokens[operator_tokens.start + 2].matchesKeywordTag(.join)) return error.UnsupportedSqlShape;
+            } else {
+                return error.UnsupportedSqlShape;
+            }
+        },
+    }
+}
+
+fn validateGeneratedJoinItemsMetadata(tokens: []const Token, read: generated_parser.GeneratedSqlReadAst) !void {
+    const join_tokens = read.join_tokens orelse return error.UnsupportedSqlShape;
+    if (join_tokens.start >= join_tokens.end or join_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    if (read.join_items.len == 0) return error.UnsupportedSqlShape;
+    const root_index = read.join_tree_root_index orelse return error.UnsupportedSqlShape;
+    if (root_index != read.join_items.len - 1 or read.join_tree_depth != read.join_items.len) return error.UnsupportedSqlShape;
+    for (read.join_items, 0..) |join, index| {
+        if (join.tree_index != index or join.tree_depth != index + 1) return error.UnsupportedSqlShape;
+        if (index == 0) {
+            if (join.left_child_index != null) return error.UnsupportedSqlShape;
+            if (join.tokens.start != join_tokens.start) return error.UnsupportedSqlShape;
+        } else {
+            if (join.left_child_index == null or join.left_child_index.? != index - 1) return error.UnsupportedSqlShape;
+            if (!generatedTokenRangeEqual(join.left_tokens, read.join_items[index - 1].tokens)) return error.UnsupportedSqlShape;
+            if (join.tokens.start != join_tokens.start) return error.UnsupportedSqlShape;
+        }
+        if (join.tokens.end > join_tokens.end or join.tokens.start >= join.tokens.end) return error.UnsupportedSqlShape;
+        if (join.left_tokens.start != join.tokens.start or join.left_tokens.end != join.operator_tokens.start) return error.UnsupportedSqlShape;
+        if (join.right_tokens.start < join.operator_tokens.end or join.right_tokens.end > join.condition_tokens.start or join.right_tokens.start >= join.right_tokens.end) return error.UnsupportedSqlShape;
+        try validateGeneratedJoinKindForOperator(tokens, join.operator_tokens, join.kind);
+        switch (join.condition_kind) {
+            .on => {
+                if (join.using_tokens != null or join.using_column_tokens != null or join.using_columns.count != 0) return error.UnsupportedSqlShape;
+                const predicate_tokens = join.predicate_tokens orelse return error.UnsupportedSqlShape;
+                if (join.condition_tokens.start + 1 != predicate_tokens.start or join.condition_tokens.end != predicate_tokens.end) return error.UnsupportedSqlShape;
+                if (!tokens[join.condition_tokens.start].matchesKeywordTag(.on)) return error.UnsupportedSqlShape;
+                if (!generatedTokenRangeEqual(join.predicate_expression.tokens orelse return error.UnsupportedSqlShape, predicate_tokens)) return error.UnsupportedSqlShape;
+                try validateGeneratedExpressionPayloads(tokens, join.predicate_expression);
+            },
+            .using => {
+                if (join.predicate_tokens != null or join.predicate_expression.tokens != null) return error.UnsupportedSqlShape;
+                const using_tokens = join.using_tokens orelse return error.UnsupportedSqlShape;
+                const column_tokens = join.using_column_tokens orelse return error.UnsupportedSqlShape;
+                if (!generatedTokenRangeEqual(using_tokens, join.condition_tokens)) return error.UnsupportedSqlShape;
+                if (using_tokens.start + 3 > using_tokens.end or !tokens[using_tokens.start].matchesKeywordTag(.using)) return error.UnsupportedSqlShape;
+                if (tokens[using_tokens.start + 1].kind != .lparen or tokens[using_tokens.end - 1].kind != .rparen) return error.UnsupportedSqlShape;
+                if (column_tokens.start != using_tokens.start + 2 or column_tokens.end != using_tokens.end - 1) return error.UnsupportedSqlShape;
+                try validateGeneratedExpressionListForClause(tokens, column_tokens, join.using_columns);
+            },
+        }
+        if (join.condition_tokens.end != join.tokens.end) return error.UnsupportedSqlShape;
+    }
+    const first = read.join_items[0];
+    if (read.join_operator_tokens == null or !generatedTokenRangeEqual(read.join_operator_tokens.?, first.operator_tokens)) return error.UnsupportedSqlShape;
+    if (read.join_kind == null or read.join_kind.? != first.kind) return error.UnsupportedSqlShape;
+    if (read.join_left_tokens == null or !generatedTokenRangeEqual(read.join_left_tokens.?, first.left_tokens)) return error.UnsupportedSqlShape;
+    if (read.join_right_tokens == null or !generatedTokenRangeEqual(read.join_right_tokens.?, first.right_tokens)) return error.UnsupportedSqlShape;
+    if (first.predicate_tokens) |predicate_tokens| {
+        if (read.join_predicate_tokens == null or !generatedTokenRangeEqual(read.join_predicate_tokens.?, predicate_tokens)) return error.UnsupportedSqlShape;
+    } else if (read.join_predicate_tokens != null) {
+        return error.UnsupportedSqlShape;
+    }
+}
+
 fn validateGeneratedJoinExecutableContract(
     generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+    tokens: []const Token,
     expected_read_kind: generated_parser.GeneratedSqlReadKind,
 ) !void {
     const read = generated_read_ast orelse return;
     if (read.kind != expected_read_kind and read.kind != .cte) return error.UnsupportedSqlShape;
+    try validateGeneratedJoinItemsMetadata(tokens, read.*);
     const root_index = read.join_tree_root_index orelse return error.UnsupportedSqlShape;
     if (read.join_items.len != 1 or root_index != 0 or read.join_tree_depth != 1) return error.UnsupportedSqlShape;
     const join = read.join_items[0];
@@ -17534,7 +17622,7 @@ pub fn parseJoinAlloc(
     pos: *usize,
     options: JoinParserOptions,
 ) !plan_mod.LoweredJoin {
-    try validateGeneratedJoinExecutableContract(options.generated_read_ast, .join);
+    try validateGeneratedJoinExecutableContract(options.generated_read_ast, tokens, .join);
     try parser.expectKeyword(tokens, pos, "select");
 
     const generated_projection_end = try generatedProjectionClauseEnd(tokens, pos.*, options.generated_read_ast);
@@ -18285,7 +18373,7 @@ pub fn parseLateralAlloc(
     pos: *usize,
     options: LateralParserOptions,
 ) !plan_mod.LoweredLateralPlan {
-    try validateGeneratedJoinExecutableContract(options.generated_read_ast, .lateral);
+    try validateGeneratedJoinExecutableContract(options.generated_read_ast, tokens, .lateral);
     try parser.expectKeyword(tokens, pos, "select");
 
     const generated_projection_end = try generatedProjectionClauseEnd(tokens, pos.*, options.generated_read_ast);
@@ -29904,6 +29992,40 @@ fn corruptGeneratedReadWhereQuantifierRange(parsed_sql: *tokenized.ParsedSql) !v
     return error.TestUnexpectedResult;
 }
 
+fn corruptGeneratedReadJoinSummaryOperatorRange(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |*read| {
+                    const source_tokens = read.source_tokens orelse return error.TestUnexpectedResult;
+                    if (read.join_operator_tokens == null) return error.TestUnexpectedResult;
+                    read.join_operator_tokens = source_tokens;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadFirstJoinPredicateExpressionRange(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |*read| {
+                    const source_tokens = read.source_tokens orelse return error.TestUnexpectedResult;
+                    if (read.join_items.len == 0 or read.join_items[0].predicate_expression.tokens == null) return error.TestUnexpectedResult;
+                    read.join_items[0].predicate_expression.tokens = source_tokens;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn corruptGeneratedReadFirstProjectionExpressionItem(parsed_sql: *tokenized.ParsedSql) !void {
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
@@ -35813,6 +35935,33 @@ test "sql adapter lower expr lowers equality join queries" {
         schema,
         &.{},
     ));
+
+    var malformed_generated_join_summary = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant = c.tenant AND o.customer_id = c.id",
+    );
+    defer malformed_generated_join_summary.deinit(alloc);
+    try corruptGeneratedReadJoinSummaryOperatorRange(&malformed_generated_join_summary);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedJoinForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_join_summary,
+        schema,
+        &.{},
+    ));
+
+    var malformed_generated_join_predicate = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant = c.tenant AND o.customer_id = c.id",
+    );
+    defer malformed_generated_join_predicate.deinit(alloc);
+    try corruptGeneratedReadFirstJoinPredicateExpressionRange(&malformed_generated_join_predicate);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedJoinForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_join_predicate,
+        schema,
+        &.{},
+    ));
+
     try std.testing.expectError(error.UnsupportedSqlShape, lowerJoinForLowerExprTestAlloc(
         alloc,
         "SELECT o.id AS order_id FROM usage_records AS o JOIN usage_records AS c ON o.customer_id = c.id JOIN usage_records AS s ON c.scope = s.scope",

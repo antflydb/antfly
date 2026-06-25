@@ -3687,7 +3687,24 @@ pub fn build(b: *std.Build) void {
 
     const lib_metadata_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &.{"metadata."}),
+        .filters = selectTestFilters(b, &.{
+            "metadata.mod.test.",
+            "metadata.api.test.",
+            "metadata.admin.test.",
+            "metadata.http_routes.test.",
+            "metadata.http_server.test.",
+            "metadata.http_client.test.",
+            "metadata.state.test.",
+            "metadata.storage.",
+            "metadata.service.test.",
+            "metadata.server.test.",
+            "metadata.sim_harness.test.",
+            "metadata.runtime.test.",
+            "metadata.reconciler.test.",
+            "metadata.control_loop.test.",
+            "metadata.transition_driver.test.",
+            "metadata.replication_backfill.test.",
+        }),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
