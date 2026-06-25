@@ -12661,8 +12661,12 @@ fn lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(
             switch (write_kind) {
                 .update, .update_source => try validateGeneratedUpdateSourceRanges(tokens, ast, end),
                 .update_joined_source => {
-                    try validateGeneratedUpdateJoinedRanges(tokens, ast, end);
-                    try validateGeneratedDmlRelationSourceBodyAlloc(alloc, parsed_sql, ast);
+                    if (ast.source_tokens != null) {
+                        try validateGeneratedUpdateJoinedRanges(tokens, ast, end);
+                        try validateGeneratedDmlRelationSourceBodyAlloc(alloc, parsed_sql, ast);
+                    } else {
+                        try validateGeneratedUpdateSourceRanges(tokens, ast, end);
+                    }
                 },
                 else => return error.UnsupportedSqlShape,
             }
@@ -12690,8 +12694,12 @@ fn lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(
             switch (write_kind) {
                 .delete, .delete_source => try validateGeneratedDeleteSourceRanges(tokens, ast, end),
                 .delete_joined_source => {
-                    try validateGeneratedDeleteJoinedRanges(tokens, ast, end);
-                    try validateGeneratedDmlRelationSourceBodyAlloc(alloc, parsed_sql, ast);
+                    if (ast.source_tokens != null) {
+                        try validateGeneratedDeleteJoinedRanges(tokens, ast, end);
+                        try validateGeneratedDmlRelationSourceBodyAlloc(alloc, parsed_sql, ast);
+                    } else {
+                        try validateGeneratedDeleteSourceRanges(tokens, ast, end);
+                    }
                 },
                 else => return error.UnsupportedSqlShape,
             }
@@ -14026,6 +14034,24 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
         defer generated.deinit(alloc);
         try std.testing.expectEqual(std.meta.activeTag(legacy), std.meta.activeTag(generated));
     }
+
+    var malformed_generated_dml = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, organization_id, quantity) VALUES ('u2', 'active', 'o1', 7) RETURNING id",
+    );
+    defer malformed_generated_dml.deinit(alloc);
+    if (malformed_generated_dml.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| dml.target_table_tokens = null,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerWritePlanParsedSqlForDmlTestAlloc(alloc, &malformed_generated_dml, schema, &.{}, options),
+    );
 
     const resolver_free_options = plan_mod.LowerWritePlanOptions{
         .row_claim = claim,

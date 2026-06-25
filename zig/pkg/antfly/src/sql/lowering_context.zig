@@ -6590,12 +6590,7 @@ pub const WritePlanLoweringContext = struct {
         self.parsed_sql = parsed_sql;
         defer self.parsed_sql = old_parsed_sql;
         if (generatedDmlAstForParsedSql(parsed_sql)) |dml_ast| {
-            if (self.callbacks.lower_generated_dml(self.alloc, parsed_sql, dml_ast.*, self.schema, self.params, options)) |lowered| {
-                return lowered;
-            } else |err| switch (err) {
-                error.UnsupportedSqlShape => {},
-                else => return err,
-            }
+            return try self.callbacks.lower_generated_dml(self.alloc, parsed_sql, dml_ast.*, self.schema, self.params, options);
         }
         return try plan.lowerWritePlanWithParsedSqlAlloc(parsed_sql, self.schema, options, self.hooks());
     }

@@ -411,8 +411,9 @@ Unsupported DDL remains on the existing parser until
    drop-behavior surface.
    The write-plan lowering context now dispatches through retained generated
    DML ASTs when the generated parser covers the statement, using direct
-   generated AST-to-plan lowerers where available and falling back to the
-   classifier path only for generated shapes that are not direct-lowered yet.
+   generated AST-to-plan lowerers and failing closed when that generated
+   AST-to-plan contract rejects the retained AST instead of retrying the
+   legacy write classifier.
    Generated-DML-specific coverage now calls the direct generated lowerer
    without retrying the classifier path, so promoted generated DML cases fail
    closed if their AST-to-plan contract regresses.
@@ -423,7 +424,11 @@ Unsupported DDL remains on the existing parser until
    payload checks.
    Recursive DML CTE prefixes now reparse each recorded generated CTE body as a
    child read and validate that child through the shared generated read-AST
-   contract before dispatching to typed recursive write-plan lowering.
+   contract before dispatching to typed recursive write-plan lowering; selector-based
+   recursive `UPDATE`/`DELETE` forms that classify as joined mutation sources
+   through their recursive CTE predicates validate the generated command body
+   without requiring an explicit generated `FROM`/`USING` relation-source
+   payload.
    Incomplete migrated DML clause-boundary shapes for insert, update, delete,
    truncate, and merge now use generated fail-closed diagnostics instead of
    classifier fallback.
@@ -916,8 +921,9 @@ Generated grammar work needs evidence at multiple levels:
   metadata plus generated child-read validation for recursive CTE insert-source, update, delete, and merge
   write-plan variants,
   generated-first write lowering context
-  dispatch, and generated-family validation fallback over other representative
-  write plans. Read plans have initial
+  dispatch, fail-closed generated DML dispatch when retained generated AST
+  metadata is malformed, and generated-family validation over other
+  representative write plans. Read plans have initial
   generated AST-to-plan parity through generated-first read lowering context
   dispatch and generated-family validation wrappers over representative query,
   aggregate, join, lateral, and non-recursive CTE plans, AST-shape coverage for
