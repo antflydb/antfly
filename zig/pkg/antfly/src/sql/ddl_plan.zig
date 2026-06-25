@@ -3013,6 +3013,29 @@ pub fn sessionCatalogPlanFromGeneratedAstAlloc(
     };
 }
 
+fn generatedSessionAstUsesDirectLowerer(
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlSessionAst,
+) bool {
+    return switch (ast.kind) {
+        .set, .reset, .show => generatedSessionNameContainsText(tokens, ast.name_tokens, "search_path"),
+        .discard_all => true,
+    };
+}
+
+fn generatedSessionNameContainsText(
+    tokens: []const grammar.Token,
+    maybe_range: ?generated_parser.GeneratedSqlTokenRange,
+    text: []const u8,
+) bool {
+    const range = maybe_range orelse return false;
+    if (range.end > tokens.len or range.start >= range.end) return false;
+    for (tokens[range.start..range.end]) |token| {
+        if (std.ascii.eqlIgnoreCase(token.text, text)) return true;
+    }
+    return false;
+}
+
 pub fn transactionBoundaryPlanFromGeneratedAst(ast: generated_parser.GeneratedSqlTransactionAst) LoweredDdlPlan {
     _ = ast;
     return .{ .adapter_noop = .{ .reason = .transaction_control } };
@@ -8569,7 +8592,7 @@ pub fn lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(
         .tokens = tokens,
         .function_bindings = function_bindings,
     };
-    return try parseDdlPlanAlloc(alloc, tokens, &state.pos, .{
+    const options = DdlPlanParserOptions{
         .schema = state.schema,
         .field_expression_qualifiers = state.field_expression_qualifiers,
         .returning_expression_qualifiers = state.returning_expression_qualifiers,
@@ -8578,7 +8601,32 @@ pub fn lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(
         .domain_options = parser_context.ParserState.ContextAccessors.ddlDomainOptions(&state),
         .create_index_options = parser_context.ParserState.ContextAccessors.createIndexOptions(&state),
         .row_security_policy_options = parser_context.ParserState.ContextAccessors.rowSecurityPolicyOptions(&state),
-    });
+    };
+    if (parsed_sql.generated_statement) |generated_statement| {
+        if (generated_statement.ast) |generated_ast| {
+            switch (generated_ast) {
+                .session => |session_ast| {
+                    if (generatedSessionAstUsesDirectLowerer(tokens, session_ast)) {
+                        return .{ .session_catalog = try sessionCatalogPlanFromGeneratedAstAlloc(alloc, tokens, session_ast) };
+                    }
+                },
+                .prepared => |prepared_ast| return .{ .prepared_statement = try preparedStatementPlanFromGeneratedAstAlloc(alloc, tokens, prepared_ast) },
+                .ddl, .extension_index => |ddl_ast| switch (ddl_ast.kind) {
+                    .create_database,
+                    .create_schema,
+                    .create_extension,
+                    .drop_database,
+                    .drop_schema,
+                    .drop_extension,
+                    => return try simpleDdlPlanFromGeneratedAstAlloc(alloc, tokens, ddl_ast),
+                    else => {},
+                },
+                .graph => |graph_ast| return try graphDdlPlanFromGeneratedAstAlloc(alloc, tokens, graph_ast),
+                .transaction, .dml, .read, .unsupported => {},
+            }
+        }
+    }
+    return try parseDdlPlanAlloc(alloc, tokens, &state.pos, options);
 }
 
 const lowerDdlPlanForTestAlloc = lowerDdlPlanAlloc;
@@ -12505,6 +12553,66 @@ test "sql adapter generated simple DDL AST lowers to catalog plans" {
     }
 
     try std.testing.expectError(error.UnsupportedSqlShape, generatedSimpleDdlPlanForTestAlloc(alloc, "CREATE DATABASE tenant_ops WITH OWNER app;"));
+}
+
+test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
+    const alloc = std.testing.allocator;
+
+    var session = try tokenized.ParsedSql.initAlloc(alloc, "SET search_path TO public;");
+    defer session.deinit(alloc);
+    var session_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &session);
+    defer session_plan.deinit(alloc);
+    switch (session_plan) {
+        .session_catalog => |plan| switch (plan) {
+            .set_search_path => |search_path| {
+                try std.testing.expectEqual(@as(usize, 1), search_path.namespaces.len);
+                try std.testing.expectEqualStrings("public", search_path.namespaces[0]);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var prepared = try tokenized.ParsedSql.initAlloc(alloc, "PREPARE usage_by_status(text) AS SELECT id FROM usage_records WHERE status = $1;");
+    defer prepared.deinit(alloc);
+    var prepared_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &prepared);
+    defer prepared_plan.deinit(alloc);
+    switch (prepared_plan) {
+        .prepared_statement => |plan| switch (plan) {
+            .prepare => |prepare| {
+                try std.testing.expectEqualStrings("usage_by_status", prepare.statement_name);
+                try std.testing.expectEqual(@as(usize, 1), prepare.parameter_count);
+                try std.testing.expectEqual(PreparedStatementSubjectKind.read, prepare.statement_kind);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var graph = try tokenized.ParsedSql.initAlloc(alloc, "CREATE GRAPH INDEX docs_edge_graph ON doc_edges EDGE (source_doc -> target_doc);");
+    defer graph.deinit(alloc);
+    var graph_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &graph);
+    defer graph_plan.deinit(alloc);
+    switch (graph_plan) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(DdlIndexMethod.antfly_graph, plan.method);
+            try std.testing.expectEqualStrings("docs_edge_graph", plan.index_name);
+            try std.testing.expectEqualStrings("doc_edges", plan.table_name);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var malformed_generated_ddl = try tokenized.ParsedSql.initAlloc(alloc, "CREATE DATABASE tenant_ops;");
+    defer malformed_generated_ddl.deinit(alloc);
+    if (malformed_generated_ddl.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.object_name_tokens = .{ .start = 1, .end = 2 },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_generated_ddl));
 }
 
 test "sql adapter generated create table and index AST lowers to DDL plans" {

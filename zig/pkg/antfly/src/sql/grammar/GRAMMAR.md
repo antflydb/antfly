@@ -905,6 +905,16 @@ Generated grammar work needs evidence at multiple levels:
   behavior, ALTER TABLE operation tails, fail-closed unsupported clauses, and
   malformed database/schema/extension catalog DDL heads that no longer fall
   back to legacy DDL probing.
+  Runtime DDL lowering now dispatches generated prepared statements, graph DDL,
+  and simple database/schema/extension catalog DDL through the generated
+  AST-to-plan boundary; session catalog lowering uses the generated session
+  AST as a fast path and falls back to the legacy session classifier for
+  settings/noop forms whose generated metadata is not yet strict enough.
+  Richer generated `CREATE INDEX`, `DROP INDEX`, `CREATE TABLE`, `DROP TABLE`,
+  and `ALTER TABLE` wrappers remain parity-tested but are not yet the public
+  runtime boundary for every generated-covered form, because expression index
+  tails, row-security ALTER routing, and broader ALTER/check expression shapes
+  still need closed generated semantic payloads.
   Simple DML has generated field-level checks for update and truncate body
   ranges, direct generated AST-to-plan parity for truncate mutation-source
   plans, direct resolver-free generated AST-to-plan coverage for supported
