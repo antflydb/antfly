@@ -567,6 +567,7 @@ fn isIncompleteGeneratedDmlBoundary(tokens: []const Token, raw_statement: RawSql
             tokenMatchesKeyword(last, .select) or
             tokenMatchesKeyword(last, .on) or
             tokenMatchesKeyword(last, .conflict) or
+            tokenMatchesText(last, "do") or
             tokenMatchesKeyword(last, .returning);
     }
     if (tokenMatchesKeyword(first, .update)) {
@@ -593,7 +594,10 @@ fn isIncompleteGeneratedDmlBoundary(tokens: []const Token, raw_statement: RawSql
             tokenMatchesKeyword(last, .when) or
             tokenMatchesKeyword(last, .matched) or
             tokenMatchesKeyword(last, .then) or
-            tokenMatchesKeyword(last, .update);
+            tokenMatchesKeyword(last, .update) or
+            tokenMatchesKeyword(last, .insert) or
+            tokenMatchesKeyword(last, .set) or
+            tokenMatchesKeyword(last, .values);
     }
     return false;
 }
@@ -1126,10 +1130,14 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE GRAPH INDEX docs_edge_graph ON"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER GRAPH INDEX docs_edge_graph ADD"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "INSERT INTO usage_records VALUES"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) VALUES ('u1') ON CONFLICT (id) DO"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "UPDATE usage_records SET"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DELETE FROM usage_records WHERE"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "TRUNCATE TABLE"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "MERGE INTO usage_records USING source_rows ON"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN NOT MATCHED THEN INSERT"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN NOT MATCHED THEN INSERT (id) VALUES"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "INSERT INTO usage_records OVERRIDING SYSTEM VALUE VALUES ('u1')"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SELECT DISTINCT"));

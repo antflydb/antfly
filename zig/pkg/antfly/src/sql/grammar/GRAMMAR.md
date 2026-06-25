@@ -114,7 +114,8 @@ command ranges plus full generated child-read parses for each recorded CTE body
 before dispatching to the typed recursive write-plan variants;
 and `TRUNCATE`
 lowers directly from generated AST ranges into mutation-source plans. Incomplete
-migrated DML statements that stop at required generated clause boundaries now
+migrated DML statements that stop at required generated clause boundaries,
+including `INSERT ... ON CONFLICT ... DO` tails and `MERGE` action bodies, now
 fail closed through the generated parser instead of falling back to the legacy
 write classifier. Other DML shapes still use an initial generated
 AST-to-plan wrapper that fails closed if the generated DML family does not
@@ -471,8 +472,8 @@ Unsupported DDL remains on the existing parser until
    metadata at the parsed boundary, and fails closed when retained generated
    kind metadata disagrees with the legacy classifier.
    Incomplete migrated DML clause-boundary shapes for insert, update, delete,
-   truncate, and merge now use generated fail-closed diagnostics instead of
-   classifier fallback.
+   truncate, `INSERT ... ON CONFLICT ... DO` tails, and `MERGE` action bodies
+   now use generated fail-closed diagnostics instead of classifier fallback.
    Switching the full DML family from generated-parser gating plus typed
    lowerer delegation to complete generated AST-driven lowering still requires
    generated command-body AST-driven lowering for recursive CTE DML beyond
