@@ -366,11 +366,17 @@ const Connection = struct {
         const sql = try cursor.takeCString();
         const parameter_count = try cursor.takeInt(i16);
         if (parameter_count < 0) return error.InvalidPgwireMessage;
-        const parameter_oids = try self.alloc.alloc(i32, @intCast(parameter_count));
-        errdefer self.alloc.free(parameter_oids);
+        var parameter_oids = try self.alloc.alloc(i32, @intCast(parameter_count));
+        errdefer if (parameter_oids.len > 0) self.alloc.free(parameter_oids);
         var i: usize = 0;
-        while (i < @as(usize, @intCast(parameter_count))) : (i += 1) parameter_oids[i] = try cursor.takeInt(i32);
+        while (i < @as(usize, @intCast(parameter_count))) : (i += 1) {
+            const oid = try cursor.takeInt(i32);
+            parameter_oids[i] = if (oid == 0) text_oid else oid;
+        }
         try cursor.expectEnd();
+        if (parameter_oids.len == 0) {
+            parameter_oids = try pgwire_module.inferredTextParameterOidsAlloc(self.alloc, sql);
+        }
         try self.setPreparedStatement(name, sql, parameter_oids);
         try self.sendParseComplete();
     }
@@ -586,7 +592,7 @@ const Connection = struct {
             .response => |*response| {
                 defer response.deinit(self.api_server.alloc);
                 self.markTransactionError();
-                try self.sendError(pgwire_module.sqlstateForHttpStatus(response.status), response.body);
+                try self.sendError(pgwire_module.sqlstateForHttpResponse(response.status, response.body), response.body);
                 return false;
             },
             .result => |*result| {
@@ -616,7 +622,7 @@ const Connection = struct {
             .response => |*response| {
                 defer response.deinit(self.api_server.alloc);
                 self.markTransactionError();
-                try self.sendError(pgwire_module.sqlstateForHttpStatus(response.status), response.body);
+                try self.sendError(pgwire_module.sqlstateForHttpResponse(response.status, response.body), response.body);
                 if (send_ready_on_error) try self.sendReadyForQuery();
                 return false;
             },
@@ -1119,6 +1125,93 @@ fn bindSqlParametersAlloc(alloc: std.mem.Allocator, sql: []const u8, parameters:
     return try out.toOwnedSlice();
 }
 
+fn inferredTextParameterOidsAlloc(alloc: std.mem.Allocator, sql: []const u8) ![]i32 {
+    const max_ordinal = try maxSqlParameterOrdinal(sql);
+    const oids = try alloc.alloc(i32, max_ordinal);
+    @memset(oids, text_oid);
+    return oids;
+}
+
+fn maxSqlParameterOrdinal(sql: []const u8) !usize {
+    var max_ordinal: usize = 0;
+    var i: usize = 0;
+    var state: enum { normal, single_quote, double_quote, line_comment, block_comment, dollar_quote } = .normal;
+    var dollar_delim: []const u8 = "";
+    while (i < sql.len) {
+        switch (state) {
+            .normal => {
+                if (sql[i] == '$') {
+                    if (dollarQuoteDelimiter(sql[i..])) |delim| {
+                        dollar_delim = delim;
+                        state = .dollar_quote;
+                        i += delim.len;
+                        continue;
+                    }
+                    if (i + 1 < sql.len and std.ascii.isDigit(sql[i + 1])) {
+                        var end = i + 1;
+                        while (end < sql.len and std.ascii.isDigit(sql[end])) : (end += 1) {}
+                        const ordinal = try std.fmt.parseInt(usize, sql[i + 1 .. end], 10);
+                        if (ordinal == 0 or ordinal > std.math.maxInt(i16)) return error.InvalidPgwireParameter;
+                        max_ordinal = @max(max_ordinal, ordinal);
+                        i = end;
+                        continue;
+                    }
+                }
+                if (sql[i] == '\'') state = .single_quote;
+                if (sql[i] == '"') state = .double_quote;
+                if (sql[i] == '-' and i + 1 < sql.len and sql[i + 1] == '-') {
+                    state = .line_comment;
+                    i += 2;
+                    continue;
+                }
+                if (sql[i] == '/' and i + 1 < sql.len and sql[i + 1] == '*') {
+                    state = .block_comment;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            },
+            .single_quote => {
+                if (sql[i] == '\'' and i + 1 < sql.len and sql[i + 1] == '\'') {
+                    i += 2;
+                    continue;
+                }
+                if (sql[i] == '\'') state = .normal;
+                i += 1;
+            },
+            .double_quote => {
+                if (sql[i] == '"' and i + 1 < sql.len and sql[i + 1] == '"') {
+                    i += 2;
+                    continue;
+                }
+                if (sql[i] == '"') state = .normal;
+                i += 1;
+            },
+            .line_comment => {
+                if (sql[i] == '\n') state = .normal;
+                i += 1;
+            },
+            .block_comment => {
+                if (sql[i] == '*' and i + 1 < sql.len and sql[i + 1] == '/') {
+                    state = .normal;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            },
+            .dollar_quote => {
+                if (std.mem.startsWith(u8, sql[i..], dollar_delim)) {
+                    state = .normal;
+                    i += dollar_delim.len;
+                    continue;
+                }
+                i += 1;
+            },
+        }
+    }
+    return max_ordinal;
+}
+
 fn appendSqlLiteral(writer: *std.Io.Writer, value: ?[]const u8) !void {
     const text = value orelse {
         try writer.writeAll("NULL");
@@ -1369,7 +1462,17 @@ fn appendColumnDescription(writer: *std.Io.Writer, column: PgwireColumn) !void {
     try writer.writeInt(i16, text_format, .big);
 }
 
-fn sqlstateForHttpStatus(status: u16) []const u8 {
+fn sqlstateForHttpResponse(status: u16, body: []const u8) []const u8 {
+    const message = std.mem.trim(u8, body, " \t\r\n");
+    if (std.mem.eql(u8, message, "current transaction is aborted")) return "25P02";
+    if (std.mem.indexOf(u8, message, "read-only transaction") != null) return "25006";
+    if (std.mem.eql(u8, message, "unsupported sql statement")) return "0A000";
+    if (std.mem.startsWith(u8, message, "document_sql_") and std.mem.indexOf(u8, message, "unsupported") != null) return "0A000";
+    if (std.mem.eql(u8, message, "not found")) return "42P01";
+    if (std.mem.eql(u8, message, "invalid sql request")) return "42601";
+    if (std.mem.eql(u8, message, "invalid sql write")) return "22023";
+    if (std.mem.eql(u8, message, "unsupported rows selector")) return "0A000";
+    if (std.mem.eql(u8, message, "sql statement timeout")) return "57014";
     return switch (status) {
         400 => "42601",
         401, 403 => "28000",
@@ -1520,6 +1623,20 @@ test "pgwire extended bind renders null parameters" {
     try std.testing.expectEqualStrings("SELECT * FROM docs WHERE deleted_at IS NULL", sql);
 }
 
+test "pgwire parse infers text parameter oids outside literals and comments" {
+    const sql =
+        \\SELECT '$1' AS literal, id
+        \\FROM docs
+        \\WHERE id = $2 AND status = $1 -- $3
+        \\AND note = $$body $4 body$$
+    ;
+    const oids = try inferredTextParameterOidsAlloc(std.testing.allocator, sql);
+    defer if (oids.len > 0) std.testing.allocator.free(oids);
+    try std.testing.expectEqual(@as(usize, 2), oids.len);
+    try std.testing.expectEqual(@as(i32, text_oid), oids[0]);
+    try std.testing.expectEqual(@as(i32, text_oid), oids[1]);
+}
+
 test "pgwire relational column descriptions use postgres-compatible text types" {
     const typed_columns = [_]runtime_schema.RelationalColumn{
         .{ .name = "id", .path = "id", .field_type = .keyword },
@@ -1557,4 +1674,24 @@ test "pgwire relational column descriptions use postgres-compatible text types" 
     const rendered = try timestampNsTextAlloc(std.testing.allocator, 123_456_789);
     defer std.testing.allocator.free(rendered);
     try std.testing.expectEqualStrings("1970-01-01T00:00:00.123456Z", rendered);
+}
+
+test "pgwire sqlstate mapping preserves postgres error classes" {
+    const cases = [_]struct {
+        status: u16,
+        body: []const u8,
+        sqlstate: []const u8,
+    }{
+        .{ .status = 400, .body = "current transaction is aborted", .sqlstate = "25P02" },
+        .{ .status = 400, .body = "cannot execute write statement in a read-only transaction", .sqlstate = "25006" },
+        .{ .status = 501, .body = "unsupported sql statement", .sqlstate = "0A000" },
+        .{ .status = 400, .body = "document_sql_unsupported_join", .sqlstate = "0A000" },
+        .{ .status = 404, .body = "not found", .sqlstate = "42P01" },
+        .{ .status = 400, .body = "invalid sql request", .sqlstate = "42601" },
+        .{ .status = 400, .body = "invalid sql write", .sqlstate = "22023" },
+        .{ .status = 408, .body = "sql statement timeout", .sqlstate = "57014" },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqualStrings(case.sqlstate, sqlstateForHttpResponse(case.status, case.body));
+    }
 }

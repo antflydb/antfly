@@ -63,6 +63,8 @@ pub const GeneratedSqlDdlKind = enum {
     create_publication,
     create_subscription,
     create_policy,
+    create_function,
+    create_procedure,
     create_index,
     create_extension,
     alter_table,
@@ -85,6 +87,8 @@ pub const GeneratedSqlDdlKind = enum {
     drop_publication,
     drop_subscription,
     drop_policy,
+    drop_function,
+    drop_procedure,
     drop_index,
     drop_schema,
     drop_database,
@@ -1586,6 +1590,9 @@ pub const simple_ddl_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CREATE PUBLICATION usage_pub FOR TABLE usage_records", .kind = .ddl },
     .{ .sql = "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=example dbname=usage' PUBLICATION usage_pub", .kind = .ddl },
     .{ .sql = "CREATE POLICY usage_policy ON usage_records USING (tenant_id = current_user)", .kind = .ddl },
+    .{ .sql = "CREATE FUNCTION audit_changes() RETURNS trigger LANGUAGE plpgsql", .kind = .ddl },
+    .{ .sql = "CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger LANGUAGE plpgsql", .kind = .ddl },
+    .{ .sql = "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql", .kind = .ddl },
     .{ .sql = "ALTER TABLE usage_records ADD COLUMN status text", .kind = .ddl },
     .{ .sql = "ALTER TABLE IF EXISTS ONLY usage_records DROP COLUMN IF EXISTS status RESTRICT", .kind = .ddl },
     .{ .sql = "ALTER VIEW active_usage RENAME TO active_usage_v2", .kind = .ddl },
@@ -1605,6 +1612,8 @@ pub const simple_ddl_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "DROP PUBLICATION IF EXISTS usage_pub", .kind = .ddl },
     .{ .sql = "DROP SUBSCRIPTION IF EXISTS usage_sub", .kind = .ddl },
     .{ .sql = "DROP POLICY IF EXISTS usage_policy ON usage_records", .kind = .ddl },
+    .{ .sql = "DROP FUNCTION IF EXISTS audit_changes(text) CASCADE", .kind = .ddl },
+    .{ .sql = "DROP PROCEDURE rotate_usage()", .kind = .ddl },
     .{ .sql = "REFRESH MATERIALIZED VIEW usage_summary", .kind = .ddl },
     .{ .sql = "DROP INDEX usage_records_status_idx", .kind = .extension_index },
     .{ .sql = "DROP EXTENSION vector", .kind = .extension_index },
@@ -1997,6 +2006,8 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (generatedCreateTableTargetRange(tokens, 0, statementTokenEnd(tokens)) != null) return .{ .ddl = .create_table };
         const second = tokens[1];
         if (second.matchesKeywordTag(.@"or") and tokens.len > 3 and tokens[2].matchesKeywordTag(.replace) and tokens[3].matchesKeywordTag(.view)) return .{ .ddl = .create_view };
+        if (second.matchesKeywordTag(.@"or") and tokens.len > 3 and tokens[2].matchesKeywordTag(.replace) and tokens[3].matchesKeywordTag(.function)) return .{ .ddl = .create_function };
+        if (second.matchesKeywordTag(.@"or") and tokens.len > 3 and tokens[2].matchesKeywordTag(.replace) and tokens[3].matchesKeywordTag(.procedure)) return .{ .ddl = .create_procedure };
         if (second.matchesKeywordTag(.database)) return .{ .ddl = .create_database };
         if (second.matchesKeywordTag(.schema)) return .{ .ddl = .create_schema };
         if (second.matchesKeywordTag(.table)) return .{ .ddl = .create_table };
@@ -2009,6 +2020,8 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.publication)) return .{ .ddl = .create_publication };
         if (second.matchesKeywordTag(.subscription)) return .{ .ddl = .create_subscription };
         if (second.matchesKeywordTag(.policy)) return .{ .ddl = .create_policy };
+        if (second.matchesKeywordTag(.function)) return .{ .ddl = .create_function };
+        if (second.matchesKeywordTag(.procedure)) return .{ .ddl = .create_procedure };
         if (second.matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
         if (second.matchesKeywordTag(.unique) and tokens.len > 2 and tokens[2].matchesKeywordTag(.index)) return .{ .extension_index = .create_index };
         if (second.matchesKeywordTag(.foreign) and tokens.len > 2 and tokens[2].matchesKeywordTag(.table)) return .{ .unsupported = .create_foreign_table };
@@ -2075,6 +2088,8 @@ fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
         if (second.matchesKeywordTag(.tablespace)) return .{ .ddl = .drop_tablespace };
         if (second.matchesKeywordTag(.publication)) return .{ .ddl = .drop_publication };
         if (second.matchesKeywordTag(.subscription)) return .{ .ddl = .drop_subscription };
+        if (second.matchesKeywordTag(.function)) return .{ .ddl = .drop_function };
+        if (second.matchesKeywordTag(.procedure)) return .{ .ddl = .drop_procedure };
         if (second.matchesKeywordTag(.index)) return .{ .extension_index = .drop_index };
         if (second.matchesKeywordTag(.schema)) return .{ .ddl = .drop_schema };
         if (second.matchesKeywordTag(.database)) return .{ .ddl = .drop_database };
@@ -2608,6 +2623,20 @@ fn buildDdlAst(
                 }
             }
         },
+        .create_function, .create_procedure => {
+            index = 1;
+            if (index + 2 < end and tokens[index].matchesKeywordTag(.@"or") and tokens[index + 1].matchesKeywordTag(.replace)) {
+                ast.replace_existing = true;
+                index += 2;
+            }
+            if (index < end and (tokens[index].matchesKeywordTag(.function) or tokens[index].matchesKeywordTag(.procedure))) {
+                index += 1;
+            }
+            ast.object_name_tokens = generatedQualifiedNameRange(tokens, index, end);
+            if (ast.object_name_tokens) |routine_range| {
+                if (routine_range.end < end) ast.alter_table_operation_tokens = .{ .start = routine_range.end, .end = end };
+            }
+        },
         .create_index => {
             if (tokens.len > 2 and tokens[1].matchesKeywordTag(.unique) and tokens[2].matchesKeywordTag(.index)) {
                 ast.unique = true;
@@ -2809,6 +2838,14 @@ fn buildDdlAst(
                     }
                 }
             }
+        },
+        .drop_function, .drop_procedure => {
+            ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
+            ast.object_name_tokens = generatedQualifiedNameRange(tokens, index, end);
+            if (ast.object_name_tokens) |routine_range| {
+                if (routine_range.end < end) ast.alter_table_operation_tokens = .{ .start = routine_range.end, .end = end };
+            }
+            ast.cascade = findKeyword(tokens, index + 1, end, .cascade) != null;
         },
         .drop_index => {
             ast.if_exists = consumeGeneratedIfExists(tokens, &index, end);
@@ -6097,6 +6134,11 @@ test "generated SQL parser facade exposes typed statement nodes" {
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_policy }, (try parseSqlAlloc(alloc, "CREATE POLICY usage_policy ON usage_records USING (tenant_id = current_user)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_policy }, (try parseSqlAlloc(alloc, "ALTER POLICY usage_policy ON usage_records RENAME TO usage_policy_v2")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_policy }, (try parseSqlAlloc(alloc, "DROP POLICY IF EXISTS usage_policy ON usage_records")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_function }, (try parseSqlAlloc(alloc, "CREATE FUNCTION audit_changes() RETURNS trigger LANGUAGE plpgsql")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_function }, (try parseSqlAlloc(alloc, "CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger LANGUAGE plpgsql")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .create_procedure }, (try parseSqlAlloc(alloc, "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_function }, (try parseSqlAlloc(alloc, "DROP FUNCTION IF EXISTS audit_changes(text) CASCADE")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .drop_procedure }, (try parseSqlAlloc(alloc, "DROP PROCEDURE rotate_usage()")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .relation_population }, (try parseSqlAlloc(alloc, "SELECT account_id, total INTO usage_archive FROM usage_records WHERE total > 10")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .relation_population }, (try parseSqlAlloc(alloc, "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT account_id FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .ddl = .alter_schema }, (try parseSqlAlloc(alloc, "ALTER SCHEMA analytics RENAME TO reporting")).statement);

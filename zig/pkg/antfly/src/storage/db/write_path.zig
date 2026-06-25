@@ -3922,6 +3922,286 @@ test "db write path bulk ingest finish publishes primary store before external d
     try std.testing.expect(result.total_hits > 0);
 }
 
+test "db write path document artifact child range applies batch without source row write" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    const artifact_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "document_units_v1", "page:000001");
+    defer alloc.free(artifact_key);
+    const artifact_value =
+        "{\"_parent_doc_key\":\"doc:a\",\"_artifact_name\":\"document_units_v1\",\"_artifact_range_id\":\"range:000000\",\"_artifact_range_kind\":\"unit\",\"_artifact_route_status\":\"remote_committed\",\"_artifact_owner_group_id\":7002,\"unit_id\":\"page:000001\",\"text\":\"alpha\"}";
+    const writes = [_]types.BatchWrite{.{
+        .key = artifact_key,
+        .value = artifact_value,
+    }};
+
+    const sequence = try db.applyDocumentArtifactChildRangeBatch(.{
+        .artifact_writes = writes[0..],
+        .sync_level = .write,
+    });
+    try std.testing.expect(sequence > 0);
+
+    const stored = try db.core.store.get(alloc, artifact_key);
+    defer alloc.free(stored);
+    try std.testing.expectEqualStrings(artifact_value, stored);
+
+    const source_store_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+    defer alloc.free(source_store_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, source_store_key));
+
+    const deletes = [_][]const u8{artifact_key};
+    const delete_sequence = try db.applyDocumentArtifactChildRangeBatch(.{
+        .artifact_delete_keys = deletes[0..],
+        .sync_level = .write,
+    });
+    try std.testing.expect(delete_sequence > sequence);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, artifact_key));
+}
+
+test "db write path document artifact child range dispatches generated artifacts to remote owner" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGE=\"}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    try std.testing.expect(try db.updateDocumentArtifactChildRangePlacement(alloc, "doc:a", "document_units_v1", .{
+        .range_id = "range:000000",
+        .placement = "remote",
+        .owner_group_id = 7002,
+        .placement_generation = 7,
+        .route_status = "remote_committed",
+        .split_eligible = true,
+    }));
+
+    var moved = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer moved.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), moved.child_ranges.len);
+    const remote_unit_key = try alloc.dupe(u8, moved.child_ranges[0].start_key);
+    defer alloc.free(remote_unit_key);
+
+    const local_deletes = [_][]const u8{remote_unit_key};
+    _ = try db.applyDocumentArtifactChildRangeBatch(.{
+        .artifact_delete_keys = local_deletes[0..],
+        .sync_level = .write,
+    });
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, remote_unit_key));
+
+    const Capture = struct {
+        calls: usize = 0,
+        owner_group_id: u64 = 0,
+        artifact_writes: usize = 0,
+        artifact_delete_keys: usize = 0,
+        documents: usize = 0,
+        dense_embeddings: usize = 0,
+        sparse_embeddings: usize = 0,
+        first_key: ?[]u8 = null,
+        first_value: ?[]u8 = null,
+
+        fn deinit(self: *@This(), allocator: Allocator) void {
+            if (self.first_key) |key| allocator.free(key);
+            if (self.first_value) |value| allocator.free(value);
+        }
+
+        fn dispatcher(self: *@This()) DocumentArtifactChildRangeDispatcher {
+            return .{ .ptr = self, .apply = apply };
+        }
+
+        fn apply(ptr: *anyopaque, allocator: Allocator, dispatch: DocumentArtifactChildRangeDispatch) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.owner_group_id = dispatch.owner_group_id;
+            self.artifact_writes += dispatch.child_batch.artifact_writes.len;
+            self.artifact_delete_keys += dispatch.child_batch.artifact_delete_keys.len;
+            self.documents += dispatch.child_batch.documents.len;
+            self.dense_embeddings += dispatch.child_batch.dense_embeddings.len;
+            self.sparse_embeddings += dispatch.child_batch.sparse_embeddings.len;
+            if (self.first_key == null and dispatch.child_batch.artifact_writes.len > 0) {
+                self.first_key = try allocator.dupe(u8, dispatch.child_batch.artifact_writes[0].key);
+                errdefer {
+                    allocator.free(self.first_key.?);
+                    self.first_key = null;
+                }
+                self.first_value = try allocator.dupe(u8, dispatch.child_batch.artifact_writes[0].value);
+            }
+        }
+    };
+
+    var capture = Capture{};
+    defer capture.deinit(alloc);
+
+    try db.batchWithDocumentArtifactChildRangeDispatcher(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YmV0YQ==\"}",
+        }},
+        .sync_level = .full_index,
+    }, capture.dispatcher());
+
+    try std.testing.expectEqual(@as(usize, 1), capture.calls);
+    try std.testing.expectEqual(@as(u64, 7002), capture.owner_group_id);
+    try std.testing.expectEqual(@as(usize, 1), capture.artifact_writes);
+    try std.testing.expectEqual(@as(usize, 0), capture.artifact_delete_keys);
+    try std.testing.expectEqualStrings(remote_unit_key, capture.first_key.?);
+    try std.testing.expect(std.mem.indexOf(u8, capture.first_value.?, "\"_artifact_route_status\":\"remote_committed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.first_value.?, "\"_artifact_owner_group_id\":7002") != null);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, remote_unit_key));
+}
+
+test "db write path document artifact child range retries remote dispatch from durable outbox" {
+    const alloc = std.testing.allocator;
+    const DB = @import("mod.zig").DB;
+    const db_test_support = @import("test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YWxwaGE=\"}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    try std.testing.expect(try db.updateDocumentArtifactChildRangePlacement(alloc, "doc:a", "document_units_v1", .{
+        .range_id = "range:000000",
+        .placement = "remote",
+        .owner_group_id = 7002,
+        .placement_generation = 7,
+        .route_status = "remote_committed",
+        .split_eligible = true,
+    }));
+
+    var moved = (try db.getDocumentArtifactManifest(alloc, "doc:a", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer moved.deinit(alloc);
+    const remote_unit_key = try alloc.dupe(u8, moved.child_ranges[0].start_key);
+    defer alloc.free(remote_unit_key);
+
+    const local_deletes = [_][]const u8{remote_unit_key};
+    _ = try db.applyDocumentArtifactChildRangeBatch(.{
+        .artifact_delete_keys = local_deletes[0..],
+        .sync_level = .write,
+    });
+
+    const FlakyCapture = struct {
+        fail_next: bool = true,
+        calls: usize = 0,
+        owner_group_id: u64 = 0,
+        artifact_writes: usize = 0,
+        first_key: ?[]u8 = null,
+
+        fn deinit(self: *@This(), allocator: Allocator) void {
+            if (self.first_key) |key| allocator.free(key);
+        }
+
+        fn dispatcher(self: *@This()) DocumentArtifactChildRangeDispatcher {
+            return .{ .ptr = self, .apply = apply };
+        }
+
+        fn apply(ptr: *anyopaque, allocator: Allocator, dispatch: DocumentArtifactChildRangeDispatch) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.fail_next) {
+                self.fail_next = false;
+                return error.IntentionalDispatchFailure;
+            }
+            self.owner_group_id = dispatch.owner_group_id;
+            self.artifact_writes += dispatch.child_batch.artifact_writes.len;
+            if (self.first_key == null and dispatch.child_batch.artifact_writes.len > 0) {
+                self.first_key = try allocator.dupe(u8, dispatch.child_batch.artifact_writes[0].key);
+            }
+        }
+    };
+
+    var capture = FlakyCapture{};
+    defer capture.deinit(alloc);
+
+    try std.testing.expectError(error.IntentionalDispatchFailure, db.batchWithDocumentArtifactChildRangeDispatcher(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YmV0YQ==\"}",
+        }},
+        .sync_level = .full_index,
+    }, capture.dispatcher()));
+
+    const outbox_prefix = try internal_keys.documentChildRangeOutboxRootPrefixAlloc(alloc);
+    defer alloc.free(outbox_prefix);
+    const pending = try db.core.scanStorePrefix(alloc, outbox_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, pending);
+    try std.testing.expectEqual(@as(usize, 1), pending.len);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, remote_unit_key));
+
+    const drained = try db.drainDocumentArtifactChildRangeOutbox(capture.dispatcher(), 0);
+    try std.testing.expectEqual(@as(usize, 1), drained.scanned);
+    try std.testing.expectEqual(@as(usize, 1), drained.dispatched);
+    try std.testing.expectEqual(@as(usize, 1), drained.deleted);
+    try std.testing.expectEqual(@as(usize, 2), capture.calls);
+    try std.testing.expectEqual(@as(u64, 7002), capture.owner_group_id);
+    try std.testing.expectEqual(@as(usize, 1), capture.artifact_writes);
+    try std.testing.expectEqualStrings(remote_unit_key, capture.first_key.?);
+
+    const after = try db.core.scanStorePrefix(alloc, outbox_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, after);
+    try std.testing.expectEqual(@as(usize, 0), after.len);
+}
+
 test "db write path replay buildDerivedBatch stores thin document and embedding replay records" {
     const alloc = std.testing.allocator;
 

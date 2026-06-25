@@ -2471,6 +2471,73 @@ test "sql adapter parsed sql owns typed statement variants" {
         else => return error.TestUnexpectedResult,
     }
 
+    var create_function = try ParsedSql.initAlloc(alloc, "CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger LANGUAGE plpgsql");
+    defer create_function.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, create_function.generatedStatementKind().?);
+    switch (create_function.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_function, ddl_ast.kind);
+            try std.testing.expect(ddl_ast.replace_existing);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 11 }, ddl_ast.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (create_function.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_function = try ParsedSql.initAlloc(alloc, "DROP FUNCTION IF EXISTS audit_changes(text) CASCADE");
+    defer drop_function.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, drop_function.generatedStatementKind().?);
+    switch (drop_function.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.drop_function, ddl_ast.kind);
+            try std.testing.expect(ddl_ast.if_exists);
+            try std.testing.expect(ddl_ast.cascade);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 4, .end = 5 }, ddl_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 9 }, ddl_ast.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (drop_function.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var create_procedure = try ParsedSql.initAlloc(alloc, "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql");
+    defer create_procedure.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, create_procedure.generatedStatementKind().?);
+    switch (create_procedure.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.create_procedure, ddl_ast.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 7 }, ddl_ast.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (create_procedure.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_procedure = try ParsedSql.initAlloc(alloc, "DROP PROCEDURE rotate_usage()");
+    defer drop_procedure.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, drop_procedure.generatedStatementKind().?);
+    switch (drop_procedure.generated_statement.?.ast.?) {
+        .ddl => |ddl_ast| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlDdlKind.drop_procedure, ddl_ast.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, ddl_ast.object_name_tokens.?);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 5 }, ddl_ast.alter_table_operation_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (drop_procedure.statement) {
+        .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
     var create_materialized_view = try ParsedSql.initAlloc(alloc, "CREATE MATERIALIZED VIEW IF NOT EXISTS usage_summary AS SELECT status FROM usage_records WITH NO DATA");
     defer create_materialized_view.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.ddl, create_materialized_view.generatedStatementKind().?);

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import struct
 import subprocess
@@ -216,6 +217,34 @@ def test_antfly_sql_can_use_http_host_port_and_pgwire(pgwire_server, antfly_bin)
     assert select_response["result"]["rows"] == [{"id": "row:a", "amount": "10"}]
 
 
+def test_pgx_default_extended_query_mode(pgwire_server):
+    if shutil.which("go") is None:
+        pytest.skip("go binary not available for pgx smoke")
+
+    smoke_dir = Path(__file__).parent / "pgx_smoke"
+    env = os.environ.copy()
+    env["GOCACHE"] = env.get("GOCACHE", "/tmp/antfly-pgx-e2e-gocache")
+    env["GOWORK"] = "off"
+    env["GOPROXY"] = "off"
+    env["GOSUMDB"] = "off"
+    result = subprocess.run(
+        ["go", "run", "-mod=readonly", ".", pgwire_server.host, str(pgwire_server.pgwire_port)],
+        cwd=smoke_dir,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+    )
+    if result.returncode != 0:
+        raise AssertionError(
+            f"pgx smoke failed (exit {result.returncode})\n"
+            f"stdout: {result.stdout}\n"
+            f"stderr: {result.stderr}\n"
+            f"server logs:\n{pgwire_server.debug_logs()[-4000:]}"
+        )
+    assert "pgx default extended query smoke passed" in result.stdout
+
+
 def test_pgwire_simple_query_accepts_multiple_statements(pgwire_server):
     table = _table_name("pgwire_multi")
     sql = (
@@ -265,7 +294,9 @@ def test_pgwire_failed_transaction_reports_error_status_until_rollback(pgwire_se
 
     assert [message["status"] for message in begin_messages if message["type"] == "ready"] == ["T"]
     assert [message["status"] for message in missing_messages if message["type"] == "ready"] == ["E"]
+    assert [message["sqlstate"] for message in missing_messages if message["type"] == "error"] == ["42P01"]
     assert [message["status"] for message in blocked_messages if message["type"] == "ready"] == ["E"]
+    assert [message["sqlstate"] for message in blocked_messages if message["type"] == "error"] == ["25P02"]
     assert any("current transaction is aborted" in message["message"] for message in blocked_messages if message["type"] == "error")
     assert [message["status"] for message in rollback_messages if message["type"] == "ready"] == ["I"]
     assert [message["tag"] for message in create_messages if message["type"] == "command"] == ["CREATE TABLE"]

@@ -108,6 +108,12 @@ retained policy-name, target-table, operation-tail, `IF EXISTS`, and
 drop-behavior metadata before delegating to the existing typed row-security
 catalog planner, including routine-backed policy predicates that require
 parser-context function bindings.
+Routine catalog DDL heads, including `CREATE FUNCTION`,
+`CREATE OR REPLACE FUNCTION`, `CREATE PROCEDURE`, `DROP FUNCTION`, and
+`DROP PROCEDURE`, now use the generated DDL boundary with retained routine
+name, signature-tail, replace, `IF EXISTS`, and cascade metadata before
+delegating routine option/body semantics to the existing typed routine catalog
+planner.
 Generated
 `CREATE INDEX` ASTs also retain
 `UNIQUE`, method, element-list, covering-index `INCLUDE (...)`, options, and
@@ -381,7 +387,12 @@ validated generated DDL AST nodes for
 policy predicates that require parser-context function bindings, and fail
 closed if generated kind, span, policy name, target table, tail, `IF EXISTS`,
 or cascade metadata is corrupted before
-delegating to the typed row-security catalog planner. Notification channel
+delegating to the typed row-security catalog planner. Legacy-supported routine
+catalog operations use validated generated DDL AST nodes for `CREATE FUNCTION`,
+`CREATE OR REPLACE FUNCTION`, `CREATE PROCEDURE`, `DROP FUNCTION`, and
+`DROP PROCEDURE`, and fail closed if generated kind, span, routine name,
+signature tail, replace, `IF EXISTS`, or cascade metadata is corrupted before
+delegating to the typed routine catalog planner. Notification channel
 commands also use the validated unsupported boundary for `LISTEN`, `NOTIFY`,
 and `UNLISTEN` before delegating to typed notification catalog planning.
 Authorization and utility commands use it for `GRANT`, `REVOKE`, `COMMENT`,
@@ -1070,6 +1081,9 @@ Generated grammar work needs evidence at multiple levels:
   `DROP MATERIALIZED VIEW`, and `REFRESH MATERIALIZED VIEW`,
   generated row-security policy catalog DDL for `CREATE POLICY`,
   `ALTER POLICY`, and `DROP POLICY`,
+  generated routine catalog DDL for `CREATE FUNCTION`,
+  `CREATE OR REPLACE FUNCTION`, `CREATE PROCEDURE`, `DROP FUNCTION`, and
+  `DROP PROCEDURE`,
   `DROP INDEX`, generated domain catalog DDL for `CREATE DOMAIN`,
   `ALTER DOMAIN`, and `DROP DOMAIN`, generated sequence catalog DDL for
   `CREATE SEQUENCE`, `ALTER SEQUENCE`, and `DROP SEQUENCE`, generated

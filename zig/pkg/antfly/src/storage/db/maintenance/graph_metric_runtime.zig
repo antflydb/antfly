@@ -6818,6 +6818,1419 @@ test "db graph metric runtime background cycles multiple worker ids across plann
     try std.testing.expectApproxEqAbs(@as(f64, 130.0), metric_result.graph_metric_results[0].scores[0].score, 0.001);
 }
 
+test "db graph metric runtime planned scheduler does not auto retry failed graph metric generation" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .graph_metric_idle_maintenance = .planned,
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 1), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    const start = try db.runGraphMetricPlannedCoordinatorSweep(.{
+        .max_metrics = 8,
+        .start_background_builds = true,
+    });
+    try std.testing.expectEqual(@as(usize, 1), start.builds_started);
+    try std.testing.expectEqual(@as(usize, 1), start.active_builds);
+
+    var failed = try db.failGraphMetricPlannedBuild(alloc, "graph_idx", "pagerank", error.InvalidGraphMetricBuildManifest);
+    defer failed.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, failed.state);
+    try std.testing.expect(failed.build_queued);
+    try std.testing.expectEqualStrings("InvalidGraphMetricBuildManifest", failed.last_error);
+    const failed_target_generation = failed.target_edge_generation;
+
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, false, 0, 0, 0, 0);
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+        try std.testing.expectEqual(@as(usize, 0), pending.queued_builds);
+        try std.testing.expectEqual(@as(usize, 0), pending.active_builds);
+    }
+
+    const duplicate = try db.runGraphMetricPlannedCoordinatorSweep(.{
+        .max_metrics = 8,
+        .start_background_builds = true,
+    });
+    try std.testing.expectEqual(@as(usize, 0), duplicate.builds_started);
+    try std.testing.expectEqual(@as(usize, 0), duplicate.active_builds);
+    try std.testing.expectEqual(@as(usize, 0), duplicate.coordinator_steps);
+    try std.testing.expect(!duplicate.durableProgressed());
+
+    {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, status.state);
+        try std.testing.expectEqual(failed_target_generation, status.target_edge_generation);
+        try std.testing.expectEqual(@as(u64, 0), status.build_job_id);
+        var failed_events: usize = 0;
+        for (status.recent_events) |event| {
+            if (event.kind == .failed) failed_events += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), failed_events);
+    }
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:e",
+            .value = "{\"title\":\"epsilon\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}",
+        }},
+        .sync_level = .write,
+    });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    try expectPlannedAutoIdleDecision(db.core.index_manager, db.graph_metric_idle_auto_options, true, 0, 1, 0, 0);
+    const retry_new_generation = try db.runGraphMetricPlannedCoordinatorSweep(.{
+        .max_metrics = 8,
+        .start_background_builds = true,
+    });
+    try std.testing.expectEqual(@as(usize, 1), retry_new_generation.builds_started);
+    {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
+        try std.testing.expect(status.building_generation > failed_target_generation);
+    }
+}
+
+test "db graph metric runtime planned scheduler boundary completes degree by name" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"manual_degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"manual\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+
+    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "manual_degree", target_generation);
+    defer started.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+    try std.testing.expectEqual(target_generation, started.building_generation);
+
+    const workers = [_][]const u8{ "worker-a", "worker-b" };
+    var step_index: usize = 0;
+    var published = false;
+    while (step_index < 1000) : (step_index += 1) {
+        const now_ms: u64 = 1000 + @as(u64, @intCast(step_index)) * 2;
+        const worker_step = try db.runGraphMetricPlannedWorkerPageStepAt("graph_idx", "manual_degree", workers[step_index % workers.len], now_ms);
+        try std.testing.expect(!worker_step.advanced_phase);
+        if (worker_step.completed_build) {
+            try std.testing.expect(worker_step.phase == .complete or worker_step.phase == .cleanup_old_generations);
+            published = true;
+            break;
+        }
+
+        const coordinator_step = try db.runGraphMetricPlannedCoordinatorStepAt("graph_idx", "manual_degree", now_ms + 1);
+        if (coordinator_step.completed_build) {
+            published = true;
+            break;
+        }
+
+        const progressed =
+            worker_step.claimed_page or
+            worker_step.completed_page or
+            coordinator_step.advanced_phase;
+        if (!progressed and worker_step.phase != .cleanup_old_generations) return error.GraphMetricBuildNoEligiblePage;
+    }
+    try std.testing.expect(published);
+
+    var published_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "central",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "manual_degree",
+                .top_k = 3,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer published_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), published_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, published_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, published_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(@as(usize, 3), published_result.graph_metric_results[0].scores.len);
+    try std.testing.expectEqualStrings("doc:b", published_result.graph_metric_results[0].scores[0].node);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), published_result.graph_metric_results[0].scores[0].score, 0.001);
+}
+
+test "db graph metric runtime planned scheduler sweeps active degree work" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"degree\":{\"enabled\":true,\"kind\":\"degree\",\"refresh\":\"manual\",\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "degree", target_generation);
+    defer started.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+    try std.testing.expectEqual(target_generation, started.building_generation);
+
+    const start = try db.runGraphMetricPlannedCoordinatorSweep(.{
+        .max_metrics = 8,
+        .start_background_builds = false,
+    });
+    try std.testing.expectEqual(@as(usize, 1), start.metrics_scanned);
+    try std.testing.expectEqual(@as(usize, 0), start.builds_started);
+    try std.testing.expect(start.active_builds > 0);
+
+    const workers = [_][]const u8{ "sweep-worker-a", "sweep-worker-b" };
+    var finished = false;
+    var saw_coordinator_publish = false;
+    var step_index: usize = 0;
+    while (step_index < 1000) : (step_index += 1) {
+        const worker = try db.runGraphMetricPlannedWorkerSweep(.{
+            .worker_id = workers[step_index % workers.len],
+            .max_pages = 1,
+        });
+        try std.testing.expectEqual(@as(usize, 0), worker.published);
+        const coordinator = try db.runGraphMetricPlannedCoordinatorSweep(.{
+            .max_metrics = 8,
+            .start_background_builds = false,
+        });
+        if (coordinator.published > 0) saw_coordinator_publish = true;
+        {
+            const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("degree");
+            defer status.deinit(alloc);
+            if (status.state == .fresh and status.published_generation != 0 and status.phase == .complete) {
+                finished = true;
+                break;
+            }
+        }
+        if (!worker.progressed() and !coordinator.progressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(finished);
+    try std.testing.expect(saw_coordinator_publish);
+
+    var published_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "central",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 3,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer published_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), published_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, published_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(@as(usize, 3), published_result.graph_metric_results[0].scores.len);
+    try std.testing.expectEqualStrings("doc:b", published_result.graph_metric_results[0].scores[0].node);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), published_result.graph_metric_results[0].scores[0].score, 0.001);
+}
+
+test "db graph metric runtime planned scheduler sweeps active pagerank work" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"manual\",\"max_iterations\":20,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        break :blk graph_entry.index.edge_generation;
+    };
+    var started = try db.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "pagerank", target_generation);
+    defer started.deinit(alloc);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+    try std.testing.expectEqual(target_generation, started.building_generation);
+
+    const workers = [_][]const u8{ "pagerank-sweep-a", "pagerank-sweep-b", "pagerank-sweep-c" };
+    var finished = false;
+    var step_index: usize = 0;
+    while (step_index < 2000) : (step_index += 1) {
+        const worker = try db.runGraphMetricPlannedWorkerSweep(.{
+            .worker_id = workers[step_index % workers.len],
+            .max_pages = 1,
+        });
+        const coordinator = try db.runGraphMetricPlannedCoordinatorSweep(.{
+            .max_metrics = 8,
+            .start_background_builds = false,
+        });
+        {
+            const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("pagerank");
+            defer status.deinit(alloc);
+            if (status.state == .fresh and status.published_generation != 0 and status.phase == .complete) {
+                try std.testing.expect(status.iterations_completed > 0);
+                finished = true;
+                break;
+            }
+        }
+        if (!worker.progressed() and !coordinator.progressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(finished);
+
+    var published_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "central",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer published_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), published_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, published_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, published_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(@as(usize, 2), published_result.graph_metric_results[0].scores.len);
+    try std.testing.expectEqualStrings("doc:d", published_result.graph_metric_results[0].scores[0].node);
+    try std.testing.expect(published_result.graph_metric_results[0].scores[0].score >= published_result.graph_metric_results[0].scores[1].score);
+}
+
+test "db graph metric runtime planned scheduler sweeps pagerank across reopened handles" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var target_generation: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph_idx",
+            .kind = .graph,
+            .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"manual\",\"max_iterations\":20,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+            },
+            .sync_level = .write,
+        });
+        try db.runUntilIdle();
+
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        target_generation = graph_entry.index.edge_generation;
+    }
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "pagerank", target_generation);
+        defer started.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+        try std.testing.expectEqual(target_generation, started.building_generation);
+
+        const initial_tick = try coordinator.runGraphMetricPlannedCoordinatorSweep(.{
+            .max_metrics = 8,
+            .start_background_builds = false,
+        });
+        try std.testing.expect(initial_tick.active_builds > 0);
+    }
+
+    const workers = [_][]const u8{ "reopened-pagerank-a", "reopened-pagerank-b", "reopened-pagerank-c" };
+    var finished = false;
+    var step_index: usize = 0;
+    while (step_index < 2000) : (step_index += 1) {
+        const worker = blk: {
+            var worker_db = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer worker_db.close();
+            break :blk try worker_db.runGraphMetricPlannedWorkerSweep(.{
+                .worker_id = workers[step_index % workers.len],
+                .max_pages = 1,
+            });
+        };
+
+        const coordinator = blk: {
+            var coordinator_db = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer coordinator_db.close();
+            const sweep = try coordinator_db.runGraphMetricPlannedCoordinatorSweep(.{
+                .max_metrics = 8,
+                .start_background_builds = false,
+            });
+            {
+                const graph_entry = coordinator_db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+                var status = try graph_entry.index.graphMetricStatus("pagerank");
+                defer status.deinit(alloc);
+                if (status.state == .fresh and status.published_generation != 0 and status.phase == .complete) {
+                    try std.testing.expectEqual(target_generation, status.published_generation);
+                    try std.testing.expect(status.iterations_completed > 0);
+                    finished = true;
+                }
+            }
+            break :blk sweep;
+        };
+        if (finished) break;
+        if (!worker.progressed() and !coordinator.progressed()) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(finished);
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        var published_result = try reader.search(alloc, .{
+            .graph_metric_queries = &.{.{
+                .name = "central",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "pagerank",
+                    .top_k = 2,
+                    .freshness = .fresh,
+                },
+            }},
+            .limit = 0,
+        });
+        defer published_result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), published_result.graph_metric_results.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, published_result.graph_metric_results[0].status.state);
+        try std.testing.expectEqual(target_generation, published_result.graph_metric_results[0].status.published_generation);
+        try std.testing.expectEqual(@as(usize, 2), published_result.graph_metric_results[0].scores.len);
+        try std.testing.expectEqualStrings("doc:d", published_result.graph_metric_results[0].scores[0].node);
+        try std.testing.expect(published_result.graph_metric_results[0].scores[0].score >= published_result.graph_metric_results[0].scores[1].score);
+    }
+}
+
+test "db graph metric runtime planned scheduler reopened coordinators do not duplicate pagerank publish" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var target_generation: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph_idx",
+            .kind = .graph,
+            .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+            },
+            .sync_level = .write,
+        });
+        try db.runUntilIdle();
+
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        target_generation = graph_entry.index.edge_generation;
+    }
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "pagerank", target_generation);
+        defer started.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+        try std.testing.expectEqual(target_generation, started.building_generation);
+    }
+
+    const workers = [_][]const u8{ "db-publish-race-worker-a", "db-publish-race-worker-b" };
+    var reached_publish = false;
+    var step_index: usize = 0;
+    while (step_index < 400) : (step_index += 1) {
+        const worker = blk: {
+            var worker_db = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer worker_db.close();
+            break :blk try worker_db.runGraphMetricPlannedWorkerPageStep("graph_idx", "pagerank", workers[step_index % workers.len]);
+        };
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("pagerank");
+            defer status.deinit(alloc);
+            if (status.phase == .publish_generation) {
+                reached_publish = true;
+                break;
+            }
+        }
+
+        const coordinator = blk: {
+            var coordinator_db = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer coordinator_db.close();
+            break :blk try coordinator_db.runGraphMetricPlannedCoordinatorStep("graph_idx", "pagerank");
+        };
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("pagerank");
+            defer status.deinit(alloc);
+            if (status.phase == .publish_generation) {
+                reached_publish = true;
+                break;
+            }
+        }
+
+        if (!worker.claimed_page and !worker.completed_page and !coordinator.advanced_phase) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(reached_publish);
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        const publish = try coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "pagerank");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.publish_generation, publish.phase);
+        try std.testing.expect(publish.advanced_phase);
+
+        const graph_entry = coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, status.phase);
+        try std.testing.expectEqual(target_generation, status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), status.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, status.recent_events[0].kind);
+    }
+
+    {
+        var duplicate_coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer duplicate_coordinator.close();
+
+        const duplicate = try duplicate_coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "pagerank");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, duplicate.phase);
+        try std.testing.expect(!duplicate.advanced_phase);
+        try std.testing.expect(!duplicate.published);
+
+        const graph_entry = duplicate_coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, status.phase);
+        try std.testing.expectEqual(target_generation, status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), status.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, status.recent_events[0].kind);
+    }
+
+    {
+        var worker_db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer worker_db.close();
+
+        var cleanup_finished = false;
+        for (0..12) |_| {
+            const cleanup = try worker_db.runGraphMetricPlannedWorkerPageStep("graph_idx", "pagerank", "db-publish-race-cleaner");
+            try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, cleanup.phase);
+            try std.testing.expect(!cleanup.advanced_phase);
+            if (cleanup.published) {
+                cleanup_finished = true;
+                break;
+            }
+        }
+        try std.testing.expect(cleanup_finished);
+    }
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, status.phase);
+        try std.testing.expectEqual(target_generation, status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), status.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, status.recent_events[0].kind);
+
+        var published_result = try reader.search(alloc, .{
+            .graph_metric_queries = &.{.{
+                .name = "central",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "pagerank",
+                    .top_k = 2,
+                    .freshness = .fresh,
+                },
+            }},
+            .limit = 0,
+        });
+        defer published_result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), published_result.graph_metric_results.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, published_result.graph_metric_results[0].status.state);
+        try std.testing.expectEqual(target_generation, published_result.graph_metric_results[0].status.published_generation);
+        try std.testing.expectEqual(@as(usize, 2), published_result.graph_metric_results[0].scores.len);
+    }
+}
+
+test "db graph metric runtime planned scheduler reopened coordinators do not duplicate eigenvector publish" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var target_generation: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph_idx",
+            .kind = .graph,
+            .config_json = "{\"metrics\":{\"eigenvector\":{\"enabled\":true,\"kind\":\"eigenvector\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+            },
+            .sync_level = .write,
+        });
+        try db.runUntilIdle();
+
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        target_generation = graph_entry.index.edge_generation;
+    }
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "eigenvector", target_generation);
+        defer started.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+        try std.testing.expectEqual(target_generation, started.building_generation);
+    }
+
+    const workers = [_][]const u8{ "db-eigenvector-publish-race-worker-a", "db-eigenvector-publish-race-worker-b" };
+    var reached_publish = false;
+    var step_index: usize = 0;
+    while (step_index < 400) : (step_index += 1) {
+        const worker = blk: {
+            var worker_db = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer worker_db.close();
+            break :blk try worker_db.runGraphMetricPlannedWorkerPageStep("graph_idx", "eigenvector", workers[step_index % workers.len]);
+        };
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("eigenvector");
+            defer status.deinit(alloc);
+            if (status.phase == .publish_generation) {
+                reached_publish = true;
+                break;
+            }
+        }
+
+        const coordinator = blk: {
+            var coordinator_db = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer coordinator_db.close();
+            break :blk try coordinator_db.runGraphMetricPlannedCoordinatorStep("graph_idx", "eigenvector");
+        };
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("eigenvector");
+            defer status.deinit(alloc);
+            if (status.phase == .publish_generation) {
+                reached_publish = true;
+                break;
+            }
+        }
+
+        if (!worker.claimed_page and !worker.completed_page and !coordinator.advanced_phase) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(reached_publish);
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        const publish = try coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "eigenvector");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.publish_generation, publish.phase);
+        try std.testing.expect(publish.advanced_phase);
+
+        const graph_entry = coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("eigenvector");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, status.phase);
+        try std.testing.expectEqual(target_generation, status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), status.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, status.recent_events[0].kind);
+    }
+
+    {
+        var duplicate_coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer duplicate_coordinator.close();
+
+        const duplicate = try duplicate_coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "eigenvector");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, duplicate.phase);
+        try std.testing.expect(!duplicate.advanced_phase);
+        try std.testing.expect(!duplicate.published);
+
+        const graph_entry = duplicate_coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("eigenvector");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, status.phase);
+        try std.testing.expectEqual(target_generation, status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), status.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, status.recent_events[0].kind);
+    }
+
+    {
+        var worker_db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer worker_db.close();
+
+        var cleanup_finished = false;
+        for (0..12) |_| {
+            const cleanup = try worker_db.runGraphMetricPlannedWorkerPageStep("graph_idx", "eigenvector", "db-eigenvector-publish-race-cleaner");
+            try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, cleanup.phase);
+            try std.testing.expect(!cleanup.advanced_phase);
+            if (cleanup.published) {
+                cleanup_finished = true;
+                break;
+            }
+        }
+        try std.testing.expect(cleanup_finished);
+    }
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("eigenvector");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, status.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, status.phase);
+        try std.testing.expectEqual(target_generation, status.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), status.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, status.recent_events[0].kind);
+
+        var published_result = try reader.search(alloc, .{
+            .graph_metric_queries = &.{.{
+                .name = "central",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "eigenvector",
+                    .top_k = 2,
+                    .freshness = .fresh,
+                },
+            }},
+            .limit = 0,
+        });
+        defer published_result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), published_result.graph_metric_results.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, published_result.graph_metric_results[0].status.state);
+        try std.testing.expectEqual(target_generation, published_result.graph_metric_results[0].status.published_generation);
+        try std.testing.expectEqual(@as(usize, 2), published_result.graph_metric_results[0].scores.len);
+    }
+}
+
+test "db graph metric runtime planned scheduler reopened coordinators do not duplicate hits publish" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var target_generation: u64 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+
+        try db.addIndex(.{
+            .name = "graph_idx",
+            .kind = .graph,
+            .config_json = "{\"metrics\":{\"hits_authority\":{\"enabled\":true,\"kind\":\"hits_authority\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}},\"hits_hub\":{\"enabled\":true,\"kind\":\"hits_hub\",\"refresh\":\"manual\",\"max_iterations\":1,\"tolerance\":0.000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+        });
+
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:hub_a", .value = "{\"title\":\"hub a\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:hub_b", .value = "{\"title\":\"hub b\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+                .{ .key = "doc:authority", .value = "{\"title\":\"authority\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:authority\",\"weight\":1.0}]}}}" },
+            },
+            .sync_level = .write,
+        });
+        try db.runUntilIdle();
+
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        target_generation = graph_entry.index.edge_generation;
+    }
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        var started = try coordinator.ensureGraphMetricPlannedBuild(alloc, "graph_idx", "hits_authority", target_generation);
+        defer started.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, started.state);
+        try std.testing.expectEqual(target_generation, started.building_generation);
+    }
+
+    const workers = [_][]const u8{ "db-hits-publish-race-worker-a", "db-hits-publish-race-worker-b" };
+    var reached_publish = false;
+    var step_index: usize = 0;
+    while (step_index < 400) : (step_index += 1) {
+        const worker = blk: {
+            var worker_db = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer worker_db.close();
+            break :blk try worker_db.runGraphMetricPlannedWorkerPageStep("graph_idx", "hits_authority", workers[step_index % workers.len]);
+        };
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("hits_authority");
+            defer status.deinit(alloc);
+            if (status.phase == .publish_generation) {
+                reached_publish = true;
+                break;
+            }
+        }
+
+        const coordinator = blk: {
+            var coordinator_db = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer coordinator_db.close();
+            break :blk try coordinator_db.runGraphMetricPlannedCoordinatorStep("graph_idx", "hits_authority");
+        };
+
+        {
+            var reader = try DB.open(alloc, std.mem.span(path), .{
+                .start_index_workers = false,
+                .ttl_cleanup = .{ .enabled = false },
+            });
+            defer reader.close();
+            const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+            var status = try graph_entry.index.graphMetricStatus("hits_authority");
+            defer status.deinit(alloc);
+            if (status.phase == .publish_generation) {
+                reached_publish = true;
+                break;
+            }
+        }
+
+        if (!worker.claimed_page and !worker.completed_page and !coordinator.advanced_phase) {
+            return error.GraphMetricBuildNoEligiblePage;
+        }
+    }
+    try std.testing.expect(reached_publish);
+
+    {
+        var coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer coordinator.close();
+
+        const publish = try coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "hits_authority");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.publish_generation, publish.phase);
+        try std.testing.expect(publish.advanced_phase);
+
+        const graph_entry = coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var authority = try graph_entry.index.graphMetricStatus("hits_authority");
+        defer authority.deinit(alloc);
+        var hub = try graph_entry.index.graphMetricStatus("hits_hub");
+        defer hub.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, authority.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, hub.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, authority.phase);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, hub.phase);
+        try std.testing.expectEqual(target_generation, authority.published_generation);
+        try std.testing.expectEqual(authority.published_generation, hub.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), authority.recent_events.len);
+        try std.testing.expectEqual(@as(usize, 1), hub.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, authority.recent_events[0].kind);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, hub.recent_events[0].kind);
+    }
+
+    {
+        var duplicate_coordinator = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer duplicate_coordinator.close();
+
+        const duplicate = try duplicate_coordinator.runGraphMetricPlannedCoordinatorStep("graph_idx", "hits_authority");
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, duplicate.phase);
+        try std.testing.expect(!duplicate.advanced_phase);
+        try std.testing.expect(!duplicate.published);
+
+        const graph_entry = duplicate_coordinator.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var authority = try graph_entry.index.graphMetricStatus("hits_authority");
+        defer authority.deinit(alloc);
+        var hub = try graph_entry.index.graphMetricStatus("hits_hub");
+        defer hub.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, authority.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, hub.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, authority.phase);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, hub.phase);
+        try std.testing.expectEqual(target_generation, authority.published_generation);
+        try std.testing.expectEqual(authority.published_generation, hub.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), authority.recent_events.len);
+        try std.testing.expectEqual(@as(usize, 1), hub.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, authority.recent_events[0].kind);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, hub.recent_events[0].kind);
+    }
+
+    {
+        var worker_db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer worker_db.close();
+
+        var cleanup_finished = false;
+        for (0..12) |_| {
+            const cleanup = try worker_db.runGraphMetricPlannedWorkerPageStep("graph_idx", "hits_authority", "db-hits-publish-race-cleaner");
+            try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.cleanup_old_generations, cleanup.phase);
+            try std.testing.expect(!cleanup.advanced_phase);
+            if (cleanup.published) {
+                cleanup_finished = true;
+                break;
+            }
+        }
+        try std.testing.expect(cleanup_finished);
+    }
+
+    {
+        var reader = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer reader.close();
+
+        const graph_entry = reader.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var authority = try graph_entry.index.graphMetricStatus("hits_authority");
+        defer authority.deinit(alloc);
+        var hub = try graph_entry.index.graphMetricStatus("hits_hub");
+        defer hub.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, authority.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, hub.state);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, authority.phase);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricBuildPhase.complete, hub.phase);
+        try std.testing.expectEqual(target_generation, authority.published_generation);
+        try std.testing.expectEqual(authority.published_generation, hub.published_generation);
+        try std.testing.expectEqual(@as(usize, 1), authority.recent_events.len);
+        try std.testing.expectEqual(@as(usize, 1), hub.recent_events.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, authority.recent_events[0].kind);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricEventKind.publish, hub.recent_events[0].kind);
+
+        var authority_result = try reader.search(alloc, .{
+            .graph_metric_queries = &.{.{
+                .name = "authority",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_authority",
+                    .top_k = 2,
+                    .freshness = .fresh,
+                },
+            }},
+            .limit = 0,
+        });
+        defer authority_result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), authority_result.graph_metric_results.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, authority_result.graph_metric_results[0].status.state);
+        try std.testing.expectEqual(target_generation, authority_result.graph_metric_results[0].status.published_generation);
+        try std.testing.expectEqual(@as(usize, 2), authority_result.graph_metric_results[0].scores.len);
+
+        var hub_result = try reader.search(alloc, .{
+            .graph_metric_queries = &.{.{
+                .name = "hub",
+                .query = .{
+                    .index_name = "graph_idx",
+                    .metric_name = "hits_hub",
+                    .top_k = 2,
+                    .freshness = .fresh,
+                },
+            }},
+            .limit = 0,
+        });
+        defer hub_result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), hub_result.graph_metric_results.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, hub_result.graph_metric_results[0].status.state);
+        try std.testing.expectEqual(target_generation, hub_result.graph_metric_results[0].status.published_generation);
+        try std.testing.expectEqual(@as(usize, 2), hub_result.graph_metric_results[0].scores.len);
+    }
+}
+
+test "db graph metric runtime planned maintenance drains background pagerank work" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.not_ready, status.state);
+        break :blk graph_entry.index.edge_generation;
+    };
+
+    const maintenance = try db.runGraphMetricPlannedMaintenanceForIdle(.{
+        .worker_id = "planned-maintenance-pagerank",
+        .max_rounds = 200,
+        .max_metrics_per_round = 8,
+        .max_pages_per_round = 1,
+    });
+    try std.testing.expectEqual(@as(usize, 1), maintenance.builds_started);
+    try std.testing.expect(maintenance.pages_completed > 0);
+    try std.testing.expect(maintenance.phases_advanced > 0);
+
+    var published_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "central",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer published_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), published_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, published_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, published_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(@as(usize, 2), published_result.graph_metric_results[0].scores.len);
+    try std.testing.expectEqualStrings("doc:d", published_result.graph_metric_results[0].scores[0].node);
+    try std.testing.expect(published_result.graph_metric_results[0].scores[0].score >= published_result.graph_metric_results[0].scores[1].score);
+}
+
+test "db graph metric runtime background drains pagerank through planned maintenance" {
+    const DB = @import("../mod.zig").DB;
+    const db_test_support = @import("../test_support.zig");
+    const tempPath = db_test_support.tempPath;
+    const cleanupTempDir = db_test_support.cleanupTempDir;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_idx",
+        .kind = .graph,
+        .config_json = "{\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\",\"refresh\":\"background\",\"max_iterations\":2,\"tolerance\":0.000000001,\"edge_filter\":{\"types\":[\"cites\"]}}}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:d\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"gamma\",\"_edges\":{\"graph_idx\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":1.0}]}}}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"delta\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+
+    const target_generation = blk: {
+        const graph_entry = db.core.graphIndex("graph_idx") orelse return error.IndexNotFound;
+        var status = try graph_entry.index.graphMetricStatus("pagerank");
+        defer status.deinit(alloc);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.not_ready, status.state);
+        break :blk graph_entry.index.edge_generation;
+    };
+
+    const resources = db.core.asyncResources();
+    var runtime = try GraphMetricRuntime.init(
+        alloc,
+        resources.store,
+        resources.index_manager,
+        resources.apply_mutex,
+        db.backend_runtime,
+        .{
+            .enabled = true,
+            .runtime_id = "runtime-pagerank-combined",
+            .planned_options = .{
+                .worker_id = "runtime-pagerank-worker",
+                .max_rounds = 1,
+                .max_metrics_per_round = 8,
+                .max_pages_per_round = 1,
+            },
+        },
+    );
+    defer runtime.deinit();
+
+    {
+        const initial_stats = runtime.stats();
+        try std.testing.expect(initial_stats.enabled);
+        try std.testing.expectEqual(Role.combined, initial_stats.role);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-pagerank-combined"), initial_stats.runtime_id_hash);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "local"), initial_stats.owner_id_hash);
+        try std.testing.expect(initial_stats.lease_key_hash != 0);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-pagerank-worker"), initial_stats.worker_id_hash);
+        try std.testing.expectEqual(@as(usize, 1), initial_stats.worker_count);
+        try std.testing.expectEqual(@as(u64, 0), initial_stats.ticks_started);
+        try std.testing.expectEqual(@as(u64, 0), initial_stats.ticks_completed);
+        try std.testing.expectEqual(@as(u64, 0), initial_stats.durable_progress_ticks);
+        try std.testing.expectEqual(@as(?[]const u8, null), initial_stats.last_error_name);
+    }
+
+    var steps: usize = 0;
+    while (try runtime.runOnce()) {
+        steps += 1;
+        if (steps > 200) return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(steps > 0);
+
+    {
+        const drained_stats = runtime.stats();
+        try std.testing.expectEqual(@as(u64, @intCast(steps + 1)), drained_stats.ticks_started);
+        try std.testing.expectEqual(drained_stats.ticks_started, drained_stats.ticks_completed);
+        try std.testing.expectEqual(@as(u64, @intCast(steps)), drained_stats.durable_progress_ticks);
+        try std.testing.expectEqual(@as(u64, 1), drained_stats.idle_ticks);
+        try std.testing.expectEqual(@as(u64, 0), drained_stats.error_ticks);
+        try std.testing.expectEqual(@as(?[]const u8, null), drained_stats.last_error_name);
+        try std.testing.expect(!drained_stats.last_result.durableProgressed());
+    }
+
+    db.graph_metric_runtime = &runtime;
+    defer db.graph_metric_runtime = null;
+    {
+        const mapped_stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, mapped_stats);
+        try std.testing.expect(mapped_stats.graph_metric_runtime.enabled);
+        try std.testing.expectEqual(types.GraphMetricRuntimeRole.combined, mapped_stats.graph_metric_runtime.role.?);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-pagerank-combined"), mapped_stats.graph_metric_runtime.runtime_id_hash);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "local"), mapped_stats.graph_metric_runtime.owner_id_hash);
+        try std.testing.expectEqual(runtime.stats().lease_key_hash, mapped_stats.graph_metric_runtime.lease_key_hash);
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, "runtime-pagerank-worker"), mapped_stats.graph_metric_runtime.worker_id_hash);
+        try std.testing.expectEqual(@as(u64, 1), mapped_stats.graph_metric_runtime.worker_count);
+        try std.testing.expectEqual(@as(u64, @intCast(steps + 1)), mapped_stats.graph_metric_runtime.ticks_started);
+        try std.testing.expectEqual(mapped_stats.graph_metric_runtime.ticks_started, mapped_stats.graph_metric_runtime.ticks_completed);
+        try std.testing.expectEqual(@as(u64, @intCast(steps)), mapped_stats.graph_metric_runtime.durable_progress_ticks);
+        try std.testing.expectEqual(@as(u64, 1), mapped_stats.graph_metric_runtime.idle_ticks);
+        try std.testing.expectEqual(@as(u64, 0), mapped_stats.graph_metric_runtime.error_ticks);
+        try std.testing.expectEqual(@as(u64, 0), mapped_stats.graph_metric_runtime.last_builds_started);
+        try std.testing.expect(!mapped_stats.graph_metric_runtime.last_budget_exhausted);
+    }
+
+    {
+        const pending = db.pendingWorkStats().graph_metric;
+        try std.testing.expect(!pending.hasWork());
+    }
+
+    var published_result = try db.search(alloc, .{
+        .graph_metric_queries = &.{.{
+            .name = "central",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        }},
+        .limit = 0,
+    });
+    defer published_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), published_result.graph_metric_results.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.fresh, published_result.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(target_generation, published_result.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(@as(usize, 2), published_result.graph_metric_results[0].scores.len);
+    try std.testing.expectEqualStrings("doc:d", published_result.graph_metric_results[0].scores[0].node);
+}
+
 test "db graph metric runtime planned maintenance reports budget exhaustion and resumes" {
     const DB = @import("../mod.zig").DB;
     const db_test_support = @import("../test_support.zig");

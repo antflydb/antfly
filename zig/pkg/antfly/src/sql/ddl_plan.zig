@@ -3302,6 +3302,11 @@ pub fn ddlPlanFromGeneratedAstAlloc(
         .alter_policy,
         .drop_policy,
         => try rowSecurityPolicyCatalogPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options),
+        .create_function,
+        .create_procedure,
+        .drop_function,
+        .drop_procedure,
+        => try routineCatalogPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options),
         .create_index => .{ .create_index = try createIndexPlanFromGeneratedAstAlloc(alloc, tokens, ast, options.create_index_options) },
         .alter_table => if (generatedAlterTableUsesRowSecurityRuntimeBoundary(tokens, ast))
             .{ .row_security_catalog = .{ .alter_table = try rowSecurityAlterTablePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } }
@@ -3343,6 +3348,10 @@ fn generatedDdlUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated
         .create_subscription,
         .alter_subscription,
         .drop_subscription,
+        .create_function,
+        .create_procedure,
+        .drop_function,
+        .drop_procedure,
         .create_policy,
         .alter_policy,
         .drop_policy,
@@ -3360,6 +3369,57 @@ fn generatedDdlUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated
         .create_graph_metric,
         => false,
     };
+}
+
+fn routineCatalogPlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+    options: DdlPlanParserOptions,
+) !LoweredDdlPlan {
+    try validateGeneratedRoutineDdlAst(tokens, ast);
+    var pos: usize = 0;
+    var plan = try parseDdlPlanAlloc(alloc, tokens, &pos, options);
+    errdefer plan.deinit(alloc);
+    if (pos != tokens.len) return error.UnsupportedSqlShape;
+    switch (plan) {
+        .function_catalog => {},
+        else => return error.UnsupportedSqlShape,
+    }
+    return plan;
+}
+
+fn validateGeneratedRoutineDdlAst(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) !void {
+    try validateGeneratedDdlAstSpans(tokens, ast);
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    const object_name_tokens = ast.object_name_tokens orelse return error.UnsupportedSqlShape;
+    if (object_name_tokens.start >= object_name_tokens.end or object_name_tokens.end > end) return error.UnsupportedSqlShape;
+    switch (ast.kind) {
+        .create_function, .create_procedure => {
+            if (end < 4 or !tokens[0].matchesKeyword("create")) return error.UnsupportedSqlShape;
+            var routine_index: usize = 1;
+            if (tokens[routine_index].matchesKeyword("or")) {
+                if (routine_index + 2 >= end or !tokens[routine_index + 1].matchesKeyword("replace")) return error.UnsupportedSqlShape;
+                routine_index += 2;
+            }
+            const expected: token_mod.TokenKeyword = switch (ast.kind) {
+                .create_function => .function,
+                .create_procedure => .procedure,
+                else => unreachable,
+            };
+            if (routine_index >= end or !tokens[routine_index].matchesKeywordTag(expected)) return error.UnsupportedSqlShape;
+        },
+        .drop_function, .drop_procedure => {
+            if (end < 4 or !tokens[0].matchesKeyword("drop")) return error.UnsupportedSqlShape;
+            const expected: token_mod.TokenKeyword = switch (ast.kind) {
+                .drop_function => .function,
+                .drop_procedure => .procedure,
+                else => unreachable,
+            };
+            if (!tokens[1].matchesKeywordTag(expected)) return error.UnsupportedSqlShape;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
 }
 
 fn generatedCreateTableUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) bool {
@@ -4728,6 +4788,8 @@ fn validateGeneratedDdlAstSpans(
         .create_publication,
         .create_subscription,
         .create_policy,
+        .create_function,
+        .create_procedure,
         .create_index,
         .create_extension,
         .create_graph_index,
@@ -4755,6 +4817,8 @@ fn validateGeneratedDdlAstSpans(
         .drop_publication,
         .drop_subscription,
         .drop_policy,
+        .drop_function,
+        .drop_procedure,
         .drop_index,
         .drop_schema,
         .drop_database,
@@ -14737,6 +14801,55 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
             try std.testing.expectEqualStrings("generated_usage_records", plan.table_name);
             try std.testing.expectEqual(@as(usize, 2), plan.columns.len);
             try std.testing.expect(plan.primary_key != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var runtime_create_function = try tokenized.ParsedSql.initAlloc(alloc, "CREATE OR REPLACE FUNCTION touch_generated_usage() RETURNS trigger LANGUAGE plpgsql;");
+    defer runtime_create_function.deinit(alloc);
+    var runtime_create_function_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_create_function);
+    defer runtime_create_function_plan.deinit(alloc);
+    switch (runtime_create_function_plan) {
+        .function_catalog => |plan| switch (plan) {
+            .create => |create| {
+                try std.testing.expectEqual(RoutineKind.function, create.kind);
+                try std.testing.expect(create.replace_existing);
+                try std.testing.expectEqualStrings("touch_generated_usage", create.routine_name);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var runtime_drop_function = try tokenized.ParsedSql.initAlloc(alloc, "DROP FUNCTION IF EXISTS touch_generated_usage(text) CASCADE;");
+    defer runtime_drop_function.deinit(alloc);
+    var runtime_drop_function_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_drop_function);
+    defer runtime_drop_function_plan.deinit(alloc);
+    switch (runtime_drop_function_plan) {
+        .function_catalog => |plan| switch (plan) {
+            .drop => |drop| {
+                try std.testing.expectEqual(RoutineKind.function, drop.kind);
+                try std.testing.expect(drop.if_exists);
+                try std.testing.expect(drop.cascade);
+                try std.testing.expectEqualStrings("touch_generated_usage", drop.routine_name);
+                try std.testing.expectEqual(@as(usize, 1), drop.argument_types.len);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var runtime_create_procedure = try tokenized.ParsedSql.initAlloc(alloc, "CREATE PROCEDURE rotate_generated_usage() LANGUAGE plpgsql;");
+    defer runtime_create_procedure.deinit(alloc);
+    var runtime_create_procedure_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &runtime_create_procedure);
+    defer runtime_create_procedure_plan.deinit(alloc);
+    switch (runtime_create_procedure_plan) {
+        .function_catalog => |plan| switch (plan) {
+            .create => |create| {
+                try std.testing.expectEqual(RoutineKind.procedure, create.kind);
+                try std.testing.expectEqualStrings("rotate_generated_usage", create.routine_name);
+            },
+            else => return error.TestUnexpectedResult,
         },
         else => return error.TestUnexpectedResult,
     }

@@ -34,9 +34,9 @@
 %token REGEX_MATCH REGEX_IMATCH REGEX_NOT_MATCH REGEX_NOT_IMATCH
 %token ADD ALL ALTER ANALYZE AND ANY ARRAY AS ASC ASYMMETRIC BEGIN BETWEEN BY CASCADE CALL CASE CAST CHECKPOINT CLOSE CLUSTER COMMIT COMMENT CONFLICT CONSTRAINT CONTINUE CURRENT CURRENT_DATE CURRENT_TIMESTAMP
 %token CREATE COPY DATA DATABASE DEALLOCATE DECLARE DEFAULT DELETE DESC DISCARD DISTINCT DO DOMAIN DROP EXECUTE
-%token ELSE END ESCAPE EXPLAIN EXISTS EXTENSION EXTRACT FALSE FETCH FILTER FIRST FOLLOWING FOR FOREIGN FROM FULL GRANT GRAPH GROUP HAVING IDENTITY IF ILIKE INCLUDE IN INDEX INNER INSERT INTERVAL INTO IS
+%token ELSE END ESCAPE EXPLAIN EXISTS EXTENSION EXTRACT FALSE FETCH FILTER FIRST FOLLOWING FOR FOREIGN FROM FULL FUNCTION GRANT GRAPH GROUP HAVING IDENTITY IF ILIKE INCLUDE IN INDEX INNER INSERT INTERVAL INTO IS
 %token ISNULL JOIN KEY LABEL LAST LATERAL LEFT LIKE LIMIT LISTEN LOAD LOCK LOCKED MATCHED MATERIALIZED MERGE METRIC MOVE NO NOT NULL NOTIFY NOTNULL NOWAIT NULLS OF ON OR ORDER OUTER OVER PARTITION POLICY PRECEDING PREPARE PRIMARY PUBLIC PUBLICATION
-%token NEXT NOTHING OFFSET ONLY QUERY RANGE RECURSIVE REFRESH REINDEX RELEASE RENAME REPLACE RESET RESTART RESTRICT RETURNING REVOKE RIGHT ROLLBACK ROW ROWS RULE SAVEPOINT SCHEMA SECURITY SELECT SERVER SET SHARE SHOW SKIP SOME SUBSCRIPTION TABLE TEMP TEMPORARY TIMESTAMP TIMESTAMPTZ TO TRUNCATE
+%token NEXT NOTHING OFFSET ONLY PROCEDURE QUERY RANGE RECURSIVE REFRESH REINDEX RELEASE RENAME REPLACE RESET RESTART RESTRICT RETURNING REVOKE RIGHT ROLLBACK ROW ROWS RULE SAVEPOINT SCHEMA SECURITY SELECT SERVER SET SHARE SHOW SKIP SOME SUBSCRIPTION TABLE TEMP TEMPORARY TIMESTAMP TIMESTAMPTZ TO TRUNCATE
 %token SEQUENCE SYMMETRIC TABLESPACE THEN TRUE TRIGGER UNION UNIQUE UNKNOWN UNLISTEN UNLOGGED UPDATE USING VACUUM VALUES VIEW WHEN WHERE WINDOW WITH WITHIN
 %token EXCEPT INTERSECT UNBOUNDED
 %token BASE_WEIGHT FIELD FRESHNESS GRAPH_METRIC KEY KIND METRIC METRIC_FRESHNESS MISSING_SCORE NAME SOURCE SOURCES TYPE WEIGHT
@@ -96,6 +96,7 @@ ddl_statement:
   | create_publication_statement
   | create_subscription_statement
   | create_policy_statement
+  | create_routine_statement
   | create_index_statement
   | create_extension_statement
   | alter_table_statement
@@ -174,6 +175,35 @@ create_subscription_statement:
 
 create_policy_statement:
     CREATE POLICY identifier_name ON qualified_name diagnostic_tail_opt
+  ;
+
+create_routine_statement:
+    CREATE create_routine_replace_opt routine_kind qualified_name LPAREN routine_parameter_list_opt RPAREN diagnostic_tail_opt
+  ;
+
+create_routine_replace_opt:
+    /* empty */
+  | OR REPLACE
+  ;
+
+routine_kind:
+    FUNCTION
+  | PROCEDURE
+  ;
+
+routine_parameter_list_opt:
+    /* empty */
+  | routine_parameter_list
+  ;
+
+routine_parameter_list:
+    routine_parameter
+  | routine_parameter_list COMMA routine_parameter
+  ;
+
+routine_parameter:
+    type_name
+  | identifier_name type_name
   ;
 
 relation_population_statement:
@@ -279,6 +309,7 @@ drop_statement:
   | DROP PUBLICATION if_exists_opt qualified_name
   | DROP SUBSCRIPTION if_exists_opt qualified_name
   | DROP POLICY if_exists_opt identifier_name ON qualified_name drop_behavior_opt
+  | DROP routine_kind if_exists_opt qualified_name LPAREN routine_type_list_opt RPAREN drop_behavior_opt
   ;
 
 refresh_materialized_view_statement:
@@ -288,6 +319,11 @@ refresh_materialized_view_statement:
 drop_database_force_opt:
     /* empty */
   | WITH LPAREN identifier_name RPAREN
+  ;
+
+routine_type_list_opt:
+    /* empty */
+  | type_name_list
   ;
 
 dml_statement:
@@ -1150,6 +1186,7 @@ identifier_name:
   | DOMAIN
   | FRESHNESS
   | FETCH
+  | FUNCTION
   | GRAPH_METRIC
   | GRANT
   | INCLUDE
@@ -1167,6 +1204,7 @@ identifier_name:
   | NAME
   | NEXT
   | NOTIFY
+  | PROCEDURE
   | REFRESH
   | RELEASE
   | RENAME
@@ -1276,6 +1314,7 @@ diagnostic_token:
   | FOREIGN
   | FROM
   | FULL
+  | FUNCTION
   | GRAPH
   | GRANT
   | GROUP
@@ -1305,6 +1344,7 @@ diagnostic_token:
   | ONLY
   | POLICY
   | PRIMARY
+  | PROCEDURE
   | PUBLICATION
   | REFRESH
   | RELEASE
