@@ -311,16 +311,19 @@ commands also use the validated unsupported boundary for `LISTEN`, `NOTIFY`,
 and `UNLISTEN` before delegating to typed notification catalog planning.
 Maintenance commands use the same validated generated unsupported boundary for
 `VACUUM`, `ANALYZE`, `REINDEX`, and `CLUSTER` before delegating to typed
-maintenance planning.
+maintenance planning. Legacy-supported cursor and savepoint commands use the
+validated unsupported boundary for `DECLARE`, `FETCH`, `CLOSE`, `SAVEPOINT`,
+and `RELEASE` before delegating to typed cursor/savepoint planning; `MOVE`
+remains an unsupported generated diagnostic because there is no typed cursor
+plan for it yet.
 Generated unsupported nodes now also participate in the parsed statement
 boundary: generated-covered unsupported heads that are not intentionally
 supported by the existing catalog planner become terminal parsed unsupported
 statements and fail closed before legacy DDL probing. Generated unsupported
 heads that already have legacy catalog/runtime support, such as `EXPLAIN`,
 `COPY`, remaining materialized-view catalog variants such as
-`ALTER MATERIALIZED VIEW`, and cursor/savepoint catalog commands, stay on an
-explicit compatibility allowlist until their generated AST-to-plan
-implementations are promoted.
+`ALTER MATERIALIZED VIEW`, stay on an explicit compatibility allowlist until
+their generated AST-to-plan implementations are promoted.
 
 ## Compatibility Policy
 

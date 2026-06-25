@@ -8897,6 +8897,7 @@ pub fn relationalIndexLifecycleName(lifecycle: runtime_schema.RelationalIndexLif
 }
 
 const GeneratedUnsupportedCatalogBoundaryFamily = enum {
+    cursor_savepoint,
     maintenance,
     materialized_view,
     notification,
@@ -8913,6 +8914,7 @@ fn generatedUnsupportedCatalogBoundary(
 ) ?GeneratedUnsupportedCatalogBoundary {
     return switch (statement) {
         .unsupported => |kind| switch (kind) {
+            .close, .declare, .fetch, .release, .savepoint => .{ .family = .cursor_savepoint, .kind = kind },
             .analyze, .cluster, .reindex, .vacuum => .{ .family = .maintenance, .kind = kind },
             .create_materialized_view, .drop_materialized_view, .refresh => .{ .family = .materialized_view, .kind = kind },
             .listen, .notify, .unlisten => .{ .family = .notification, .kind = kind },
@@ -9002,6 +9004,34 @@ fn validateGeneratedUnsupportedCatalogAst(
         return error.UnsupportedSqlShape;
     }
     switch (boundary.family) {
+        .cursor_savepoint => switch (boundary.kind) {
+            .close => {
+                if (end < 1 or !tokens[0].matchesKeyword("close")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            .declare => {
+                if (end < 1 or !tokens[0].matchesKeyword("declare")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            .fetch => {
+                if (end < 1 or !tokens[0].matchesKeyword("fetch")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            .release => {
+                if (end < 1 or !tokens[0].matchesKeyword("release")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            .savepoint => {
+                if (end < 1 or !tokens[0].matchesKeyword("savepoint")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+            else => return error.UnsupportedSqlShape,
+        },
         .maintenance => switch (boundary.kind) {
             .analyze => {
                 if (end < 1 or !tokens[0].matchesKeyword("analyze")) {
@@ -9102,6 +9132,44 @@ fn catalogDdlPlanFromGeneratedUnsupportedAstAlloc(
     }
     if (pos.* != tokens.len) return error.UnsupportedSqlShape;
     switch (boundary.family) {
+        .cursor_savepoint => switch (boundary.kind) {
+            .close => switch (plan) {
+                .cursor_portal => |cursor| switch (cursor) {
+                    .close => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            .declare => switch (plan) {
+                .cursor_portal => |cursor| switch (cursor) {
+                    .declare => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            .fetch => switch (plan) {
+                .cursor_portal => |cursor| switch (cursor) {
+                    .fetch => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            .release => switch (plan) {
+                .savepoint_transaction => |savepoint| switch (savepoint) {
+                    .release => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            .savepoint => switch (plan) {
+                .savepoint_transaction => |savepoint| switch (savepoint) {
+                    .savepoint => {},
+                    else => return error.UnsupportedSqlShape,
+                },
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
         .maintenance => switch (boundary.kind) {
             .analyze => switch (plan) {
                 .maintenance_job => |maintenance| switch (maintenance) {
@@ -14670,6 +14738,128 @@ test "sql adapter generated maintenance unsupported AST lowers to catalog plans"
     var malformed_subject = try tokenized.ParsedSql.initAlloc(
         alloc,
         "REINDEX TABLE usage_records;",
+    );
+    defer malformed_subject.deinit(alloc);
+    if (malformed_subject.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.subject_tokens = .{ .start = 0, .end = malformed_subject.items().len },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_subject));
+}
+
+test "sql adapter generated cursor and savepoint unsupported AST lowers to catalog plans" {
+    const alloc = std.testing.allocator;
+
+    var declare_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records ORDER BY id;",
+    );
+    defer declare_sql.deinit(alloc);
+    var declare_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &declare_sql);
+    defer declare_plan.deinit(alloc);
+    switch (declare_plan) {
+        .cursor_portal => |cursor| switch (cursor) {
+            .declare => |declare| {
+                try std.testing.expectEqualStrings("usage_cursor", declare.portal_name);
+                try std.testing.expectEqual(CursorScrollMode.default, declare.scroll);
+                try std.testing.expect(!declare.binary);
+                try std.testing.expect(!declare.hold);
+                try std.testing.expectEqual(PreparedStatementSubjectKind.read, declare.statement_kind);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var fetch_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "FETCH FORWARD 10 IN usage_cursor;",
+    );
+    defer fetch_sql.deinit(alloc);
+    var fetch_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &fetch_sql);
+    defer fetch_plan.deinit(alloc);
+    switch (fetch_plan) {
+        .cursor_portal => |cursor| switch (cursor) {
+            .fetch => |fetch| {
+                try std.testing.expectEqualStrings("usage_cursor", fetch.portal_name);
+                try std.testing.expectEqual(CursorFetchDirection.forward, fetch.direction);
+                try std.testing.expectEqual(@as(?i64, 10), fetch.count);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var close_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "CLOSE ALL;",
+    );
+    defer close_sql.deinit(alloc);
+    var close_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &close_sql);
+    defer close_plan.deinit(alloc);
+    switch (close_plan) {
+        .cursor_portal => |cursor| switch (cursor) {
+            .close => |close| {
+                try std.testing.expect(close.all);
+                try std.testing.expect(close.portal_name == null);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var savepoint_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SAVEPOINT before_retry;",
+    );
+    defer savepoint_sql.deinit(alloc);
+    var savepoint_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &savepoint_sql);
+    defer savepoint_plan.deinit(alloc);
+    switch (savepoint_plan) {
+        .savepoint_transaction => |savepoint| switch (savepoint) {
+            .savepoint => |savepoint_name| try std.testing.expectEqualStrings("before_retry", savepoint_name.savepoint_name),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var release_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "RELEASE SAVEPOINT before_retry;",
+    );
+    defer release_sql.deinit(alloc);
+    var release_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &release_sql);
+    defer release_plan.deinit(alloc);
+    switch (release_plan) {
+        .savepoint_transaction => |savepoint| switch (savepoint) {
+            .release => |savepoint_name| try std.testing.expectEqualStrings("before_retry", savepoint_name.savepoint_name),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var malformed_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "FETCH usage_cursor;",
+    );
+    defer malformed_kind.deinit(alloc);
+    if (malformed_kind.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.kind = .close,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanParsedSqlAlloc(alloc, &malformed_kind));
+
+    var malformed_subject = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SAVEPOINT before_retry;",
     );
     defer malformed_subject.deinit(alloc);
     if (malformed_subject.generated_statement) |*generated_statement| {
