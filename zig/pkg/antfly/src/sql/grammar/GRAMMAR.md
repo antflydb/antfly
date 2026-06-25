@@ -226,7 +226,11 @@ tails with count expression metadata, and simple query, aggregate, join, and
 window pagination use generated range-validated lowering when generated read
 metadata is available; lateral, set-operation, and non-recursive CTE final-read
 pagination now use the same generated range validation on their typed lowerer
-paths.
+paths. Generated CTE read lowering now derives non-recursive final read-family
+dispatch from generated final-select ranges and clause metadata, including
+final set-operation reads, instead of re-entering the legacy read classifier;
+recursive CTEs still dispatch through the recursive CTE family after validating
+their generated recursive flag.
 Unsupported read shapes
 still fall back, and deeper read cutover still requires full generated
 query-body AST payloads for expression-level projections and predicates,
@@ -552,7 +556,10 @@ Unsupported DDL remains on the existing parser until
    explicit recursive flag; and simple non-recursive CTE reads dispatch to the
    typed read lowerer after validating those ranges. Recursive CTE reads now
    validate generated recursive CTE ranges and the recursive flag before
-   dispatching to the typed recursive CTE lowerer.
+   dispatching to the typed recursive CTE lowerer. Generated CTE read lowering
+   now derives non-recursive final read-family dispatch from generated
+   final-select ranges and clause metadata, including final set-operation
+   reads, instead of re-entering the legacy read classifier.
    Generated pagination coverage now accepts and ranges expression and
    PostgreSQL-compatible `ALL`/`NULL` `LIMIT` tails, `OFFSET` with optional
    `ROW`/`ROWS`, and `FETCH FIRST`/`FETCH NEXT` tails with optional fetch

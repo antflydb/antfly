@@ -193,8 +193,7 @@ pub fn lowerReadPlanFromGeneratedReadAstAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     read_ast: generated_parser.GeneratedSqlReadAst,
 ) !plan.LoweredReadPlan {
-    const read_kind = parsed_sql.readStatementKind() orelse return error.UnsupportedSqlShape;
-    if (!generatedReadAstMatchesReadKind(read_ast, read_kind)) return error.UnsupportedSqlShape;
+    const read_kind = try generatedReadStatementKind(parsed_sql.items(), read_ast);
     try validateGeneratedReadAstRanges(parsed_sql.items(), read_ast);
     return switch (read_ast.kind) {
         .query => blk: {
@@ -263,23 +262,51 @@ pub fn lowerReadPlanFromGeneratedReadAstAlloc(
     };
 }
 
-fn generatedReadAstMatchesReadKind(
+fn generatedReadStatementKind(
+    tokens: []const tokenized.Token,
     read_ast: generated_parser.GeneratedSqlReadAst,
-    read_kind: classifier.SqlReadStatementKind,
-) bool {
+) !classifier.SqlReadStatementKind {
     return switch (read_ast.kind) {
-        .query => read_kind == .query,
-        .aggregate => read_kind == .aggregate,
-        .join => read_kind == .join,
-        .lateral => read_kind == .lateral,
-        .window => read_kind == .window,
-        .set_operation => read_kind == .set_operation,
-        .cte => switch (read_kind) {
-            .query, .aggregate, .join, .lateral, .window => !read_ast.cte_recursive,
-            .recursive_cte => read_ast.cte_recursive,
-            .set_operation => false,
+        .query => .query,
+        .aggregate => .aggregate,
+        .join => .join,
+        .lateral => .lateral,
+        .window => .window,
+        .set_operation => .set_operation,
+        .cte => {
+            if (read_ast.cte_recursive) return .recursive_cte;
+            return try generatedCteFinalReadStatementKind(tokens, read_ast);
         },
     };
+}
+
+fn generatedCteFinalReadStatementKind(
+    tokens: []const tokenized.Token,
+    read_ast: generated_parser.GeneratedSqlReadAst,
+) !classifier.SqlReadStatementKind {
+    if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return error.UnsupportedSqlShape;
+    if (read_ast.set_operation_tokens != null) return .set_operation;
+    if (read_ast.source_tokens) |source| {
+        if (generatedReadRangeContainsKeyword(tokens, source, .lateral)) return .lateral;
+    }
+    if (read_ast.projection_tokens) |projection| {
+        if (generatedReadRangeContainsKeyword(tokens, projection, .over)) return .window;
+    }
+    const aggregate_projection = if (read_ast.projection_tokens) |projection|
+        generatedReadRangeHasAggregateFunction(tokens, projection)
+    else
+        false;
+    if ((read_ast.distinct_tokens != null and read_ast.distinct_on_items.count == 0) or
+        read_ast.group_tokens != null or
+        read_ast.having_tokens != null or
+        aggregate_projection)
+    {
+        return .aggregate;
+    }
+    if (read_ast.source_tokens) |source| {
+        if (generatedReadRangeContainsKeyword(tokens, source, .join)) return .join;
+    }
+    return .query;
 }
 
 fn validateGeneratedReadAstRanges(tokens: []const tokenized.Token, read_ast: generated_parser.GeneratedSqlReadAst) !void {
@@ -988,6 +1015,74 @@ fn validateGeneratedCteReadAst(tokens: []const tokenized.Token, read_ast: genera
     if (body.end >= tokens.len or tokens[body.end].kind != .rparen) return error.UnsupportedSqlShape;
     if (cte.end >= tokens.len or !tokens[cte.end].matchesKeywordTag(.select)) return error.UnsupportedSqlShape;
     if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return error.UnsupportedSqlShape;
+    try validateGeneratedCteFinalReadKind(tokens, read_ast, try generatedCteFinalReadStatementKind(tokens, read_ast));
+}
+
+fn validateGeneratedCteFinalReadKind(
+    tokens: []const tokenized.Token,
+    read_ast: generated_parser.GeneratedSqlReadAst,
+    final_read_kind: classifier.SqlReadStatementKind,
+) !void {
+    if (read_ast.projection_tokens == null or read_ast.source_tokens == null) return error.UnsupportedSqlShape;
+    switch (final_read_kind) {
+        .query => {
+            if (read_ast.group_tokens != null or read_ast.having_tokens != null or read_ast.window_tokens != null or
+                read_ast.set_operation_tokens != null)
+            {
+                return error.UnsupportedSqlShape;
+            }
+            if (read_ast.source_tokens) |source| {
+                try validateGeneratedReadRangeDoesNotContainKeyword(tokens, source, .join);
+                try validateGeneratedReadRangeDoesNotContainKeyword(tokens, source, .lateral);
+            }
+            if (read_ast.projection_tokens) |projection| try validateGeneratedReadRangeDoesNotContainKeyword(tokens, projection, .over);
+            if (read_ast.projection_tokens) |projection| {
+                if (generatedReadRangeHasAggregateFunction(tokens, projection)) return error.UnsupportedSqlShape;
+            }
+        },
+        .aggregate => {
+            if (read_ast.window_tokens != null or read_ast.set_operation_tokens != null) return error.UnsupportedSqlShape;
+            const aggregate_projection = if (read_ast.projection_tokens) |projection|
+                generatedReadRangeHasAggregateFunction(tokens, projection)
+            else
+                false;
+            if (read_ast.group_tokens == null and read_ast.having_tokens == null and read_ast.distinct_tokens == null and !aggregate_projection) {
+                return error.UnsupportedSqlShape;
+            }
+        },
+        .join => {
+            if (read_ast.group_tokens != null or read_ast.having_tokens != null or read_ast.window_tokens != null or
+                read_ast.set_operation_tokens != null)
+            {
+                return error.UnsupportedSqlShape;
+            }
+            if (read_ast.projection_tokens) |projection| {
+                if (generatedReadRangeHasAggregateFunction(tokens, projection)) return error.UnsupportedSqlShape;
+            }
+            try validateGeneratedReadRangeContainsKeyword(tokens, read_ast.source_tokens.?, .join);
+        },
+        .lateral => {
+            if (read_ast.group_tokens != null or read_ast.having_tokens != null or read_ast.window_tokens != null or
+                read_ast.set_operation_tokens != null)
+            {
+                return error.UnsupportedSqlShape;
+            }
+            if (read_ast.projection_tokens) |projection| {
+                if (generatedReadRangeHasAggregateFunction(tokens, projection)) return error.UnsupportedSqlShape;
+            }
+            try validateGeneratedReadRangeContainsKeyword(tokens, read_ast.source_tokens.?, .lateral);
+        },
+        .window => {
+            if (read_ast.group_tokens != null or read_ast.having_tokens != null or read_ast.set_operation_tokens != null) {
+                return error.UnsupportedSqlShape;
+            }
+            try validateGeneratedReadRangeContainsKeyword(tokens, read_ast.projection_tokens.?, .over);
+        },
+        .set_operation => {
+            if (read_ast.set_operation_tokens == null) return error.UnsupportedSqlShape;
+        },
+        .recursive_cte => return error.UnsupportedSqlShape,
+    }
 }
 
 fn lowerGeneratedCteReadPlanAlloc(
@@ -1064,11 +1159,65 @@ fn validateGeneratedReadRangeContainsKeyword(
     range: generated_parser.GeneratedSqlTokenRange,
     keyword: token_mod.TokenKeyword,
 ) !void {
+    if (generatedReadRangeContainsKeyword(tokens, range, keyword)) return;
+    return error.UnsupportedSqlShape;
+}
+
+fn generatedReadRangeContainsKeyword(
+    tokens: []const tokenized.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    keyword: token_mod.TokenKeyword,
+) bool {
     var index = range.start;
     while (index < range.end) : (index += 1) {
-        if (tokens[index].matchesKeywordTag(keyword)) return;
+        if (tokens[index].matchesKeywordTag(keyword)) return true;
     }
-    return error.UnsupportedSqlShape;
+    return false;
+}
+
+fn generatedReadRangeHasAggregateFunction(
+    tokens: []const tokenized.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    var depth: usize = 0;
+    var index = range.start;
+    while (index < range.end) : (index += 1) {
+        const token = tokens[index];
+        switch (token.kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth > 0) depth -= 1;
+            },
+            .identifier => if (depth == 0 and index + 1 < range.end and tokens[index + 1].kind == .lparen and generatedSqlAggregateFunctionName(token)) {
+                return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn generatedSqlAggregateFunctionName(token: tokenized.Token) bool {
+    return token.matchesKeywordTag(.count) or
+        token.matchesKeywordTag(.sum) or
+        token.matchesKeywordTag(.avg) or
+        token.matchesKeywordTag(.min) or
+        token.matchesKeywordTag(.max) or
+        token.matchesKeywordTag(.bool_or) or
+        token.matchesKeywordTag(.bool_and) or
+        token.matchesKeywordTag(.array_agg) or
+        token.matchesKeywordTag(.string_agg);
+}
+
+fn validateGeneratedReadRangeDoesNotContainKeyword(
+    tokens: []const tokenized.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    keyword: token_mod.TokenKeyword,
+) !void {
+    var index = range.start;
+    while (index < range.end) : (index += 1) {
+        if (tokens[index].matchesKeywordTag(keyword)) return error.UnsupportedSqlShape;
+    }
 }
 
 fn validateGeneratedReadRangePrecededByKeyword(
@@ -5346,6 +5495,70 @@ test "sql adapter lowering context classifies read sql into typed plan families"
     ;
     const schema = try runtimeSchemaFromJsonForLoweringContextTestAlloc(alloc, schema_json);
     defer runtime_schema.freeSchema(alloc, schema);
+
+    var cte_query_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows",
+    );
+    defer cte_query_sql.deinit(alloc);
+    const cte_query_generated = cte_query_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    const cte_query_read_ast = switch (cte_query_generated.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    try std.testing.expectEqual(classifier.SqlReadStatementKind.query, try generatedReadStatementKind(cte_query_sql.items(), cte_query_read_ast));
+
+    var cte_set_operation_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows UNION SELECT id FROM usage_archive",
+    );
+    defer cte_set_operation_sql.deinit(alloc);
+    const cte_set_operation_generated = cte_set_operation_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    const cte_set_operation_read_ast = switch (cte_set_operation_generated.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    try std.testing.expectEqual(classifier.SqlReadStatementKind.set_operation, try generatedReadStatementKind(cte_set_operation_sql.items(), cte_set_operation_read_ast));
+
+    var cte_count_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH source_rows AS (SELECT id FROM usage_records) SELECT COUNT(*) FROM source_rows",
+    );
+    defer cte_count_sql.deinit(alloc);
+    const cte_count_generated = cte_count_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    const cte_count_read_ast = switch (cte_count_generated.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    try std.testing.expectEqual(classifier.SqlReadStatementKind.aggregate, try generatedReadStatementKind(cte_count_sql.items(), cte_count_read_ast));
+
+    var cte_join_aggregate_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH source_rows AS (SELECT id FROM usage_records) SELECT source_rows.id, COUNT(*) FROM source_rows JOIN usage_records ON source_rows.id = usage_records.id GROUP BY source_rows.id",
+    );
+    defer cte_join_aggregate_sql.deinit(alloc);
+    const cte_join_aggregate_generated = cte_join_aggregate_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    const cte_join_aggregate_read_ast = switch (cte_join_aggregate_generated.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    try std.testing.expectEqual(classifier.SqlReadStatementKind.aggregate, try generatedReadStatementKind(cte_join_aggregate_sql.items(), cte_join_aggregate_read_ast));
+
+    var recursive_cte_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows",
+    );
+    defer recursive_cte_sql.deinit(alloc);
+    const recursive_cte_generated = recursive_cte_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    const recursive_cte_read_ast = switch (recursive_cte_generated.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    try std.testing.expectEqual(classifier.SqlReadStatementKind.recursive_cte, try generatedReadStatementKind(recursive_cte_sql.items(), recursive_cte_read_ast));
+
+    var malformed_cte_read_ast = cte_query_read_ast;
+    malformed_cte_read_ast.source_tokens = null;
+    try std.testing.expectError(error.UnsupportedSqlShape, generatedReadStatementKind(cte_query_sql.items(), malformed_cte_read_ast));
 
     var query = try lowerReadPlanForLoweringContextTestAlloc(
         alloc,
