@@ -27,6 +27,7 @@ pub const ConnectionsResponse = types.ConnectionsResponse;
 pub const DocumentArtifactChildRange = types.DocumentArtifactChildRange;
 pub const DocumentArtifactManifest = types.DocumentArtifactManifest;
 pub const DocumentArtifactManifestList = types.DocumentArtifactManifestList;
+pub const TableArtifactEnrichmentList = types.TableArtifactEnrichmentList;
 pub const DocumentArtifactReprocessResponse = types.DocumentArtifactReprocessResponse;
 pub const DocumentArtifactTableReprocessRequest = types.DocumentArtifactTableReprocessRequest;
 pub const DocumentArtifactReprocessFailure = types.DocumentArtifactReprocessFailure;

@@ -139,6 +139,11 @@ pub const TableApi = struct {
         InternalFailure,
     };
 
+    pub const ExecuteListArtifactEnrichmentsError = error{
+        NotFound,
+        InternalFailure,
+    };
+
     pub const ExecuteDocumentArtifactManifestError = error{
         NotFound,
         MethodNotAllowed,
@@ -252,6 +257,11 @@ pub const TableApi = struct {
             table_name: []const u8,
             artifact_name: []const u8,
         ) ExecuteDeleteArtifactEnrichmentError!void = null,
+        execute_list_artifact_enrichments: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+        ) ExecuteListArtifactEnrichmentsError![]u8 = null,
         execute_document_artifact_manifest: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -387,6 +397,15 @@ pub const TableApi = struct {
     ) ExecuteDeleteArtifactEnrichmentError!void {
         const fn_ptr = self.vtable.execute_delete_artifact_enrichment orelse return error.MethodNotAllowed;
         return try fn_ptr(self.ptr, alloc, table_name, artifact_name);
+    }
+
+    pub fn executeListArtifactEnrichments(
+        self: TableApi,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) ExecuteListArtifactEnrichmentsError![]u8 {
+        const fn_ptr = self.vtable.execute_list_artifact_enrichments orelse return error.NotFound;
+        return try fn_ptr(self.ptr, alloc, table_name);
     }
 
     pub fn executeDocumentArtifactManifest(
@@ -744,6 +763,18 @@ pub fn handleDeleteArtifactEnrichment(
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact enrichment delete failed") },
     };
     return .{ .status = 201, .body = try alloc.dupe(u8, "{}") };
+}
+
+pub fn handleListArtifactEnrichments(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    api: TableApi,
+) !OwnedResponse {
+    const response_body = api.executeListArtifactEnrichments(alloc, table_name) catch |err| switch (err) {
+        error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
+        error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact enrichment list failed") },
+    };
+    return .{ .status = 200, .body = response_body };
 }
 
 pub fn handleDocumentArtifactManifest(
