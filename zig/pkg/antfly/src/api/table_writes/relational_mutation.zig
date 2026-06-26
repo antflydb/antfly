@@ -25,6 +25,32 @@ const table_write_core = @import("core.zig");
 
 const TableWriteSource = table_write_core.TableWriteSource;
 
+pub fn mutateRowsJoinedFromSourceRowsOnDb(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    target_schema: storage_schema.TableSchema,
+    source_schema: storage_schema.TableSchema,
+    req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+    source_rows: []const []const u8,
+) !db_mod.types.RelationalRowsMutationSourceResult {
+    var target_candidates = try db.collectRelationalRowsJoinedMutationTargetCandidatesForTargetRangeAlloc(alloc, target_schema, req, null);
+    errdefer {
+        for (target_candidates) |*candidate| candidate.deinit(alloc);
+        if (target_candidates.len > 0) alloc.free(target_candidates);
+    }
+
+    var candidates = try db_mod.DB.buildRelationalRowsJoinedMutationSourceCandidatesFromCollectedRowsAlloc(alloc, req, &target_candidates, source_rows);
+    errdefer {
+        for (candidates) |*candidate| candidate.deinit(alloc);
+        if (candidates.len > 0) alloc.free(candidates);
+    }
+
+    var plan = try db_mod.DB.selectPlannedRelationalRowsJoinedMutationSourceCandidatesAlloc(alloc, req, &candidates);
+    defer plan.deinit(alloc);
+
+    return try db.stagePlannedRelationalRowsJoinedMutationSourceWithSourceSchemaAlloc(alloc, target_schema, source_schema, req, plan.matched, plan.candidates);
+}
+
 pub fn mutateRowsJoinedFromRecursiveCtePlanAlloc(
     alloc: std.mem.Allocator,
     read_source: table_reads.TableReadSource,

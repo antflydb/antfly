@@ -267,6 +267,7 @@ pub const mutateRowsJoinedFromRecursiveCtePlanAutocommitAlloc = table_write_rela
 pub const mutateRowsJoinedFromRecursiveCtePlanAutocommitWithSessionAlloc = table_write_relational_mutation.mutateRowsJoinedFromRecursiveCtePlanAutocommitWithSessionAlloc;
 pub const mergeRowsFromRecursiveCtePlanAlloc = table_write_relational_mutation.mergeRowsFromRecursiveCtePlanAlloc;
 pub const mergeRowsFromRecursiveCtePlanWithSessionAlloc = table_write_relational_mutation.mergeRowsFromRecursiveCtePlanWithSessionAlloc;
+const mutateRowsJoinedFromSourceRowsOnDb = table_write_relational_mutation.mutateRowsJoinedFromSourceRowsOnDb;
 const ManagedDbOpenMode = table_write_managed_db.ManagedDbOpenMode;
 const ManagedDbOpenOptions = table_write_managed_db.ManagedDbOpenOptions;
 const haMirrorForManagedDbOpenMode = table_write_managed_db.haMirrorForManagedDbOpenMode;
@@ -12360,32 +12361,6 @@ fn joinedMutationSourceTargetClaim(req: db_mod.types.RelationalRowsJoinedMutatio
         .left => req.join.left.row_claim,
         .right => req.join.right.row_claim,
     };
-}
-
-fn mutateRowsJoinedFromSourceRowsOnDb(
-    alloc: std.mem.Allocator,
-    db: *db_mod.DB,
-    target_schema: storage_schema.TableSchema,
-    source_schema: storage_schema.TableSchema,
-    req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
-    source_rows: []const []const u8,
-) !db_mod.types.RelationalRowsMutationSourceResult {
-    var target_candidates = try db.collectRelationalRowsJoinedMutationTargetCandidatesForTargetRangeAlloc(alloc, target_schema, req, null);
-    errdefer {
-        for (target_candidates) |*candidate| candidate.deinit(alloc);
-        if (target_candidates.len > 0) alloc.free(target_candidates);
-    }
-
-    var candidates = try db_mod.DB.buildRelationalRowsJoinedMutationSourceCandidatesFromCollectedRowsAlloc(alloc, req, &target_candidates, source_rows);
-    errdefer {
-        for (candidates) |*candidate| candidate.deinit(alloc);
-        if (candidates.len > 0) alloc.free(candidates);
-    }
-
-    var plan = try db_mod.DB.selectPlannedRelationalRowsJoinedMutationSourceCandidatesAlloc(alloc, req, &candidates);
-    defer plan.deinit(alloc);
-
-    return try db.stagePlannedRelationalRowsJoinedMutationSourceWithSourceSchemaAlloc(alloc, target_schema, source_schema, req, plan.matched, plan.candidates);
 }
 
 fn mutateRowsJoinedFromSourceRowsAutocommitOnDb(

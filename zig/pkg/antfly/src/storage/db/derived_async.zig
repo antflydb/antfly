@@ -68,6 +68,55 @@ const readEnvUsize = db_internal.readEnvUsize;
 const readEnvU64 = db_internal.readEnvU64;
 const storeDocumentValueForGraphSource = db_internal.storeDocumentValueForGraphSource;
 
+const TestHelpers = if (builtin.is_test) struct {
+    const support = @import("test_support.zig");
+
+    pub const default_test_wait_attempts = support.default_test_wait_attempts;
+
+    pub fn tempPath(buf: []u8) [*:0]const u8 {
+        return support.tempPath(buf);
+    }
+
+    pub fn cleanupTempDir(path: [*:0]const u8) void {
+        support.cleanupTempDir(path);
+    }
+
+    pub fn waitForSearchResult(alloc: Allocator, db: anytype, req: types.SearchRequest, min_hits: u32) !types.SearchResult {
+        return support.waitForSearchResult(alloc, db, req, min_hits);
+    }
+
+    pub fn waitForAppliedSequenceAdvance(alloc: Allocator, db: anytype, index_name: []const u8, previous: u64) !u64 {
+        return support.waitForAppliedSequenceAdvance(alloc, db, index_name, previous);
+    }
+
+    pub fn putDenseEmbeddingArtifactForTest(db: anytype, alloc: Allocator, artifact_key: []const u8, source_hash: ?u64, vector: []const f32) !void {
+        return support.putDenseEmbeddingArtifactForTest(db, alloc, artifact_key, source_hash, vector);
+    }
+
+    pub fn putSparseEmbeddingArtifactForTest(
+        db: anytype,
+        alloc: Allocator,
+        artifact_key: []const u8,
+        source_hash: ?u64,
+        indices: []const u32,
+        values: []const f32,
+    ) !void {
+        return support.putSparseEmbeddingArtifactForTest(db, alloc, artifact_key, source_hash, indices, values);
+    }
+
+    pub fn stressDenseBackend() hbc_mod.StorageBackend {
+        return support.stressDenseBackend();
+    }
+
+    pub fn allocStressDenseDocJson(alloc: Allocator, dims: usize, doc_index: usize) ![]u8 {
+        return support.allocStressDenseDocJson(alloc, dims, doc_index);
+    }
+
+    pub fn profileBenchTestsEnabled() bool {
+        return support.profileBenchTestsEnabled();
+    }
+} else struct {};
+
 fn containsDeleteKey(list: []const []const u8, key: []const u8) bool {
     return db_internal.containsKey(list, key);
 }
@@ -2225,14 +2274,11 @@ test "dense catch-up maintenance cooldown skips light repeated maintenance" {
 
 test "db derived async runUntilIdle drains lazy dense posting maintenance" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -2282,14 +2328,11 @@ test "db derived async runUntilIdle drains lazy dense posting maintenance" {
 
 test "db derived async collectManagedSyncTargets includes graph index for graph artifact journal changes" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -5217,14 +5260,11 @@ pub fn Impl(comptime DB: type) type {
 
 test "db derived async replay reopen preserves applied watermark above retained replay floor" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{
@@ -5258,14 +5298,11 @@ test "db derived async replay reopen preserves applied watermark above retained 
 
 test "db derived async replay writer open resumes generated enrichment replay from journal" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{
@@ -5428,14 +5465,11 @@ test "db derived async replay text replay delete keys include upserted derived d
 
 test "db derived async replay skips dense embedding writes when artifact payload is missing" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
     {
@@ -5490,14 +5524,11 @@ test "db derived async replay skips dense embedding writes when artifact payload
 
 test "db derived async replay skips and deletes corrupt dense embedding artifacts" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
     {
@@ -5557,14 +5588,11 @@ test "db derived async replay skips and deletes corrupt dense embedding artifact
 
 test "db derived async dense artifact rebuild deletes corrupt stored embedding artifacts" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -5604,14 +5632,11 @@ test "db derived async dense artifact rebuild write cleanup tolerates artifact-b
 
 test "db derived async replay applies sparse embeddings from artifact payloads" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -5629,7 +5654,7 @@ test "db derived async replay applies sparse embeddings from artifact payloads" 
 
         const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "sp_v1");
         defer alloc.free(artifact_key);
-        try db_test_support.putSparseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &.{ 1, 5 }, &.{ 0.5, 0.75 });
+        try TestHelpers.putSparseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &.{ 1, 5 }, &.{ 0.5, 0.75 });
 
         const derived_batch = derived_types.DerivedBatch{
             .sparse_embeddings = &.{
@@ -5656,14 +5681,11 @@ test "db derived async replay applies sparse embeddings from artifact payloads" 
 
 test "db derived async replay skips and deletes corrupt sparse embedding artifacts" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
     {
@@ -5717,13 +5739,10 @@ test "db derived async replay skips and deletes corrupt sparse embedding artifac
 test "db derived async replay batch persists per-index applied sequence watermark" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -5747,13 +5766,10 @@ test "db derived async replay batch persists per-index applied sequence watermar
 test "db derived async replay batch truncates replay logs after managed indexes catch up" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -5770,11 +5786,11 @@ test "db derived async replay batch truncates replay logs after managed indexes 
         },
     });
 
-    _ = try db_test_support.waitForAppliedSequenceAdvance(alloc, &db, "ft_v1", 0);
+    _ = try TestHelpers.waitForAppliedSequenceAdvance(alloc, &db, "ft_v1", 0);
 
     var remaining_journal_entries: usize = std.math.maxInt(usize);
     var attempts: usize = 0;
-    while (attempts < db_test_support.default_test_wait_attempts) : (attempts += 1) {
+    while (attempts < TestHelpers.default_test_wait_attempts) : (attempts += 1) {
         const journal_entries = try db.core.store.iterateReplayFrom(alloc, 1);
         defer {
             for (journal_entries) |*entry| entry.deinit(alloc);
@@ -5790,13 +5806,10 @@ test "db derived async replay batch truncates replay logs after managed indexes 
 test "db derived async replay io_threaded executor processes indexed writes" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .executor = .{ .backend = .io_threaded },
@@ -5816,7 +5829,7 @@ test "db derived async replay io_threaded executor processes indexed writes" {
         .sync_level = .full_index,
     });
 
-    var result = try db_test_support.waitForSearchResult(alloc, &db, .{
+    var result = try TestHelpers.waitForSearchResult(alloc, &db, .{
         .index_name = "ft_v1",
         .query = .{ .match_all = {} },
     }, 1);
@@ -5829,13 +5842,10 @@ test "db derived async replay io_threaded executor processes indexed writes" {
 test "db derived async replay reopen replays pending derived embeddings from durable log" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
 
@@ -5865,7 +5875,7 @@ test "db derived async replay reopen replays pending derived embeddings from dur
         }, &.{});
         const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
         defer alloc.free(artifact_key);
-        try db_test_support.putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
+        try TestHelpers.putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
         extracted.dense_embeddings[0].artifact_key = try alloc.dupe(u8, artifact_key);
 
         var derived_batch = try @import("write_path.zig").buildDerivedBatch(alloc, req, &.{extracted}, &.{}, &.{});
@@ -5898,13 +5908,10 @@ test "db derived async replay reopen replays pending derived embeddings from dur
 test "db derived async replay reopen replays pending derived embeddings with durable lsm primary backend" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
 
@@ -5936,7 +5943,7 @@ test "db derived async replay reopen replays pending derived embeddings with dur
         }, &.{});
         const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
         defer alloc.free(artifact_key);
-        try db_test_support.putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
+        try TestHelpers.putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
         extracted.dense_embeddings[0].artifact_key = try alloc.dupe(u8, artifact_key);
 
         var derived_batch = try @import("write_path.zig").buildDerivedBatch(alloc, req, &.{extracted}, &.{}, &.{});
@@ -5971,13 +5978,10 @@ test "db derived async replay reopen replays pending derived embeddings with dur
 test "db derived async replay replay respects per-index applied watermarks" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
 
@@ -6012,7 +6016,7 @@ test "db derived async replay replay respects per-index applied watermarks" {
         }, &.{});
         const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
         defer alloc.free(artifact_key);
-        try db_test_support.putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
+        try TestHelpers.putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
         extracted.dense_embeddings[0].artifact_key = try alloc.dupe(u8, artifact_key);
 
         var derived_batch = try @import("write_path.zig").buildDerivedBatch(alloc, req, &.{extracted}, &.{}, &.{});
@@ -6048,13 +6052,10 @@ test "db derived async replay replay respects per-index applied watermarks" {
 test "db derived async replay replay applies dense embeddings from artifact payloads" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -6072,7 +6073,7 @@ test "db derived async replay replay applies dense embeddings from artifact payl
 
         const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
         defer alloc.free(artifact_key);
-        try db_test_support.putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 0, 1 });
+        try TestHelpers.putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 0, 1 });
 
         const derived_batch = derived_types.DerivedBatch{
             .dense_embeddings = &.{
@@ -6107,15 +6108,12 @@ test "db derived async replay replay applies dense embeddings from artifact payl
 
 test "db derived async dense artifact rebuild rebuildDenseIndexesFromStoredEmbeddingArtifactsIfNeeded repairs external dense doc gaps on reopen" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const threadedIo = db_internal.threadedIo;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -6196,15 +6194,12 @@ test "db derived async dense artifact rebuild rebuildDenseIndexesFromStoredEmbed
 
 test "db derived async dense artifact rebuild dense artifact rebuild preserves stable vector ids distinct from ordinals" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const threadedIo = db_internal.threadedIo;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{});
@@ -6270,14 +6265,11 @@ test "db derived async dense artifact rebuild dense artifact rebuild preserves s
 
 test "db derived async dense artifact rebuild dense artifact rebuild force-resets corrupt external dense structure" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{
@@ -6351,17 +6343,13 @@ test "db derived async dense artifact rebuild dense artifact rebuild force-reset
 
 test "db derived async dense artifact rebuild dense artifact rebuild resumes from persisted state" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
     const threadedIo = db_internal.threadedIo;
     const alloc = std.testing.allocator;
     const doc_count: usize = 8;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{
@@ -6389,7 +6377,7 @@ test "db derived async dense artifact rebuild dense artifact rebuild resumes fro
 
             const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_id, "dense_idx");
             defer alloc.free(artifact_key);
-            try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{
+            try TestHelpers.putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{
                 @floatFromInt(i + 1),
                 0,
                 0,
@@ -6483,18 +6471,14 @@ test "db derived async dense artifact rebuild dense artifact rebuild resumes fro
 
 test "db derived async dense artifact rebuild dense artifact rebuild progress counts source artifacts across multiple consumer indexes" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
     const threadedIo = db_internal.threadedIo;
     const alloc = std.testing.allocator;
     const doc_count: usize = 3;
     const shared_cfg = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true,\"embedding_name\":\"shared_dense_v1\"}";
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{
@@ -6527,7 +6511,7 @@ test "db derived async dense artifact rebuild dense artifact rebuild progress co
 
             const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_id, "shared_dense_v1");
             defer alloc.free(artifact_key);
-            try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{
+            try TestHelpers.putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{
                 @floatFromInt(i + 1),
                 0,
                 0,
@@ -6585,15 +6569,12 @@ test "db derived async dense artifact rebuild dense artifact rebuild progress co
 
 test "db derived async dense artifact rebuild chunk-backed dense artifact rebuild stays pending until all chunk artifacts are rebuilt" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const threadedIo = db_internal.threadedIo;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
 
@@ -6706,18 +6687,14 @@ test "db derived async dense artifact rebuild chunk-backed dense artifact rebuil
 
 test "db derived async dense artifact rebuild dense artifact rebuild does not let resumed targets skip fresh targets" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
     const threadedIo = db_internal.threadedIo;
     const alloc = std.testing.allocator;
     const doc_count: usize = 4;
     const shared_cfg = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true,\"embedding_name\":\"shared_dense_v1\"}";
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{
@@ -6750,7 +6727,7 @@ test "db derived async dense artifact rebuild dense artifact rebuild does not le
 
             const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_id, "shared_dense_v1");
             defer alloc.free(artifact_key);
-            try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{
+            try TestHelpers.putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{
                 @floatFromInt(i + 1),
                 0,
                 0,
@@ -6839,16 +6816,12 @@ test "db derived async dense artifact rebuild dense artifact rebuild does not le
 
 test "db derived async dense artifact rebuild dense artifact rebuild ignores stale wrong-dimension artifacts when counting progress" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
     const threadedIo = db_internal.threadedIo;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{
@@ -6871,11 +6844,11 @@ test "db derived async dense artifact rebuild dense artifact rebuild ignores sta
 
         const valid_artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "shared_dense_v1");
         defer alloc.free(valid_artifact_key);
-        try putDenseEmbeddingArtifactForTest(&db, alloc, valid_artifact_key, null, &[_]f32{ 1, 0, 0 });
+        try TestHelpers.putDenseEmbeddingArtifactForTest(&db, alloc, valid_artifact_key, null, &[_]f32{ 1, 0, 0 });
 
         const stale_artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:stale", "shared_dense_v1");
         defer alloc.free(stale_artifact_key);
-        try putDenseEmbeddingArtifactForTest(&db, alloc, stale_artifact_key, null, &[_]f32{ 1, 0 });
+        try TestHelpers.putDenseEmbeddingArtifactForTest(&db, alloc, stale_artifact_key, null, &[_]f32{ 1, 0 });
     }
 
     var io_impl = threadedIo();
@@ -6920,14 +6893,11 @@ test "db derived async dense artifact rebuild dense artifact rebuild ignores sta
 
 test "db derived async dense artifact rebuild dense artifact rebuild clears stale persisted state when no valid artifacts remain" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{
@@ -6968,15 +6938,11 @@ test "db derived async dense artifact rebuild dense artifact rebuild clears stal
 
 test "db derived async dense artifact rebuild dense artifact rebuild waits for replay debt instead of raw doc count alone" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    const putDenseEmbeddingArtifactForTest = db_test_support.putDenseEmbeddingArtifactForTest;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var appended_sequence: u64 = 0;
 
@@ -7001,7 +6967,7 @@ test "db derived async dense artifact rebuild dense artifact rebuild waits for r
 
         const artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
         defer alloc.free(artifact_key);
-        try putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
+        try TestHelpers.putDenseEmbeddingArtifactForTest(&db, alloc, artifact_key, null, &[_]f32{ 1, 0 });
 
         var dense_embeddings = try alloc.alloc(derived_types.DerivedDenseEmbeddingWrite, 1);
         var batch = derived_types.DerivedBatch{
@@ -7056,11 +7022,6 @@ test "db derived async dense startup catch-up defaults keep more than one cache 
 
 test "db derived async io_threaded executor stress applies explicit dense embeddings on lsm backend" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const stressDenseBackend = db_test_support.stressDenseBackend;
-    const allocStressDenseDocJson = db_test_support.allocStressDenseDocJson;
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     if (db_internal.getenv("ANTFLY_STRESS_DB_DENSE_REPRO") == null) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
@@ -7068,11 +7029,11 @@ test "db derived async io_threaded executor stress applies explicit dense embedd
     const total_docs = index_manager_mod.stressEnvUsize("ANTFLY_STRESS_DENSE_DOCS", 4096);
     const batch_size = @max(@as(usize, 1), index_manager_mod.stressEnvUsize("ANTFLY_STRESS_DENSE_BATCH", 256));
     const progress_interval = @max(batch_size, index_manager_mod.stressEnvUsize("ANTFLY_STRESS_DENSE_PROGRESS", batch_size * 8));
-    const dense_backend = stressDenseBackend();
+    const dense_backend = TestHelpers.stressDenseBackend();
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
@@ -7106,7 +7067,7 @@ test "db derived async io_threaded executor stress applies explicit dense embedd
 
         for (queued_docs..end) |doc_index| {
             const doc_key = try std.fmt.allocPrint(alloc, "doc:{d:0>8}", .{doc_index});
-            const doc_json = try allocStressDenseDocJson(alloc, dims, doc_index);
+            const doc_json = try TestHelpers.allocStressDenseDocJson(alloc, dims, doc_index);
             try writes.append(alloc, .{
                 .key = doc_key,
                 .value = doc_json,
@@ -7160,12 +7121,8 @@ test "db derived async io_threaded executor stress applies explicit dense embedd
 test "db derived async hbc posting lazy versus eager profile benchmark" {
     const DB = @import("mod.zig").DB;
     const BatchProfile = @import("mod.zig").BatchProfile;
-    const db_test_support = @import("test_support.zig");
-    const profileBenchTestsEnabled = db_test_support.profileBenchTestsEnabled;
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const monotonicTimeNs = platform.time.monotonicNs;
-    if (!profileBenchTestsEnabled()) return error.SkipZigTest;
+    if (!TestHelpers.profileBenchTestsEnabled()) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     const dims: usize = @max(@as(usize, 1), readEnvUsize("ANTFLY_HBC_POSTING_BENCH_DIMS", 16));
@@ -7228,8 +7185,8 @@ test "db derived async hbc posting lazy versus eager profile benchmark" {
 
     for (modes) |mode| {
         var path_buf: [256]u8 = undefined;
-        const path = tempPath(&path_buf);
-        defer cleanupTempDir(path);
+        const path = TestHelpers.tempPath(&path_buf);
+        defer TestHelpers.cleanupTempDir(path);
 
         var db = try DB.open(alloc, std.mem.span(path), .{});
         defer db.close();

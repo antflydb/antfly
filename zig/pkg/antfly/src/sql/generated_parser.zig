@@ -904,6 +904,7 @@ pub const GeneratedSqlCteAst = struct {
     body_fetch_tokens: ?GeneratedSqlTokenRange = null,
     body_fetch_count_tokens: ?GeneratedSqlTokenRange = null,
     body_fetch_count_expression: GeneratedSqlExpressionAst = .{},
+    body_row_lock_tokens: ?GeneratedSqlTokenRange = null,
     body_set_operation_tokens: ?GeneratedSqlTokenRange = null,
     body_set_operation: GeneratedSqlSetOperationAst = .{},
     body_projection_items: GeneratedSqlListAst = .{},
@@ -1523,6 +1524,7 @@ pub fn cloneCteBodyReadAstAlloc(
     cloned.fetch_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_fetch_tokens, body.start, body.end);
     cloned.fetch_count_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_fetch_count_tokens, body.start, body.end);
     cloned.fetch_count_expression = try cloneRebasedGeneratedExpressionAlloc(alloc, cte.body_fetch_count_expression, body.start, body.end);
+    cloned.row_lock_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_row_lock_tokens, body.start, body.end);
     cloned.set_operation_tokens = try rebaseGeneratedSqlTokenRangeOptional(cte.body_set_operation_tokens, body.start, body.end);
     cloned.set_operation = try cloneRebasedGeneratedSetOperationAlloc(alloc, cte.body_set_operation, body.start, body.end);
     return cloned;
@@ -3801,18 +3803,19 @@ fn buildGeneratedSubqueryExpressionAst(
     const limit_index = findTopLevelKeyword(tokens, projection_start, body_end, .limit);
     const offset_index = findTopLevelKeyword(tokens, projection_start, body_end, .offset);
     const fetch_index = findTopLevelKeyword(tokens, projection_start, body_end, .fetch);
+    const row_lock_index = generatedReadRowLockStart(tokens, projection_start, body_end);
 
-    const projection_end = firstOptionalIndex(&[_]?usize{ from_index, where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
+    const projection_end = firstOptionalIndex(&[_]?usize{ from_index, where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index, row_lock_index }) orelse body_end;
     if (projection_start < projection_end) {
         ast.subquery_projection_tokens = .{ .start = projection_start, .end = projection_end };
         ast.subquery_projection_items = try buildTopLevelListAst(alloc, tokens, ast.subquery_projection_tokens.?, .{ .bare_alias = true });
     }
     if (from_index) |idx| {
-        const source_end = firstOptionalIndex(&[_]?usize{ where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
+        const source_end = firstOptionalIndex(&[_]?usize{ where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index, row_lock_index }) orelse body_end;
         if (idx + 1 < source_end) ast.subquery_source_tokens = .{ .start = idx + 1, .end = source_end };
     }
     if (where_index) |idx| {
-        const where_end = firstOptionalIndex(&[_]?usize{ group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
+        const where_end = firstOptionalIndex(&[_]?usize{ group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index, row_lock_index }) orelse body_end;
         if (idx + 1 < where_end) {
             ast.subquery_where_tokens = .{ .start = idx + 1, .end = where_end };
             ast.subquery_where_expression_kind = generatedExpressionKindForRange(tokens, ast.subquery_where_tokens.?);
@@ -4068,8 +4071,9 @@ fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.
     const limit_index = findTopLevelKeyword(tokens, projection_start, body_end, .limit);
     const offset_index = findTopLevelKeyword(tokens, projection_start, body_end, .offset);
     const fetch_index = findTopLevelKeyword(tokens, projection_start, body_end, .fetch);
+    const row_lock_index = generatedReadRowLockStart(tokens, projection_start, body_end);
 
-    const projection_end = firstOptionalIndex(&[_]?usize{ from_index, where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
+    const projection_end = firstOptionalIndex(&[_]?usize{ from_index, where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index, row_lock_index }) orelse body_end;
     if (projection_start < projection_end) {
         const projection_tokens = GeneratedSqlTokenRange{ .start = projection_start, .end = projection_end };
         cte.body_projection_tokens = projection_tokens;
@@ -4082,7 +4086,7 @@ fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.
         }
     }
     if (from_index) |idx| {
-        const source_end = firstOptionalIndex(&[_]?usize{ where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
+        const source_end = firstOptionalIndex(&[_]?usize{ where_index, group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index, row_lock_index }) orelse body_end;
         if (idx + 1 < source_end) {
             const source_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = source_end };
             cte.body_source_tokens = source_tokens;
@@ -4105,7 +4109,7 @@ fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.
         }
     }
     if (where_index) |idx| {
-        const where_end = firstOptionalIndex(&[_]?usize{ group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
+        const where_end = firstOptionalIndex(&[_]?usize{ group_index, having_index, window_index, order_index, limit_index, offset_index, fetch_index, row_lock_index }) orelse body_end;
         if (idx + 1 < where_end) {
             const where_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = where_end };
             cte.body_where_tokens = where_tokens;
@@ -4114,7 +4118,7 @@ fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.
     }
     if (group_index) |idx| {
         const group_start = if (idx + 1 < body_end and tokens[idx + 1].matchesKeywordTag(.by)) idx + 2 else idx + 1;
-        const group_end = firstOptionalIndex(&[_]?usize{ having_index, window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
+        const group_end = firstOptionalIndex(&[_]?usize{ having_index, window_index, order_index, limit_index, offset_index, fetch_index, row_lock_index }) orelse body_end;
         if (group_start < group_end) {
             const group_tokens = GeneratedSqlTokenRange{ .start = group_start, .end = group_end };
             cte.body_group_tokens = group_tokens;
@@ -4128,7 +4132,7 @@ fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.
         }
     }
     if (having_index) |idx| {
-        const having_end = firstOptionalIndex(&[_]?usize{ window_index, order_index, limit_index, offset_index, fetch_index }) orelse body_end;
+        const having_end = firstOptionalIndex(&[_]?usize{ window_index, order_index, limit_index, offset_index, fetch_index, row_lock_index }) orelse body_end;
         if (idx + 1 < having_end) {
             const having_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = having_end };
             cte.body_having_tokens = having_tokens;
@@ -4136,7 +4140,7 @@ fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.
         }
     }
     if (window_index) |idx| {
-        const window_end = firstOptionalIndex(&[_]?usize{ order_index, limit_index, offset_index, fetch_index }) orelse body_end;
+        const window_end = firstOptionalIndex(&[_]?usize{ order_index, limit_index, offset_index, fetch_index, row_lock_index }) orelse body_end;
         if (idx + 1 < window_end) {
             const window_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = window_end };
             cte.body_window_tokens = window_tokens;
@@ -4146,7 +4150,7 @@ fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.
     }
     if (order_index) |idx| {
         const order_start = if (idx + 1 < body_end and tokens[idx + 1].matchesKeywordTag(.by)) idx + 2 else idx + 1;
-        const order_end = firstOptionalIndex(&[_]?usize{ limit_index, offset_index, fetch_index }) orelse body_end;
+        const order_end = firstOptionalIndex(&[_]?usize{ limit_index, offset_index, fetch_index, row_lock_index }) orelse body_end;
         if (order_start < order_end) {
             const order_tokens = GeneratedSqlTokenRange{ .start = order_start, .end = order_end };
             cte.body_order_tokens = order_tokens;
@@ -4160,7 +4164,7 @@ fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.
         }
     }
     if (limit_index) |idx| {
-        const limit_end = firstOptionalIndex(&[_]?usize{ offset_index, fetch_index }) orelse body_end;
+        const limit_end = firstOptionalIndex(&[_]?usize{ offset_index, fetch_index, row_lock_index }) orelse body_end;
         if (idx + 1 < limit_end) {
             const limit_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = limit_end };
             cte.body_limit_tokens = limit_tokens;
@@ -4172,7 +4176,7 @@ fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.
         }
     }
     if (offset_index) |idx| {
-        const offset_end = firstOptionalIndex(&[_]?usize{fetch_index}) orelse body_end;
+        const offset_end = firstOptionalIndex(&[_]?usize{ fetch_index, row_lock_index }) orelse body_end;
         if (idx + 1 < offset_end) {
             const offset_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = offset_end };
             cte.body_offset_tokens = offset_tokens;
@@ -4182,14 +4186,18 @@ fn buildReadCteBodyMetadata(alloc: std.mem.Allocator, tokens: []const token_mod.
         }
     }
     if (fetch_index) |idx| {
-        if (idx + 1 < body_end) {
-            const fetch_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = body_end };
+        const fetch_end = row_lock_index orelse body_end;
+        if (idx + 1 < fetch_end) {
+            const fetch_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = fetch_end };
             cte.body_fetch_tokens = fetch_tokens;
             if (generatedFetchCountTokens(tokens, fetch_tokens)) |count_tokens| {
                 cte.body_fetch_count_tokens = count_tokens;
                 try buildGeneratedExpressionAstInto(alloc, tokens, count_tokens, &cte.body_fetch_count_expression);
             }
         }
+    }
+    if (row_lock_index) |idx| {
+        if (idx + 1 < body_end) cte.body_row_lock_tokens = .{ .start = idx, .end = body_end };
     }
 }
 
@@ -10179,6 +10187,19 @@ test "generated SQL parser facade builds extended read AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.cte_items[0].body_fetch_count_tokens.?);
             try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, read.cte_items[0].body_fetch_count_expression.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 10, .end = 11 }, read.cte_items[0].body_fetch_count_expression.tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const cte_row_lock_body_read_sql = "WITH source_rows AS (SELECT id FROM usage_records FOR UPDATE SKIP LOCKED) SELECT id FROM source_rows";
+    const cte_row_lock_body_read_result = try parseSqlAlloc(alloc, cte_row_lock_body_read_sql);
+    switch (cte_row_lock_body_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.cte, read.kind);
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.cte_items[0].body_kind.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 4, .end = 12 }, read.cte_items[0].body_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 8 }, read.cte_items[0].body_source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 12 }, read.cte_items[0].body_row_lock_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }

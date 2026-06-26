@@ -353,6 +353,9 @@ typed `RowClaimRequest` planner, while document SQL rejects them with the
 explicit `DocumentSqlLockingUnsupported` diagnostic. The generated row-lock
 boundary is mode-aware so temporal `FOR SYSTEM_TIME` source clauses remain
 part of their relation source rather than being misclassified as lock tails.
+Generated CTE body metadata now retains and validates body-level
+`body_row_lock_tokens` as well, and rebases that metadata when a CTE body is
+cloned into the direct generated read AST path.
 Deeper read cutover still requires full generated
 query-body AST payloads for expression-level projections and predicates,
 complete multi-join planning and richer join-tree semantics beyond the current
@@ -894,7 +897,9 @@ Unsupported DDL remains on the existing parser until
    Complete generated row-locking reads now retain generated `row_lock_tokens`
    and lower through typed relational row-claim planning for supported
    relational reads; document SQL returns the explicit
-   `DocumentSqlLockingUnsupported` diagnostic. Incomplete generated read
+   `DocumentSqlLockingUnsupported` diagnostic. CTE read bodies now retain
+   `body_row_lock_tokens`, validate the `FOR` row-lock boundary, and clone that
+   metadata into direct generated read ASTs. Incomplete generated read
    clause-boundary shapes for
    `SELECT`/`WITH`, source clauses, predicates, grouping, having filters,
    incomplete boolean and comparison operator tails, ordering,

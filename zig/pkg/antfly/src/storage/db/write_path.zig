@@ -69,6 +69,22 @@ const BorrowedGraphMaterializationBatch = db_internal.BorrowedGraphMaterializati
 const containsStoreWriteKey = db_internal.containsStoreWriteKey;
 const filterChangedGraphMaterializationBatch = db_internal.filterChangedGraphMaterializationBatch;
 
+const TestHelpers = if (builtin.is_test) struct {
+    const support = @import("test_support.zig");
+
+    pub fn tempPath(buf: []u8) [*:0]const u8 {
+        return support.tempPath(buf);
+    }
+
+    pub fn cleanupTempDir(path: [*:0]const u8) void {
+        support.cleanupTempDir(path);
+    }
+
+    pub fn profileBenchTestsEnabled() bool {
+        return support.profileBenchTestsEnabled();
+    }
+} else struct {};
+
 pub const BatchProfile = struct {
     total_ns: u64 = 0,
     resolve_transforms_ns: u64 = 0,
@@ -3069,14 +3085,11 @@ fn chunkCacheTupleKeyAlloc(alloc: Allocator, components: []const []const u8) ![]
 
 test "db write path doc identity allocates final document ordinal then rejects new documents" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
@@ -3122,14 +3135,11 @@ test "db write path doc identity allocates final document ordinal then rejects n
 
 test "db write path doc identity allocates final document ordinal with all index families present" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
@@ -3210,14 +3220,11 @@ test "db write path doc identity allocates final document ordinal with all index
 
 test "db write path doc identity rejects new document writes at ordinal exhaustion for every sync level" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
@@ -3262,14 +3269,11 @@ test "db write path doc identity rejects new document writes at ordinal exhausti
 
 test "db write path caches identity visibility summary after local writes" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .mem = .{} },
@@ -3291,14 +3295,11 @@ test "db write path caches identity visibility summary after local writes" {
 
 test "db write path document extraction templated inline source size is rejected before persistence" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const security = scraping.ContentSecurityConfig{ .max_download_size_bytes = 4 };
     var remote_content = scraping.RemoteContentConfig{ .security = security };
@@ -3332,14 +3333,11 @@ test "db write path document extraction templated inline source size is rejected
 
 test "db write path transform resolves transforms against pending same-batch writes" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -3375,15 +3373,12 @@ test "db write path transform resolves transforms against pending same-batch wri
 
 test "db write path transform relational batch transforms read and rewrite base rows only" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -3431,14 +3426,11 @@ test "db write path transform relational batch transforms read and rewrite base 
 
 test "db write path transform keeps delete when same-batch transform targets deleted key" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -3466,15 +3458,12 @@ test "db write path transform keeps delete when same-batch transform targets del
 
 test "db write path transform relational batch keeps delete when same-batch transform targets deleted key" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -3506,14 +3495,11 @@ test "db write path transform relational batch keeps delete when same-batch tran
 
 test "db write path bulk ingest write commits document writes before finish" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -3539,14 +3525,11 @@ test "db write path bulk ingest write commits document writes before finish" {
 
 test "db write path bulk ingest primary lsm writes use direct sorted ingest batch mode" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .lsm = .{
@@ -3581,14 +3564,11 @@ test "db write path bulk ingest primary lsm writes use direct sorted ingest batc
 
 test "db write path bulk ingest resolves transforms across direct write batches" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -3631,14 +3611,11 @@ test "db write path bulk ingest resolves transforms across direct write batches"
 
 test "db write path bulk ingest applies pure-doc work at requested sync level" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -3682,14 +3659,11 @@ test "db write path bulk ingest applies pure-doc work at requested sync level" {
 
 test "db write path bulk ingest keeps direct writes visible before timestamped batch" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -3724,14 +3698,11 @@ test "db write path bulk ingest keeps direct writes visible before timestamped b
 
 test "db write path bulk ingest keeps direct writes visible before predicate batch" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -3776,14 +3747,11 @@ test "db write path bulk ingest keeps direct writes visible before predicate bat
 
 test "db write path bulk ingest keeps direct writes visible before graph batch" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -3821,14 +3789,11 @@ test "db write path bulk ingest keeps direct writes visible before graph batch" 
 
 test "db write path bulk ingest query_readonly reopen serves empty dense search instead of index-not-found" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var writer = try DB.open(alloc, std.mem.span(path), .{});
     defer writer.close();
@@ -3871,14 +3836,11 @@ test "db write path bulk ingest query_readonly reopen serves empty dense search 
 
 test "db write path bulk ingest query_readonly reopen does not backfill pending external dense artifacts" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     {
         var writer = try DB.open(alloc, std.mem.span(path), .{
@@ -3919,14 +3881,11 @@ test "db write path bulk ingest query_readonly reopen does not backfill pending 
 
 test "db write path bulk ingest dense auto finish wakes weak-sync replay and publishes visibility after catch-up" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -3994,14 +3953,11 @@ test "db write path bulk ingest dense auto finish wakes weak-sync replay and pub
 
 test "db write path bulk ingest dense auto finish wakes current replay target if deferred wake is absent" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -4037,14 +3993,11 @@ test "db write path bulk ingest dense auto finish wakes current replay target if
 
 test "db write path bulk ingest dense auto replays packed external embedding strings" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -4077,14 +4030,11 @@ test "db write path bulk ingest dense auto replays packed external embedding str
 
 test "db write path bulk ingest full_text sync defers text merge work until finish" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .text_merge = .{
@@ -4134,14 +4084,11 @@ test "db write path bulk ingest full_text sync defers text merge work until fini
 
 test "db write path bulk ingest finish publishes primary store before external dense leaf splits" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -4188,14 +4135,11 @@ test "db write path bulk ingest finish publishes primary store before external d
 
 test "db write path bulk ingest algebraic survives reopen with durable lsm primary backend" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     const cfg =
         \\{
@@ -4273,16 +4217,12 @@ test "db write path bulk ingest algebraic survives reopen with durable lsm prima
 
 test "db write path batch load profile benchmark" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const profileBenchTestsEnabled = db_test_support.profileBenchTestsEnabled;
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
-    if (!profileBenchTestsEnabled()) return error.SkipZigTest;
+    if (!TestHelpers.profileBenchTestsEnabled()) return error.SkipZigTest;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
@@ -4377,13 +4317,10 @@ test "db write path batch load profile benchmark" {
 test "db write path extract enrichments exposes cleaned writes and special fields" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -4419,13 +4356,10 @@ test "db write path extract enrichments exposes cleaned writes and special field
 test "db write path extract enrichments projects configured embedded json vector and graph fields" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -4477,13 +4411,10 @@ test "db write path extract enrichments projects configured embedded json vector
 test "db write path extract enrichments rejects unsupported legacy summaries field" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -4499,13 +4430,10 @@ test "db write path extract enrichments rejects unsupported legacy summaries fie
 test "db write path document artifact child range applies batch without source row write" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
@@ -4548,13 +4476,10 @@ test "db write path document artifact child range applies batch without source r
 test "db write path document artifact child range dispatches generated artifacts to remote owner" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
@@ -4664,13 +4589,10 @@ test "db write path document artifact child range dispatches generated artifacts
 test "db write path document artifact child range retries remote dispatch from durable outbox" {
     const alloc = std.testing.allocator;
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{
         .start_index_workers = false,
@@ -4814,15 +4736,12 @@ test "db write path replay buildDerivedBatch stores thin document and embedding 
 
 test "db write path batch appends only thin replay stream records" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
     const replay_stream_mod = @import("derived/replay_stream.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -4843,15 +4762,12 @@ test "db write path batch appends only thin replay stream records" {
 
 test "db write path batch writes thin change journal record" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
     const replay_stream_mod = @import("derived/replay_stream.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -4880,15 +4796,12 @@ test "db write path batch writes thin change journal record" {
 
 test "db write path batch uses change journal as the replay authority" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
     const replay_stream_mod = @import("derived/replay_stream.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -4910,15 +4823,12 @@ test "db write path batch uses change journal as the replay authority" {
 
 test "db write path direct graph writes record graph artifacts in the replay stream instead of graph payload replay" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
     const replay_stream_mod = @import("derived/replay_stream.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
@@ -4952,15 +4862,12 @@ test "db write path direct graph writes record graph artifacts in the replay str
 
 test "db write path _edges writes record graph artifacts in the replay stream instead of graph payload replay" {
     const DB = @import("mod.zig").DB;
-    const db_test_support = @import("test_support.zig");
     const replay_stream_mod = @import("derived/replay_stream.zig");
-    const tempPath = db_test_support.tempPath;
-    const cleanupTempDir = db_test_support.cleanupTempDir;
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
-    const path = tempPath(&path_buf);
-    defer cleanupTempDir(path);
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
 
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();

@@ -1338,6 +1338,10 @@ fn generatedReadCtePayloadIsValid(
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_offset_tokens)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_fetch_tokens)) return false;
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_fetch_count_tokens)) return false;
+        if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_row_lock_tokens)) return false;
+        if (cte.body_row_lock_tokens) |row_lock_tokens| {
+            if (row_lock_tokens.start >= row_lock_tokens.end or !tokenMatchesKeyword(tokens[row_lock_tokens.start], .@"for")) return false;
+        }
         if (!generatedReadOptionalNestedRangeIsValid(tokens, end, body, cte.body_set_operation_tokens)) return false;
         if (cte.body_projection_tokens == null) return false;
     }
@@ -4595,6 +4599,23 @@ test "sql adapter parsed sql read statement kind fails closed on classifier disa
     generated_row_lock_query.statement = parseStatement(generated_row_lock_query.raw_statement, malformed_row_lock_generated, &generated_row_lock_query.tokenized_sql);
     try std.testing.expect(generated_row_lock_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_row_lock_query.statement));
+
+    var generated_cte_row_lock_query = try ParsedSql.initAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records FOR UPDATE SKIP LOCKED) SELECT id FROM source_rows");
+    defer generated_cte_row_lock_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_cte_row_lock_query.generatedStatementKind().?);
+
+    var malformed_cte_row_lock_generated = generated_cte_row_lock_query.generated_statement.?;
+    if (malformed_cte_row_lock_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| read_ast.cte_items[0].body_row_lock_tokens = read_ast.cte_items[0].body_source_tokens,
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_cte_row_lock_query.statement = parseStatement(generated_cte_row_lock_query.raw_statement, malformed_cte_row_lock_generated, &generated_cte_row_lock_query.tokenized_sql);
+    try std.testing.expect(generated_cte_row_lock_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_cte_row_lock_query.statement));
 
     var malformed_command_span = generated_query.generated_statement.?;
     if (malformed_command_span.ast) |*generated_ast| {
