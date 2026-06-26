@@ -21,7 +21,6 @@ const sql_adapter_runtime = @import("../sql/runtime.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
 const sql_adapter = @import("../sql/mod.zig");
-const sql_catalog_apply = @import("../sql/catalog_apply.zig");
 const ddl_plan = @import("../sql/ddl_plan.zig");
 const table_catalog = @import("table_catalog.zig");
 const transactions_mod = @import("../storage/transactions.zig");
@@ -67,7 +66,7 @@ fn expectAppliedDdlCorpusPlan(
     alloc: std.mem.Allocator,
     base_schema_json: []const u8,
     entry: AppParityCorpusEntry,
-    lowered: LoweredDdlPlan,
+    logical: sql_adapter.LogicalSqlPlan,
 ) !void {
     if (entry.applied_plan.len == 0) return;
 
@@ -79,9 +78,9 @@ fn expectAppliedDdlCorpusPlan(
     for (entry.apply_setup_sql) |setup_sql| {
         var parsed_setup_sql = try sql_adapter.ParsedSql.initAlloc(alloc, setup_sql);
         defer parsed_setup_sql.deinit(alloc);
-        var setup_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &parsed_setup_sql);
+        var setup_plan = try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_setup_sql, .{});
         defer setup_plan.deinit(alloc);
-        var setup_applied = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, current_schema_json, setup_plan);
+        var setup_applied = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, setup_plan);
         defer setup_applied.deinit(alloc);
         const next_schema_json = setup_applied.takeSchemaJson();
         if (owned_current_schema_json) |schema_json| alloc.free(schema_json);
@@ -89,7 +88,7 @@ fn expectAppliedDdlCorpusPlan(
         current_schema_json = next_schema_json;
     }
 
-    var applied = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, current_schema_json, lowered);
+    var applied = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, logical);
     defer applied.deinit(alloc);
     const fingerprint = try ddlAppliedFingerprintAlloc(alloc, applied);
     defer alloc.free(fingerprint);
@@ -138,9 +137,9 @@ fn schemaJsonFromSetupSqlAlloc(
     for (setup_sql) |sql| {
         var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
         defer parsed_sql.deinit(alloc);
-        var setup_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &parsed_sql);
+        var setup_plan = try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
         defer setup_plan.deinit(alloc);
-        var setup_applied = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, current_schema_json, setup_plan);
+        var setup_applied = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, setup_plan);
         defer setup_applied.deinit(alloc);
         const next_schema_json = setup_applied.takeSchemaJson();
         if (owned_current_schema_json) |schema_json| alloc.free(schema_json);
@@ -1006,7 +1005,7 @@ fn expectAppParityUnsupportedPlanEntry(
     switch (entry.family) {
         .unsupported => try expectFailClosedUnsupported(lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, .{})),
         .unsupported_read => try expectFailClosedUnsupported(lowerReadPlanWithFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, .{})),
-        .unsupported_ddl => try expectFailClosedUnsupported(lowerDdlPlanParsedSqlAlloc(alloc, parsed_sql)),
+        .unsupported_ddl => try expectFailClosedUnsupported(sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, .{})),
         .unsupported_write => try expectFailClosedUnsupported(lowerAppParityWritePlanParsedSqlAlloc(alloc, effective_schema, entry, parsed_sql, unique_resolver, row_claim)),
         .unsupported_insert => try expectFailClosedUnsupported(lowerInsertWithResolverParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, unique_resolver)),
         .unsupported_update => try expectFailClosedUnsupported(lowerUpdateParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, unique_resolver)),
@@ -1111,13 +1110,15 @@ fn expectAppParityCorpusEntry(
 
     switch (entry.family) {
         .ddl => {
+            var logical = try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
+            defer logical.deinit(alloc);
             var lowered = try lowerDdlPlanParsedSqlAlloc(alloc, &parsed_sql);
             defer lowered.deinit(alloc);
             try expectDdlSummary(entry.summary, lowered);
             const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
             defer alloc.free(fingerprint);
             try expectAppParityPlan(entry.plan, fingerprint);
-            try expectAppliedDdlCorpusPlan(alloc, base_schema_json, entry, lowered);
+            try expectAppliedDdlCorpusPlan(alloc, base_schema_json, entry, logical);
             try expectDdlExecutionCorpusPlan(alloc, entry, lowered);
         },
         .query_function => return error.TestUnexpectedResult,
@@ -1171,14 +1172,17 @@ fn expectAppParityCorpusEntry(
         .merge_mutation,
         => return error.TestUnexpectedResult,
         .adapter_noop_ddl => {
-            if (lowerDdlPlanParsedSqlAlloc(alloc, &parsed_sql)) |lowered_value| {
-                var lowered = lowered_value;
-                defer lowered.deinit(alloc);
-                switch (lowered) {
-                    .adapter_noop => |plan| try std.testing.expectEqualStrings(entry.classification_reason, @tagName(plan.reason)),
+            if (sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{})) |logical_value| {
+                var logical = logical_value;
+                defer logical.deinit(alloc);
+                switch (logical) {
+                    .other_ddl => |plan| switch (plan) {
+                        .adapter_noop => |noop| try std.testing.expectEqualStrings(entry.classification_reason, @tagName(noop.reason)),
+                        else => return error.TestUnexpectedResult,
+                    },
                     else => return error.TestUnexpectedResult,
                 }
-                const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+                const fingerprint = try adapterNoopFingerprintAlloc(alloc, "ddl", entry.classification_reason);
                 defer alloc.free(fingerprint);
                 try expectAppParityPlan(entry.plan, fingerprint);
             } else |err| {
@@ -1227,9 +1231,9 @@ fn appParityAppliedDdlPlanAlloc(
     for (entry.apply_setup_sql) |setup_sql| {
         var parsed_setup_sql = try sql_adapter.ParsedSql.initAlloc(alloc, setup_sql);
         defer parsed_setup_sql.deinit(alloc);
-        var setup_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &parsed_setup_sql);
+        var setup_plan = try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_setup_sql, .{});
         defer setup_plan.deinit(alloc);
-        var setup_applied = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, current_schema_json, setup_plan);
+        var setup_applied = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, setup_plan);
         defer setup_applied.deinit(alloc);
         const next_schema_json = setup_applied.takeSchemaJson();
         if (owned_current_schema_json) |schema_json| alloc.free(schema_json);
@@ -1237,9 +1241,9 @@ fn appParityAppliedDdlPlanAlloc(
         current_schema_json = next_schema_json;
     }
 
-    var lowered = try lowerDdlPlanParsedSqlAlloc(alloc, parsed_sql);
-    defer lowered.deinit(alloc);
-    var applied = try applyLoweredDdlPlanToSchemaJsonForTestAlloc(alloc, current_schema_json, lowered);
+    var logical = try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, .{});
+    defer logical.deinit(alloc);
+    var applied = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, logical);
     defer applied.deinit(alloc);
     return try ddlAppliedFingerprintAlloc(alloc, applied);
 }
@@ -2777,7 +2781,7 @@ const MergeExecutionTargetRow = sql_adapter.MergeExecutionTargetRow;
 
 const appendNonZeroU32FingerprintAlloc = sql_adapter.appendNonZeroU32FingerprintAlloc;
 const appendTrueBoolFingerprintAlloc = sql_adapter.appendTrueBoolFingerprintAlloc;
-const applyLoweredDdlPlanToSchemaJsonForTestAlloc = sql_catalog_apply.applyLoweredDdlPlanToSchemaJsonForTestAlloc;
+const applyLogicalDdlPlanToSchemaJsonAlloc = sql_adapter.applyLogicalDdlPlanToSchemaJsonAlloc;
 const buildMergeMutationBatchAlloc = sql_adapter.buildMergeMutationBatchAlloc;
 const buildMergeMutationBatchFromDbAcrossRangesAlloc = sql_adapter_runtime.buildMergeMutationBatchFromDbAcrossRangesAlloc;
 const buildMergeMutationBatchFromDbsAcrossRangesAlloc = sql_adapter_runtime.buildMergeMutationBatchFromDbsAcrossRangesAlloc;

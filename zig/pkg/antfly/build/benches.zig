@@ -314,13 +314,7 @@ pub fn addBenchSteps(ctx: anytype) BenchSteps {
     });
 
     const run_docid_doc_set_bench = b.addRunArtifact(docid_doc_set_bench);
-    if (b.args) |args| {
-        run_docid_doc_set_bench.addArgs(args);
-    } else {
-        run_docid_doc_set_bench.addArgs(&.{ "--samples", "1", "--repeats", "16", "--small", "32", "--medium", "1024", "--large", "16384" });
-    }
-    const docid_doc_set_bench_step = b.step("docid-doc-set-bench", "Benchmark DOCID doc-set representations against sparse id baselines");
-    docid_doc_set_bench_step.dependOn(&run_docid_doc_set_bench.step);
+    run_docid_doc_set_bench.addArgs(&.{ "--samples", "1", "--repeats", "16", "--small", "32", "--medium", "1024", "--large", "16384" });
 
     const backend_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/backend_bench.zig"),
@@ -1254,13 +1248,7 @@ pub fn addBenchSteps(ctx: anytype) BenchSteps {
     });
 
     const run_docid_write_bench = b.addRunArtifact(docid_write_bench);
-    if (b.args) |args| {
-        run_docid_write_bench.addArgs(args);
-    } else {
-        run_docid_write_bench.addArgs(&.{ "--docs", "512", "--batch-size", "128", "--body-repeat", "1" });
-    }
-    const docid_write_bench_step = b.step("docid-write-bench", "Benchmark DOCID write-path identity metadata overhead across sync levels");
-    docid_write_bench_step.dependOn(&run_docid_write_bench.step);
+    run_docid_write_bench.addArgs(&.{ "--docs", "512", "--batch-size", "128", "--body-repeat", "1" });
 
     const docid_query_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/docid_query_bench.zig"),
@@ -1275,15 +1263,12 @@ pub fn addBenchSteps(ctx: anytype) BenchSteps {
     });
 
     const run_docid_query_bench = b.addRunArtifact(docid_query_bench);
-    if (b.args) |args| {
-        run_docid_query_bench.addArgs(args);
-    } else {
-        run_docid_query_bench.addArgs(&.{ "--docs", "4096", "--queries", "16", "--repeats", "8", "--filter-size", "256", "--limit", "32" });
-    }
-    const docid_query_bench_step = b.step("docid-query-bench", "Benchmark real DB query shapes with public IDs, ordinal doc sets, and sparse-ID projection");
-    docid_query_bench_step.dependOn(&run_docid_query_bench.step);
-    const build_docid_query_bench_step = b.step("docid-query-bench-build", "Build docid_query_bench without running it");
-    build_docid_query_bench_step.dependOn(&docid_query_bench.step);
+    run_docid_query_bench.addArgs(&.{ "--docs", "4096", "--queries", "16", "--repeats", "8", "--filter-size", "256", "--limit", "32" });
+
+    const docid_bench_step = b.step("docid-bench", "Run DOCID doc-set, write-path, and query benchmarks");
+    docid_bench_step.dependOn(&run_docid_doc_set_bench.step);
+    docid_bench_step.dependOn(&run_docid_write_bench.step);
+    docid_bench_step.dependOn(&run_docid_query_bench.step);
 
     const algebraic_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/algebraic_bench.zig"),

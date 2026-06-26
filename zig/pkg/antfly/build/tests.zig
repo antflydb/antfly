@@ -1663,16 +1663,8 @@ pub const APITestFilters = struct {
 
     pub const public_table_http_docid = [_][]const u8{
         "public table batch handler maps doc identity unavailable errors",
-        "public table batch handler maps HA write gate errors",
         "public table query handler maps doc identity unavailable errors",
-        "public table query handler maps HA read gate errors",
         "public table query view handler maps doc identity unavailable errors",
-        "public table backup handler accepts portable format",
-        "public table query view handler maps HA read gate errors",
-        "public document artifact manifest handlers map HA read gate errors",
-        "public table graph metric action handler returns status response",
-        "public document artifact manifest handler returns summary and raw state",
-        "public document artifact reprocess handler returns accepted",
     };
 
     pub const rows = [_][]const u8{
@@ -3211,7 +3203,7 @@ pub fn addAPIFocusedTestSteps(
         .resolution_source = addAPIFocusedTestRun(b, root_module, "lib-resolution-source-test", "Run focused cross-shard resolution candidate-source and entity-sink tests", &APITestFilters.resolution_source, false, false, null),
         .auth = addAPIFocusedTestRun(b, root_module, "lib-api-auth-test", "Run focused API auth/usermgr HTTP tests", &APITestFilters.auth, true, false, openapi_root_check_step),
         .logic = addAPIFocusedTestRun(b, root_module, "lib-api-logic-test", "Run focused API table/index encoder, parser, and schema-update logic tests", &APITestFilters.logic, true, false, openapi_root_check_step),
-        .docid_lifecycle = addAPIFocusedTestRun(b, root_module, "docid-lifecycle-test", "Run focused DOCID lifecycle and distributed snapshot hardening tests", &APITestFilters.docid_lifecycle, true, false, null),
+        .docid_lifecycle = addAPIFocusedTestRun(b, root_module, null, "Run focused DOCID lifecycle and distributed snapshot hardening tests", &APITestFilters.docid_lifecycle, true, false, null),
         .swarm_backup_restore = addAPIFocusedTestRun(b, root_module, "lib-api-swarm-backup-restore-test", "Run the focused swarm-like backup/restore e2e test", &APITestFilters.swarm_backup_restore, false, false, null),
     };
 }
@@ -3496,8 +3488,6 @@ pub fn addAPITableTestSteps(
     addFocusedAPITestStep(b, "sql-api-parity-test", "Run SQL/API typed-plan parity corpus tests", sql_api_parity);
     addFocusedAPITestStep(b, "sql-api-parity-fixture-promote", "Regenerate the SQL/API typed-plan parity fixture from the source corpus", sql_api_parity_fixture_promote);
     addFocusedAPITestStep(b, "sql-api-parity-fixture-check", "Check that the SQL/API typed-plan parity fixture matches the source corpus", sql_api_parity_fixture_check);
-    addFocusedAPITestStep(b, "api-public-table-http-docid-test", "Run focused public table HTTP read-unavailable tests", public_table_http_docid);
-
     return .{
         .docid = docid,
         .serverless_docid = serverless_docid,
@@ -3609,17 +3599,17 @@ pub fn addAPITableAggregateTestStep(
     return step;
 }
 
-pub fn addDocIdLifecycleDependencies(
+pub fn addDocIdTestStep(
+    b: *std.Build,
     focused: APIFocusedTestRun,
     runs: APITableTestRuns,
     db_result_shape: *std.Build.Step.Run,
 ) *std.Build.Step {
-    const step = focused.step orelse
-        @panic("DOCID lifecycle focused run must expose a build step");
+    const step = b.step("docid-test", "Run DOCID lifecycle, API, and storage focused tests");
     step.dependOn(&focused.run.step);
+    step.dependOn(&runs.docid.step);
+    step.dependOn(&runs.serverless_docid.step);
     step.dependOn(&runs.transactions_docid.step);
-    step.dependOn(&runs.table_reads.step);
-    step.dependOn(&runs.table_writes.step);
     step.dependOn(&runs.public_table_http_docid.step);
     step.dependOn(&runs.raft_transition_runtime_docid.step);
     step.dependOn(&db_result_shape.step);

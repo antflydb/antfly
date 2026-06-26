@@ -1507,7 +1507,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     }, antfly_imports);
-    _ = antfly_tests_build.addDocIdLifecycleDependencies(
+    _ = antfly_tests_build.addDocIdTestStep(
+        b,
         api_focused_tests.docid_lifecycle,
         api_table_tests,
         lib_db_module_tests.result_shape,

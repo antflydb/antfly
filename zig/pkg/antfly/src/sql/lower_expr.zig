@@ -1873,10 +1873,12 @@ fn generatedSelectItemStartAllowsExpressionKind(
 }
 
 fn validateGeneratedSelectItemStartForExpression(
+    tokens: []const Token,
     start: SelectItemStart,
     generated_expression: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
     const expression = generated_expression orelse return;
+    try validateGeneratedExpressionPayloads(tokens, expression.*);
     if (!generatedSelectItemStartAllowsExpressionKind(start, expression.kind)) return error.UnsupportedSqlShape;
 }
 
@@ -1909,10 +1911,12 @@ fn generatedOrderExpressionStartAllowsExpressionKind(
 }
 
 fn validateGeneratedOrderExpressionStartForExpression(
+    tokens: []const Token,
     start: OrderExpressionStart,
     generated_expression: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
     const expression = generated_expression orelse return;
+    try validateGeneratedExpressionPayloads(tokens, expression.*);
     if (!generatedOrderExpressionStartAllowsExpressionKind(start, expression.kind)) return error.UnsupportedSqlShape;
 }
 
@@ -23020,7 +23024,7 @@ pub fn parseOrderExpressionAlloc(
     }
 
     const start = orderExpressionStartAt(tokens, pos.*);
-    try validateGeneratedOrderExpressionStartForExpression(start, options.generated_expression_ast);
+    try validateGeneratedOrderExpressionStartForExpression(tokens, start, options.generated_expression_ast);
     switch (start) {
         .parenthesized_null_test => {
             _ = parser.matchToken(tokens, pos, .lparen) orelse unreachable;
@@ -23989,7 +23993,7 @@ pub fn parseSelectItemAlloc(
     options: SelectItemParserOptions,
 ) !plan_mod.SelectItem {
     if (selectItemStartWithFunctionBindingsAt(tokens, pos.*, function_bindings)) |start| {
-        try validateGeneratedSelectItemStartForExpression(start, options.generated_expression_ast);
+        try validateGeneratedSelectItemStartForExpression(tokens, start, options.generated_expression_ast);
         switch (start) {
             .pipe_concat => return .{ .expression = try parseTextExpressionProjectionAlloc(alloc, tokens, pos, type_context, options.expression) },
             .unary_negative => return .{ .expression = try parseGenericExpressionProjectionAlloc(alloc, tokens, pos, type_context, options.expression) },
@@ -32550,6 +32554,24 @@ fn corruptGeneratedReadFirstOrderExpressionKind(
     return error.TestUnexpectedResult;
 }
 
+fn corruptGeneratedReadFirstOrderExpressionOperatorToTokens(parsed_sql: *tokenized.ParsedSql) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (read.order_items.expressions.len == 0) return error.TestUnexpectedResult;
+                    var expression = &read.order_items.expressions[0];
+                    if (expression.operator_tokens == null or expression.tokens == null) return error.TestUnexpectedResult;
+                    expression.operator_tokens = expression.tokens;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn corruptGeneratedReadFirstGroupExpressionItem(parsed_sql: *tokenized.ParsedSql) !void {
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
@@ -33528,6 +33550,20 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms with ge
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
         alloc,
         &malformed_query_order_kind,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_query_order_operator = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' ORDER BY amount + 1 DESC LIMIT 5",
+    );
+    defer malformed_query_order_operator.deinit(alloc);
+    try corruptGeneratedReadFirstOrderExpressionOperatorToTokens(&malformed_query_order_operator);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_query_order_operator,
         schema,
         &.{},
         .{},
