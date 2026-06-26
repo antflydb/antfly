@@ -2471,6 +2471,19 @@ fn testingEmptyIndexesCatalog() table_catalog.CatalogSource {
     };
 }
 
+fn testingVisibleRootGenerationSource(value: *u64) VisibleRootGenerationSource {
+    const Source = struct {
+        fn visibleRootGenerationForGroup(ptr: *anyopaque, _: u64) u64 {
+            return (@as(*u64, @ptrCast(@alignCast(ptr)))).*;
+        }
+    };
+
+    return .{
+        .ptr = value,
+        .vtable = &.{ .visible_root_generation_for_group = Source.visibleRootGenerationForGroup },
+    };
+}
+
 test "write cache invalidation retires leased entry until release" {
     const alloc = std.testing.allocator;
 
@@ -2678,4 +2691,71 @@ test "write cache keeps leased entry cleanup reachable when retirement bookkeepi
     cached.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
+}
+
+test "write cache transfers adoptable provisioned db to destination cache" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-transfer-generation", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    const catalog = testingEmptyIndexesCatalog();
+    var source_cache = ProvisionedTableWriteCache.init(alloc);
+    defer source_cache.deinit();
+    var dest_cache = ProvisionedTableWriteCache.init(alloc);
+    defer dest_cache.deinit();
+
+    var generation: u64 = 1;
+    var seeded = try source_cache.getOrOpenLocked(path, catalog, 7001, generation, "docs");
+    seeded.deinit(alloc);
+    source_cache.entries.items[0].allow_generation_adoption = true;
+    try source_cache.replaceTableMetadataLocked("docs", "{\"indexes\":[]}", "");
+
+    generation = 2;
+    const moved = try source_cache.transferAdoptableEntriesForTableLocked(&dest_cache, "docs", testingVisibleRootGenerationSource(&generation));
+    try std.testing.expectEqual(@as(usize, 1), moved);
+    try std.testing.expectEqual(@as(usize, 0), source_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), dest_cache.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 2), dest_cache.entries.items[0].lsm_root_generation);
+
+    const misses_before = dest_cache.miss_count.load(.monotonic);
+    var cached = try dest_cache.getOrOpenLocked(path, catalog, 7001, generation, "docs");
+    cached.deinit(alloc);
+    try std.testing.expectEqual(misses_before, dest_cache.miss_count.load(.monotonic));
+}
+
+test "write cache retires adoptable seed when transfer allocators differ" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-transfer-allocator-mismatch", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    const catalog = testingEmptyIndexesCatalog();
+    var source_cache = ProvisionedTableWriteCache.init(alloc);
+    defer source_cache.deinit();
+    var dest_arena = std.heap.ArenaAllocator.init(alloc);
+    defer dest_arena.deinit();
+    var dest_cache = ProvisionedTableWriteCache.init(dest_arena.allocator());
+    defer dest_cache.deinit();
+
+    var generation: u64 = 1;
+    var seeded = try source_cache.getOrOpenLocked(path, catalog, 7001, generation, "docs");
+    seeded.deinit(alloc);
+    source_cache.entries.items[0].allow_generation_adoption = true;
+
+    generation = 2;
+    const retired = try source_cache.transferAdoptableEntriesForTableLocked(&dest_cache, "docs", testingVisibleRootGenerationSource(&generation));
+    try std.testing.expectEqual(@as(usize, 1), retired);
+    try std.testing.expectEqual(@as(usize, 0), source_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), dest_cache.entries.items.len);
 }

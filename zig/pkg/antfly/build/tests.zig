@@ -1528,6 +1528,9 @@ pub const APITestFilters = struct {
     };
 
     pub const table_writes_docid = [_][]const u8{
+        // Prefer owner-module prefixes for tests moved out of api/table_writes.zig.
+        // Keep exact names here only for facade/integration tests that still live
+        // in the monolithic table_writes module.
         "api.table_writes.backup_restore.test.",
         "api.table_writes.bulk_ingest.test.",
         "api.table_writes.cache.test.",
@@ -1561,7 +1564,6 @@ pub const APITestFilters = struct {
         "provisioned same-table foreign key action job routes runtime parent through catalog owner range",
         "provisioned table write source routes same-owner identity rewrites and rejects cross-owner rewrites",
         "provisioned table write source routes cross-table rows insert source through catalog owners",
-        "recursive cte joined mutation source executes through typed read materialization and write staging",
         "provisioned table write source stages relational mutation source on single owner range",
         "provisioned table write source globally plans relational mutation source across ranges",
         "hosted provisioned table write source globally plans relational mutation source across local owner ranges",
