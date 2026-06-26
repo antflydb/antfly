@@ -2437,6 +2437,7 @@ pub const OutputOrderExpressionParserOptions = struct {
     function_bindings: SqlFunctionBindings = .{},
     context_hooks: SelectParserContextHooks,
     order_expression_hooks: OrderExpressionParserOptions,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst = null,
 };
 
 pub const OrderByParserOptions = struct {
@@ -12828,12 +12829,19 @@ pub fn parseAggregateOrderByAlloc(
     order_expression_options: OutputOrderExpressionParserOptions,
 ) !void {
     while (true) {
+        const item_start = pos.*;
+        const generated_expression = try generatedOrderExpressionAtItemStart(item_start, order_expression_options.generated_read_ast);
+        if (generated_expression == null and order_expression_options.generated_read_ast != null) return error.UnsupportedSqlShape;
+        var item_order_expression_options = order_expression_options;
+        item_order_expression_options.order_expression_hooks.generated_expression_ast = generated_expression;
         var order = if (parser.matchToken(tokens, pos, .number)) |token| blk: {
+            try validateGeneratedSimpleOrderExpression(generated_expression);
             const ordinal = std.fmt.parseInt(u32, token.text, 10) catch return error.UnsupportedSqlShape;
             break :blk db_mod.types.RelationalRowsQueryOrder{ .field = try aggregateOutputFieldByOrdinalAlloc(alloc, group_fields, group_expressions, aggregations, ordinal) };
         } else if (peekAggregateOutputOrderExpression(tokens, pos.*)) blk: {
-            break :blk try parseAggregateOutputOrderExpressionAlloc(alloc, tokens, pos, schema, type_context, group_fields, group_expressions, aggregations, order_expression_options);
+            break :blk try parseAggregateOutputOrderExpressionAlloc(alloc, tokens, pos, schema, type_context, group_fields, group_expressions, aggregations, item_order_expression_options);
         } else blk: {
+            try validateGeneratedSimpleOrderExpression(generated_expression);
             const field = try parseAggregateOutputFieldAlloc(alloc, tokens, pos, group_fields, group_expressions, aggregations, field_options);
             if (!aggregateOutputFieldIsUnique(group_fields, group_expressions, aggregations, field)) {
                 alloc.free(field);
@@ -12864,7 +12872,13 @@ pub fn parseWindowOutputOrderByAlloc(
     options: OutputOrderExpressionParserOptions,
 ) !void {
     while (true) {
+        const item_start = pos.*;
+        const generated_expression = try generatedOrderExpressionAtItemStart(item_start, options.generated_read_ast);
+        if (generated_expression == null and options.generated_read_ast != null) return error.UnsupportedSqlShape;
+        var item_options = options;
+        item_options.order_expression_hooks.generated_expression_ast = generated_expression;
         var order = if (parser.matchToken(tokens, pos, .number)) |token| blk: {
+            try validateGeneratedSimpleOrderExpression(generated_expression);
             const ordinal = std.fmt.parseInt(u32, token.text, 10) catch return error.UnsupportedSqlShape;
             const field = try windowOutputFieldByOrdinalAlloc(alloc, select, ordinal);
             if (!windowOutputFieldIsUnique(select.fields, select.windows, field)) {
@@ -12873,8 +12887,9 @@ pub fn parseWindowOutputOrderByAlloc(
             }
             break :blk db_mod.types.RelationalRowsQueryOrder{ .field = field };
         } else if (peekWindowOutputOrderExpression(tokens, pos.*)) blk: {
-            break :blk try parseWindowOutputOrderExpressionAlloc(alloc, tokens, pos, schema, type_context, select, options);
+            break :blk try parseWindowOutputOrderExpressionAlloc(alloc, tokens, pos, schema, type_context, select, item_options);
         } else blk: {
+            try validateGeneratedSimpleOrderExpression(generated_expression);
             const field = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
             if (!windowOutputFieldIsUnique(select.fields, select.windows, field)) {
                 alloc.free(field);
@@ -12904,7 +12919,13 @@ pub fn parseJoinOrderByAlloc(
     options: OutputOrderExpressionParserOptions,
 ) !void {
     while (true) {
+        const item_start = pos.*;
+        const generated_expression = try generatedOrderExpressionAtItemStart(item_start, options.generated_read_ast);
+        if (generated_expression == null and options.generated_read_ast != null) return error.UnsupportedSqlShape;
+        var item_options = options;
+        item_options.order_expression_hooks.generated_expression_ast = generated_expression;
         var order = if (parser.matchToken(tokens, pos, .number)) |token| blk: {
+            try validateGeneratedSimpleOrderExpression(generated_expression);
             const ordinal = std.fmt.parseInt(u32, token.text, 10) catch return error.UnsupportedSqlShape;
             const field = try joinOutputFieldByOrdinalAlloc(alloc, select, ordinal);
             if (!joinProjectionOutputIsUnique(select, field)) {
@@ -12913,8 +12934,9 @@ pub fn parseJoinOrderByAlloc(
             }
             break :blk db_mod.types.RelationalRowsQueryOrder{ .field = field };
         } else if (peekAggregateOutputOrderExpression(tokens, pos.*)) blk: {
-            break :blk try parseJoinOutputOrderExpressionAlloc(alloc, tokens, pos, schema, select, options);
+            break :blk try parseJoinOutputOrderExpressionAlloc(alloc, tokens, pos, schema, select, item_options);
         } else blk: {
+            try validateGeneratedSimpleOrderExpression(generated_expression);
             const field = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
             if (!joinProjectionOutputIsUnique(select, field)) {
                 alloc.free(field);
@@ -18555,7 +18577,11 @@ pub fn parseAggregateAlloc(
                 select.group_expressions,
                 select.aggregations,
                 options.output_field_options,
-                options.output_order_expression_options,
+                blk: {
+                    var order_options = options.output_order_expression_options;
+                    order_options.generated_read_ast = options.generated_read_ast;
+                    break :blk order_options;
+                },
             );
             if (generated_order_end) |end| {
                 if (pos.* != end) return error.UnsupportedSqlShape;
@@ -18947,7 +18973,11 @@ pub fn parseWindowSelectAlloc(
                 options.context_hooks.row_expression_type_context(options.context_hooks.ptr),
                 &order_by,
                 select,
-                options.output_order_expression_options,
+                blk: {
+                    var order_options = options.output_order_expression_options;
+                    order_options.generated_read_ast = options.generated_read_ast;
+                    break :blk order_options;
+                },
             );
             if (generated_order_end) |end| {
                 if (pos.* != end) return error.UnsupportedSqlShape;
@@ -19427,7 +19457,11 @@ pub fn parseJoinAlloc(
                 current_context.schema,
                 &order_by,
                 select.items,
-                options.output_order_expression_options,
+                blk: {
+                    var order_options = options.output_order_expression_options;
+                    order_options.generated_read_ast = options.generated_read_ast;
+                    break :blk order_options;
+                },
             );
             if (generated_order_end) |end| {
                 if (pos.* != end) return error.UnsupportedSqlShape;
@@ -20106,7 +20140,11 @@ pub fn parseLateralAlloc(
                 current_context.schema,
                 &order_by,
                 select.items,
-                options.output_order_expression_options,
+                blk: {
+                    var order_options = options.output_order_expression_options;
+                    order_options.generated_read_ast = options.generated_read_ast;
+                    break :blk order_options;
+                },
             );
             if (generated_order_end) |end| {
                 if (pos.* != end) return error.UnsupportedSqlShape;
@@ -32375,6 +32413,32 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms with ge
         &.{},
     ));
 
+    var malformed_aggregate_order_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT status, SUM(amount) AS total FROM usage_records GROUP BY status ORDER BY total DESC LIMIT 5",
+    );
+    defer malformed_aggregate_order_kind.deinit(alloc);
+    try corruptGeneratedReadFirstOrderExpressionKind(&malformed_aggregate_order_kind, .current_date);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
+        alloc,
+        &malformed_aggregate_order_kind,
+        schema,
+        &.{},
+    ));
+
+    var malformed_window_order_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT tenant_id, row_number() OVER (PARTITION BY tenant_id ORDER BY id) AS rn FROM usage_records ORDER BY rn DESC LIMIT 5",
+    );
+    defer malformed_window_order_kind.deinit(alloc);
+    try corruptGeneratedReadFirstOrderExpressionKind(&malformed_window_order_kind, .current_date);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedWindowPlanForLowerExprTestAlloc(
+        alloc,
+        &malformed_window_order_kind,
+        schema,
+        &.{},
+    ));
+
     var malformed_join = try tokenized.ParsedSql.initAlloc(
         alloc,
         "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE o.status = 'open' ORDER BY order_id ASC LIMIT 5",
@@ -32384,6 +32448,19 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms with ge
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedJoinForLowerExprTestAlloc(
         alloc,
         &malformed_join,
+        schema,
+        &.{},
+    ));
+
+    var malformed_join_order_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE o.status = 'open' ORDER BY order_id ASC LIMIT 5",
+    );
+    defer malformed_join_order_kind.deinit(alloc);
+    try corruptGeneratedReadFirstOrderExpressionKind(&malformed_join_order_kind, .current_date);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedJoinForLowerExprTestAlloc(
+        alloc,
+        &malformed_join_order_kind,
         schema,
         &.{},
     ));
