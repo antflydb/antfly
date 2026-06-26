@@ -795,6 +795,13 @@ pub fn applyLogicalDdlPlanToRuntimeSchemaAlloc(
 ) !runtime_schema.TableSchema {
     return switch (plan) {
         .table_ddl => |table_plan| try applyTableDdlPlanToRuntimeSchemaAlloc(alloc, current, table_plan),
+        .routine => |routine_plan| switch (routine_plan) {
+            .trigger_catalog => |trigger_plan| switch (trigger_plan) {
+                .drop => |drop_trigger| try applyDropRoutineTriggerPlanToRuntimeSchemaAlloc(alloc, current, drop_trigger),
+                else => error.UnsupportedSqlShape,
+            },
+            else => error.UnsupportedSqlShape,
+        },
         .catalog_ddl => |catalog_plan| switch (catalog_plan) {
             .comment_metadata => |comment| applyCommentMetadataPlanAlloc(alloc, current, comment),
             else => error.UnsupportedSqlShape,
@@ -807,56 +814,21 @@ pub fn applyLogicalDdlPlanToRuntimeSchemaAlloc(
     };
 }
 
-pub fn applyLogicalDdlPlanToRuntimeSchemaAlloc(
+fn applyDropRoutineTriggerPlanToRuntimeSchemaAlloc(
     alloc: std.mem.Allocator,
     current: runtime_schema.TableSchema,
-    plan: ddl_plan.LoweredDdlPlan,
+    drop_trigger: ddl_plan.DropRoutineTriggerPlan,
 ) !runtime_schema.TableSchema {
-    return switch (plan) {
-        .adapter_noop, .session_catalog => if (current.storage_mode == .relational)
-            ddl_plan.cloneRelationalRuntimeSchemaAlloc(alloc, current)
-        else
-            ddl_plan.cloneEmptyRuntimeSchemaAlloc(alloc, current),
-        .create_table => |create_table| applyCreateTablePlanAlloc(alloc, current, create_table),
-        .table_clone => |table_clone| blk: {
-            var create_table = try ddl_plan.createTablePlanFromTableCloneSourceAlloc(alloc, current, table_clone);
-            defer create_table.deinit(alloc);
-            break :blk try ddl_plan.runtimeSchemaFromCreateTablePlanAlloc(alloc, create_table);
-        },
-        .view_catalog => error.UnsupportedSqlShape,
-        .materialized_view_catalog => error.UnsupportedSqlShape,
-        .relation_lifetime => error.UnsupportedSqlShape,
-        .enum_type_catalog => error.UnsupportedSqlShape,
-        .domain_catalog => error.UnsupportedSqlShape,
-        .sequence_catalog => error.UnsupportedSqlShape,
-        .identity_allocator_catalog => error.UnsupportedSqlShape,
-        .schema_namespace_catalog => error.UnsupportedSqlShape,
-        .extension_catalog => error.UnsupportedSqlShape,
-        .function_catalog => error.UnsupportedSqlShape,
-        .trigger_catalog => error.UnsupportedSqlShape,
-        .procedure_call => error.UnsupportedSqlShape,
-        .authorization_catalog => error.UnsupportedSqlShape,
-        .bulk_io => error.UnsupportedSqlShape,
-        .table_partition_catalog => error.UnsupportedSqlShape,
-        .row_security_catalog => error.UnsupportedSqlShape,
-        .database_catalog => error.UnsupportedSqlShape,
-        .tablespace_catalog => error.UnsupportedSqlShape,
-        .notification_channel => error.UnsupportedSqlShape,
-        .logical_replication => error.UnsupportedSqlShape,
-        .type_system_catalog => error.UnsupportedSqlShape,
-        .maintenance_job => error.UnsupportedSqlShape,
-        .prepared_statement => error.UnsupportedSqlShape,
-        .prepared_transaction => error.UnsupportedSqlShape,
-        .cursor_portal => error.UnsupportedSqlShape,
-        .savepoint_transaction => error.UnsupportedSqlShape,
-        .comment_metadata => |comment| applyCommentMetadataPlanAlloc(alloc, current, comment),
-        .transaction_control => error.UnsupportedSqlShape,
-        .create_index => |create_index| applyCreateIndexPlanAlloc(alloc, current, create_index),
-        .drop_index => |drop_index| applyDropIndexPlanAlloc(alloc, current, drop_index),
-        .drop_table => |drop_table| applyDropTablePlanAlloc(alloc, current, drop_table),
-        .alter_table => |alter_table| applyAlterTablePlanAlloc(alloc, current, alter_table),
-        .create_update_policy => |update_policy| applyCreateUpdatePolicyPlanAlloc(alloc, current, update_policy),
-    };
+    if (drop_trigger.cascade) return error.UnsupportedSqlShape;
+    const operations = [_]ddl_plan.AlterTableOperation{.{ .drop_update_policy = .{
+        .trigger_name = drop_trigger.trigger_name,
+        .if_exists = drop_trigger.if_exists,
+    } }};
+    return try applyAlterTablePlanAlloc(alloc, current, .{
+        .table_name = drop_trigger.table_name,
+        .if_exists = drop_trigger.if_exists,
+        .operations = operations[0..],
+    });
 }
 
 const AppliedDdlRewriteExpressionSource = struct {
@@ -1131,213 +1103,17 @@ fn alterTableRowRewritePlanSourceAlloc(
 pub fn applyLogicalDdlPlanToSchemaJsonAlloc(
     alloc: std.mem.Allocator,
     current_schema_json: []const u8,
-    plan: ddl_plan.LoweredDdlPlan,
-) !ddl_plan.AppliedDdlSchemaJson {
-    switch (plan) {
-        .adapter_noop, .session_catalog => return .{ .schema_json = try alloc.dupe(u8, current_schema_json) },
-        .create_table => |create_table| {
-            try validateTemporalForeignKeysSupported(create_table.foreign_keys);
-            if (current_schema_json.len != 0) {
-                if (create_table.replace_existing) return try appliedDdlSchemaJsonWithFlagsAlloc(
-                    alloc,
-                    try schema_json.schemaJsonFromCreateTablePlanAlloc(alloc, create_table),
-                    true,
-                    true,
-                    true,
-                    null,
-                    .{},
-                );
-                if (!create_table.if_not_exists) return error.InvalidSqlCatalog;
-                return .{ .schema_json = try alloc.dupe(u8, current_schema_json) };
-            }
-            return .{ .schema_json = try schema_json.schemaJsonFromCreateTablePlanAlloc(alloc, create_table) };
-        },
-        .table_clone => |table_clone| return try appliedDdlSchemaJsonWithFlagsAlloc(
-            alloc,
-            try schema_json.schemaJsonFromTableClonePlanAlloc(alloc, current_schema_json, table_clone),
-            table_clone.options.indexes,
-            table_clone.options.constraints or table_clone.options.checks,
-            false,
-            null,
-            .{},
-        ),
-        .drop_table => |drop_table| {
-            if (current_schema_json.len == 0) {
-                if (drop_table.if_exists) return .{ .schema_json = try alloc.dupe(u8, "") };
-                return error.InvalidSqlCatalog;
-            }
-            try schema_json.validateDdlAppliedSchemaJsonAlloc(alloc, current_schema_json);
-            return .{ .schema_json = try alloc.dupe(u8, "") };
-        },
-        .view_catalog => return error.UnsupportedSqlShape,
-        .materialized_view_catalog => return error.UnsupportedSqlShape,
-        .relation_lifetime => return error.UnsupportedSqlShape,
-        .enum_type_catalog => return error.UnsupportedSqlShape,
-        .domain_catalog => return error.UnsupportedSqlShape,
-        .sequence_catalog => return error.UnsupportedSqlShape,
-        .identity_allocator_catalog => return error.UnsupportedSqlShape,
-        .schema_namespace_catalog => return error.UnsupportedSqlShape,
-        .extension_catalog => return error.UnsupportedSqlShape,
-        .function_catalog => return error.UnsupportedSqlShape,
-        .trigger_catalog => return error.UnsupportedSqlShape,
-        .procedure_call => return error.UnsupportedSqlShape,
-        .authorization_catalog => return error.UnsupportedSqlShape,
-        .bulk_io => return error.UnsupportedSqlShape,
-        .table_partition_catalog => return error.UnsupportedSqlShape,
-        .row_security_catalog => return error.UnsupportedSqlShape,
-        .database_catalog => return error.UnsupportedSqlShape,
-        .tablespace_catalog => return error.UnsupportedSqlShape,
-        .notification_channel => return error.UnsupportedSqlShape,
-        .logical_replication => return error.UnsupportedSqlShape,
-        .type_system_catalog => return error.UnsupportedSqlShape,
-        .maintenance_job => return error.UnsupportedSqlShape,
-        .prepared_statement => return error.UnsupportedSqlShape,
-        .prepared_transaction => return error.UnsupportedSqlShape,
-        .cursor_portal => return error.UnsupportedSqlShape,
-        .savepoint_transaction => return error.UnsupportedSqlShape,
-        .transaction_control => return error.UnsupportedSqlShape,
-        .create_index, .drop_index, .alter_table, .create_update_policy, .comment_metadata => {},
-    }
-
-    if (current_schema_json.len == 0) {
-        return switch (plan) {
-            .adapter_noop, .session_catalog => unreachable,
-            .drop_index => |drop_index| if (drop_index.if_exists) .{ .schema_json = try alloc.dupe(u8, current_schema_json) } else error.InvalidSqlCatalog,
-            .alter_table => |alter_table| if (alter_table.if_exists) .{ .schema_json = try alloc.dupe(u8, current_schema_json) } else error.InvalidSqlCatalog,
-            .create_table => unreachable,
-            .table_clone => unreachable,
-            .view_catalog => unreachable,
-            .materialized_view_catalog => unreachable,
-            .relation_lifetime => unreachable,
-            .enum_type_catalog => unreachable,
-            .domain_catalog => unreachable,
-            .sequence_catalog => unreachable,
-            .identity_allocator_catalog => unreachable,
-            .schema_namespace_catalog => unreachable,
-            .extension_catalog => unreachable,
-            .function_catalog => unreachable,
-            .trigger_catalog => unreachable,
-            .procedure_call => unreachable,
-            .authorization_catalog => unreachable,
-            .bulk_io => unreachable,
-            .table_partition_catalog => unreachable,
-            .row_security_catalog => unreachable,
-            .database_catalog => unreachable,
-            .tablespace_catalog => unreachable,
-            .notification_channel => unreachable,
-            .logical_replication => unreachable,
-            .type_system_catalog => unreachable,
-            .maintenance_job => unreachable,
-            .prepared_statement => unreachable,
-            .prepared_transaction => unreachable,
-            .cursor_portal => unreachable,
-            .savepoint_transaction => unreachable,
-            .comment_metadata => error.InvalidSqlCatalog,
-            .transaction_control => unreachable,
-            .drop_table => unreachable,
-            .create_index, .create_update_policy => error.InvalidSqlCatalog,
-        };
-    }
-    var arena_impl = std.heap.ArenaAllocator.init(alloc);
-    defer arena_impl.deinit();
-    const arena = arena_impl.allocator();
-    var parsed = try std.json.parseFromSlice(std.json.Value, arena, current_schema_json, .{});
-    const root = switch (parsed.value) {
-        .object => |*object| object,
-        else => return error.InvalidSqlCatalog,
-    };
-
-    var result: ddl_plan.AppliedDdlSchemaJson = .{ .schema_json = &.{} };
-    switch (plan) {
-        .adapter_noop, .session_catalog => unreachable,
-        .create_table => unreachable,
-        .table_clone => unreachable,
-        .view_catalog => unreachable,
-        .materialized_view_catalog => unreachable,
-        .relation_lifetime => unreachable,
-        .enum_type_catalog => unreachable,
-        .domain_catalog => unreachable,
-        .sequence_catalog => unreachable,
-        .identity_allocator_catalog => unreachable,
-        .schema_namespace_catalog => unreachable,
-        .extension_catalog => unreachable,
-        .function_catalog => unreachable,
-        .trigger_catalog => unreachable,
-        .procedure_call => unreachable,
-        .authorization_catalog => unreachable,
-        .bulk_io => unreachable,
-        .table_partition_catalog => unreachable,
-        .row_security_catalog => unreachable,
-        .database_catalog => unreachable,
-        .tablespace_catalog => unreachable,
-        .notification_channel => unreachable,
-        .logical_replication => unreachable,
-        .type_system_catalog => unreachable,
-        .maintenance_job => unreachable,
-        .prepared_statement => unreachable,
-        .prepared_transaction => unreachable,
-        .cursor_portal => unreachable,
-        .savepoint_transaction => unreachable,
-        .comment_metadata => |comment| try schema_json.applyCommentMetadataPlanToSchemaJsonValue(arena, root, comment),
-        .transaction_control => unreachable,
-        .drop_table => unreachable,
-        .create_index => |create_index| {
-            const changed = try schema_json.applyCreateIndexPlanToSchemaJsonValue(arena, root, create_index);
-            result.requires_rebuild = changed;
-            result.validation_required = changed and create_index.unique;
-        },
-        .drop_index => |drop_index| try schema_json.applyDropIndexPlanToSchemaJsonValue(arena, root, drop_index),
-        .alter_table => |alter_table| {
-            const flags = try alterTablePlanWorkFlagsForSchemaJson(root, alter_table);
-            result.requires_rebuild = flags.requires_rebuild;
-            result.validation_required = flags.validation_required;
-            result.rewrite_required = flags.rewrite_required;
-            try schema_json.applyAlterTablePlanToSchemaJsonValue(arena, root, alter_table);
-        },
-        .create_update_policy => |update_policy| {
-            try schema_json.applyCreateUpdatePolicyPlanToSchemaJsonValue(arena, root, update_policy);
-        },
-    }
-    const updated_schema_json = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
-    errdefer alloc.free(updated_schema_json);
-    const rewrite_source = switch (plan) {
-        .alter_table => |alter_table| try alterTableRewriteExpressionSourceAlloc(alloc, alter_table),
-        else => null,
-    };
-    defer if (rewrite_source) |source| freeAppliedDdlRewriteExpressionSource(alloc, source);
-    const row_rewrite_source = switch (plan) {
-        .alter_table => |alter_table| blk: {
-            const old_schema = try schema_json.runtimeSchemaFromSchemaJsonAlloc(alloc, current_schema_json);
-            defer runtime_schema.freeSchema(alloc, old_schema);
-            const new_schema = try schema_json.runtimeSchemaFromSchemaJsonAlloc(alloc, updated_schema_json);
-            defer runtime_schema.freeSchema(alloc, new_schema);
-            break :blk try alterTableRowRewritePlanSourceAlloc(alloc, old_schema, new_schema, alter_table);
-        },
-        else => AppliedDdlRowRewritePlanSource{},
-    };
-    defer freeAppliedDdlRowRewritePlanSource(alloc, row_rewrite_source);
-    if (rewrite_source != null and !row_rewrite_source.empty()) return error.UnsupportedSqlShape;
-    result = try appliedDdlSchemaJsonWithFlagsAlloc(
-        alloc,
-        updated_schema_json,
-        result.requires_rebuild,
-        result.validation_required,
-        result.rewrite_required,
-        rewrite_source,
-        row_rewrite_source,
-    );
-    errdefer result.deinit(alloc);
-    try schema_json.validateDdlAppliedSchemaJsonAlloc(alloc, result.schema_json);
-    return result;
-}
-
-pub fn applyLogicalDdlPlanToSchemaJsonAlloc(
-    alloc: std.mem.Allocator,
-    current_schema_json: []const u8,
     plan: binder.LogicalSqlPlan,
 ) !ddl_plan.AppliedDdlSchemaJson {
     return switch (plan) {
         .table_ddl => |table_plan| try applyTableDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, table_plan),
+        .routine => |routine_plan| switch (routine_plan) {
+            .trigger_catalog => |trigger_plan| switch (trigger_plan) {
+                .drop => |drop_trigger| try applyDropRoutineTriggerPlanToSchemaJsonAlloc(alloc, current_schema_json, drop_trigger),
+                else => error.UnsupportedSqlShape,
+            },
+            else => error.UnsupportedSqlShape,
+        },
         .catalog_ddl => |catalog_plan| switch (catalog_plan) {
             .comment_metadata => |comment| try applyCommentMetadataPlanToSchemaJsonAlloc(alloc, current_schema_json, comment),
             else => error.UnsupportedSqlShape,
@@ -1345,6 +1121,23 @@ pub fn applyLogicalDdlPlanToSchemaJsonAlloc(
         .other_ddl, .session => .{ .schema_json = try alloc.dupe(u8, current_schema_json) },
         else => error.UnsupportedSqlShape,
     };
+}
+
+fn applyDropRoutineTriggerPlanToSchemaJsonAlloc(
+    alloc: std.mem.Allocator,
+    current_schema_json: []const u8,
+    drop_trigger: ddl_plan.DropRoutineTriggerPlan,
+) !ddl_plan.AppliedDdlSchemaJson {
+    if (drop_trigger.cascade) return error.UnsupportedSqlShape;
+    const operations = [_]ddl_plan.AlterTableOperation{.{ .drop_update_policy = .{
+        .trigger_name = drop_trigger.trigger_name,
+        .if_exists = drop_trigger.if_exists,
+    } }};
+    return try applyTableDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, .{ .alter_table = .{
+        .table_name = drop_trigger.table_name,
+        .if_exists = drop_trigger.if_exists,
+        .operations = operations[0..],
+    } });
 }
 
 fn applyCommentMetadataPlanToSchemaJsonAlloc(

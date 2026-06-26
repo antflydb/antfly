@@ -10424,7 +10424,10 @@ test "hosted cross-range graph query expands explicit local start keys" {
 
 test "hosted cross-range graph metric fan-in merges compatible published shard generations" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-hosted-cross-range-graph-metric-merge";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-cross-range-graph-metric-merge", .{tmp.sub_path});
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -10622,7 +10625,10 @@ test "hosted cross-range graph metric fan-in merges compatible published shard g
 
 test "hosted cross-range graph metric fan-in merges active stale shard for published" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-hosted-cross-range-graph-metric-active-stale";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-cross-range-graph-metric-active-stale", .{tmp.sub_path});
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -11032,7 +11038,10 @@ test "hosted cross-range graph metric fan-in merges active stale shard for publi
 
 test "hosted cross-range graph metric fan-in merges nonuniform promotion shard layout" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-hosted-cross-range-graph-metric-promotion-merge";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-cross-range-graph-metric-promotion-merge", .{tmp.sub_path});
+    defer alloc.free(path);
     const shard_count = 8;
     const group_ids = [_]u64{ 7301, 7302, 7303, 7304, 7305, 7306, 7307, 7308 };
     const prefixes = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
@@ -11345,7 +11354,10 @@ test "hosted cross-range graph metric fan-in merges nonuniform promotion shard l
 
 test "hosted cross-range graph metric fan-in merges compatible hits pair" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-hosted-cross-range-graph-metric-hits-pair";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-cross-range-graph-metric-hits-pair", .{tmp.sub_path});
+    defer alloc.free(path);
     const shard_count = 8;
     const group_ids = [_]u64{ 7311, 7312, 7313, 7314, 7315, 7316, 7317, 7318 };
     const prefixes = [_][]const u8{ "j", "k", "l", "m", "n", "o", "p", "q" };
@@ -11838,7 +11850,10 @@ test "hosted cross-range graph metric fan-in merges compatible hits pair" {
 
 test "hosted cross-range graph metric fan-in rejects incompatible remote hits pair" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-hosted-cross-range-graph-metric-hits-pair-reject";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-cross-range-graph-metric-hits-pair-reject", .{tmp.sub_path});
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -12107,7 +12122,10 @@ test "hosted cross-range graph metric fan-in rejects incompatible remote hits pa
 
 test "hosted cross-range graph metric fan-in rejects missing remote hits status" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-hosted-cross-range-graph-metric-hits-missing-status";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-cross-range-graph-metric-hits-missing-status", .{tmp.sub_path});
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -12307,7 +12325,10 @@ test "hosted cross-range graph metric fan-in rejects missing remote hits status"
 
 test "hosted cross-range graph metric fan-in rejects unpublished or incompatible shard generations" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-hosted-cross-range-graph-metric-reject";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-cross-range-graph-metric-reject", .{tmp.sub_path});
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();

@@ -1432,7 +1432,7 @@ fn validateGeneratedFunctionCallPayloads(
 
     if (expression.over_tokens) |over_tokens| {
         if (over_tokens.start != cursor or over_tokens.end != expression_tokens.end) return error.UnsupportedSqlShape;
-        try validateGeneratedWindowOverClauseForSpec(tokens, over_tokens.start, over_tokens.end, &expression);
+        try validateGeneratedWindowOverClauseForSpec(tokens, null, over_tokens.start, over_tokens.end, &expression);
         cursor = over_tokens.end;
     } else if (expression.over_name_tokens != null or
         expression.over_definition_tokens != null or
@@ -2062,12 +2062,17 @@ fn validateGeneratedSimpleOrderExpression(
 
 fn validateGeneratedWindowOverClauseForSpec(
     tokens: []const Token,
+    function: ?db_mod.types.RelationalRowsWindowFunction,
     over_start: usize,
     over_end: usize,
     generated_expression: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
     const expression = generated_expression orelse return;
     if (expression.kind != .function_call) return error.UnsupportedSqlShape;
+    if (function) |expected_function| {
+        const function_token = try generatedExpressionFunctionNameToken(tokens, expression.*);
+        if (!std.ascii.eqlIgnoreCase(function_token.text, windowFunctionName(expected_function))) return error.UnsupportedSqlShape;
+    }
     const over_range = expression.over_tokens orelse return error.UnsupportedSqlShape;
     if (over_range.start != over_start or over_range.end != over_end or over_range.end > tokens.len) return error.UnsupportedSqlShape;
     if (over_range.start >= over_range.end or !tokens[over_range.start].matchesKeywordTag(.over)) return error.UnsupportedSqlShape;
@@ -14607,7 +14612,7 @@ pub fn parseWindowSpecAlloc(
     var definition_transferred = false;
     errdefer if (!definition_transferred) plan_mod.freeNamedWindowDefinition(alloc, definition);
     if (definition.order_by.len == 0 and windowFunctionRequiresOrder(function)) return error.UnsupportedSqlShape;
-    try validateGeneratedWindowOverClauseForSpec(tokens, over_start, pos.*, options.generated_expression_ast);
+    try validateGeneratedWindowOverClauseForSpec(tokens, function, over_start, pos.*, options.generated_expression_ast);
 
     const output = try grammar.parseProjectionOutputOwnedAlloc(alloc, tokens, pos, windowFunctionName(function));
     var output_transferred = false;
@@ -41285,6 +41290,19 @@ test "sql adapter lower expr lowers row_number window query plans" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedWindowPlanForLowerExprTestAlloc(
         alloc,
         &malformed_inline_over_order,
+        schema,
+        &.{},
+    ));
+
+    var malformed_inline_function_name = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS row_num, rank() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS tenant_rank FROM usage_records WHERE status = 'open' ORDER BY row_num ASC LIMIT 5",
+    );
+    defer malformed_inline_function_name.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionFunctionNameToSecondProjection(&malformed_inline_function_name);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedWindowPlanForLowerExprTestAlloc(
+        alloc,
+        &malformed_inline_function_name,
         schema,
         &.{},
     ));
