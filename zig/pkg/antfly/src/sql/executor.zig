@@ -14,13 +14,23 @@
 
 const std = @import("std");
 
+const catalog_resources = @import("../api/catalog_resources.zig");
+const table_catalog = @import("../api/table_catalog.zig");
 const binder = @import("binder.zig");
 const classifier = @import("classifier.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const lower_expr = @import("lower_expr.zig");
+const plan_mod = @import("plan.zig");
 const tokenized = @import("tokenized.zig");
 
 pub const SqlExecutionPlan = binder.LogicalSqlPlan;
+
+pub const PlanParsedSqlOptions = struct {
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession = catalog_resources.SqlCatalogSession.default(),
+    write_options: plan_mod.LowerWritePlanOptions = .{},
+    function_bindings: lower_expr.SqlFunctionBindings = .{},
+};
 
 pub fn classifyParsedSql(parsed_sql: *const tokenized.ParsedSql) ?SqlExecutionPlan {
     if (parsed_sql.writeStatementKind()) |kind| {
@@ -39,6 +49,32 @@ pub fn lowerDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(
 ) !SqlExecutionPlan {
     var lowered = try ddl_plan.lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, function_bindings);
     return binder.logicalPlanFromLoweredDdlPlan(&lowered);
+}
+
+pub fn planParsedSqlWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    options: PlanParsedSqlOptions,
+) !SqlExecutionPlan {
+    if (parsed_sql.writeStatementKind() != null) {
+        var bound = try binder.bindWritePlanCatalogStatementWithSessionAlloc(
+            alloc,
+            parsed_sql,
+            options.write_options,
+            options.catalog,
+            options.session,
+        );
+        defer bound.deinit(alloc);
+        return try binder.logicalWritePlanFromBoundStatement(&bound);
+    }
+
+    if (parsed_sql.readStatementKind() != null) {
+        var bound = try binder.bindReadPlanCatalogStatementWithSessionAlloc(alloc, parsed_sql, options.catalog, options.session);
+        defer bound.deinit(alloc);
+        return try binder.logicalReadPlanFromBoundStatement(&bound);
+    }
+
+    return try lowerDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, options.function_bindings);
 }
 
 test "sql executor classifies statement families and owns ddl plans" {

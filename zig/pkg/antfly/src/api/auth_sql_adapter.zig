@@ -69,9 +69,9 @@ pub fn executeRelationalSqlDdlOnUserManagerWithCatalogAndFunctionBindings(
     catalog: SqlAuthCatalog,
     function_bindings: sql_adapter.SqlFunctionBindings,
 ) !?tables_api.AppliedRelationalSqlDdlRecord {
-    var plan = try sql_adapter.lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, function_bindings);
-    defer plan.deinit(alloc);
-    return try executeRelationalSqlDdlPlanOnUserManagerWithCatalog(manager, alloc, plan, catalog);
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try executeRelationalSqlDdlParsedSqlOnUserManagerWithCatalogAndFunctionBindings(manager, alloc, &parsed_sql, catalog, function_bindings);
 }
 
 pub fn executeRelationalSqlDdlParsedSqlOnUserManagerWithCatalogAndFunctionBindings(
@@ -81,18 +81,30 @@ pub fn executeRelationalSqlDdlParsedSqlOnUserManagerWithCatalogAndFunctionBindin
     catalog: SqlAuthCatalog,
     function_bindings: sql_adapter.SqlFunctionBindings,
 ) !?tables_api.AppliedRelationalSqlDdlRecord {
-    var plan = try sql_adapter.lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, function_bindings);
-    defer plan.deinit(alloc);
-    return try executeRelationalSqlDdlPlanOnUserManagerWithCatalog(manager, alloc, plan, catalog);
+    var logical_plan = try sql_adapter.lowerDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, function_bindings);
+    defer logical_plan.deinit(alloc);
+    return try executeRelationalSqlLogicalPlanOnUserManagerWithCatalog(manager, alloc, &logical_plan, catalog);
 }
 
-pub fn executeRelationalSqlDdlPlanOnUserManagerWithCatalog(
+pub fn executeRelationalSqlLogicalPlanOnUserManagerWithCatalog(
     manager: *usermgr.UserManager,
     alloc: std.mem.Allocator,
-    plan: sql_adapter.LoweredDdlPlan,
+    logical_plan: *sql_adapter.LogicalSqlPlan,
     catalog: SqlAuthCatalog,
 ) !?tables_api.AppliedRelationalSqlDdlRecord {
-    switch (plan) {
+    return switch (logical_plan.*) {
+        .auth => |auth_plan| try executeRelationalSqlAuthPlanOnUserManagerWithCatalog(manager, alloc, auth_plan, catalog),
+        else => null,
+    };
+}
+
+pub fn executeRelationalSqlAuthPlanOnUserManagerWithCatalog(
+    manager: *usermgr.UserManager,
+    alloc: std.mem.Allocator,
+    plan: sql_adapter.AuthorizationLogicalPlan,
+    catalog: SqlAuthCatalog,
+) !?tables_api.AppliedRelationalSqlDdlRecord {
+    return switch (plan) {
         .authorization_catalog => |authorization_plan| switch (authorization_plan) {
             .create_role => |create| return try executeCreateRole(manager, alloc, create),
             .alter_role => |alter| return try executeAlterRole(manager, alloc, alter, catalog),
@@ -106,6 +118,18 @@ pub fn executeRelationalSqlDdlPlanOnUserManagerWithCatalog(
             .alter_policy => |alter| return try executeAlterRowSecurityPolicy(manager, alloc, alter, catalog),
             .drop_policy => |drop| return try executeDropRowSecurityPolicy(manager, alloc, drop, catalog),
         },
+    };
+}
+
+pub fn executeRelationalSqlDdlPlanOnUserManagerWithCatalog(
+    manager: *usermgr.UserManager,
+    alloc: std.mem.Allocator,
+    plan: sql_adapter.LoweredDdlPlan,
+    catalog: SqlAuthCatalog,
+) !?tables_api.AppliedRelationalSqlDdlRecord {
+    switch (plan) {
+        .authorization_catalog => |authorization_plan| return try executeRelationalSqlAuthPlanOnUserManagerWithCatalog(manager, alloc, .{ .authorization_catalog = authorization_plan }, catalog),
+        .row_security_catalog => |row_security_plan| return try executeRelationalSqlAuthPlanOnUserManagerWithCatalog(manager, alloc, .{ .row_security_catalog = row_security_plan }, catalog),
         else => return null,
     }
 }

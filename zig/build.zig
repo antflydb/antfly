@@ -1402,10 +1402,9 @@ pub fn build(b: *std.Build) void {
         .filters = selectTestFilters(b, &antfly_tests_build.PackageTestFilters.antfly_embedded_api),
     });
     const run_antfly_embedded_api_pkg_tests = b.addRunArtifact(antfly_embedded_api_pkg_tests);
-    const antfly_embedded_pkg_test_step = b.step("antfly-embedded-test", "Run the standalone antfly-embedded package compile test");
-    antfly_embedded_pkg_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
-    antfly_embedded_pkg_test_step.dependOn(&run_antfly_embedded_db_pkg_tests.step);
-    antfly_embedded_pkg_test_step.dependOn(&run_antfly_embedded_api_pkg_tests.step);
+    embedded_test_run.step.dependOn(&run_antfly_embedded_pkg_tests.step);
+    embedded_test_run.step.dependOn(&run_antfly_embedded_db_pkg_tests.step);
+    embedded_test_run.step.dependOn(&run_antfly_embedded_api_pkg_tests.step);
 
     const run_antfly_client_pkg_tests = antfly_tests_build.addModuleTestStep(
         b,
@@ -1596,16 +1595,15 @@ pub fn build(b: *std.Build) void {
     const serverless_tests = serverless_test_run.tests;
     const run_serverless_tests = serverless_test_run.run;
 
-    const run_lib_data_runtime_tests = antfly_tests_build.addModuleTestStep(
-        b,
-        data_runtime_test_mod,
-        "lib-data-runtime-test",
-        "Run focused data runtime tests",
-        .{
-            .filters = &antfly_tests_build.DataTestFilters.runtime,
-            .simple_runner = true,
+    const data_runtime_tests = b.addTest(.{
+        .root_module = data_runtime_test_mod,
+        .filters = &antfly_tests_build.DataTestFilters.runtime,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
         },
-    ).run;
+    });
+    const run_data_runtime_tests = b.addRunArtifact(data_runtime_tests);
 
     const run_lib_data_storage_tests = antfly_tests_build.addModuleTestStep(
         b,
@@ -1627,13 +1625,10 @@ pub fn build(b: *std.Build) void {
     });
     antfly_imports.configure(b, metadata_fk_test_mod, true, true);
     const metadata_tests = antfly_tests_build.addMetadataTestSteps(b, lib_test_mod, metadata_fk_test_mod);
-    const lib_metadata_tests = metadata_tests.root.tests;
-    const run_lib_metadata_tests = metadata_tests.root.run;
+    const metadata_root_tests = metadata_tests.root.tests;
     const run_lib_metadata_sim_smoke_tests = metadata_tests.sim_smoke.run;
     const run_lib_metadata_vopr_tests = metadata_tests.vopr.run;
-    const lib_metadata_vopr_chaos_tests = metadata_tests.vopr_chaos.tests;
     const run_lib_metadata_vopr_chaos_tests = metadata_tests.vopr_chaos.run;
-    _ = metadata_tests.chaos.transition;
     const lib_metadata_public_chaos_test_step = metadata_tests.chaos.public;
     const run_lib_metadata_sim_public_tests = metadata_tests.sim_public.run;
 
@@ -1659,7 +1654,7 @@ pub fn build(b: *std.Build) void {
 
     _ = antfly_tests_build.addAPITableAggregateTestStep(b, api_table_tests, .{
         .data_storage = run_lib_data_storage_tests,
-        .data_runtime = run_lib_data_runtime_tests,
+        .data_runtime = run_data_runtime_tests,
         .metadata_sim_smoke = run_lib_metadata_sim_smoke_tests,
         .metadata_sim_public = run_lib_metadata_sim_public_tests,
         .metadata_vopr = run_lib_metadata_vopr_tests,
@@ -1671,8 +1666,6 @@ pub fn build(b: *std.Build) void {
     antfly_tests_build.dependOnAPIGeneratedChecks(generated_steps.generated_check, api_table_tests);
 
     const run_lib_metadata_sim_forward_tests = metadata_tests.sim_forward.run;
-    const run_lib_metadata_service_tests = metadata_tests.service.run;
-    const run_lib_metadata_logic_tests = metadata_tests.logic.run;
 
     const storage_tests = antfly_tests_build.addStorageTestSteps(b, lib_test_mod, &unit_progress_skip_filters);
     const run_lib_storage_tests = storage_tests.root.run;
@@ -1686,8 +1679,7 @@ pub fn build(b: *std.Build) void {
     ha_test_step.dependOn(&run_lib_ha_compat_tests.step);
 
     const sim_test_step = b.step("sim-test", "Run mocked-time Antfly simulation suites");
-    sim_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);
-    sim_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
+    sim_test_step.dependOn(metadata_tests.sim_all);
     sim_test_step.dependOn(&run_lib_raft_sim_tests.step);
 
     const integration_test_step = b.step("integration-test", "Run focused real HTTP and public API integration suites");
@@ -1697,7 +1689,7 @@ pub fn build(b: *std.Build) void {
 
     const chaos_test_step = b.step("chaos-test", "Run bounded generated chaos campaigns with labeled progress");
     var chaos_progress_tail: ?*std.Build.Step = null;
-    chaos_progress_tail = chainLabeledRun(b, lib_metadata_vopr_chaos_tests, "lib-metadata-vopr-chaos-test", chaos_progress_tail);
+    chaos_test_step.dependOn(metadata_tests.chaos.all);
     chaos_progress_tail = chainLabeledRun(b, lib_lsm_backend_chaos_tests, "lib-lsm-backend-chaos-test", chaos_progress_tail);
     chaos_progress_tail = chainLabeledRun(b, lib_ha_chaos_tests, "ha-chaos-test", chaos_progress_tail);
     chaos_test_step.dependOn(chaos_progress_tail.?);
@@ -1784,7 +1776,7 @@ pub fn build(b: *std.Build) void {
     usermgr_storage_swarm_runtime_test_mod.addImport("antfly_root", swarm_runtime_test_mod);
     usermgr_storage_swarm_runtime_test_mod.addImport("antfly_platform", platform_mod);
     swarm_runtime_test_mod.addImport("usermgr_storage", usermgr_storage_swarm_runtime_test_mod);
-    const lib_swarm_runtime_tests = b.addTest(.{
+    const swarm_tests = b.addTest(.{
         .root_module = swarm_runtime_test_mod,
         .filters = &antfly_tests_build.SwarmRuntimeTestFilters.focused,
         .test_runner = .{
@@ -1792,15 +1784,15 @@ pub fn build(b: *std.Build) void {
             .mode = .simple,
         },
     });
-    const lib_swarm_runtime_test_step = b.step("lib-swarm-runtime-test", "Run focused swarm runtime tests");
-    const run_lib_swarm_runtime_tests = b.addRunArtifact(lib_swarm_runtime_tests);
-    lib_swarm_runtime_test_step.dependOn(&run_lib_swarm_runtime_tests.step);
+    const run_swarm_tests = b.addRunArtifact(swarm_tests);
 
-    const raft_test_step = b.step("raft-test", "Run raft integration unit tests");
+    const runtime_test_step = b.step("runtime-test", "Run focused data and swarm runtime tests");
+    runtime_test_step.dependOn(&run_data_runtime_tests.step);
+    runtime_test_step.dependOn(&run_swarm_tests.step);
+
+    const raft_test_step = b.step("raft-test", "Run raft unit and transport tests");
     raft_test_step.dependOn(&run_raft_unit_tests.step);
-
-    const raft_transport_test_step = b.step("raft-transport-test", "Run raft transport unit tests");
-    raft_transport_test_step.dependOn(&run_raft_transport_tests.step);
+    raft_test_step.dependOn(&run_raft_transport_tests.step);
 
     unit_test_step.dependOn(&standalone_module_tests.regex.run.step);
     unit_test_step.dependOn(&standalone_module_tests.jsonschema.run.step);
@@ -1823,10 +1815,8 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&lib_db_test.run.step);
     unit_test_step.dependOn(&lib_db_module_tests.result_shape.step);
     unit_test_step.dependOn(&run_serverless_tests.step);
-    unit_test_step.dependOn(&run_lib_data_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_data_storage_tests.step);
-    unit_test_step.dependOn(&run_lib_metadata_logic_tests.step);
-    unit_test_step.dependOn(&run_lib_metadata_service_tests.step);
+    unit_test_step.dependOn(metadata_tests.root.step);
     antfly_tests_build.dependOnAPITableUnitTestRuns(unit_test_step, api_table_tests);
     unit_test_step.dependOn(&run_lib_api_auth_tests.step);
     unit_test_step.dependOn(&run_lib_api_logic_tests.step);
@@ -1840,7 +1830,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_audio_tests.step);
     unit_test_step.dependOn(delegated_inference_steps.inference_test);
     unit_test_step.dependOn(delegated_inference_steps.inference_finetune_test);
-    unit_test_step.dependOn(lib_swarm_runtime_test_step);
+    unit_test_step.dependOn(runtime_test_step);
     unit_test_step.dependOn(&run_ha_tests.step);
     unit_test_step.dependOn(&run_raft_unit_tests.step);
     unit_test_step.dependOn(&run_raft_transport_tests.step);
@@ -1848,9 +1838,9 @@ pub fn build(b: *std.Build) void {
     var unit_progress_tail: ?*std.Build.Step = null;
     unit_progress_tail = chainLabeledRun(b, lib_storage_progress_tests, "lib-storage-test", unit_progress_tail);
     unit_progress_tail = chainLabeledRun(b, lib_db_test.tests, antfly_tests_build.db_root_step_name, unit_progress_tail);
-    unit_progress_tail = chainLabeledRun(b, lib_metadata_tests, "lib-metadata-test", unit_progress_tail);
+    unit_progress_tail = chainLabeledRun(b, metadata_root_tests, "metadata-test", unit_progress_tail);
     unit_progress_tail = chainLabeledRun(b, raft_unit_tests, "raft-test", unit_progress_tail);
-    unit_progress_tail = chainLabeledRun(b, raft_transport_tests, "raft-transport-test", unit_progress_tail);
+    unit_progress_tail = chainLabeledRun(b, raft_transport_tests, "raft.transport", unit_progress_tail);
     unit_progress_tail = chainLabeledRun(b, serverless_tests, "serverless-test", unit_progress_tail);
     unit_progress_tail = chainLabeledRun(b, standalone_module_tests.template.tests, "lib-template-test", unit_progress_tail);
     unit_test_progress_step.dependOn(unit_progress_tail.?);
@@ -1984,7 +1974,7 @@ pub fn build(b: *std.Build) void {
         &standalone_module_tests.api_json_helpers.run.step,
         &run_antfly_client_pkg_tests.step,
         &root_module_tests.run.step,
-        &run_lib_metadata_tests.step,
+        metadata_tests.root.step,
         &run_lib_storage_tests.step,
         &run_lsm_backend_tests.step,
         &run_resource_budget_tests.step,

@@ -269,7 +269,6 @@ pub const MetadataChaosTestSteps = struct {
 
 pub const MetadataTestSteps = struct {
     root: MetadataTestRun,
-    foreign_key: MetadataTestRun,
     table_workflow: MetadataTestRun,
     sim: MetadataTestRun,
     sim_core: MetadataTestRun,
@@ -278,6 +277,7 @@ pub const MetadataTestSteps = struct {
     vopr_chaos: MetadataTestRun,
     sim_public: MetadataTestRun,
     sim_forward: MetadataTestRun,
+    sim_all: *std.Build.Step,
     service: MetadataTestRun,
     logic: MetadataTestRun,
     chaos: MetadataChaosTestSteps,
@@ -3254,6 +3254,19 @@ fn addMetadataTestRun(
     default_filters: []const []const u8,
     select_filters: bool,
 ) MetadataTestRun {
+    var test_run = addMetadataTestRunArtifact(b, root_module, default_filters, select_filters);
+    const step = b.step(name, description);
+    step.dependOn(&test_run.run.step);
+    test_run.step = step;
+    return test_run;
+}
+
+fn addMetadataTestRunArtifact(
+    b: *std.Build,
+    root_module: *std.Build.Module,
+    default_filters: []const []const u8,
+    select_filters: bool,
+) MetadataTestRun {
     const filters = if (select_filters) selectTestFilters(b, default_filters) else default_filters;
     const tests = b.addTest(.{
         .root_module = root_module,
@@ -3264,27 +3277,11 @@ fn addMetadataTestRun(
         },
     });
     const run = b.addRunArtifact(tests);
-    const step = b.step(name, description);
-    step.dependOn(&run.step);
     return .{
         .tests = tests,
         .run = run,
-        .step = step,
+        .step = &run.step,
     };
-}
-
-fn addMetadataChaosStep(
-    b: *std.Build,
-    root_module: *std.Build.Module,
-    name: []const u8,
-    description: []const u8,
-    default_filters: []const []const u8,
-) *std.Build.Step {
-    const step = b.step(name, description);
-    const filters = selectTestFilters(b, default_filters);
-    const tail = chainLabeledFilteredTests(b, root_module, name, filters, null);
-    step.dependOn(tail);
-    return step;
 }
 
 pub fn addMetadataTestSteps(
@@ -3292,32 +3289,49 @@ pub fn addMetadataTestSteps(
     root_module: *std.Build.Module,
     foreign_key_module: *std.Build.Module,
 ) MetadataTestSteps {
-    const root = addMetadataTestRun(b, root_module, "lib-metadata-test", "Run root-module metadata tests only", &MetadataTestFilters.root, true);
-    const foreign_key = addMetadataTestRun(b, foreign_key_module, "metadata-fk-test", "Run focused metadata tests for foreign-key ownership metadata", &MetadataTestFilters.foreign_key, false);
-    const table_workflow = addMetadataTestRun(b, root_module, "lib-metadata-table-workflow-test", "Run focused metadata table workflow tests", &MetadataTestFilters.table_workflow, false);
-    const sim = addMetadataTestRun(b, root_module, "lib-metadata-sim-test", "Run metadata real-HTTP simulation tests only", &MetadataTestFilters.sim, true);
-    const sim_core = addMetadataTestRun(b, root_module, "lib-metadata-sim-core-test", "Run deterministic metadata virtual-transport simulation tests without public API or chaos", &MetadataTestFilters.sim_core, true);
-    const sim_smoke = addMetadataTestRun(b, root_module, "lib-metadata-sim-smoke-test", "Run fast metadata virtual-transport simulation smoke tests", &MetadataTestFilters.sim_smoke, true);
-    const vopr = addMetadataTestRun(b, root_module, "lib-metadata-vopr-test", "Run seeded metadata virtual-operation campaign tests", &MetadataTestFilters.vopr, true);
-    const vopr_chaos = addMetadataTestRun(b, root_module, "lib-metadata-vopr-chaos-test", "Run expanded metadata VOPR generated workload campaigns", &MetadataTestFilters.vopr_chaos, true);
-    const sim_public = addMetadataTestRun(b, root_module, "lib-metadata-sim-public-test", "Run metadata public lifecycle/split/merge simulation tests", &MetadataTestFilters.sim_public, false);
-    const sim_forward = addMetadataTestRun(b, root_module, "lib-metadata-sim-forward-test", "Run metadata HTTP forwarding simulation tests only", &MetadataTestFilters.sim_forward, false);
-    const service = addMetadataTestRun(b, root_module, "lib-metadata-service-test", "Run metadata service/control-loop integration tests", &MetadataTestFilters.service, false);
-    const logic = addMetadataTestRun(b, root_module, "lib-metadata-logic-test", "Run metadata logic/state/planner tests", &MetadataTestFilters.logic, false);
+    const root = addMetadataTestRun(b, root_module, "metadata-test", "Run root-module and foreign-key metadata tests", &MetadataTestFilters.root, true);
+    const foreign_key_tests = b.addTest(.{
+        .root_module = foreign_key_module,
+        .filters = &MetadataTestFilters.foreign_key,
+    });
+    const run_foreign_key_tests = b.addRunArtifact(foreign_key_tests);
+    root.step.dependOn(&run_foreign_key_tests.step);
+    const table_workflow = addMetadataTestRunArtifact(b, root_module, &MetadataTestFilters.table_workflow, false);
+    const service = addMetadataTestRunArtifact(b, root_module, &MetadataTestFilters.service, false);
+    const logic = addMetadataTestRunArtifact(b, root_module, &MetadataTestFilters.logic, false);
+    root.step.dependOn(&table_workflow.run.step);
+    root.step.dependOn(&service.run.step);
+    root.step.dependOn(&logic.run.step);
 
-    const transition_chaos = addMetadataChaosStep(b, root_module, "lib-metadata-transition-chaos-test", "Run metadata split/merge transition restart and partition chaos simulations", &MetadataTestFilters.transition_chaos);
-    const public_chaos = addMetadataChaosStep(b, root_module, "lib-metadata-public-chaos-test", "Run metadata public traffic split/merge chaos simulations", &MetadataTestFilters.public_chaos);
-    const relational_public_chaos = addMetadataChaosStep(b, root_module, "lib-metadata-relational-public-chaos-test", "Run metadata relational public traffic chaos simulations", &MetadataTestFilters.relational_public_chaos);
-    const placement_chaos = addMetadataChaosStep(b, root_module, "lib-metadata-placement-chaos-test", "Run metadata placement restart chaos simulations", &MetadataTestFilters.placement_chaos);
+    const sim = addMetadataTestRunArtifact(b, root_module, &MetadataTestFilters.sim, true);
+    const sim_core = addMetadataTestRunArtifact(b, root_module, &MetadataTestFilters.sim_core, true);
+    const sim_smoke = addMetadataTestRunArtifact(b, root_module, &MetadataTestFilters.sim_smoke, true);
+    const vopr = addMetadataTestRunArtifact(b, root_module, &MetadataTestFilters.vopr, true);
+    const sim_public = addMetadataTestRunArtifact(b, root_module, &MetadataTestFilters.sim_public, false);
+    const sim_forward = addMetadataTestRunArtifact(b, root_module, &MetadataTestFilters.sim_forward, false);
+    const sim_all = b.step("metadata-sim-test", "Run metadata simulation and VOPR tests");
+    sim_all.dependOn(&sim.run.step);
+    sim_all.dependOn(&sim_core.run.step);
+    sim_all.dependOn(&sim_smoke.run.step);
+    sim_all.dependOn(&vopr.run.step);
+    sim_all.dependOn(&sim_public.run.step);
+    sim_all.dependOn(&sim_forward.run.step);
 
-    const all_chaos = b.step("lib-metadata-chaos-test", "Run metadata delayed/restart/partition chaos simulations");
+    const vopr_chaos = addMetadataTestRunArtifact(b, root_module, &MetadataTestFilters.vopr_chaos, true);
+    const transition_chaos = chainLabeledFilteredTests(b, root_module, "metadata-chaos.transition", selectTestFilters(b, &MetadataTestFilters.transition_chaos), null);
+    const public_chaos = chainLabeledFilteredTests(b, root_module, "metadata-chaos.public", selectTestFilters(b, &MetadataTestFilters.public_chaos), null);
+    const relational_public_chaos = chainLabeledFilteredTests(b, root_module, "metadata-chaos.relational-public", selectTestFilters(b, &MetadataTestFilters.relational_public_chaos), null);
+    const placement_chaos = chainLabeledFilteredTests(b, root_module, "metadata-chaos.placement", selectTestFilters(b, &MetadataTestFilters.placement_chaos), null);
+
+    const all_chaos = b.step("metadata-chaos-test", "Run metadata delayed/restart/partition chaos simulations");
+    all_chaos.dependOn(&vopr_chaos.run.step);
     all_chaos.dependOn(transition_chaos);
     all_chaos.dependOn(public_chaos);
+    all_chaos.dependOn(relational_public_chaos);
     all_chaos.dependOn(placement_chaos);
 
     return .{
         .root = root,
-        .foreign_key = foreign_key,
         .table_workflow = table_workflow,
         .sim = sim,
         .sim_core = sim_core,
@@ -3326,6 +3340,7 @@ pub fn addMetadataTestSteps(
         .vopr_chaos = vopr_chaos,
         .sim_public = sim_public,
         .sim_forward = sim_forward,
+        .sim_all = sim_all,
         .service = service,
         .logic = logic,
         .chaos = .{
@@ -3344,9 +3359,9 @@ pub fn chainMetadataChaosSoakTests(
     previous: ?*std.Build.Step,
 ) *std.Build.Step {
     var tail = previous;
-    tail = chainLabeledFilteredTests(b, root_module, "lib-metadata-transition-chaos-test", selectTestFilters(b, &MetadataTestFilters.transition_chaos), tail);
-    tail = chainLabeledFilteredTests(b, root_module, "lib-metadata-public-chaos-test", selectTestFilters(b, &MetadataTestFilters.public_chaos), tail);
-    tail = chainLabeledFilteredTests(b, root_module, "lib-metadata-placement-chaos-test", selectTestFilters(b, &MetadataTestFilters.placement_chaos), tail);
+    tail = chainLabeledFilteredTests(b, root_module, "metadata-chaos.transition", selectTestFilters(b, &MetadataTestFilters.transition_chaos), tail);
+    tail = chainLabeledFilteredTests(b, root_module, "metadata-chaos.public", selectTestFilters(b, &MetadataTestFilters.public_chaos), tail);
+    tail = chainLabeledFilteredTests(b, root_module, "metadata-chaos.placement", selectTestFilters(b, &MetadataTestFilters.placement_chaos), tail);
     return tail.?;
 }
 

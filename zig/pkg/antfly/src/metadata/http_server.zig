@@ -229,6 +229,7 @@ pub const AdminSource = struct {
         var logical_plan = try sql_adapter.lowerDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
         defer logical_plan.deinit(alloc);
         var durable_plan = try sql_adapter.DurableSqlPlan.fromLogical(&logical_plan);
+        defer durable_plan.deinit(alloc);
         return try fn_ptr(self.ptr, alloc, &durable_plan, catalog_resources.SqlCatalogSession.default());
     }
 
@@ -240,6 +241,7 @@ pub const AdminSource = struct {
     ) !tables_api.AppliedRelationalSqlDdlRecord {
         const fn_ptr = self.vtable.apply_relational_sql_ddl_plan_with_session orelse return error.UnsupportedOperation;
         var durable_plan = sql_adapter.DurableSqlPlan.fromDdlPayload(plan);
+        defer durable_plan.deinit(alloc);
         return try fn_ptr(self.ptr, alloc, &durable_plan, session);
     }
 
@@ -2241,6 +2243,7 @@ fn applyRelationalSqlDdlPlanOnMetadataServiceWithSession(
     session: catalog_resources.SqlCatalogSession,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
     var durable_plan = sql_adapter.DurableSqlPlan.fromDdlPayload(plan);
+    defer durable_plan.deinit(alloc);
     return try applyDurableSqlPlanOnMetadataServiceWithSession(service_impl, alloc, &durable_plan, session);
 }
 
