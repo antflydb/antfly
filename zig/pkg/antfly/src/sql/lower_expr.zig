@@ -566,10 +566,119 @@ fn validateGeneratedSourceTableFunctionPayloads(
     }
 }
 
+fn validateGeneratedCteItemPayloads(
+    tokens: []const Token,
+    list_tokens: generated_parser.GeneratedSqlTokenRange,
+    cte: generated_parser.GeneratedSqlCteAst,
+) !void {
+    if (cte.name_tokens.start < list_tokens.start or cte.name_tokens.end > list_tokens.end or cte.name_tokens.end != cte.name_tokens.start + 1) return error.UnsupportedSqlShape;
+    if (cte.name_tokens.end > tokens.len or tokens[cte.name_tokens.start].kind != .identifier) return error.UnsupportedSqlShape;
+
+    var cursor = cte.name_tokens.end;
+    if (cte.column_tokens) |column_tokens| {
+        if (column_tokens.start != cursor or column_tokens.end > list_tokens.end or column_tokens.end <= column_tokens.start + 1) return error.UnsupportedSqlShape;
+        if (tokens[column_tokens.start].kind != .lparen or tokens[column_tokens.end - 1].kind != .rparen) return error.UnsupportedSqlShape;
+        const column_name_tokens = cte.column_name_tokens orelse return error.UnsupportedSqlShape;
+        if (column_name_tokens.start != column_tokens.start + 1 or column_name_tokens.end != column_tokens.end - 1) return error.UnsupportedSqlShape;
+        try validateGeneratedExpressionListForClause(tokens, column_name_tokens, cte.column_names);
+        cursor = column_tokens.end;
+    } else if (cte.column_name_tokens != null or cte.column_names.count != 0 or cte.column_names.items.len != 0) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (cursor >= list_tokens.end or !tokens[cursor].matchesKeywordTag(.as)) return error.UnsupportedSqlShape;
+    cursor += 1;
+
+    if (cte.materialization_tokens) |materialization_tokens| {
+        if (materialization_tokens.start != cursor or materialization_tokens.end > list_tokens.end or materialization_tokens.start >= materialization_tokens.end) return error.UnsupportedSqlShape;
+        const materialization = cte.materialization orelse return error.UnsupportedSqlShape;
+        switch (materialization) {
+            .materialized => {
+                if (materialization_tokens.end != materialization_tokens.start + 1 or !tokens[materialization_tokens.start].matchesKeywordTag(.materialized)) return error.UnsupportedSqlShape;
+            },
+            .not_materialized => {
+                if (materialization_tokens.end != materialization_tokens.start + 2 or
+                    !tokens[materialization_tokens.start].matchesKeywordTag(.not) or
+                    !tokens[materialization_tokens.start + 1].matchesKeywordTag(.materialized))
+                {
+                    return error.UnsupportedSqlShape;
+                }
+            },
+        }
+        cursor = materialization_tokens.end;
+    } else if (cte.materialization != null) {
+        return error.UnsupportedSqlShape;
+    }
+
+    const body_tokens = cte.body_tokens orelse return error.UnsupportedSqlShape;
+    if (cursor >= list_tokens.end or tokens[cursor].kind != .lparen) return error.UnsupportedSqlShape;
+    if (body_tokens.start != cursor + 1 or body_tokens.end >= list_tokens.end or tokens[body_tokens.end].kind != .rparen) return error.UnsupportedSqlShape;
+    if (body_tokens.start >= body_tokens.end or body_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    if (cte.body_kind == null or cte.body_select_tokens == null) return error.UnsupportedSqlShape;
+    const select_tokens = cte.body_select_tokens.?;
+    if (select_tokens.start != body_tokens.start or select_tokens.end != select_tokens.start + 1 or !tokens[select_tokens.start].matchesKeywordTag(.select)) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedCteReadPayloads(
+    tokens: []const Token,
+    read: generated_parser.GeneratedSqlReadAst,
+) !void {
+    if (read.kind != .cte) {
+        if (read.cte_tokens != null or
+            read.cte_list_tokens != null or
+            read.cte_name_tokens != null or
+            read.cte_body_tokens != null or
+            read.cte_last_name_tokens != null or
+            read.cte_last_body_tokens != null or
+            read.cte_items.len != 0 or
+            read.cte_count != 0 or
+            read.cte_recursive)
+        {
+            return error.UnsupportedSqlShape;
+        }
+        return;
+    }
+
+    const cte_tokens = read.cte_tokens orelse return error.UnsupportedSqlShape;
+    const list_tokens = read.cte_list_tokens orelse return error.UnsupportedSqlShape;
+    if (cte_tokens.start >= cte_tokens.end or cte_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    if (list_tokens.start < cte_tokens.start or list_tokens.end > cte_tokens.end or list_tokens.start >= list_tokens.end) return error.UnsupportedSqlShape;
+    if (read.cte_recursive) {
+        if (cte_tokens.start >= list_tokens.start or !tokens[cte_tokens.start].matchesKeywordTag(.recursive) or list_tokens.start != cte_tokens.start + 1) return error.UnsupportedSqlShape;
+    } else if (list_tokens.start != cte_tokens.start) {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (read.cte_count == 0 or read.cte_items.len != read.cte_count) return error.UnsupportedSqlShape;
+    const first = read.cte_items[0];
+    const last = read.cte_items[read.cte_items.len - 1];
+    if (!generatedTokenRangeEqual(read.cte_name_tokens orelse return error.UnsupportedSqlShape, first.name_tokens)) return error.UnsupportedSqlShape;
+    if (!generatedTokenRangeEqual(read.cte_body_tokens orelse return error.UnsupportedSqlShape, first.body_tokens orelse return error.UnsupportedSqlShape)) return error.UnsupportedSqlShape;
+    if (!generatedTokenRangeEqual(read.cte_last_name_tokens orelse return error.UnsupportedSqlShape, last.name_tokens)) return error.UnsupportedSqlShape;
+    if (!generatedTokenRangeEqual(read.cte_last_body_tokens orelse return error.UnsupportedSqlShape, last.body_tokens orelse return error.UnsupportedSqlShape)) return error.UnsupportedSqlShape;
+
+    for (read.cte_items, 0..) |cte, index| {
+        try validateGeneratedCteItemPayloads(tokens, list_tokens, cte);
+        if (index == 0) {
+            if (cte.name_tokens.start != list_tokens.start) return error.UnsupportedSqlShape;
+        } else {
+            const previous_body = read.cte_items[index - 1].body_tokens orelse return error.UnsupportedSqlShape;
+            const comma_index = previous_body.end + 1;
+            if (comma_index >= tokens.len or tokens[comma_index].kind != .comma or cte.name_tokens.start != comma_index + 1) return error.UnsupportedSqlShape;
+        }
+        if (index + 1 == read.cte_items.len) {
+            const body = cte.body_tokens orelse return error.UnsupportedSqlShape;
+            if (body.end + 1 != list_tokens.end) return error.UnsupportedSqlShape;
+        }
+    }
+}
+
 pub fn validateGeneratedReadAstPayloads(
     tokens: []const Token,
     read: generated_parser.GeneratedSqlReadAst,
 ) !void {
+    try validateGeneratedCteReadPayloads(tokens, read);
+
     if (read.distinct_tokens) |range| {
         _ = try validateGeneratedDistinctClause(tokens, range, read.distinct_on_items);
     } else if (read.distinct_on_items.count != 0 or read.distinct_on_items.items.len != 0) {
@@ -37078,6 +37187,47 @@ test "sql adapter lower expr lowers non recursive cte query plans" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
         alloc,
         &malformed_generated_cte_body_order_expression,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_generated_cte_count = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH open_orders AS (SELECT id FROM orders), closed_orders AS (SELECT id FROM orders) SELECT id FROM open_orders",
+    );
+    defer malformed_generated_cte_count.deinit(alloc);
+    if (malformed_generated_cte_count.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| read.cte_count += 1,
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_cte_count,
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var malformed_generated_cte_materialization = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH open_orders AS MATERIALIZED (SELECT id FROM orders) SELECT id FROM open_orders",
+    );
+    defer malformed_generated_cte_materialization.deinit(alloc);
+    if (malformed_generated_cte_materialization.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.cte_items.len == 0) return error.TestUnexpectedResult;
+                read.cte_items[0].materialization = .not_materialized;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_cte_materialization,
         schema,
         &.{},
         .{},
