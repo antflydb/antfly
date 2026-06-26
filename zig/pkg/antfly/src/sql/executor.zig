@@ -47,8 +47,7 @@ pub fn planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     function_bindings: lower_expr.SqlFunctionBindings,
 ) !SqlExecutionPlan {
-    var lowered = try ddl_plan.lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, function_bindings);
-    return binder.logicalPlanFromLoweredDdlPlan(&lowered);
+    return try ddl_plan.planLogicalDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, function_bindings);
 }
 
 pub fn planParsedSqlWithSessionAlloc(

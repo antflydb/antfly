@@ -21236,3 +21236,421 @@ test "replica root reconcile seeds write cache across generation bump" {
     cached_after_bump.deinit(alloc);
     try std.testing.expectEqual(misses_before, write_cache.miss_count.load(.monotonic));
 }
+
+test "provisioned table read source serves profiled dense query without runtime status warmup" {
+    const alloc = std.testing.allocator;
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-warmed-read-cache-profiled-query", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    {
+        var db = try openManagedDbWithIndexesJson(
+            alloc,
+            path,
+            "{\"indexes\":[{\"name\":\"semantic_idx\",\"type\":\"embeddings\",\"config\":{\"field\":\"embedding\",\"dims\":2}}]}",
+        );
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:a", .value = "{\"_embeddings\":{\"semantic_idx\":[1,2]}}" },
+                .{ .key = "doc:b", .value = "{\"_embeddings\":{\"semantic_idx\":[2,1]}}" },
+            },
+            .sync_level = .full_index,
+        });
+    }
+
+    var read_cache = table_reads.ProvisionedTableReadCache.init(alloc);
+    defer read_cache.deinit();
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    _ = try write_cache.getOrOpenLocked(path, Catalog.iface(), 7001, 0, "docs");
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+
+    var write_source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    write_source.read_cache = &read_cache;
+    write_source.write_cache = &write_cache;
+    write_source.runtime_status_cache = &snapshot_cache;
+    write_source.markWriteCacheDirty("docs");
+
+    try std.testing.expect((try write_source.source().localRuntimeStatuses(alloc, "docs")) == null);
+
+    var read_source = table_reads.ProvisionedTableReadSource.init(replica_root_dir, Catalog.iface(), raft_mod.read_gate.noopReadableLeaseRequester());
+    read_source.cache = &read_cache;
+
+    var owned = try query_api.parseQueryRequest(alloc, null, "docs",
+        \\{"embeddings":{"semantic_idx":[1.0,2.0]},"indexes":["semantic_idx"],"limit":2,"profile":true}
+    );
+    defer owned.deinit(alloc);
+
+    var response = (try read_source.source().query(alloc, "docs", owned.req, .read_index)).?;
+    defer response.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, response.json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.responses.?[0].hits != null);
+    try std.testing.expect(parsed.value.responses.?[0].profile != null);
+}
+
+test "hosted provisioned table read source serves profiled dense query after external write-sync batch without index-not-found" {
+    const alloc = std.testing.allocator;
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, group_id: u64) raft_mod.HostedReplicaStatus {
+            return if (group_id == 7001) .active else .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, group_id: u64) ?u64 {
+            return if (group_id == 7001) 1 else null;
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, group_id: u64) raft_mod.HostedReplicaStatus {
+            _ = node_id;
+            return if (group_id == 7001) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+    };
+
+    const ExecutorState = struct {
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return error.UnexpectedHttpRequest;
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-profiled-external-write-sync", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+
+    var write_source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    _ = try write_source.source().batch(alloc, "docs", .{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"_embeddings\":{\"semantic_idx\":[1,2]}}" },
+            .{ .key = "doc:b", .value = "{\"_embeddings\":{\"semantic_idx\":[2,1]}}" },
+        },
+        .sync_level = .write,
+    });
+
+    var executor_state = ExecutorState{};
+    var hosted = table_reads.HostedProvisionedTableReadSource.init(
+        replica_root_dir,
+        Catalog.iface(),
+        raft_mod.read_gate.noopReadableLeaseRequester(),
+        FakeRouter.iface(),
+        executor_state.iface(),
+    );
+
+    var owned = try query_api.parseQueryRequest(alloc, null, "docs",
+        \\{"embeddings":{"semantic_idx":[1.0,2.0]},"indexes":["semantic_idx"],"limit":2,"profile":true}
+    );
+    defer owned.deinit(alloc);
+
+    var response = (try hosted.source().query(alloc, "docs", owned.req, .read_index)).?;
+    defer response.deinit(alloc);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("responses") != null);
+}
+
+test "provisioned table read source survives many external write-sync batches before first profiled dense query" {
+    const alloc = std.testing.allocator;
+    const total_docs: usize = 50_000;
+    const batch_size: usize = 250;
+    const dims: usize = 384;
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":384}}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeStatusSource = struct {
+        fn iface() http_server.StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return try Catalog.adminSnapshot(undefined);
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            Catalog.freeAdminSnapshot(undefined, snapshot);
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-profiled-external-write-sync-many", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+
+    var read_cache = table_reads.ProvisionedTableReadCache.init(alloc);
+    defer read_cache.deinit();
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+
+    var write_source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    write_source.read_cache = &read_cache;
+    write_source.write_cache = &write_cache;
+    write_source.runtime_status_cache = &snapshot_cache;
+
+    const dense_doc_json = blk: {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll("{\"_embeddings\":{\"semantic_idx\":[");
+        for (0..dims) |i| {
+            if (i != 0) try out.writer.writeByte(',');
+            try out.writer.writeAll("1");
+        }
+        try out.writer.writeAll("]}}");
+        break :blk try out.toOwnedSlice();
+    };
+    defer alloc.free(dense_doc_json);
+
+    const query_json = blk: {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.writeAll("{\"embeddings\":{\"semantic_idx\":[");
+        for (0..dims) |i| {
+            if (i != 0) try out.writer.writeByte(',');
+            try out.writer.writeAll("1.0");
+        }
+        try out.writer.writeAll("]},\"indexes\":[\"semantic_idx\"],\"limit\":10,\"profile\":true}");
+        break :blk try out.toOwnedSlice();
+    };
+    defer alloc.free(query_json);
+
+    {
+        var cold_read_source = table_reads.ProvisionedTableReadSource.init(
+            replica_root_dir,
+            Catalog.iface(),
+            raft_mod.read_gate.noopReadableLeaseRequester(),
+        );
+        cold_read_source.cache = &read_cache;
+
+        var cold_owned = try query_api.parseQueryRequest(alloc, null, "docs", query_json);
+        defer cold_owned.deinit(alloc);
+
+        var cold_response = (try cold_read_source.source().query(alloc, "docs", cold_owned.req, .read_index)).?;
+        defer cold_response.deinit(alloc);
+    }
+
+    for (0..(total_docs / batch_size)) |batch_idx| {
+        const writes = try alloc.alloc(db_mod.types.BatchWrite, batch_size);
+        defer {
+            for (writes) |write| {
+                alloc.free(@constCast(write.key));
+                alloc.free(@constCast(write.value));
+            }
+            alloc.free(writes);
+        }
+        for (writes, 0..) |*write, i| {
+            const doc_idx = batch_idx * batch_size + i;
+            write.key = try std.fmt.allocPrint(alloc, "doc:{d:0>8}", .{doc_idx});
+            write.value = try alloc.dupe(u8, dense_doc_json);
+        }
+        _ = try write_source.source().batch(alloc, "docs", .{
+            .writes = writes,
+            .sync_level = .write,
+        });
+    }
+
+    var read_source = table_reads.ProvisionedTableReadSource.init(
+        replica_root_dir,
+        Catalog.iface(),
+        raft_mod.read_gate.noopReadableLeaseRequester(),
+    );
+    read_source.cache = &read_cache;
+
+    var server = http_server.ApiHttpServer.init(
+        alloc,
+        .{},
+        FakeStatusSource.iface(),
+        read_source.source(),
+        write_source.source(),
+    );
+
+    const IndexDetail = struct {
+        status: ?struct {
+            doc_count: ?u64 = null,
+            total_indexed: ?u64 = null,
+            replay_target_sequence: ?u64 = null,
+            replay_applied_sequence: ?u64 = null,
+            replay_catch_up_required: ?bool = null,
+            backfill_active: ?bool = null,
+            rebuilding: ?bool = null,
+        } = null,
+    };
+
+    var ready = false;
+    for (0..200) |_| {
+        var detail = try server.handlePublicTableGetIndex("docs", "semantic_idx");
+        defer detail.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), detail.status);
+        var parsed_detail = try std.json.parseFromSlice(IndexDetail, alloc, detail.body, .{ .ignore_unknown_fields = true });
+        defer parsed_detail.deinit();
+        if (parsed_detail.value.status) |idx| {
+            if ((idx.doc_count orelse 0) == total_docs and
+                (idx.total_indexed orelse 0) == total_docs and
+                (idx.replay_applied_sequence orelse 0) == (idx.replay_target_sequence orelse 0) and
+                !(idx.replay_catch_up_required orelse false) and
+                !(idx.backfill_active orelse false) and
+                !(idx.rebuilding orelse false))
+            {
+                ready = true;
+                break;
+            }
+        }
+        sleepNs(10 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(ready);
+
+    var response = try server.handlePublicTableQuery("docs", query_json, null);
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), response.status);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("responses") != null);
+}

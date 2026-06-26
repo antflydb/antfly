@@ -12974,6 +12974,7 @@ fn lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(
                 error.InvalidRowsRequest => return error.UnsupportedSqlShape,
                 else => return err,
             };
+            if (!generatedDmlParserConsumedStatement(tokens, end, parser_state.pos)) return error.UnsupportedSqlShape;
             lowered.insert_source.sync_level = options.sync_level;
             return .{ .recursive_insert_source = lowered };
         },
@@ -13007,6 +13008,7 @@ fn lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(
                 error.InvalidRowsRequest => return error.UnsupportedSqlShape,
                 else => return err,
             };
+            if (!generatedDmlParserConsumedStatement(tokens, end, parser_state.pos)) return error.UnsupportedSqlShape;
             lowered.mutation.sync_level = options.sync_level;
             return .{ .recursive_update_joined_source = lowered };
         },
@@ -13040,6 +13042,7 @@ fn lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(
                 error.InvalidRowsRequest => return error.UnsupportedSqlShape,
                 else => return err,
             };
+            if (!generatedDmlParserConsumedStatement(tokens, end, parser_state.pos)) return error.UnsupportedSqlShape;
             lowered.mutation.sync_level = options.sync_level;
             return .{ .recursive_delete_joined_source = lowered };
         },
@@ -13061,6 +13064,7 @@ fn lowerRecursiveWritePlanFromGeneratedDmlAstAlloc(
                 error.InvalidRowsRequest => return error.UnsupportedSqlShape,
                 else => return err,
             };
+            if (!generatedDmlParserConsumedStatement(tokens, end, parser_state.pos)) return error.UnsupportedSqlShape;
             lowered.merge.sync_level = options.sync_level;
             return .{ .recursive_merge_mutation = lowered };
         },
@@ -15326,6 +15330,48 @@ test "sql adapter lower dml lowers generated DML AST through typed write plans" 
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var parsed_recursive_update_returning = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records WHERE status = 'ready' UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows) RETURNING id",
+    );
+    defer parsed_recursive_update_returning.deinit(alloc);
+    var recursive_update_returning_ast = switch ((parsed_recursive_update_returning.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var recursive_update_returning = try lowerWritePlanFromGeneratedDmlAstDirectAlloc(
+        alloc,
+        &parsed_recursive_update_returning,
+        recursive_update_returning_ast,
+        schema,
+        &.{},
+        options,
+    );
+    defer recursive_update_returning.deinit(alloc);
+    switch (recursive_update_returning) {
+        .recursive_update_joined_source => |recursive_update| {
+            try std.testing.expectEqualStrings("source_rows", recursive_update.recursive.cte_name);
+            try std.testing.expectEqualStrings("usage_records", recursive_update.mutation.target_table_name);
+            try std.testing.expectEqual(@as(usize, 1), recursive_update.mutation.mutation.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const recursive_update_returning_range = recursive_update_returning_ast.returning_tokens orelse return error.TestUnexpectedResult;
+    if (recursive_update_returning_range.start == 0) return error.TestUnexpectedResult;
+    recursive_update_returning_ast.statement_span.end = parsed_recursive_update_returning.items()[recursive_update_returning_range.start - 2].source_end;
+    recursive_update_returning_ast.returning_tokens = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerWritePlanFromGeneratedDmlAstDirectAlloc(
+            alloc,
+            &parsed_recursive_update_returning,
+            recursive_update_returning_ast,
+            schema,
+            &.{},
+            options,
+        ),
+    );
 
     var generated_recursive_delete = try lowerGeneratedDmlWritePlanForDmlTestAlloc(
         alloc,

@@ -759,7 +759,9 @@ Unsupported DDL remains on the existing parser until
    recursive `UPDATE`/`DELETE` forms that classify as joined mutation sources
    through their recursive CTE predicates validate the generated command body
    without requiring an explicit generated `FROM`/`USING` relation-source
-   payload.
+   payload, and recursive generated DML delegation now fails closed unless the
+   typed recursive parser consumes exactly the retained generated statement
+   boundary.
    Generated DML AST kind also owns parsed-statement write-family
    classification for generated-covered writes, preserves recursive CTE write
    metadata at the parsed boundary, validates top-level command source spans

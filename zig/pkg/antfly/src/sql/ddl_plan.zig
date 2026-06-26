@@ -11750,6 +11750,168 @@ pub fn lowerDdlPlanParsedSqlAlloc(
     return try lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, .{});
 }
 
+pub fn planLogicalDdlPlanParsedSqlWithFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !binder.LogicalSqlPlan {
+    var lowered = try lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, function_bindings);
+    return logicalPlanFromLoweredDdlPlan(&lowered);
+}
+
+pub fn logicalPlanFromLoweredDdlPlan(plan: *LoweredDdlPlan) binder.LogicalSqlPlan {
+    return switch (plan.*) {
+        .adapter_noop => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .other_ddl = .{ .adapter_noop = payload } };
+        },
+        .session_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .session = payload };
+        },
+        .transaction_control => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .transaction = .{ .control = payload } };
+        },
+        .prepared_transaction => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .transaction = .{ .prepared = payload } };
+        },
+        .savepoint_transaction => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .transaction = .{ .savepoint = payload } };
+        },
+        .prepared_statement => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .prepared_statement = payload };
+        },
+        .cursor_portal => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .cursor = payload };
+        },
+        .notification_channel => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .notification = payload };
+        },
+        .function_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .routine = .{ .function_catalog = payload } };
+        },
+        .trigger_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .routine = .{ .trigger_catalog = payload } };
+        },
+        .procedure_call => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .routine = .{ .procedure_call = payload } };
+        },
+        .authorization_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .auth = .{ .authorization_catalog = payload } };
+        },
+        .row_security_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .auth = .{ .row_security_catalog = payload } };
+        },
+        .extension_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .extension = payload };
+        },
+        .maintenance_job => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .maintenance = payload };
+        },
+        .bulk_io => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .bulk_io = payload };
+        },
+        .create_table => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .table_ddl = .{ .create_table = payload } };
+        },
+        .table_clone => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .table_ddl = .{ .table_clone = payload } };
+        },
+        .view_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .table_ddl = .{ .view_catalog = payload } };
+        },
+        .materialized_view_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .table_ddl = .{ .materialized_view_catalog = payload } };
+        },
+        .relation_lifetime => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .table_ddl = .{ .relation_lifetime = payload } };
+        },
+        .table_partition_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .table_ddl = .{ .table_partition_catalog = payload } };
+        },
+        .create_index => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .table_ddl = .{ .create_index = payload } };
+        },
+        .drop_index => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .table_ddl = .{ .drop_index = payload } };
+        },
+        .drop_table => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .table_ddl = .{ .drop_table = payload } };
+        },
+        .alter_table => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .table_ddl = .{ .alter_table = payload } };
+        },
+        .create_update_policy => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .table_ddl = .{ .create_update_policy = payload } };
+        },
+        .enum_type_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .catalog_ddl = .{ .enum_type_catalog = payload } };
+        },
+        .domain_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .catalog_ddl = .{ .domain_catalog = payload } };
+        },
+        .sequence_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .catalog_ddl = .{ .sequence_catalog = payload } };
+        },
+        .identity_allocator_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .catalog_ddl = .{ .identity_allocator_catalog = payload } };
+        },
+        .schema_namespace_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .catalog_ddl = .{ .schema_namespace_catalog = payload } };
+        },
+        .database_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .catalog_ddl = .{ .database_catalog = payload } };
+        },
+        .tablespace_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .catalog_ddl = .{ .tablespace_catalog = payload } };
+        },
+        .logical_replication => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .catalog_ddl = .{ .logical_replication = payload } };
+        },
+        .type_system_catalog => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .catalog_ddl = .{ .type_system_catalog = payload } };
+        },
+        .comment_metadata => |payload| blk: {
+            plan.* = undefined;
+            break :blk .{ .catalog_ddl = .{ .comment_metadata = payload } };
+        },
+    };
+}
+
 const RoutineTriggerParser = struct {
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
