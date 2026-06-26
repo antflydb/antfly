@@ -1003,6 +1003,12 @@ Unsupported DDL remains on the existing parser until
    subqueries, require generated `JOIN ... ON` predicate expressions to match
    their retained `ON` bodies, and validate retained subquery `FROM`/`WHERE`
    keyword layout.
+   Ordinary select-list lowering now threads generated projection expression
+   AST items into the typed projection parser and verifies unambiguous
+   projection starts against the retained generated expression kind, so
+   malformed generated `CURRENT_DATE`/`CURRENT_TIMESTAMP`, cast, case, concat,
+   unary/logical, parenthesized, and function-call projection metadata fails
+   closed before fallback projection parsing can accept it.
    Generated read validation
    rejects pagination payloads that are missing required expressions, attach
    expressions to `LIMIT ALL`, place expression spans outside their owning

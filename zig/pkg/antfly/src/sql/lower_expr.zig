@@ -1778,6 +1778,84 @@ fn generatedProjectionExpressionAtItemStart(
     return null;
 }
 
+fn generatedSelectItemStartAllowsExpressionKind(
+    start: SelectItemStart,
+    kind: generated_parser.GeneratedSqlExpressionKind,
+) bool {
+    return switch (start) {
+        .pipe_concat => kind == .string_concat,
+        .unary_negative => kind == .unary_negative,
+        .boolean_not => kind == .logical_not,
+        .extension_function,
+        .routine_expression,
+        .uuid_v4,
+        .json_extract_path,
+        .json_typeof,
+        .json_array_length,
+        .json_build_object,
+        .convert_from,
+        .to_jsonb,
+        .array_length,
+        .array_position,
+        .array_element_transform,
+        .array_to_string,
+        .string_to_array,
+        .coalesce,
+        .case_fold,
+        .replace,
+        .regexp_replace,
+        .regexp_substr,
+        .regexp_match,
+        .regexp_count,
+        .regexp_instr,
+        .translate,
+        .concat,
+        .nullif,
+        .text_length,
+        .ascii,
+        .chr,
+        .substring,
+        .overlay,
+        .split_part,
+        .strpos,
+        .left_right,
+        .pad,
+        .repeat,
+        .reverse,
+        .md5,
+        .starts_with,
+        .ends_with,
+        .date_trunc,
+        .date_bin,
+        .date_part,
+        .abs,
+        .round,
+        .trunc,
+        .floor,
+        .ceil,
+        .sqrt,
+        .sign,
+        .mod,
+        .power,
+        .greatest_least,
+        => kind == .function_call,
+        .now => kind == .function_call or kind == .current_timestamp,
+        .current_date => kind == .current_date,
+        .typed_datetime_literal => kind == .timestamp_literal,
+        .case => kind == .case_expression,
+        .cast => kind == .cast,
+        .parenthesized => kind == .grouped,
+    };
+}
+
+fn validateGeneratedSelectItemStartForExpression(
+    start: SelectItemStart,
+    generated_expression: ?*const generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    const expression = generated_expression orelse return;
+    if (!generatedSelectItemStartAllowsExpressionKind(start, expression.kind)) return error.UnsupportedSqlShape;
+}
+
 fn validateGeneratedWindowOverClauseForSpec(
     tokens: []const Token,
     over_start: usize,
@@ -13140,6 +13218,11 @@ pub fn parseAggregateSelectListAlloc(
             try aggregations.append(alloc, spec);
             spec_transferred = true;
         } else {
+            const item_start = pos.*;
+            const generated_expression = try generatedProjectionExpressionAtItemStart(item_start, generated_read_ast);
+            if (generated_expression == null and generated_read_ast != null) return error.UnsupportedSqlShape;
+            var item_options = select_item_options;
+            item_options.generated_expression_ast = generated_expression;
             const item = try parseSelectItemAlloc(
                 alloc,
                 tokens,
@@ -13152,7 +13235,7 @@ pub fn parseAggregateSelectListAlloc(
                 defer_row_expression_field_validation,
                 field_source,
                 type_context,
-                select_item_options,
+                item_options,
             );
             var item_transferred = false;
             errdefer if (!item_transferred) plan_mod.freeSelectItem(alloc, item);
@@ -17745,6 +17828,7 @@ pub fn parseSelectAlloc(
             .defer_row_expression_field_validation = current_context.defer_row_expression_field_validation,
             .field_source = options.field_source,
             .select_item_options = options.select_item_options,
+            .generated_read_ast = options.generated_read_ast,
         },
     );
     errdefer strings.freeStringSlice(alloc, select.fields);
@@ -22692,6 +22776,7 @@ pub const SelectItemParserOptions = struct {
     select_field: SelectFieldItemParserOptions,
     extension_function: ExtensionFunctionRowExpressionParserOptions,
     routine_expression: RoutineExpressionRowExpressionParserOptions,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
 };
 
 pub const SelectListParserOptions = struct {
@@ -22705,6 +22790,7 @@ pub const SelectListParserOptions = struct {
     defer_row_expression_field_validation: bool = false,
     field_source: db_mod.types.RelationalRowsExpressionFieldSource = .row,
     select_item_options: SelectItemParserOptions,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst = null,
 };
 
 pub const ReturningSelectItemParserOptions = struct {
@@ -22947,6 +23033,11 @@ pub fn parseSelectListAlloc(
             continue;
         }
 
+        const item_start = pos.*;
+        const generated_expression = try generatedProjectionExpressionAtItemStart(item_start, options.generated_read_ast);
+        if (generated_expression == null and options.generated_read_ast != null) return error.UnsupportedSqlShape;
+        var select_item_options = options.select_item_options;
+        select_item_options.generated_expression_ast = generated_expression;
         const item = try parseSelectItemAlloc(
             alloc,
             tokens,
@@ -22959,7 +23050,7 @@ pub fn parseSelectListAlloc(
             options.defer_row_expression_field_validation,
             options.field_source,
             options.type_context,
-            options.select_item_options,
+            select_item_options,
         );
         var item_transferred = false;
         errdefer if (!item_transferred) plan_mod.freeSelectItem(alloc, item);
@@ -23293,6 +23384,12 @@ pub fn parseWindowSelectListAlloc(
             try windows.append(alloc, spec);
             spec_transferred = true;
         } else {
+            const item_start = pos.*;
+            const generated_expression = try generatedProjectionExpressionAtItemStart(item_start, options.generated_read_ast);
+            if (generated_expression == null and options.generated_read_ast != null) return error.UnsupportedSqlShape;
+            if (generated_expression) |expression| {
+                if (expression.kind != .token_range) return error.UnsupportedSqlShape;
+            }
             const parsed_field = try parseRowExpressionFieldOwnedAlloc(
                 alloc,
                 tokens,
@@ -23361,6 +23458,7 @@ pub fn parseSelectItemAlloc(
     options: SelectItemParserOptions,
 ) !plan_mod.SelectItem {
     if (selectItemStartWithFunctionBindingsAt(tokens, pos.*, function_bindings)) |start| {
+        try validateGeneratedSelectItemStartForExpression(start, options.generated_expression_ast);
         switch (start) {
             .pipe_concat => return .{ .expression = try parseTextExpressionProjectionAlloc(alloc, tokens, pos, type_context, options.expression) },
             .unary_negative => return .{ .expression = try parseGenericExpressionProjectionAlloc(alloc, tokens, pos, type_context, options.expression) },
@@ -29141,6 +29239,20 @@ test "sql adapter lower expr lowers current time projections" {
     try std.testing.expectEqual(@as(usize, 2), lowered_current_date.plan.query.expressions[0].expression.operands.len);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.now, lowered_current_date.plan.query.expressions[0].expression.operands[1].kind);
 
+    var malformed_generated_current_date = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT CURRENT_DATE AS planned_day_ns FROM users WHERE id = $1",
+    );
+    defer malformed_generated_current_date.deinit(alloc);
+    try corruptGeneratedReadFirstProjectionExpressionKind(&malformed_generated_current_date, .current_timestamp);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_current_date,
+        schema,
+        &.{.{ .string = "u1" }},
+        .{},
+    ));
+
     var lowered_typed_literal = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
         "SELECT TIMESTAMPTZ '2025-01-01T01:30:00+01:30' AS planned_at_ns FROM users WHERE id = $1",
@@ -31564,6 +31676,25 @@ fn corruptGeneratedReadFirstProjectionOperatorToLeftOperand(parsed_sql: *tokeniz
                         return;
                     }
                     return error.TestUnexpectedResult;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn corruptGeneratedReadFirstProjectionExpressionKind(
+    parsed_sql: *tokenized.ParsedSql,
+    kind: generated_parser.GeneratedSqlExpressionKind,
+) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (read.projection_items.expressions.len == 0) return error.TestUnexpectedResult;
+                    read.projection_items.expressions[0].kind = kind;
+                    return;
                 },
                 else => return error.TestUnexpectedResult,
             }
