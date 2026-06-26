@@ -10102,11 +10102,14 @@ fn parseDdlRoutineRowExpressionAlloc(
     }
     if (parser.matchToken(tokens, pos, .rparen) == null) {
         while (true) {
-            const operand = try parseDdlRowExpressionAlloc(alloc, tokens, pos, options, false);
+            const arg_start = pos.*;
+            const arg_end = ddlRoutineArgumentEnd(tokens, arg_start) orelse return error.UnsupportedSqlShape;
+            const operand = try parseDdlRoutineArgumentExpressionAlloc(alloc, tokens[arg_start..arg_end], options);
             var operand_transferred = false;
             errdefer if (!operand_transferred) runtime_schema.freeRelationalRowsExpression(alloc, operand);
             try operands.append(alloc, operand);
             operand_transferred = true;
+            pos.* = arg_end;
             if (parser.matchToken(tokens, pos, .comma) != null) continue;
             break;
         }
@@ -10125,6 +10128,55 @@ fn parseDdlRoutineRowExpressionAlloc(
         return error.UnsupportedSqlShape;
     }
     return try lower_expr.cloneExpressionSubstitutingRoutineArgsAlloc(alloc, binding.expression, operands.items);
+}
+
+fn parseDdlRoutineArgumentExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    options: DdlExpressionOptions,
+) !db_mod.types.RelationalRowsExpression {
+    var arg_pos: usize = 0;
+    if (parseDdlRowExpressionAlloc(alloc, tokens, &arg_pos, options, false)) |expression| {
+        if (arg_pos == tokens.len) return expression;
+        runtime_schema.freeRelationalRowsExpression(alloc, expression);
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape, error.InvalidSqlCatalog => {},
+        else => return err,
+    }
+
+    if (tokens.len == 1 and tokens[0].kind == .identifier and
+        !tokens[0].matchesKeywordTag(.null) and
+        !tokens[0].matchesKeywordTag(.true) and
+        !tokens[0].matchesKeywordTag(.false))
+    {
+        return .{
+            .kind = .field,
+            .field = try alloc.dupe(u8, tokens[0].text),
+        };
+    }
+
+    arg_pos = 0;
+    return .{
+        .kind = .value,
+        .value_json = try value_mod.parseJsonValueAlloc(alloc, tokens, &arg_pos, options.params),
+    };
+}
+
+fn ddlRoutineArgumentEnd(tokens: []const grammar.Token, start: usize) ?usize {
+    var depth: usize = 0;
+    var index = start;
+    while (index < tokens.len) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth == 0) return index;
+                depth -= 1;
+            },
+            .comma => if (depth == 0) return index,
+            else => {},
+        }
+    }
+    return null;
 }
 
 fn parseDdlConditionAlternativesAlloc(
