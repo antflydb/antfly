@@ -598,7 +598,7 @@ row_lock_wait_policy_opt:
   ;
 
 graph_statement:
-    CREATE GRAPH INDEX identifier_name ON qualified_name diagnostic_tail_opt
+    CREATE GRAPH INDEX if_not_exists_opt identifier_name ON qualified_name diagnostic_tail_opt
   | CREATE GRAPH METRIC identifier_name ON qualified_name diagnostic_tail_opt
   | ALTER GRAPH INDEX identifier_name diagnostic_tail_opt
   ;

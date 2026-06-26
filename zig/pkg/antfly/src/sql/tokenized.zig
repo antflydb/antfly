@@ -1585,7 +1585,13 @@ fn generatedGraphRequiredPayloadIsValid(
             if (!tokens[0].matchesKeywordTag(.create) or !tokens[1].matchesKeywordTag(.graph)) return false;
             if (graph_ast.kind == .create_index and !tokens[2].matchesKeywordTag(.index)) return false;
             if (graph_ast.kind == .create_metric and !tokens[2].matchesKeywordTag(.metric)) return false;
-            if (!std.meta.eql(graph_ast.object_name_tokens orelse return false, generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 4 })) return false;
+            var object_start: usize = 3;
+            if (graph_ast.if_not_exists) {
+                if (graph_ast.kind != .create_index) return false;
+                if (end < 9 or !tokens[3].matchesKeywordTag(.@"if") or !tokens[4].matchesKeywordTag(.not) or !tokens[5].matchesKeywordTag(.exists)) return false;
+                object_start = 6;
+            }
+            if (!std.meta.eql(graph_ast.object_name_tokens orelse return false, generated_parser.GeneratedSqlTokenRange{ .start = object_start, .end = object_start + 1 })) return false;
             const source = graph_ast.source_name_tokens orelse return false;
             if (source.start == 0 or source.end > end or !tokens[source.start - 1].matchesKeywordTag(.on)) return false;
             if (graph_ast.kind == .create_metric) return generatedGraphOptionsFollow(end, source.end, graph_ast.option_tokens) and

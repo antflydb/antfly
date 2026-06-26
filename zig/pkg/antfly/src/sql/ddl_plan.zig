@@ -4648,7 +4648,13 @@ fn validateGeneratedGraphAstRanges(
             if (!tokens[0].matchesKeywordTag(.create)) return error.UnsupportedSqlShape;
             if (ast.kind == .create_index and !tokens[2].matchesKeywordTag(.index)) return error.UnsupportedSqlShape;
             if (ast.kind == .create_metric and !tokens[2].matchesKeywordTag(.metric)) return error.UnsupportedSqlShape;
-            _ = try requireGeneratedTokenRangeAt(ast.object_name_tokens, 3, end);
+            var object_start: usize = 3;
+            if (ast.if_not_exists) {
+                if (ast.kind != .create_index) return error.UnsupportedSqlShape;
+                if (end < 9 or !tokens[3].matchesKeywordTag(.@"if") or !tokens[4].matchesKeywordTag(.not) or !tokens[5].matchesKeywordTag(.exists)) return error.UnsupportedSqlShape;
+                object_start = 6;
+            }
+            _ = try requireGeneratedTokenRangeAt(ast.object_name_tokens, object_start, end);
             const source_range = ast.source_name_tokens orelse return error.UnsupportedSqlShape;
             if (!generatedRangeWithinStatement(source_range, end) or source_range.start == 0 or !tokens[source_range.start - 1].matchesKeywordTag(.on)) {
                 return error.UnsupportedSqlShape;
@@ -4661,6 +4667,7 @@ fn validateGeneratedGraphAstRanges(
             }
         },
         .alter_metric => {
+            if (ast.if_not_exists) return error.UnsupportedSqlShape;
             if (end < 8) return error.UnsupportedSqlShape;
             if (!tokens[0].matchesKeywordTag(.alter) or !tokens[2].matchesKeywordTag(.index)) return error.UnsupportedSqlShape;
             _ = try requireGeneratedTokenRangeAt(ast.source_name_tokens, 3, end);
@@ -4866,7 +4873,7 @@ fn createGraphIndexPlanFromGeneratedAstAlloc(
     return .{
         .index_name = index_name,
         .table_name = table_name,
-        .if_not_exists = false,
+        .if_not_exists = ast.if_not_exists,
         .unique = false,
         .method = .antfly_graph,
         .columns = columns,
@@ -4935,7 +4942,7 @@ fn createGraphExtractionIndexPlanFromGeneratedAstAlloc(
     return .{
         .index_name = index_name,
         .table_name = table_name,
-        .if_not_exists = false,
+        .if_not_exists = ast.if_not_exists,
         .unique = false,
         .method = .antfly_graph,
         .columns = columns,
@@ -17411,11 +17418,24 @@ test "sql adapter ddl plan lowers generated graph AST into typed index plans" {
                 try std.testing.expectEqual(legacy.method, generated.method);
                 try std.testing.expectEqualStrings(legacy.index_name, generated.index_name);
                 try std.testing.expectEqualStrings(legacy.table_name, generated.table_name);
+                try std.testing.expectEqual(legacy.if_not_exists, generated.if_not_exists);
                 try std.testing.expectEqual(@as(usize, 2), generated.columns.len);
                 try std.testing.expectEqualStrings(legacy.columns[0], generated.columns[0]);
                 try std.testing.expectEqualStrings(legacy.columns[1], generated.columns[1]);
             },
             else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const graph_index_if_not_exists_sql = "CREATE GRAPH INDEX IF NOT EXISTS docs_edge_graph_syntax ON doc_edges EDGE (source_doc -> target_doc);";
+    var generated_graph_index_if_not_exists = try generatedGraphDdlPlanForTestAlloc(alloc, graph_index_if_not_exists_sql);
+    defer generated_graph_index_if_not_exists.deinit(alloc);
+    switch (generated_graph_index_if_not_exists) {
+        .create_index => |generated| {
+            try std.testing.expect(generated.if_not_exists);
+            try std.testing.expectEqualStrings("docs_edge_graph_syntax", generated.index_name);
+            try std.testing.expectEqualStrings("doc_edges", generated.table_name);
         },
         else => return error.TestUnexpectedResult,
     }

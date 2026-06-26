@@ -1766,6 +1766,7 @@ pub const GeneratedSqlGraphAst = struct {
     kind: GeneratedSqlGraphKind,
     statement_span: token_mod.SourceSpan,
     command_span: token_mod.SourceSpan,
+    if_not_exists: bool = false,
     object_name_tokens: ?GeneratedSqlTokenRange = null,
     source_name_tokens: ?GeneratedSqlTokenRange = null,
     algorithm_tokens: ?GeneratedSqlTokenRange = null,
@@ -2123,6 +2124,7 @@ pub const antfly_extension_read_corpus = [_]GeneratedSqlCorpusCase{
 
 pub const simple_graph_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CREATE GRAPH INDEX docs_edge_graph ON doc_edges", .kind = .graph },
+    .{ .sql = "CREATE GRAPH INDEX IF NOT EXISTS docs_edge_graph ON doc_edges EDGE (source_doc -> target_doc)", .kind = .graph },
     .{ .sql = "CREATE GRAPH INDEX docs_edge_graph_syntax ON doc_edges EDGE (source_doc -> target_doc) TYPE edge_type WEIGHT confidence WITH (edge_policy = 'all')", .kind = .graph },
     .{ .sql = "CREATE GRAPH METRIC docs_pagerank ON doc_edges WITH (metric = 'pagerank')", .kind = .graph },
     .{ .sql = "ALTER GRAPH INDEX docs_edge_graph ADD METRIC pagerank_v1 USING pagerank WITH (damping = 0.85, max_iterations = 40)", .kind = .graph },
@@ -3465,8 +3467,10 @@ fn buildGraphAst(
     };
     switch (kind) {
         .create_index, .create_metric => {
-            ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, 3, end);
-            if (findKeyword(tokens, 4, end, .on)) |on_index| {
+            var index: usize = 3;
+            if (kind == .create_index) ast.if_not_exists = consumeGeneratedIfNotExists(tokens, &index, end);
+            ast.object_name_tokens = generatedSingleTokenRangeIfIdentifier(tokens, index, end);
+            if (findKeyword(tokens, index + 1, end, .on)) |on_index| {
                 ast.source_name_tokens = generatedQualifiedNameRange(tokens, on_index + 1, end);
                 if (ast.source_name_tokens) |source| {
                     if (kind == .create_index) {
@@ -7708,6 +7712,7 @@ test "generated SQL parser facade exposes typed read and unsupported statement n
     try std.testing.expectEqual(GeneratedSqlStatement{ .read = .query }, (try parseSqlAlloc(alloc, "SELECT id FROM usage_records FOR UPDATE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .read = .cte }, (try parseSqlAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows FOR SHARE NOWAIT")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .create_index }, (try parseSqlAlloc(alloc, "CREATE GRAPH INDEX docs_edge_graph ON doc_edges")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .create_index }, (try parseSqlAlloc(alloc, "CREATE GRAPH INDEX IF NOT EXISTS docs_edge_graph ON doc_edges EDGE (source_doc -> target_doc)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .create_metric }, (try parseSqlAlloc(alloc, "CREATE GRAPH METRIC docs_pagerank ON doc_edges")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .graph = .alter_metric }, (try parseSqlAlloc(alloc, "ALTER GRAPH INDEX docs_edge_graph ADD METRIC pagerank_v1 USING pagerank")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .analyze }, (try parseSqlAlloc(alloc, "ANALYZE")).statement);
@@ -11505,6 +11510,19 @@ test "generated SQL parser facade builds extended read AST spans" {
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 14 }, graph.edge_type_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 15, .end = 16 }, graph.edge_weight_tokens.?);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 16, .end = 22 }, graph.option_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const graph_index_if_not_exists_sql = "CREATE GRAPH INDEX IF NOT EXISTS docs_edge_graph_syntax ON doc_edges EDGE (source_doc -> target_doc)";
+    const graph_index_if_not_exists_result = try parseSqlAlloc(alloc, graph_index_if_not_exists_sql);
+    switch (graph_index_if_not_exists_result.ast.?) {
+        .graph => |graph| {
+            try std.testing.expectEqual(GeneratedSqlGraphKind.create_index, graph.kind);
+            try std.testing.expect(graph.if_not_exists);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, graph.object_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, graph.source_name_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 15 }, graph.edge_tokens.?);
         },
         else => return error.TestUnexpectedResult,
     }
