@@ -228,7 +228,15 @@ pub const Client = struct {
     /// Execute a graph metric operational action
     /// POST /db/v1/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}/actions/{action}
     pub fn executeGraphMetricAction(self: *@This(), table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !ApiResponse(types.GraphMetricActionResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/indexes/{s}/graph-metrics/{s}/actions/{s}", .{ self.base_url, table_name, index_name, metric_name, action });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
+        defer self.allocator.free(encoded_index_name);
+        const encoded_metric_name = try httpx.PercentEncoding.encode(self.allocator, metric_name);
+        defer self.allocator.free(encoded_metric_name);
+        const encoded_action = try httpx.PercentEncoding.encode(self.allocator, action);
+        defer self.allocator.free(encoded_action);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/indexes/{s}/graph-metrics/{s}/actions/{s}", .{ self.base_url, encoded_table_name, encoded_index_name, encoded_metric_name, encoded_action });
         defer self.allocator.free(url);
         var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.GraphMetricActionResponse).fromResponse(self.allocator, &resp);
@@ -510,7 +518,9 @@ pub const Client = struct {
     /// Get tablespace
     /// GET /db/v1/tablespaces/{tablespaceName}
     pub fn getTablespace(self: *@This(), tablespace_name: []const u8) !ApiResponse(types.TablespaceCatalogRecord) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tablespaces/{s}", .{ self.base_url, tablespace_name });
+        const encoded_tablespace_name = try httpx.PercentEncoding.encode(self.allocator, tablespace_name);
+        defer self.allocator.free(encoded_tablespace_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tablespaces/{s}", .{ self.base_url, encoded_tablespace_name });
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.TablespaceCatalogRecord).fromResponse(self.allocator, &resp);
@@ -519,7 +529,9 @@ pub const Client = struct {
     /// Create tablespace
     /// POST /db/v1/tablespaces/{tablespaceName}
     pub fn createTablespace(self: *@This(), tablespace_name: []const u8, body: types.CreateTablespaceRequest) !ApiResponse(types.TablespaceCatalogRecord) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tablespaces/{s}", .{ self.base_url, tablespace_name });
+        const encoded_tablespace_name = try httpx.PercentEncoding.encode(self.allocator, tablespace_name);
+        defer self.allocator.free(encoded_tablespace_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tablespaces/{s}", .{ self.base_url, encoded_tablespace_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -530,7 +542,9 @@ pub const Client = struct {
     /// Drop tablespace
     /// DELETE /db/v1/tablespaces/{tablespaceName}
     pub fn dropTablespace(self: *@This(), tablespace_name: []const u8) !ApiResponse(std.json.Value) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tablespaces/{s}", .{ self.base_url, tablespace_name });
+        const encoded_tablespace_name = try httpx.PercentEncoding.encode(self.allocator, tablespace_name);
+        defer self.allocator.free(encoded_tablespace_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tablespaces/{s}", .{ self.base_url, encoded_tablespace_name });
         defer self.allocator.free(url);
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
@@ -548,7 +562,9 @@ pub const Client = struct {
     /// Get database
     /// GET /db/v1/databases/{databaseName}
     pub fn getDatabase(self: *@This(), database_name: []const u8) !ApiResponse(types.DatabaseCatalogRecord) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}", .{ self.base_url, database_name });
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}", .{ self.base_url, encoded_database_name });
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.DatabaseCatalogRecord).fromResponse(self.allocator, &resp);
@@ -557,7 +573,9 @@ pub const Client = struct {
     /// Create database
     /// POST /db/v1/databases/{databaseName}
     pub fn createDatabase(self: *@This(), database_name: []const u8) !ApiResponse(types.DatabaseCatalogRecord) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}", .{ self.base_url, database_name });
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}", .{ self.base_url, encoded_database_name });
         defer self.allocator.free(url);
         var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.DatabaseCatalogRecord).fromResponse(self.allocator, &resp);
@@ -566,7 +584,9 @@ pub const Client = struct {
     /// Drop database
     /// DELETE /db/v1/databases/{databaseName}
     pub fn dropDatabase(self: *@This(), database_name: []const u8) !ApiResponse(std.json.Value) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}", .{ self.base_url, database_name });
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}", .{ self.base_url, encoded_database_name });
         defer self.allocator.free(url);
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
@@ -575,7 +595,9 @@ pub const Client = struct {
     /// Set database tablespace
     /// PUT /db/v1/databases/{databaseName}/tablespace
     pub fn setDatabaseTablespace(self: *@This(), database_name: []const u8, body: types.CatalogTablespaceBindingRequest) !ApiResponse(types.DatabaseCatalogRecord) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/tablespace", .{ self.base_url, database_name });
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/tablespace", .{ self.base_url, encoded_database_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -586,7 +608,9 @@ pub const Client = struct {
     /// Clear database tablespace
     /// DELETE /db/v1/databases/{databaseName}/tablespace
     pub fn clearDatabaseTablespace(self: *@This(), database_name: []const u8) !ApiResponse(types.DatabaseCatalogRecord) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/tablespace", .{ self.base_url, database_name });
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/tablespace", .{ self.base_url, encoded_database_name });
         defer self.allocator.free(url);
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.DatabaseCatalogRecord).fromResponse(self.allocator, &resp);
@@ -595,7 +619,9 @@ pub const Client = struct {
     /// List namespaces
     /// GET /db/v1/databases/{databaseName}/namespaces
     pub fn listNamespaces(self: *@This(), database_name: []const u8) !ApiResponse([]const types.NamespaceCatalogRecord) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces", .{ self.base_url, database_name });
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces", .{ self.base_url, encoded_database_name });
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse([]const types.NamespaceCatalogRecord).fromResponse(self.allocator, &resp);
@@ -604,7 +630,11 @@ pub const Client = struct {
     /// Create namespace
     /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}
     pub fn createNamespace(self: *@This(), database_name: []const u8, namespace_name: []const u8) !ApiResponse(types.NamespaceCatalogRecord) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}", .{ self.base_url, database_name, namespace_name });
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}", .{ self.base_url, encoded_database_name, encoded_namespace_name });
         defer self.allocator.free(url);
         var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.NamespaceCatalogRecord).fromResponse(self.allocator, &resp);
@@ -613,7 +643,11 @@ pub const Client = struct {
     /// Drop namespace
     /// DELETE /db/v1/databases/{databaseName}/namespaces/{namespaceName}
     pub fn dropNamespace(self: *@This(), database_name: []const u8, namespace_name: []const u8) !ApiResponse(std.json.Value) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}", .{ self.base_url, database_name, namespace_name });
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}", .{ self.base_url, encoded_database_name, encoded_namespace_name });
         defer self.allocator.free(url);
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
@@ -622,7 +656,11 @@ pub const Client = struct {
     /// Set namespace tablespace
     /// PUT /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tablespace
     pub fn setNamespaceTablespace(self: *@This(), database_name: []const u8, namespace_name: []const u8, body: types.CatalogTablespaceBindingRequest) !ApiResponse(types.NamespaceCatalogRecord) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tablespace", .{ self.base_url, database_name, namespace_name });
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tablespace", .{ self.base_url, encoded_database_name, encoded_namespace_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -633,7 +671,11 @@ pub const Client = struct {
     /// Clear namespace tablespace
     /// DELETE /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tablespace
     pub fn clearNamespaceTablespace(self: *@This(), database_name: []const u8, namespace_name: []const u8) !ApiResponse(types.NamespaceCatalogRecord) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tablespace", .{ self.base_url, database_name, namespace_name });
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tablespace", .{ self.base_url, encoded_database_name, encoded_namespace_name });
         defer self.allocator.free(url);
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.NamespaceCatalogRecord).fromResponse(self.allocator, &resp);
@@ -642,7 +684,11 @@ pub const Client = struct {
     /// List tables in namespace
     /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables
     pub fn listNamespaceTables(self: *@This(), database_name: []const u8, namespace_name: []const u8, params: ListNamespaceTablesParams) !ApiResponse([]const types.TableStatus) {
-        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables", .{ self.base_url, database_name, namespace_name });
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables", .{ self.base_url, encoded_database_name, encoded_namespace_name });
         defer self.allocator.free(url);
         var query_buf = std.ArrayListUnmanaged(u8).empty;
         defer query_buf.deinit(self.allocator);
@@ -665,7 +711,13 @@ pub const Client = struct {
     /// Get namespace table details
     /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}
     pub fn getNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !ApiResponse(types.TableStatus) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}", .{ self.base_url, database_name, namespace_name, table_name });
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.TableStatus).fromResponse(self.allocator, &resp);
@@ -674,7 +726,13 @@ pub const Client = struct {
     /// Create namespace table
     /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}
     pub fn createNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.CreateTableRequest) !ApiResponse(types.TableStatus) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}", .{ self.base_url, database_name, namespace_name, table_name });
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -685,7 +743,13 @@ pub const Client = struct {
     /// Drop namespace table
     /// DELETE /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}
     pub fn dropNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !ApiResponse(std.json.Value) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}", .{ self.base_url, database_name, namespace_name, table_name });
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
         defer self.allocator.free(url);
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
@@ -694,7 +758,13 @@ pub const Client = struct {
     /// Query an explicit namespace table
     /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query
     pub fn queryNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.QueryRequest) !ApiResponse(types.QueryResponses) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/query", .{ self.base_url, database_name, namespace_name, table_name });
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/query", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -705,7 +775,13 @@ pub const Client = struct {
     /// Perform batch inserts and deletes on an explicit namespace table
     /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/batch
     pub fn batchNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.BatchRequest) !ApiResponse(types.BatchResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/batch", .{ self.base_url, database_name, namespace_name, table_name });
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/batch", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -716,7 +792,13 @@ pub const Client = struct {
     /// Perform structured relational row writes on an explicit namespace table
     /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/batch
     pub fn rowsBatchNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.RowsBatchRequest) !ApiResponse(types.BatchResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/rows/batch", .{ self.base_url, database_name, namespace_name, table_name });
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/rows/batch", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -727,7 +809,13 @@ pub const Client = struct {
     /// Backup an explicit namespace table
     /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/backup
     pub fn backupNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.BackupRequest) !ApiResponse(std.json.Value) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/backup", .{ self.base_url, database_name, namespace_name, table_name });
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/backup", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -738,7 +826,13 @@ pub const Client = struct {
     /// Restore an explicit namespace table from backup
     /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/restore
     pub fn restoreNamespaceTable(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, body: types.RestoreRequest) !ApiResponse(std.json.Value) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/restore", .{ self.base_url, database_name, namespace_name, table_name });
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/restore", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -749,7 +843,15 @@ pub const Client = struct {
     /// Retrieve a document by key from an explicit namespace table
     /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/documents/{key}
     pub fn lookupNamespaceTableDocument(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, key: []const u8, params: LookupNamespaceTableDocumentParams) !ApiResponse(std.json.Value) {
-        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/documents/{s}", .{ self.base_url, database_name, namespace_name, table_name, key });
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/documents/{s}", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_key });
         defer self.allocator.free(url);
         var query_buf = std.ArrayListUnmanaged(u8).empty;
         defer query_buf.deinit(self.allocator);
@@ -772,7 +874,13 @@ pub const Client = struct {
     /// List indexes for an explicit namespace table
     /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes
     pub fn listNamespaceTableIndexes(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !ApiResponse([]const types.IndexStatus) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/indexes", .{ self.base_url, database_name, namespace_name, table_name });
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/indexes", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name });
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse([]const types.IndexStatus).fromResponse(self.allocator, &resp);
@@ -781,7 +889,15 @@ pub const Client = struct {
     /// Get index details for an explicit namespace table
     /// GET /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}
     pub fn getNamespaceTableIndex(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !ApiResponse(types.IndexStatus) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/indexes/{s}", .{ self.base_url, database_name, namespace_name, table_name, index_name });
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
+        defer self.allocator.free(encoded_index_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/indexes/{s}", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_index_name });
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.IndexStatus).fromResponse(self.allocator, &resp);
@@ -790,7 +906,15 @@ pub const Client = struct {
     /// Add an index to an explicit namespace table
     /// POST /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}
     pub fn createNamespaceTableIndex(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8, body: types.IndexConfig) !ApiResponse(std.json.Value) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/indexes/{s}", .{ self.base_url, database_name, namespace_name, table_name, index_name });
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
+        defer self.allocator.free(encoded_index_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/indexes/{s}", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_index_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -801,7 +925,15 @@ pub const Client = struct {
     /// Drop an index from an explicit namespace table
     /// DELETE /db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}
     pub fn dropNamespaceTableIndex(self: *@This(), database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !ApiResponse(std.json.Value) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/indexes/{s}", .{ self.base_url, database_name, namespace_name, table_name, index_name });
+        const encoded_database_name = try httpx.PercentEncoding.encode(self.allocator, database_name);
+        defer self.allocator.free(encoded_database_name);
+        const encoded_namespace_name = try httpx.PercentEncoding.encode(self.allocator, namespace_name);
+        defer self.allocator.free(encoded_namespace_name);
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
+        defer self.allocator.free(encoded_index_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/databases/{s}/namespaces/{s}/tables/{s}/indexes/{s}", .{ self.base_url, encoded_database_name, encoded_namespace_name, encoded_table_name, encoded_index_name });
         defer self.allocator.free(url);
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
@@ -900,7 +1032,9 @@ pub const Client = struct {
     /// Perform structured relational row writes by row identity
     /// POST /db/v1/tables/{tableName}/rows/batch
     pub fn rowsBatchWrite(self: *@This(), table_name: []const u8, body: types.RowsBatchRequest) !ApiResponse(types.BatchResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/batch", .{ self.base_url, table_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/batch", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -911,7 +1045,9 @@ pub const Client = struct {
     /// Stage typed relational update/delete operations from a claimed row source
     /// POST /db/v1/tables/{tableName}/rows/mutation-source
     pub fn rowsMutationSource(self: *@This(), table_name: []const u8, body: std.json.Value) !ApiResponse(types.RowsMutationSourceResultSet) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/mutation-source", .{ self.base_url, table_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/mutation-source", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -922,7 +1058,9 @@ pub const Client = struct {
     /// Lookup relational rows by structured row identity
     /// POST /db/v1/tables/{tableName}/rows/get
     pub fn rowsGet(self: *@This(), table_name: []const u8, body: types.RowsGetRequest) !ApiResponse(types.RowsGetResultSet) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/get", .{ self.base_url, table_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/get", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -933,7 +1071,9 @@ pub const Client = struct {
     /// Execute a typed relational row read plan
     /// POST /db/v1/tables/{tableName}/rows/plan
     pub fn rowsPlan(self: *@This(), table_name: []const u8, body: types.RowsPlanRequest) !ApiResponse(std.json.Value) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/plan", .{ self.base_url, table_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/plan", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -944,7 +1084,9 @@ pub const Client = struct {
     /// Execute a typed relational row query plan
     /// POST /db/v1/tables/{tableName}/rows/query
     pub fn rowsQuery(self: *@This(), table_name: []const u8, body: types.RowsQueryPlanRequest) !ApiResponse(types.RowsQueryResultSet) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/query", .{ self.base_url, table_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/query", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -955,7 +1097,9 @@ pub const Client = struct {
     /// Execute a typed relational row aggregate plan
     /// POST /db/v1/tables/{tableName}/rows/aggregate
     pub fn rowsAggregate(self: *@This(), table_name: []const u8, body: types.RowsAggregatePlanRequest) !ApiResponse(types.RowsAggregateResultSet) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/aggregate", .{ self.base_url, table_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/aggregate", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -966,7 +1110,9 @@ pub const Client = struct {
     /// Execute a typed relational row window plan
     /// POST /db/v1/tables/{tableName}/rows/window
     pub fn rowsWindow(self: *@This(), table_name: []const u8, body: types.RowsWindowPlanRequest) !ApiResponse(types.RowsStreamResultSet) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/window", .{ self.base_url, table_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/window", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -977,7 +1123,9 @@ pub const Client = struct {
     /// Execute a typed relational row join plan
     /// POST /db/v1/tables/{tableName}/rows/join
     pub fn rowsJoin(self: *@This(), table_name: []const u8, body: types.RowsJoinPlanRequest) !ApiResponse(types.RowsStreamResultSet) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/join", .{ self.base_url, table_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/join", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -988,7 +1136,9 @@ pub const Client = struct {
     /// Execute a typed relational row lateral plan
     /// POST /db/v1/tables/{tableName}/rows/lateral
     pub fn rowsLateral(self: *@This(), table_name: []const u8, body: types.RowsLateralPlanRequest) !ApiResponse(types.RowsStreamResultSet) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/lateral", .{ self.base_url, table_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/rows/lateral", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);

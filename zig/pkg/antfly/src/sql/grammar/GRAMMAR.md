@@ -1063,8 +1063,10 @@ variants for:
   value token ranges, plus generated AST-to-plan parity for generated-covered
   session catalog commands
 - transaction statement, including a generated AST payload for command spans
-  and optional `WORK`/`TRANSACTION` boundary-tail token ranges, plus generated
-  AST-to-plan parity for generated-covered transaction boundary commands
+  and optional `WORK`/`TRANSACTION` boundary-tail token ranges or transaction
+  mode token ranges, plus generated AST-to-plan parity for generated-covered
+  transaction boundary commands and `SET TRANSACTION`, `START TRANSACTION`,
+  and `BEGIN` transaction-mode commands
 - prepared statement, including a generated AST payload for command, name,
   argument, and nested-statement token ranges, plus generated AST-to-plan parity
   for typed `PREPARE`, `EXECUTE`, and `DEALLOCATE`

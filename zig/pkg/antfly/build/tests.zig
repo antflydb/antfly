@@ -63,6 +63,22 @@ pub const APIDocIdTestRuns = struct {
     raft_transition_runtime_docid: *std.Build.Step.Run,
 };
 
+pub const APIFocusedTestRun = struct {
+    tests: *std.Build.Step.Compile,
+    run: *std.Build.Step.Run,
+    step: ?*std.Build.Step = null,
+};
+
+pub const APIFocusedTestRuns = struct {
+    public_api_parity: APIFocusedTestRun,
+    public_api_graph_metric_e2e: APIFocusedTestRun,
+    resolution_source: APIFocusedTestRun,
+    auth: APIFocusedTestRun,
+    logic: APIFocusedTestRun,
+    docid_lifecycle: APIFocusedTestRun,
+    swarm_backup_restore: APIFocusedTestRun,
+};
+
 pub const GraphMetricTestModules = struct {
     root: *std.Build.Module,
     query_fan_in: *std.Build.Module,
@@ -111,6 +127,20 @@ pub const MetadataTestSteps = struct {
     service: MetadataTestRun,
     logic: MetadataTestRun,
     chaos: MetadataChaosTestSteps,
+};
+
+pub const StorageTestRun = struct {
+    tests: *std.Build.Step.Compile,
+    run: *std.Build.Step.Run,
+    step: ?*std.Build.Step = null,
+};
+
+pub const StorageTestSteps = struct {
+    root: StorageTestRun,
+    ha: StorageTestRun,
+    progress: StorageTestRun,
+    lsm_backend: StorageTestRun,
+    resource_budget: StorageTestRun,
 };
 
 pub const db_root_step_name = "lib-db-test";
@@ -2012,6 +2042,58 @@ fn addFocusedAPITestStep(
     step.dependOn(&run.step);
 }
 
+fn addAPIFocusedTestRun(
+    b: *std.Build,
+    root_module: *std.Build.Module,
+    name: ?[]const u8,
+    description: []const u8,
+    default_filters: []const []const u8,
+    simple_runner: bool,
+    select_filters: bool,
+    dependency: ?*std.Build.Step,
+) APIFocusedTestRun {
+    const filters = if (select_filters) selectTestFilters(b, default_filters) else default_filters;
+    const tests = if (simple_runner) b.addTest(.{
+        .root_module = root_module,
+        .filters = filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    }) else b.addTest(.{
+        .root_module = root_module,
+        .filters = filters,
+    });
+    const run = b.addRunArtifact(tests);
+    if (dependency) |dep| run.step.dependOn(dep);
+    const step = if (name) |step_name| blk: {
+        const focused_step = b.step(step_name, description);
+        focused_step.dependOn(&run.step);
+        break :blk focused_step;
+    } else null;
+    return .{
+        .tests = tests,
+        .run = run,
+        .step = step,
+    };
+}
+
+pub fn addAPIFocusedTestSteps(
+    b: *std.Build,
+    root_module: *std.Build.Module,
+    openapi_root_check_step: *std.Build.Step,
+) APIFocusedTestRuns {
+    return .{
+        .public_api_parity = addAPIFocusedTestRun(b, root_module, "public-api-parity-test", "Run focused stateful public API parity tests", &APITestFilters.public_api_parity, true, true, openapi_root_check_step),
+        .public_api_graph_metric_e2e = addAPIFocusedTestRun(b, root_module, null, "Run focused public API graph metric e2e tests", &APITestFilters.public_api_graph_metric_e2e, false, false, openapi_root_check_step),
+        .resolution_source = addAPIFocusedTestRun(b, root_module, "lib-resolution-source-test", "Run focused cross-shard resolution candidate-source and entity-sink tests", &APITestFilters.resolution_source, false, false, null),
+        .auth = addAPIFocusedTestRun(b, root_module, "lib-api-auth-test", "Run focused API auth/usermgr HTTP tests", &APITestFilters.auth, true, false, openapi_root_check_step),
+        .logic = addAPIFocusedTestRun(b, root_module, "lib-api-logic-test", "Run focused API table/index encoder, parser, and schema-update logic tests", &APITestFilters.logic, true, false, openapi_root_check_step),
+        .docid_lifecycle = addAPIFocusedTestRun(b, root_module, "docid-lifecycle-test", "Run focused DOCID lifecycle and distributed snapshot hardening tests", &APITestFilters.docid_lifecycle, true, false, null),
+        .swarm_backup_restore = addAPIFocusedTestRun(b, root_module, "lib-api-swarm-backup-restore-test", "Run the focused swarm-like backup/restore e2e test", &APITestFilters.swarm_backup_restore, false, false, null),
+    };
+}
+
 fn addSimpleSelectedTestRun(
     b: *std.Build,
     root_module: *std.Build.Module,
@@ -2145,6 +2227,54 @@ pub fn chainMetadataChaosSoakTests(
     tail = chainLabeledFilteredTests(b, root_module, "lib-metadata-public-chaos-test", selectTestFilters(b, &MetadataTestFilters.public_chaos), tail);
     tail = chainLabeledFilteredTests(b, root_module, "lib-metadata-placement-chaos-test", selectTestFilters(b, &MetadataTestFilters.placement_chaos), tail);
     return tail.?;
+}
+
+fn addStorageTestRun(
+    b: *std.Build,
+    root_module: *std.Build.Module,
+    name: ?[]const u8,
+    description: []const u8,
+    default_filters: []const []const u8,
+    select_filters: bool,
+    skip_filters: []const []const u8,
+) StorageTestRun {
+    const filters = if (select_filters) selectTestFilters(b, default_filters) else default_filters;
+    const tests = b.addTest(.{
+        .root_module = root_module,
+        .filters = filters,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run = b.addRunArtifact(tests);
+    for (skip_filters) |filter| {
+        run.addArgs(&.{ "--skip-test-filter", filter });
+    }
+    const step = if (name) |step_name| blk: {
+        const storage_step = b.step(step_name, description);
+        storage_step.dependOn(&run.step);
+        break :blk storage_step;
+    } else null;
+    return .{
+        .tests = tests,
+        .run = run,
+        .step = step,
+    };
+}
+
+pub fn addStorageTestSteps(
+    b: *std.Build,
+    root_module: *std.Build.Module,
+    progress_skip_filters: []const []const u8,
+) StorageTestSteps {
+    return .{
+        .root = addStorageTestRun(b, root_module, "lib-storage-test", "Run root-module storage tests only", &StorageTestFilters.root, true, &.{}),
+        .ha = addStorageTestRun(b, root_module, "ha-test", "Run hot-standby HA storage tests", &StorageTestFilters.ha, false, &.{}),
+        .progress = addStorageTestRun(b, root_module, null, "Run root-module storage tests with progress skips", &StorageTestFilters.root, true, progress_skip_filters),
+        .lsm_backend = addStorageTestRun(b, root_module, "lsm-backend-test", "Run LSM backend unit tests only", &StorageTestFilters.lsm_backend, false, &.{}),
+        .resource_budget = addStorageTestRun(b, root_module, "resource-budget-test", "Run storage resource-manager accounting tests", &StorageTestFilters.resource_budget, false, &.{}),
+    };
 }
 
 pub fn addRootTestStep(

@@ -325,7 +325,7 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
     if (isGeneratedGraphDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedCatalogDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedRelationPopulationHead(tokens, raw_statement)) return false;
-    if (isGeneratedTransactionBoundaryStatement(tokens, raw_statement)) return false;
+    if (isGeneratedTransactionControlStatement(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedDdlBoundary(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedDmlBoundary(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedReadBoundary(tokens, raw_statement)) return false;
@@ -351,17 +351,24 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
     };
 }
 
-fn isGeneratedTransactionBoundaryStatement(tokens: []const Token, raw_statement: RawSqlStatement) bool {
+fn isGeneratedTransactionControlStatement(tokens: []const Token, raw_statement: RawSqlStatement) bool {
     const start = raw_statement.token_start;
     const end = raw_statement.token_end;
     if (start >= end or end > tokens.len) return false;
     const first = tokens[start];
-    if (!tokenMatchesKeyword(first, .begin) and
-        !tokenMatchesKeyword(first, .commit) and
-        !tokenMatchesKeyword(first, .rollback))
-    {
-        return false;
+    if (tokenMatchesKeyword(first, .set)) {
+        if (start + 1 < end and tokenMatchesText(tokens[start + 1], "transaction")) return true;
+        return start + 4 < end and
+            tokenMatchesText(tokens[start + 1], "session") and
+            tokenMatchesText(tokens[start + 2], "characteristics") and
+            tokenMatchesKeyword(tokens[start + 3], .as) and
+            tokenMatchesText(tokens[start + 4], "transaction");
     }
+    if (tokenMatchesText(first, "start")) {
+        return start + 1 < end and tokenMatchesText(tokens[start + 1], "transaction");
+    }
+    if (tokenMatchesKeyword(first, .begin)) return true;
+    if (!tokenMatchesKeyword(first, .commit) and !tokenMatchesKeyword(first, .rollback)) return false;
     if (end == start + 1) return true;
     return end == start + 2 and
         (tokenMatchesText(tokens[start + 1], "work") or tokenMatchesText(tokens[start + 1], "transaction"));
@@ -3044,6 +3051,25 @@ test "sql adapter parsed sql owns typed statement variants" {
     }
     switch (transaction.statement) {
         .ddl => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    var transaction_mode = try ParsedSql.initAlloc(alloc, "SET TRANSACTION READ ONLY");
+    defer transaction_mode.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.transaction, transaction_mode.generatedStatementKind().?);
+    switch (transaction_mode.generated_statement.?.ast.?) {
+        .transaction => |generated_transaction| {
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTransactionKind.set_transaction, generated_transaction.kind);
+            try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = 4 }, generated_transaction.mode_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var session_characteristics = try ParsedSql.initAlloc(alloc, "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE");
+    defer session_characteristics.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.session, session_characteristics.generatedStatementKind().?);
+    switch (session_characteristics.statement) {
+        .session => {},
         else => return error.TestUnexpectedResult,
     }
 

@@ -40,7 +40,7 @@
 %token ISNULL JOIN KEY LABEL LAST LATERAL LEFT LIKE LIMIT LISTEN LOAD LOCK LOCKED MATCHED MATERIALIZED MERGE METHOD METRIC MOVE NO NOT NULL NOTIFY NOTNULL NOWAIT NULLS OF ON OR ORDER OUTER OVER OVERLAY OWNED PARTITION PLACING POLICY POSITION PRECEDING PREPARE PRIMARY PUBLIC PUBLICATION
 %token NEXT NOTHING OFFSET ONLY OPERATOR PORTION PRIVILEGES PROCEDURE QUERY RANGE REASSIGN RECURSIVE REFRESH REINDEX RELEASE RENAME REPLACE RESET RESTART RESTRICT RETURNING REVOKE RIGHT ROLLBACK ROLE ROW ROWS RULE SAVEPOINT SCHEMA SECURITY SELECT SERVER SET SHARE SHOW SKIP SOME SUBSCRIPTION SYSTEM TABLE TEMP TEMPORARY TIMESTAMP TIMESTAMPTZ TO TRUNCATE
 %token SEQUENCE SUBSTRING SYMMETRIC TABLESPACE THEN TRUE TRIGGER UNION UNIQUE UNKNOWN UNLISTEN UNLOGGED UPDATE USING VACUUM VALUES VIEW WHEN WHERE WINDOW WITH WITHIN
-%token WORK TRANSACTION
+%token CHARACTERISTICS COMMITTED DEFERRABLE ISOLATION LEVEL READ REPEATABLE SERIALIZABLE SESSION START TRANSACTION UNCOMMITTED WORK WRITE
 %token EXCEPT INTERSECT UNBOUNDED
 %token BASE_WEIGHT FIELD FRESHNESS GRAPH_METRIC KEY KIND METRIC METRIC_FRESHNESS MISSING_SCORE NAME SOURCE SOURCES TYPE WEIGHT
 
@@ -59,13 +59,16 @@ session_statement:
     SET qualified_name EQ expression
   | SET qualified_name TO expression
   | SET qualified_name expression
+  | SET SESSION CHARACTERISTICS AS TRANSACTION transaction_mode_list
   | RESET qualified_name
   | SHOW qualified_name
   | DISCARD ALL
   ;
 
 transaction_statement:
-    BEGIN transaction_boundary_tail_opt
+    SET TRANSACTION transaction_mode_list
+  | START TRANSACTION start_transaction_tail_opt
+  | BEGIN begin_transaction_tail_opt
   | COMMIT transaction_boundary_tail_opt
   | ROLLBACK transaction_boundary_tail_opt
   ;
@@ -74,6 +77,40 @@ transaction_boundary_tail_opt:
     /* empty */
   | WORK
   | TRANSACTION
+  ;
+
+start_transaction_tail_opt:
+    /* empty */
+  | transaction_mode_list
+  ;
+
+begin_transaction_tail_opt:
+    /* empty */
+  | WORK
+  | TRANSACTION
+  | TRANSACTION transaction_mode_list
+  | transaction_mode_list
+  ;
+
+transaction_mode_list:
+    transaction_mode_item
+  | transaction_mode_list COMMA transaction_mode_item
+  | transaction_mode_list transaction_mode_item
+  ;
+
+transaction_mode_item:
+    ISOLATION LEVEL transaction_isolation_level
+  | READ ONLY
+  | READ WRITE
+  | DEFERRABLE
+  | NOT DEFERRABLE
+  ;
+
+transaction_isolation_level:
+    SERIALIZABLE
+  | REPEATABLE READ
+  | READ COMMITTED
+  | READ UNCOMMITTED
   ;
 
 prepared_statement:

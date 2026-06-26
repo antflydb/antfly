@@ -3092,34 +3092,69 @@ pub fn sessionCatalogPlanFromGeneratedAstAlloc(
     };
 }
 
-pub fn transactionBoundaryPlanFromGeneratedAst(
+pub fn transactionControlPlanFromGeneratedAst(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlTransactionAst,
 ) !LoweredDdlPlan {
     try validateGeneratedTransactionAstSpans(tokens, ast);
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    if (ast.mode_tokens) |mode_tokens| {
+        if (mode_tokens.start != 1 or mode_tokens.end != end) return error.UnsupportedSqlShape;
+        var pos: usize = 0;
+        const starter: TransactionModeStarter = switch (ast.kind) {
+            .set_transaction => .set_transaction,
+            .start_transaction => .start_transaction,
+            .begin => .begin,
+            .commit, .rollback => return error.UnsupportedSqlShape,
+        };
+        const mode = try parseTransactionModePlanTail(tokens[mode_tokens.start..mode_tokens.end], &pos, starter);
+        if (pos != mode_tokens.end - mode_tokens.start) return error.UnsupportedSqlShape;
+        return .{ .transaction_control = .{ .transaction_mode = mode } };
+    }
     return .{ .adapter_noop = .{ .reason = .transaction_control } };
+}
+
+pub fn transactionBoundaryPlanFromGeneratedAst(
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlTransactionAst,
+) !LoweredDdlPlan {
+    const plan = try transactionControlPlanFromGeneratedAst(tokens, ast);
+    switch (plan) {
+        .adapter_noop => return plan,
+        else => return error.UnsupportedSqlShape,
+    }
 }
 
 fn validateGeneratedTransactionAstSpans(
     tokens: []const grammar.Token,
     ast: generated_parser.GeneratedSqlTransactionAst,
 ) !void {
-    _ = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
-    if (tokens[0].source_start != ast.command_span.start or tokens[0].source_end != ast.command_span.end) {
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    if (end == 0 or tokens[0].source_start != ast.command_span.start or tokens[0].source_end != ast.command_span.end) {
         return error.UnsupportedSqlShape;
     }
-    const expected: token_mod.TokenKeyword = switch (ast.kind) {
-        .begin => .begin,
-        .commit => .commit,
-        .rollback => .rollback,
-    };
-    if (!tokens[0].matchesKeywordTag(expected)) return error.UnsupportedSqlShape;
+    switch (ast.kind) {
+        .set_transaction => if (!tokens[0].matchesKeywordTag(.set)) return error.UnsupportedSqlShape,
+        .start_transaction => if (!tokens[0].matchesKeyword("start")) return error.UnsupportedSqlShape,
+        .begin => if (!tokens[0].matchesKeywordTag(.begin)) return error.UnsupportedSqlShape,
+        .commit => if (!tokens[0].matchesKeywordTag(.commit)) return error.UnsupportedSqlShape,
+        .rollback => if (!tokens[0].matchesKeywordTag(.rollback)) return error.UnsupportedSqlShape,
+    }
+    if (ast.boundary_tail_tokens != null and ast.mode_tokens != null) return error.UnsupportedSqlShape;
     if (ast.boundary_tail_tokens) |tail| {
-        if (tail.start != 1 or tail.end != 2 or tail.end > tokens.len) return error.UnsupportedSqlShape;
-        if (!tokens[tail.start].matchesKeyword("work") and !tokens[tail.start].matchesKeyword("transaction")) {
-            return error.UnsupportedSqlShape;
+        if (tail.start != 1 or tail.end != 2 or tail.end > end) return error.UnsupportedSqlShape;
+        switch (ast.kind) {
+            .set_transaction => return error.UnsupportedSqlShape,
+            .start_transaction => if (!tokens[tail.start].matchesKeyword("transaction")) return error.UnsupportedSqlShape,
+            .begin, .commit, .rollback => {
+                if (!tokens[tail.start].matchesKeyword("work") and !tokens[tail.start].matchesKeyword("transaction")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
         }
-    } else if (generatedStatementEnd(tokens, ast.statement_span).? > 1) {
+    } else if (ast.mode_tokens == null and ast.kind == .set_transaction) {
+        return error.UnsupportedSqlShape;
+    } else if (ast.mode_tokens == null and end > 1) {
         return error.UnsupportedSqlShape;
     }
 }
@@ -10915,7 +10950,7 @@ pub fn lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(
             switch (generated_ast) {
                 .session => |session_ast| return try sessionDdlPlanFromGeneratedAstAlloc(alloc, tokens, session_ast),
                 .prepared => |prepared_ast| return .{ .prepared_statement = try preparedStatementPlanFromGeneratedAstAlloc(alloc, tokens, prepared_ast) },
-                .transaction => |transaction_ast| return try transactionBoundaryPlanFromGeneratedAst(tokens, transaction_ast),
+                .transaction => |transaction_ast| return try transactionControlPlanFromGeneratedAst(tokens, transaction_ast),
                 .ddl, .extension_index => |ddl_ast| {
                     if (generatedDdlUsesRuntimeBoundary(tokens, ddl_ast)) {
                         return try ddlPlanFromGeneratedAstAlloc(alloc, tokens, ddl_ast, options);
@@ -15254,6 +15289,90 @@ test "sql adapter generated transaction AST lowers to transaction boundary plans
     );
 }
 
+test "sql adapter generated transaction AST lowers to transaction mode plans" {
+    const alloc = std.testing.allocator;
+
+    const cases = [_]struct {
+        sql: []const u8,
+        starter: TransactionModeStarter,
+        isolation_level: ?TransactionIsolationLevel = null,
+        access_mode: ?TransactionAccessMode = null,
+        deferrable: ?bool = null,
+    }{
+        .{
+            .sql = "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY;",
+            .starter = .set_transaction,
+            .isolation_level = .serializable,
+            .access_mode = .read_only,
+        },
+        .{
+            .sql = "START TRANSACTION ISOLATION LEVEL REPEATABLE READ;",
+            .starter = .start_transaction,
+            .isolation_level = .repeatable_read,
+        },
+        .{
+            .sql = "BEGIN TRANSACTION READ WRITE DEFERRABLE;",
+            .starter = .begin,
+            .access_mode = .read_write,
+            .deferrable = true,
+        },
+    };
+
+    for (cases) |case| {
+        const generated = try generatedTransactionControlPlanForTestAlloc(alloc, case.sql);
+        var legacy = try lowerDdlPlanForTestAlloc(alloc, case.sql);
+        defer legacy.deinit(alloc);
+        switch (generated) {
+            .transaction_control => |generated_control| switch (generated_control) {
+                .transaction_mode => |generated_mode| switch (legacy) {
+                    .transaction_control => |legacy_control| switch (legacy_control) {
+                        .transaction_mode => |legacy_mode| {
+                            try std.testing.expectEqual(legacy_mode.starter, generated_mode.starter);
+                            try std.testing.expectEqual(legacy_mode.isolation_level, generated_mode.isolation_level);
+                            try std.testing.expectEqual(legacy_mode.access_mode, generated_mode.access_mode);
+                            try std.testing.expectEqual(legacy_mode.deferrable, generated_mode.deferrable);
+                            try std.testing.expectEqual(case.starter, generated_mode.starter);
+                            try std.testing.expectEqual(case.isolation_level, generated_mode.isolation_level);
+                            try std.testing.expectEqual(case.access_mode, generated_mode.access_mode);
+                            try std.testing.expectEqual(case.deferrable, generated_mode.deferrable);
+                        },
+                        else => return error.TestUnexpectedResult,
+                    },
+                    else => return error.TestUnexpectedResult,
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    var missing_mode = try tokenized.ParsedSql.initAlloc(alloc, "SET TRANSACTION READ ONLY;");
+    defer missing_mode.deinit(alloc);
+    const missing_mode_raw = missing_mode.generated_statement orelse return error.TestUnexpectedResult;
+    var missing_mode_ast = switch (missing_mode_raw.ast orelse return error.TestUnexpectedResult) {
+        .transaction => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    missing_mode_ast.mode_tokens = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        transactionControlPlanFromGeneratedAst(missing_mode.items(), missing_mode_ast),
+    );
+
+    var malformed_mode = try tokenized.ParsedSql.initAlloc(alloc, "BEGIN READ ONLY;");
+    defer malformed_mode.deinit(alloc);
+    const malformed_mode_raw = malformed_mode.generated_statement orelse return error.TestUnexpectedResult;
+    var malformed_mode_ast = switch (malformed_mode_raw.ast orelse return error.TestUnexpectedResult) {
+        .transaction => |ast| ast,
+        else => return error.TestUnexpectedResult,
+    };
+    malformed_mode_ast.mode_tokens = .{ .start = 2, .end = 3 };
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        transactionControlPlanFromGeneratedAst(malformed_mode.items(), malformed_mode_ast),
+    );
+}
+
 test "sql adapter generated simple DDL AST lowers to catalog plans" {
     const alloc = std.testing.allocator;
 
@@ -16563,6 +16682,17 @@ fn generatedTransactionBoundaryPlanForTestAlloc(alloc: std.mem.Allocator, sql: [
         else => return error.UnsupportedSqlShape,
     };
     return try transactionBoundaryPlanFromGeneratedAst(parsed.items(), transaction_ast);
+}
+
+fn generatedTransactionControlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !LoweredDdlPlan {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    const generated_raw = parsed.generated_statement orelse return error.UnsupportedSqlShape;
+    const transaction_ast = switch (generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .transaction => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    return try transactionControlPlanFromGeneratedAst(parsed.items(), transaction_ast);
 }
 
 fn generatedSimpleDdlPlanForTestAlloc(alloc: std.mem.Allocator, sql: []const u8) !LoweredDdlPlan {

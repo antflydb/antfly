@@ -20,9 +20,7 @@ const antfly_storage_build = @import("pkg/antfly/build/storage.zig");
 const antfly_tests_build = @import("pkg/antfly/build/tests.zig");
 const inference_runtime_build = @import("pkg/inference/build/runtime.zig");
 
-const APITestFilters = antfly_tests_build.APITestFilters;
 const LmdbBackend = antfly_storage_build.LmdbBackend;
-const chainLabeledFilteredTests = antfly_tests_build.chainLabeledFilteredTests;
 const chainLabeledRun = antfly_tests_build.chainLabeledRun;
 const configureEmbeddedModule = antfly_embedded_build.configureModule;
 const lmdb_c_flags = antfly_storage_build.lmdb_c_flags;
@@ -3160,205 +3158,28 @@ pub fn build(b: *std.Build) void {
 
     const lib_db_module_tests = antfly_tests_build.addDBRootModuleTestSteps(b, lib_test_mod);
 
-    const lib_metadata_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &antfly_tests_build.MetadataTestFilters.root),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_metadata_tests = b.addRunArtifact(lib_metadata_tests);
-    const lib_metadata_test_step = b.step("lib-metadata-test", "Run root-module metadata tests only");
-    lib_metadata_test_step.dependOn(&run_lib_metadata_tests.step);
-
     const metadata_fk_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/metadata_fk_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
     antfly_imports.configure(b, metadata_fk_test_mod, true, true);
-    const lib_metadata_fk_tests = b.addTest(.{
-        .root_module = metadata_fk_test_mod,
-        .filters = &antfly_tests_build.MetadataTestFilters.foreign_key,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_metadata_fk_tests = b.addRunArtifact(lib_metadata_fk_tests);
-    const lib_metadata_fk_test_step = b.step("metadata-fk-test", "Run focused metadata tests for foreign-key ownership metadata");
-    lib_metadata_fk_test_step.dependOn(&run_lib_metadata_fk_tests.step);
+    const metadata_tests = antfly_tests_build.addMetadataTestSteps(b, lib_test_mod, metadata_fk_test_mod);
+    const lib_metadata_tests = metadata_tests.root.tests;
+    const run_lib_metadata_tests = metadata_tests.root.run;
+    const run_lib_metadata_sim_smoke_tests = metadata_tests.sim_smoke.run;
+    const run_lib_metadata_vopr_tests = metadata_tests.vopr.run;
+    const lib_metadata_vopr_chaos_tests = metadata_tests.vopr_chaos.tests;
+    const run_lib_metadata_vopr_chaos_tests = metadata_tests.vopr_chaos.run;
+    const lib_metadata_transition_chaos_test_step = metadata_tests.chaos.transition;
+    const lib_metadata_public_chaos_test_step = metadata_tests.chaos.public;
+    const run_lib_metadata_sim_public_tests = metadata_tests.sim_public.run;
 
-    const lib_metadata_table_workflow_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &antfly_tests_build.MetadataTestFilters.table_workflow,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_metadata_table_workflow_tests = b.addRunArtifact(lib_metadata_table_workflow_tests);
-    const lib_metadata_table_workflow_test_step = b.step("lib-metadata-table-workflow-test", "Run focused metadata table workflow tests");
-    lib_metadata_table_workflow_test_step.dependOn(&run_lib_metadata_table_workflow_tests.step);
-
-    const lib_metadata_sim_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &antfly_tests_build.MetadataTestFilters.sim),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_metadata_sim_tests = b.addRunArtifact(lib_metadata_sim_tests);
-    const lib_metadata_sim_test_step = b.step("lib-metadata-sim-test", "Run metadata real-HTTP simulation tests only");
-    lib_metadata_sim_test_step.dependOn(&run_lib_metadata_sim_tests.step);
-
-    const lib_metadata_sim_core_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &antfly_tests_build.MetadataTestFilters.sim_core),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_metadata_sim_core_tests = b.addRunArtifact(lib_metadata_sim_core_tests);
-    const lib_metadata_sim_core_test_step = b.step("lib-metadata-sim-core-test", "Run deterministic metadata virtual-transport simulation tests without public API or chaos");
-    lib_metadata_sim_core_test_step.dependOn(&run_lib_metadata_sim_core_tests.step);
-
-    const lib_metadata_sim_smoke_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &antfly_tests_build.MetadataTestFilters.sim_smoke),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_metadata_sim_smoke_tests = b.addRunArtifact(lib_metadata_sim_smoke_tests);
-    const lib_metadata_sim_smoke_test_step = b.step("lib-metadata-sim-smoke-test", "Run fast metadata virtual-transport simulation smoke tests");
-    lib_metadata_sim_smoke_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);
-
-    const lib_metadata_vopr_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &antfly_tests_build.MetadataTestFilters.vopr),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_metadata_vopr_tests = b.addRunArtifact(lib_metadata_vopr_tests);
-    const lib_metadata_vopr_test_step = b.step("lib-metadata-vopr-test", "Run seeded metadata virtual-operation campaign tests");
-    lib_metadata_vopr_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
-
-    const lib_metadata_vopr_chaos_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &antfly_tests_build.MetadataTestFilters.vopr_chaos),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_metadata_vopr_chaos_tests = b.addRunArtifact(lib_metadata_vopr_chaos_tests);
-    const lib_metadata_vopr_chaos_test_step = b.step("lib-metadata-vopr-chaos-test", "Run expanded metadata VOPR generated workload campaigns");
-    lib_metadata_vopr_chaos_test_step.dependOn(&run_lib_metadata_vopr_chaos_tests.step);
-
-    const lib_metadata_transition_chaos_filters = selectTestFilters(b, &antfly_tests_build.MetadataTestFilters.transition_chaos);
-    const lib_metadata_public_chaos_filters = selectTestFilters(b, &antfly_tests_build.MetadataTestFilters.public_chaos);
-    const lib_metadata_relational_public_chaos_filters = selectTestFilters(b, &antfly_tests_build.MetadataTestFilters.relational_public_chaos);
-    const lib_metadata_placement_chaos_filters = selectTestFilters(b, &antfly_tests_build.MetadataTestFilters.placement_chaos);
-
-    const lib_metadata_transition_chaos_test_step = b.step("lib-metadata-transition-chaos-test", "Run metadata split/merge transition restart and partition chaos simulations");
-    var metadata_transition_chaos_progress_tail: ?*std.Build.Step = null;
-    metadata_transition_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-transition-chaos-test", lib_metadata_transition_chaos_filters, metadata_transition_chaos_progress_tail);
-    lib_metadata_transition_chaos_test_step.dependOn(metadata_transition_chaos_progress_tail.?);
-
-    const lib_metadata_public_chaos_test_step = b.step("lib-metadata-public-chaos-test", "Run metadata public traffic split/merge chaos simulations");
-    var metadata_public_chaos_progress_tail: ?*std.Build.Step = null;
-    metadata_public_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-public-chaos-test", lib_metadata_public_chaos_filters, metadata_public_chaos_progress_tail);
-    lib_metadata_public_chaos_test_step.dependOn(metadata_public_chaos_progress_tail.?);
-
-    const lib_metadata_relational_public_chaos_test_step = b.step("lib-metadata-relational-public-chaos-test", "Run metadata relational public traffic chaos simulations");
-    var metadata_relational_public_chaos_progress_tail: ?*std.Build.Step = null;
-    metadata_relational_public_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-relational-public-chaos-test", lib_metadata_relational_public_chaos_filters, metadata_relational_public_chaos_progress_tail);
-    lib_metadata_relational_public_chaos_test_step.dependOn(metadata_relational_public_chaos_progress_tail.?);
-
-    const lib_metadata_placement_chaos_test_step = b.step("lib-metadata-placement-chaos-test", "Run metadata placement restart chaos simulations");
-    var metadata_placement_chaos_progress_tail: ?*std.Build.Step = null;
-    metadata_placement_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-placement-chaos-test", lib_metadata_placement_chaos_filters, metadata_placement_chaos_progress_tail);
-    lib_metadata_placement_chaos_test_step.dependOn(metadata_placement_chaos_progress_tail.?);
-
-    const lib_metadata_chaos_test_step = b.step("lib-metadata-chaos-test", "Run metadata delayed/restart/partition chaos simulations");
-    var metadata_chaos_progress_tail: ?*std.Build.Step = null;
-    metadata_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-transition-chaos-test", lib_metadata_transition_chaos_filters, metadata_chaos_progress_tail);
-    metadata_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-public-chaos-test", lib_metadata_public_chaos_filters, metadata_chaos_progress_tail);
-    metadata_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-placement-chaos-test", lib_metadata_placement_chaos_filters, metadata_chaos_progress_tail);
-    lib_metadata_chaos_test_step.dependOn(metadata_chaos_progress_tail.?);
-
-    const lib_metadata_sim_public_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &antfly_tests_build.MetadataTestFilters.sim_public,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_metadata_sim_public_tests = b.addRunArtifact(lib_metadata_sim_public_tests);
-    const lib_metadata_sim_public_test_step = b.step("lib-metadata-sim-public-test", "Run metadata public lifecycle/split/merge simulation tests");
-    lib_metadata_sim_public_test_step.dependOn(&run_lib_metadata_sim_public_tests.step);
-
-    const public_api_parity_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &APITestFilters.public_api_parity),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_public_api_parity_tests = b.addRunArtifact(public_api_parity_tests);
-    run_public_api_parity_tests.step.dependOn(&openapi_root_check.step);
-    const public_api_parity_test_step = b.step("public-api-parity-test", "Run focused stateful public API parity tests");
-    public_api_parity_test_step.dependOn(&run_public_api_parity_tests.step);
-
-    const public_api_graph_metric_e2e_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &APITestFilters.public_api_graph_metric_e2e,
-    });
-    const run_public_api_graph_metric_e2e_tests = b.addRunArtifact(public_api_graph_metric_e2e_tests);
-    run_public_api_graph_metric_e2e_tests.step.dependOn(&openapi_root_check.step);
-
-    const lib_resolution_source_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &APITestFilters.resolution_source,
-    });
-    const run_lib_resolution_source_tests = b.addRunArtifact(lib_resolution_source_tests);
-    const lib_resolution_source_test_step = b.step("lib-resolution-source-test", "Run focused cross-shard resolution candidate-source and entity-sink tests");
-    lib_resolution_source_test_step.dependOn(&run_lib_resolution_source_tests.step);
-
-    const lib_api_auth_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &APITestFilters.auth,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_api_auth_tests = b.addRunArtifact(lib_api_auth_tests);
-    run_lib_api_auth_tests.step.dependOn(&openapi_root_check.step);
-    const lib_api_auth_test_step = b.step("lib-api-auth-test", "Run focused API auth/usermgr HTTP tests");
-    lib_api_auth_test_step.dependOn(&run_lib_api_auth_tests.step);
-
-    const lib_api_logic_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &APITestFilters.logic,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_api_logic_tests = b.addRunArtifact(lib_api_logic_tests);
-    run_lib_api_logic_tests.step.dependOn(&openapi_root_check.step);
-    const lib_api_logic_test_step = b.step("lib-api-logic-test", "Run focused API table/index encoder, parser, and schema-update logic tests");
-    lib_api_logic_test_step.dependOn(&run_lib_api_logic_tests.step);
+    const api_focused_tests = antfly_tests_build.addAPIFocusedTestSteps(b, lib_test_mod, &openapi_root_check.step);
+    const run_public_api_parity_tests = api_focused_tests.public_api_parity.run;
+    const run_public_api_graph_metric_e2e_tests = api_focused_tests.public_api_graph_metric_e2e.run;
+    const run_lib_api_auth_tests = api_focused_tests.auth.run;
+    const run_lib_api_logic_tests = api_focused_tests.logic.run;
 
     const api_transactions_docid_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_transactions_test_root.zig"),
@@ -3413,16 +3234,8 @@ pub fn build(b: *std.Build) void {
         .raft_transition_runtime_docid = raft_transition_runtime_docid_test_mod,
     });
     unit_test_step.dependOn(&api_docid_tests.provisioned_query_visibility.step);
-    const lib_docid_lifecycle_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &APITestFilters.docid_lifecycle,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_docid_lifecycle_tests = b.addRunArtifact(lib_docid_lifecycle_tests);
-    const docid_lifecycle_test_step = b.step("docid-lifecycle-test", "Run focused DOCID lifecycle and distributed snapshot hardening tests");
+    const run_lib_docid_lifecycle_tests = api_focused_tests.docid_lifecycle.run;
+    const docid_lifecycle_test_step = api_focused_tests.docid_lifecycle.step.?;
     docid_lifecycle_test_step.dependOn(&run_lib_docid_lifecycle_tests.step);
     docid_lifecycle_test_step.dependOn(&api_docid_tests.transactions_docid.step);
     docid_lifecycle_test_step.dependOn(&api_docid_tests.table_reads_docid.step);
@@ -3456,14 +3269,6 @@ pub fn build(b: *std.Build) void {
     lib_api_docid_test_step.dependOn(lib_metadata_public_chaos_test_step);
     lib_api_docid_test_step.dependOn(&lib_db_module_tests.result_shape.step);
 
-    const lib_api_swarm_backup_restore_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &APITestFilters.swarm_backup_restore,
-    });
-    const run_lib_api_swarm_backup_restore_tests = b.addRunArtifact(lib_api_swarm_backup_restore_tests);
-    const lib_api_swarm_backup_restore_test_step = b.step("lib-api-swarm-backup-restore-test", "Run the focused swarm-like backup/restore e2e test");
-    lib_api_swarm_backup_restore_test_step.dependOn(&run_lib_api_swarm_backup_restore_tests.step);
-
     const openapi_root_check_step = b.step("openapi-root-check", "Check that the bundled root OpenAPI spec matches the modular Zig specs");
     openapi_root_check_step.dependOn(&openapi_root_check.step);
     const openapi_check_step = b.step("openapi-check", "Check checked-in OpenAPI artifacts are current");
@@ -3478,102 +3283,16 @@ pub fn build(b: *std.Build) void {
     }
     generated_check_step.dependOn(&api_docid_tests.sql_api_parity_fixture_check.step);
 
-    const lib_metadata_sim_forward_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &antfly_tests_build.MetadataTestFilters.sim_forward,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_metadata_sim_forward_tests = b.addRunArtifact(lib_metadata_sim_forward_tests);
-    const lib_metadata_sim_forward_test_step = b.step("lib-metadata-sim-forward-test", "Run metadata HTTP forwarding simulation tests only");
-    lib_metadata_sim_forward_test_step.dependOn(&run_lib_metadata_sim_forward_tests.step);
+    const run_lib_metadata_sim_forward_tests = metadata_tests.sim_forward.run;
+    const run_lib_metadata_service_tests = metadata_tests.service.run;
+    const run_lib_metadata_logic_tests = metadata_tests.logic.run;
 
-    const lib_metadata_service_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &antfly_tests_build.MetadataTestFilters.service,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_metadata_service_tests = b.addRunArtifact(lib_metadata_service_tests);
-    const lib_metadata_service_test_step = b.step("lib-metadata-service-test", "Run metadata service/control-loop integration tests");
-    lib_metadata_service_test_step.dependOn(&run_lib_metadata_service_tests.step);
-
-    const lib_metadata_logic_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &antfly_tests_build.MetadataTestFilters.logic,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_metadata_logic_tests = b.addRunArtifact(lib_metadata_logic_tests);
-    const lib_metadata_logic_test_step = b.step("lib-metadata-logic-test", "Run metadata logic/state/planner tests");
-    lib_metadata_logic_test_step.dependOn(&run_lib_metadata_logic_tests.step);
-
-    const lib_storage_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &antfly_tests_build.StorageTestFilters.root),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_storage_tests = b.addRunArtifact(lib_storage_tests);
-    const lib_storage_test_step = b.step("lib-storage-test", "Run root-module storage tests only");
-    lib_storage_test_step.dependOn(&run_lib_storage_tests.step);
-
-    const ha_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &antfly_tests_build.StorageTestFilters.ha,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_ha_tests = b.addRunArtifact(ha_tests);
-    const ha_test_step = b.step("ha-test", "Run hot-standby HA storage tests");
-    ha_test_step.dependOn(&run_ha_tests.step);
-
-    const lib_storage_progress_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &antfly_tests_build.StorageTestFilters.root),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_storage_progress_tests = b.addRunArtifact(lib_storage_progress_tests);
-    for (unit_progress_skip_filters) |filter| {
-        run_lib_storage_progress_tests.addArgs(&.{ "--skip-test-filter", filter });
-    }
-
-    const lsm_backend_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &antfly_tests_build.StorageTestFilters.lsm_backend,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lsm_backend_tests = b.addRunArtifact(lsm_backend_tests);
-    const lsm_backend_test_step = b.step("lsm-backend-test", "Run LSM backend unit tests only");
-    lsm_backend_test_step.dependOn(&run_lsm_backend_tests.step);
-
-    const resource_budget_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &antfly_tests_build.StorageTestFilters.resource_budget,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_resource_budget_tests = b.addRunArtifact(resource_budget_tests);
-    const resource_budget_test_step = b.step("resource-budget-test", "Run storage resource-manager accounting tests");
-    resource_budget_test_step.dependOn(&run_resource_budget_tests.step);
+    const storage_tests = antfly_tests_build.addStorageTestSteps(b, lib_test_mod, &unit_progress_skip_filters);
+    const run_lib_storage_tests = storage_tests.root.run;
+    const run_ha_tests = storage_tests.ha.run;
+    const lib_storage_progress_tests = storage_tests.progress.tests;
+    const run_lsm_backend_tests = storage_tests.lsm_backend.run;
+    const run_resource_budget_tests = storage_tests.resource_budget.run;
 
     const sim_test_step = b.step("sim-test", "Run mocked-time Antfly simulation suites");
     sim_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);
@@ -3594,9 +3313,7 @@ pub fn build(b: *std.Build) void {
 
     const chaos_soak_test_step = b.step("chaos-soak-test", "Run broad legacy metadata and raft chaos simulation soaks");
     var chaos_soak_progress_tail: ?*std.Build.Step = null;
-    chaos_soak_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-transition-chaos-test", lib_metadata_transition_chaos_filters, chaos_soak_progress_tail);
-    chaos_soak_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-public-chaos-test", lib_metadata_public_chaos_filters, chaos_soak_progress_tail);
-    chaos_soak_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-placement-chaos-test", lib_metadata_placement_chaos_filters, chaos_soak_progress_tail);
+    chaos_soak_progress_tail = antfly_tests_build.chainMetadataChaosSoakTests(b, lib_test_mod, chaos_soak_progress_tail);
     chaos_soak_progress_tail = chainLabeledRun(b, lib_raft_chaos_tests, "lib-raft-chaos-test", chaos_soak_progress_tail);
     chaos_soak_test_step.dependOn(chaos_soak_progress_tail.?);
     soak_test_step.dependOn(chaos_soak_test_step);
@@ -3828,7 +3545,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(delegated_inference_steps.inference_test);
     unit_test_step.dependOn(delegated_inference_steps.inference_finetune_test);
     unit_test_step.dependOn(lib_swarm_runtime_test_step);
-    unit_test_step.dependOn(ha_test_step);
+    unit_test_step.dependOn(&run_ha_tests.step);
     unit_test_step.dependOn(&run_raft_unit_tests.step);
     unit_test_step.dependOn(&run_raft_transport_tests.step);
 

@@ -39,6 +39,8 @@ pub const GeneratedSqlSessionKind = enum {
 };
 
 pub const GeneratedSqlTransactionKind = enum {
+    set_transaction,
+    start_transaction,
     begin,
     commit,
     rollback,
@@ -971,6 +973,7 @@ pub const GeneratedSqlTransactionAst = struct {
     statement_span: token_mod.SourceSpan,
     command_span: token_mod.SourceSpan,
     boundary_tail_tokens: ?GeneratedSqlTokenRange = null,
+    mode_tokens: ?GeneratedSqlTokenRange = null,
 };
 
 pub const GeneratedSqlPreparedAst = struct {
@@ -1789,9 +1792,15 @@ pub const first_family_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "RESET search_path", .kind = .session },
     .{ .sql = "SHOW search_path", .kind = .session },
     .{ .sql = "DISCARD ALL", .kind = .session },
+    .{ .sql = "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY", .kind = .session },
+    .{ .sql = "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY", .kind = .transaction },
+    .{ .sql = "START TRANSACTION", .kind = .transaction },
+    .{ .sql = "START TRANSACTION ISOLATION LEVEL REPEATABLE READ", .kind = .transaction },
     .{ .sql = "BEGIN", .kind = .transaction },
+    .{ .sql = "BEGIN READ WRITE DEFERRABLE", .kind = .transaction },
     .{ .sql = "BEGIN WORK", .kind = .transaction },
     .{ .sql = "BEGIN TRANSACTION", .kind = .transaction },
+    .{ .sql = "BEGIN TRANSACTION READ ONLY", .kind = .transaction },
     .{ .sql = "COMMIT", .kind = .transaction },
     .{ .sql = "COMMIT WORK", .kind = .transaction },
     .{ .sql = "COMMIT TRANSACTION", .kind = .transaction },
@@ -2198,15 +2207,23 @@ pub fn tokenIdsAlloc(alloc: std.mem.Allocator, tokens: []const token_mod.Token) 
         if (tok.kind == .semicolon and trailingSemicolonOnly(tokens, index)) break;
         const prev = if (index > 0) tokens[index - 1] else null;
         const next = if (index + 1 < tokens.len) tokens[index + 1] else null;
-        try appendTokenIds(alloc, &ids, tok, prev, next);
+        try appendTokenIds(alloc, &ids, tokens, index, tok, prev, next);
     }
     return try ids.toOwnedSlice(alloc);
 }
 
-fn appendTokenIds(alloc: std.mem.Allocator, ids: *std.ArrayListUnmanaged(u16), tok: token_mod.Token, prev: ?token_mod.Token, next: ?token_mod.Token) !void {
+fn appendTokenIds(
+    alloc: std.mem.Allocator,
+    ids: *std.ArrayListUnmanaged(u16),
+    tokens: []const token_mod.Token,
+    index: usize,
+    tok: token_mod.Token,
+    prev: ?token_mod.Token,
+    next: ?token_mod.Token,
+) !void {
     switch (tok.kind) {
         .identifier => {
-            if (try contextualKeywordSymbolId(tok, prev)) |id| {
+            if (try contextualKeywordSymbolId(tokens, index, tok, prev)) |id| {
                 try ids.append(alloc, id);
                 return;
             }
@@ -2258,17 +2275,38 @@ fn appendTokenIds(alloc: std.mem.Allocator, ids: *std.ArrayListUnmanaged(u16), t
     }
 }
 
-fn contextualKeywordSymbolId(tok: token_mod.Token, prev: ?token_mod.Token) !?u16 {
-    const previous = prev orelse return null;
-    if (!previous.matchesKeywordTag(.begin) and
-        !previous.matchesKeywordTag(.commit) and
-        !previous.matchesKeywordTag(.rollback))
-    {
-        return null;
-    }
-    if (tok.matchesKeyword("work")) return generated.symbolId("WORK") orelse error.UnsupportedSqlShape;
+fn contextualKeywordSymbolId(tokens: []const token_mod.Token, index: usize, tok: token_mod.Token, prev: ?token_mod.Token) !?u16 {
+    _ = prev;
+    if (!generatedTransactionControlContext(tokens, index)) return null;
+    if (tok.matchesKeyword("characteristics")) return generated.symbolId("CHARACTERISTICS") orelse error.UnsupportedSqlShape;
+    if (tok.matchesKeyword("committed")) return generated.symbolId("COMMITTED") orelse error.UnsupportedSqlShape;
+    if (tok.matchesKeyword("deferrable")) return generated.symbolId("DEFERRABLE") orelse error.UnsupportedSqlShape;
+    if (tok.matchesKeyword("isolation")) return generated.symbolId("ISOLATION") orelse error.UnsupportedSqlShape;
+    if (tok.matchesKeyword("level")) return generated.symbolId("LEVEL") orelse error.UnsupportedSqlShape;
+    if (tok.matchesKeyword("read")) return generated.symbolId("READ") orelse error.UnsupportedSqlShape;
+    if (tok.matchesKeyword("repeatable")) return generated.symbolId("REPEATABLE") orelse error.UnsupportedSqlShape;
+    if (tok.matchesKeyword("serializable")) return generated.symbolId("SERIALIZABLE") orelse error.UnsupportedSqlShape;
+    if (tok.matchesKeyword("start")) return generated.symbolId("START") orelse error.UnsupportedSqlShape;
     if (tok.matchesKeyword("transaction")) return generated.symbolId("TRANSACTION") orelse error.UnsupportedSqlShape;
+    if (tok.matchesKeyword("uncommitted")) return generated.symbolId("UNCOMMITTED") orelse error.UnsupportedSqlShape;
+    if (tok.matchesKeyword("work")) return generated.symbolId("WORK") orelse error.UnsupportedSqlShape;
+    if (tok.matchesKeyword("write")) return generated.symbolId("WRITE") orelse error.UnsupportedSqlShape;
     return null;
+}
+
+fn generatedTransactionControlContext(tokens: []const token_mod.Token, index: usize) bool {
+    if (index >= tokens.len or tokens.len == 0) return false;
+    const first = tokens[0];
+    if (first.matchesKeyword("start")) return true;
+    if (first.matchesKeywordTag(.begin)) return true;
+    if (first.matchesKeywordTag(.commit) or first.matchesKeywordTag(.rollback)) return index <= 1;
+    if (!first.matchesKeywordTag(.set)) return false;
+    if (tokens.len > 1 and tokens[1].matchesKeyword("transaction")) return true;
+    return tokens.len > 4 and
+        tokens[1].matchesKeyword("session") and
+        tokens[2].matchesKeyword("characteristics") and
+        tokens[3].matchesKeywordTag(.as) and
+        tokens[4].matchesKeyword("transaction");
 }
 
 fn generatedParserTreatsKeywordAsIdentifier(tok: token_mod.Token, prev: ?token_mod.Token, next: ?token_mod.Token) bool {
@@ -2333,10 +2371,12 @@ fn classifyTokens(tokens: []const token_mod.Token) GeneratedSqlStatementKind {
 fn classifyStatement(tokens: []const token_mod.Token) GeneratedSqlStatement {
     if (tokens.len == 0) return .other;
     const first = tokens[0];
+    if (first.matchesKeywordTag(.set) and tokens.len > 1 and tokens[1].matchesKeyword("transaction")) return .{ .transaction = .set_transaction };
     if (first.matchesKeywordTag(.set)) return .{ .session = .set };
     if (first.matchesKeywordTag(.reset)) return .{ .session = .reset };
     if (first.matchesKeywordTag(.show)) return .{ .session = .show };
     if (first.matchesKeywordTag(.discard)) return .{ .session = .discard_all };
+    if (first.matchesKeyword("start")) return .{ .transaction = .start_transaction };
     if (first.matchesKeywordTag(.begin)) return .{ .transaction = .begin };
     if (first.matchesKeywordTag(.commit)) return .{ .transaction = .commit };
     if (first.matchesKeywordTag(.rollback)) return .{ .transaction = .rollback };
@@ -2938,7 +2978,7 @@ fn buildGeneratedAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, 
     const command_span = tokens[command_start].sourceSpan();
     return switch (statement) {
         .session => |kind| .{ .session = buildSessionAst(tokens, end, kind, statement_span, command_span) },
-        .transaction => |kind| .{ .transaction = buildTransactionAst(end, kind, statement_span, command_span) },
+        .transaction => |kind| .{ .transaction = buildTransactionAst(tokens, end, kind, statement_span, command_span) },
         .prepared => |kind| .{ .prepared = buildPreparedAst(tokens, end, kind, statement_span, command_span) },
         .ddl => |kind| .{ .ddl = buildDdlAst(tokens, end, kind, statement_span, command_span) },
         .dml => |kind| .{ .dml = try buildDmlAst(alloc, tokens, command_start, end, kind, statement_span, command_span) },
@@ -2960,17 +3000,44 @@ fn buildGeneratedAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, 
 }
 
 fn buildTransactionAst(
+    tokens: []const token_mod.Token,
     end: usize,
     kind: GeneratedSqlTransactionKind,
     statement_span: token_mod.SourceSpan,
     command_span: token_mod.SourceSpan,
 ) GeneratedSqlTransactionAst {
-    return .{
+    var ast = GeneratedSqlTransactionAst{
         .kind = kind,
         .statement_span = statement_span,
         .command_span = command_span,
-        .boundary_tail_tokens = if (end > 1) .{ .start = 1, .end = end } else null,
     };
+    switch (kind) {
+        .set_transaction => ast.mode_tokens = if (end > 1) .{ .start = 1, .end = end } else null,
+        .start_transaction => {
+            if (end == 2) {
+                ast.boundary_tail_tokens = .{ .start = 1, .end = 2 };
+            } else if (end > 2) {
+                ast.mode_tokens = .{ .start = 1, .end = end };
+            }
+        },
+        .begin => {
+            if (generatedBeginHasModeTail(tokens, end)) {
+                ast.mode_tokens = .{ .start = 1, .end = end };
+            } else if (end > 1) {
+                ast.boundary_tail_tokens = .{ .start = 1, .end = end };
+            }
+        },
+        .commit, .rollback => {
+            if (end > 1) ast.boundary_tail_tokens = .{ .start = 1, .end = end };
+        },
+    }
+    return ast;
+}
+
+fn generatedBeginHasModeTail(tokens: []const token_mod.Token, end: usize) bool {
+    if (end <= 1 or end > tokens.len) return false;
+    if (end == 2 and (tokens[1].matchesKeyword("work") or tokens[1].matchesKeyword("transaction"))) return false;
+    return true;
 }
 
 fn generatedCommandStartIndex(tokens: []const token_mod.Token, statement: GeneratedSqlStatement) ?usize {
@@ -7121,6 +7188,19 @@ test "generated SQL parser facade builds control AST spans" {
             try std.testing.expectEqualStrings("ROLLBACK TRANSACTION", spanText(transaction_sql, transaction.statement_span));
             try std.testing.expectEqualStrings("ROLLBACK", spanText(transaction_sql, transaction.command_span));
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 2 }, transaction.boundary_tail_tokens.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const transaction_mode_sql = "START TRANSACTION ISOLATION LEVEL REPEATABLE READ;";
+    const transaction_mode_result = try parseSqlAlloc(alloc, transaction_mode_sql);
+    switch (transaction_mode_result.ast.?) {
+        .transaction => |transaction| {
+            try std.testing.expectEqual(GeneratedSqlTransactionKind.start_transaction, transaction.kind);
+            try std.testing.expectEqualStrings("START TRANSACTION ISOLATION LEVEL REPEATABLE READ", spanText(transaction_mode_sql, transaction.statement_span));
+            try std.testing.expectEqualStrings("START", spanText(transaction_mode_sql, transaction.command_span));
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 6 }, transaction.mode_tokens.?);
+            try std.testing.expect(transaction.boundary_tail_tokens == null);
         },
         else => return error.TestUnexpectedResult,
     }

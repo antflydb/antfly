@@ -12425,10 +12425,22 @@ fn lowerWritePlanParsedSqlForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     options: plan_mod.LowerWritePlanOptions,
 ) !plan_mod.LoweredWritePlan {
+    return try lowerWritePlanParsedSqlWithFunctionBindingsForDmlTestAlloc(alloc, parsed_sql, schema, params, options, .{});
+}
+
+fn lowerWritePlanParsedSqlWithFunctionBindingsForDmlTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !plan_mod.LoweredWritePlan {
     var context = lowering_context.WritePlanLoweringContext{
         .alloc = alloc,
         .schema = schema,
         .params = params,
+        .function_bindings = function_bindings,
         .callbacks = .{
             .lower_generated_dml = lowerWritePlanFromGeneratedDmlAstDirectWithFunctionBindingsAlloc,
             .lower_recursive_insert_source_with_schemas = lowerRecursiveInsertSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc,
@@ -14235,7 +14247,7 @@ fn lowerWritePlanWithCatalogSessionParsedSqlForDmlTestAlloc(
         .schema = schema,
         .params = params,
         .callbacks = .{
-            .lower_with_options = lowerWritePlanParsedSqlForDmlTestAlloc,
+            .lower_with_options = lowerWritePlanParsedSqlWithFunctionBindingsForDmlTestAlloc,
         },
     };
     return try context.lowerParsedWithSession(parsed_sql, options, catalog, session);
