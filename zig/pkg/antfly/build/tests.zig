@@ -16,6 +16,8 @@ const std = @import("std");
 
 const max_build_zig_bytes = 2 * 1024 * 1024;
 const max_db_zig_bytes = 1024 * 1024;
+const max_db_module_zig_bytes = 64 * 1024 * 1024;
+const db_source_root = "pkg/antfly/src/storage/db";
 
 pub const no_default_filters = [_][]const u8{};
 
@@ -195,6 +197,17 @@ pub const APIDocIdTestRuns = struct {
     sql_api_parity_fixture_check: *std.Build.Step.Run,
     internal_group_write_routes: *std.Build.Step.Run,
     raft_transition_runtime_docid: *std.Build.Step.Run,
+};
+
+pub const APIDocIdAggregateDependencies = struct {
+    data_storage: *std.Build.Step.Run,
+    data_runtime: *std.Build.Step.Run,
+    metadata_sim_smoke: *std.Build.Step.Run,
+    metadata_sim_public: *std.Build.Step.Run,
+    metadata_vopr: *std.Build.Step.Run,
+    metadata_vopr_chaos: *std.Build.Step.Run,
+    metadata_public_chaos: *std.Build.Step,
+    db_result_shape: *std.Build.Step.Run,
 };
 
 pub const APIFocusedTestRun = struct {
@@ -399,6 +412,42 @@ fn isManifestOwnedAPITestStepName(name: []const u8) bool {
     return false;
 }
 
+const build_zig_owned_test_step_names = [_][]const u8{
+    "test",
+    "yacc-test",
+    "lite-go-test",
+    "lite-package-test",
+    "antfly-embedded-test",
+    "lake-scaffold-test",
+    "lib-raft-sim-test",
+    "lib-raft-chaos-test",
+    "antfly-test",
+    "conformance-test",
+    "promotion-test",
+    "soak-test",
+    "unit-test",
+    "unit-test-progress",
+    "docid-operational-hardening-test",
+    "lib-api-docid-test",
+    "sim-test",
+    "integration-test",
+    "chaos-test",
+    "chaos-soak-test",
+    "lib-audio-test",
+    "lib-swarm-runtime-test",
+    "raft-test",
+    "raft-transport-test",
+    "antfly-main-test",
+    "lite-core-test",
+};
+
+fn isBuildZigOwnedTestStepName(name: []const u8) bool {
+    inline for (build_zig_owned_test_step_names) |step_name| {
+        if (std.mem.eql(u8, name, step_name)) return true;
+    }
+    return false;
+}
+
 fn assertBuildZigDoesNotDeclareManifestOwnedTestSteps(source: []const u8) void {
     const needle = "b.step(" ++ "\"";
     var search_index: usize = 0;
@@ -421,12 +470,37 @@ fn assertBuildZigDoesNotDeclareManifestOwnedTestSteps(source: []const u8) void {
     }
 }
 
+fn assertBuildZigOnlyDeclaresOwnedTestSteps(source: []const u8) void {
+    const needle = "b.step(" ++ "\"";
+    var search_index: usize = 0;
+    while (std.mem.indexOfPos(u8, source, search_index, needle)) |start| {
+        const name_start = start + needle.len;
+        const name_end = std.mem.indexOfScalarPos(u8, source, name_start, '"') orelse
+            std.debug.panic("unterminated build step name in build.zig at line {}", .{lineNumberForOffset(source, start)});
+        const name = source[name_start..name_end];
+        if (std.mem.indexOf(u8, name, "test") != null and
+            !isBuildZigOwnedTestStepName(name) and
+            !isDBFocusedTestStepName(name) and
+            !isStandaloneModuleTestStepName(name) and
+            !isStorageBackendTestStepName(name) and
+            !isManifestOwnedAPITestStepName(name))
+        {
+            std.debug.panic(
+                "build.zig declares unclassified test step '{s}' at line {}; add leaf test inventory through pkg/antfly/build/tests.zig",
+                .{ name, lineNumberForOffset(source, start) },
+            );
+        }
+        search_index = name_end + 1;
+    }
+}
+
 pub fn assertBuildZigDoesNotOwnTestInventory(b: *std.Build) void {
     const source = readBuildSourceAlloc(b);
     assertBuildZigDoesNotInlineTestFilters(source);
     assertBuildZigTestFiltersReferenceManifest(source);
     assertBuildZigDoesNotPassDirectTestFilterArgs(source);
     assertBuildZigDoesNotDeclareManifestOwnedTestSteps(source);
+    assertBuildZigOnlyDeclaresOwnedTestSteps(source);
 }
 
 fn assertDBRootDoesNotOwnInlineTests(source: []const u8) void {
@@ -453,6 +527,68 @@ fn assertDBRootDoesNotOwnPrivateHelpers(source: []const u8) void {
     }
 }
 
+fn dbSourceMayImportDBRoot(path: []const u8) bool {
+    return std.mem.eql(u8, path, "db.zig") or std.mem.eql(u8, path, "mod.zig");
+}
+
+fn assertDBSourceDoesNotImportDBRoot(path: []const u8, source: []const u8) void {
+    if (dbSourceMayImportDBRoot(path)) return;
+    const needles = [_][]const u8{
+        "@import(\"db.zig\")",
+        "@import(\"../db.zig\")",
+    };
+    inline for (needles) |needle| {
+        if (std.mem.indexOf(u8, source, needle)) |start| {
+            std.debug.panic(
+                "storage/db/{s} imports db.zig at line {}; implementation modules must use Impl(comptime DB: type)",
+                .{ path, lineNumberForOffset(source, start) },
+            );
+        }
+    }
+}
+
+fn assertDBSourceDoesNotInstantiateSiblingImpl(path: []const u8, source: []const u8) void {
+    if (std.mem.eql(u8, path, "db.zig")) return;
+    if (std.mem.indexOf(u8, source, ".Impl(")) |start| {
+        std.debug.panic(
+            "storage/db/{s} instantiates a sibling Impl at line {}; cross-module DB behavior must go through DB forwarding methods or shared helpers",
+            .{ path, lineNumberForOffset(source, start) },
+        );
+    }
+}
+
+fn assertDBImplementationModuleContract(b: *std.Build) void {
+    var dir = b.build_root.handle.openDir(b.graph.io, db_source_root, .{ .iterate = true }) catch |err| {
+        std.debug.panic("failed to open {s} for DB implementation module guardrail: {}", .{ db_source_root, err });
+    };
+    defer dir.close(b.graph.io);
+
+    var walker = dir.walk(b.allocator) catch |err| {
+        std.debug.panic("failed to walk {s} for DB implementation module guardrail: {}", .{ db_source_root, err });
+    };
+    defer walker.deinit();
+
+    while (walker.next(b.graph.io) catch |err| {
+        std.debug.panic("failed to scan {s} for DB implementation module guardrail: {}", .{ db_source_root, err });
+    }) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.path, ".zig")) continue;
+        const source = dir.readFileAlloc(
+            b.graph.io,
+            entry.path,
+            b.allocator,
+            .limited(max_db_module_zig_bytes),
+        ) catch |err| {
+            std.debug.panic(
+                "failed to read storage/db/{s} for DB implementation module guardrail: {}",
+                .{ entry.path, err },
+            );
+        };
+        assertDBSourceDoesNotImportDBRoot(entry.path, source);
+        assertDBSourceDoesNotInstantiateSiblingImpl(entry.path, source);
+    }
+}
+
 pub fn assertDBRefactorBoundary(b: *std.Build) void {
     const source = readBuildRootFileAlloc(
         b,
@@ -462,6 +598,7 @@ pub fn assertDBRefactorBoundary(b: *std.Build) void {
     );
     assertDBRootDoesNotOwnInlineTests(source);
     assertDBRootDoesNotOwnPrivateHelpers(source);
+    assertDBImplementationModuleContract(b);
 }
 
 pub const capi_default_filters = [_][]const u8{
@@ -1370,6 +1507,8 @@ pub const APITestFilters = struct {
         "provisioned restore repair open rejects stale doc identity namespace",
         "write cache reserves retirement slots when pruning multiple leased generations",
         "full text memory attribution aggregation includes norm bytes",
+        "startup catch-up stats for path include table and index-local wal retention",
+        "runtime status startup snapshot builds synthetic status from object-form indexes json",
         "table write source core forwards required batch and defaults optional capabilities",
         "remote batch request encoder preserves writes deletes transforms and escaping",
         "primary lookup adopts seeded write cache across visible generation bump",
@@ -3309,6 +3448,32 @@ pub fn addAPIDocIdTestSteps(
         .internal_group_write_routes = internal_group_write_routes,
         .raft_transition_runtime_docid = raft_transition_runtime_docid,
     };
+}
+
+pub fn addAPIDocIdAggregateTestStep(
+    b: *std.Build,
+    runs: APIDocIdTestRuns,
+    deps: APIDocIdAggregateDependencies,
+) *std.Build.Step {
+    const step = b.step("lib-api-docid-test", "Run focused API DOCID boundary tests");
+    step.dependOn(&runs.docid.step);
+    step.dependOn(&runs.serverless_docid.step);
+    step.dependOn(&runs.transactions_docid.step);
+    step.dependOn(&runs.table_reads_docid.step);
+    step.dependOn(&runs.table_writes_docid.step);
+    step.dependOn(&runs.public_table_http_docid.step);
+    step.dependOn(&runs.rows.step);
+    step.dependOn(&runs.internal_group_write_routes.step);
+    step.dependOn(&runs.raft_transition_runtime_docid.step);
+    step.dependOn(&deps.data_storage.step);
+    step.dependOn(&deps.data_runtime.step);
+    step.dependOn(&deps.metadata_sim_smoke.step);
+    step.dependOn(&deps.metadata_sim_public.step);
+    step.dependOn(&deps.metadata_vopr.step);
+    step.dependOn(&deps.metadata_vopr_chaos.step);
+    step.dependOn(deps.metadata_public_chaos);
+    step.dependOn(&deps.db_result_shape.step);
+    return step;
 }
 
 pub fn addDBRootTestStep(

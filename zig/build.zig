@@ -3071,24 +3071,16 @@ pub fn build(b: *std.Build) void {
     docid_operational_hardening_test_step.dependOn(lib_metadata_public_chaos_test_step);
     docid_operational_hardening_test_step.dependOn(lib_lsm_backend_chaos_test_step);
 
-    const lib_api_docid_test_step = b.step("lib-api-docid-test", "Run focused API DOCID boundary tests");
-    lib_api_docid_test_step.dependOn(&api_docid_tests.docid.step);
-    lib_api_docid_test_step.dependOn(&api_docid_tests.serverless_docid.step);
-    lib_api_docid_test_step.dependOn(&api_docid_tests.transactions_docid.step);
-    lib_api_docid_test_step.dependOn(&api_docid_tests.table_reads_docid.step);
-    lib_api_docid_test_step.dependOn(&api_docid_tests.table_writes_docid.step);
-    lib_api_docid_test_step.dependOn(&api_docid_tests.public_table_http_docid.step);
-    lib_api_docid_test_step.dependOn(&api_docid_tests.rows.step);
-    lib_api_docid_test_step.dependOn(&api_docid_tests.internal_group_write_routes.step);
-    lib_api_docid_test_step.dependOn(&api_docid_tests.raft_transition_runtime_docid.step);
-    lib_api_docid_test_step.dependOn(&run_lib_data_storage_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_data_runtime_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_metadata_sim_public_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_metadata_vopr_chaos_tests.step);
-    lib_api_docid_test_step.dependOn(lib_metadata_public_chaos_test_step);
-    lib_api_docid_test_step.dependOn(&lib_db_module_tests.result_shape.step);
+    _ = antfly_tests_build.addAPIDocIdAggregateTestStep(b, api_docid_tests, .{
+        .data_storage = run_lib_data_storage_tests,
+        .data_runtime = run_lib_data_runtime_tests,
+        .metadata_sim_smoke = run_lib_metadata_sim_smoke_tests,
+        .metadata_sim_public = run_lib_metadata_sim_public_tests,
+        .metadata_vopr = run_lib_metadata_vopr_tests,
+        .metadata_vopr_chaos = run_lib_metadata_vopr_chaos_tests,
+        .metadata_public_chaos = lib_metadata_public_chaos_test_step,
+        .db_result_shape = lib_db_module_tests.result_shape,
+    });
 
     const openapi_root_check_step = b.step("openapi-root-check", "Check that the bundled root OpenAPI spec matches the modular Zig specs");
     openapi_root_check_step.dependOn(&openapi_root_check.step);

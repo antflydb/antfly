@@ -325,6 +325,7 @@ fn allowsGeneratedGrammarFallback(tokens: []const Token, raw_statement: RawSqlSt
     if (isGeneratedGraphDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedCatalogDdlHead(tokens, raw_statement)) return false;
     if (isGeneratedRelationPopulationHead(tokens, raw_statement)) return false;
+    if (isGeneratedUnsupportedHead(tokens, raw_statement)) return false;
     if (isGeneratedTransactionControlStatement(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedDdlBoundary(tokens, raw_statement)) return false;
     if (isIncompleteGeneratedDmlBoundary(tokens, raw_statement)) return false;
@@ -415,6 +416,184 @@ fn isGeneratedRelationPopulationHead(tokens: []const Token, raw_statement: RawSq
     consumeRelationLifetime(tokens, &index, end);
     if (index >= end or !tokenMatchesKeyword(tokens[index], .table)) return false;
     return findTopLevelKeyword(tokens, index + 1, end, .as) != null;
+}
+
+fn isGeneratedUnsupportedHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
+    const start = raw_statement.token_start;
+    const end = raw_statement.token_end;
+    if (start >= end or end > tokens.len) return false;
+    const first = tokens[start];
+    if (tokenMatchesKeyword(first, .analyze) or
+        tokenMatchesKeyword(first, .call) or
+        tokenMatchesKeyword(first, .checkpoint) or
+        tokenMatchesKeyword(first, .cluster) or
+        tokenMatchesKeyword(first, .comment) or
+        tokenMatchesKeyword(first, .copy) or
+        tokenMatchesText(first, "do") or
+        tokenMatchesKeyword(first, .explain) or
+        tokenMatchesKeyword(first, .grant) or
+        tokenMatchesKeyword(first, .listen) or
+        tokenMatchesText(first, "load") or
+        tokenMatchesText(first, "lock") or
+        tokenMatchesText(first, "move") or
+        tokenMatchesKeyword(first, .notify) or
+        tokenMatchesKeyword(first, .reindex) or
+        tokenMatchesKeyword(first, .revoke) or
+        tokenMatchesKeyword(first, .security) or
+        tokenMatchesKeyword(first, .unlisten) or
+        tokenMatchesKeyword(first, .vacuum))
+    {
+        return true;
+    }
+    if (tokenMatchesKeyword(first, .import)) {
+        return start + 2 < end and
+            tokenMatchesKeyword(tokens[start + 1], .foreign) and
+            tokenMatchesKeyword(tokens[start + 2], .schema);
+    }
+    if (tokenMatchesKeyword(first, .reassign)) {
+        return start + 1 < end and tokenMatchesKeyword(tokens[start + 1], .owned);
+    }
+    if (tokenMatchesKeyword(first, .alter)) return isGeneratedUnsupportedAlterHead(tokens, start, end);
+    if (tokenMatchesKeyword(first, .create)) return isGeneratedUnsupportedCreateHead(tokens, start, end);
+    if (tokenMatchesKeyword(first, .drop)) return isGeneratedUnsupportedDropHead(tokens, start, end);
+    return false;
+}
+
+fn isGeneratedUnsupportedAlterHead(tokens: []const Token, start: usize, end: usize) bool {
+    if (start + 1 >= end) return false;
+    const second = tokens[start + 1];
+    if (tokenMatchesKeyword(second, .aggregate) or
+        tokenMatchesText(second, "conversion") or
+        tokenMatchesKeyword(second, .function) or
+        tokenMatchesKeyword(second, .index) or
+        tokenMatchesText(second, "language") or
+        tokenMatchesKeyword(second, .operator) or
+        tokenMatchesKeyword(second, .procedure) or
+        tokenMatchesText(second, "routine") or
+        tokenMatchesKeyword(second, .rule) or
+        tokenMatchesKeyword(second, .server) or
+        tokenMatchesKeyword(second, .system) or
+        tokenMatchesText(second, "statistics") or
+        tokenMatchesKeyword(second, .trigger) or
+        tokenMatchesText(second, "transform"))
+    {
+        return true;
+    }
+    if (tokenMatchesKeyword(second, .default)) {
+        return start + 2 < end and tokenMatchesKeyword(tokens[start + 2], .privileges);
+    }
+    if (tokenMatchesText(second, "event")) {
+        return start + 2 < end and tokenMatchesKeyword(tokens[start + 2], .trigger);
+    }
+    if (tokenMatchesKeyword(second, .foreign)) {
+        return start + 2 < end and
+            (tokenMatchesKeyword(tokens[start + 2], .table) or
+                (start + 3 < end and tokenMatchesKeyword(tokens[start + 2], .data) and tokenMatchesText(tokens[start + 3], "wrapper")));
+    }
+    if (tokenMatchesText(second, "large")) {
+        return start + 2 < end and tokenMatchesText(tokens[start + 2], "object");
+    }
+    if (tokenMatchesKeyword(second, .materialized)) {
+        return start + 2 < end and tokenMatchesKeyword(tokens[start + 2], .view);
+    }
+    if (tokenMatchesKeyword(second, .text)) {
+        if (start + 2 >= end or !tokenMatchesText(tokens[start + 2], "search")) return false;
+        return start + 3 >= end or
+            (tokenMatchesText(tokens[start + 3], "configuration") or
+                tokenMatchesText(tokens[start + 3], "dictionary") or
+                tokenMatchesText(tokens[start + 3], "parser") or
+                tokenMatchesText(tokens[start + 3], "template"));
+    }
+    if (tokenMatchesText(second, "user")) {
+        return start + 2 < end and tokenMatchesText(tokens[start + 2], "mapping");
+    }
+    return false;
+}
+
+fn isGeneratedUnsupportedCreateHead(tokens: []const Token, start: usize, end: usize) bool {
+    if (start + 1 >= end) return false;
+    const second = tokens[start + 1];
+    if (tokenMatchesText(second, "conversion") or
+        tokenMatchesText(second, "language") or
+        tokenMatchesKeyword(second, .rule) or
+        tokenMatchesKeyword(second, .server) or
+        tokenMatchesText(second, "statistics") or
+        tokenMatchesText(second, "transform") or
+        tokenMatchesKeyword(second, .trigger))
+    {
+        return true;
+    }
+    if (tokenMatchesKeyword(second, .access)) {
+        return start + 2 < end and tokenMatchesKeyword(tokens[start + 2], .method);
+    }
+    if (tokenMatchesText(second, "event")) {
+        return start + 2 < end and tokenMatchesKeyword(tokens[start + 2], .trigger);
+    }
+    if (tokenMatchesKeyword(second, .foreign)) {
+        return start + 2 < end and
+            (tokenMatchesKeyword(tokens[start + 2], .table) or
+                (start + 3 < end and tokenMatchesKeyword(tokens[start + 2], .data) and tokenMatchesText(tokens[start + 3], "wrapper")));
+    }
+    if (tokenMatchesKeyword(second, .operator)) {
+        return start + 2 < end and
+            (tokenMatchesText(tokens[start + 2], "class") or tokenMatchesText(tokens[start + 2], "family"));
+    }
+    if (tokenMatchesKeyword(second, .text)) {
+        if (start + 2 >= end or !tokenMatchesText(tokens[start + 2], "search")) return false;
+        return start + 3 >= end or
+            (tokenMatchesText(tokens[start + 3], "configuration") or
+                tokenMatchesText(tokens[start + 3], "dictionary") or
+                tokenMatchesText(tokens[start + 3], "parser") or
+                tokenMatchesText(tokens[start + 3], "template"));
+    }
+    if (tokenMatchesText(second, "user")) {
+        return start + 2 < end and tokenMatchesText(tokens[start + 2], "mapping");
+    }
+    return false;
+}
+
+fn isGeneratedUnsupportedDropHead(tokens: []const Token, start: usize, end: usize) bool {
+    if (start + 1 >= end) return false;
+    const second = tokens[start + 1];
+    if (tokenMatchesText(second, "conversion") or
+        tokenMatchesText(second, "language") or
+        tokenMatchesKeyword(second, .owned) or
+        tokenMatchesText(second, "routine") or
+        tokenMatchesKeyword(second, .rule) or
+        tokenMatchesKeyword(second, .server) or
+        tokenMatchesText(second, "statistics") or
+        tokenMatchesText(second, "transform") or
+        tokenMatchesKeyword(second, .trigger))
+    {
+        return true;
+    }
+    if (tokenMatchesKeyword(second, .access)) {
+        return start + 2 < end and tokenMatchesKeyword(tokens[start + 2], .method);
+    }
+    if (tokenMatchesText(second, "event")) {
+        return start + 2 < end and tokenMatchesKeyword(tokens[start + 2], .trigger);
+    }
+    if (tokenMatchesKeyword(second, .foreign)) {
+        return start + 2 < end and
+            (tokenMatchesKeyword(tokens[start + 2], .table) or
+                (start + 3 < end and tokenMatchesKeyword(tokens[start + 2], .data) and tokenMatchesText(tokens[start + 3], "wrapper")));
+    }
+    if (tokenMatchesKeyword(second, .operator)) {
+        return start + 2 < end and
+            (tokenMatchesText(tokens[start + 2], "class") or tokenMatchesText(tokens[start + 2], "family"));
+    }
+    if (tokenMatchesKeyword(second, .text)) {
+        if (start + 2 >= end or !tokenMatchesText(tokens[start + 2], "search")) return false;
+        return start + 3 >= end or
+            (tokenMatchesText(tokens[start + 3], "configuration") or
+                tokenMatchesText(tokens[start + 3], "dictionary") or
+                tokenMatchesText(tokens[start + 3], "parser") or
+                tokenMatchesText(tokens[start + 3], "template"));
+    }
+    if (tokenMatchesText(second, "user")) {
+        return start + 2 < end and tokenMatchesText(tokens[start + 2], "mapping");
+    }
+    return false;
 }
 
 fn consumeRelationLifetime(tokens: []const Token, index: *usize, end: usize) void {
@@ -3066,6 +3245,16 @@ test "sql adapter parsed sql owns typed statement variants" {
             try std.testing.expect(parsed.readStatementKind() == null);
             try std.testing.expect(parsed.writeStatementKind() == null);
         }
+    }
+
+    const strict_unsupported_rejections = [_][]const u8{
+        "ALTER TRANSFORM FOR",
+        "DROP ROUTINE IF EXISTS",
+        "CREATE TEXT SEARCH",
+        "IMPORT FOREIGN SCHEMA public FROM SERVER",
+    };
+    for (strict_unsupported_rejections) |sql| {
+        try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, sql));
     }
 
     var session = try ParsedSql.initAlloc(alloc, "SET search_path TO public");

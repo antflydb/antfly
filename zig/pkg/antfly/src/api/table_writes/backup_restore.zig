@@ -22,6 +22,44 @@ const portable_backup = @import("../../storage/portable_backup.zig");
 
 const dropped_table_trash_dir_name = ".antfly-drop-trash";
 
+pub const DroppedTableDeleteHook = struct {
+    ptr: *anyopaque,
+    run: *const fn (ptr: *anyopaque) void,
+
+    pub fn runHook(self: DroppedTableDeleteHook) void {
+        self.run(self.ptr);
+    }
+};
+
+pub const DroppedTableDeleteWork = struct {
+    path: []u8,
+    before_delete: ?DroppedTableDeleteHook = null,
+
+    pub fn deletePath(path: []const u8, log_failure: bool, before_delete: ?DroppedTableDeleteHook) !void {
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        if (before_delete) |hook| hook.runHook();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch |err| {
+            if (!log_failure) return err;
+            std.log.warn("background dropped-table delete failed path={s} err={s}", .{
+                path,
+                @errorName(err),
+            });
+        };
+    }
+
+    pub fn run(ptr: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        try deletePath(self.path, true, self.before_delete);
+    }
+
+    pub fn deinit(ptr: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        std.heap.page_allocator.free(self.path);
+        std.heap.page_allocator.destroy(self);
+    }
+};
+
 pub fn prepareLocalTablePathForRestore(alloc: std.mem.Allocator, path: []const u8) !void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
