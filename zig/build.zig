@@ -19,6 +19,7 @@ const antfly_capi_build = @import("pkg/antfly/build/capi.zig");
 const antfly_conformance_build = @import("pkg/antfly/build/conformance.zig");
 const antfly_embedded_build = @import("pkg/antfly/build/embedded.zig");
 const antfly_generated_build = @import("pkg/antfly/build/generated.zig");
+const antfly_inference_build = @import("pkg/antfly/build/inference.zig");
 const antfly_lite_build = @import("pkg/antfly/build/lite.zig");
 const antfly_storage_build = @import("pkg/antfly/build/storage.zig");
 const antfly_tests_build = @import("pkg/antfly/build/tests.zig");
@@ -39,89 +40,9 @@ const BuildEdition = enum {
     inference,
 };
 
-const inference_delegated_steps = [_][]const u8{
-    "run",
-    "finetune",
-    "bench-paged-attention",
-    "bench-training",
-    "bench-linalg",
-    "bench-audio",
-    "bench-gliner2-native",
-    "gliner2-production-readiness",
-    "test-finetune",
-    "test",
-    "wasm",
-};
-
-const DelegatedPackageStep = struct {
-    run: *std.Build.Step.Run,
-    step: *std.Build.Step,
-};
-
-const DelegatedInferenceBuildSteps = struct {
-    inference_test: *std.Build.Step,
-    inference_finetune_test: *std.Build.Step,
-};
-
 fn dependOnAll(step: *std.Build.Step, dependencies: []const *std.Build.Step) void {
     for (dependencies) |dependency| {
         step.dependOn(dependency);
-    }
-}
-
-fn addDelegatedPackageStep(
-    b: *std.Build,
-    package_step_prefix: []const u8,
-    package_dir: []const u8,
-    step_name: []const u8,
-    package_name: []const u8,
-) DelegatedPackageStep {
-    const run = b.addSystemCommand(&.{
-        b.graph.zig_exe,
-        "build",
-        step_name,
-    });
-    run.setCwd(b.path(package_dir));
-    const delegated = b.step(
-        b.fmt("{s}-{s}", .{ package_step_prefix, step_name }),
-        b.fmt("Delegate to {s} zig build {s}", .{ package_name, step_name }),
-    );
-    delegated.dependOn(&run.step);
-    return .{
-        .run = run,
-        .step = delegated,
-    };
-}
-
-fn forwardBuildArgs(b: *std.Build, run: *std.Build.Step.Run) void {
-    if (b.args) |args| {
-        run.addArg("--");
-        run.addArgs(args);
-    }
-}
-
-fn addDelegatedInferenceOptions(
-    b: *std.Build,
-    run: *std.Build.Step.Run,
-    enable_metal: bool,
-    enable_onnx: bool,
-    onnx_root: []const u8,
-    enable_cuda: bool,
-    cuda_artifacts: []const u8,
-    enable_system_blas: bool,
-    blas_root: ?[]const u8,
-) void {
-    run.addArg("-Dshared-lib-root=../..");
-    run.addArg(if (enable_metal) "-Dmetal=true" else "-Dmetal=false");
-    run.addArg(if (enable_onnx) "-Donnx=true" else "-Donnx=false");
-    if (enable_onnx) {
-        run.addArg(b.fmt("-Donnx-root={s}", .{onnx_root}));
-    }
-    run.addArg(if (enable_cuda) "-Dcuda=true" else "-Dcuda=false");
-    run.addArg(b.fmt("-Dcuda-artifacts={s}", .{cuda_artifacts}));
-    run.addArg(if (enable_system_blas) "-Dsystem-blas=true" else "-Dsystem-blas=false");
-    if (enable_system_blas) {
-        if (blas_root) |root| run.addArg(b.fmt("-Dblas-root={s}", .{root}));
     }
 }
 
@@ -130,35 +51,6 @@ fn expectQuietSuccess(run: *std.Build.Step.Run) *std.Build.Step {
     run.expectExitCode(0);
     run.expectStdErrMatch("");
     return &run.step;
-}
-
-fn addDelegatedInferenceBuildSteps(
-    b: *std.Build,
-    enable_metal: bool,
-    enable_onnx: bool,
-    onnx_root: []const u8,
-    enable_cuda: bool,
-    cuda_artifacts: []const u8,
-    enable_system_blas: bool,
-    blas_root: ?[]const u8,
-) DelegatedInferenceBuildSteps {
-    var test_step: ?*std.Build.Step = null;
-    var finetune_test_step: ?*std.Build.Step = null;
-    for (inference_delegated_steps) |step_name| {
-        const delegated = addDelegatedPackageStep(b, "inference", "pkg/inference", step_name, "pkg/inference");
-        const run = delegated.run;
-        addDelegatedInferenceOptions(b, run, enable_metal, enable_onnx, onnx_root, enable_cuda, cuda_artifacts, enable_system_blas, blas_root);
-        forwardBuildArgs(b, run);
-        if (std.mem.eql(u8, step_name, "test")) {
-            test_step = delegated.step;
-        } else if (std.mem.eql(u8, step_name, "test-finetune")) {
-            finetune_test_step = delegated.step;
-        }
-    }
-    return .{
-        .inference_test = test_step.?,
-        .inference_finetune_test = finetune_test_step.?,
-    };
 }
 
 const FfmpegPaths = struct {
@@ -501,16 +393,16 @@ pub fn build(b: *std.Build) void {
             @panic("-Donnx=true requires an ONNX Runtime install; pass -Donnx-root=<path>");
         }
     }
-    const delegated_inference_steps = addDelegatedInferenceBuildSteps(
-        b,
-        termite_enable_metal,
-        termite_enable_onnx,
-        termite_onnx_root,
-        termite_enable_cuda,
-        termite_cuda_artifacts,
-        termite_enable_system_blas,
-        termite_blas_root,
-    );
+    const delegated_inference_steps = antfly_inference_build.addDelegatedBuildSteps(.{
+        .b = b,
+        .enable_metal = termite_enable_metal,
+        .enable_onnx = termite_enable_onnx,
+        .onnx_root = termite_onnx_root,
+        .enable_cuda = termite_enable_cuda,
+        .cuda_artifacts = termite_cuda_artifacts,
+        .enable_system_blas = termite_enable_system_blas,
+        .blas_root = termite_blas_root,
+    });
 
     const lmdb_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
     const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, antfly_version);
