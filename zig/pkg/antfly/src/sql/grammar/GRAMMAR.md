@@ -474,8 +474,8 @@ generated diagnostic because there is no typed cursor plan for it yet. Bulk
 I/O commands use the validated unsupported boundary for `COPY` before
 delegating to typed bulk I/O planning. `EXPLAIN` uses the validated
 unsupported boundary before delegating to typed explain planning, including
-generated subject-range validation before the inner read/write statement is
-reparsed.
+generated option payloads and subject-range validation before the inner
+read/write statement is reparsed.
 Generated unsupported utility command heads that require a subject, such as
 `CALL`, `COPY`, `GRANT`, `LISTEN`, `LOCK`, `NOTIFY`, `REINDEX`, `REVOKE`,
 `SAVEPOINT`, and `UNLISTEN`, now fail closed through the generated parser when
@@ -1156,7 +1156,8 @@ Generated grammar work needs evidence at multiple levels:
   statistics, operator/aggregate ALTER forms, operator class/family, and text-search
   configuration/dictionary/parser/template DDL, and bare, simple, optioned,
   and `EXPLAIN ANALYZE` forms now produce generated unsupported AST nodes with
-  stable reason metadata and subject ranges where available.
+  stable reason metadata, explain-option payloads, and subject ranges where
+  available.
 - AST shape tests for source spans, identifier normalization, literals,
   placeholders, casts, operators, and nested statements. The first AST shape
   tests cover generated session, transaction, prepared, DDL, DML, read, and

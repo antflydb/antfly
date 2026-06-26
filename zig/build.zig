@@ -3051,12 +3051,9 @@ pub fn build(b: *std.Build) void {
     const lite_cli_test_step = b.step("lite-cli-test", "Run Antfly Lite CLI tests");
     lite_cli_test_step.dependOn(&run_lite_cli_tests.step);
 
-    const lib_recall_default_filters = [_][]const u8{
-        "HBC recall",
-    };
     const lib_recall_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_recall_default_filters),
+        .filters = selectTestFilters(b, &antfly_tests_build.RecallTestFilters.hbc),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3068,70 +3065,27 @@ pub fn build(b: *std.Build) void {
 
     const raft_unit_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &.{"raft."}),
+        .filters = selectTestFilters(b, &antfly_tests_build.RaftTestFilters.root),
     });
     const run_raft_unit_tests = b.addRunArtifact(raft_unit_tests);
 
     const raft_transport_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"raft.transport."},
+        .filters = &antfly_tests_build.RaftTestFilters.transport,
     });
     const run_raft_transport_tests = b.addRunArtifact(raft_transport_tests);
 
-    const lib_raft_sim_default_filters = [_][]const u8{
-        "managed host simulation drives add and peer refresh through deterministic steps",
-        "managed host simulation restores through both raft state backends",
-        "managed host simulation keeps WAL replay debt bounded across repeated proposals",
-        "managed host simulation removes routes and replicas across deterministic steps",
-        "simulation harness module compiles",
-        "cluster simulation validates mirrored merge pair invariants",
-        "cluster simulation validates split transition enrichment invariants",
-        "cluster simulation validates merge transition enrichment invariants",
-        "cluster simulation drives split transition actions deterministically",
-        "cluster simulation drives merge transition actions deterministically",
-    };
     const lib_raft_sim_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &lib_raft_sim_default_filters,
+        .filters = &antfly_tests_build.RaftTestFilters.sim,
     });
     const run_lib_raft_sim_tests = b.addRunArtifact(lib_raft_sim_tests);
     const lib_raft_sim_test_step = b.step("lib-raft-sim-test", "Run raft simulation harness tests");
     lib_raft_sim_test_step.dependOn(&run_lib_raft_sim_tests.step);
 
-    const lib_raft_chaos_default_filters = [_][]const u8{
-        "managed host simulation restores through both raft state backends",
-        "managed host simulation persists replica removal across restart for both raft state backends",
-        "managed host simulation drops queued metadata updates across restart for both raft state backends",
-        "managed host simulation does not persist proposals before a runtime round across both raft state backends",
-        "managed http host simulation starts listener and applies deterministic metadata updates",
-        "managed http host simulations elect and replicate over real HTTP",
-        "managed http host simulation can remove and rejoin from HTTP snapshot fetch",
-        "managed http cluster simulation",
-        "http host simulation drives queued split transitions through the service lane",
-        "http host simulation rolls back and retries queued split transitions through the service lane",
-        "http host simulation removes queued split transition mid-flight",
-        "http host simulation updates split transition to rollback mid-flight",
-        "cluster simulation drives queued split transitions through service-owned metadata updates",
-        "cluster simulation resumes queued split transitions after node restart",
-        "cluster simulation removes queued split transition mid-flight across node restart",
-        "cluster simulation rolls back queued split transition mid-flight across node restart",
-        "cluster simulation survives repeated same-id split overwrites across restart",
-        "cluster simulation drives queued merge transitions through service-owned metadata updates",
-        "http host simulation drives queued merge transitions through the service lane",
-        "http host simulation rolls back and retries queued merge transitions through the service lane",
-        "http host simulation removes queued merge transition mid-flight",
-        "http host simulation updates merge transition to rollback mid-flight",
-        "cluster simulation resumes queued merge transitions after node restart",
-        "cluster simulation rolls back queued merge transition mid-flight across node restart",
-        "cluster simulation survives repeated same-id merge overwrites across restart",
-        "cluster simulation isolates concurrent",
-        "cluster simulation drives multiple concurrent real transition ids through multiplexed runtime",
-        "cluster simulation isolates overlapping same-id split overwrites while other transitions complete",
-        "cluster simulation removes queued merge transition mid-flight across node restart",
-    };
     const lib_raft_chaos_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &lib_raft_chaos_default_filters,
+        .filters = &antfly_tests_build.RaftTestFilters.chaos,
     });
     const run_lib_raft_chaos_tests = b.addRunArtifact(lib_raft_chaos_tests);
     const lib_raft_chaos_test_step = b.step("lib-raft-chaos-test", "Run longer raft restart/HTTP simulation campaigns");
@@ -3152,38 +3106,16 @@ pub fn build(b: *std.Build) void {
     const run_lib_lsm_backend_chaos_tests = b.addRunArtifact(lib_lsm_backend_chaos_tests);
     const lib_lsm_backend_chaos_test_step = b.step("lib-lsm-backend-chaos-test", "Run longer LSM backend compaction chaos campaigns");
     lib_lsm_backend_chaos_test_step.dependOn(&run_lib_lsm_backend_chaos_tests.step);
-    const lib_ha_chaos_default_filters = [_][]const u8{
-        "storage.ha chaos crash during base backup preserves slot pin and catch-up boundary",
-        "storage.ha chaos crash after receive replays durable WAL before streaming resumes",
-        "storage.ha chaos rejects noncontiguous records and follows timeline switch across restart",
-        "storage.ha chaos crash during apply preserves remote write and blocks remote apply",
-        "storage.ha chaos crash after apply before ack reports durable progress on resume",
-        "storage.ha chaos primary restart preserves synchronous acknowledgement boundaries",
-        "storage.ha chaos lag retention forces reseed and former primary cannot rewind expired WAL",
-        "storage.ha chaos network partition requires fence before standby promotion",
-    };
     const lib_ha_chaos_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_ha_chaos_default_filters),
+        .filters = selectTestFilters(b, &antfly_tests_build.HATestFilters.chaos),
     });
     const run_lib_ha_chaos_tests = b.addRunArtifact(lib_ha_chaos_tests);
     const lib_ha_chaos_test_step = b.step("ha-chaos-test", "Run HA hot-standby crash and partition hardening tests");
     lib_ha_chaos_test_step.dependOn(&run_lib_ha_chaos_tests.step);
-    const lib_ha_compat_default_filters = [_][]const u8{
-        "storage.ha compat decodes v1 replication record fixture",
-        "storage.ha compat keeps v1 replication record encoding stable",
-        "storage.ha compat decodes v1 timeline switch record fixture",
-        "storage.ha compat keeps v1 timeline switch encoding stable",
-        "storage.ha compat decodes v1 base backup and checkpoint record fixtures",
-        "storage.ha compat keeps v1 base backup and checkpoint encodings stable",
-        "storage.ha compat decodes v1 backup manifest fixture",
-        "storage.ha compat keeps v1 backup manifest encoding stable",
-        "storage.ha compat keeps v1 backup manifest file kind tags stable",
-        "storage.ha compat keeps v1 record kind tags stable",
-    };
     const lib_ha_compat_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_ha_compat_default_filters),
+        .filters = selectTestFilters(b, &antfly_tests_build.HATestFilters.compat),
     });
     const run_lib_ha_compat_tests = b.addRunArtifact(lib_ha_compat_tests);
     const lib_ha_compat_test_step = b.step("ha-compat-test", "Run HA replication format compatibility tests");
@@ -3222,70 +3154,15 @@ pub fn build(b: *std.Build) void {
     const serverless_test_step = b.step("serverless-test", "Run serverless and serverless transport tests");
     serverless_test_step.dependOn(&run_serverless_tests.step);
 
-    const lib_data_runtime_default_filters = [_][]const u8{
-        "data runtime status refresh publishes synthetic missing status for absent local group db",
-        "data runtime status refresh budget reuses cached group status instead of opening db",
-        "data runtime status refresh reuses managed writer snapshot instead of reopening table db",
-        "data runtime keeps status refresh dirty for non-startup async index work",
-        "data runtime runRound does not refresh provisioned replica root inline while worker is active",
-        "data runtime data changes mark provisioned startup catch-up dirty",
-        "data runtime structural changes preserve writer-published runtime status",
-        "data runtime startup catch-up prefers cached admin snapshot",
-        "data runtime startup catch-up clears no-debt busy writer groups",
-        "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
-        "data runtime background maintenance is due for dense posting cadence without lsm debt",
-        "data runtime local split fallback preserves source identity namespace",
-        "data runtime local merge fallback derives receiver identity namespace from catalog",
-        "data runtime resolves extension package store env before local default",
-        "data runtime cli accepts ARD identity flags",
-        "data public API listener uses public API request body limit",
-        "data server can register a store without enabling data raft",
-        "data server registered data raft uses wal state backend by default",
-        "data server wires configured HA executors into API server",
-        "data server mirrors managed primary writes into HA replication log",
-        "data server fail-closed sync policy rejects primary writes before local commit",
-        "data server block sync policy waits for standby acknowledgement before commit returns",
-        "data server propagates standby HA write gate into provisioned write sources",
-        "storage.ha data server rejects writes and owner jobs after primary promotion fence",
-        "data server applies routed HA replication records through standby write gate",
-        "data server pulls and applies HA standby replication through internal HTTP client",
-        "data server resumes HA standby replication from durable progress after restart",
-        "data runtime records HA standby replication round failures",
-        "data runtime records HA standby apply failures without stopping run round",
-    };
-    const run_lib_data_runtime_tests = addFilteredTestStep(b, data_runtime_test_mod, "lib-data-runtime-test", "Run focused data runtime tests", &lib_data_runtime_default_filters, .{ .simple_runner = true });
+    const run_lib_data_runtime_tests = addFilteredTestStep(b, data_runtime_test_mod, "lib-data-runtime-test", "Run focused data runtime tests", &antfly_tests_build.DataTestFilters.runtime, .{ .simple_runner = true });
 
-    const lib_data_storage_default_filters = [_][]const u8{
-        "db split sync coordinator allocates destination identity namespace",
-        "db split status rejects stale destination identity namespace",
-        "db merge coordinator opt-in applies configured receiver identity namespace",
-        "db merge coordinator reapplies target namespace for persisted reassignment opt-in",
-        "db merge coordinator bootstraps relational rows and column entries",
-        "db merge coordinator rollback reapplies target namespace for persisted reassignment opt-in",
-    };
-    const run_lib_data_storage_tests = addFilteredTestStep(b, data_storage_test_mod, "lib-data-storage-test", "Run focused data storage tests", &lib_data_storage_default_filters, .{ .simple_runner = true });
+    const run_lib_data_storage_tests = addFilteredTestStep(b, data_storage_test_mod, "lib-data-storage-test", "Run focused data storage tests", &antfly_tests_build.DataTestFilters.storage, .{ .simple_runner = true });
 
     const lib_db_module_tests = antfly_tests_build.addDBRootModuleTestSteps(b, lib_test_mod);
 
     const lib_metadata_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &.{
-            "metadata.mod.test.",
-            "metadata.api.test.",
-            "metadata.admin.test.",
-            "metadata.http_routes.test.",
-            "metadata.http_server.test.",
-            "metadata.http_client.test.",
-            "metadata.state.test.",
-            "metadata.storage.",
-            "metadata.service.test.",
-            "metadata.server.test.",
-            "metadata.runtime.test.",
-            "metadata.reconciler.test.",
-            "metadata.control_loop.test.",
-            "metadata.transition_driver.test.",
-            "metadata.replication_backfill.test.",
-        }),
+        .filters = selectTestFilters(b, &antfly_tests_build.MetadataTestFilters.root),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3303,25 +3180,7 @@ pub fn build(b: *std.Build) void {
     antfly_imports.configure(b, metadata_fk_test_mod, true, true);
     const lib_metadata_fk_tests = b.addTest(.{
         .root_module = metadata_fk_test_mod,
-        .filters = &.{
-            "metadata raft apply store preserves projected tables and ranges across reopen",
-            "metadata reconciler converges foreign key reference owner ranges",
-            "metadata reconciler derives foreign key reference owner ranges from table schemas",
-            "metadata reconciler derives primary key and unique owner ranges from table schemas",
-            "metadata reconciler derives secondary index rebuild ranges from building relational indexes",
-            "metadata reconciler preserves split foreign key reference owner ranges for active schema foreign keys",
-            "metadata reconciler converges unique constraint owner ranges",
-            "metadata raft apply store persists secondary index rebuild work ranges across reopen",
-            "placement planner places foreign key reference owner ranges",
-            "placement planner places unique constraint owner ranges",
-            "placement planner places secondary index rebuild ranges",
-            "table manager applies foreign key reference range lifecycle operations",
-            "table manager applies secondary index rebuild lifecycle operations",
-            "table manager applies unique constraint range lifecycle operations",
-            "table manager owns foreign key reference owner ranges",
-            "table manager owns secondary index rebuild work ranges",
-            "table manager owns unique constraint owner ranges",
-        },
+        .filters = &antfly_tests_build.MetadataTestFilters.foreign_key,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3333,13 +3192,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_metadata_table_workflow_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{
-            "table workflow can reconcile foreign key reference owner ranges",
-            "table workflow drives foreign key reference range lifecycle commands",
-            "metadata http server accepts internal foreign key reference range lifecycle routes",
-            "table workflow can drive real metadata service topology and split setup",
-            "table workflow can drive placement intents through the real metadata control loop",
-        },
+        .filters = &antfly_tests_build.MetadataTestFilters.table_workflow,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3349,10 +3202,9 @@ pub fn build(b: *std.Build) void {
     const lib_metadata_table_workflow_test_step = b.step("lib-metadata-table-workflow-test", "Run focused metadata table workflow tests");
     lib_metadata_table_workflow_test_step.dependOn(&run_lib_metadata_table_workflow_tests.step);
 
-    const lib_metadata_sim_default_filters = [_][]const u8{"metadata http cluster simulation"};
     const lib_metadata_sim_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_metadata_sim_default_filters),
+        .filters = selectTestFilters(b, &antfly_tests_build.MetadataTestFilters.sim),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3362,23 +3214,9 @@ pub fn build(b: *std.Build) void {
     const lib_metadata_sim_test_step = b.step("lib-metadata-sim-test", "Run metadata real-HTTP simulation tests only");
     lib_metadata_sim_test_step.dependOn(&run_lib_metadata_sim_tests.step);
 
-    const lib_metadata_sim_core_default_filters = [_][]const u8{
-        "metadata http cluster simulation drives table placement convergence",
-        "metadata http cluster simulation converges placement after candidate churn",
-        "metadata http cluster simulation drives split intent through the control loop",
-        "metadata http cluster simulation drives merge intent through the control loop",
-        "metadata http cluster simulation drives automatic split through the control loop",
-        "metadata http cluster simulation drives automatic merge through the control loop",
-        "metadata http cluster simulation uses live median key for automatic split planning",
-        "metadata http cluster simulation uses remote live median key when metadata leader is not a shard replica",
-        "metadata http cluster simulation publishes split topology after finalize",
-        "metadata http cluster simulation publishes merge topology after finalize",
-        "metadata http cluster simulation provisions split destination replicas across nodes",
-        "metadata http cluster simulation retires merge donor replicas across nodes",
-    };
     const lib_metadata_sim_core_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_metadata_sim_core_default_filters),
+        .filters = selectTestFilters(b, &antfly_tests_build.MetadataTestFilters.sim_core),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3388,15 +3226,9 @@ pub fn build(b: *std.Build) void {
     const lib_metadata_sim_core_test_step = b.step("lib-metadata-sim-core-test", "Run deterministic metadata virtual-transport simulation tests without public API or chaos");
     lib_metadata_sim_core_test_step.dependOn(&run_lib_metadata_sim_core_tests.step);
 
-    const lib_metadata_sim_smoke_default_filters = [_][]const u8{
-        "metadata sim split runtime preserves source identity namespace",
-        "metadata sim merge runtime records doc identity reassignment opt-in",
-        "metadata http cluster simulation drives table placement convergence",
-        "metadata http cluster simulation drives split intent through the control loop",
-    };
     const lib_metadata_sim_smoke_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_metadata_sim_smoke_default_filters),
+        .filters = selectTestFilters(b, &antfly_tests_build.MetadataTestFilters.sim_smoke),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3406,12 +3238,9 @@ pub fn build(b: *std.Build) void {
     const lib_metadata_sim_smoke_test_step = b.step("lib-metadata-sim-smoke-test", "Run fast metadata virtual-transport simulation smoke tests");
     lib_metadata_sim_smoke_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);
 
-    const lib_metadata_vopr_default_filters = [_][]const u8{
-        "metadata VOPR seeded smoke campaign",
-    };
     const lib_metadata_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_metadata_vopr_default_filters),
+        .filters = selectTestFilters(b, &antfly_tests_build.MetadataTestFilters.vopr),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3421,13 +3250,9 @@ pub fn build(b: *std.Build) void {
     const lib_metadata_vopr_test_step = b.step("lib-metadata-vopr-test", "Run seeded metadata virtual-operation campaign tests");
     lib_metadata_vopr_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
 
-    const lib_metadata_vopr_chaos_default_filters = [_][]const u8{
-        "metadata VOPR expanded generated workload campaign",
-        "metadata VOPR relational identity owner topology campaign",
-    };
     const lib_metadata_vopr_chaos_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_metadata_vopr_chaos_default_filters),
+        .filters = selectTestFilters(b, &antfly_tests_build.MetadataTestFilters.vopr_chaos),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3437,47 +3262,10 @@ pub fn build(b: *std.Build) void {
     const lib_metadata_vopr_chaos_test_step = b.step("lib-metadata-vopr-chaos-test", "Run expanded metadata VOPR generated workload campaigns");
     lib_metadata_vopr_chaos_test_step.dependOn(&run_lib_metadata_vopr_chaos_tests.step);
 
-    const lib_metadata_transition_chaos_default_filters = [_][]const u8{
-        "metadata http cluster simulation completes automatic split after metadata leader restart",
-        "metadata http cluster simulation completes automatic split after metadata leader partition",
-        "metadata http cluster simulation completes automatic split under delayed raft transport",
-        "metadata http cluster simulation completes automatic split after leader restart under delayed raft transport",
-        "metadata http cluster simulation completes automatic split after source group leader restart",
-        "metadata http cluster simulation completes automatic split after destination group leader restart",
-        "metadata http cluster simulation completes automatic split after leader partition under delayed raft transport",
-        "metadata http cluster simulation completes automatic merge after metadata leader restart",
-        "metadata http cluster simulation completes automatic merge after donor group leader restart",
-        "metadata http cluster simulation completes automatic merge after receiver group leader restart",
-        "metadata http cluster simulation completes automatic merge after metadata leader partition",
-        "metadata http cluster simulation completes automatic merge under delayed raft transport",
-        "metadata http cluster simulation completes automatic merge after leader restart under delayed raft transport",
-        "metadata http cluster simulation completes automatic merge after leader partition under delayed raft transport",
-        "metadata http cluster simulation survives leader restart before forced automatic split reconcile",
-    };
-    const lib_metadata_public_chaos_default_filters = [_][]const u8{
-        "metadata http cluster simulation serves public traffic across automatic split under delayed raft transport",
-        "metadata http cluster simulation serves public traffic across automatic split after leader restart under delayed raft transport",
-        "metadata http cluster simulation serves public traffic across automatic split after source leader restart under delayed raft transport",
-        "metadata http cluster simulation serves public traffic across automatic split after leader partition under delayed raft transport",
-        "metadata http cluster simulation serves public traffic across automatic split after metadata leader partition",
-        "metadata http cluster simulation serves public traffic across automatic merge under delayed raft transport",
-        "metadata http cluster simulation serves public traffic across automatic merge after leader restart under delayed raft transport",
-        "metadata http cluster simulation serves public traffic across automatic merge after donor leader restart under delayed raft transport",
-        "metadata http cluster simulation serves public traffic across automatic merge after leader partition under delayed raft transport",
-        "metadata http cluster simulation serves public traffic across automatic merge after metadata leader partition",
-        "metadata http cluster simulation resolves relational unique selectors across hosted storage restart",
-    };
-    const lib_metadata_relational_public_chaos_default_filters = [_][]const u8{
-        "metadata http cluster simulation resolves relational unique selectors across hosted storage restart",
-    };
-    const lib_metadata_placement_chaos_default_filters = [_][]const u8{
-        "metadata http cluster simulation survives metadata leader restart during placement reconcile",
-        "metadata http cluster simulation drops table topology across leader restart",
-    };
-    const lib_metadata_transition_chaos_filters = selectTestFilters(b, &lib_metadata_transition_chaos_default_filters);
-    const lib_metadata_public_chaos_filters = selectTestFilters(b, &lib_metadata_public_chaos_default_filters);
-    const lib_metadata_relational_public_chaos_filters = selectTestFilters(b, &lib_metadata_relational_public_chaos_default_filters);
-    const lib_metadata_placement_chaos_filters = selectTestFilters(b, &lib_metadata_placement_chaos_default_filters);
+    const lib_metadata_transition_chaos_filters = selectTestFilters(b, &antfly_tests_build.MetadataTestFilters.transition_chaos);
+    const lib_metadata_public_chaos_filters = selectTestFilters(b, &antfly_tests_build.MetadataTestFilters.public_chaos);
+    const lib_metadata_relational_public_chaos_filters = selectTestFilters(b, &antfly_tests_build.MetadataTestFilters.relational_public_chaos);
+    const lib_metadata_placement_chaos_filters = selectTestFilters(b, &antfly_tests_build.MetadataTestFilters.placement_chaos);
 
     const lib_metadata_transition_chaos_test_step = b.step("lib-metadata-transition-chaos-test", "Run metadata split/merge transition restart and partition chaos simulations");
     var metadata_transition_chaos_progress_tail: ?*std.Build.Step = null;
@@ -3508,12 +3296,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_metadata_sim_public_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{
-            "metadata http cluster simulation serves public lifecycle from a non-host node after public create",
-            "metadata http cluster simulation seeds default admin for auth-enabled public api",
-            "metadata http cluster simulation forwards public split flow from a non-host node after public create",
-            "metadata http cluster simulation forwards public merge flow from a non-host node after public create",
-        },
+        .filters = &antfly_tests_build.MetadataTestFilters.sim_public,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3697,7 +3480,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_metadata_sim_forward_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"forwards public table io"},
+        .filters = &antfly_tests_build.MetadataTestFilters.sim_forward,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3709,12 +3492,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_metadata_service_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{
-            "metadata service ",
-            "metadata control loop can drive the real metadata service",
-            "table workflow can drive real metadata service topology and split setup",
-            "table workflow can drive placement intents through the real metadata control loop",
-        },
+        .filters = &antfly_tests_build.MetadataTestFilters.service,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3726,38 +3504,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_metadata_logic_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{
-            "metadata reconciler",
-            "metadata transition state",
-            "metadata server module compiles",
-            "metadata catalog validation requires cross-table foreign keys to reference parent unique columns",
-            "metadata catalog validation rejects relational parent table drop while referenced",
-            "metadata catalog validation applies sql drop table cascade through child schema updates",
-            "metadata catalog validation treats missing drop table if exists as ddl noop",
-            "metadata admin source advances foreign key validation state through schema update",
-            "metadata fk schema controller config builds bounded maintenance options",
-            "metadata merge request validation rejects incompatible doc identity namespaces",
-            "metadata split request validation rejects stale doc identity namespace",
-            "metadata transition actions",
-            "placement planner",
-            "metadata control loop proposes desired transitions through the service seam",
-            "metadata control loop plans placement intents",
-            "table manager ",
-            "metadata state ",
-            "transition controller ",
-            "metadata module compiles",
-            "metadata transition driver ",
-            "metadata storage module compiles",
-            "table workflow can build desired topology through the control loop seam",
-            "table workflow doc identity guards reject active transition intents",
-            "table workflow can remove a table topology from desired state",
-            "table workflow can reconcile projected local placement intents",
-            "metadata raft apply store ",
-            "metadata.table record decoder",
-            "metadata catalog identity",
-            "metadata state machine projects transitions through metadata apply store",
-            "table provisioner restore rejects mismatched doc identity namespace",
-        },
+        .filters = &antfly_tests_build.MetadataTestFilters.logic,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3767,12 +3514,9 @@ pub fn build(b: *std.Build) void {
     const lib_metadata_logic_test_step = b.step("lib-metadata-logic-test", "Run metadata logic/state/planner tests");
     lib_metadata_logic_test_step.dependOn(&run_lib_metadata_logic_tests.step);
 
-    const lib_storage_default_filters = [_][]const u8{
-        "storage.",
-    };
     const lib_storage_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_storage_default_filters),
+        .filters = selectTestFilters(b, &antfly_tests_build.StorageTestFilters.root),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3784,7 +3528,7 @@ pub fn build(b: *std.Build) void {
 
     const ha_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"storage.ha"},
+        .filters = &antfly_tests_build.StorageTestFilters.ha,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3796,7 +3540,7 @@ pub fn build(b: *std.Build) void {
 
     const lib_storage_progress_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_storage_default_filters),
+        .filters = selectTestFilters(b, &antfly_tests_build.StorageTestFilters.root),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3809,7 +3553,7 @@ pub fn build(b: *std.Build) void {
 
     const lsm_backend_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"storage.lsm_backend."},
+        .filters = &antfly_tests_build.StorageTestFilters.lsm_backend,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -3821,16 +3565,7 @@ pub fn build(b: *std.Build) void {
 
     const resource_budget_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{
-            "resource manager observes over-budget external usage",
-            "cache reports shared byte usage to resource manager",
-            "derived backlog tracker accounts and releases payload bytes",
-            "hbc shared cache namespaces entries",
-            "hbc shared cache evicts across namespaces under one resource budget",
-            "hbc cache reports byte usage to resource manager",
-            "hbc cache shrinks to resource budget under pressure",
-            "provisioned group storage derives all resource budgets",
-        },
+        .filters = &antfly_tests_build.StorageTestFilters.resource_budget,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,

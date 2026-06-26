@@ -14,13 +14,20 @@
 
 const std = @import("std");
 
+const db_mod = @import("../../storage/db/mod.zig");
 const storage_schema = @import("../../storage/schema.zig");
+const raft_mod = @import("../../raft/mod.zig");
+const query_api = @import("../query.zig");
+const relational_rows_api = @import("../relational_rows.zig");
 const external_binding_api = @import("../../serverless/external_source/catalog_binding.zig");
 const external_source_api = @import("../../serverless/external_source/mod.zig");
 const artifact_ref_api = @import("../../serverless/manifest/artifact_ref.zig");
 const sidecar_manifest_api = @import("../../serverless/segment/sidecar_manifest.zig");
 const source_binding_api = @import("../../serverless/segment/source_binding.zig");
 const serverless_query = @import("../../serverless/query/mod.zig");
+const table_read_core = @import("core.zig");
+
+const TableReadSource = table_read_core.TableReadSource;
 
 pub const PinnedExternalLakeRowsScanner = struct {
     inventory: external_source_api.Inventory,
@@ -85,6 +92,337 @@ pub fn executePinnedExternalLakeRowsScanAlloc(
         .sidecar_policy = sidecar_context.sidecar_policy,
         .candidates = sidecar_context.candidates,
     });
+}
+
+pub fn rowsQueryPlanFromLakeScanAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    table_name: []const u8,
+    runtime_schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsQueryPlan,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsQueryResult {
+    if (plan.ctes.len != 0 or plan.ranges.len != 0) {
+        var base_rows = (try fullRowsFromLakeScanAlloc(alloc, source, table_name, runtime_schema, consistency)) orelse return null;
+        defer base_rows.deinit(alloc);
+        return try relational_rows_api.executeRowsQueryPlanOnJsonRowsAlloc(alloc, runtime_schema, plan, base_rows.rows);
+    }
+    var lake_request = try relational_rows_api.buildLakeRowsScanRequestForRowsQueryAlloc(alloc, runtime_schema, plan.query);
+    defer lake_request.deinit(alloc);
+
+    var scan_result = (try source.lakeRowsScan(alloc, table_name, runtime_schema, lake_request.request, consistency)) orelse return null;
+    defer scan_result.deinit(alloc);
+    return try relational_rows_api.buildRowsQueryResultFromLakeRowsWithSchemaAlloc(alloc, runtime_schema, plan.query, scan_result);
+}
+
+pub fn rowsAggregatePlanFromLakeScanAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    table_name: []const u8,
+    runtime_schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsAggregatePlan,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsAggregateResult {
+    if (plan.ctes.len != 0 or plan.ranges.len != 0) {
+        var base_rows = (try fullRowsFromLakeScanAlloc(alloc, source, table_name, runtime_schema, consistency)) orelse return null;
+        defer base_rows.deinit(alloc);
+        return try relational_rows_api.executeRowsAggregatePlanOnJsonRowsAlloc(alloc, runtime_schema, plan, base_rows.rows);
+    }
+    var maybe_expression_request = try relational_rows_api.buildLakeRowsExpressionAggregateRequestForRowsAggregateAlloc(alloc, plan.aggregate);
+    if (maybe_expression_request) |*expression_request| {
+        defer expression_request.deinit(alloc);
+        const expression_result = source.lakeRowsExpressionAggregates(alloc, table_name, runtime_schema, expression_request.request, consistency) catch |err| switch (err) {
+            error.UnsupportedOperation,
+            error.UnsupportedRowsQuery,
+            error.UnsupportedLakeRowsExpressionAggregate,
+            error.EmptyLakeRowsExpressionAggregate,
+            => null,
+            else => return err,
+        };
+        if (expression_result) |value| {
+            var owned_value = value;
+            defer owned_value.deinit(alloc);
+            return try relational_rows_api.buildRowsAggregateResultFromLakeRowsExpressionAggregatesAlloc(alloc, plan.aggregate, owned_value);
+        }
+    }
+
+    var lake_request = try relational_rows_api.buildLakeRowsScanRequestForRowsAggregateAlloc(alloc, runtime_schema, plan.aggregate);
+    defer lake_request.deinit(alloc);
+
+    var scan_result = (try source.lakeRowsScan(alloc, table_name, runtime_schema, lake_request.request, consistency)) orelse return null;
+    defer scan_result.deinit(alloc);
+    return try relational_rows_api.buildRowsAggregateResultFromLakeRowsAlloc(alloc, plan.aggregate, scan_result);
+}
+
+pub fn rowsWindowPlanFromLakeScanAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    table_name: []const u8,
+    runtime_schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsWindowPlan,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsWindowResult {
+    if (plan.ctes.len != 0 or plan.ranges.len != 0) return error.UnsupportedRowsQuery;
+    var base_rows = (try fullRowsFromLakeScanAlloc(alloc, source, table_name, runtime_schema, consistency)) orelse return null;
+    defer base_rows.deinit(alloc);
+    return try relational_rows_api.executeRowsWindowPlanOnJsonRowsAlloc(alloc, runtime_schema, plan, base_rows.rows);
+}
+
+pub fn rowsJoinPlanFromLakeScanAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    table_name: []const u8,
+    runtime_schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsJoinPlan,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsJoinResult {
+    if (!relationalRowsPlanUsesDefaultSideTables(table_name, plan.left_table, plan.right_table)) return error.UnsupportedRowsQuery;
+    var base_rows = (try fullRowsFromLakeScanAlloc(alloc, source, table_name, runtime_schema, consistency)) orelse return null;
+    defer base_rows.deinit(alloc);
+    return try relational_rows_api.executeRowsJoinPlanOnJsonRowsWithSchemasAlloc(
+        alloc,
+        runtime_schema,
+        runtime_schema,
+        runtime_schema,
+        plan,
+        base_rows.rows,
+        base_rows.rows,
+        base_rows.rows,
+    );
+}
+
+pub fn rowsLateralPlanFromLakeScanAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    table_name: []const u8,
+    runtime_schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsLateralPlan,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsJoinResult {
+    if (!relationalRowsPlanUsesDefaultSideTables(table_name, plan.left_table, plan.right_table)) return error.UnsupportedRowsQuery;
+    var base_rows = (try fullRowsFromLakeScanAlloc(alloc, source, table_name, runtime_schema, consistency)) orelse return null;
+    defer base_rows.deinit(alloc);
+    return try relational_rows_api.executeRowsLateralPlanOnJsonRowsWithSchemasAlloc(
+        alloc,
+        runtime_schema,
+        runtime_schema,
+        runtime_schema,
+        plan,
+        base_rows.rows,
+        base_rows.rows,
+        base_rows.rows,
+    );
+}
+
+pub fn fullRowsFromLakeScanAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    table_name: []const u8,
+    runtime_schema: storage_schema.TableSchema,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsQueryResult {
+    const full_source = db_mod.types.RelationalRowsQueryRequest{ .select_all = true };
+    var lake_request = try relational_rows_api.buildLakeRowsScanRequestForRowsQueryAlloc(alloc, runtime_schema, full_source);
+    defer lake_request.deinit(alloc);
+
+    var scan_result = (try source.lakeRowsScan(alloc, table_name, runtime_schema, lake_request.request, consistency)) orelse return null;
+    defer scan_result.deinit(alloc);
+    return try relational_rows_api.buildRowsQueryResultFromLakeRowsWithSchemaAlloc(alloc, runtime_schema, full_source, scan_result);
+}
+
+pub fn relationalRowsPlanUsesDefaultSideTables(default_table_name: []const u8, left_table_name: []const u8, right_table_name: []const u8) bool {
+    return (left_table_name.len == 0 or std.mem.eql(u8, left_table_name, default_table_name)) and
+        (right_table_name.len == 0 or std.mem.eql(u8, right_table_name, default_table_name));
+}
+
+test "external lake row plan helpers execute through lake source hooks" {
+    const alloc = std.testing.allocator;
+    var columns = [_]storage_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+    };
+    const schema = storage_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+        .primary_key = .{ .columns = &.{"id"} },
+        .external_base_source = .{
+            .table_id = "events",
+            .format = .parquet,
+            .source_uri = "s3://bucket/events",
+            .snapshot_mode = .{ .object_version_digest = "digest-1" },
+            .schema_fingerprint = "schema-v1",
+        },
+    };
+
+    const FakeLakeSource = struct {
+        scan_calls: usize = 0,
+        expression_aggregate_calls: usize = 0,
+
+        fn source(self: *@This()) TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .lake_rows_scan = lakeRowsScan,
+                    .lake_rows_expression_aggregates = lakeRowsExpressionAggregates,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?table_read_core.LookupResponse {
+            return error.UnexpectedLookupForLakeRowsTest;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?table_read_core.ScanResponse {
+            return error.UnexpectedDocumentScanForLakeRowsTest;
+        }
+
+        fn query(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) !?query_api.QueryResponse {
+            return error.UnexpectedSearchForLakeRowsTest;
+        }
+
+        fn lakeRowsScan(
+            ptr: *anyopaque,
+            scan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            runtime_schema: storage_schema.TableSchema,
+            request: serverless_query.LakeRowsScanRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) !?serverless_query.LakeRowsScanResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("events", table_name);
+            try std.testing.expect(runtime_schema.external_base_source != null);
+            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+            self.scan_calls += 1;
+
+            const rows = try scan_alloc.alloc(serverless_query.lake_rows.ProjectedRow, 2);
+            errdefer scan_alloc.free(rows);
+            rows[0] = try buildRow(scan_alloc, "row:1", request.projected_columns, 20);
+            errdefer rows[0].deinit(scan_alloc);
+            rows[1] = try buildRow(scan_alloc, "row:2", request.projected_columns, 30);
+            return .{ .rows = rows, .total = 2 };
+        }
+
+        fn lakeRowsExpressionAggregates(
+            ptr: *anyopaque,
+            expression_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            runtime_schema: storage_schema.TableSchema,
+            request: serverless_query.LakeRowsExpressionAggregateRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) !?serverless_query.LakeRowsExpressionAggregateResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("events", table_name);
+            try std.testing.expect(runtime_schema.external_base_source != null);
+            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+            self.expression_aggregate_calls += 1;
+
+            const expressions = try expression_alloc.alloc(serverless_query.lake_rows.ExpressionResult, request.expressions.len);
+            errdefer expression_alloc.free(expressions);
+            var initialized: usize = 0;
+            errdefer {
+                for (expressions[0..initialized]) |*expression| expression.deinit(expression_alloc);
+            }
+            for (request.expressions, expressions) |spec, *out| {
+                out.* = .{
+                    .name = try expression_alloc.dupe(u8, spec.name),
+                    .value = switch (spec.op) {
+                        .count => .{ .count = 2 },
+                        .sum_i64 => .{ .sum_i64 = 50 },
+                        .min_i64 => .{ .min_i64 = 20 },
+                        .max_i64 => .{ .max_i64 = 30 },
+                        .avg_i64 => .{ .avg_i64 = .{ .sum_i64 = 50, .count = 2 } },
+                    },
+                };
+                initialized += 1;
+            }
+            return .{ .expressions = expressions, .source = .rowsource_scan };
+        }
+
+        fn buildRow(
+            row_alloc: std.mem.Allocator,
+            row_key: []const u8,
+            projected_columns: []const []const u8,
+            amount: i64,
+        ) !serverless_query.lake_rows.ProjectedRow {
+            const cells = try row_alloc.alloc(serverless_query.lake_rows.ProjectedCell, projected_columns.len);
+            errdefer row_alloc.free(cells);
+            var initialized: usize = 0;
+            errdefer {
+                for (cells[0..initialized]) |*cell| cell.deinit(row_alloc);
+            }
+            for (projected_columns, cells) |column, *cell| {
+                cell.* = .{
+                    .name = try row_alloc.dupe(u8, column),
+                    .value = if (std.mem.eql(u8, column, "id"))
+                        .{ .bytes = try row_alloc.dupe(u8, if (amount == 20) "a" else "b") }
+                    else if (std.mem.eql(u8, column, "amount"))
+                        .{ .i64 = amount }
+                    else
+                        return error.UnexpectedLakeProjection,
+                };
+                initialized += 1;
+            }
+            return .{
+                .row_ref = .{ .relational_key = row_key },
+                .cells = cells,
+            };
+        }
+    };
+
+    var fake = FakeLakeSource{};
+    const source = fake.source();
+    const select = [_][]const u8{"amount"};
+    var query_result = (try rowsQueryPlanFromLakeScanAlloc(alloc, source, "events", schema, .{
+        .query = .{
+            .select = select[0..],
+            .select_all = false,
+            .limit = 2,
+        },
+    }, .read_index)).?;
+    defer query_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), fake.scan_calls);
+    try std.testing.expectEqual(@as(u32, 2), query_result.total);
+    try std.testing.expectEqualStrings("{\"amount\":20}", query_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"amount\":30}", query_result.rows[1]);
+
+    const aggregations = [_]db_mod.types.RelationalRowsAggregateSpec{
+        .{ .name = "count_all", .op = .count },
+        .{ .name = "sum_amount", .op = .sum, .field = "amount" },
+    };
+    var aggregate_result = (try rowsAggregatePlanFromLakeScanAlloc(alloc, source, "events", schema, .{
+        .aggregate = .{
+            .aggregations = aggregations[0..],
+        },
+    }, .read_index)).?;
+    defer aggregate_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), fake.scan_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.expression_aggregate_calls);
+    try std.testing.expectEqual(@as(u32, 1), aggregate_result.total_groups);
+    try std.testing.expectEqualStrings("{\"count_all\":2,\"sum_amount\":50}", aggregate_result.rows[0]);
 }
 
 test "pinned external lake rows scanner validates schema binding against inventory" {

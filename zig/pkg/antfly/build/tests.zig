@@ -1041,6 +1041,7 @@ pub const APITestFilters = struct {
         "provisioned table read source executes relational row query plans across ranges",
         "routed rows query plan executes over scanned owner rows with ctes",
         "external lake rows query and aggregate plans route through lake scan hook",
+        "external lake row plan helpers execute through lake source hooks",
         "pinned external lake rows scanner validates schema binding against inventory",
         "object storage pinned external lake source routes row plans through scanner",
         "owned object storage lake source discovers and pins parquet prefix inventory",
@@ -1553,6 +1554,82 @@ pub const MetadataTestFilters = struct {
     pub const placement_chaos = [_][]const u8{
         "metadata http cluster simulation survives metadata leader restart during placement reconcile",
         "metadata http cluster simulation drops table topology across leader restart",
+    };
+
+    pub const sim_public = [_][]const u8{
+        "metadata http cluster simulation serves public lifecycle from a non-host node after public create",
+        "metadata http cluster simulation seeds default admin for auth-enabled public api",
+        "metadata http cluster simulation forwards public split flow from a non-host node after public create",
+        "metadata http cluster simulation forwards public merge flow from a non-host node after public create",
+    };
+
+    pub const sim_forward = [_][]const u8{
+        "forwards public table io",
+    };
+
+    pub const service = [_][]const u8{
+        "metadata service ",
+        "metadata control loop can drive the real metadata service",
+        "table workflow can drive real metadata service topology and split setup",
+        "table workflow can drive placement intents through the real metadata control loop",
+    };
+
+    pub const logic = [_][]const u8{
+        "metadata reconciler",
+        "metadata transition state",
+        "metadata server module compiles",
+        "metadata catalog validation requires cross-table foreign keys to reference parent unique columns",
+        "metadata catalog validation rejects relational parent table drop while referenced",
+        "metadata catalog validation applies sql drop table cascade through child schema updates",
+        "metadata catalog validation treats missing drop table if exists as ddl noop",
+        "metadata admin source advances foreign key validation state through schema update",
+        "metadata fk schema controller config builds bounded maintenance options",
+        "metadata merge request validation rejects incompatible doc identity namespaces",
+        "metadata split request validation rejects stale doc identity namespace",
+        "metadata transition actions",
+        "placement planner",
+        "metadata control loop proposes desired transitions through the service seam",
+        "metadata control loop plans placement intents",
+        "table manager ",
+        "metadata state ",
+        "transition controller ",
+        "metadata module compiles",
+        "metadata transition driver ",
+        "metadata storage module compiles",
+        "table workflow can build desired topology through the control loop seam",
+        "table workflow doc identity guards reject active transition intents",
+        "table workflow can remove a table topology from desired state",
+        "table workflow can reconcile projected local placement intents",
+        "metadata raft apply store ",
+        "metadata.table record decoder",
+        "metadata catalog identity",
+        "metadata state machine projects transitions through metadata apply store",
+        "table provisioner restore rejects mismatched doc identity namespace",
+    };
+};
+
+pub const StorageTestFilters = struct {
+    pub const root = [_][]const u8{
+        "storage.",
+    };
+
+    pub const ha = [_][]const u8{
+        "storage.ha",
+    };
+
+    pub const lsm_backend = [_][]const u8{
+        "storage.lsm_backend.",
+    };
+
+    pub const resource_budget = [_][]const u8{
+        "resource manager observes over-budget external usage",
+        "cache reports shared byte usage to resource manager",
+        "derived backlog tracker accounts and releases payload bytes",
+        "hbc shared cache namespaces entries",
+        "hbc shared cache evicts across namespaces under one resource budget",
+        "hbc cache reports byte usage to resource manager",
+        "hbc cache shrinks to resource budget under pressure",
+        "provisioned group storage derives all resource budgets",
     };
 };
 

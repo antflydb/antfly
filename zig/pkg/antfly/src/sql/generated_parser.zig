@@ -1702,6 +1702,22 @@ pub const GeneratedSqlUnsupportedAst = struct {
     statement_span: token_mod.SourceSpan,
     command_span: token_mod.SourceSpan,
     subject_tokens: ?GeneratedSqlTokenRange = null,
+    explain_options_tokens: ?GeneratedSqlTokenRange = null,
+    explain_options_valid: bool = true,
+    explain_analyze: bool = false,
+    explain_format: GeneratedSqlExplainFormat = .text,
+    explain_verbose: bool = false,
+    explain_costs: bool = true,
+    explain_buffers: bool = false,
+    explain_timing: bool = true,
+    explain_summary: bool = true,
+    explain_settings: bool = false,
+    explain_wal: bool = false,
+};
+
+pub const GeneratedSqlExplainFormat = enum {
+    text,
+    json,
 };
 
 pub const GeneratedSqlAst = union(enum) {
@@ -2761,9 +2777,7 @@ fn buildUnsupportedAst(
         .command_span = command_span,
     };
     if (kind == .explain) {
-        if (generatedExplainSubjectStart(tokens, end)) |subject_start| {
-            ast.subject_tokens = .{ .start = subject_start, .end = end };
-        }
+        populateGeneratedExplainUnsupportedAst(tokens, end, &ast);
     } else if (generatedUnsupportedSubjectStart(kind, end)) |subject_start| {
         ast.subject_tokens = .{ .start = subject_start, .end = end };
     }
@@ -2780,16 +2794,116 @@ fn generatedUnsupportedSubjectStart(kind: GeneratedSqlUnsupportedKind, end: usiz
     return if (end > start) start else null;
 }
 
-fn generatedExplainSubjectStart(tokens: []const token_mod.Token, end: usize) ?usize {
-    if (end <= 1 or end > tokens.len) return null;
+fn populateGeneratedExplainUnsupportedAst(
+    tokens: []const token_mod.Token,
+    end: usize,
+    ast: *GeneratedSqlUnsupportedAst,
+) void {
+    if (end <= 1 or end > tokens.len) return;
     var index: usize = 1;
     if (tokens[index].matchesKeywordTag(.analyze)) {
+        ast.explain_analyze = true;
         index += 1;
     } else if (tokens[index].kind == .lparen) {
-        const close = findMatchingParen(tokens, index, end) orelse return null;
+        const close = findMatchingParen(tokens, index, end) orelse {
+            ast.explain_options_valid = false;
+            return;
+        };
+        ast.explain_options_tokens = .{ .start = index, .end = close + 1 };
+        parseGeneratedExplainOptionList(tokens, index + 1, close, ast) catch {
+            ast.explain_options_valid = false;
+        };
         index = close + 1;
     }
-    return if (index < end) index else null;
+    if (index < end) ast.subject_tokens = .{ .start = index, .end = end };
+}
+
+fn parseGeneratedExplainOptionList(
+    tokens: []const token_mod.Token,
+    start: usize,
+    end: usize,
+    ast: *GeneratedSqlUnsupportedAst,
+) !void {
+    var index = start;
+    while (index < end) {
+        try parseGeneratedExplainOption(tokens, &index, end, ast);
+        if (index == end) return;
+        if (tokens[index].kind != .comma) return error.UnsupportedSqlShape;
+        index += 1;
+        if (index >= end) return error.UnsupportedSqlShape;
+    }
+    if (start == end) return error.UnsupportedSqlShape;
+}
+
+fn parseGeneratedExplainOption(
+    tokens: []const token_mod.Token,
+    index: *usize,
+    end: usize,
+    ast: *GeneratedSqlUnsupportedAst,
+) !void {
+    if (index.* >= end) return error.UnsupportedSqlShape;
+    const name = tokens[index.*];
+    index.* += 1;
+    if (name.matchesKeywordTag(.format)) {
+        if (index.* >= end) return error.UnsupportedSqlShape;
+        if (tokens[index.*].matchesKeywordTag(.json)) {
+            ast.explain_format = .json;
+        } else if (tokens[index.*].matchesKeywordTag(.text)) {
+            ast.explain_format = .text;
+        } else {
+            return error.UnsupportedSqlShape;
+        }
+        index.* += 1;
+        return;
+    }
+
+    if (name.matchesKeywordTag(.analyze)) {
+        ast.explain_analyze = parseGeneratedExplainOptionalBool(tokens, index, end, true);
+    } else if (name.matchesKeywordTag(.verbose)) {
+        ast.explain_verbose = parseGeneratedExplainOptionalBool(tokens, index, end, true);
+    } else if (name.matchesKeywordTag(.costs)) {
+        ast.explain_costs = parseGeneratedExplainOptionalBool(tokens, index, end, true);
+    } else if (name.matchesKeywordTag(.buffers)) {
+        ast.explain_buffers = parseGeneratedExplainOptionalBool(tokens, index, end, true);
+    } else if (name.matchesKeywordTag(.timing)) {
+        ast.explain_timing = parseGeneratedExplainOptionalBool(tokens, index, end, true);
+    } else if (name.matchesKeywordTag(.summary)) {
+        ast.explain_summary = parseGeneratedExplainOptionalBool(tokens, index, end, true);
+    } else if (name.matchesKeywordTag(.settings)) {
+        ast.explain_settings = parseGeneratedExplainOptionalBool(tokens, index, end, true);
+    } else if (name.matchesKeywordTag(.wal)) {
+        ast.explain_wal = parseGeneratedExplainOptionalBool(tokens, index, end, true);
+    } else {
+        return error.UnsupportedSqlShape;
+    }
+}
+
+fn parseGeneratedExplainOptionalBool(
+    tokens: []const token_mod.Token,
+    index: *usize,
+    end: usize,
+    default_value: bool,
+) bool {
+    const before = index.*;
+    if (index.* < end and
+        (tokens[index.*].matchesKeywordTag(.true) or
+            tokens[index.*].matchesKeywordTag(.on) or
+            tokens[index.*].matchesKeywordTag(.yes)))
+    {
+        index.* += 1;
+        return true;
+    }
+    index.* = before;
+    if (index.* < end and
+        (tokens[index.*].matchesKeywordTag(.false) or
+            tokens[index.*].matchesKeywordTag(.off) or
+            tokens[index.*].matchesKeywordTag(.no)))
+    {
+        index.* += 1;
+        return false;
+    }
+    index.* = before;
+    return default_value;
 }
 
 fn buildGeneratedAst(alloc: std.mem.Allocator, tokens: []const token_mod.Token, statement: GeneratedSqlStatement) !?GeneratedSqlAst {
@@ -10942,6 +11056,10 @@ test "generated SQL parser facade builds extended read AST spans" {
             try std.testing.expectEqualStrings("EXPLAIN", spanText(explain_sql, unsupported.command_span));
             try std.testing.expect(unsupported.subject_tokens.?.start == 1);
             try std.testing.expect(unsupported.subject_tokens.?.end == 5);
+            try std.testing.expect(unsupported.explain_options_tokens == null);
+            try std.testing.expect(unsupported.explain_options_valid);
+            try std.testing.expect(!unsupported.explain_analyze);
+            try std.testing.expectEqual(GeneratedSqlExplainFormat.text, unsupported.explain_format);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -10954,6 +11072,8 @@ test "generated SQL parser facade builds extended read AST spans" {
             try std.testing.expectEqual(GeneratedSqlUnsupportedReason.explain_not_planned_by_generated_parser, unsupported.reason);
             try std.testing.expectEqualStrings("EXPLAIN", spanText(empty_explain_sql, unsupported.statement_span));
             try std.testing.expect(unsupported.subject_tokens == null);
+            try std.testing.expect(unsupported.explain_options_tokens == null);
+            try std.testing.expect(unsupported.explain_options_valid);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -10965,6 +11085,17 @@ test "generated SQL parser facade builds extended read AST spans" {
             try std.testing.expectEqual(GeneratedSqlUnsupportedKind.explain, unsupported.kind);
             try std.testing.expectEqual(GeneratedSqlUnsupportedReason.explain_not_planned_by_generated_parser, unsupported.reason);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 26, .end = 30 }, unsupported.subject_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 26 }, unsupported.explain_options_tokens.?);
+            try std.testing.expect(unsupported.explain_options_valid);
+            try std.testing.expect(unsupported.explain_analyze);
+            try std.testing.expectEqual(GeneratedSqlExplainFormat.json, unsupported.explain_format);
+            try std.testing.expect(unsupported.explain_verbose);
+            try std.testing.expect(!unsupported.explain_costs);
+            try std.testing.expect(unsupported.explain_buffers);
+            try std.testing.expect(!unsupported.explain_timing);
+            try std.testing.expect(!unsupported.explain_summary);
+            try std.testing.expect(unsupported.explain_settings);
+            try std.testing.expect(unsupported.explain_wal);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -10975,6 +11106,21 @@ test "generated SQL parser facade builds extended read AST spans" {
         .unsupported => |unsupported| {
             try std.testing.expectEqual(GeneratedSqlUnsupportedKind.explain, unsupported.kind);
             try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 12 }, unsupported.subject_tokens.?);
+            try std.testing.expect(unsupported.explain_options_tokens == null);
+            try std.testing.expect(unsupported.explain_options_valid);
+            try std.testing.expect(unsupported.explain_analyze);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const invalid_explain_options_sql = "EXPLAIN (FORMAT YAML) SELECT 1";
+    const invalid_explain_options_result = try parseSqlAlloc(alloc, invalid_explain_options_sql);
+    switch (invalid_explain_options_result.ast.?) {
+        .unsupported => |unsupported| {
+            try std.testing.expectEqual(GeneratedSqlUnsupportedKind.explain, unsupported.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 7 }, unsupported.subject_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 5 }, unsupported.explain_options_tokens.?);
+            try std.testing.expect(!unsupported.explain_options_valid);
         },
         else => return error.TestUnexpectedResult,
     }

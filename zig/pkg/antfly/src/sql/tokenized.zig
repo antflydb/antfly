@@ -896,7 +896,7 @@ fn parseStatement(
             .graph => return .{ .ddl = .{ .raw = raw_statement } },
             .unsupported => |kind| {
                 if (generatedUnsupportedUsesDdlPlanBoundary(kind)) return .{ .ddl = .{ .raw = raw_statement } };
-                if (kind == .explain) return .{ .explain = parseExplainStatement(raw_statement, tokenized_sql.items()) catch .{ .raw = raw_statement } };
+                if (kind == .explain) return .{ .explain = parseGeneratedExplainStatement(raw_statement, tokenized_sql.items(), generated_raw) };
                 return .{ .unsupported = .{ .kind = kind, .raw = raw_statement } };
             },
             .other => {},
@@ -1882,6 +1882,64 @@ fn classifyDdlLikeStatement(raw_statement: RawSqlStatement, tokens: []const Toke
     return .{ .ddl = .{ .raw = raw_statement } };
 }
 
+fn parseGeneratedExplainStatement(
+    raw_statement: RawSqlStatement,
+    tokens: []const Token,
+    generated_raw: GeneratedRawSqlStatement,
+) ParsedExplainStatement {
+    const ast_value = generated_raw.ast orelse return .{ .raw = raw_statement };
+    const unsupported = switch (ast_value) {
+        .unsupported => |value| value,
+        else => return .{ .raw = raw_statement },
+    };
+    if (unsupported.kind != .explain or unsupported.reason != .explain_not_planned_by_generated_parser) return .{ .raw = raw_statement };
+    if (!std.meta.eql(unsupported.command_span, tokens[raw_statement.token_start].sourceSpan())) return .{ .raw = raw_statement };
+    if (!unsupported.explain_options_valid) return .{ .raw = raw_statement };
+    if (unsupported.explain_options_tokens) |options| {
+        if (!generatedExplainTokenRangeIsValid(tokens, raw_statement, options)) return .{ .raw = raw_statement };
+        if (options.start <= raw_statement.token_start or options.end > raw_statement.token_end) return .{ .raw = raw_statement };
+        if (tokens[options.start].kind != .lparen or tokens[options.end - 1].kind != .rparen) return .{ .raw = raw_statement };
+    }
+
+    var statement = ParsedExplainStatement{
+        .raw = raw_statement,
+        .analyze = unsupported.explain_analyze,
+        .format = generatedExplainFormat(unsupported.explain_format),
+        .verbose = unsupported.explain_verbose,
+        .costs = unsupported.explain_costs,
+        .buffers = unsupported.explain_buffers,
+        .timing = unsupported.explain_timing,
+        .summary = unsupported.explain_summary,
+        .settings = unsupported.explain_settings,
+        .wal = unsupported.explain_wal,
+    };
+    if (unsupported.subject_tokens) |subject| {
+        if (!generatedExplainTokenRangeIsValid(tokens, raw_statement, subject)) return .{ .raw = raw_statement };
+        if (subject.start <= raw_statement.token_start or subject.end > raw_statement.token_end) return .{ .raw = raw_statement };
+        statement.inner_token_start = subject.start;
+        statement.inner_token_end = subject.end;
+    }
+    return statement;
+}
+
+fn generatedExplainFormat(format: generated_parser.GeneratedSqlExplainFormat) ast.SqlExplainFormat {
+    return switch (format) {
+        .text => .text,
+        .json => .json,
+    };
+}
+
+fn generatedExplainTokenRangeIsValid(
+    tokens: []const Token,
+    raw_statement: RawSqlStatement,
+    range: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    return range.start < range.end and
+        range.start >= raw_statement.token_start and
+        range.end <= raw_statement.token_end and
+        range.end <= tokens.len;
+}
+
 fn parseExplainStatement(raw_statement: RawSqlStatement, tokens: []const Token) !ParsedExplainStatement {
     var index = raw_statement.token_start;
     if (!matchKeywordTag(tokens, &index, raw_statement.token_end, .explain)) return error.UnsupportedSqlShape;
@@ -2368,6 +2426,10 @@ test "sql adapter parsed sql owns typed statement variants" {
                     try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.explain, unsupported.kind);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedReason.explain_not_planned_by_generated_parser, unsupported.reason);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = 5 }, unsupported.subject_tokens.?);
+                    try std.testing.expect(unsupported.explain_options_tokens == null);
+                    try std.testing.expect(unsupported.explain_options_valid);
+                    try std.testing.expect(!unsupported.explain_analyze);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExplainFormat.text, unsupported.explain_format);
                 },
                 else => return error.TestUnexpectedResult,
             }
@@ -2396,6 +2458,17 @@ test "sql adapter parsed sql owns typed statement variants" {
                     try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.explain, unsupported.kind);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedReason.explain_not_planned_by_generated_parser, unsupported.reason);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = statement.inner_token_start.?, .end = statement.inner_token_end.? }, unsupported.subject_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = 26 }, unsupported.explain_options_tokens.?);
+                    try std.testing.expect(unsupported.explain_options_valid);
+                    try std.testing.expect(unsupported.explain_analyze);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlExplainFormat.json, unsupported.explain_format);
+                    try std.testing.expect(unsupported.explain_verbose);
+                    try std.testing.expect(!unsupported.explain_costs);
+                    try std.testing.expect(unsupported.explain_buffers);
+                    try std.testing.expect(!unsupported.explain_timing);
+                    try std.testing.expect(!unsupported.explain_summary);
+                    try std.testing.expect(unsupported.explain_settings);
+                    try std.testing.expect(unsupported.explain_wal);
                 },
                 else => return error.TestUnexpectedResult,
             }
@@ -2415,6 +2488,9 @@ test "sql adapter parsed sql owns typed statement variants" {
                     try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.explain, unsupported.kind);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedReason.explain_not_planned_by_generated_parser, unsupported.reason);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = statement.inner_token_start.?, .end = statement.inner_token_end.? }, unsupported.subject_tokens.?);
+                    try std.testing.expect(unsupported.explain_options_tokens == null);
+                    try std.testing.expect(unsupported.explain_options_valid);
+                    try std.testing.expect(unsupported.explain_analyze);
                 },
                 else => return error.TestUnexpectedResult,
             }
@@ -2434,6 +2510,8 @@ test "sql adapter parsed sql owns typed statement variants" {
                     try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.explain, unsupported.kind);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedReason.explain_not_planned_by_generated_parser, unsupported.reason);
                     try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 5, .end = 7 }, unsupported.subject_tokens.?);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 1, .end = 5 }, unsupported.explain_options_tokens.?);
+                    try std.testing.expect(!unsupported.explain_options_valid);
                 },
                 else => return error.TestUnexpectedResult,
             }
