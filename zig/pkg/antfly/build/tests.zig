@@ -1555,8 +1555,6 @@ pub const APITestFilters = struct {
         "provisioned schema rewrite worker pass drains projected catalog range job",
         "provisioned table write source drop table does not hold local db mutex during background delete",
         "provisioned table write source drop table waits for in-flight group batch on same table",
-        "foreign key integrity job diagnostics merge samples across passes",
-        "foreign key integrity job records diagnostics across incomplete passes",
         "unique schema controller maintenance",
         "foreign key schema controller maintenance",
         "foreign key schema controller maintenance resumes durable action job",

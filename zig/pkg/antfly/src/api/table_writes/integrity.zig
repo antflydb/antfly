@@ -3653,6 +3653,224 @@ test "unique integrity owner topology inspection reports active and transitional
     try std.testing.expect(!topology.ranges[2].active);
 }
 
+test "foreign key integrity job diagnostics merge samples across passes" {
+    const alloc = std.testing.allocator;
+    const old_samples =
+        \\[{"group_id":7,"kind":"missing_parent","constraint_name":"orders_customer_id_fkey","child_table":"row","child_key":"order:old","parent_table":"customers","parent_key":"customer:old","parent_values":[],"observed_parent_values":[]}]
+    ;
+    const existing: db_mod.DB.ForeignKeyIntegrityJobRecord = .{
+        .job_id = "job:fk",
+        .table_name = "orders",
+        .action = "validate",
+        .worker_id = "worker",
+        .constraint_name = "orders_customer_id_fkey",
+        .lower_doc_key = "",
+        .upper_doc_key = "",
+        .lease_ms = 60_000,
+        .max_work_units = 1,
+        .status = "running",
+        .created_at_ns = 1,
+        .updated_at_ns = 2,
+        .violation_samples_json = old_samples,
+        .violation_sample_count = 1,
+    };
+
+    const old_parent_values = try alloc.alloc(ForeignKeyIntegrityTupleValue, 1);
+    old_parent_values[0] = .{
+        .column = try alloc.dupe(u8, "email"),
+        .value = try alloc.dupe(u8, "old@example.test"),
+    };
+    var new_violations = [_]ForeignKeyIntegrityViolation{
+        .{
+            .group_id = 7,
+            .kind = .missing_parent,
+            .constraint_name = try alloc.dupe(u8, "orders_customer_id_fkey"),
+            .child_table = try alloc.dupe(u8, "row"),
+            .child_key = try alloc.dupe(u8, "order:old"),
+            .parent_table = try alloc.dupe(u8, "customers"),
+            .parent_key = try alloc.dupe(u8, "customer:old"),
+        },
+        .{
+            .group_id = 8,
+            .kind = .missing_parent,
+            .constraint_name = try alloc.dupe(u8, "orders_customer_id_fkey"),
+            .child_table = try alloc.dupe(u8, "row"),
+            .child_key = try alloc.dupe(u8, "order:new"),
+            .parent_table = try alloc.dupe(u8, "customers"),
+            .parent_key = try alloc.dupe(u8, "customer:new"),
+        },
+        .{
+            .group_id = 7,
+            .kind = .missing_parent,
+            .constraint_name = try alloc.dupe(u8, "orders_customer_id_fkey"),
+            .child_table = try alloc.dupe(u8, "row"),
+            .child_key = try alloc.dupe(u8, "order:old"),
+            .parent_table = try alloc.dupe(u8, "customers"),
+            .parent_key = try alloc.dupe(u8, "customer:old"),
+            .parent_values = old_parent_values,
+        },
+    };
+    defer {
+        for (&new_violations) |*violation| violation.deinit(alloc);
+    }
+    const result: ForeignKeyIntegrityResult = .{
+        .action = .validate,
+        .valid = false,
+        .complete = true,
+        .violation_limit = 100,
+        .violations_truncated = false,
+        .report = .{ .missing_parent_rows = 2 },
+        .groups = &.{},
+        .violations = new_violations[0..],
+    };
+
+    var diagnostics = try foreignKeyIntegrityJobDiagnosticsAlloc(alloc, existing, result);
+    defer diagnostics.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), diagnostics.sample_count);
+    try std.testing.expect(!diagnostics.truncated);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.samples_json, "\"child_key\":\"order:old\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.samples_json, "\"child_key\":\"order:new\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, diagnostics.samples_json, "old@example.test") != null);
+}
+
+test "foreign key integrity job records diagnostics across incomplete passes" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-fk-job-pass-diagnostics";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+
+    try startForeignKeyIntegrityJobOnDb(
+        &db,
+        "job:fk:diagnostics",
+        "orders",
+        .validate,
+        "worker:first",
+        "orders_customer_id_fkey",
+        "",
+        "",
+        60_000,
+        2,
+    );
+
+    var first_violations = [_]ForeignKeyIntegrityViolation{.{
+        .group_id = 7,
+        .kind = .missing_parent,
+        .constraint_name = try alloc.dupe(u8, "orders_customer_id_fkey"),
+        .child_table = try alloc.dupe(u8, "row"),
+        .child_key = try alloc.dupe(u8, "order:first"),
+        .parent_table = try alloc.dupe(u8, "customers"),
+        .parent_key = try alloc.dupe(u8, "customer:first"),
+    }};
+    defer first_violations[0].deinit(alloc);
+    const first_result: ForeignKeyIntegrityResult = .{
+        .action = .validate,
+        .valid = false,
+        .complete = false,
+        .violation_limit = 100,
+        .violations_truncated = false,
+        .report = .{ .missing_parent_rows = 1 },
+        .groups = &.{},
+        .violations = first_violations[0..],
+    };
+    try finishForeignKeyIntegrityJobOnDb(alloc, &db, "job:fk:diagnostics", first_result);
+
+    {
+        const running = (try db.loadForeignKeyIntegrityJobRecord("job:fk:diagnostics")) orelse return error.TestUnexpectedResult;
+        defer db.freeForeignKeyIntegrityJobRecord(running);
+        try std.testing.expectEqualStrings("running", running.status);
+        try std.testing.expect(!running.completed);
+        try std.testing.expect(running.valid == null);
+        try std.testing.expectEqual(@as(u64, 1), running.last_report.missing_parent_rows);
+        try std.testing.expectEqual(@as(usize, 1), running.violation_sample_count);
+        try std.testing.expect(std.mem.indexOf(u8, running.violation_samples_json, "order:first") != null);
+        try std.testing.expectEqual(@as(u64, 1), running.diagnostic_passes);
+        try std.testing.expectEqual(@as(u64, 1), running.violating_passes);
+        try std.testing.expect(running.first_violation_at_ns != null);
+        try std.testing.expect(running.last_violation_at_ns != null);
+    }
+
+    try startForeignKeyIntegrityJobOnDb(
+        &db,
+        "job:fk:diagnostics",
+        "orders",
+        .validate,
+        "worker:second",
+        "orders_customer_id_fkey",
+        "",
+        "",
+        60_000,
+        2,
+    );
+    {
+        const resumed = (try db.loadForeignKeyIntegrityJobRecord("job:fk:diagnostics")) orelse return error.TestUnexpectedResult;
+        defer db.freeForeignKeyIntegrityJobRecord(resumed);
+        try std.testing.expectEqualStrings("worker:second", resumed.worker_id);
+        try std.testing.expectEqual(@as(u64, 1), resumed.last_report.missing_parent_rows);
+        try std.testing.expectEqual(@as(usize, 1), resumed.violation_sample_count);
+        try std.testing.expectEqual(@as(u64, 1), resumed.diagnostic_passes);
+        try std.testing.expectEqual(@as(u64, 1), resumed.violating_passes);
+    }
+
+    const second_result: ForeignKeyIntegrityResult = .{
+        .action = .validate,
+        .valid = false,
+        .complete = true,
+        .violation_limit = 100,
+        .violations_truncated = false,
+        .report = .{ .missing_ref_rows = 1 },
+        .groups = &.{},
+        .violations = &.{},
+    };
+    try finishForeignKeyIntegrityJobOnDb(alloc, &db, "job:fk:diagnostics", second_result);
+
+    const completed = (try db.loadForeignKeyIntegrityJobRecord("job:fk:diagnostics")) orelse return error.TestUnexpectedResult;
+    defer db.freeForeignKeyIntegrityJobRecord(completed);
+    try std.testing.expectEqualStrings("invalid", completed.status);
+    try std.testing.expect(completed.completed);
+    try std.testing.expect(!completed.valid.?);
+    try std.testing.expectEqual(@as(u64, 0), completed.last_report.missing_parent_rows);
+    try std.testing.expectEqual(@as(u64, 1), completed.last_report.missing_ref_rows);
+    try std.testing.expectEqual(@as(u64, 1), completed.aggregate_report.missing_parent_rows);
+    try std.testing.expectEqual(@as(u64, 1), completed.aggregate_report.missing_ref_rows);
+    try std.testing.expectEqual(@as(usize, 1), completed.violation_sample_count);
+    try std.testing.expect(std.mem.indexOf(u8, completed.violation_samples_json, "order:first") != null);
+    try std.testing.expectEqual(@as(u64, 2), completed.diagnostic_passes);
+    try std.testing.expectEqual(@as(u64, 2), completed.violating_passes);
+    try std.testing.expect(completed.first_violation_at_ns != null);
+    try std.testing.expect(completed.last_violation_at_ns != null);
+    try std.testing.expect(completed.last_violation_at_ns.? >= completed.first_violation_at_ns.?);
+
+    var hydrated_result: ForeignKeyIntegrityResult = .{
+        .job_id = try alloc.dupe(u8, "job:fk:diagnostics"),
+        .action = .validate,
+        .valid = false,
+        .complete = true,
+        .violation_limit = 100,
+        .violations_truncated = false,
+        .report = .{ .missing_ref_rows = 1 },
+        .groups = try alloc.alloc(ForeignKeyIntegrityGroupReport, 0),
+        .violations = try alloc.alloc(ForeignKeyIntegrityViolation, 0),
+    };
+    defer hydrated_result.deinit(alloc);
+    try hydrateForeignKeyIntegrityResultDiagnosticsFromJobOnDb(alloc, &db, 7, &hydrated_result);
+    try std.testing.expectEqual(@as(u64, 1), hydrated_result.report.missing_parent_rows);
+    try std.testing.expectEqual(@as(u64, 1), hydrated_result.report.missing_ref_rows);
+    try std.testing.expectEqual(@as(usize, 1), hydrated_result.violations.len);
+    try std.testing.expectEqual(db_mod.relational_store.ForeignKeyIntegrityViolationKind.missing_parent, hydrated_result.violations[0].kind);
+    try std.testing.expectEqualStrings("order:first", hydrated_result.violations[0].child_key);
+    try std.testing.expectEqual(@as(usize, 1), hydrated_result.jobs.len);
+    try std.testing.expectEqual(@as(u64, 7), hydrated_result.jobs[0].group_id);
+    try std.testing.expectEqual(@as(u64, 2), hydrated_result.jobs[0].diagnostic_passes);
+    try std.testing.expectEqual(@as(u64, 2), hydrated_result.jobs[0].violating_passes);
+    try std.testing.expect(hydrated_result.jobs[0].first_violation_at_ns != null);
+    try std.testing.expect(hydrated_result.jobs[0].last_violation_at_ns != null);
+}
+
 test "foreign key integrity diagnostics deduplicates violation samples" {
     const alloc = std.testing.allocator;
     var violations = try alloc.alloc(ForeignKeyIntegrityViolation, 2);
