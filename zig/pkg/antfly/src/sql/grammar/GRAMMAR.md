@@ -1173,8 +1173,8 @@ contract until storage and API row plans grow those outer-join semantics.
    validated owned expression item arrays, full multi-join
    planning/lowering and richer join-tree semantics beyond the current
   validated binary inner/left/cross join nodes with retained `ON`/`USING` or
-  conditionless cartesian payload layout and fail-closed right/full plus
-  conditionless `NATURAL JOIN` metadata, expression AST
+  conditionless cartesian payload layout, exact join-item tail validation, and
+  fail-closed right/full plus conditionless `NATURAL JOIN` metadata, expression AST
    planning/lowering beyond the current recursive
    predicate/operator/subquery-tail metadata and structural checks, broader function
    semantic planning outside the currently range-validated generic, aggregate,

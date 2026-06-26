@@ -800,6 +800,7 @@ fn validateGeneratedJoinTreeMetadataForSource(
         if (join.condition_tokens.start < join.right_tokens.end or join.condition_tokens.end > join.tokens.end) {
             return error.UnsupportedSqlShape;
         }
+        if (join.tokens.end != join.condition_tokens.end) return error.UnsupportedSqlShape;
         switch (join.condition_kind) {
             .none => {
                 if (join.kind != .cross and join.kind != .natural) return error.UnsupportedSqlShape;
@@ -5678,6 +5679,31 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_join_child_parsed_sql, malformed_join_child_read_ast),
+    );
+
+    var malformed_join_tail_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.id = accounts.id ORDER BY usage_records.id",
+    );
+    defer malformed_join_tail_parsed_sql.deinit(alloc);
+    const malformed_join_tail_generated_raw = malformed_join_tail_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_join_tail_read_ast = switch (malformed_join_tail_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    const malformed_join_tail_end = (malformed_join_tail_read_ast.order_tokens orelse return error.UnsupportedSqlShape).end;
+    malformed_join_tail_read_ast.source_tokens = .{
+        .start = (malformed_join_tail_read_ast.source_tokens orelse return error.UnsupportedSqlShape).start,
+        .end = malformed_join_tail_end,
+    };
+    malformed_join_tail_read_ast.join_tokens = .{
+        .start = (malformed_join_tail_read_ast.join_tokens orelse return error.UnsupportedSqlShape).start,
+        .end = malformed_join_tail_end,
+    };
+    malformed_join_tail_read_ast.join_items[0].tokens.end = malformed_join_tail_end;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedJoinTreeMetadata(malformed_join_tail_parsed_sql.items(), &malformed_join_tail_read_ast),
     );
 
     var malformed_join_condition_keyword_parsed_sql = try tokenized.ParsedSql.initAlloc(

@@ -270,7 +270,7 @@ pub const IdentityAllocatorSpec = struct {
     }
 };
 
-pub const LoweredDdlPlan = union(enum) {
+const LoweredDdlPlan = union(enum) {
     adapter_noop: AdapterNoopDdlPlan,
     session_catalog: SessionCatalogPlan,
     create_table: CreateTablePlan,
@@ -364,7 +364,7 @@ pub const DdlPlanParserOptions = struct {
     row_security_policy_options: RowSecurityPolicyOptions,
 };
 
-pub fn parseDdlPlanAlloc(
+fn parseDdlPlanAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     pos: *usize,
