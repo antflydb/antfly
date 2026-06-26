@@ -2399,6 +2399,7 @@ pub const UniquePredicateWhereExpressionParserOptions = struct {
 pub const AggregateOutputFieldExpressionConditionParserOptions = struct {
     params: []const value_mod.SqlValue = &.{},
     output_field_options: AggregateOutputFieldParserOptions,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
 };
 
 pub const ReturningProjectionParserOptions = struct {
@@ -2421,6 +2422,7 @@ pub const JoinedMutationReturningProjectionParserOptions = struct {
 pub const AggregateOutputExpressionConditionParserOptions = struct {
     context_hooks: SelectParserContextHooks,
     case_expression_hooks: CaseExpressionParserHooks,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
 };
 
 pub const BareBooleanAggregateHavingExpressionParserOptions = struct {
@@ -11856,10 +11858,12 @@ pub fn parseAggregateOutputFieldExpressionConditionAlloc(
         switch (is_tail.kind) {
             .distinct_comparison, .null_test => {},
             .boolean_unknown => {
+                try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, generatedIsTailExpressionKind(is_tail));
                 if (column.field_type != .boolean) return error.InvalidSqlCatalog;
                 break :blk is_tail.op;
             },
             .boolean_literal => {
+                try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, generatedIsTailExpressionKind(is_tail));
                 if (column.field_type != .boolean) return error.InvalidSqlCatalog;
                 const value_json = try alloc.dupe(u8, value_mod.booleanJson(is_tail.boolean_value));
                 errdefer alloc.free(value_json);
@@ -11885,6 +11889,7 @@ pub fn parseAggregateOutputFieldExpressionConditionAlloc(
         }
         break :blk is_tail.op;
     } else try parseComparisonOp(tokens, pos);
+    try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, generatedComparisonExpressionKindForOp(op));
 
     const lhs: db_mod.types.RelationalRowsExpression = .{
         .kind = .field,
@@ -11935,7 +11940,7 @@ pub fn parseAggregateOutputExpressionConditionAlloc(
         .storage_mode = .relational,
         .relational_columns = output_columns,
     };
-    return try parseCaseExpressionConditionWithSelectSchemaAlloc(
+    const condition = try parseCaseExpressionConditionWithSelectSchemaAlloc(
         alloc,
         tokens,
         pos,
@@ -11943,6 +11948,11 @@ pub fn parseAggregateOutputExpressionConditionAlloc(
         options.context_hooks,
         options.case_expression_hooks,
     );
+    var condition_transferred = false;
+    errdefer if (!condition_transferred) freeExpressionCondition(alloc, condition);
+    try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, generatedComparisonExpressionKindForOp(condition.op));
+    condition_transferred = true;
+    return condition;
 }
 
 pub fn parseAggregateOutputOrderExpressionAlloc(
@@ -12089,6 +12099,8 @@ pub fn parseAggregateHavingBooleanIsNotGroups(
 
     const column = try aggregateOutputColumnForFieldAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations, field);
     const value = (try value_mod.parseSqlBooleanIsValue(tokens, pos, column)) orelse return error.UnsupportedSqlShape;
+    const expected_kind: generated_parser.GeneratedSqlExpressionKind = if (value) .is_not_true else .is_not_false;
+    try validateGeneratedExpressionPredicateKind(options.generated_expression_ast, expected_kind);
     try appendBooleanIsNotExpressionGroups(alloc, groups, field, value);
     return true;
 }
@@ -12570,19 +12582,26 @@ pub fn parseAggregateHavingConditionAlternativesAlloc(
     aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
     field_options: AggregateOutputFieldExpressionConditionParserOptions,
     expression_options: AggregateOutputExpressionConditionParserOptions,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
     if (value_mod.matchStandaloneSqlBooleanLiteral(tokens, pos)) |enabled| {
         try appendBooleanConstantExpressionGroup(alloc, alternatives, enabled);
         return;
     }
-    if (try parseAggregateHavingBooleanIsNotGroups(alloc, tokens, pos, schema, type_context, alternatives, group_fields, group_expressions, aggregations, field_options)) {
+    const generated_condition_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+    var field_options_with_generated = field_options;
+    field_options_with_generated.generated_expression_ast = generated_condition_expression;
+    var expression_options_with_generated = expression_options;
+    expression_options_with_generated.generated_expression_ast = generated_condition_expression;
+
+    if (try parseAggregateHavingBooleanIsNotGroups(alloc, tokens, pos, schema, type_context, alternatives, group_fields, group_expressions, aggregations, field_options_with_generated)) {
         return;
     }
 
     const condition = if (peekAggregateHavingExpression(tokens, pos.*))
-        try parseAggregateOutputExpressionConditionAlloc(alloc, tokens, pos, schema, type_context, group_fields, group_expressions, aggregations, expression_options)
+        try parseAggregateOutputExpressionConditionAlloc(alloc, tokens, pos, schema, type_context, group_fields, group_expressions, aggregations, expression_options_with_generated)
     else
-        try parseAggregateOutputFieldExpressionConditionAlloc(alloc, tokens, pos, schema, type_context, group_fields, group_expressions, aggregations, field_options);
+        try parseAggregateOutputFieldExpressionConditionAlloc(alloc, tokens, pos, schema, type_context, group_fields, group_expressions, aggregations, field_options_with_generated);
     var condition_transferred = false;
     errdefer if (!condition_transferred) freeExpressionCondition(alloc, condition);
 
@@ -12607,8 +12626,12 @@ pub fn parseAggregateHavingNotGroupAlloc(
     aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
     field_options: AggregateOutputFieldExpressionConditionParserOptions,
     expression_options: AggregateOutputExpressionConditionParserOptions,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
     try parser.expectKeyword(tokens, pos, "not");
+    if (generated_expression_ast) |expression| {
+        if (expression.kind != .logical_not) return error.UnsupportedSqlShape;
+    }
     try parser.expectToken(tokens, pos, .lparen);
     var groups = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
     var groups_transferred = false;
@@ -12634,6 +12657,7 @@ pub fn parseAggregateHavingNotGroupAlloc(
             aggregations,
             field_options,
             expression_options,
+            generated_expression_ast,
         );
         try andExpressionPredicateAlternatives(alloc, &groups, alternatives.items);
         freeExpressionPredicateGroups(alloc, alternatives.items);
@@ -12658,6 +12682,7 @@ pub fn parseAggregateHavingOrGroupsAlloc(
     aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
     field_options: AggregateOutputFieldExpressionConditionParserOptions,
     expression_options: AggregateOutputExpressionConditionParserOptions,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
     while (true) {
         const parenthesized = matchBooleanGroupOpen(tokens, pos);
@@ -12685,6 +12710,7 @@ pub fn parseAggregateHavingOrGroupsAlloc(
                 aggregations,
                 field_options,
                 expression_options,
+                generated_expression_ast,
             );
             try andExpressionPredicateAlternatives(alloc, &groups, alternatives.items);
             freeExpressionPredicateGroups(alloc, alternatives.items);
@@ -12717,27 +12743,32 @@ pub fn parseAggregateHavingAlloc(
     field_condition_options: AggregateOutputFieldExpressionConditionParserOptions,
     expression_condition_options: AggregateOutputExpressionConditionParserOptions,
     bare_boolean_options: BareBooleanAggregateHavingExpressionParserOptions,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
     if (try canParseBareBooleanAggregateHavingExpression(alloc, tokens, pos.*, schema, type_context, group_fields, group_expressions, aggregations)) {
         try parseBareBooleanAggregateHavingExpression(alloc, tokens, pos, schema, type_context, expressions, group_fields, group_expressions, aggregations, bare_boolean_options);
         return;
     }
     if (parser.hasTopLevelOrBeforeTailToken(tokens, pos.*, sqlWhereTailClauseKeywordToken) or aggregateHavingHasBooleanIsNot(tokens, pos.*)) {
-        try parseAggregateHavingOrGroupsAlloc(alloc, tokens, pos, schema, type_context, any_groups, group_fields, group_expressions, aggregations, field_condition_options, expression_condition_options);
+        try parseAggregateHavingOrGroupsAlloc(alloc, tokens, pos, schema, type_context, any_groups, group_fields, group_expressions, aggregations, field_condition_options, expression_condition_options, generated_expression_ast);
         return;
     }
     while (true) {
         if (canParseAggregateHavingNot(tokens, pos.*)) {
-            try parseAggregateHavingNotGroupAlloc(alloc, tokens, pos, schema, type_context, not_groups, group_fields, group_expressions, aggregations, field_condition_options, expression_condition_options);
+            const generated_condition_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+            try parseAggregateHavingNotGroupAlloc(alloc, tokens, pos, schema, type_context, not_groups, group_fields, group_expressions, aggregations, field_condition_options, expression_condition_options, generated_condition_expression);
         } else if (value_mod.matchStandaloneSqlBooleanLiteral(tokens, pos)) |enabled| {
             if (!enabled) try appendBooleanConstantExpressionCondition(alloc, expressions, false);
         } else if (peekAggregateHavingExpression(tokens, pos.*)) {
-            const condition = try parseAggregateOutputExpressionConditionAlloc(alloc, tokens, pos, schema, type_context, group_fields, group_expressions, aggregations, expression_condition_options);
+            var expression_options_with_generated = expression_condition_options;
+            expression_options_with_generated.generated_expression_ast = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
+            const condition = try parseAggregateOutputExpressionConditionAlloc(alloc, tokens, pos, schema, type_context, group_fields, group_expressions, aggregations, expression_options_with_generated);
             var condition_transferred = false;
             errdefer if (!condition_transferred) freeExpressionCondition(alloc, condition);
             try expressions.append(alloc, condition);
             condition_transferred = true;
         } else {
+            const generated_condition_expression = try generatedPredicateExpressionAtStart(pos.*, generated_expression_ast);
             const field = try parseAggregateOutputFieldAlloc(alloc, tokens, pos, group_fields, group_expressions, aggregations, output_field_options);
             var field_transferred = false;
             errdefer if (!field_transferred) alloc.free(field);
@@ -12750,10 +12781,12 @@ pub fn parseAggregateHavingAlloc(
                 switch (is_tail.kind) {
                     .distinct_comparison, .null_test => {},
                     .boolean_unknown => {
+                        try validateGeneratedExpressionPredicateKind(generated_condition_expression, generatedIsTailExpressionKind(is_tail));
                         if (column.field_type != .boolean) return error.InvalidSqlCatalog;
                         break :blk is_tail.op;
                     },
                     .boolean_literal => {
+                        try validateGeneratedExpressionPredicateKind(generated_condition_expression, generatedIsTailExpressionKind(is_tail));
                         if (column.field_type != .boolean) return error.InvalidSqlCatalog;
                         const value_json = try alloc.dupe(u8, value_mod.booleanJson(is_tail.boolean_value));
                         var value_transferred = false;
@@ -12772,6 +12805,7 @@ pub fn parseAggregateHavingAlloc(
                 }
                 break :blk is_tail.op;
             } else try parseComparisonOp(tokens, pos);
+            try validateGeneratedExpressionPredicateKind(generated_condition_expression, generatedComparisonExpressionKindForOp(op));
             const value_json = switch (op) {
                 .is_null, .is_not_null => null,
                 else => try value_mod.parseJsonValueAlloc(alloc, tokens, pos, params),
@@ -18731,6 +18765,10 @@ pub fn parseAggregateAlloc(
             if (distinct_group_only) return error.UnsupportedSqlShape;
             const keyword_index = pos.* - 1;
             const generated_having_end = try generatedHavingClauseEnd(tokens, keyword_index, pos.*, options.generated_read_ast);
+            const generated_having_expression: ?*const generated_parser.GeneratedSqlExpressionAst = if (generated_having_end != null) blk: {
+                const generated_read = options.generated_read_ast orelse return error.UnsupportedSqlShape;
+                break :blk &generated_read.having_expression;
+            } else null;
             try parseAggregateHavingAlloc(
                 alloc,
                 tokens,
@@ -18755,6 +18793,7 @@ pub fn parseAggregateAlloc(
                     .context_hooks = options.context_hooks,
                     .bare_boolean_hooks = options.bare_boolean_hooks,
                 },
+                generated_having_expression,
             );
             if (generated_having_end) |end| {
                 if (pos.* != end) return error.UnsupportedSqlShape;
@@ -32146,6 +32185,25 @@ fn setGeneratedReadWhereExpressionKind(
     return error.TestUnexpectedResult;
 }
 
+fn setGeneratedReadHavingExpressionKind(
+    parsed_sql: *tokenized.ParsedSql,
+    kind: generated_parser.GeneratedSqlExpressionKind,
+) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (read.having_tokens == null) return error.TestUnexpectedResult;
+                    read.having_expression.kind = kind;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn setGeneratedReadWhereFirstBooleanConditionKind(
     parsed_sql: *tokenized.ParsedSql,
     kind: generated_parser.GeneratedSqlExpressionKind,
@@ -32155,6 +32213,25 @@ fn setGeneratedReadWhereFirstBooleanConditionKind(
             switch (generated_ast.*) {
                 .read => |read| {
                     if (!setGeneratedExpressionFirstBooleanConditionKind(&read.where_expression, kind)) return error.TestUnexpectedResult;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn setGeneratedReadHavingFirstBooleanConditionKind(
+    parsed_sql: *tokenized.ParsedSql,
+    kind: generated_parser.GeneratedSqlExpressionKind,
+) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    if (read.having_tokens == null) return error.TestUnexpectedResult;
+                    if (!setGeneratedExpressionFirstBooleanConditionKind(&read.having_expression, kind)) return error.TestUnexpectedResult;
                     return;
                 },
                 else => return error.TestUnexpectedResult,
@@ -32784,6 +32861,32 @@ test "sql adapter lower expr lowers grouped aggregate queries with generated gro
     try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
         alloc,
         &malformed_having,
+        schema,
+        &.{},
+    ));
+
+    var malformed_having_expression_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT status, SUM(amount) AS total FROM usage_records GROUP BY status HAVING total > 10 ORDER BY total DESC LIMIT 5",
+    );
+    defer malformed_having_expression_kind.deinit(alloc);
+    try setGeneratedReadHavingExpressionKind(&malformed_having_expression_kind, .between);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
+        alloc,
+        &malformed_having_expression_kind,
+        schema,
+        &.{},
+    ));
+
+    var malformed_having_boolean_child_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT status, SUM(amount) AS total FROM usage_records GROUP BY status HAVING total > 10 OR total = 0 ORDER BY total DESC LIMIT 5",
+    );
+    defer malformed_having_boolean_child_kind.deinit(alloc);
+    try setGeneratedReadHavingFirstBooleanConditionKind(&malformed_having_boolean_child_kind, .between);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedAggregateForLowerExprTestAlloc(
+        alloc,
+        &malformed_having_boolean_child_kind,
         schema,
         &.{},
     ));

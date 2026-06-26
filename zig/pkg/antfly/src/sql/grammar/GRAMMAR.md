@@ -994,7 +994,10 @@ Unsupported DDL remains on the existing parser until
    threaded into expression alternative lowering, including inside generated
    logical `NOT` groups, so child predicate metadata is validated while
    boolean expression groups are expanded;
-   aggregate `HAVING` clauses apply the same clause-span guard.
+   aggregate `HAVING` clauses apply the same clause-span guard and now thread
+   generated predicate metadata into typed output-field, output-expression,
+   `OR`, and `NOT` lowering so stale comparison or boolean-test kinds fail
+   closed before aggregate plans are accepted.
    Generated named `WINDOW` clauses now validate top-level window item,
    name/definition, partition list, order list, and frame expression spans
    before the typed window lowerer accepts a consumed `WINDOW` tail.
