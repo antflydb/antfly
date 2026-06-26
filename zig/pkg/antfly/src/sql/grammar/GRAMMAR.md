@@ -1105,8 +1105,10 @@ contract until storage and API row plans grow those outer-join semantics.
    typed window specs validate the retained function-name token before
    accepting generated `OVER` metadata;
    scalar expression predicate lowering now validates exact-range generated
-   function-call metadata against the typed row-expression function kind before
-   accepting retained predicate payloads;
+   function-call metadata against the typed row-expression function kind, and
+   exact-range generated JSON key/extract and string-concat operator metadata
+   against the typed row-expression operator kind, before accepting retained
+   predicate payloads;
    select-list,
    `GROUP BY`, and order-expression item handoffs now also require the
    retained generated expression payload to be internally valid at the lookup
@@ -1178,7 +1180,7 @@ contract until storage and API row plans grow those outer-join semantics.
    subquery semantic planning/lowering beyond retained generated payload
    validation, remaining specialized expression operators, richer
    inline window-expression semantic planning beyond current generated `OVER`
-   clause span validation, broader recursive CTE semantic planning beyond the
+   clause span and argument-range validation, broader recursive CTE semantic planning beyond the
    current generated-first lowering boundary and validated body
    clause/list/expression/join/window/pagination/row-lock metadata, and
    unsupported-shape diagnostics.

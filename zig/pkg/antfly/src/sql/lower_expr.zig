@@ -2909,7 +2909,21 @@ fn generatedFunctionNameMatchesRowExpressionKind(
     };
 }
 
-fn validateGeneratedRowExpressionFunctionIdentity(
+fn generatedOperatorKindMatchesRowExpressionKind(
+    generated_kind: generated_parser.GeneratedSqlExpressionKind,
+    parsed_expression: db_mod.types.RelationalRowsExpression,
+) ?bool {
+    return switch (generated_kind) {
+        .string_concat => parsed_expression.kind == .concat,
+        .json_access, .json_text_access, .json_path_access, .json_path_text_access => parsed_expression.kind == .json_extract,
+        .json_key_exists => parsed_expression.kind == .json_path_exists,
+        .json_key_any => parsed_expression.kind == .json_path_exists or parsed_expression.kind == .bool_or,
+        .json_key_all => parsed_expression.kind == .json_path_exists or parsed_expression.kind == .bool_and,
+        else => null,
+    };
+}
+
+fn validateGeneratedRowExpressionIdentity(
     tokens: []const Token,
     start: usize,
     end: usize,
@@ -2919,10 +2933,20 @@ fn validateGeneratedRowExpressionFunctionIdentity(
     const root = generated_expression_ast orelse return;
     const range: generated_parser.GeneratedSqlTokenRange = .{ .start = start, .end = end };
     const generated_expression = generatedExpressionForExactRange(root, range) orelse return;
-    if (generated_expression.kind != .function_call) return;
-    const token = try generatedExpressionFunctionNameToken(tokens, generated_expression.*);
-    if (generatedFunctionNameMatchesRowExpressionKind(token, parsed_expression.kind)) |matches| {
-        if (!matches) return error.UnsupportedSqlShape;
+    switch (generated_expression.kind) {
+        .function_call => {
+            const token = try generatedExpressionFunctionNameToken(tokens, generated_expression.*);
+            if (generatedFunctionNameMatchesRowExpressionKind(token, parsed_expression.kind)) |matches| {
+                if (!matches) return error.UnsupportedSqlShape;
+            }
+        },
+        else => {
+            if (generatedOperatorKindMatchesRowExpressionKind(generated_expression.kind, parsed_expression)) |matches| {
+                if (!matches) return error.UnsupportedSqlShape;
+                const operator_tokens = generated_expression.operator_tokens orelse return error.UnsupportedSqlShape;
+                try validateGeneratedExpressionOperatorTokens(tokens, generated_expression.kind, operator_tokens);
+            }
+        },
     }
 }
 
@@ -2944,7 +2968,7 @@ fn parseExpressionWhereConditionRowExpressionAlloc(
         options.variadic_hooks,
     );
     errdefer freeExpression(alloc, expression);
-    try validateGeneratedRowExpressionFunctionIdentity(
+    try validateGeneratedRowExpressionIdentity(
         tokens,
         start,
         pos.*,
@@ -23383,7 +23407,7 @@ pub fn parseOrderExpressionAlloc(
         const expression = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
         var expression_transferred = false;
         errdefer if (!expression_transferred) freeExpression(alloc, expression);
-        try validateGeneratedRowExpressionFunctionIdentity(
+        try validateGeneratedRowExpressionIdentity(
             tokens,
             expression_start,
             pos.*,
@@ -23423,7 +23447,7 @@ pub fn parseOrderExpressionAlloc(
             const expression = try parseParenthesizedRowExpressionAlloc(alloc, tokens, pos, options.parenthesized);
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(alloc, expression);
-            try validateGeneratedRowExpressionFunctionIdentity(
+            try validateGeneratedRowExpressionIdentity(
                 tokens,
                 expression_start,
                 pos.*,
@@ -23439,7 +23463,7 @@ pub fn parseOrderExpressionAlloc(
             const expression = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(alloc, expression);
-            try validateGeneratedRowExpressionFunctionIdentity(
+            try validateGeneratedRowExpressionIdentity(
                 tokens,
                 expression_start,
                 pos.*,
@@ -23464,7 +23488,7 @@ pub fn parseOrderExpressionAlloc(
             const expression = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(alloc, expression);
-            try validateGeneratedRowExpressionFunctionIdentity(
+            try validateGeneratedRowExpressionIdentity(
                 tokens,
                 expression_start,
                 pos.*,
@@ -23500,7 +23524,7 @@ pub fn parseOrderExpressionAlloc(
             );
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(alloc, expression);
-            try validateGeneratedRowExpressionFunctionIdentity(
+            try validateGeneratedRowExpressionIdentity(
                 tokens,
                 expression_start,
                 pos.*,
@@ -23528,7 +23552,7 @@ pub fn parseOrderExpressionAlloc(
             const expression = try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .md5, type_context, .text, options.fixed_unary);
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(alloc, expression);
-            try validateGeneratedRowExpressionFunctionIdentity(
+            try validateGeneratedRowExpressionIdentity(
                 tokens,
                 expression_start,
                 pos.*,
@@ -23543,7 +23567,7 @@ pub fn parseOrderExpressionAlloc(
             const expression = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(alloc, expression);
-            try validateGeneratedRowExpressionFunctionIdentity(
+            try validateGeneratedRowExpressionIdentity(
                 tokens,
                 expression_start,
                 pos.*,
@@ -23570,7 +23594,7 @@ pub fn parseOrderExpressionAlloc(
         const expression = try parseArithmeticExpressionRestAlloc(alloc, tokens, pos, .{ .kind = .field, .field = field }, 0, type_context, options.arithmetic_hooks);
         var expression_transferred = false;
         errdefer if (!expression_transferred) freeExpression(alloc, expression);
-        try validateGeneratedRowExpressionFunctionIdentity(
+        try validateGeneratedRowExpressionIdentity(
             tokens,
             expression_start,
             pos.*,
@@ -33184,6 +33208,25 @@ fn setGeneratedReadWhereExpressionKind(
     return error.TestUnexpectedResult;
 }
 
+fn setGeneratedReadWhereLeftExpressionKind(
+    parsed_sql: *tokenized.ParsedSql,
+    kind: generated_parser.GeneratedSqlExpressionKind,
+) !void {
+    if (parsed_sql.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .read => |read| {
+                    const left_expression = read.where_expression.left_expression orelse return error.TestUnexpectedResult;
+                    left_expression.kind = kind;
+                    return;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 fn setGeneratedReadHavingExpressionKind(
     parsed_sql: *tokenized.ParsedSql,
     kind: generated_parser.GeneratedSqlExpressionKind,
@@ -35031,6 +35074,20 @@ test "sql adapter lower expr lowers jsonb containment existence and extraction p
     try std.testing.expectEqualStrings("flags", key_set_exists.plan.query.expression_predicates[0].lhs.operands[0].json_path);
     try std.testing.expectEqualStrings("billing", key_set_exists.plan.query.expression_predicates[0].lhs.operands[1].json_path);
     try std.testing.expectEqualStrings("true", key_set_exists.plan.query.expression_predicates[0].rhs[0].value_json);
+
+    var malformed_generated_key_set_kind = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE (metadata ?& ARRAY['flags', 'billing']) IS TRUE ORDER BY id ASC LIMIT 5",
+    );
+    defer malformed_generated_key_set_kind.deinit(alloc);
+    try setGeneratedReadWhereLeftExpressionKind(&malformed_generated_key_set_kind, .json_key_any);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &malformed_generated_key_set_kind,
+        schema,
+        &.{},
+        .{},
+    ));
 
     var negated_key_set_exists = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
