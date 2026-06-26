@@ -408,14 +408,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    const linalg_bench_exe = b.addExecutable(.{
-        .name = "antfly-inference-linalg-bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/linalg_bench.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-        }),
-    });
     training_bench_exe.root_module.addImport("build_options", build_options_mod);
     training_bench_exe.root_module.addImport("ml", ml_mod);
     configureNativeTool(b, training_bench_exe, target, enable_system_blas, blas_root, enable_metal);
@@ -425,13 +417,6 @@ pub fn build(b: *std.Build) void {
     }
     const training_bench_step = b.step("bench-training", "Run the native training benchmark");
     training_bench_step.dependOn(&run_training_bench.step);
-    linalg_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
-    const run_linalg_bench = b.addRunArtifact(linalg_bench_exe);
-    if (b.args) |args| {
-        run_linalg_bench.addArgs(args);
-    }
-    const linalg_bench_step = b.step("bench-linalg", "Run the shared linalg benchmark");
-    linalg_bench_step.dependOn(&run_linalg_bench.step);
 
     const clipclap_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-clipclap-kernels-bench",
@@ -590,24 +575,6 @@ pub fn build(b: *std.Build) void {
     }
     const reranker_e2e_bench_step = b.step("bench-reranker-e2e", "Run real-bundle text reranker E2E benchmarks");
     reranker_e2e_bench_step.dependOn(&run_reranker_e2e_bench.step);
-
-    const audio_bench_exe = b.addExecutable(.{
-        .name = "antfly-inference-audio-bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/audio_bench.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-        }),
-    });
-    audio_bench_exe.root_module.addImport("build_options", build_options_mod);
-    audio_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
-    audio_bench_exe.root_module.link_libc = true;
-    const run_audio_bench = b.addRunArtifact(audio_bench_exe);
-    if (b.args) |args| {
-        run_audio_bench.addArgs(args);
-    }
-    const audio_bench_step = b.step("bench-audio", "Run the checked-in audio decode and synthesis benchmark");
-    audio_bench_step.dependOn(&run_audio_bench.step);
 
     // Tests
     const runtime_test_filter = b.option(bool, "runtime-test-filter", "Build unit tests with a simple runtime-filtering test runner") orelse false;

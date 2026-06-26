@@ -1190,6 +1190,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .lib_image_spng_paths = lib_image_spng_paths,
         .lib_image_enable_spng = lib_image_enable_spng,
+        .inference_linalg_mod = inference_graph.inference_linalg_mod,
+        .inference_audio_mod = inference_graph.inference_audio_mod,
     });
 
     const image_conformance_steps = antfly_conformance_build.addImageConformanceSteps(.{

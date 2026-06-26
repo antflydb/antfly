@@ -1030,7 +1030,8 @@ contract until storage and API row plans grow those outer-join semantics.
    clause body; simple generated read, aggregate, window, join, and lateral
    `WHERE` lowering now also threads single-atom generated predicate ASTs into
    the typed atom parsers so quantified `ANY`/`SOME`/`ALL` branches fail
-   closed when the retained generated expression kind does not match; typed
+   closed when the retained generated expression kind, comparison operator
+   token, or quantifier token does not match the typed parser branch; typed
    expression predicate lowering similarly consumes generated single-atom
    metadata for comparison, null/boolean/distinct `IS` predicates,
    `IN`/`BETWEEN`, regex, and `LIKE`/`ILIKE` predicates so stale operator

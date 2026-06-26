@@ -117,7 +117,7 @@ with explicit errors rather than falling back silently.
 - Legacy aliases remain wrappers, not a second product surface.
 - `zig build finetune -- <args>` runs the same binary and dispatcher as the
   installed CLI.
-- `zig build test-finetune` and the root antfly inference test cover the dispatcher,
+- `zig build finetune-test` and the root antfly inference test cover the dispatcher,
   recipe plan manifests, and synthetic smoke fixtures.
 - CPU-only smoke paths are mandatory in CI; accelerator paths are separate
   opt-in lanes with clear skip behavior.
@@ -135,7 +135,7 @@ Keep a small developer surface:
 
 ```sh
 zig build finetune -- <args passed to antfly inference finetune>
-zig build test-finetune
+zig build finetune-test
 ```
 
 Optional narrowly scoped test steps are acceptable when they are real test
@@ -407,7 +407,7 @@ Migrate toward the target surface directly:
 8. Convert reranker, ColQwen2, LayoutLMv3, and fused chunker.
 9. Collapse `build/finetune/tools.zig` and `build/finetune/workflows.zig` once
    the CLI owns the surface.
-10. Keep only focused `test-finetune*` build steps.
+10. Keep only focused finetune test build steps.
 
 ## Non-Goals
 

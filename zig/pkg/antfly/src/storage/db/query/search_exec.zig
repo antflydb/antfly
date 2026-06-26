@@ -4780,7 +4780,13 @@ fn searchDenseInternal(
             !unresolved_stored_filters;
         if (load_stored_before_postprocess) {
             const load_start = platform_time.monotonicNs();
-            stored_data = try executor.load_projected_document(executor.ctx, alloc, postprocess_req, doc_key);
+            stored_data = executor.load_projected_document(executor.ctx, alloc, postprocess_req, doc_key) catch |err| switch (err) {
+                error.StoredDocMissing => {
+                    if (doc_key_owned) alloc.free(doc_key);
+                    continue;
+                },
+                else => return err,
+            };
             stored_data_owned = true;
             profile.load_projected_document_ns += platform_time.monotonicNs() - load_start;
         }
@@ -4880,7 +4886,10 @@ fn loadMissingProjectedDenseHitDocuments(
 ) !void {
     for (hits) |*hit| {
         if (hit.stored_data != null) continue;
-        hit.stored_data = try executor.load_projected_document(executor.ctx, alloc, req, hit.id);
+        hit.stored_data = executor.load_projected_document(executor.ctx, alloc, req, hit.id) catch |err| switch (err) {
+            error.StoredDocMissing => continue,
+            else => return err,
+        };
     }
 }
 

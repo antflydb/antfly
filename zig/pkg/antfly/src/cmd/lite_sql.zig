@@ -213,10 +213,16 @@ fn executeParsedSqlJsonAlloc(allocator: Allocator, db: *antfly.db.DB, session: *
 }
 
 fn executeDdlAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session, parsed_sql: *const sql_adapter.ParsedSql) ![]u8 {
-    var plan = try sql_adapter.lowerDdlPlanParsedSqlAlloc(allocator, parsed_sql);
-    defer plan.deinit(allocator);
+    var logical_plan = try sql_adapter.planDdlLogicalPlanParsedSqlWithFunctionBindingsAlloc(allocator, parsed_sql, .{});
+    defer logical_plan.deinit(allocator);
+    var table_plan = switch (logical_plan) {
+        .table_ddl => |plan| plan,
+        else => return error.UnsupportedSqlShape,
+    };
+    logical_plan = .{ .other_ddl = .{ .moved = {} } };
+    defer table_plan.deinit(allocator);
 
-    const table_name = try ddlTargetTableNameAlloc(allocator, plan, session.catalog.session());
+    const table_name = try ddlTargetTableNameAlloc(allocator, table_plan, session.catalog.session());
     defer allocator.free(table_name);
 
     const existing_table = try loadLiteSqlTableRecordForTargetAlloc(allocator, db, table_name, session.catalog.session());
@@ -230,10 +236,10 @@ fn executeDdlAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session, p
         .desired_replica_count = 1,
     };
 
-    var applied = try tables_api.applyRelationalSqlDdlPlanToTableRecordWithSessionAlloc(
+    var applied = try tables_api.applyTableDdlPlanToTableRecordWithSessionAlloc(
         allocator,
         &base_table,
-        &plan,
+        &table_plan,
         session.catalog.session(),
     );
     defer applied.deinit(allocator);
@@ -558,8 +564,8 @@ const DbUniqueSelectorResolverContext = struct {
     }
 };
 
-fn ddlTargetTableNameAlloc(allocator: Allocator, plan: sql_adapter.LoweredDdlPlan, session: catalog_resources.SqlCatalogSession) ![]u8 {
-    var target = try tables_api.relationalSqlDdlTargetForPlanWithSessionAlloc(allocator, plan, session);
+fn ddlTargetTableNameAlloc(allocator: Allocator, plan: sql_adapter.TableDdlLogicalPlan, session: catalog_resources.SqlCatalogSession) ![]u8 {
+    var target = try tables_api.relationalSqlDdlTargetForTablePlanWithSessionAlloc(allocator, plan, session);
     defer target.deinit(allocator);
     if (target.table_name.len == 0) return error.UnsupportedSqlShape;
     return try allocator.dupe(u8, target.table_name);

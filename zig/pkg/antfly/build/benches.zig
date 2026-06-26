@@ -29,6 +29,41 @@ pub fn addLibraryBenchSteps(ctx: anytype) void {
     const target = ctx.target;
     const lib_image_spng_paths = ctx.lib_image_spng_paths;
     const lib_image_enable_spng = ctx.lib_image_enable_spng;
+    const inference_linalg_mod = ctx.inference_linalg_mod;
+    const inference_audio_mod = ctx.inference_audio_mod;
+
+    const linalg_bench = b.addExecutable(.{
+        .name = "lib-linalg-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/lib/linalg_bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    linalg_bench.root_module.addImport("inference_linalg", inference_linalg_mod);
+    const run_linalg_bench = b.addRunArtifact(linalg_bench);
+    if (b.args) |args| {
+        run_linalg_bench.addArgs(args);
+    }
+    const linalg_bench_step = b.step("bench-linalg", "Run lib/linalg benchmarks");
+    linalg_bench_step.dependOn(&run_linalg_bench.step);
+
+    const audio_bench = b.addExecutable(.{
+        .name = "lib-audio-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/lib/audio_bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    audio_bench.root_module.addImport("inference_audio", inference_audio_mod);
+    audio_bench.root_module.link_libc = true;
+    const run_audio_bench = b.addRunArtifact(audio_bench);
+    if (b.args) |args| {
+        run_audio_bench.addArgs(args);
+    }
+    const audio_bench_step = b.step("bench-audio", "Run lib/audio decode and synthesis benchmarks");
+    audio_bench_step.dependOn(&run_audio_bench.step);
 
     const lib_image_bench_build_options = b.addOptions();
     lib_image_bench_build_options.addOption(bool, "enable_spng", lib_image_enable_spng);

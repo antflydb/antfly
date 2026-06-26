@@ -144,7 +144,7 @@ const tests = [_]common.TestSpec{
 };
 
 pub fn register(ctx: common.Context) void {
-    const aggregate = ctx.b.step("test-finetune", "Run all focused fine-tuning tests");
+    const aggregate = ctx.b.step("finetune-test", "Run all focused fine-tuning tests");
     for (tests) |spec| {
         const step = common.addTest(ctx, spec);
         aggregate.dependOn(step);

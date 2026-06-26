@@ -24,10 +24,8 @@ const delegated_steps = [_]DelegatedStep{
     .{ .public_name = "finetune", .package_step = "finetune" },
     .{ .public_name = "bench-paged-attention", .package_step = "bench-paged-attention" },
     .{ .public_name = "bench-training", .package_step = "bench-training" },
-    .{ .public_name = "bench-linalg", .package_step = "bench-linalg" },
-    .{ .public_name = "bench-audio", .package_step = "bench-audio" },
     .{ .public_name = "bench-gliner2-native", .package_step = "bench-gliner2-native" },
-    .{ .public_name = "finetune-test", .package_step = "test-finetune" },
+    .{ .public_name = "finetune-test", .package_step = "finetune-test" },
     .{ .public_name = "test", .package_step = "test" },
     .{ .public_name = "wasm", .package_step = "wasm" },
 };

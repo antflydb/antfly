@@ -72,8 +72,8 @@ delegated root steps when possible:
 zig build inference-run
 zig build inference-test
 zig build inference-wasm
-zig build inference-bench-linalg
-zig build inference-bench-audio
+zig build bench-linalg
+zig build bench-audio
 ```
 
 For package-local inference work:

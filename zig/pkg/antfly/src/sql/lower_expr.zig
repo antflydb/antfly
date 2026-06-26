@@ -4251,14 +4251,17 @@ pub fn parseValueEqualsAnyArrayPredicateAlloc(
     returning_expression_qualifiers: []const []const u8,
     defer_row_expression_field_validation: bool,
     array_any: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayAnyPredicate),
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !bool {
     if (!valueEqualsAnyArrayPredicateCanStart(tokens, pos.*)) return false;
 
     const value_json = try value_mod.parseJsonValueAlloc(alloc, tokens, pos, params);
     var value_transferred = false;
     errdefer if (!value_transferred) alloc.free(value_json);
+    const operator_token_index = pos.*;
     try parser.expectToken(tokens, pos, .eq);
     if (!matchAnyOrSomeKeyword(tokens, pos)) return error.UnsupportedSqlShape;
+    try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast, tokens, operator_token_index, pos.* - 1);
     try parser.expectToken(tokens, pos, .lparen);
     const parsed_field = try parseRowExpressionFieldOwnedAlloc(
         alloc,
@@ -4538,9 +4541,10 @@ pub fn parseScalarWhereSetIntoOrBranchesAlloc(
         return true;
     }
 
+    const op_token_index = pos.*;
     const op = try parseComparisonOp(tokens, pos);
     if (op == .eq and matchAnyOrSomeKeyword(tokens, pos)) {
-        try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast);
+        try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast, tokens, op_token_index, pos.* - 1);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -4549,7 +4553,7 @@ pub fn parseScalarWhereSetIntoOrBranchesAlloc(
         return true;
     }
     if (op == .ne and matchAnyOrSomeKeyword(tokens, pos)) {
-        try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast);
+        try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast, tokens, op_token_index, pos.* - 1);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -4558,7 +4562,7 @@ pub fn parseScalarWhereSetIntoOrBranchesAlloc(
         return true;
     }
     if (op == .eq and parser.matchKeyword(tokens, pos, "all")) {
-        try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast);
+        try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast, tokens, op_token_index, pos.* - 1);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -4567,7 +4571,7 @@ pub fn parseScalarWhereSetIntoOrBranchesAlloc(
         return true;
     }
     if (op == .ne and parser.matchKeyword(tokens, pos, "all")) {
-        try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast);
+        try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast, tokens, op_token_index, pos.* - 1);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -4904,6 +4908,7 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
         return;
     }
 
+    const op_token_index = pos.*;
     const op: runtime_schema.RelationalCheckOp = if (try parseExpressionIsTailIf(tokens, pos, .{
         .allow_boolean_unknown = true,
         .allow_boolean_literal = true,
@@ -4941,7 +4946,7 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
         try parseComparisonOp(tokens, pos);
 
     if (op == .eq and matchAnyOrSomeKeyword(tokens, pos)) {
-        try validateGeneratedQuantifiedPredicateExpression(options.generated_expression_ast);
+        try validateGeneratedQuantifiedPredicateExpression(options.generated_expression_ast, tokens, op_token_index, pos.* - 1);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -4952,7 +4957,7 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
         return;
     }
     if (op == .ne and matchAnyOrSomeKeyword(tokens, pos)) {
-        try validateGeneratedQuantifiedPredicateExpression(options.generated_expression_ast);
+        try validateGeneratedQuantifiedPredicateExpression(options.generated_expression_ast, tokens, op_token_index, pos.* - 1);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -4963,7 +4968,7 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
         return;
     }
     if (op == .eq and parser.matchKeyword(tokens, pos, "all")) {
-        try validateGeneratedQuantifiedPredicateExpression(options.generated_expression_ast);
+        try validateGeneratedQuantifiedPredicateExpression(options.generated_expression_ast, tokens, op_token_index, pos.* - 1);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -4974,7 +4979,7 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
         return;
     }
     if (op == .ne and parser.matchKeyword(tokens, pos, "all")) {
-        try validateGeneratedQuantifiedPredicateExpression(options.generated_expression_ast);
+        try validateGeneratedQuantifiedPredicateExpression(options.generated_expression_ast, tokens, op_token_index, pos.* - 1);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -5252,6 +5257,7 @@ pub fn parseExpressionWhereConditionsAlloc(
         return;
     }
 
+    const op_token_index = pos.*;
     const op: runtime_schema.RelationalCheckOp = if (try parseExpressionIsTailIf(tokens, pos, .{
         .allow_boolean_unknown = true,
         .allow_boolean_literal = true,
@@ -5291,7 +5297,7 @@ pub fn parseExpressionWhereConditionsAlloc(
         try parseComparisonOp(tokens, pos);
 
     if (op == .eq and matchAnyOrSomeKeyword(tokens, pos)) {
-        try validateGeneratedQuantifiedPredicateExpression(options.generated_expression_ast);
+        try validateGeneratedQuantifiedPredicateExpression(options.generated_expression_ast, tokens, op_token_index, pos.* - 1);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -5302,7 +5308,7 @@ pub fn parseExpressionWhereConditionsAlloc(
         return;
     }
     if (op == .ne and matchAnyOrSomeKeyword(tokens, pos)) {
-        try validateGeneratedQuantifiedPredicateExpression(options.generated_expression_ast);
+        try validateGeneratedQuantifiedPredicateExpression(options.generated_expression_ast, tokens, op_token_index, pos.* - 1);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -5313,7 +5319,7 @@ pub fn parseExpressionWhereConditionsAlloc(
         return;
     }
     if (op == .eq and parser.matchKeyword(tokens, pos, "all")) {
-        try validateGeneratedQuantifiedPredicateExpression(options.generated_expression_ast);
+        try validateGeneratedQuantifiedPredicateExpression(options.generated_expression_ast, tokens, op_token_index, pos.* - 1);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -5324,7 +5330,7 @@ pub fn parseExpressionWhereConditionsAlloc(
         return;
     }
     if (op == .ne and parser.matchKeyword(tokens, pos, "all")) {
-        try validateGeneratedQuantifiedPredicateExpression(options.generated_expression_ast);
+        try validateGeneratedQuantifiedPredicateExpression(options.generated_expression_ast, tokens, op_token_index, pos.* - 1);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -25365,9 +25371,30 @@ pub fn appendTextPatternPredicateAlloc(
 
 fn validateGeneratedQuantifiedPredicateExpression(
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
+    tokens: []const Token,
+    operator_token_index: usize,
+    quantifier_token_index: usize,
 ) !void {
     const expression = generated_expression_ast orelse return;
     if (expression.kind != .quantified_comparison) return error.UnsupportedSqlShape;
+    const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
+    if (operator_token_index >= tokens.len or
+        operator_tokens.start != operator_token_index or
+        operator_tokens.end != operator_token_index + 1 or
+        !generatedTokenKindIsComparisonOperator(tokens[operator_token_index].kind))
+    {
+        return error.UnsupportedSqlShape;
+    }
+    const quantifier_tokens = expression.quantifier_tokens orelse return error.UnsupportedSqlShape;
+    if (quantifier_token_index >= tokens.len or
+        quantifier_tokens.start != quantifier_token_index or
+        quantifier_tokens.end != quantifier_token_index + 1 or
+        !tokenAtIsAnySomeOrAll(tokens, quantifier_token_index))
+    {
+        return error.UnsupportedSqlShape;
+    }
+    const right_tokens = expression.right_tokens orelse return error.UnsupportedSqlShape;
+    if (operator_tokens.end != quantifier_tokens.start or quantifier_tokens.end != right_tokens.start) return error.UnsupportedSqlShape;
 }
 
 fn validateGeneratedPatternPredicateExpression(
@@ -25457,7 +25484,7 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (!negated and valueEqualsAnyArrayPredicateCanStart(tokens, pos.*)) {
-        try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast);
+        try validateGeneratedExpressionPredicateKind(generated_expression_ast, .quantified_comparison);
     }
     if (!negated and try parseValueEqualsAnyArrayPredicateAlloc(
         alloc,
@@ -25469,6 +25496,7 @@ pub fn parseWhereAtomAlloc(
         returning_expression_qualifiers,
         defer_row_expression_field_validation,
         array_any,
+        generated_expression_ast,
     )) {
         return;
     }
@@ -25720,9 +25748,10 @@ pub fn parseWhereAtomAlloc(
         return;
     }
 
+    const op_token_index = pos.*;
     const op = try parseComparisonOp(tokens, pos);
     if (op == .eq and matchAnyOrSomeKeyword(tokens, pos)) {
-        try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast);
+        try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast, tokens, op_token_index, pos.* - 1);
         if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
@@ -25740,7 +25769,7 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (op == .ne and matchAnyOrSomeKeyword(tokens, pos)) {
-        try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast);
+        try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast, tokens, op_token_index, pos.* - 1);
         if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
@@ -25755,7 +25784,7 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (op == .eq and parser.matchKeyword(tokens, pos, "all")) {
-        try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast);
+        try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast, tokens, op_token_index, pos.* - 1);
         if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
@@ -25766,7 +25795,7 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (op == .ne and parser.matchKeyword(tokens, pos, "all")) {
-        try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast);
+        try validateGeneratedQuantifiedPredicateExpression(generated_expression_ast, tokens, op_token_index, pos.* - 1);
         if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
@@ -25948,6 +25977,7 @@ pub fn parseJoinWhereAlloc(
             if (!parser.matchKeyword(tokens, pos, "and")) break;
             continue;
         }
+        const op_token_index = pos.*;
         const op: runtime_schema.RelationalCheckOp = if (try parseExpressionIsTailIf(tokens, pos, .{
             .allow_boolean_unknown = true,
             .allow_boolean_literal = true,
@@ -25988,7 +26018,7 @@ pub fn parseJoinWhereAlloc(
             break :blk is_tail.op;
         } else try parseComparisonOp(tokens, pos);
         if (op == .eq and matchAnyOrSomeKeyword(tokens, pos)) {
-            try validateGeneratedQuantifiedPredicateExpression(generated_atom_expression);
+            try validateGeneratedQuantifiedPredicateExpression(generated_atom_expression, tokens, op_token_index, pos.* - 1);
             if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
             try parser.expectToken(tokens, pos, .lparen);
             const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
