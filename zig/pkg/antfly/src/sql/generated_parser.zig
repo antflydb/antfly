@@ -2087,6 +2087,9 @@ pub const antfly_extension_read_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "SELECT id, score FROM antfly.semantic_search(index => 'docs_embeddings', query => 'refund', limit => 10)", .kind = .read },
     .{ .sql = "SELECT id FROM antfly.vector_search(index => 'docs_vectors', vector => '[0.1,0.2]', limit => 10)", .kind = .read },
     .{ .sql = "SELECT id FROM antfly.graph_traverse(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', max_depth => 2)", .kind = .read },
+    .{ .sql = "SELECT id FROM antfly.graph_neighbors(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', direction => 'out')", .kind = .read },
+    .{ .sql = "SELECT id, score FROM antfly.graph_shortest_path(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', target => 'doc:z', max_depth => 4)", .kind = .read },
+    .{ .sql = "SELECT id, score FROM antfly.graph_k_shortest_paths(table_name => 'docs', index => 'docs_edge_graph', result_ref => '$starts', target_result_ref => '$targets', k => 3, max_depth => 6)", .kind = .read },
     .{ .sql = "SELECT id, score FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b') AS gm", .kind = .read },
     .{ .sql = "SELECT gm.id, ranked.score FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b') AS gm JOIN antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 5) AS ranked ON gm.id = ranked.id", .kind = .read },
     .{ .sql = "SELECT * FROM antfly.graph_metric_rerank(full_text_index => 'docs_body_fts', query => 'refund', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', weight => 1.5, base_weight => 0.25)", .kind = .read },
@@ -8559,6 +8562,71 @@ test "generated SQL parser facade builds read AST spans" {
             try std.testing.expectEqualStrings(
                 "'b'",
                 tokenRangeText(graph_source_read_sql, graph_source_tokens.items, read.source_graph_function_items[0].return_value_tokens.?),
+            );
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const graph_neighbors_source_read_sql = "SELECT * FROM antfly.graph_neighbors(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', direction => 'out') AS neighbors";
+    var graph_neighbors_source_tokens = try lexer.tokenizeAlloc(alloc, graph_neighbors_source_read_sql);
+    defer lexer.freeTokens(alloc, &graph_neighbors_source_tokens);
+    const graph_neighbors_source_read_result = try parseTokensAlloc(alloc, graph_neighbors_source_tokens.items);
+    switch (graph_neighbors_source_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(@as(usize, 1), read.source_antfly_function_count);
+            try std.testing.expectEqual(@as(usize, 1), read.source_graph_function_count);
+            try std.testing.expectEqual(GeneratedSqlAntflyTableFunctionKind.graph_neighbors, read.source_antfly_function_items[0].kind);
+            try std.testing.expectEqual(GeneratedSqlGraphTableFunctionKind.neighbors, read.source_graph_function_items[0].kind);
+            try std.testing.expectEqualStrings(
+                "'doc:root'",
+                tokenRangeText(graph_neighbors_source_read_sql, graph_neighbors_source_tokens.items, read.source_graph_function_items[0].start_value_tokens.?),
+            );
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const graph_shortest_path_source_read_sql = "SELECT * FROM antfly.graph_shortest_path(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', target => 'doc:z', max_depth => 4) AS path";
+    var graph_shortest_path_source_tokens = try lexer.tokenizeAlloc(alloc, graph_shortest_path_source_read_sql);
+    defer lexer.freeTokens(alloc, &graph_shortest_path_source_tokens);
+    const graph_shortest_path_source_read_result = try parseTokensAlloc(alloc, graph_shortest_path_source_tokens.items);
+    switch (graph_shortest_path_source_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(@as(usize, 1), read.source_antfly_function_count);
+            try std.testing.expectEqual(@as(usize, 1), read.source_graph_function_count);
+            try std.testing.expectEqual(GeneratedSqlAntflyTableFunctionKind.graph_shortest_path, read.source_antfly_function_items[0].kind);
+            try std.testing.expectEqual(GeneratedSqlGraphTableFunctionKind.shortest_path, read.source_graph_function_items[0].kind);
+            try std.testing.expectEqualStrings(
+                "'doc:a'",
+                tokenRangeText(graph_shortest_path_source_read_sql, graph_shortest_path_source_tokens.items, read.source_graph_function_items[0].start_value_tokens.?),
+            );
+            try std.testing.expectEqualStrings(
+                "'doc:z'",
+                tokenRangeText(graph_shortest_path_source_read_sql, graph_shortest_path_source_tokens.items, read.source_graph_function_items[0].target_value_tokens.?),
+            );
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const graph_k_shortest_paths_source_read_sql = "SELECT * FROM antfly.graph_k_shortest_paths(table_name => 'docs', index => 'docs_edge_graph', result_ref => '$starts', target_result_ref => '$targets', k => 3, max_depth => 6) AS paths";
+    var graph_k_shortest_paths_source_tokens = try lexer.tokenizeAlloc(alloc, graph_k_shortest_paths_source_read_sql);
+    defer lexer.freeTokens(alloc, &graph_k_shortest_paths_source_tokens);
+    const graph_k_shortest_paths_source_read_result = try parseTokensAlloc(alloc, graph_k_shortest_paths_source_tokens.items);
+    switch (graph_k_shortest_paths_source_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(@as(usize, 1), read.source_antfly_function_count);
+            try std.testing.expectEqual(@as(usize, 1), read.source_graph_function_count);
+            try std.testing.expectEqual(GeneratedSqlAntflyTableFunctionKind.graph_k_shortest_paths, read.source_antfly_function_items[0].kind);
+            try std.testing.expectEqual(GeneratedSqlGraphTableFunctionKind.k_shortest_paths, read.source_graph_function_items[0].kind);
+            try std.testing.expectEqualStrings(
+                "'$starts'",
+                tokenRangeText(graph_k_shortest_paths_source_read_sql, graph_k_shortest_paths_source_tokens.items, read.source_graph_function_items[0].start_result_ref_value_tokens.?),
+            );
+            try std.testing.expectEqualStrings(
+                "'$targets'",
+                tokenRangeText(graph_k_shortest_paths_source_read_sql, graph_k_shortest_paths_source_tokens.items, read.source_graph_function_items[0].target_result_ref_value_tokens.?),
             );
         },
         else => return error.TestUnexpectedResult,

@@ -31162,6 +31162,72 @@ test "sql adapter lower expr treats direct graph table functions as relation sou
     try std.testing.expect(query.plan.ctes[0].table_function != null);
     try std.testing.expectEqualStrings("gm", query.plan.query.source_cte);
 
+    var neighbors_query = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, score FROM antfly.graph_neighbors(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', direction => 'out') AS neighbors WHERE graph_name = 'neighbors' ORDER BY score DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer neighbors_query.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", neighbors_query.table_name);
+    try std.testing.expectEqual(@as(usize, 1), neighbors_query.plan.ctes.len);
+    try std.testing.expectEqualStrings("neighbors", neighbors_query.plan.ctes[0].name);
+    switch (neighbors_query.plan.ctes[0].table_function orelse return error.TestUnexpectedResult) {
+        .graph_query => |graph_query| {
+            try std.testing.expectEqualStrings("usage_records", graph_query.table_name);
+            try std.testing.expectEqualStrings("neighbors", graph_query.query.name);
+            try std.testing.expectEqual(@as(@TypeOf(graph_query.query.query.query_type), .neighbors), graph_query.query.query.query_type);
+            try std.testing.expectEqual(@as(u32, 1), graph_query.query.query.params.max_depth);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqualStrings("neighbors", neighbors_query.plan.query.source_cte);
+
+    var shortest_path_query = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, score FROM antfly.graph_shortest_path(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:a', target => 'doc:z', max_depth => 4) AS path ORDER BY score DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer shortest_path_query.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", shortest_path_query.table_name);
+    try std.testing.expectEqual(@as(usize, 1), shortest_path_query.plan.ctes.len);
+    try std.testing.expectEqualStrings("path", shortest_path_query.plan.ctes[0].name);
+    switch (shortest_path_query.plan.ctes[0].table_function orelse return error.TestUnexpectedResult) {
+        .graph_query => |graph_query| {
+            try std.testing.expectEqualStrings("usage_records", graph_query.table_name);
+            try std.testing.expectEqualStrings("shortest_path", graph_query.query.name);
+            try std.testing.expectEqual(@as(@TypeOf(graph_query.query.query.query_type), .shortest_path), graph_query.query.query.query_type);
+            try std.testing.expectEqual(@as(u32, 4), graph_query.query.query.params.max_depth);
+            try std.testing.expect(graph_query.query.query.target_nodes != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqualStrings("path", shortest_path_query.plan.query.source_cte);
+
+    var k_shortest_paths_query = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, score FROM antfly.graph_k_shortest_paths(table_name => 'usage_records', index => 'docs_edge_graph', result_ref => '$starts', target_result_ref => '$targets', k => 3, max_depth => 6) AS paths ORDER BY score DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer k_shortest_paths_query.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", k_shortest_paths_query.table_name);
+    try std.testing.expectEqual(@as(usize, 1), k_shortest_paths_query.plan.ctes.len);
+    try std.testing.expectEqualStrings("paths", k_shortest_paths_query.plan.ctes[0].name);
+    switch (k_shortest_paths_query.plan.ctes[0].table_function orelse return error.TestUnexpectedResult) {
+        .graph_query => |graph_query| {
+            try std.testing.expectEqualStrings("usage_records", graph_query.table_name);
+            try std.testing.expectEqualStrings("k_shortest_paths", graph_query.query.name);
+            try std.testing.expectEqual(@as(@TypeOf(graph_query.query.query.query_type), .k_shortest_paths), graph_query.query.query.query_type);
+            try std.testing.expectEqual(@as(u32, 3), graph_query.query.query.k);
+            try std.testing.expectEqual(@as(u32, 6), graph_query.query.query.params.max_depth);
+            try std.testing.expect(graph_query.query.query.target_nodes != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqualStrings("paths", k_shortest_paths_query.plan.query.source_cte);
+
     var aggregate = try lowerAggregatePlanForLowerExprTestAlloc(
         alloc,
         "SELECT graph_name, COUNT(*) AS row_count FROM antfly.graph_match(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b') AS gm WHERE score >= 0 GROUP BY graph_name ORDER BY row_count DESC LIMIT 5",

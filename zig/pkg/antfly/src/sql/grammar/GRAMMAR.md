@@ -1048,18 +1048,20 @@ Unsupported DDL remains on the existing parser until
    owned named-argument item/name/operator/value ranges, list-based Antfly
    function kind metadata across joined sources, graph function subset metadata,
    graph-specific semantic argument payloads for table/index selectors,
-   start/target selectors, pattern returns, metric names, and query text, and
-   fail-closed generated-read validation that rejects duplicate named
-   arguments and corrupted or missing required graph payloads before typed
-   lowering. Direct relational table-function lowering now accepts
-   `antfly.graph_metric(...)` alongside traversal and match table functions,
-   preserves the generated-covered metric source shape through typed relation
-   source planning, supports joins between graph-match and graph-metric table
-   functions, and materializes direct graph metric score rows through the
-   existing graph table-function row contract. CTE bodies now retain the same
-   Antfly and graph table-function source metadata, validate it at the CTE
-   boundary, and rebase it into the direct generated read AST used by child
-   body planning. Broader graph DSL cutover still
+   start/target selectors, result-ref selectors, pattern returns, metric names,
+   and query text, and fail-closed generated-read validation that rejects
+   duplicate named arguments and corrupted or missing required graph payloads
+   before typed lowering. Direct relational table-function lowering now accepts
+   `antfly.graph_neighbors(...)`, `antfly.graph_shortest_path(...)`,
+   `antfly.graph_k_shortest_paths(...)`, and `antfly.graph_metric(...)`
+   alongside traversal and match table functions, preserves the
+   generated-covered graph-query and metric source shapes through typed
+   relation source planning, supports joins between graph-match and
+   graph-metric table functions, and materializes direct graph query and graph
+   metric rows through the existing graph table-function row contract. CTE
+   bodies now retain the same Antfly and graph table-function source metadata,
+   validate it at the CTE boundary, and rebase it into the direct generated
+   read AST used by child body planning. Broader graph DSL cutover still
    requires direct generated graph-query planning beyond retained semantic
    payload validation and broader unsupported-shape diagnostics.
 
@@ -1248,11 +1250,13 @@ Generated grammar work needs evidence at multiple levels:
   statement corpus.
 - Corpus tests for accepted Antfly-specific syntax. The generated corpus now
   covers canonical `antfly.full_text_search`, `antfly.semantic_search`,
-  `antfly.vector_search`, `antfly.graph_traverse`, `antfly.graph_match`,
+  `antfly.vector_search`, `antfly.graph_traverse`,
+  `antfly.graph_neighbors`, `antfly.graph_shortest_path`,
+  `antfly.graph_k_shortest_paths`, `antfly.graph_match`,
   `antfly.graph_metric`, and `antfly.graph_metric_rerank` table-function read
   source syntax with named arguments; executable relational row-source lowering
-  covers graph traversal/match rows, graph metric score rows, and graph metric
-  rerank search-hit rows.
+  covers graph traversal, neighbors, shortest-path, k-shortest-path, match,
+  graph metric score, and graph metric rerank search-hit rows.
 - Corpus tests for intentionally unsupported PostgreSQL syntax with stable
   diagnostics. Seed `ANALYZE`, bulk I/O `COPY`, maintenance `VACUUM`/`REINDEX`,
   utility/control statements such as `CLUSTER`, `COMMENT`, `GRANT`/`REVOKE`,
