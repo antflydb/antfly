@@ -373,14 +373,16 @@ fn isGeneratedTransactionControlStatement(tokens: []const Token, raw_statement: 
         return start + 1 < end and tokenMatchesText(tokens[start + 1], "transaction");
     }
     if (tokenMatchesKeyword(first, .begin)) return true;
-    if (tokenMatchesKeyword(first, .savepoint)) return end == start + 2;
+    if (tokenMatchesKeyword(first, .savepoint)) return true;
     if (tokenMatchesText(first, "release")) {
+        if (end <= start + 1) return true;
         if (end == start + 2) return tokens[start + 1].kind == .identifier;
         return end == start + 3 and
             tokenMatchesKeyword(tokens[start + 1], .savepoint) and
             tokens[start + 2].kind == .identifier;
     }
     if (tokenMatchesKeyword(first, .rollback) and start + 1 < end and tokenMatchesKeyword(tokens[start + 1], .to)) {
+        if (end <= start + 2) return true;
         if (end == start + 3) return tokens[start + 2].kind == .identifier;
         return end == start + 4 and
             tokenMatchesKeyword(tokens[start + 2], .savepoint) and
@@ -2563,6 +2565,9 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "REINDEX"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "REVOKE"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SAVEPOINT"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "SAVEPOINT before retry"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "RELEASE SAVEPOINT"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ROLLBACK TO SAVEPOINT"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "UNLISTEN"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "INSERT INTO usage_records VALUES"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) VALUES ('u1') ON CONFLICT (id) DO"));

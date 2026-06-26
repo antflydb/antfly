@@ -498,8 +498,10 @@ incomplete cursor commands fail closed instead of falling back to the legacy
 DDL-like command adapter.
 Savepoint commands use generated transaction AST nodes for `SAVEPOINT`,
 `RELEASE [SAVEPOINT]`, and `ROLLBACK TO [SAVEPOINT]` before delegating to typed
-savepoint planning. `MOVE` remains an unsupported generated diagnostic because
-there is no typed cursor plan for it yet. Bulk I/O commands use the validated
+savepoint planning. Savepoint heads and rollback-to/release prefixes now
+require generated parser success at SQL ingress, including malformed or
+incomplete savepoint-name tails. `MOVE` remains an unsupported generated
+diagnostic because there is no typed cursor plan for it yet. Bulk I/O commands use the validated
 unsupported boundary for `COPY` before
 delegating to typed bulk I/O planning. `EXPLAIN` uses the validated
 unsupported boundary before delegating to typed explain planning, including
