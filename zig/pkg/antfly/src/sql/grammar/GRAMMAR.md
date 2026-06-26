@@ -773,13 +773,18 @@ Unsupported DDL remains on the existing parser until
    predicates, conflict predicates, merge join predicates, and returning lists
    also propagate generated syntax diagnostics instead of re-entering legacy
    write parsing.
+   Plain DML command heads, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, and
+   `MERGE`, now require generated-parser success at SQL ingress even for
+   complete-looking malformed statements, so those heads cannot fall back to
+   legacy write-family classification when the generated grammar rejects them.
    Switching the full DML family from generated-parser gating plus typed
    lowerer delegation to complete generated AST-driven lowering still requires
-   generated command-body AST-driven lowering for recursive CTE DML beyond
+   generated command-body AST-driven lowering for `WITH`-prefixed recursive
+   CTE DML beyond
    validated generated CTE child-read bodies and direct recursive write-plan
    dispatch, broader unsupported-shape diagnostics, and full generated
-   statement-head promotion once generated coverage matches the current typed
-   DML lowerer surface.
+   `WITH` statement-head promotion once generated coverage can distinguish read
+   CTEs from write CTEs before successful generated parsing.
 4. Read queries: projections, predicates, joins, CTEs, aggregates, windows,
    set operations, lateral, ordering, limits, and document-table sources.
    Initial generated-parser coverage now retains raw and AST read nodes for

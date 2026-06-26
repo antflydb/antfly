@@ -333,6 +333,7 @@ fn generatedStrictParseFailureShouldPropagate(tokens: []const Token, raw_stateme
     if (raw_statement.token_start >= raw_statement.token_end or raw_statement.token_end > tokens.len) return true;
     if (tokens[raw_statement.token_end - 1].kind == .eq or tokens[raw_statement.token_end - 1].kind == .comma) return true;
     if (tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .to) or tokenMatchesKeyword(tokens[raw_statement.token_end - 1], .as)) return true;
+    if (isGeneratedDmlStatementHead(tokens, raw_statement)) return true;
     if (isGeneratedUnsupportedHead(tokens, raw_statement)) return true;
     return isIncompleteGeneratedDdlBoundary(tokens, raw_statement) or
         isIncompleteGeneratedDmlBoundary(tokens, raw_statement) or
@@ -1280,6 +1281,17 @@ fn isIncompleteGeneratedDmlBoundary(tokens: []const Token, raw_statement: RawSql
             tokenMatchesKeyword(last, .values);
     }
     return false;
+}
+
+fn isGeneratedDmlStatementHead(tokens: []const Token, raw_statement: RawSqlStatement) bool {
+    const start = raw_statement.token_start;
+    if (start >= raw_statement.token_end or raw_statement.token_end > tokens.len) return false;
+    const first = tokens[start];
+    return tokenMatchesKeyword(first, .insert) or
+        tokenMatchesKeyword(first, .update) or
+        tokenMatchesKeyword(first, .delete) or
+        tokenMatchesKeyword(first, .truncate) or
+        tokenMatchesKeyword(first, .merge);
 }
 
 fn isGeneratedDmlTrailingQuantifier(tokens: []const Token, start: usize, end: usize) bool {
@@ -5426,6 +5438,22 @@ test "sql adapter parsed sql write statement kind fails closed on classifier dis
     generated_recursive_insert.statement = parseStatement(generated_recursive_insert.raw_statement, malformed_cte_prefix, &generated_recursive_insert.tokenized_sql);
     try std.testing.expect(generated_recursive_insert.writeStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_recursive_insert.statement));
+}
+
+test "sql adapter parsed sql requires generated parser success for plain DML heads" {
+    const alloc = std.testing.allocator;
+
+    const cases = [_][]const u8{
+        "INSERT usage_records (id) VALUES ('u1')",
+        "UPDATE usage_records WHERE id = 'u1'",
+        "DELETE usage_records WHERE id = 'u1'",
+        "TRUNCATE TABLE",
+        "MERGE INTO usage_records USING source_rows WHEN MATCHED THEN DELETE",
+    };
+
+    for (cases) |sql| {
+        try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, sql));
+    }
 }
 
 test "sql adapter parsed sql retains generated read nodes for covered query corpus" {
